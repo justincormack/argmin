@@ -1,5 +1,7 @@
 #!/bin/sh
 
+# Keep a checkout of my Obsidian notes, just the relevant parts for reference
+
 PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
   echo "Not inside a git repo"
   exit 1

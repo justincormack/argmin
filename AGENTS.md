@@ -10,6 +10,8 @@ The guides/ folder has guides about specific technical or other issues and codin
 The plans/ folder is for work plans. Remember to adjust these if during implementation things change and the
 plan detail needs correcting.
 
+Under tmp/ but not committed to repo are clones of dependencies so we can read code
+
 ## Dependencies
 
 We are trying to not have too many dependencies and to keep code simple and understandable. Ask before adding
