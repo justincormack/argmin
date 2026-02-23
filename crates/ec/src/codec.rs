@@ -84,6 +84,12 @@ pub enum EcError {
     #[error("scratch buffer too small: need {required} bytes, got {provided}")]
     ScratchTooSmall { required: usize, provided: usize },
 
+    #[error("shard size {size} exceeds i32::MAX; split into smaller stripes")]
+    ShardSizeTooLarge { size: usize },
+
+    #[error("duplicate recover shard index {index}")]
+    DuplicateRecoverIndex { index: usize },
+
     #[error("internal: matrix inversion failed (singular matrix)")]
     SingularMatrix,
 }
@@ -169,6 +175,9 @@ impl ErasureCodec {
         }
 
         let shard_size = data[0].len();
+        if shard_size > i32::MAX as usize {
+            return Err(EcError::ShardSizeTooLarge { size: shard_size });
+        }
         for (i, s) in data.iter().enumerate().skip(1) {
             if s.len() != shard_size {
                 return Err(EcError::ShardSizeMismatch {
@@ -246,6 +255,9 @@ impl ErasureCodec {
         }
 
         let shard_size = data[0].len();
+        if shard_size > i32::MAX as usize {
+            return Err(EcError::ShardSizeTooLarge { size: shard_size });
+        }
         for (i, s) in data.iter().enumerate().skip(1) {
             if s.len() != shard_size {
                 return Err(EcError::ShardSizeMismatch {
@@ -317,8 +329,13 @@ impl ErasureCodec {
     ///
     /// `present_indices`: sorted, deduplicated shard indices (0..k+m); length >= k.
     /// `present_data`:    one slice per entry in `present_indices`, all of length `shard_size`.
-    /// `recover_indices`: shard indices to reconstruct; must not overlap `present_indices`.
+    /// `recover_indices`: shard indices to reconstruct; must not overlap `present_indices`
+    ///                    and must not contain duplicates.
     /// `outputs`:         one `&mut [u8]` per entry in `recover_indices`, each `shard_size` bytes.
+    ///
+    /// If `present_indices.len() > k`, only the first `k` entries are used for the
+    /// matrix inversion; the remaining entries are ignored. Callers may pass all
+    /// available shards without trimming — the codec selects the first `k`.
     ///
     /// ZONE_HOT: no heap allocation. All scratch (matrices, GF tables, pointer arrays)
     /// is stack-allocated and bounded by MAX_TOTAL_SHARDS.
@@ -372,6 +389,7 @@ impl ErasureCodec {
         for &idx in present_indices {
             present_set |= 1u64 << idx;
         }
+        let mut recover_set = 0u64;
         for &idx in recover_indices.iter() {
             if idx >= total {
                 return Err(EcError::ShardIndexOutOfRange { index: idx, total });
@@ -379,10 +397,17 @@ impl ErasureCodec {
             if present_set & (1u64 << idx) != 0 {
                 return Err(EcError::OverlappingIndices { index: idx });
             }
+            if recover_set & (1u64 << idx) != 0 {
+                return Err(EcError::DuplicateRecoverIndex { index: idx });
+            }
+            recover_set |= 1u64 << idx;
         }
 
         // ── Validate shard sizes ──────────────────────────────────────────
         let shard_size = present_data[0].len();
+        if shard_size > i32::MAX as usize {
+            return Err(EcError::ShardSizeTooLarge { size: shard_size });
+        }
         for (i, s) in present_data.iter().enumerate().skip(1) {
             if s.len() != shard_size {
                 return Err(EcError::ShardSizeMismatch {

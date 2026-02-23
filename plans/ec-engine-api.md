@@ -21,7 +21,7 @@ Alternatives considered and rejected:
 ISA-L is a C library. The FFI boundary is encapsulated entirely within the `ec` crate; no `unsafe` appears in any other crate. The `ec-sys` sub-crate holds the raw bindings and `build.rs`; `ec` (the public crate) is safe Rust.
 
 **ISA-L key functions used:**
-- `gf_gen_cauchy1_matrix(matrix, m, k)` — generate encoding matrix (ZONE_INIT)
+- `gf_gen_cauchy1_matrix(matrix, k+m, k)` — generates the **full** `(k+m)×k` systematic encoding matrix (identity rows 0..k, Cauchy parity rows k..k+m); call as `(a, k+p, k)` and pass `a[k*k..]` to `ec_init_tables` (ZONE_INIT)
 - `ec_init_tables(k, m, encode_matrix, gf_tables)` — precompute GF multiply tables (ZONE_INIT)
 - `ec_encode_data(len, k, m, gf_tables, data_ptrs, parity_ptrs)` — encode (ZONE_HOT)
 - `gf_invert_matrix(in, out, n)` — matrix inversion for decode sub-matrix (ZONE_HOT, stack-allocated inputs)
@@ -115,23 +115,29 @@ impl ErasureCodec {
         parity: &mut [&mut [u8]],
     ) -> Result<(), EcError>;
 
+    /// Required scratch buffer size (bytes) for `verify` at a given `shard_size`.
+    /// Allocate once and reuse across many `verify` calls (e.g. a scrub pass).
+    pub fn verify_scratch_size(&self, shard_size: usize) -> usize; // = m * shard_size
+
     /// Verify that parity shards are consistent with data shards.
-    /// Re-encodes internally and compares; returns Ok(false) if any parity
-    /// shard differs (shard index returned for diagnostics).
+    /// Re-encodes data into `scratch` and compares against `parity`.
+    /// Returns `Err(ScratchTooSmall)` if scratch is < m * shard_size bytes.
     ///
     /// ZONE_HOT: no heap allocation.
     pub fn verify(
         &self,
         data: &[&[u8]],
         parity: &[&[u8]],
+        scratch: &mut [u8],
     ) -> Result<VerifyResult, EcError>;
 
     /// Reconstruct missing shards from a subset of available shards.
     ///
-    /// `present_indices`: sorted slice of shard indices (0..k+m) that are available;
-    ///                    must have length >= k.
+    /// `present_indices`: sorted, deduplicated shard indices (0..k+m); length >= k.
+    ///                    If length > k, only the first k entries are used.
     /// `present_data`:    one slice per entry in `present_indices`, all length `shard_size`.
-    /// `recover_indices`: shard indices to reconstruct (may be data or parity).
+    /// `recover_indices`: shard indices to reconstruct (may be data or parity);
+    ///                    must not overlap `present_indices` and must not contain duplicates.
     /// `outputs`:         one &mut [u8] per entry in `recover_indices`, all length `shard_size`.
     ///
     /// ZONE_HOT: no heap allocation. Scratch space for matrix inversion is
@@ -148,7 +154,9 @@ impl ErasureCodec {
 
 **Design notes:**
 - Shard size is inferred from the first input slice; all others are validated equal.
-- `present_indices` and `recover_indices` are disjoint (caller's responsibility; API validates).
+- Shard size must be ≤ `i32::MAX` (ISA-L takes `len` as `c_int`); returns `ShardSizeTooLarge` otherwise.
+- `present_indices` and `recover_indices` are disjoint; API validates and returns `OverlappingIndices`.
+- Duplicates within `recover_indices` are rejected with `DuplicateRecoverIndex`.
 - Shard index layout: `0..k` = data shards, `k..k+m` = parity shards.
 
 ---
@@ -194,6 +202,15 @@ pub enum EcError {
 
     #[error("present_indices is not sorted at position {index}")]
     UnsortedIndices { index: usize },
+
+    #[error("scratch buffer too small: need {required} bytes, got {provided}")]
+    ScratchTooSmall { required: usize, provided: usize },
+
+    #[error("shard size {size} exceeds i32::MAX; split into smaller stripes")]
+    ShardSizeTooLarge { size: usize },
+
+    #[error("duplicate recover shard index {index}")]
+    DuplicateRecoverIndex { index: usize },
 
     /// Should not occur with a Cauchy encoding matrix; indicates a bug.
     #[error("internal: matrix inversion failed (singular)")]
@@ -241,6 +258,8 @@ No `String` fields — all variants carry only fixed-size data, complying with t
 - Flip one bit in any data shard → call encode again (expected: still Ok for re-encoded parity, but object is now "wrong" — verify tests the pairing).
 - Corrupt one parity shard byte → `VerifyResult::Mismatch(idx)` for correct index.
 - Restore that byte → `VerifyResult::Ok`.
+- `scratch` too small → `Err(ScratchTooSmall)`.
+- Allocate scratch once, call verify many times (scrub pass pattern) — assert same result each time.
 
 ### 4. Reconstruct — exhaustive for small k+m
 
@@ -288,9 +307,10 @@ Each of these must return `Err(...)`, never panic:
 
 ### 8. Allocation tests (ZONE_HOT compliance)
 
-Use a custom counting allocator (wrap `std::alloc::System`, count allocs):
-- `encode` on pre-built codec: **zero heap allocations**.
-- `verify` on pre-built codec: **zero heap allocations**.
+Use a custom counting allocator (wrap `std::alloc::System`, count allocs).
+Counting uses thread-local state (not a global atomic) so parallel test threads do not interfere.
+- `encode` on pre-built codec: **zero heap allocations** (beyond caller ref-slice Vecs).
+- `verify` on pre-built codec: **zero heap allocations** (caller provides scratch buffer).
 - `reconstruct` on pre-built codec: **zero heap allocations**.
 
 These tests are `#[cfg(test)]`-only, since the counting allocator is test infrastructure.
@@ -307,14 +327,17 @@ forall (k in 1..=8, m in 1..=4, shard_size in 0..=4096, data: Vec<u8>):
 
 Shrinking on failure will produce a minimal (k, m, shard_size, data) counterexample.
 
-### 10. Fuzz targets
+### 10. Fuzz targets (deferred)
+
+Fuzz targets are planned but not yet implemented. Deferred until the proptest suite
+is stable and the API is frozen.
 
 - `fuzz_encode`: arbitrary `(k, m, data_bytes)` — must not panic.
 - `fuzz_reconstruct`: arbitrary present/absent shard pattern + data — must not panic.
 
-Both registered as `cargo-fuzz` targets.
+Both will be registered as `cargo-fuzz` targets when implemented.
 
-### 11. Benchmarks (`criterion`)
+### 11. Benchmarks (`criterion`, deferred)
 
 Measure encode throughput (GB/s) and reconstruct throughput:
 
@@ -327,6 +350,8 @@ Measure encode throughput (GB/s) and reconstruct throughput:
 | (4, 2) | 64 MB | large, cache-cold |
 
 Track peak RSS and allocation count per CI run (per memory policy §9).
+
+Benchmarks are deferred until the API is frozen. Criterion harness to be added to `crates/ec/benches/`.
 
 ---
 

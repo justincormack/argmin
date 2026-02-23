@@ -502,6 +502,23 @@ fn reconstruct_outputs_length_mismatch() {
     ));
 }
 
+// ── Duplicate recover_indices ─────────────────────────────────────────────────
+
+#[test]
+fn reconstruct_duplicate_recover_index() {
+    let codec = ErasureCodec::new(EcConfig::new(4, 2).unwrap()).unwrap();
+    let data = make_data(4, 64);
+    let data_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+    let mut out0 = vec![0u8; 64];
+    let mut out1 = vec![0u8; 64];
+    let mut outputs: Vec<&mut [u8]> = vec![out0.as_mut_slice(), out1.as_mut_slice()];
+    // shard 4 appears twice in recover_indices
+    assert!(matches!(
+        codec.reconstruct(&[0, 1, 2, 3], &data_refs, &[4, 4], &mut outputs),
+        Err(EcError::DuplicateRecoverIndex { index: 4 })
+    ));
+}
+
 // ── Single-byte shards (minimum non-zero size) ────────────────────────────────
 
 #[test]
@@ -580,6 +597,22 @@ mod alloc_tests {
         // The codec itself must not allocate. We check that the number is bounded and small.
         // (Two Vec::new() calls = 2 allocs for the ref slices above, both by caller.)
         assert_eq!(allocs, 2, "codec encode should not allocate beyond caller ref vecs");
+    }
+
+    #[test]
+    fn verify_zero_allocs_in_hot_path() {
+        let codec = ErasureCodec::new(EcConfig::new(4, 2).unwrap()).unwrap();
+        let data = make_data(4, 4096);
+        let parity = encode(&codec, &data);
+        let mut scratch = vec![0u8; codec.verify_scratch_size(4096)];
+
+        let allocs = count_allocs(|| {
+            let data_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+            let parity_refs: Vec<&[u8]> = parity.iter().map(|v| v.as_slice()).collect();
+            codec.verify(&data_refs, &parity_refs, &mut scratch).unwrap();
+        });
+
+        assert_eq!(allocs, 2, "codec verify should not allocate beyond caller ref vecs");
     }
 
     #[test]

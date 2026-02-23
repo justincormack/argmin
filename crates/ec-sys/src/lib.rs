@@ -11,11 +11,18 @@
 use std::os::raw::{c_int, c_uchar};
 
 extern "C" {
-    /// Generate a Cauchy matrix of size `m` × `k` in GF(2^8).
+    /// Generate the full systematic encoding matrix of size `m` × `k` in GF(2^8).
+    ///
+    /// Despite the name, this writes a *complete* `m × k` matrix where:
+    /// - The top-left `(m-k) × k` block (rows 0..m-k) is the `k × k` identity
+    ///   matrix (coefficients for the k data shards).
+    /// - The remaining `(m - (m-k)) × k` rows are the Cauchy parity coefficients.
+    ///
+    /// In practice, call this as `gf_gen_cauchy1_matrix(a, k + p, k)` where `k`
+    /// is the data shard count and `p` is the parity shard count.  The result is
+    /// a `(k+p) × k` matrix; pass `&a[k*k..]` to `ec_init_tables` for encoding.
     ///
     /// `a` must point to a buffer of at least `m * k` bytes.
-    /// The identity rows (data shards) are NOT included; this is the parity
-    /// sub-matrix only.
     pub fn gf_gen_cauchy1_matrix(a: *mut c_uchar, m: c_int, k: c_int);
 
     /// Invert an `n` × `n` matrix over GF(2^8).
@@ -51,4 +58,45 @@ extern "C" {
         data: *mut *mut c_uchar,
         coding: *mut *mut c_uchar,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify that `gf_gen_cauchy1_matrix(a, k+m, k)` writes the k×k identity
+    /// matrix into the first k rows. This guards against the parameter-order bug
+    /// where `(a, m, k)` was called instead of `(a, k+m, k)`, which silently
+    /// produced identity rows for parity (encode appeared to work but reconstruction
+    /// was always singular when any parity shard was used).
+    #[test]
+    fn cauchy_matrix_has_identity_rows() {
+        let k: i32 = 4;
+        let m: i32 = 2;
+        let total = k + m;
+        let mut matrix = vec![0u8; (total * k) as usize];
+        unsafe {
+            gf_gen_cauchy1_matrix(matrix.as_mut_ptr(), total, k);
+        }
+        // The first k rows must form the k×k identity matrix.
+        for row in 0..k as usize {
+            for col in 0..k as usize {
+                let expected = if row == col { 1u8 } else { 0u8 };
+                assert_eq!(
+                    matrix[row * k as usize + col],
+                    expected,
+                    "identity check failed at row={row}, col={col}"
+                );
+            }
+        }
+        // The remaining m rows must be non-zero (Cauchy coefficients; not identity).
+        // We don't check exact values, just that they are not all-zero rows.
+        for row in k as usize..total as usize {
+            let row_slice = &matrix[row * k as usize..(row + 1) * k as usize];
+            assert!(
+                row_slice.iter().any(|&b| b != 0),
+                "parity row {row} is all-zero (expected non-zero Cauchy coefficients)"
+            );
+        }
+    }
 }
