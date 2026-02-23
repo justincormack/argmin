@@ -36,6 +36,18 @@ All `Error` enum variants must carry only fixed-size data (`usize`, `&'static st
 primitive integers). No `String`, no `Vec`, no `Box<dyn Error>` in any
 variant. Returning an error must be as cheap as returning `Ok`.
 
+### Bounding an input does not bound products of that input
+
+Checking `shard_size <= i32::MAX` prevents ISA-L from receiving an
+overflowed `c_int`, but it does not prevent `m * shard_size` from
+overflowing `usize` on a 32-bit target (e.g. m=8, shard_size=2^31-1
+gives ~16 GB, which wraps a 32-bit usize). Any size derived by multiplying
+a bounded input by another variable needs its own overflow check. Use
+`saturating_mul` (safe fallback: result exceeds any real allocation, so
+downstream size comparisons still work correctly) or `checked_mul` (explicit
+error on overflow). Apply the same pattern throughout: every `a * b` that
+feeds a size comparison or allocation should use one of these.
+
 ### Internal APIs can be stricter than external ones
 
 This is an internal API (not public-facing S3). Require sorted indices rather
@@ -120,6 +132,17 @@ message, because proptest's shrinking loop does not expect panics. Use
 `prop_assert!` / `prop_assert_eq!` (which return `Err` and let proptest
 shrink normally) instead of `assert!` / `.unwrap()` for assertions that
 could legitimately fail on generated inputs.
+
+### Extract validation logic into `pub(crate)` helpers to keep tests sound
+
+When a validation check (e.g. `shard_size > i32::MAX`) needs to be tested
+but reaching it through the public API requires constructing inputs that
+would be UB or impractically large (gigabyte allocations), the right fix is
+to extract the check into a small `pub(crate)` function and test that
+directly. Reaching for `std::slice::from_raw_parts` with a length larger
+than the backing allocation is UB in Rust even if no bytes are accessed —
+the entire span is required to be valid memory. A `pub(crate)` helper is
+zero overhead, clearly testable, and eliminates the UB entirely.
 
 ---
 
