@@ -110,6 +110,11 @@ pub enum EcError {
 ///
 /// Holds the Cauchy encoding matrix and the pre-computed GF multiplication tables
 /// for encoding. Reconstruction computes its own per-call tables on the stack.
+///
+/// # Thread safety
+/// ISA-L documents its functions as reentrant and thread-safe, so it is safe to
+/// call `encode`, `verify`, and `reconstruct` concurrently on the same codec
+/// instance.
 pub struct ErasureCodec {
     config: EcConfig,
     /// Cauchy encoding matrix, m × k bytes (parity rows only; data rows are identity).
@@ -133,6 +138,9 @@ impl ErasureCodec {
         let mut encode_matrix = vec![0u8; total * k];
         let mut encode_tables = vec![0u8; GF_TABLE_ENTRY * k * m];
 
+        // SAFETY: ISA-L specifies gf_gen_cauchy1_matrix writes exactly total*k bytes
+        // to encode_matrix, and ec_init_tables reads the parity rows from that buffer
+        // and writes exactly 32*k*m bytes to encode_tables.
         unsafe {
             ec_sys::gf_gen_cauchy1_matrix(
                 encode_matrix.as_mut_ptr(),
@@ -232,6 +240,9 @@ impl ErasureCodec {
             parity_ptrs[i] = s.as_mut_ptr();
         }
 
+        // SAFETY: ISA-L treats gftbls and data inputs as read-only and writes
+        // exactly shard_size bytes into each parity buffer. The buffers are
+        // non-overlapping per the API contract above.
         unsafe {
             ec_sys::ec_encode_data(
                 shard_size as i32,
@@ -326,6 +337,9 @@ impl ErasureCodec {
             data_ptrs[i] = s.as_ptr() as *mut u8;
         }
 
+        // SAFETY: ISA-L treats gftbls and data inputs as read-only and writes
+        // exactly shard_size bytes into each scratch shard. The buffers are
+        // non-overlapping per the API contract above.
         unsafe {
             ec_sys::ec_encode_data(
                 shard_size as i32,

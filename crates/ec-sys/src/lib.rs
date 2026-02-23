@@ -7,6 +7,9 @@
 //! All functions here are `unsafe`. Callers must ensure buffer sizes match the
 //! documented requirements. See the ISA-L header `isa-l/erasure_code.h` for
 //! full documentation.
+//!
+//! ISA-L documents its library functions as reentrant and thread-safe; callers
+//! may invoke them concurrently as long as they provide non-overlapping buffers.
 
 use std::os::raw::{c_int, c_uchar};
 

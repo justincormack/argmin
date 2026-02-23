@@ -72,6 +72,8 @@ pub(crate) fn reconstruct_shards(
 
     // ── Step 3: Invert sub-matrix ─────────────────────────────────────────
     let mut inv_matrix = [0u8; MAX_TOTAL_SHARDS * MAX_TOTAL_SHARDS];
+    // SAFETY: ISA-L's gf_invert_matrix reads and writes exactly k*k bytes in
+    // the provided buffers and does not access memory beyond those arrays.
     let rc = unsafe {
         ec_sys::gf_invert_matrix(
             sub_matrix.as_mut_ptr(),
@@ -101,6 +103,8 @@ pub(crate) fn reconstruct_shards(
 
     // ── Step 6: Apply recovery matrix via ISA-L ────────────────────────────
     let mut gf_tables = [0u8; GF_TABLE_ENTRY * MAX_TOTAL_SHARDS * MAX_TOTAL_SHARDS];
+    // SAFETY: ISA-L treats the recovery matrix as read-only and writes exactly
+    // 32*k*n_recover bytes into gf_tables.
     unsafe {
         ec_sys::ec_init_tables(
             k as i32,
@@ -120,6 +124,9 @@ pub(crate) fn reconstruct_shards(
         out_ptrs[i] = s.as_mut_ptr();
     }
 
+    // SAFETY: ISA-L treats gftbls and data inputs as read-only and writes
+    // exactly shard_size bytes into each output buffer. The buffers are
+    // non-overlapping per the API contract enforced by the caller.
     unsafe {
         ec_sys::ec_encode_data(
             shard_size as i32,
