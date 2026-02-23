@@ -49,9 +49,25 @@ This is weighted HRW (Mitzenmacher & Upfal formulation, also called straw2 in Ce
 parlance). Weight proportional assignment follows from the exponential clock argument:
 a node with weight w receives a fraction w / sum(w) of all placements in expectation.
 
-**Constraint enforcement.** After scoring, walk nodes in ascending score order and
-accept greedily: skip a node if its rack already has `max_shards_per_rack` accepted
-shards. This is one linear pass, no backtracking.
+**Constraint enforcement.** Rather than scoring all N nodes, sorting, then filtering,
+we use a streaming selection that maintains only `total_shards` candidates at a time.
+Process each node once; maintain a buffer of the current best `total_shards` candidates
+respecting the rack cap. Three cases on each node:
+
+1. **Buffer not full, rack under cap** → insert unconditionally.
+2. **Buffer full, rack under cap** → evict the global worst (highest score) if the new
+   node's score is lower.
+3. **Rack at cap (buffer full or not)** → find the worst node in the buffer from this
+   rack; replace it if the new node's score is lower. Otherwise skip.
+
+This is O(N × total_shards) time and O(total_shards) space. No sorting, no
+pre-allocated fixed-size array sized to cluster capacity.
+
+The algorithm produces the globally optimal selection (minimum total score subject to
+the rack cap constraint). Proof by exchange argument: a node rejected via case 3 is
+dominated within its own rack — every optimal selection that includes it could swap it
+for a lower-score node from the same rack already in the buffer. A node rejected via
+case 2 is globally dominated — its score is ≥ every node already selected.
 
 ### Hash function: rapidhash
 
@@ -102,9 +118,11 @@ Following `guides/rust_memory_policy_strict.md`:
 
 - **ZONE_INIT**: `ClusterMap::new`, `Placer::new` — allocation allowed; build sorted
   node metadata, pre-validate.
-- **ZONE_HOT** (`Placer::place`): **zero heap allocation**. Scoring and selection use
-  a stack-allocated `[ScoredNode; MAX_NODES]` array. At `MAX_NODES = 256` and 16
-  bytes per entry, that is 4 KB stack usage — well within normal limits.
+- **ZONE_HOT** (`Placer::place`): **zero heap allocation**. The streaming selection
+  algorithm uses two stack-allocated arrays bounded by `total_shards` (≤ 32), not by
+  cluster size: a candidate buffer of 32 entries (~768 bytes) and a rack-count table
+  of 32 entries (~256 bytes). Stack cost is O(total_shards) regardless of how many
+  nodes the cluster contains.
 
 ### What is NOT in this API
 
@@ -201,9 +219,9 @@ impl ClusterMap {
     /// - `nodes` is empty
     /// - any `weight` is negative or NaN or infinite
     /// - any NodeId is duplicated
-    /// - `nodes.len() > MAX_NODES`
     ///
-    /// ZONE_INIT: allocates.
+    /// ZONE_INIT: allocates. ClusterMap owns a Vec<NodeInfo> proportional to cluster
+    /// size; this is expected and fine. Only place() (ZONE_HOT) is allocation-free.
     pub fn new(nodes: &[NodeInfo]) -> Result<Self, PlacementError>;
 
     /// Number of nodes with weight > 0.0.
@@ -215,9 +233,6 @@ impl ClusterMap {
     /// Sum of weights across all active nodes.
     pub fn total_weight(&self) -> f64;
 }
-
-/// Hard upper bound on cluster size.
-pub const MAX_NODES: usize = 256;
 ```
 
 ---
@@ -300,9 +315,6 @@ pub enum PlacementError {
     #[error("empty cluster: no nodes provided")]
     EmptyCluster,
 
-    #[error("node count {count} exceeds MAX_NODES ({max})")]
-    TooManyNodes { count: usize, max: usize },
-
     #[error("duplicate node id {id}")]
     DuplicateNodeId { id: u32 },
 
@@ -353,10 +365,32 @@ matching the precision of `f64` mantissa and avoiding `ln(0) = -∞`.
 
 Nodes with `weight = 0.0` are skipped before scoring (treated as absent).
 
-Selection: fill `[ScoredNode; MAX_NODES]` on the stack, partial-sort to find the
-top-`total_shards` entries with the rack cap applied greedily. Partial sort uses
-an insertion-sort style scan (O(N * total_shards)), acceptable since both N ≤ 256
-and total_shards ≤ 32.
+**Selection (streaming, O(total_shards) space):**
+
+Two stack-allocated arrays, both sized to `total_shards` (≤ 32):
+- `candidates: [(f64, NodeId, RackId); total_shards]` — current best selection
+- `rack_counts: [(RackId, u8); total_shards]` — how many slots each rack occupies
+
+For each node i in `ClusterMap` order:
+1. Compute `score_i`. Skip if `weight_i == 0.0`.
+2. Look up `rc` = count of `rack_i` in `rack_counts`.
+3. **Case: rack under cap (`rc < max_shards_per_rack`)**
+   - If `candidates` is not full: insert `(score_i, node_i, rack_i)` directly.
+   - If `candidates` is full: find the entry with the highest score (`worst`).
+     If `score_i < worst.score`: evict `worst`, insert new entry (update `rack_counts`
+     for both the evicted rack and the new rack).
+4. **Case: rack at cap (`rc == max_shards_per_rack`)**
+   - Find the highest-score entry in `candidates` with `rack == rack_i` (`worst_in_rack`).
+   - If `score_i < worst_in_rack.score`: replace it. (`rack_counts` for this rack is unchanged.)
+   - Otherwise: skip.
+
+After all nodes are processed:
+- If `candidates` has fewer than `total_shards` entries: return `ConstraintUnsatisfiable`.
+- Otherwise: copy `candidates[i].node_id` into `out[i]` for each i.
+
+The shard order in `out` follows the order entries were inserted into `candidates`
+(stable by construction). This is deterministic because `ClusterMap` stores nodes in
+a canonical order (sorted by `NodeId` at construction time).
 
 ---
 
@@ -376,12 +410,19 @@ PG virtualization is a two-line transformation the caller applies to its key bef
 calling `place`. Embedding it here would add state (pg_count, pg map) with no benefit
 until the metadata cluster layer is built.
 
-### 3. Stack allocation bounded by MAX_NODES
+### 3. Streaming selection, not sort-then-filter
 
-`MAX_NODES = 256` keeps the stack frame at ~4 KB. This is simpler than requiring
-caller-provided scratch (no `place_scratch_size` helper needed). The EC crate uses
-the same pattern for matrix inversion (1024-byte stack array for 32×32 matrix). If
-clusters ever exceed 256 nodes, we add a scratch buffer API at that point.
+The hot path maintains a candidate buffer of size `total_shards` (≤ 32) and scans
+the cluster's node list once. This gives O(total_shards) stack space regardless of
+cluster size — no fixed `MAX_NODES` constant that becomes a footgun when clusters grow.
+
+Cluster size is unbounded by the placement algorithm. The `ClusterMap` itself owns a
+`Vec<NodeInfo>` on the heap (ZONE_INIT allocation, expected and fine); only `place()`
+(ZONE_HOT) is bounded-stack.
+
+The algorithm is O(N × total_shards) time. For N=1000 nodes and total_shards=16,
+that is 16,000 iterations with trivial arithmetic — negligible. The EC crate uses the
+same pattern for matrix inversion (stack-allocated 32×32 array, O(k³) ops).
 
 ### 4. `place()` takes `&self`
 
@@ -421,7 +462,6 @@ placement.
 | `max_shards_per_rack = 0` | `InvalidMaxShardsPerRack` |
 | `max_shards_per_rack > total_shards` | `InvalidMaxShardsPerRack` |
 | `ClusterMap::new([])` | `EmptyCluster` |
-| `ClusterMap::new` with > MAX_NODES entries | `TooManyNodes` |
 | Duplicate NodeId | `DuplicateNodeId` |
 | Negative weight | `InvalidWeight` |
 | NaN weight | `InvalidWeight` |
@@ -505,6 +545,14 @@ assignments as each light node (within 20% tolerance).
 - Cluster of 8 nodes; 3 have weight 0.0. total_shards=4.
 - `active_node_count = 5`. Place succeeds; output never contains a zero-weight NodeId.
 
+### 14. Large cluster (no MAX_NODES footgun)
+
+- Construct a cluster with 1000 nodes across 100 racks (equal weights).
+- Place 1000 random keys with total_shards=8, max_per_rack=2.
+- Assert all placements succeed, no duplicates, rack constraint respected.
+- Assert zero heap allocations in `place()` (counting allocator).
+- Validates that cluster size is not bounded by any compile-time constant.
+
 ### 14. Hot path allocation (ZONE_HOT compliance)
 
 Using the thread-local counting allocator pattern from the EC crate:
@@ -514,7 +562,7 @@ Using the thread-local counting allocator pattern from the EC crate:
 
 ```
 forall (
-    node_count in 1..=64usize,
+    node_count in 1..=256usize,
     rack_count  in 1..=node_count,
     total_shards in 1..=min(node_count, 32) as u8,
     key: Vec<u8>
@@ -546,6 +594,6 @@ Measure `place()` throughput (placements/second) for:
 |---|---|---|
 | 12 nodes, 3 racks | 6 | default target config |
 | 50 nodes, 5 racks | 8 | medium cluster |
-| 256 nodes, 16 racks | 16 | MAX_NODES stress |
+| 1000 nodes, 100 racks | 16 | large cluster, validate O(N) scaling |
 
 Track zero-allocation assertion and peak stack depth per CI run.
