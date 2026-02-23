@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 7380c8fda912d8aedf427288941028fa25378dcbbc4b300cc246493f0d18720b # shrinks to k = 2, m = 1, shard_size = 69, seed = 6934858962956676814
