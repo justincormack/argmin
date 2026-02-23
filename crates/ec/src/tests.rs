@@ -1,4 +1,5 @@
 use crate::{EcConfig, EcError, ErasureCodec, VerifyResult, MAX_TOTAL_SHARDS};
+use crate::codec::check_shard_size;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -504,41 +505,19 @@ fn reconstruct_outputs_length_mismatch() {
 
 // ── ShardSizeTooLarge ─────────────────────────────────────────────────────────
 
-/// The ShardSizeTooLarge check fires before any byte is read, so we can use a
-/// slice whose *length* exceeds i32::MAX without backing memory for all of it.
-/// On 64-bit targets, `len * size_of::<u8>() = i32::MAX + 1 << isize::MAX` so
-/// the slice invariant is satisfied. On 32-bit targets this test is skipped.
+/// Test the ShardSizeTooLarge boundary via the extracted helper, which avoids
+/// constructing fake large slices (that would be UB). The helper is called by
+/// encode, verify, and reconstruct before any bytes are read.
 #[test]
-#[cfg(target_pointer_width = "64")]
-fn encode_shard_size_too_large() {
-    let codec = ErasureCodec::new(EcConfig::new(1, 1).unwrap()).unwrap();
-    let backing = [0u8; 1];
-    // Safety: encode reads only `data[0].len()` and returns ShardSizeTooLarge
-    // before dereferencing any bytes beyond the backing allocation.
-    let too_large: &[u8] =
-        unsafe { std::slice::from_raw_parts(backing.as_ptr(), i32::MAX as usize + 1) };
-    let data = [too_large];
-    let mut parity_buf = [0u8; 1];
-    let mut parity = [parity_buf.as_mut_slice()];
+fn shard_size_too_large_boundary() {
+    assert!(check_shard_size(0).is_ok());
+    assert!(check_shard_size(i32::MAX as usize).is_ok());
     assert!(matches!(
-        codec.encode(&data, &mut parity),
-        Err(EcError::ShardSizeTooLarge { .. })
+        check_shard_size(i32::MAX as usize + 1),
+        Err(EcError::ShardSizeTooLarge { size }) if size == i32::MAX as usize + 1
     ));
-}
-
-#[test]
-#[cfg(target_pointer_width = "64")]
-fn reconstruct_shard_size_too_large() {
-    let codec = ErasureCodec::new(EcConfig::new(1, 1).unwrap()).unwrap();
-    let backing = [0u8; 1];
-    // Safety: same as encode_shard_size_too_large above.
-    let too_large: &[u8] =
-        unsafe { std::slice::from_raw_parts(backing.as_ptr(), i32::MAX as usize + 1) };
-    let present = [too_large];
-    let mut out_buf = [0u8; 1];
-    let mut outputs = [out_buf.as_mut_slice()];
     assert!(matches!(
-        codec.reconstruct(&[0], &present, &[1], &mut outputs),
+        check_shard_size(usize::MAX),
         Err(EcError::ShardSizeTooLarge { .. })
     ));
 }

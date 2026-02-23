@@ -3,6 +3,18 @@ use crate::reconstruct::reconstruct_shards;
 /// Maximum supported total shards (k + m).
 pub const MAX_TOTAL_SHARDS: usize = 32;
 
+/// Validate that `shard_size` fits in ISA-L's `c_int` (`len`) parameter.
+///
+/// Extracted as a testable helper so tests can verify the boundary without
+/// constructing fake large slices (which would be UB).
+pub(crate) fn check_shard_size(size: usize) -> Result<(), EcError> {
+    if size > i32::MAX as usize {
+        Err(EcError::ShardSizeTooLarge { size })
+    } else {
+        Ok(())
+    }
+}
+
 // GF table size: 32 bytes per (source, output) pair.
 const GF_TABLE_ENTRY: usize = 32;
 
@@ -184,9 +196,7 @@ impl ErasureCodec {
         }
 
         let shard_size = data[0].len();
-        if shard_size > i32::MAX as usize {
-            return Err(EcError::ShardSizeTooLarge { size: shard_size });
-        }
+        check_shard_size(shard_size)?;
         for (i, s) in data.iter().enumerate().skip(1) {
             if s.len() != shard_size {
                 return Err(EcError::ShardSizeMismatch {
@@ -268,9 +278,7 @@ impl ErasureCodec {
         }
 
         let shard_size = data[0].len();
-        if shard_size > i32::MAX as usize {
-            return Err(EcError::ShardSizeTooLarge { size: shard_size });
-        }
+        check_shard_size(shard_size)?;
         for (i, s) in data.iter().enumerate().skip(1) {
             if s.len() != shard_size {
                 return Err(EcError::ShardSizeMismatch {
@@ -290,7 +298,10 @@ impl ErasureCodec {
             }
         }
 
-        let required = m * shard_size;
+        // saturating_mul: if m * shard_size overflows usize (only possible on
+        // 32-bit targets since shard_size <= i32::MAX was checked above), the
+        // saturated value exceeds any real allocation so ScratchTooSmall is returned.
+        let required = m.saturating_mul(shard_size);
         if scratch.len() < required {
             return Err(EcError::ScratchTooSmall { required, provided: scratch.len() });
         }
@@ -422,9 +433,7 @@ impl ErasureCodec {
 
         // ── Validate shard sizes ──────────────────────────────────────────
         let shard_size = present_data[0].len();
-        if shard_size > i32::MAX as usize {
-            return Err(EcError::ShardSizeTooLarge { size: shard_size });
-        }
+        check_shard_size(shard_size)?;
         for (i, s) in present_data.iter().enumerate().skip(1) {
             if s.len() != shard_size {
                 return Err(EcError::ShardSizeMismatch {
