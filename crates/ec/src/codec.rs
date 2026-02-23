@@ -325,10 +325,10 @@ impl ErasureCodec {
         // borrow-checker limitation of taking multiple &mut sub-slices at once.
         let mut tmp_parity_ptrs: [*mut u8; MAX_TOTAL_SHARDS] =
             [std::ptr::null_mut(); MAX_TOTAL_SHARDS];
-        for i in 0..m {
+        for (i, slot) in tmp_parity_ptrs.iter_mut().enumerate().take(m) {
             // Safety: each pointer points to a distinct, non-overlapping shard_size
             // region within `scratch`, which is valid for the duration of this scope.
-            tmp_parity_ptrs[i] = unsafe { scratch.as_mut_ptr().add(i * shard_size) };
+            *slot = unsafe { scratch.as_mut_ptr().add(i * shard_size) };
         }
 
         let mut data_ptrs: [*mut u8; MAX_TOTAL_SHARDS] = [std::ptr::null_mut(); MAX_TOTAL_SHARDS];

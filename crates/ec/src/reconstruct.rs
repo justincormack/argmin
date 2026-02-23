@@ -45,6 +45,7 @@ fn gf_add(a: u8, b: u8) -> u8 {
     a ^ b
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn reconstruct_shards(
     k: usize,
     _m: usize,
