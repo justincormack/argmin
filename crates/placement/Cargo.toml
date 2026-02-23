@@ -1,0 +1,13 @@
+[package]
+name = "placement"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rapidhash = "4"
+smallvec = { version = "1", features = ["union"] }
+libm = "0.2"
+thiserror = "2"
+
+[dev-dependencies]
+proptest = "1"
