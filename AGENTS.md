@@ -5,6 +5,8 @@
 The notes/ path has rough design notes and is not part of this repo. It also contains some useful papers. Do
 not edit anything here.
 
+The guides/ folder has guides about specific technical or otehr issues and coding guidelines.
+
 ## Dependencies
 
 We are trying to not have too many dependencies and to keep code simple and understandable. Ask before adding
