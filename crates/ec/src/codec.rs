@@ -151,8 +151,13 @@ impl ErasureCodec {
     /// let mut scratch = vec![0u8; codec.verify_scratch_size(shard_size)];
     /// codec.verify(&data, &parity, &mut scratch)?;
     /// ```
+    ///
+    /// `shard_size` must satisfy the same `<= i32::MAX` constraint as `verify`.
+    /// If the product `m * shard_size` would overflow `usize`, this returns
+    /// `usize::MAX`; the subsequent `verify` call will return `ScratchTooSmall`
+    /// since no real allocation can satisfy that requirement.
     pub fn verify_scratch_size(&self, shard_size: usize) -> usize {
-        self.config.parity_shards as usize * shard_size
+        (self.config.parity_shards as usize).saturating_mul(shard_size)
     }
 
 // ── Hot path ──────────────────────────────────────────────────────────────
@@ -161,6 +166,10 @@ impl ErasureCodec {
     ///
     /// `data`:   exactly k slices, all of equal length (`shard_size`; may be 0).
     /// `parity`: exactly m mutable slices, each of length `shard_size`.
+    ///
+    /// **No aliasing**: `data` and `parity` buffers must not overlap. ISA-L reads
+    /// from `data` and writes to `parity` concurrently; aliased buffers produce
+    /// undefined results.
     ///
     /// ZONE_HOT: no heap allocation.
     pub fn encode(&self, data: &[&[u8]], parity: &mut [&mut [u8]]) -> Result<(), EcError> {
@@ -236,6 +245,10 @@ impl ErasureCodec {
     /// `scratch` must be at least `m * shard_size` bytes. The caller allocates
     /// this once and reuses it across many verify calls (e.g. a scrub pass).
     /// Returns `Err(EcError::ScratchTooSmall)` if `scratch` is undersized.
+    ///
+    /// **No aliasing**: `data`, `parity`, and `scratch` buffers must not overlap.
+    /// ISA-L reads from `data` and writes to `scratch`; aliased buffers produce
+    /// undefined results.
     ///
     /// ZONE_HOT: no heap allocation.
     pub fn verify(
@@ -336,6 +349,10 @@ impl ErasureCodec {
     /// If `present_indices.len() > k`, only the first `k` entries are used for the
     /// matrix inversion; the remaining entries are ignored. Callers may pass all
     /// available shards without trimming — the codec selects the first `k`.
+    ///
+    /// **No aliasing**: `present_data` and `outputs` buffers must not overlap. ISA-L
+    /// reads from `present_data` and writes to `outputs`; aliased buffers produce
+    /// undefined results.
     ///
     /// ZONE_HOT: no heap allocation. All scratch (matrices, GF tables, pointer arrays)
     /// is stack-allocated and bounded by MAX_TOTAL_SHARDS.
