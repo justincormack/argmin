@@ -47,8 +47,24 @@ This is weighted HRW (Mitzenmacher & Upfal formulation). Weight proportional ass
 follows from the exponential clock argument: a node with weight w receives a fraction
 w / sum(w) of all placements in expectation.
 
-**Constraint enforcement** is pluggable. The algorithm calls the constraint function
-once per candidate node per `place()` invocation. See `PlacementConstraint` below.
+**Floating-point determinism.** `f64::ln()` calls the platform's libm, whose results
+are not required to be correctly rounded by IEEE 754. Results can differ across glibc
+versions, musl, macOS libm, and between x86-64 and ARM64 — meaning two cluster nodes
+could compute different placements for the same key if they run different hardware or
+libc versions.
+
+To support mixed ARM64/AMD64 and heterogeneous deployments, we use `libm::log` from the
+`libm` crate (rust-lang/libm), which is a pure-Rust port of the musl math library.
+It gives bit-identical results on all IEEE 754-compliant platforms by construction,
+since it never calls the platform libc. This is a one-line change at the call site and
+adds one dependency.
+
+**Tie-breaking.** If two nodes have exactly equal scores (probability ~2^-64 per pair),
+the tie is broken by scan order. Because `ClusterMap` stores nodes sorted by `NodeId`
+at construction time, lower `NodeId` wins on a tie. This is deterministic.
+
+**Constraint enforcement** is pluggable but subject to a correctness contract. See
+`PlacementConstraint` below.
 
 ### Hash function: rapidhash
 
@@ -67,9 +83,9 @@ position in the physical hierarchy. This is not a hardcoded `rack: RackId` field
 is a `TopologyKey` that can represent any depth of hierarchy:
 
 ```
-(Zone, 1), (Rack, 3)
-(Zone, 1), (Rack, 3), (Machine, 7)
-(Datacenter, 2), (Zone, 1), (Rack, 3), (Machine, 7), (Disk, 0)
+(Rack, 3)
+(Rack, 3), (Machine, 7)
+(Zone, 1), (Rack, 3), (Machine, 7), (Disk, 0)
 ```
 
 The placement constraint operates on `TopologyKey` by extracting whichever `Level`
@@ -95,8 +111,7 @@ Following `guides/rust_memory_policy_strict.md`:
 - **ZONE_HOT** (`Placer::place`): **zero heap allocation**. Two stack-allocated arrays
   bounded by `total_shards` (≤ 32): a candidate buffer (~768 bytes) and a group-count
   table (~256 bytes). `TopologyKey` is inline (SmallVec inline storage) for paths ≤ 4
-  levels, so comparing and reading `TopologyKey` in the hot path does not allocate.
-  The `admit` closure must not allocate.
+  levels. The `admit` closure must not allocate.
 
 ### What is NOT in this API
 
@@ -127,6 +142,8 @@ Single crate: `placement`. No sub-crates needed (pure safe Rust, no FFI).
 **Dependencies added by this step:**
 - `rapidhash` — hash function
 - `smallvec` — inline storage for `TopologyKey` segments
+- `libm` — pure-Rust port of musl math; used for `libm::log` to give bit-identical
+  results across x86-64, ARM64, and any other IEEE 754 platform
 - `thiserror` — already in workspace (used by `ec` crate)
 
 ---
@@ -137,8 +154,7 @@ Single crate: `placement`. No sub-crates needed (pure safe Rust, no FFI).
 
 ```rust
 /// Opaque identifier for a storage node (one disk = one node).
-/// Assigned by the caller at ClusterMap construction time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId(u32);
 
 impl NodeId {
@@ -147,7 +163,7 @@ impl NodeId {
 }
 ```
 
-`RackId` is not a separate type. Rack identity is expressed as `(Level::Rack, u32)`
+`RackId` is not a separate type. Rack identity is expressed as `(Level::RACK, u32)`
 inside a `TopologyKey`.
 
 ---
@@ -155,21 +171,20 @@ inside a `TopologyKey`.
 ### `Level`
 
 ```rust
-/// A topology level tag — identifies which axis of the physical hierarchy a segment
-/// refers to (rack, machine, zone, etc.).
+/// A topology level tag — identifies which axis of the hierarchy a segment refers to.
 ///
-/// Implemented as a newtype over u8 rather than an enum so that callers can define
-/// their own levels without modifying this crate:
+/// Implemented as a newtype over u8 rather than an enum, so callers can define their
+/// own levels without changing this crate:
 ///
 ///   const DATACENTER: Level = Level(8);   // coarser than Zone
 ///   const ROW:        Level = Level(24);  // between Zone and Rack
 ///   const PDU:        Level = Level(40);  // between Rack and Machine
 ///
-/// The built-in constants are spaced at multiples of 16, leaving room for callers
-/// to insert before, after, or between them without colliding.
+/// Built-in constants are spaced at multiples of 16, leaving 15 values between each
+/// pair for caller-defined levels.
 ///
-/// Ord is derived on the inner u8, so broader levels (lower values) sort before
-/// narrower levels (higher values) — consistent with TopologyKey segment ordering.
+/// Ord on the inner u8 means broader levels (lower values) sort before narrower ones,
+/// consistent with TopologyKey segment ordering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Level(pub u8);
 
@@ -188,44 +203,43 @@ impl Level {
 ```rust
 /// The physical location of a node, as an ordered list of (Level, id) segments.
 ///
-/// Ordered from broadest to most specific (e.g. Zone → Rack → Machine → Disk).
+/// Segments must be ordered from broadest to most specific and must not repeat a
+/// Level. `TopologyKey::new` enforces this: it sorts by Level and returns
+/// Err(DuplicateLevel) if any Level appears more than once.
+///
 /// Inline storage for up to 4 segments; no heap allocation for the common case.
-///
-/// # Examples
-///
-/// Single-level (rack-only cluster):
-///   TopologyKey::new(&[(Level::Rack, 3)])
-///
-/// Two-level (rack + machine):
-///   TopologyKey::rack_machine(3, 7)
-///
-/// Three-level (zone + rack + machine):
-///   TopologyKey::new(&[(Level::Zone, 1), (Level::Rack, 3), (Level::Machine, 7)])
 pub struct TopologyKey(SmallVec<[(Level, u32); 4]>);
 
 impl TopologyKey {
-    /// Construct from a slice of (level, id) segments.
-    pub fn new(segments: &[(Level, u32)]) -> Self;
+    /// Construct from a slice of (Level, id) segments.
+    ///
+    /// Segments are sorted by Level automatically.
+    /// Returns Err(DuplicateLevel) if any Level appears more than once.
+    pub fn new(segments: &[(Level, u32)]) -> Result<Self, TopologyError>;
 
-    /// Convenience: a single rack segment.
+    /// Convenience: single RACK segment.
     pub fn rack(rack: u32) -> Self;
 
-    /// Convenience: rack + machine segments (the common two-level case).
+    /// Convenience: RACK + MACHINE segments (common two-level case).
     pub fn rack_machine(rack: u32, machine: u32) -> Self;
 
-    /// Read-only view of the segments.
+    /// Read-only view of the segments, in Level order.
     pub fn segments(&self) -> &[(Level, u32)];
 
     /// Return the value for a given level, if present.
-    /// Returns None if this key has no segment with the given Level.
     pub fn level(&self, kind: Level) -> Option<u32>;
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum TopologyError {
+    #[error("level {0:?} appears more than once in TopologyKey")]
+    DuplicateLevel(Level),
 }
 ```
 
-`TopologyKey` implements `PartialEq`, `Eq`, `Hash`, `Clone`.
-
-Two nodes with the same `TopologyKey` share all failure domains — this is the degenerate
-case (both on the same machine and rack), which the constraint should penalise.
+`TopologyKey` implements `PartialEq`, `Eq`, `Hash`, `Clone`. Equality and hashing
+operate on the sorted segment slice, so two keys constructed from the same segments
+in different orders compare equal.
 
 ---
 
@@ -265,7 +279,8 @@ impl ClusterMap {
     /// - any weight is negative, NaN, or infinite
     /// - any NodeId is duplicated
     ///
-    /// Nodes are stored sorted by NodeId (canonical scan order for place()).
+    /// Nodes are stored sorted by NodeId (canonical scan order for place(),
+    /// and tie-breaking order for equal scores).
     ///
     /// ZONE_INIT: allocates.
     pub fn new(nodes: &[NodeInfo]) -> Result<Self, PlacementError>;
@@ -274,7 +289,6 @@ impl ClusterMap {
     pub fn active_node_count(&self) -> usize;
 
     /// Number of distinct values at a given topology level among active nodes.
-    /// E.g. distinct_count(Level::Rack) returns the number of unique rack IDs.
     pub fn distinct_count(&self, level: Level) -> usize;
 
     /// Sum of weights across all active nodes.
@@ -306,6 +320,26 @@ pub enum Admission {
 
 ### `PlacementConstraint`
 
+#### Correctness contract
+
+The greedy streaming selection algorithm is proven correct only for **partition matroid
+constraints**. A constraint is a valid partition matroid if and only if:
+
+- Every node has a fixed group, determined solely by `group_key(node)`.
+- Each group has a fixed capacity `max_per_group` that does not depend on the
+  composition or count of other groups in the current selection.
+- `admit(same_group_count, new_node)` returns `Global` when
+  `same_group_count < max_per_group`, and `Constrained` when
+  `same_group_count >= max_per_group`.
+
+The per-group cap may vary by group identity (e.g. different racks could have
+different caps), and it may depend on `new_node` itself (e.g. cap = EC parity count,
+captured by closure). It must not depend on the count or identity of other groups.
+
+If an `admit` function violates this contract (e.g. "admit only if total candidates
+< N/2"), the algorithm may return a suboptimal or inconsistent placement. No
+compile-time enforcement is possible; this is a documented caller responsibility.
+
 ```rust
 /// A pluggable placement constraint.
 ///
@@ -314,54 +348,55 @@ pub enum Admission {
 ///
 /// **`group_key`** — pure function of a node. Called once per node at `Placer::new`
 /// (ZONE_INIT) and stored alongside each node. In the hot path, same-group candidates
-/// are found by comparing stored u64 group keys — no re-evaluation of the constraint.
+/// are found by comparing stored u64 keys — no re-evaluation.
 ///
-/// **`admit`** — called once per candidate node during `place()` (ZONE_HOT). Given
-/// the current candidate selection and the proposed new node, returns the admission
-/// decision. Captures EC config (k, m) and policy parameters via closure.
-/// `Constrained` means: may only replace a candidate whose stored group key equals
-/// `group_key(new_node)`.
+/// **`admit`** — called once per candidate node during `place()` (ZONE_HOT).
+/// Arguments:
+///   - `same_group_count`: number of candidates currently in the buffer whose stored
+///     group_key matches group_key(new_node). Precomputed by the algorithm; no
+///     iteration over the candidate buffer is required.
+///   - `new_node`: the node being evaluated.
 ///
-/// **ZONE_HOT requirement**: `admit` must not allocate.
+/// Returns the admission decision. Must implement a partition matroid (see above).
+///
+/// **ZONE_HOT requirement**: `admit` must not allocate. It must not access the full
+/// candidate buffer — only `same_group_count` and `new_node` are provided.
 pub struct PlacementConstraint {
     pub group_key: Arc<dyn Fn(&NodeInfo) -> u64 + Send + Sync>,
-    pub admit: Arc<dyn Fn(&[NodeInfo], &NodeInfo) -> Admission + Send + Sync>,
+    pub admit: Arc<dyn Fn(usize, &NodeInfo) -> Admission + Send + Sync>,
 }
 
 impl PlacementConstraint {
     /// Cap on the number of shards sharing a given topology level value.
     ///
-    /// E.g. level_cap(Level::Rack, 2) → at most 2 shards per rack.
-    ///      level_cap(Level::Zone, 1) → at most 1 shard per zone.
+    /// Satisfies the partition matroid contract: group = level value, fixed cap.
     ///
-    /// Nodes that have no segment for `level` are treated as sharing a sentinel
-    /// group (they compete globally among themselves), not as members of any
-    /// capped group.
+    /// Nodes without a segment for `level` are treated as unconstrained (Global).
+    /// Their group_key sentinel (u64::MAX) keeps them isolated from real level values.
     pub fn level_cap(level: Level, max: usize) -> Self {
         PlacementConstraint {
             group_key: Arc::new(move |node| {
                 node.location.level(level)
                     .map(|v| v as u64)
-                    .unwrap_or(u64::MAX)   // sentinel: nodes without this level
+                    .unwrap_or(u64::MAX)
             }),
-            admit: Arc::new(move |candidates, new_node| {
-                match new_node.location.level(level) {
-                    None => Admission::Global,  // no segment for this level; unconstrained
-                    Some(my_val) => {
-                        let count = candidates.iter()
-                            .filter(|c| c.location.level(level) == Some(my_val))
-                            .count();
-                        if count < max { Admission::Global } else { Admission::Constrained }
-                    }
+            admit: Arc::new(move |same_group_count, new_node| {
+                if new_node.location.level(level).is_none() {
+                    return Admission::Global;  // node has no segment at this level
+                }
+                if same_group_count < max {
+                    Admission::Global
+                } else {
+                    Admission::Constrained
                 }
             }),
         }
     }
 
-    /// Convenience: rack cap. Equivalent to level_cap(Level::Rack, max).
-    /// The default for a (k, m) EC scheme is max = m (parity count).
+    /// Rack cap. Equivalent to level_cap(Level::RACK, max).
+    /// Default for a (k, m) EC scheme: max = m (parity count).
     pub fn rack_cap(max: usize) -> Self {
-        Self::level_cap(Level::Rack, max)
+        Self::level_cap(Level::RACK, max)
     }
 
     /// No constraint: all nodes compete globally.
@@ -374,25 +409,23 @@ impl PlacementConstraint {
 }
 ```
 
-Custom constraints have full access to the `TopologyKey` and can combine multiple
-levels, consult external metadata, or implement EC-role-aware logic:
+Custom constraints that satisfy the partition matroid contract:
 
 ```rust
-// Example: different caps for data shards vs parity shards, using candidates.len()
-// as a proxy for current shard index (0..k = data, k..k+m = parity).
-let k = ec_config.data_shards as usize;
+// EC-role-aware cap: stricter for data shards than parity shards.
+// Uses the group count via same_group_count; captures k via closure.
+// This is still a valid partition matroid: the cap is fixed per call
+// based on the node's identity (shard role isn't yet determined here —
+// this applies the same cap to all shards; EC-role differentiation
+// is a future extension requiring a more complex selection algorithm).
+let max_per_rack: usize = 2;
 PlacementConstraint {
     group_key: Arc::new(|node| {
-        node.location.level(Level::Rack).unwrap_or(u32::MAX) as u64
+        node.location.level(Level::RACK).unwrap_or(u32::MAX) as u64
     }),
-    admit: Arc::new(move |candidates, new_node| {
-        let shard_idx = candidates.len();          // next slot to fill
-        let max = if shard_idx < k { 1 } else { 2 }; // stricter for data shards
-        let my_rack = new_node.location.level(Level::Rack);
-        let count = candidates.iter()
-            .filter(|c| c.location.level(Level::Rack) == my_rack)
-            .count();
-        if count < max { Admission::Global } else { Admission::Constrained }
+    admit: Arc::new(move |same_group_count, _new_node| {
+        if same_group_count < max_per_rack { Admission::Global }
+        else { Admission::Constrained }
     }),
 }
 ```
@@ -484,8 +517,6 @@ pub enum PlacementError {
 }
 ```
 
-No topology-specific fields in errors — topology is the constraint's concern.
-
 ---
 
 ## Scoring and Selection Implementation Detail
@@ -498,10 +529,18 @@ For node i, given input key `K`:
 hash_input  = K ++ node_id.as_u32().to_le_bytes()   (concatenated)
 h: u64      = rapidhash(hash_input)
 U_i: f64    = ((h >> 11) + 1) as f64 / (1u64 << 53) as f64   // maps to (0, 1]
-score_i     = -f64::ln(U_i) / weight_i
+score_i     = -libm::log(U_i) / weight_i
 ```
 
 Nodes with `weight = 0.0` are skipped before scoring.
+
+**Tie-breaking.** Exact score ties are broken by scan order. Because `ClusterMap`
+stores nodes sorted by `NodeId`, a tie is broken in favour of the node with the
+lower `NodeId`. This is deterministic.
+
+**Floating-point note.** `libm::log` is used instead of `f64::ln()` to give
+bit-identical results across x86-64, ARM64, and all other IEEE 754 platforms.
+See the Background section and resolved decision 11.
 
 ### Streaming selection (O(total_shards) space)
 
@@ -509,31 +548,51 @@ Two stack-allocated arrays, both sized to `total_shards` (≤ 32):
 - `candidates: [(score: f64, node_id: NodeId, group_key: u64); 32]`
 - `group_counts: [(group_key: u64, count: u8); 32]`
 
+Both arrays track their own length (`cand_len` and `gc_len` respectively).
+`group_counts` is a flat association list, not a hash map. Lookup is a linear scan
+for a matching `group_key`; since `total_shards ≤ 32`, this is at most 32 comparisons.
+
+**Helpers used in the algorithm below:**
+
+- `gc_get(gk)`: scan `group_counts[0..gc_len]` for an entry with `group_key == gk`;
+  return its `count`, or 0 if not found.
+- `gc_inc(gk)`: find or insert `(gk, 0)` in `group_counts`, then increment `count`.
+- `gc_dec(gk)`: find the entry for `gk` and decrement `count`; remove if count
+  reaches 0 (shift remaining entries down).
+
 `group_key` per candidate is the precomputed value from `constraint.group_key`.
 
-For each node i in `ClusterMap` canonical order (sorted by `NodeId` at construction):
+For each node i in `ClusterMap` canonical order (sorted by `NodeId`):
 
 1. Compute `score_i`. Skip if `weight_i == 0.0`.
-2. Look up `gk_i = precomputed_group_key[i]`.
-3. Call `admission = constraint.admit(candidate_node_infos, &node_info_i)`.
-4. **`Excluded`** → skip.
-5. **`Global`**:
-   - If `candidates` not full: insert `(score_i, node_id_i, gk_i)`.
-   - Else: find `worst` = entry with highest score. If `score_i < worst.score`: evict
-     `worst` (decrement its group count), insert new entry.
-6. **`Constrained`**:
-   - Find `worst_in_group` = highest-score entry where `group_key == gk_i`.
-   - If `score_i < worst_in_group.score`: replace it (group count unchanged).
+2. `gk_i = precomputed_group_key[i]`.
+3. `gc = gc_get(gk_i)`.
+4. Call `admission = constraint.admit(gc, &node_info_i)`.
+5. **`Excluded`** → skip.
+6. **`Global`**:
+   - If `cand_len < total_shards`: append `(score_i, node_id_i, gk_i)` to candidates;
+     `gc_inc(gk_i)`.
+   - Else: find `worst` = entry in candidates with the highest score. If
+     `score_i < worst.score`: replace `worst` with `(score_i, node_id_i, gk_i)`;
+     `gc_dec(worst.group_key)`; `gc_inc(gk_i)`.
+7. **`Constrained`**:
+   - Find `worst_in_group` = entry in candidates with the highest score among those
+     where `group_key == gk_i`.
+   - If `score_i < worst_in_group.score`: replace `worst_in_group` with
+     `(score_i, node_id_i, gk_i)`. Group count for `gk_i` is unchanged (one
+     entry removed and one added for the same group).
    - Else: skip.
 
-After all nodes: if `candidates.len() < total_shards` → `ConstraintUnsatisfiable`.
+After all nodes: if `cand_len < total_shards` → `ConstraintUnsatisfiable`.
 Otherwise copy `candidates[i].node_id` into `out[i]`.
 
-**Correctness proof** (exchange argument): a node rejected via `Constrained` (score ≥
-worst in its group) is dominated within its group — any optimal selection containing
-it can swap it for a lower-score same-group node already in the buffer. A node rejected
-via `Global` (score ≥ global worst) is globally dominated. Both cases mean: no rejected
-node can appear in any optimal selection.
+**Correctness proof** (exchange argument, for partition matroid constraints):
+A node rejected via `Constrained` (score ≥ worst in its group) is dominated within
+its group — any optimal selection containing it can swap it for a lower-score
+same-group node already in the buffer. A node rejected via `Global` (score ≥ global
+worst) is globally dominated. Both cases mean no rejected node can appear in any
+optimal selection. Correctness holds only when `admit` satisfies the partition matroid
+contract documented in `PlacementConstraint`.
 
 ---
 
@@ -553,77 +612,84 @@ placement crate to the metadata layer prematurely.
 ### 3. Streaming selection, not sort-then-filter
 
 The hot path uses a candidate buffer of size `total_shards` (≤ 32) — O(total_shards)
-stack space regardless of cluster size. No `MAX_NODES` constant. The `ClusterMap` owns
-a `Vec<NodeInfo>` (ZONE_INIT); only `place()` (ZONE_HOT) is bounded-stack.
-O(N × total_shards) time: for N=1000 and total_shards=16, 16,000 iterations.
+stack space regardless of cluster size. No `MAX_NODES` constant. O(N × total_shards)
+time: for N=1000 and total_shards=16, 16,000 iterations.
 
 ### 4. TopologyKey instead of RackId
 
-`NodeInfo` does not have a `rack: RackId` field. Topology is a `TopologyKey`: an
-ordered list of `(Level, u32)` segments. This means:
+`NodeInfo` has `location: TopologyKey` instead of `rack: RackId`. New topology axes
+require no struct changes. `Level::RACK` is not privileged.
 
-- New topology axes (zone, machine, power domain, etc.) require no struct changes.
-- The constraint operates on whichever levels it cares about.
-- `Level::RACK` is not privileged; it is just a named constant.
-
-`SmallVec<[(Level, u32); 4]>` gives inline storage for paths up to 4 levels (which
-covers every realistic hierarchy: zone → rack → machine → disk). No heap allocation
-for the common case.
+`SmallVec<[(Level, u32); 4]>` gives inline storage for ≤4 levels (zone → rack →
+machine → disk). No heap allocation for the common case.
 
 ### 5. Level is a newtype, not an enum
 
-`Level` is `struct Level(pub u8)` with associated constants, not an enum. This is
-the key that makes spacing meaningful: downstream callers can define their own
-`const MY_LEVEL: Level = Level(24)` and use it with `level_cap` or constraint
-closures without any changes to this crate.
+`Level` is `struct Level(pub u8)`. Callers define their own levels with
+`const MY_LEVEL: Level = Level(24)`. Built-in constants are spaced at multiples of
+16, leaving room to insert levels at any point in the hierarchy.
 
-The built-in constants are spaced at multiples of 16 (Zone=16, Rack=32, Machine=48,
-Disk=64), leaving 15 values between each pair for caller-defined levels. An enum
-would not allow this — `#[non_exhaustive]` only prevents exhaustive matching;
-it does not let callers add variants. A newtype gives real extensibility.
+An `enum` would not allow this — `#[non_exhaustive]` only prevents exhaustive
+matching; it does not let callers add variants. A newtype gives real extensibility.
 
-### 6. Pluggable constraint: two-function design
+### 6. TopologyKey sorts and validates at construction
 
-`group_key(node) -> u64` is a pure function of a node, precomputed once at
-`Placer::new` (ZONE_INIT). This allows ZONE_HOT to find same-group candidates by
-integer comparison without re-evaluating the constraint.
+`TopologyKey::new` sorts segments by `Level` automatically and returns
+`Err(DuplicateLevel)` if any level appears more than once. This keeps the invariant
+(ordered, unique levels) enforced at the boundary rather than relying on callers.
 
-`admit(candidates, new_node) -> Admission` is called in ZONE_HOT. It has full
-visibility into the current candidate selection and captures EC config and policy
-parameters via closure.
+The convenience constructors (`rack`, `rack_machine`) are infallible because their
+segments are statically known to be valid.
 
-`PlacementConfig` has no topology fields. All topology policy is in the constraint.
+### 7. Constraint contract: partition matroids only
 
-### 7. level_cap is the primitive; rack_cap is a convenience alias
+The greedy streaming algorithm is proven correct only for partition matroid
+constraints (fixed group per node, fixed per-group cap). This is documented
+explicitly as a caller contract on `PlacementConstraint`. Arbitrary `admit` logic
+can produce suboptimal or inconsistent results.
+
+The `admit` signature takes `(same_group_count: usize, new_node: &NodeInfo)` rather
+than the full candidate slice. This enforces the partition matroid contract
+structurally (the function cannot depend on the composition of other groups) and
+eliminates any risk of allocation or `Vec` construction in the hot path.
+
+### 8. level_cap is the primitive; rack_cap is a convenience alias
 
 `level_cap(level, max)` is the general form. `rack_cap(max)` is
-`level_cap(Level::Rack, max)`. The default for a (k, m) EC scheme is
-`rack_cap(m)`.
+`level_cap(Level::RACK, max)`. Default for (k, m) EC: `rack_cap(m)`.
 
-### 8. Nodes without a given level segment
+### 9. Nodes without a given level segment
 
 If a node's `TopologyKey` has no segment for the constrained `Level`, `level_cap`
-treats it as `Admission::Global` (unconstrained). This is a safe fallback: such nodes
-were not given topology information for that axis and should not be excluded. The
-`group_key` sentinel (`u64::MAX`) ensures they form their own group and don't
-collide with real level values.
+returns `Global` (unconstrained). `group_key` returns `u64::MAX` as a sentinel,
+keeping such nodes in their own isolated group.
 
-### 9. `place()` takes `&self`
+### 10. `place()` takes `&self`
 
-All mutable state is stack-local. The `Placer` is safe to share across concurrent
-request-handling threads without locking.
+All mutable state is stack-local. Safe to share across concurrent threads without
+locking.
 
-### 10. Floating-point determinism
+### 11. Cross-platform floating-point determinism via libm crate
 
-`f64::ln` is correctly rounded per IEEE 754 on all supported targets. Only
-same-machine consistency is required; cross-architecture bit-identical results are
-not needed.
+`f64::ln()` calls the platform libc's `log()`, which is not required to be correctly
+rounded by IEEE 754. Results can differ between glibc and musl, between glibc versions,
+and between x86-64 and ARM64. A cluster running mixed hardware or a rolling OS upgrade
+could compute inconsistent placements if two nodes disagree on a score.
 
-### 11. Error on unsatisfiable constraint
+We use `libm::log` from the `libm` crate (rust-lang/libm). This is a pure-Rust port of
+the musl `log` implementation. Because it contains no platform calls and operates
+entirely on IEEE 754 bit patterns, it gives bit-identical results on every conforming
+platform. The change at the call site is trivial: replace `x.ln()` with `libm::log(x)` (C
+convention: `log` = natural logarithm).
 
-Return `Err(ConstraintUnsatisfiable { shards, filled })`. The caller handles the
-fallback (e.g. retry with `PlacementConstraint::none()`). No topology specifics in
-the error.
+This supports mixed ARM64/AMD64 deployments, heterogeneous libc versions, and partial
+OS upgrades without any operational constraints on homogeneity.
+
+### 12. Tie-breaking: lower NodeId wins
+
+`ClusterMap` sorts nodes by `NodeId` at construction. On an exact score tie, the
+node encountered first in the scan wins, which is the node with the lower `NodeId`.
+This is fully deterministic.
 
 ---
 
@@ -644,11 +710,15 @@ the error.
 
 ### 2. TopologyKey construction and accessors
 
-- `rack(3).level(Level::Rack)` → `Some(3)`
-- `rack(3).level(Level::Zone)` → `None`
-- `rack_machine(3, 7).level(Level::Machine)` → `Some(7)`
-- `rack_machine(3, 7).segments()` → `&[(Rack, 3), (Machine, 7)]`
-- `TopologyKey::new(&[])` → empty key; `level(Level::Rack)` → `None`
+- `rack(3).level(Level::RACK)` → `Some(3)`
+- `rack(3).level(Level::ZONE)` → `None`
+- `rack_machine(3, 7).level(Level::MACHINE)` → `Some(7)`
+- `rack_machine(3, 7).segments()` → `&[(RACK, 3), (MACHINE, 7)]` (sorted)
+- Segments provided out of order are sorted automatically.
+- Duplicate level → `Err(DuplicateLevel)`.
+- `TopologyKey::new(&[])` → Ok; `level(Level::RACK)` → `None`.
+- Custom caller-defined level: `const MY_LEVEL: Level = Level(24);`
+  `TopologyKey::new(&[(MY_LEVEL, 5)])?.level(MY_LEVEL)` → `Some(5)`.
 
 ### 3. Output length mismatch
 
@@ -658,7 +728,7 @@ the error.
 ### 4. Determinism
 
 Same cluster + constraint + key → same output every call:
-- Call `place` 100 times; assert all results equal.
+- Call `place` 100 times; assert all results identical.
 - Two `Placer`s from identical inputs; assert outputs match.
 - Modified key → different output (hash sensitivity).
 
@@ -669,10 +739,10 @@ Include `total_shards = active_node_count` to stress this.
 
 ### 6. rack_cap / level_cap constraint respected
 
-- `level_cap(Level::Rack, 2)`: count shards per rack-id; assert each ≤ 2.
-- `level_cap(Level::Zone, 1)`: at most 1 shard per zone value.
-- `level_cap(Level::Machine, 1)` with `TopologyKey::rack_machine(r, m)`:
-  no two shards on the same machine, regardless of rack.
+- `level_cap(Level::RACK, 2)`: count shards per rack-id; assert each ≤ 2.
+- `level_cap(Level::ZONE, 1)`: at most 1 shard per zone value.
+- `level_cap(Level::MACHINE, 1)` with `rack_machine(r, m)`:
+  no two shards on the same machine.
 
 ### 7. ConstraintUnsatisfiable
 
@@ -681,73 +751,80 @@ Include `total_shards = active_node_count` to stress this.
 | 1 rack, total_shards=6, rack_cap(2) | `ConstraintUnsatisfiable` |
 | 3 racks × 2 nodes, total_shards=6, rack_cap(2) | Ok |
 | All nodes weight 0.0 | `TooFewNodes` |
-| level_cap(Zone, 1) with 2 zones, total_shards=3 | `ConstraintUnsatisfiable` |
+| level_cap(ZONE, 1) with 2 zones, total_shards=3 | `ConstraintUnsatisfiable` |
 
 ### 8. Nodes without the constrained level
 
-- Cluster has nodes with and without `Level::Zone`.
-- `level_cap(Level::Zone, 1)`: nodes lacking Zone are treated as unconstrained
-  (returned `Global`); they do not block nodes that do have Zone segments.
+- Mixed cluster: some nodes have `Level::ZONE`, some don't.
+- `level_cap(Level::ZONE, 1)`: nodes lacking ZONE get `Global`; they don't block
+  capped placement of nodes that do have ZONE.
 
 ### 9. PlacementConstraint::none()
 
-- All nodes compete globally; `total_shards = node_count` fills all nodes.
-- No duplicates.
+- All nodes compete globally. No duplicates.
+- `total_shards = node_count` fills all nodes.
 
-### 10. Custom constraint via closure
+### 10. Custom constraint (partition matroid)
 
-Supply a closure implementing an AZ cap via a NodeId → AZ HashMap. Assert the output
-respects the AZ cap. Validates the pluggable path works identically to the built-in.
+Supply a closure implementing a machine cap via same_group_count. Assert output
+respects the cap. Validates the pluggable path.
 
-### 11. Even distribution (statistical)
+### 11. Constraint contract violation (documented, not enforced)
+
+Deliberately provide an `admit` function that violates the partition matroid contract
+(e.g., returns `Global` based on total candidate count, not just same-group count).
+Document in the test that results may be suboptimal; assert only that the output is
+valid (no duplicates, correct length). This is a negative test confirming the
+documented limitation, not a correctness assertion.
+
+### 12. Even distribution (statistical)
 
 12 nodes across 3 racks (4 nodes each, equal weights), `total_shards=6`,
-`rack_cap(2)`. Place 10,000 random keys. Each node should receive
+`rack_cap(2)`. Place 10,000 random keys. Each node receives
 `10000 * 6 / 12 = 5000` assignments ± 20%.
 
-### 12. Weighted distribution (statistical)
+### 13. Weighted distribution (statistical)
 
-One node with weight 2.0, four nodes with weight 1.0, `none()`, `total_shards=3`.
-Place 10,000 keys. Heavy node receives ≈2× as many assignments as each light node
-(± 20%).
+One node weight 2.0, four nodes weight 1.0, `none()`, `total_shards=3`.
+Place 10,000 keys. Heavy node receives ≈2× assignments as each light node (± 20%).
 
-### 13. Minimal movement on node removal
+### 14. Minimal movement on node removal
 
 - Place 10,000 keys on N=12 nodes.
 - Remove one node (weight 0.0 in new ClusterMap).
-- Re-place all keys. Assert fraction of changed assignments ≤ 1/(N-1) + 0.05.
+- Re-place. Assert changed fraction ≤ 1/(N-1) + 0.05.
 
-### 14. Node addition — monotonicity
+### 15. Node addition — monotonicity
 
-- Add a node to a cluster; re-place 10,000 keys.
-- Assert changed assignments moved TO the new node only. No existing pair swapped.
+- Add a node; re-place 10,000 keys.
+- Assert changed assignments moved TO the new node only.
 
-### 15. distinct_count
+### 16. Tie-breaking is deterministic
 
-- Cluster with 12 nodes, 3 racks of 4: `distinct_count(Level::Rack)` = 3.
-- Cluster with rack_machine topology: `distinct_count(Level::Machine)` = count of
-  unique (machine) values across active nodes.
-- Nodes lacking the queried level are not counted.
+- Construct two nodes with identical scores for a given key (requires crafting
+  node IDs such that `hash(key || id_a) == hash(key || id_b)`, which is
+  impractical directly — instead, mock the scoring function in a unit test to
+  inject equal scores).
+- Assert the node with the lower NodeId is selected consistently.
 
-### 16. Large cluster (no footgun)
+### 17. distinct_count
 
-- 1000 nodes across 100 racks (10 nodes/rack), `total_shards=8`, `rack_cap(2)`.
-- Place 1000 random keys. Assert success, no duplicates, rack cap respected.
+- 12 nodes, 3 racks: `distinct_count(Level::RACK)` = 3.
+- Nodes without RACK segment: not counted in RACK distinct_count.
+
+### 18. Large cluster (no footgun)
+
+- 1000 nodes, 100 racks, `total_shards=8`, `rack_cap(2)`.
+- Place 1000 keys. Assert success, no duplicates, cap respected.
 - Assert zero heap allocations in `place()`.
 
-### 17. TopologyKey inline storage (no heap)
-
-- Construct `TopologyKey::new(&[(Zone,1),(Rack,2),(Machine,3),(Disk,0)])` (4 segments).
-- Verify SmallVec inline path (no heap allocation during construction).
-- 5-segment key spills to heap — this is expected and documented.
-
-### 18. Hot path allocation (ZONE_HOT compliance)
+### 19. Hot path allocation (ZONE_HOT compliance)
 
 Thread-local counting allocator (same pattern as EC crate):
 - `place()` on a pre-built `Placer`: **zero heap allocations**.
 - Verified for `rack_cap`, `level_cap`, and a custom closure constraint.
 
-### 19. Property-based tests (proptest)
+### 20. Property-based tests (proptest)
 
 ```
 forall (
@@ -757,7 +834,6 @@ forall (
     key: Vec<u8>
 ):
     cluster = build_cluster(node_count, rack_count, equal_weights)
-              // each node gets TopologyKey::rack(rack_id)
     max_per_rack = ceil(total_shards / rack_count)
     placer = Placer::new(
         PlacementConfig::new(total_shards)?,
@@ -771,12 +847,12 @@ forall (
     prop_assert!(rack counts all <= max_per_rack)
 ```
 
-### 20. Fuzz targets (deferred)
+### 21. Fuzz targets (deferred)
 
 `fuzz_place`: arbitrary (cluster bytes, key bytes, config, constraint params) —
-must not panic. Register as `cargo-fuzz` target when proptest suite is stable.
+must not panic.
 
-### 21. Benchmarks (deferred)
+### 22. Benchmarks (deferred)
 
 | Cluster | total_shards | Constraint |
 |---|---|---|
