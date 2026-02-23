@@ -1,0 +1,14 @@
+# OS ignores
+.DS_Store
+Thumbs.db
+# editors etc
+*.swp
+.vscode/
+# ignore tmp and build directories
+tmp/
+/target/
+# environments
+.direnv/
+.env
+# Obsidian notes checkout
+/notes/
