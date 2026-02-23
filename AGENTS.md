@@ -5,7 +5,10 @@
 The notes/ path has rough design notes and is not part of this repo. It also contains some useful papers. Do
 not edit anything here.
 
-The guides/ folder has guides about specific technical or otehr issues and coding guidelines.
+The guides/ folder has guides about specific technical or other issues and coding guidelines.
+
+The plans/ folder is for work plans. Remember to adjust these if during implementation things change and the
+plan detail needs correcting.
 
 ## Dependencies
 
