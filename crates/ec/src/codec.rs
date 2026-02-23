@@ -104,6 +104,9 @@ pub enum EcError {
 
     #[error("internal: matrix inversion failed (singular matrix)")]
     SingularMatrix,
+
+    #[error("runtime smoke test failed: {reason}")]
+    SmokeTestFailed { reason: String },
 }
 
 /// Pre-computed erasure coding context. Build once; reuse across encode/reconstruct calls.
@@ -483,4 +486,72 @@ impl ErasureCodec {
             shard_size,
         )
     }
+}
+
+/// Runtime smoke test for erasure coding.
+///
+/// This is intended to be called at process startup on the target machine to
+/// exercise the CPU-specific ISA-L paths (e.g. AVX512) that may not be
+/// exercised on the build host.
+pub fn self_test() -> Result<(), EcError> {
+    let config = EcConfig::new(4, 2)?;
+    let codec = ErasureCodec::new(config)?;
+    let k = config.data_shards as usize;
+    let m = config.parity_shards as usize;
+    let shard_size = 256usize;
+
+    let data: Vec<Vec<u8>> = (0..k)
+        .map(|i| {
+            (0..shard_size)
+                .map(|j| ((i * 37 + j * 13 + 7) & 0xFF) as u8)
+                .collect()
+        })
+        .collect();
+
+    let mut parity: Vec<Vec<u8>> = (0..m).map(|_| vec![0u8; shard_size]).collect();
+    let data_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+    let mut parity_refs: Vec<&mut [u8]> = parity.iter_mut().map(|v| v.as_mut_slice()).collect();
+    codec.encode(&data_refs, &mut parity_refs)?;
+
+    let mut scratch = vec![0u8; codec.verify_scratch_size(shard_size)];
+    match codec.verify(&data_refs, &parity.iter().map(|v| v.as_slice()).collect::<Vec<_>>(), &mut scratch)? {
+        VerifyResult::Ok => {}
+        VerifyResult::Mismatch(idx) => {
+            return Err(EcError::SmokeTestFailed {
+                reason: format!("verify mismatch at shard index {}", idx),
+            });
+        }
+    }
+
+    let present_indices: Vec<usize> = vec![0, 2, 3, k]; // includes parity shard 0 at index k
+    let present_data: Vec<&[u8]> = vec![
+        data[0].as_slice(),
+        data[2].as_slice(),
+        data[3].as_slice(),
+        parity[0].as_slice(),
+    ];
+    let recover_indices: Vec<usize> = vec![1, k + 1];
+    let mut recovered_data = vec![vec![0u8; shard_size]; recover_indices.len()];
+    let mut recovered_refs: Vec<&mut [u8]> =
+        recovered_data.iter_mut().map(|v| v.as_mut_slice()).collect();
+
+    codec.reconstruct(
+        &present_indices,
+        &present_data,
+        &recover_indices,
+        &mut recovered_refs,
+    )?;
+
+    if recovered_data[0] != data[1] {
+        return Err(EcError::SmokeTestFailed {
+            reason: "reconstruction mismatch for missing data shard".to_string(),
+        });
+    }
+    if recovered_data[1] != parity[1] {
+        return Err(EcError::SmokeTestFailed {
+            reason: "reconstruction mismatch for missing parity shard".to_string(),
+        });
+    }
+
+    Ok(())
 }

@@ -1,5 +1,6 @@
 use crate::{EcConfig, EcError, ErasureCodec, VerifyResult, MAX_TOTAL_SHARDS};
 use crate::codec::check_shard_size;
+use crate::self_test;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -76,6 +77,11 @@ fn encode_deterministic() {
     let p1 = encode(&codec, &data);
     let p2 = encode(&codec, &data);
     assert_eq!(p1, p2);
+}
+
+#[test]
+fn runtime_smoke_test_ok() {
+    self_test().unwrap();
 }
 
 #[test]
