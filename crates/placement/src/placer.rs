@@ -79,6 +79,13 @@ impl Placer {
     /// `out`:  caller-allocated; length must equal config.total_shards.
     ///         On success, out[i] is the NodeId for shard i.
     ///
+    /// **Output ordering**: the mapping of nodes to shard indices is determined
+    /// by the internal candidate buffer's insertion/replacement order during the
+    /// NodeId-ordered scan. It is NOT sorted by score or NodeId. The mapping is
+    /// fully deterministic for the same key and cluster, but callers should treat
+    /// shard index as opaque — the semantic meaning of each index is defined by
+    /// the layer above (e.g. the EC engine's data/parity layout).
+    ///
     /// Returns Err(ConstraintUnsatisfiable) if the constraint prevents filling all
     /// slots. Returns Err(OutputLengthMismatch) if out.len() != total_shards.
     ///
@@ -97,7 +104,9 @@ impl Placer {
         let mut cands = [EMPTY_CAND; MAX_SHARDS];
         let mut cand_len: usize = 0;
 
-        // Group-count association list: [(group_key, count)]; only 0..gc_len are valid.
+        // Group-count association list: flat array of (group_key, count) pairs;
+        // only indices 0..gc_len are valid. Lookups (gc_get/gc_inc/gc_dec) are
+        // O(gc_len) linear scans — at most total_shards (≤ 32) comparisons each.
         // Invariant: gc_len <= cand_len (one entry per distinct group in cands).
         let mut gc = [(0u64, 0u8); MAX_SHARDS];
         let mut gc_len: usize = 0;

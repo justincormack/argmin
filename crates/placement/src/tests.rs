@@ -371,27 +371,50 @@ fn custom_partition_matroid_constraint() {
 
 #[test]
 fn contract_violation_output_is_valid() {
-    // Deliberately violate the partition matroid contract: admit returns Global
-    // based on total candidate count (not just same-group count).
-    // We only assert output validity (no duplicates, correct length), not optimality.
+    // Deliberately violate the partition matroid contract: the admit closure
+    // uses shared mutable state (a global call counter) instead of deriving
+    // its decision purely from same_group_count and a fixed per-group cap.
+    // The effective cap for any given group varies depending on how many other
+    // groups have already been processed — not a partition matroid.
+    //
+    // Per the documented contract, the algorithm gives no optimality or
+    // consistency guarantees here. We assert only that the output is
+    // structurally valid (no duplicates, correct length) if place() succeeds,
+    // or that ConstraintUnsatisfiable is returned.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let call_count = std::sync::Arc::new(AtomicUsize::new(0));
+    let cc = call_count.clone();
     let map = build_cluster(12, 3, 1.0);
     let bad_constraint = PlacementConstraint {
         group_key: std::sync::Arc::new(|node| {
             node.location.level(Level::RACK).unwrap_or(0) as u64
         }),
-        admit: std::sync::Arc::new(|_same_group, _node| {
-            // Unconditionally Global — not a partition matroid for rack capping
-            Admission::Global
+        // VIOLATION: returns Global for the first 6 admit() calls regardless of
+        // which group is being evaluated, and Constrained for all subsequent calls.
+        // The per-group cap is not fixed — it depends on how many other groups
+        // were evaluated first, which the algorithm's correctness proof cannot handle.
+        admit: std::sync::Arc::new(move |_same_group, _node| {
+            let n = cc.fetch_add(1, Ordering::Relaxed);
+            if n < 6 { Admission::Global } else { Admission::Constrained }
         }),
     };
     let placer =
         Placer::new(PlacementConfig::new(6).unwrap(), &map, bad_constraint).unwrap();
 
-    let out = place_once(&placer, b"key");
-    assert_eq!(out.len(), 6);
-    let mut seen = std::collections::BTreeSet::new();
-    for &nid in &out {
-        assert!(seen.insert(nid), "duplicate node in output from bad constraint");
+    let mut out = vec![NodeId::new(0); 6];
+    match placer.place(b"key", &mut out) {
+        Ok(()) => {
+            // If it succeeds, output must be structurally valid.
+            let mut seen = std::collections::BTreeSet::new();
+            for &nid in &out {
+                assert!(seen.insert(nid), "duplicate node in output from bad constraint");
+            }
+        }
+        Err(PlacementError::ConstraintUnsatisfiable { .. }) => {
+            // Also acceptable: contract violation may prevent filling all slots.
+        }
+        Err(e) => panic!("unexpected error from bad constraint: {e:?}"),
     }
 }
 
