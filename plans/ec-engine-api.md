@@ -161,6 +161,27 @@ impl ErasureCodec {
 
 ---
 
+### `self_test`
+
+```rust
+/// Runtime smoke test for erasure coding.
+///
+/// Intended to be called once at process startup on the target machine to
+/// exercise the CPU-specific ISA-L paths (e.g. AVX-512) that may differ from
+/// the build host. Allocates internally; do not call on the hot path.
+pub fn self_test() -> Result<(), EcError>;
+```
+
+Exercises a full encode → verify → reconstruct round-trip using a (4,2) codec and
+non-trivial data, with a `shard_size` of 256 bytes (a multiple of 64, ensuring
+AVX-512-width SIMD paths are exercised). Missing shards tested: one data shard
+(index 1) and one parity shard (index 5).
+
+Returns `Ok(())` if all checks pass, or `Err(EcError::SmokeTestFailed { reason })` on
+any mismatch.
+
+---
+
 ### `VerifyResult`
 
 ```rust
@@ -215,10 +236,13 @@ pub enum EcError {
     /// Should not occur with a Cauchy encoding matrix; indicates a bug.
     #[error("internal: matrix inversion failed (singular)")]
     SingularMatrix,
+
+    #[error("runtime smoke test failed: {reason}")]
+    SmokeTestFailed { reason: String },
 }
 ```
 
-No `String` fields — all variants carry only fixed-size data, complying with the hot-path allocation policy.
+All hot-path variants carry only fixed-size data (no `String` fields), complying with the memory policy. `SmokeTestFailed` carries a `String` because it is only used at startup, never on the hot path.
 
 ---
 
@@ -327,7 +351,12 @@ forall (k in 1..=8, m in 1..=4, shard_size in 0..=4096, data: Vec<u8>):
 
 Shrinking on failure will produce a minimal (k, m, shard_size, data) counterexample.
 
-### 10. Fuzz targets (deferred)
+### 10. Runtime smoke test (`self_test`)
+
+- `self_test()` returns `Ok(())` — covered by `runtime_smoke_test_ok` unit test.
+- Rationale: ISA-L dispatches SIMD paths at runtime (AVX-512, AVX2, SSE3) based on CPUID. The build host may use a different ISA level than the production machine. Calling `self_test` at process startup catches any mismatch between the tested and deployed assembly.
+
+### 11. Fuzz targets (deferred)
 
 Fuzz targets are planned but not yet implemented. Deferred until the proptest suite
 is stable and the API is frozen.
@@ -337,7 +366,7 @@ is stable and the API is frozen.
 
 Both will be registered as `cargo-fuzz` targets when implemented.
 
-### 11. Benchmarks (`criterion`, deferred)
+### 12. Benchmarks (`criterion`, deferred)
 
 Measure encode throughput (GB/s) and reconstruct throughput:
 
