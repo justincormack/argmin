@@ -3,5 +3,6 @@ resolver = "2"
 members = [
     "crates/ec-sys",
     "crates/ec",
+    "crates/crc64",
     "crates/placement",
 ]

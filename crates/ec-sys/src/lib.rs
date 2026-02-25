@@ -1,12 +1,12 @@
-//! Raw FFI bindings to Intel ISA-L erasure coding functions.
+//! Raw FFI bindings to Intel ISA-L functions.
 //!
-//! Only the functions used by the `ec` crate are bound here. All other ISA-L
-//! functionality (CRC, compression, etc.) is out of scope.
+//! Binds erasure coding functions (used by the `ec` crate) and CRC64 functions
+//! (used by the `crc64` crate).
 //!
 //! # Safety
 //! All functions here are `unsafe`. Callers must ensure buffer sizes match the
-//! documented requirements. See the ISA-L header `isa-l/erasure_code.h` for
-//! full documentation.
+//! documented requirements. See the ISA-L headers `isa-l/erasure_code.h` and
+//! `isa-l/crc64.h` for full documentation.
 //!
 //! ISA-L documents its library functions as reentrant and thread-safe; callers
 //! may invoke them concurrently as long as they provide non-overlapping buffers.
@@ -61,6 +61,21 @@ extern "C" {
         data: *mut *mut c_uchar,
         coding: *mut *mut c_uchar,
     );
+
+    // ── CRC64 ────────────────────────────────────────────────────────────
+
+    /// Compute CRC-64/Rocksoft (= CRC-64/NVME) in reflected form.
+    ///
+    /// Multi-binary dispatcher: automatically selects the fastest
+    /// implementation at runtime (table-based, CLMUL, or AVX-512).
+    ///
+    /// Polynomial: 0xAD93D23594C93659 (reflected)
+    /// Init / XorOut: 0xFFFFFFFFFFFFFFFF
+    ///
+    /// To compute incrementally, pass the previous result as `init_crc`.
+    /// For the first call, pass `0` (the ISA-L convention; the function
+    /// applies the init/xorout internally).
+    pub fn crc64_rocksoft_refl(init_crc: u64, buf: *const c_uchar, len: u64) -> u64;
 }
 
 #[cfg(test)]
