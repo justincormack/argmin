@@ -202,10 +202,10 @@ full data path end to end and allows testing with real S3 clients (aws-cli, boto
 ### v1-minimal build order
 
 ```
-Phase 1 — leaf libraries (no deps, parallelizable):
+Phase 1 — leaf libraries (no deps, parallelizable):             [COMPLETE]
   1. Erasure Coding Engine      (pure math, ISA-L wrapper)        [done]
   2. Placement / Topology       (pure math, rendezvous hashing)   [done]
-  3. CRC64-NVME                 (ISA-L crc64_rocksoft_refl)       [bind in ec-sys]
+  3. CRC64-NVME                 (ISA-L crc64_rocksoft_refl)       [done]
 
 Phase 2 — storage layer:
   4. ShardStore trait + FileShardStore  (per-PG file I/O, CRC, SQLite shard index)
