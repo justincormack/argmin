@@ -726,14 +726,17 @@ should be on a checksumming filesystem (BTRFS/ZFS) for its own protection.
 
 ### CRC64-NVME implementation
 
-Need a Rust CRC64-NVME implementation. Options:
-- `crc64fast` crate: CRC64-ECMA, not CRC64-NVME. Wrong polynomial.
-- Roll our own using the NVMe polynomial (0xAD93D23594C93659, reflected).
-- Use a crate that supports the NVMe polynomial if one exists.
-- Hardware acceleration via `crc` intrinsics on ARM, table-based on x86 for now.
+**Resolved**: Use ISA-L's `crc64_rocksoft_refl()`. CRC-64/Rocksoft and CRC-64/NVME are
+the same algorithm (polynomial `0xAD93D23594C93659`, reflected, init/xorout
+`0xFFFFFFFFFFFFFFFF`). ISA-L is already a dependency for the EC engine. The function
+auto-selects the fastest implementation at runtime (CLMUL/AVX-512 on x86_64).
 
-This needs investigation. The polynomial and table generation are straightforward but
-correctness matters — need known test vectors from the NVMe spec.
+Add the FFI binding to the ec-sys crate alongside the existing erasure coding bindings.
+
+Test vectors:
+- `"123456789"` → `0xAE8B14860A799888`
+- `"hello world!"` → `0xD9160D1FA8E418E3`
+- 32 zero bytes → `0xCF3473434D4ECF3B`
 
 ---
 
@@ -968,12 +971,12 @@ later.
 ```rust
 /// Per-PG shard store. Each PG on this node has its own ShardStore instance
 /// backed by a PG directory and PG-local SQLite database.
-#[async_trait]
+/// v1-minimal: synchronous API (no async runtime).
 pub trait ShardStore {
-    async fn write_shard(&self, key: &[u8], data: &[u8]) -> Result<WriteAck, StoreError>;
-    async fn read_shard(&self, key: &[u8]) -> Result<ShardData, StoreError>;
-    async fn delete_shard(&self, key: &[u8]) -> Result<(), StoreError>;
-    async fn stat_shard(&self, key: &[u8]) -> Result<ShardStat, StoreError>;
+    fn write_shard(&self, key: &[u8], data: &[u8]) -> Result<WriteAck, StoreError>;
+    fn read_shard(&self, key: &[u8]) -> Result<ShardData, StoreError>;
+    fn delete_shard(&self, key: &[u8]) -> Result<(), StoreError>;
+    fn stat_shard(&self, key: &[u8]) -> Result<ShardStat, StoreError>;
 }
 
 /// The storage node daemon manages multiple PG ShardStore instances.
@@ -987,26 +990,16 @@ pub trait StorageNode {
 
 ## Concurrency Model
 
-### Open question: Async runtime
+### IO model
 
-The EC engine is deliberately sync (pure CPU work). The storage node is I/O-bound
-(disk reads/writes, network). An async runtime is natural here.
+**v1-minimal: Synchronous IO throughout.** No async runtime, no Tokio. Plain blocking
+file IO and blocking SQLite calls. The HTTP server uses thread-per-connection or a
+simple thread pool. This eliminates async complexity and makes the codebase much
+simpler for initial development.
 
-Options:
-1. **Tokio**: De facto standard. Excellent ecosystem. Large dependency.
-2. **Thread pool + blocking I/O**: Simpler. One thread per disk. No async complexity.
-   But: less efficient for the network side (need separate threads for network I/O).
-3. **io_uring (tokio-uring or glommio)**: Maximum I/O efficiency. Linux-only. Less
-   mature ecosystem.
-
-**Consideration**: The storage node will eventually need network I/O (RPC) and disk
-I/O. Tokio handles both. However, disk I/O on Linux is not truly async — `tokio::fs`
-uses a thread pool internally. `io_uring` is the only way to get real async disk I/O
-on Linux.
-
-**Recommendation**: Tokio for the network layer. For disk I/O, use
-`tokio::task::spawn_blocking` with a bounded thread pool (one thread per disk is the
-simplest model). Consider io_uring later if disk I/O scheduling becomes a bottleneck.
+**Post-v1-minimal**: When adding distribution (RPC, multi-node), revisit the IO model.
+Options at that point: Tokio for network + spawn_blocking for disk, or io_uring for
+true async disk IO. But for single-node v1-minimal, sync is the right choice.
 
 ### Disk-level concurrency
 
@@ -1218,8 +1211,8 @@ Metrics to expose (for Prometheus or similar):
 
 ## Build Sequence for the Storage Node
 
-1. **CRC64-NVME implementation**: Find or write a correct CRC64-NVME implementation
-   with test vectors from the NVMe spec. This is a leaf dependency.
+1. **CRC64-NVME binding**: Add `crc64_rocksoft_refl` FFI binding to ec-sys crate,
+   with a safe Rust wrapper. Verify with NVMe test vectors. This is a leaf dependency.
 2. **ShardStore trait + in-memory implementation**: Define the per-PG API trait.
    Implement a `MemoryShardStore` for testing the layers above without disk I/O.
 3. **Per-PG file store (file-per-shard)**: Implement `FileShardStore` backed by a PG
@@ -1254,5 +1247,5 @@ Metrics to expose (for Prometheus or similar):
 | 8 | CRC verify on read | Always | Configurable / sample |
 | 9 | Deletion model | Eager | Lazy with grace period |
 | 10 | RPC protocol | Defer (trait-based API first) | gRPC, HTTP/2, custom |
-| 11 | Async runtime | Tokio + spawn_blocking | Thread pool, io_uring |
+| 11 | IO model (v1-minimal) | Synchronous (no async runtime) | Tokio, io_uring (post-v1-minimal) |
 | 12 | Streaming vs buffered writes | Buffered | Streaming for large shards |

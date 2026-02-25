@@ -864,18 +864,25 @@ CREATE TABLE multipart_parts (
 
 - **etag**: Stored as fixed-size binary (BLOB), max 64 bytes (512 bits). An
   `etag_kind` discriminator (u8 stored as INTEGER) identifies the hash algorithm:
-  CRC64-NVME (8 bytes), MD5 (16 bytes), SHA-256 (32 bytes), etc. The S3 API returns
-  etags as hex strings in quotes (e.g. `"d41d8cd98f00b204e9800998ecf8427e"`), so the
-  frontend hex-encodes the binary on output. This keeps the metadata record fixed-size
-  and avoids storing hex-encoded strings that are 2× the binary size.
+  CRC64-NVME (8 bytes), SHA-256 (32 bytes), etc. The S3 API returns etags as hex
+  strings in quotes (e.g. `"ae8b14860a799888"`), so the frontend hex-encodes the
+  binary on output. This keeps the metadata record fixed-size and avoids storing
+  hex-encoded strings that are 2× the binary size.
 
-  For multipart uploads, S3's etag format is `MD5_of_part_MD5s-partcount`. We can
-  either replicate this convention or use our own (e.g. CRC64-NVME of the combined
-  stream). The etag_kind field distinguishes these cases.
+  **Default etag algorithm: CRC64-NVME** (not MD5). MD5 is deprecated and we don't
+  want to compute it. Some older S3 clients (rclone, s3cmd) verify etag == MD5; these
+  clients won't work with our etags for integrity checking, but will work for
+  conditional requests (If-Match/If-None-Match) since those compare opaque strings.
+  AWS S3 itself is moving to CRC64-NVME as the default checksum. S3 allows users to
+  choose their checksum algorithm via `x-amz-checksum-algorithm`; we can add support
+  for additional algorithms later.
+
+  For multipart uploads, the etag format will be a composite CRC64-NVME (e.g.
+  CRC64-NVME of part CRC64s concatenated, with a `-partcount` suffix to signal
+  multipart origin). The etag_kind field distinguishes these cases.
 
   512 bits (64 bytes) is sufficient for any current or foreseeable hash, including
-  SHA-512. If we default to CRC64-NVME for internal etags, that's only 8 bytes per
-  object — very compact.
+  SHA-512. CRC64-NVME is only 8 bytes per object — very compact.
 
 - **No placement_key in object records**: The PG is derived deterministically from
   the object key: `pg_id = hash(bucket + "/" + key) % pg_count`. Shard locations are
@@ -1219,40 +1226,40 @@ With per-PG metadata, the frontend interacts with two services:
 **Global service** (for bucket operations and cluster topology):
 
 ```rust
-#[async_trait]
+/// v1-minimal: synchronous API (no async runtime).
 pub trait GlobalService {
     // Bucket operations
-    async fn create_bucket(&self, req: CreateBucketReq) -> Result<(), MetadataError>;
-    async fn delete_bucket(&self, bucket: &str) -> Result<(), MetadataError>;
-    async fn head_bucket(&self, bucket: &str) -> Result<BucketInfo, MetadataError>;
-    async fn list_buckets(&self, owner: u64) -> Result<Vec<BucketInfo>, MetadataError>;
+    fn create_bucket(&self, req: CreateBucketReq) -> Result<(), MetadataError>;
+    fn delete_bucket(&self, bucket: &str) -> Result<(), MetadataError>;
+    fn head_bucket(&self, bucket: &str) -> Result<BucketInfo, MetadataError>;
+    fn list_buckets(&self, owner: u64) -> Result<Vec<BucketInfo>, MetadataError>;
 
     // Cluster topology
-    async fn get_cluster_map(&self) -> Result<ClusterMap, MetadataError>;
-    async fn get_pg_state(&self, pg_id: u32) -> Result<PgState, MetadataError>;
+    fn get_cluster_map(&self) -> Result<ClusterMap, MetadataError>;
+    fn get_pg_state(&self, pg_id: u32) -> Result<PgState, MetadataError>;
 }
 ```
 
 **PG primary** (for object operations — same node that stores shards):
 
 ```rust
-#[async_trait]
+/// v1-minimal: synchronous API (no async runtime).
 pub trait PgMetadataStore {
     // Object operations (namespace only — no data)
-    async fn put_object_meta(&self, req: PutObjectMetaReq) -> Result<PutObjectMetaResp, MetadataError>;
-    async fn get_object_meta(&self, bucket: &str, key: &str, version: Option<&str>)
+    fn put_object_meta(&self, req: PutObjectMetaReq) -> Result<PutObjectMetaResp, MetadataError>;
+    fn get_object_meta(&self, bucket: &str, key: &str, version: Option<&str>)
         -> Result<ObjectRecord, MetadataError>;
-    async fn delete_object_meta(&self, bucket: &str, key: &str, version: Option<&str>)
+    fn delete_object_meta(&self, bucket: &str, key: &str, version: Option<&str>)
         -> Result<DeleteResult, MetadataError>;
-    async fn list_pg_objects(&self, req: ListPgObjectsReq) -> Result<ListPgObjectsResp, MetadataError>;
-    async fn list_object_versions(&self, req: ListVersionsReq) -> Result<ListVersionsResp, MetadataError>;
+    fn list_pg_objects(&self, req: ListPgObjectsReq) -> Result<ListPgObjectsResp, MetadataError>;
+    fn list_object_versions(&self, req: ListVersionsReq) -> Result<ListVersionsResp, MetadataError>;
 
     // Multipart operations
-    async fn create_multipart(&self, req: CreateMultipartReq) -> Result<String, MetadataError>;
-    async fn put_part_meta(&self, req: PutPartMetaReq) -> Result<(), MetadataError>;
-    async fn complete_multipart(&self, req: CompleteMultipartReq) -> Result<ObjectRecord, MetadataError>;
-    async fn abort_multipart(&self, upload_id: &str) -> Result<(), MetadataError>;
-    async fn list_parts(&self, upload_id: &str) -> Result<Vec<PartInfo>, MetadataError>;
+    fn create_multipart(&self, req: CreateMultipartReq) -> Result<String, MetadataError>;
+    fn put_part_meta(&self, req: PutPartMetaReq) -> Result<(), MetadataError>;
+    fn complete_multipart(&self, req: CompleteMultipartReq) -> Result<ObjectRecord, MetadataError>;
+    fn abort_multipart(&self, upload_id: &str) -> Result<(), MetadataError>;
+    fn list_parts(&self, upload_id: &str) -> Result<Vec<PartInfo>, MetadataError>;
 }
 ```
 

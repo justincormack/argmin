@@ -150,59 +150,150 @@ The system decomposes into these major internal layers:
 
 ---
 
-## Dependency Order (Suggested Build Sequence)
+## Milestone: v1-minimal (single-node, in-process)
+
+The first milestone is a single-process S3-compatible server that links all subsystems
+together without distribution. No Raft, no RPC, no multi-node. This validates the
+full data path end to end and allows testing with real S3 clients (aws-cli, boto3).
+
+### What v1-minimal includes
+
+- **S3 API**: Priority 1 operations — PutObject (single-part), GetObject (with range
+  requests), DeleteObject, HeadObject, ListObjectsV2, CreateBucket, DeleteBucket,
+  ListBuckets. AWS Signature V4 auth with static access key/secret pairs.
+- **EC engine**: Encode/decode with ISA-L, default (4,2).
+- **Placement**: Rendezvous hashing, but with a single-node cluster map (all shards
+  go to the local node). PGs with fixed modulo (hash % pg_count).
+- **Storage node**: Per-PG directories, file-per-shard on local disk, CRC64-NVME
+  integrity, SQLite WAL for per-PG metadata (shard index + object records).
+- **Metadata**: Per-PG SQLite databases hold object records directly. No Raft, no
+  replication — single writer. Bucket table in a separate SQLite DB (placeholder
+  for the future global service).
+- **Sync IO**: Plain synchronous IO throughout. No async runtime (Tokio deferred to
+  post-v1-minimal). Thread-per-connection or simple thread pool for HTTP. Sync file
+  IO, sync SQLite. Simplifies the entire codebase for initial development.
+- **All in one process**: HTTP server → EC encode → place (locally) → write shards
+  to disk → commit metadata to per-PG SQLite. No RPC — just trait method calls.
+
+### What v1-minimal defers
+
+- Multi-node / distribution (Raft, RPC, replication, epoch fencing)
+- Primary-based consensus and peering protocol
+- Multipart uploads (Priority 2 — fast follow after v1-minimal works)
+- Versioning (Priority 3)
+- Scrub / repair / background maintenance
+- PG migration and rebalancing
+- Conditional PUT (If-None-Match)
+
+### Why v1-minimal first
+
+- Tests the full S3 data path with real clients before tackling distribution.
+- Validates the per-PG on-disk layout, shard format, metadata schema, EC integration.
+- Every trait (`ShardStore`, `PgMetadataStore`, `GlobalService`) gets an in-process
+  implementation that becomes the test harness for multi-node later.
+- Catches design mistakes early — easier to fix the shard format or schema now than
+  after building replication on top.
+- Usable immediately for development and testing of higher layers.
+
+---
+
+## Build Sequence
+
+### v1-minimal build order
 
 ```
 Phase 1 — leaf libraries (no deps, parallelizable):
-  1. Erasure Coding Engine      (pure math, ISA-L wrapper)
-  2. Placement / Topology       (pure math, rendezvous hashing)
-  3. Auth / IAM                 (pure crypto, SigV4)
+  1. Erasure Coding Engine      (pure math, ISA-L wrapper)        [done]
+  2. Placement / Topology       (pure math, rendezvous hashing)   [done]
+  3. CRC64-NVME                 (ISA-L crc64_rocksoft_refl)       [bind in ec-sys]
+  4. Auth / SigV4               (pure crypto)
 
-Phase 2 — core services (deps on Phase 1, parallelizable):
-  4a. Storage Node shard I/O    (deps: EC Engine)
-  4b. Global Service (Raft)     (deps: Placement)
+Phase 2 — storage layer:
+  5. ShardStore trait + FileShardStore  (per-PG file I/O, CRC, SQLite shard index)
+  6. Per-PG metadata (local)           (object records in per-PG SQLite, no replication)
+  7. Bucket metadata (local)           (bucket table in SQLite, no Raft)
 
-Phase 3 — integrated metadata:
-  5. Per-PG Metadata            (deps: 4a + 4b — integrates shard I/O with
-                                 epoch fencing and PG assignments from Global Service)
+Phase 3 — S3 server:
+  8. HTTP Frontend              (S3 API parsing, SigV4, XML responses)
+  9. Coordinator                (ties it all together: S3 op → EC → place → store → metadata)
+```
 
-Phase 4 — user-facing:
-  6. HTTP Frontend              (deps: Auth, Global Service, Per-PG Metadata, Storage)
-  7. Multipart Staging          (deps: Storage, Per-PG Metadata)
+### Post-v1-minimal (distributed)
 
-Phase 5 — background:
-  8. Repair / Background        (deps: all of the above)
+```
+Phase 4 — distribution:
+  10. Global Service (Raft)      (bucket DB, cluster map, PG state — replicated)
+  11. Internal RPC protocol      (node-to-node shard I/O and metadata replication)
+  12. Per-PG replication         (primary-based consensus, epoch fencing)
+  13. Peering protocol           (primary failover recovery)
+
+Phase 5 — completeness:
+  14. Multipart uploads
+  15. Versioning + conditional PUT
+  16. Repair / scrub / background maintenance
+  17. PG migration / rebalancing
 ```
 
 ### Notes on build order
 
-- **4a and 4b are independent and can be built in parallel.** The storage node shard
-  I/O (file operations, CRC, SQLite shard index) doesn't need the global service.
-  The global service (Raft, bucket DB, cluster map) doesn't need shard I/O.
-- **Phase 3 integrates them**: the per-PG metadata layer adds primary-based consensus,
-  epoch fencing, object records, and the peering protocol on top of the shard store,
-  using epochs and PG assignments from the global service.
-- **The global service is small but foundational.** It's the single source of truth for
-  cluster topology. Everything else derives PG assignments and epochs from it.
+- **Phase 1 items 1 and 2 are already implemented.** CRC64-NVME just needs an FFI
+  binding added to ec-sys (ISA-L's `crc64_rocksoft_refl` is the same algorithm).
+  Auth/SigV4 is an independent leaf task.
+- **Phase 2 is the core of v1-minimal.** The storage layer with per-PG SQLite is the
+  foundation everything else builds on. The same SQLite schema and ShardStore trait
+  will be used in the distributed version — we're just skipping replication for now.
+- **Phase 3 wires it all together.** The HTTP frontend and coordinator are the
+  integration layer. The coordinator orchestrates: parse S3 request → prepend
+  metadata (C2) → EC encode → derive PG → write shards → commit object record.
+- **Phase 4 adds distribution.** The in-process trait implementations from v1-minimal
+  become the "local" implementations. RPC adds remote variants. Raft adds the global
+  service. Per-PG replication adds primary-backup consensus.
 
 ---
 
-## Key Design Decisions (Resolved or Leaning)
+## Key Design Decisions
 
-| Decision | Options | Status |
+### Resolved
+
+| Decision | Resolution |
+|---|---|
+| Language | **Rust** |
+| Metadata architecture | **Per-PG metadata** (Ceph model). Global service for buckets + cluster map only |
+| Per-PG consensus | **Primary-based with epoch fencing** (no per-PG Raft). Deferred to post-v1-minimal |
+| Global service | **Raft-replicated SQLite** with application-level state machine. Deferred to post-v1-minimal |
+| Placement algorithm | **Rendezvous hashing** (implemented) |
+| PG count (v1-minimal) | **Fixed modulo** (hash % pg_count). Dynamic rendezvous later |
+| EC parameters | Configurable, default **(4,2)**. **ISA-L** for encoding (implemented) |
+| User metadata storage | **C2: prepend to data before EC**. Storage node sees opaque bytes |
+| Metadata embedding | **C2 over C1**. Single-shard self-description (C1) not worth the storage node complexity |
+| Shard identity | **Composite key**: object_key_hash ‖ version_id ‖ shard_index. Fixed-size, opaque to storage node |
+| On-disk layout | **Per-PG directories, file per shard**. Raw block device out of scope |
+| Local metadata DB | **SQLite WAL mode** (synchronous=NORMAL default) |
+| Checksum storage | **Per-PG metadata DB only** (recomputable from data) |
+| fsync strategy | **fdatasync per shard** |
+| O_DIRECT | **No** — use posix_fadvise(DONTNEED) for large shards |
+| CRC verify on read | **Always** |
+| Deletion model | **Eager** (shard delete is final by the time it reaches storage node) |
+| Raft state machine | **Application-level commands** (not WAL replication) |
+| Raft library | **openraft** (needs evaluation for snapshot/membership support) |
+| Version ID format | **ULID** (lexicographic sort = chronological) |
+| GC timing | **Batched + rate-limited** |
+| IO model (v1-minimal) | **Synchronous** (plain sync IO, no async runtime). Async deferred to post-v1-minimal |
+| Streaming vs buffered | **Buffered** (4MB max shard, manageable memory) |
+| Global service reads | **Leader reads** (simplest, low traffic on global service) |
+| Etag calculation | **CRC64-NVME** for single-part uploads. Not MD5 (deprecated). Multipart composite etag TBD |
+| Etag storage | **Binary BLOB, max 64 bytes** + etag_kind discriminator (u8) |
+| Consistency model | **Per-key strong** (mandatory). Eventually consistent LIST (acceptable for v1) |
+| Wire protocol (internal) | **Trait-based API first**. In-process for v1-minimal. RPC added post-v1-minimal |
+| Encryption at rest | **LUKS at filesystem level** first. Per-object encryption deferred |
+
+### Still open (needed before v1-minimal coding starts)
+
+| Decision | Options | Notes |
 |---|---|---|
-| Language | Rust / Go | **Rust** |
-| Metadata architecture | Centralized Raft cluster / per-PG metadata | **Leaning per-PG** (Ceph model). Global service for buckets + cluster map only |
-| Per-PG consensus | Per-PG Raft / primary-based with epoch fencing | **Primary-based with epoch fencing** (no per-PG Raft) |
-| Global service | SQLite+Raft | **Raft-replicated SQLite** with application-level state machine |
-| Placement algorithm | CRUSH / Rendezvous hashing | **Rendezvous hashing** (implemented) |
-| Placement groups | Yes / No | **Yes** — dynamic PG count via rendezvous hashing over PG set (~100-200 PGs/node) |
-| EC parameters | (k, m) — e.g., (4,2), (6,3), (8,4) | Configurable, default (4,2). **ISA-L** for encoding |
-| User metadata storage | In metadata index / prepended to shard data | **C2: prepend to data before EC** (metadata cluster stays lean) |
-| Consistency model | Strong / eventual | **Per-key strong** (mandatory). Eventually consistent LIST (v1) |
-| Etag format | Hex string / binary BLOB | **Binary BLOB, max 64 bytes** + etag_kind discriminator |
-| Wire protocol (internal) | gRPC / HTTP/2 / custom | Defer — trait-based API first, RPC later |
-| Encryption at rest | LUKS / per-object SSE-C | LUKS at filesystem level first |
+| Shard key byte format | Exact encoding of composite key | Hash width, version field size, byte order. Small decision |
+| PG write quorum (distributed) | All replicas / majority | Deferred to post-v1-minimal. Single-node has no quorum |
+| v1-minimal S3 scope | Priority 1 only / include multipart | Multipart is a fast follow but most clients need it |
 
 ---
 
