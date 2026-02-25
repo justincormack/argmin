@@ -8,12 +8,14 @@ local disk, maintaining per-shard integrity checksums, and exposing a simple int
 API for shard read/write/delete/verify operations.
 
 The storage node does NOT handle:
-- Object-level logic (that's the metadata cluster)
+- Object-level S3 semantics (bucket policy, versioning logic)
 - Placement decisions (that's the placement layer)
 - Erasure coding (that's the EC engine, used by the coordinator/frontend)
 - S3 protocol (that's the HTTP frontend)
 
-It is a shard-level key-value store with integrity guarantees.
+It is a shard-level key-value store with integrity guarantees. With per-PG metadata
+(Architecture E), it also hosts the per-PG object metadata index — but the storage
+node's core responsibility is still shard I/O and integrity.
 
 ---
 
@@ -333,37 +335,31 @@ metadata is always authoritative" is far more valuable than optimizing that edge
 
 ---
 
-### Preferred: Architecture C (hybrid)
+### Preferred: Architecture C with per-PG metadata (C + E)
 
-**Current leaning**: Architecture C — metadata cluster as the primary source for
-namespace operations, with object metadata also preserved alongside shard data for
-disaster recovery. C1 (replicated header per shard) vs C2 (prepend to data before EC)
-is an open sub-question. Not yet a final decision.
+**Current leaning**: Architecture C2 (prepend metadata to data before EC), combined
+with per-PG metadata (Architecture E from metadata-cluster-design.md). Object metadata
+is embedded in shard data (C2) and also stored in the per-PG SQLite database on each
+PG's nodes. C1 (replicated header per shard) vs C2 is still an open sub-question,
+but C2 is favoured for storage node simplicity.
 
-The storage node remains a simple shard store for normal operations. Only a disaster
-recovery tool needs to parse metadata from shards.
+The storage node is a shard store with a per-PG metadata index. The metadata index
+stores the fixed-size object records (size, etag, last-modified, ec params, status).
+User-defined metadata (content-type, x-amz-meta-*) lives only in the shard data (C2
+prepend) — it is not in the per-PG metadata index.
 
 Normal operation:
-- HeadObject, ListObjects → metadata cluster only (fast).
-- GetObject → metadata cluster for routing, then storage nodes for shard data.
-- PutObject → storage nodes receive shards, metadata cluster gets the namespace entry.
+- HeadObject → PG node (fixed fields from per-PG metadata + user metadata from shards).
+- ListObjects → Fan-out to all PG primaries, merge-sort.
+- GetObject → PG node (metadata record + shard data, same nodes).
+- PutObject → PG primary (shards + metadata record, same nodes).
 
 Disaster recovery:
-- Scan shards on all nodes, extract/reconstruct metadata, rebuild the metadata cluster.
+- Reconstruct k shards → get both data and metadata. Rebuild per-PG SQLite from shards.
 
-**Arguments for Architecture C over A**: Losing the metadata cluster would mean
-permanent loss of user-defined metadata, content-types, and the namespace — even
-though the raw data bytes survive in the shards.
-
-**Arguments for Architecture A over C**: Simpler storage node (especially vs C1). If
-the metadata cluster has its own robust replication and backup strategy
-(Raft-replicated SQLite with periodic snapshots), the risk of total metadata loss may
-be low enough that the extra complexity isn't justified.
-
-Architecture B (MinIO-style, no metadata cluster) is not preferred because it makes
-ListObjects expensive and couples the storage node to object-level semantics. MinIO
-also replicates the full metadata to every node (k+m copies), does not integrity-check
-it, and requires every node to act as a metadata server — none of which we want.
+Architecture B (MinIO-style) is not preferred because it replicates full metadata to
+every node (k+m copies), does not integrity-check it, and couples the storage node
+to object-level semantics.
 
 ---
 
@@ -403,10 +399,9 @@ Shard key = hash(shard_bytes). Enables deduplication.
 - Con: Erasure-coded shards have high entropy — dedup ratio is near zero.
 - Con: Not worth the complexity for this system.
 
-**Recommendation**: Option A or B. Lean toward B for repairability, but this depends
-on how the metadata cluster tracks versions and multipart uploads. Final decision can
-be deferred until the metadata cluster design is done — the storage node just needs
-`&[u8]` as a key.
+**Recommendation**: Option A or B. Lean toward B for repairability. With per-PG
+directories, the shard_key only needs to be unique within a PG — the pg_id provides
+the outer namespace. The storage node just needs `&[u8]` as a key within a PG.
 
 ### Shard key format (if using Option B)
 
@@ -422,41 +417,88 @@ shard_key = object_key_hash (16 bytes) || version_id (8 bytes) || shard_index (1
 
 This is the most consequential design decision. Options from simplest to most complex:
 
+### Top-level structure: per-PG directories
+
+With per-PG metadata (Architecture E in metadata-cluster-design.md), the on-disk
+layout is organized by placement group. Each PG is a self-contained unit on disk:
+
+```
+/data/
+  pg-0000/
+    shards/
+      <prefix>/<shard_key_hex>      # shard data files
+    metadata.db                      # per-PG SQLite (object records, oplog)
+    tmp/                             # temp files for atomic writes
+  pg-0001/
+    shards/
+      ...
+    metadata.db
+    tmp/
+  ...
+  pg-1023/
+    ...
+  node.db                            # node-level metadata (node_id, disk_id, format_version)
+```
+
+**Why per-PG directories:**
+- **GC is PG-scoped.** The PG primary can scan its own `metadata.db` for
+  PendingDelete records and delete shards from the same directory. No cross-PG
+  coordination needed.
+- **Migration moves a whole PG.** To migrate PG-42 to a new node, copy (or
+  reconstruct) the entire `pg-0042/` directory. Shards, metadata, and oplog move
+  together as a unit.
+- **Scrub is PG-scoped.** Each PG can be scrubbed independently. The scrub process
+  walks the PG's shard directory and cross-references against `metadata.db`.
+- **Peering after failure.** When a new primary takes over, it reconciles by
+  exchanging oplog entries. The oplog is in the PG's `metadata.db`, so peering is
+  self-contained.
+- **Startup recovery is PG-scoped.** Each PG directory can reconcile its
+  `metadata.db` against its shard files independently. Faster parallel recovery.
+- **Deletion of a PG.** If a PG migrates away entirely, `rm -rf pg-NNNN/` cleans
+  up everything. No scattered shards to find.
+
+A node participates in many PGs (typically `pg_count * (k+m) / node_count` PGs).
+With 1024 PGs and 6 nodes, each node hosts ~1024 PGs. With more nodes, fewer PGs
+per node.
+
 ### Option 1: One file per shard (filesystem-managed)
 
+Within each PG directory, shards are stored as individual files:
+
 ```
-/data/<prefix>/<shard_key_hex>
+/data/pg-0042/shards/<prefix>/<shard_key_hex>
 ```
 
-Where `<prefix>` is the first 2-4 hex chars of the shard key (fanout to avoid large
-directories).
+Where `<prefix>` is the first 2 hex chars of the shard key (fanout to avoid large
+directories within a PG).
 
-- Example: `/data/a3/b7/a3b7f2...89_03` (shard index 3 of object a3b7f2...89)
+- Example: `/data/pg-0042/shards/a3/a3b7f2...89_03` (shard index 3)
 - Shard data is the file contents.
-- CRC64-NVME stored in the local metadata DB (not inline with data).
+- CRC64-NVME stored in the PG's `metadata.db` (not inline with data).
 
-**Write path**: write to temp file in same directory → fsync → rename → fsync parent
-dir. Atomic on POSIX filesystems.
+**Write path**: write to temp file in PG's tmp/ dir → fsync → rename into shards/
+→ fsync parent dir. Atomic on POSIX filesystems.
 
 **Pros**:
 - Simplest possible implementation. Easy to debug (ls, hexdump, du).
 - Filesystem handles space allocation, directory indexing, free space.
 - Works on any POSIX filesystem.
 - cp, rsync, standard tools all work for manual recovery.
+- Per-PG directories naturally limit directory size — even with millions of objects,
+  each PG holds only `total_objects / pg_count` shards.
 
 **Cons**:
 - Inode overhead: each shard consumes an inode. For small objects with (4,2) EC, a
   1KB object creates 6 files of ~170 bytes each. Inode overhead dominates.
-- Directory scaling: even with fanout, millions of files stress the filesystem's
-  directory implementation (XFS B-tree handles this better than ext4 HTree).
 - Metadata overhead: stat() per shard on read. Filesystem metadata operations are not
   free.
 - Fragmentation: many small files fragment sequential read patterns.
 
 **Mitigation**: XFS handles large file counts well (B-tree directories, efficient
-extent allocation). Set `mkfs.xfs -n ftype=1` and use directory fanout. For a node
-with 10TB and average shard size of 1MB, that's ~10M files — well within XFS's
-comfortable range.
+extent allocation). Set `mkfs.xfs -n ftype=1` and use directory fanout. With per-PG
+directories, each PG's shard/ tree is much smaller than the total — for 10M shards
+across 1024 PGs, that's ~10K files per PG directory. Easily within XFS's comfortable
+range.
 
 ### Option 2: Packed shard files (append-log per directory bucket)
 
@@ -506,17 +548,25 @@ block-device-backed nodes simultaneously.
 
 ### Option 4: Hybrid — data files on XFS, metadata in SQLite on separate volume
 
-Keep shard data as files (Option 1 or 2), but store the local metadata (shard
-index, checksums, status) in a SQLite database on a separate filesystem or volume.
+Keep shard data as files (Option 1 or 2), but store the per-PG SQLite databases on
+a separate filesystem or volume.
 
 This is the approach described in the territory map ("XFS recommended for data,
 BTRFS/ZFS for metadata"). The separate filesystem for metadata allows:
-- Using BTRFS/ZFS checksumming for the metadata DB itself (defense in depth).
+- Using BTRFS/ZFS checksumming for the per-PG SQLite databases (defense in depth).
 - Separate I/O scheduling for metadata vs data.
 - Smaller metadata volume that benefits from being on SSD even if data is on HDD.
 
+With per-PG layout, the structure would be:
+```
+/data/pg-NNNN/shards/...          # XFS data volume
+/meta/pg-NNNN/metadata.db         # BTRFS/ZFS metadata volume (or SSD)
+```
+
+The PG directory is split across volumes, but logically remains a single unit.
+
 **This is the recommended starting point** — simple file-per-shard for data (Option
-1), SQLite for metadata, potentially on separate volumes.
+1), per-PG SQLite for metadata, potentially on separate volumes.
 
 ---
 
@@ -544,12 +594,13 @@ optimization and avoids the compaction complexity of Option 2.
 
 ## Local Metadata Database
 
-Each storage node maintains a local database tracking which shards it holds and their
-integrity state.
+Each storage node maintains per-PG SQLite databases. With per-PG metadata
+(Architecture E), each PG's `metadata.db` stores both shard-level information (CRC,
+status) and object-level metadata records (as described in metadata-cluster-design.md).
 
-### What the metadata DB stores
+### What each per-PG metadata DB stores
 
-Per shard:
+**Shard tracking** (shard-level, local to this node):
 - `shard_key` (primary key, variable-length bytes)
 - `data_size` (u64, bytes)
 - `crc64_nvme` (u64, computed at write time)
@@ -558,11 +609,16 @@ Per shard:
 - `status` (u8: Live, Deleting, Quarantined)
 - `data_path` (optional, if not derivable from shard_key — for Option 2/3)
 
-Node-level:
+**Object records** (per-PG metadata, replicated across PG nodes):
+- See metadata-cluster-design.md Per-PG schema (objects table, pg_oplog, multipart
+  tables).
+
+**Node-level metadata** (separate `node.db`, not per-PG):
 - `node_id` (u32, this node's identity)
 - `disk_id` (u32, if multiple disks per node)
 - `format_version` (u16)
-- Total shard count, total bytes (derived, cached)
+- List of PGs this node participates in and its role (primary/secondary)
+- Current cluster map epoch
 
 ### SQLite vs LMDB
 
@@ -686,24 +742,24 @@ correctness matters — need known test vectors from the NVMe spec.
 ### Single shard write
 
 ```
-1. Receive shard data + shard_key over RPC
-2. Validate: shard_key length, data size within limits
+1. Receive shard data + shard_key + pg_id over RPC
+2. Validate: shard_key length, data size within limits, PG is owned by this node
 3. Compute CRC64-NVME over shard data
-4. Write shard data to temp file (O_WRONLY | O_CREAT | O_EXCL)
+4. Write shard data to temp file in pg-{pg_id}/tmp/ (O_WRONLY | O_CREAT | O_EXCL)
 5. fsync temp file
-6. Rename temp file to final path
+6. Rename temp file to pg-{pg_id}/shards/<prefix>/<shard_key_hex>
 7. fsync parent directory
-8. Insert metadata record into SQLite (shard_key, size, crc64, timestamp)
+8. Insert shard record into pg-{pg_id}/metadata.db (shard_key, size, crc64, timestamp)
 9. Return success + crc64 to caller
 ```
 
 ### Failure modes
 
-- **Crash between step 5 and 6**: Temp file exists on disk. On startup, scan for and
-  delete orphaned temp files.
-- **Crash between step 6 and 8**: Data file exists but no metadata record. On startup,
-  scan data directory for files not in the metadata DB — either add them (recompute
-  CRC) or delete them, depending on policy.
+- **Crash between step 5 and 6**: Temp file exists in PG's tmp/ dir. On startup,
+  clean all PG tmp/ directories.
+- **Crash between step 6 and 8**: Shard file exists but no metadata record. On
+  startup, scan each PG's shard directory for files not in that PG's metadata DB —
+  either add them (recompute CRC) or delete them, depending on policy.
 - **Crash during step 8**: SQLite WAL handles this. Transaction either committed or not.
 
 ### Open question: Write ordering — data first or metadata first?
@@ -794,10 +850,10 @@ EC layer above can reconstruct from other shards if we detect corruption early.
 ## Delete Path
 
 ```
-1. Receive shard_key over RPC
-2. Update metadata: status = Deleting
-3. unlink data file
-4. Delete metadata record
+1. Receive pg_id + shard_key over RPC
+2. Update pg-{pg_id}/metadata.db: shard status = Deleting
+3. unlink shard file from pg-{pg_id}/shards/...
+4. Delete shard record from pg-{pg_id}/metadata.db
 5. Return success
 ```
 
@@ -810,9 +866,9 @@ Deletes are idempotent: deleting a non-existent shard returns success.
 **Lazy**: Mark as deleted in metadata, background process unlinks files. Allows
 undeletion within a grace period. Adds complexity.
 
-**Recommendation**: Eager deletion for now. The metadata cluster handles versioning
-and soft-delete semantics at the object level. By the time a delete reaches the
-storage node, it should be final.
+**Recommendation**: Eager deletion for now. The per-PG metadata handles versioning
+and soft-delete semantics at the object level. By the time a shard delete reaches
+the storage node, it should be final.
 
 ---
 
@@ -820,18 +876,19 @@ storage node, it should be final.
 
 A background process that reads every shard and verifies its CRC64. This catches
 silent data corruption (bit rot) that wouldn't be detected until a client reads the
-shard.
+shard. Scrub operates per PG:
 
 ```
-for each shard in metadata DB where status == Live:
-    read shard data from disk
-    compute CRC64-NVME
-    if mismatch:
-        mark shard as Quarantined
-        report to repair subsystem
-    else:
-        update last_verified timestamp
-    sleep/yield to avoid starving client I/O
+for each PG this node participates in:
+    for each shard in pg-{pg_id}/metadata.db where status == Live:
+        read shard data from pg-{pg_id}/shards/...
+        compute CRC64-NVME
+        if mismatch:
+            mark shard as Quarantined
+            report to repair subsystem
+        else:
+            update last_verified timestamp
+        sleep/yield to avoid starving client I/O
 ```
 
 ### Design parameters
@@ -841,8 +898,11 @@ for each shard in metadata DB where status == Live:
   Spread over 30 days → ~2 hours/day of scrub I/O.
 - **I/O priority**: Use `ionice` (CFQ) or cgroup I/O limits. Scrub must not degrade
   client latency.
-- **Ordering**: Sequential scan of data directory for sequential disk reads. Don't
+- **Ordering**: Sequential scan of each PG's shard directory for sequential disk
+  reads. Process one PG at a time (or interleave at a coarse granularity). Don't
   randomize (random I/O on HDD is catastrophic for scrub throughput).
+- **PG-scoped progress**: Scrub progress is tracked per PG. A PG migration doesn't
+  reset scrub progress for unrelated PGs.
 
 ---
 
@@ -853,19 +913,21 @@ protocol between the coordinator/frontend and the storage nodes.
 
 ### Operations
 
+All shard operations are PG-scoped:
+
 ```
-WriteShard(shard_key: bytes, data: bytes) → Result<WriteAck, Error>
+WriteShard(pg_id: u32, shard_key: bytes, data: bytes) → Result<WriteAck, Error>
     WriteAck { crc64: u64, stored_size: u64 }
 
-ReadShard(shard_key: bytes) → Result<ShardData, Error>
+ReadShard(pg_id: u32, shard_key: bytes) → Result<ShardData, Error>
     ShardData { data: bytes, crc64: u64 }
 
-DeleteShard(shard_key: bytes) → Result<(), Error>
+DeleteShard(pg_id: u32, shard_key: bytes) → Result<(), Error>
 
-StatShard(shard_key: bytes) → Result<ShardStat, Error>
+StatShard(pg_id: u32, shard_key: bytes) → Result<ShardStat, Error>
     ShardStat { size: u64, crc64: u64, created_at: u64, last_verified: u64 }
 
-ListShards(prefix: bytes, cursor: bytes, limit: u32) → Result<ShardList, Error>
+ListShards(pg_id: u32, prefix: bytes, cursor: bytes, limit: u32) → Result<ShardList, Error>
     ShardList { keys: Vec<bytes>, next_cursor: Option<bytes> }
 ```
 
@@ -904,12 +966,20 @@ Design the internal API as a trait; implement the trait in-process first, add RP
 later.
 
 ```rust
+/// Per-PG shard store. Each PG on this node has its own ShardStore instance
+/// backed by a PG directory and PG-local SQLite database.
 #[async_trait]
 pub trait ShardStore {
     async fn write_shard(&self, key: &[u8], data: &[u8]) -> Result<WriteAck, StoreError>;
     async fn read_shard(&self, key: &[u8]) -> Result<ShardData, StoreError>;
     async fn delete_shard(&self, key: &[u8]) -> Result<(), StoreError>;
     async fn stat_shard(&self, key: &[u8]) -> Result<ShardStat, StoreError>;
+}
+
+/// The storage node daemon manages multiple PG ShardStore instances.
+/// It routes requests to the correct PG based on the pg_id in the request.
+pub trait StorageNode {
+    fn get_pg_store(&self, pg_id: u32) -> Result<&dyn ShardStore, StoreError>;
 }
 ```
 
@@ -945,7 +1015,19 @@ same disk should be limited (SSDs handle ~32-128 concurrent ops well; HDDs shoul
 serialize writes).
 
 A storage node may manage multiple disks. Each disk is essentially an independent
-shard store. The node daemon multiplexes across them.
+shard store. The node daemon multiplexes across them. PG directories should ideally
+be spread across disks for balanced I/O, but a single PG's shards should be on one
+disk (simplifies the per-PG directory structure).
+
+### PG-level concurrency
+
+With per-PG metadata, each PG's SQLite database has its own write serialization
+(SQLite single-writer). PGs on the same node are independent — writes to different
+PGs don't contend on metadata locks. This gives natural per-PG write concurrency.
+
+The PG primary serializes writes for conditional correctness (per-key
+linearizability). This is per-PG, not per-node — different PGs on the same node
+can accept writes concurrently.
 
 ---
 
@@ -954,9 +1036,9 @@ shard store. The node daemon multiplexes across them.
 Following `guides/rust_memory_policy_strict.md`:
 
 ### ZONE_INIT
-- Open SQLite connections.
+- Open per-PG SQLite connections (one per PG this node participates in).
 - Pre-allocate shard I/O buffers (buffer pool).
-- Scan data directory for orphaned temp files.
+- Per-PG startup recovery: scan each PG's directories for orphaned temp files.
 
 ### ZONE_HOT (shard read/write)
 - Borrow a buffer from the pool (fixed-size, e.g. 4MB + header room).
@@ -1010,21 +1092,27 @@ setup for operators who want defense-in-depth.
 
 ## Startup and Recovery
 
-On startup, the storage node must reconcile its metadata DB with the actual files on
-disk:
+On startup, the storage node reconciles each PG's metadata DB with its shard files.
+This is done per PG, which enables parallel recovery across PGs:
 
-1. **Delete orphaned temp files**: Any file matching the temp pattern (e.g.
-   `.shard.tmp.*`) is removed.
-2. **Detect orphaned data files**: Scan data directory for files not in the metadata
-   DB. Policy: delete them (they're from incomplete writes) or re-index them (compute
-   CRC, add to metadata DB). Deleting is safer — if the metadata was never committed,
-   the coordinator never acknowledged the write, so the caller will retry.
-3. **Detect missing data files**: Query metadata DB for shards that should exist but
-   whose data files are missing. Mark as Quarantined. Report to repair subsystem.
-4. **Verify metadata DB integrity**: `PRAGMA integrity_check` on SQLite.
+For each PG directory:
+1. **Delete orphaned temp files**: Any file in the PG's `tmp/` directory is removed.
+2. **Detect orphaned shard files**: Scan PG's `shards/` directory for files not in
+   the PG's `metadata.db`. Policy: delete them (they're from incomplete writes) or
+   re-index them (compute CRC, add to metadata DB). Deleting is safer — if the
+   metadata was never committed, the coordinator never acknowledged the write, so the
+   caller will retry.
+3. **Detect missing shard files**: Query PG's `metadata.db` for shards that should
+   exist but whose data files are missing. Mark as Quarantined. Report to repair
+   subsystem.
+4. **Verify metadata DB integrity**: `PRAGMA integrity_check` on each PG's SQLite DB.
+5. **Check epoch**: Compare this node's last-seen epoch against the global service's
+   current epoch. If behind, fetch the latest cluster map to determine if any PG
+   role changes have occurred (new primary, PG migration).
 
-This scan should be fast (just readdir + metadata DB queries, no data reads). Full
-CRC verification is the scrub's job, not startup's.
+This scan should be fast (just readdir + metadata DB queries per PG, no data reads).
+PGs can be recovered in parallel across threads. Full CRC verification is the scrub's
+job, not startup's.
 
 ---
 
@@ -1072,11 +1160,14 @@ Note: no `String` fields. `Io` carries the raw errno rather than a `std::io::Err
 
 ```rust
 pub struct StorageNodeConfig {
-    /// Path to the data directory (shard files).
+    /// Path to the data directory (PG directories with shard files).
+    /// Layout: {data_dir}/pg-{NNNN}/shards/...
     pub data_dir: PathBuf,
 
-    /// Path to the metadata database. Defaults to data_dir/metadata.db.
-    pub metadata_db_path: Option<PathBuf>,
+    /// Optional separate path for per-PG metadata databases.
+    /// If set, PG metadata lives at {metadata_dir}/pg-{NNNN}/metadata.db
+    /// If None, metadata is at {data_dir}/pg-{NNNN}/metadata.db
+    pub metadata_dir: Option<PathBuf>,
 
     /// Maximum shard size in bytes. Default: 4 * 1024 * 1024 (4MB).
     pub max_shard_size: u64,
@@ -1090,7 +1181,7 @@ pub struct StorageNodeConfig {
     /// SQLite synchronous mode. Default: Normal.
     pub sync_mode: SyncMode, // Normal | Full
 
-    /// Directory fanout depth (hex prefix). Default: 2 (256 subdirectories).
+    /// Directory fanout depth (hex prefix) within PG shard dirs. Default: 1 (16 subdirs).
     pub fanout_depth: u8,
 
     /// Target scrub interval in days. Default: 30.
@@ -1129,16 +1220,21 @@ Metrics to expose (for Prometheus or similar):
 
 1. **CRC64-NVME implementation**: Find or write a correct CRC64-NVME implementation
    with test vectors from the NVMe spec. This is a leaf dependency.
-2. **ShardStore trait + in-memory implementation**: Define the API trait. Implement a
-   `MemoryShardStore` for testing the layers above without disk I/O.
-3. **Local file store (file-per-shard)**: Implement `FileShardStore` with the write
-   path (temp file → fsync → rename), read path (with CRC verification), delete.
-4. **SQLite metadata layer**: Integrate SQLite for the shard index. Migration schema.
-5. **Startup recovery**: Orphan cleanup, consistency check.
-6. **Scrub**: Background verification process with I/O throttling.
-7. **Buffer pool**: Pre-allocated buffer management for ZONE_HOT compliance.
-8. **Integration tests**: End-to-end write → read → verify → delete cycles, crash
-   recovery simulation, concurrent operations.
+2. **ShardStore trait + in-memory implementation**: Define the per-PG API trait.
+   Implement a `MemoryShardStore` for testing the layers above without disk I/O.
+3. **Per-PG file store (file-per-shard)**: Implement `FileShardStore` backed by a PG
+   directory. Write path (temp file → fsync → rename), read path (with CRC
+   verification), delete. Each instance manages one PG directory.
+4. **Per-PG SQLite metadata layer**: Integrate SQLite for the per-PG shard index
+   and object records. Migration schema.
+5. **StorageNode daemon**: Multiplexes across PG stores. Routes requests by pg_id.
+   Manages PG lifecycle (create PG directory when assigned, clean up when migrated).
+6. **Startup recovery**: Per-PG orphan cleanup, consistency check, epoch reconciliation.
+7. **Scrub**: Background verification process per PG with I/O throttling.
+8. **Buffer pool**: Pre-allocated buffer management for ZONE_HOT compliance.
+9. **Integration tests**: End-to-end write → read → verify → delete cycles per PG,
+   crash recovery simulation, concurrent operations across PGs, PG migration
+   (directory lifecycle).
 
 ---
 
@@ -1146,10 +1242,10 @@ Metrics to expose (for Prometheus or similar):
 
 | # | Question | Current Leaning | Alternatives |
 |---|---|---|---|
-| 0a | Where does S3 object metadata live? | Preferred: Architecture C (metadata cluster + embedded metadata for DR) | Pure shard KV (Arch A), MinIO-style (Arch B) |
+| 0a | Where does S3 object metadata live? | Preferred: Architecture C2 + E (per-PG metadata index + embedded in shard data) | Centralized metadata cluster (Arch A/C), MinIO-style (Arch B) |
 | 0b | How is metadata embedded? | Open: C1 (replicated header per shard) vs C2 (prepend to data before EC) | C1 gives single-shard self-description + independent integrity check; C2 is simpler for storage node |
 | 1 | Shard identity model | Composite key (Option B) | Opaque UUID (Option A) |
-| 2 | On-disk layout | File per shard (Option 1) | Packed files (Option 2) |
+| 2 | On-disk layout | Per-PG directories, file per shard (Option 1) | Packed files (Option 2) |
 | 3 | Small object optimization | Defer; measure first | Inline in SQLite |
 | 4 | Metadata DB | SQLite WAL mode | LMDB, RocksDB |
 | 5 | Checksum storage | Metadata DB only | Inline with data |
