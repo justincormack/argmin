@@ -68,16 +68,16 @@ The system decomposes into these major internal layers:
 ```
 ┌─────────────────────────────────────────┐
 │         HTTP Frontend (S3 API)          │  ← request parsing, auth, routing
-├─────────────────────────────────────────┤
-│          Metadata Layer                 │  ← bucket/object namespace, versions
-├────────────────────┬────────────────────┤
-│   Placement Layer  │  Multipart Staging │  ← where does this data live?
-├────────────────────┴────────────────────┤
+├──────────────────┬──────────────────────┤
+│  Global Service  │   Placement Layer    │  ← buckets, cluster map, PG state
+│  (Raft, 3-5 n.)  │                      │
+├──────────────────┴──────────────────────┤
 │         Erasure Coding Layer            │  ← RS encode/decode, stripe assembly
 ├─────────────────────────────────────────┤
-│    Storage Node Layer (per machine)     │  ← local reads/writes, checksums
+│    Storage Node Layer (per machine)     │  ← per-PG: shard I/O + object
+│      per-PG metadata + shard data       │    metadata index + checksums
 ├─────────────────────────────────────────┤
-│         Repair / Background Jobs        │  ← heal, rebalance, scrub
+│         Repair / Background Jobs        │  ← heal, rebalance, scrub, PG migration
 └─────────────────────────────────────────┘
 ```
 
@@ -99,26 +99,26 @@ The system decomposes into these major internal layers:
 **Dependencies**: none
 **Notes**: CRUSH-inspired: pseudo-random, no per-object map needed. Rendezvous hashing (`score = -ln(U) / w`) as simpler alternative. Must handle node add/remove with minimal data movement and respect failure domain constraints (rack, machine, disk).
 
-### 3. Storage Node (local)
-**What**: Per-node daemon that stores shard data and its own metadata.
-**In**: shard writes/reads over internal RPC
+### 3. Storage Node — Shard I/O
+**What**: Per-node shard storage layer: file-per-shard on XFS, CRC64-NVME integrity, per-PG directory layout.
+**In**: shard writes/reads/deletes scoped by PG
 **Out**: stored bytes, per-shard checksums
 **Dependencies**: Erasure Coding Engine
-**Notes**: File layout on disk (XFS recommended for data, BTRFS/ZFS for metadata). Atomic writes. CRC64-NVME attached to every shard. Local metadata DB (SQLite or LMDB — LMDB fragile on crash, SQLite safer). Expose simple internal API (not S3).
+**Notes**: Per-PG directories on disk (`pg-NNNN/shards/`, `pg-NNNN/metadata.db`, `pg-NNNN/tmp/`). Atomic writes (temp → fsync → rename). CRC64-NVME per shard. SQLite in WAL mode for per-PG shard index. ShardStore trait per PG, StorageNode multiplexes across PGs. See `plans/storage-node-design.md`.
 
-### 4. Metadata Cluster
-**What**: Distributed store of bucket/object namespace: bucket→objects, object→version list, version→shard placement.
-**In**: namespace operations (put, get, delete, list, version-list)
-**Out**: object metadata (etag, size, checksum, shard locations, content-type, user-metadata)
+### 4. Global Service (Raft)
+**What**: Small Raft-replicated cluster (3-5 nodes) that owns global state: bucket table, cluster map with epoch, PG state.
+**In**: bucket CRUD, cluster topology changes (node add/remove/reweight), PG migration lifecycle
+**Out**: bucket metadata, cluster map (with monotonic epoch), PG-to-node mapping and migration status
 **Dependencies**: Placement layer
-**Notes**: Options: Raft-replicated SQLite (Litestream-style), co-located quorum per shard group, or simple leader-replicated. For simplicity, start with Raft/replicated SQLite. Separation of metadata from data is key for small-object performance.
+**Notes**: Raft-replicated SQLite with application-level state machine (not WAL replication). Handles only global operations — not per-object metadata. Tables: `buckets`, `pg_state`, `cluster_maps`. Publishes cluster map epochs to all storage nodes. This is the only Raft group in the system. Tiny write volume (bucket ops + topology changes are rare). See `plans/metadata-cluster-design.md`.
 
-### 5. HTTP Frontend
-**What**: S3-compatible HTTP/1.1 and HTTP/2 server.
-**In**: raw HTTP requests
-**Out**: properly formatted S3 XML responses
-**Dependencies**: Auth layer, Metadata Cluster, Storage Nodes
-**Notes**: Parse AWS Signature V4. Route to correct bucket/object operations. Handle virtual-hosted-style (`bucket.host`) and path-style (`/bucket/key`). Return correct error XML (NoSuchKey, AccessDenied, etc.). Chunked transfer for large GET/PUT.
+### 5. Per-PG Metadata (on Storage Nodes)
+**What**: Object metadata index co-located with shard data on each PG's storage nodes. Primary-based consensus with epoch fencing.
+**In**: object metadata operations (put/get/delete/list) routed by PG
+**Out**: object records (size, etag, last-modified, EC params, status), operation log for peering
+**Dependencies**: Storage Node shard I/O, Global Service (for epoch, PG assignments)
+**Notes**: PG primary (first node in placement output) serializes writes, replicates to secondaries. Epoch fencing prevents split-brain (replicas reject stale-epoch writes). Per-PG SQLite stores object records + oplog. Peering after primary failure reconciles state. User metadata (content-type, x-amz-meta-*) is NOT here — it's in shard data (C2 prepend). ListObjects = fan-out to all PG primaries, merge-sort (eventually consistent for v1). See `plans/metadata-cluster-design.md`.
 
 ### 6. Auth / IAM (minimal)
 **What**: Credential management and request authentication.
@@ -127,47 +127,81 @@ The system decomposes into these major internal layers:
 **Dependencies**: none (pure crypto)
 **Notes**: Start with static access-key/secret pairs (sufficient for most use cases). AWS Signature V4 is HMAC-SHA256 over canonical request. Presigned URLs use same mechanism. Skip full IAM policies initially — owner-only or simple allow-all per key.
 
-### 7. Multipart Staging
+### 7. HTTP Frontend
+**What**: S3-compatible HTTP/1.1 and HTTP/2 server.
+**In**: raw HTTP requests
+**Out**: properly formatted S3 XML responses
+**Dependencies**: Auth layer, Global Service, Per-PG Metadata, Storage Nodes
+**Notes**: Parse AWS Signature V4. Route bucket operations to Global Service. Route object operations by deriving PG from key, then to PG primary. Handle virtual-hosted-style (`bucket.host`) and path-style (`/bucket/key`). Return correct error XML (NoSuchKey, AccessDenied, etc.). Chunked transfer for large GET/PUT. ListObjects fans out to all PG primaries and merge-sorts.
+
+### 8. Multipart Staging
 **What**: Temporary storage for in-progress multipart uploads.
 **In**: UploadId + PartNumber + data
 **Out**: staged parts retrievable by UploadId
-**Dependencies**: Storage Node layer
-**Notes**: Parts can use the same storage infrastructure as objects (just different namespace). Track via metadata. On Complete, assemble into final EC-encoded object. On Abort, delete staged shards.
+**Dependencies**: Storage Nodes, Per-PG Metadata
+**Notes**: Parts use the same per-PG storage infrastructure as objects (tracked in per-PG metadata). On Complete, assemble into final EC-encoded object. On Abort, delete staged shards. Multipart upload records live in the PG of the target object key.
 
-### 8. Repair / Background Maintenance
-**What**: Detect and repair missing/corrupted shards; rebalance on node add/remove; periodic scrub.
-**In**: cluster health events, periodic triggers
-**Out**: healed shards, rebalanced data
-**Dependencies**: Placement, Erasure Coding, Storage Nodes
-**Notes**: Prioritize repairs that restore stripes to full width. Delay rebuilds during correlated outages (avoid burning parity unnecessarily). Bandwidth-limited repair to avoid starving client IO.
+### 9. Repair / Background Maintenance
+**What**: Detect and repair missing/corrupted shards; rebalance on node add/remove; periodic scrub; PG migration.
+**In**: cluster health events, periodic triggers, PG migration state from Global Service
+**Out**: healed shards, rebalanced data, migrated PGs
+**Dependencies**: Placement, Erasure Coding, Storage Nodes, Global Service
+**Notes**: Prioritize repairs that restore stripes to full width. Delay rebuilds during correlated outages (avoid burning parity unnecessarily). Bandwidth-limited repair to avoid starving client IO. PG migration: copy shard data + metadata from old nodes to new nodes per cluster map change, then update PG state in Global Service.
 
 ---
 
 ## Dependency Order (Suggested Build Sequence)
 
 ```
-1. Erasure Coding Engine      (no deps, pure math)
-2. Placement / Topology       (no deps, pure math)
-3. Auth / IAM                 (no deps, pure crypto)
-4. Storage Node               (deps: EC Engine)
-5. Metadata Cluster           (deps: Placement)
-6. Multipart Staging          (deps: Storage Node, Metadata)
-7. HTTP Frontend              (deps: Auth, Metadata, Storage Nodes)
-8. Repair / Background        (deps: all of the above)
+Phase 1 — leaf libraries (no deps, parallelizable):
+  1. Erasure Coding Engine      (pure math, ISA-L wrapper)
+  2. Placement / Topology       (pure math, rendezvous hashing)
+  3. Auth / IAM                 (pure crypto, SigV4)
+
+Phase 2 — core services (deps on Phase 1, parallelizable):
+  4a. Storage Node shard I/O    (deps: EC Engine)
+  4b. Global Service (Raft)     (deps: Placement)
+
+Phase 3 — integrated metadata:
+  5. Per-PG Metadata            (deps: 4a + 4b — integrates shard I/O with
+                                 epoch fencing and PG assignments from Global Service)
+
+Phase 4 — user-facing:
+  6. HTTP Frontend              (deps: Auth, Global Service, Per-PG Metadata, Storage)
+  7. Multipart Staging          (deps: Storage, Per-PG Metadata)
+
+Phase 5 — background:
+  8. Repair / Background        (deps: all of the above)
 ```
+
+### Notes on build order
+
+- **4a and 4b are independent and can be built in parallel.** The storage node shard
+  I/O (file operations, CRC, SQLite shard index) doesn't need the global service.
+  The global service (Raft, bucket DB, cluster map) doesn't need shard I/O.
+- **Phase 3 integrates them**: the per-PG metadata layer adds primary-based consensus,
+  epoch fencing, object records, and the peering protocol on top of the shard store,
+  using epochs and PG assignments from the global service.
+- **The global service is small but foundational.** It's the single source of truth for
+  cluster topology. Everything else derives PG assignments and epochs from it.
 
 ---
 
-## Key Design Decisions to Resolve Early
+## Key Design Decisions (Resolved or Leaning)
 
-| Decision | Options | Current Leaning |
+| Decision | Options | Status |
 |---|---|---|
-| Language | Rust / Go | Notes reference both; Go for simplicity |
-| Metadata store | SQLite+Raft / LMDB / distributed | Replicated SQLite (simpler) |
-| Placement algorithm | CRUSH / Rendezvous hashing | Rendezvous for simplicity |
-| EC parameters | (k, m) — e.g., (4,2), (6,3), (8,4) | Configurable, default (4,2) |
-| Consistency model | Strong / eventual | Strong preferred |
-| Wire protocol (internal) | gRPC / HTTP/2 / custom | HTTP/2 + simple binary |
+| Language | Rust / Go | **Rust** |
+| Metadata architecture | Centralized Raft cluster / per-PG metadata | **Leaning per-PG** (Ceph model). Global service for buckets + cluster map only |
+| Per-PG consensus | Per-PG Raft / primary-based with epoch fencing | **Primary-based with epoch fencing** (no per-PG Raft) |
+| Global service | SQLite+Raft | **Raft-replicated SQLite** with application-level state machine |
+| Placement algorithm | CRUSH / Rendezvous hashing | **Rendezvous hashing** (implemented) |
+| Placement groups | Yes / No | **Yes** — ~1024 PGs, set at cluster creation |
+| EC parameters | (k, m) — e.g., (4,2), (6,3), (8,4) | Configurable, default (4,2). **ISA-L** for encoding |
+| User metadata storage | In metadata index / prepended to shard data | **C2: prepend to data before EC** (metadata cluster stays lean) |
+| Consistency model | Strong / eventual | **Per-key strong** (mandatory). Eventually consistent LIST (v1) |
+| Etag format | Hex string / binary BLOB | **Binary BLOB, max 64 bytes** + etag_kind discriminator |
+| Wire protocol (internal) | gRPC / HTTP/2 / custom | Defer — trait-based API first, RPC later |
 | Encryption at rest | LUKS / per-object SSE-C | LUKS at filesystem level first |
 
 ---
