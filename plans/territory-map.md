@@ -207,10 +207,10 @@ Phase 1 — leaf libraries (no deps, parallelizable):             [COMPLETE]
   2. Placement / Topology       (pure math, rendezvous hashing)   [done]
   3. CRC64-NVME                 (ISA-L crc64_rocksoft_refl)       [done]
 
-Phase 2 — storage layer:
-  4. ShardStore trait + FileShardStore  (per-PG file I/O, CRC, SQLite shard index)
-  5. Per-PG metadata (local)           (object records in per-PG SQLite, no replication)
-  6. Bucket metadata (local)           (bucket table in SQLite, no Raft)
+Phase 2 — storage layer:                                         [COMPLETE]
+  4. ShardStore trait + FileShardStore  (per-PG file I/O, CRC, SQLite shard index) [done]
+  5. Per-PG metadata (local)           (object records in per-PG SQLite, no replication) [done]
+  6. Bucket metadata (local)           (bucket table in SQLite, no Raft) [done]
 
 Phase 3 — S3 server:
   7. Auth / SigV4               (pure crypto, needed by HTTP frontend)

@@ -5,4 +5,5 @@ members = [
     "crates/ec",
     "crates/crc64",
     "crates/placement",
+    "crates/storage",
 ]
