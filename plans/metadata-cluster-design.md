@@ -1,14 +1,19 @@
-# Metadata Cluster — Design Document
+# Metadata Service — Design Document
 
 ## Scope
 
-This document covers the design of the metadata cluster (subsystem 4 in the build
-sequence). The metadata cluster is responsible for the bucket/object namespace: it
+This document covers the design of the metadata service (subsystem 4 in the build
+sequence). The metadata service is responsible for the bucket/object namespace: it
 tracks which objects exist, their versions, and enough information to route requests
 to the right storage nodes. It is the authoritative index for the system.
 
-The metadata cluster does NOT store:
-- Shard data (that's the storage nodes)
+**Architecture**: The current leaning is **per-PG metadata (Architecture E)**, where
+object metadata lives on the same storage nodes that hold the PG's shards. A small
+**global service** (3-5 node Raft group) handles bucket operations, cluster topology,
+and PG state. There is no separate centralized metadata cluster for object records.
+
+The metadata service does NOT store:
+- Shard data (that's the storage node's shard store)
 - User-defined metadata / content-type / S3 headers (those are stored in the shard
   data as a prepended metadata blob — see storage-node-design.md, Architecture C2)
 - Raw checksums of shard data (those are per-storage-node)
@@ -21,21 +26,22 @@ object-level bookkeeping (versioning, lifecycle).
 ## Relationship to Storage Node Design
 
 The storage node design doc (storage-node-design.md) establishes several decisions
-that constrain the metadata cluster:
+that constrain the metadata service:
 
-- **Architecture C (preferred)**: The metadata cluster is the primary source for
-  namespace operations. Object metadata (content-type, x-amz-meta-*) is also embedded
-  in shard data for disaster recovery. The metadata cluster does NOT store user-defined
-  metadata.
+- **Architecture C2 (preferred)**: User metadata (content-type, x-amz-meta-*) is
+  prepended to object data before EC encoding. The metadata service does NOT store
+  user-defined metadata — it stores only the fields needed for namespace operations.
 - **Shards are fully immutable (write-once)**: CopyObject-to-self with metadata
-  changes creates entirely new shards. The metadata cluster updates its record to point
-  to the new shards.
-- **Shard identity**: The metadata cluster must track the mapping from
-  (bucket, key, version) → shard placement information.
+  changes creates entirely new shards. The metadata record is updated to reflect
+  the new version.
+- **Shard identity**: The metadata service tracks (bucket, key, version). Shard
+  locations are derived from PG placement, not stored per-object.
 - **HeadObject for user metadata**: Served from storage nodes (reading the metadata
-  prefix from shard data), NOT from the metadata cluster. The metadata cluster provides
-  routing information (which nodes hold the shards) so the frontend can fetch the
-  metadata from the right place.
+  prefix from shard data), NOT from the metadata service. The metadata service provides
+  the fixed fields (size, etag, last-modified); the frontend reads user metadata from
+  the PG's storage nodes.
+- **Per-PG co-location**: With Architecture E, the metadata index and shard data
+  are on the same nodes. The PG primary handles both metadata writes and shard I/O.
 
 ---
 
@@ -44,29 +50,30 @@ that constrain the metadata cluster:
 ```
 HTTP Frontend
      │
-     ├─── ListObjects, HeadBucket ─────► Metadata Cluster (direct response)
+     ├─── CreateBucket, ListBuckets ──► Global Service (Raft, 3-5 nodes)
      │
-     ├─── PutObject ──► Metadata Cluster (namespace entry)
-     │                  + Storage Nodes (shard data)
+     ├─── PutObject ──► PG Primary (object record + shard data on same nodes)
      │
-     ├─── GetObject ──► Metadata Cluster (routing info)
-     │                  + Storage Nodes (shard data, includes user metadata)
+     ├─── GetObject ──► PG Primary/Replica (object record + shard data)
      │
-     ├─── HeadObject ─► Metadata Cluster (size, etag, last-modified)
-     │                  + Storage Node shard 0 (user metadata, content-type)
+     ├─── HeadObject ─► PG Primary (object record: size, etag, last-modified)
+     │                  + shard 0 (user metadata, content-type)
      │
-     └─── DeleteObject ► Metadata Cluster (remove namespace entry)
-                         + Storage Nodes (delete shards, async)
+     ├─── ListObjects ► Fan-out to all PG primaries, merge-sort
+     │
+     └─── DeleteObject ► PG Primary (mark PendingDelete + delete shards async)
 ```
 
-The metadata cluster is on the critical path for every S3 operation except scrub and
-repair. Its latency and availability directly determine system performance.
+With per-PG metadata, most S3 operations go directly to PG nodes — no separate
+metadata cluster in the request path. Only bucket-level operations and cluster
+topology changes go to the global service. This means per-object latency depends
+on PG primary availability, not on a central metadata cluster.
 
 ---
 
-## What the Metadata Cluster Stores
+## What the Metadata Service Stores
 
-### Per-bucket record
+### Per-bucket record (global service)
 
 ```
 bucket_name (primary key, string, max 63 chars)
@@ -78,7 +85,7 @@ bucket_name (primary key, string, max 63 chars)
 
 Buckets are a flat namespace — no nesting. Bucket names are globally unique.
 
-### Per-object record
+### Per-object record (per-PG, on PG's storage nodes)
 
 This is the core record. One record per (bucket, key, version).
 
@@ -86,14 +93,17 @@ This is the core record. One record per (bucket, key, version).
 (bucket, key, version_id) → ObjectRecord
   - size (u64, original object size in bytes — NOT including prepended metadata)
   - etag (fixed-size binary, max 64 bytes — see etag format below)
+  - etag_kind (u8)
   - last_modified (u64, unix millis)
   - storage_class (u8, initially just STANDARD)
   - ec_k (u8)
   - ec_m (u8)
-  - shard_placement_key (bytes, the key used for placement — may be object key hash,
-    PG ID, or composite)
   - status (u8: Live, DeleteMarker, PendingDelete)
 ```
+
+Note: no placement_key or shard locations. The PG is derived from the object key:
+`pg_id = hash(bucket + "/" + key) % pg_count`. Shard locations are derived from the
+PG's current node mapping. This keeps the per-object record small and fixed-size.
 
 ### What is NOT stored here
 
@@ -103,14 +113,14 @@ This is the core record. One record per (bucket, key, version).
 - **per-shard checksums** — in each storage node's local metadata DB
 - **shard data** — on storage nodes
 
-The metadata cluster record is intentionally small and fixed-size. Variable-length
-user metadata (up to 2KB) does not flow through Raft consensus. This keeps write
-transactions fast and replication costs predictable.
+The per-object record is intentionally small and fixed-size. Variable-length
+user metadata (up to 2KB) is in shard data, not in the metadata index. This keeps
+per-PG replication fast and predictable.
 
 ### Open question: Placement generation and the rebalance problem
 
 Since the placement layer is deterministic (given a key and cluster map, any node
-can compute shard locations), the metadata cluster may not need to store explicit
+can compute shard locations), the metadata service may not need to store explicit
 shard locations. But this breaks down during topology changes.
 
 **The problem**: When the cluster map changes (node added, removed, reweighted),
@@ -129,7 +139,7 @@ placed with. Reads use that version's cluster map to compute placement. The syst
 keeps a history of recent cluster maps.
 
 After the repair subsystem migrates a shard to its new location, it updates the
-object's generation in the metadata cluster.
+object's generation in the metadata service.
 
 - Pro: Reads always go to the correct location.
 - Pro: Simple, explicit — no guessing or fallback.
@@ -141,7 +151,7 @@ object's generation in the metadata cluster.
 #### Approach 2: Placement groups (PGs)
 
 Instead of per-object placement, hash objects into a fixed number of placement groups
-(e.g. 1024-8192 PGs). Each PG maps to a set of nodes. The metadata cluster stores
+(e.g. 1024-8192 PGs). Each PG maps to a set of nodes. The global service stores
 which PG an object belongs to (just `pg_id = hash(key) % pg_count`). Migration status
 is tracked per PG, not per object.
 
@@ -210,64 +220,333 @@ This question is closely related to whether we use placement groups. Without PGs
 This is the standard approach for a reason — it bounds the management overhead
 regardless of object count.
 
-**Open question**: Do we adopt PGs? The placement crate already supports them as a
-caller concern (`placer.place(&pg_id.to_le_bytes(), ...)`). The question is whether
-the metadata cluster and repair subsystem are designed around PG-level tracking.
+**Resolved: Adopt placement groups.** The per-PG migration tracking is far more
+manageable than per-object metadata updates or multi-fallback read paths.
 
-If PGs are adopted:
-- The metadata record doesn't need a placement generation. It stores `placement_key`
-  (which may be the PG ID or the raw object key).
-- A separate PG state table tracks migration status per PG.
-- The cluster map is versioned. Each PG knows which cluster map version its current
-  placement was computed from.
+PG count is configurable at cluster creation time, with a sensible default (e.g.
+1024 for small clusters, 4096+ for larger ones). PG count cannot change after
+creation without a data migration (PG split/merge), which is out of scope for v1.
 
-If PGs are not adopted:
-- We likely need Approach 4 (two-phase map) for simplicity, accepting that topology
-  changes are slow. Or Approach 1 (per-object generation), accepting that rebalance
-  writes many metadata records.
+The per-object metadata record does NOT need a placement generation. It does not
+even need to store a placement_key — the PG is derived from the object key:
 
-**Recommendation**: Adopt placement groups. The per-PG migration tracking is far
-more manageable than per-object metadata updates or multi-fallback read paths. PG
-count should be configurable at cluster creation time, with a sensible default (e.g.
-1024 for small clusters, 4096+ for larger ones).
+```
+pg_id = hash(bucket + "/" + key) % pg_count
+```
 
-This means the metadata per-object record does NOT need a placement generation. The
-per-object record stores the `placement_key` (from which the PG is derived). PG
-migration state is tracked in a separate, small table.
+PG migration state is tracked in a separate, small table (see PG State Table below).
+
+---
+
+## Open question: Centralized vs per-PG metadata
+
+The rest of this document describes a **centralized** metadata cluster (a single Raft
+group that holds all object records). But there is a fundamentally different
+architecture: **per-PG metadata**, where each PG's storage nodes also own the object
+metadata for that PG. This eliminates the separate metadata cluster entirely.
+
+### Architecture E: Per-PG metadata (Ceph model)
+
+Instead of a central metadata service, each PG's nodes hold both shards and object
+metadata. There is no separate metadata cluster for object records.
+
+```
+Global service (tiny, 3-5 nodes):
+  - Bucket table (create/delete/list buckets, versioning config)
+  - Cluster map + PG state (node membership, PG migration)
+  - PG count
+  ~ a few hundred records total
+
+Per-PG (on PG's storage nodes):
+  - Object records for all objects in this PG
+  - Shard data
+  - Per-object user metadata (in shard prefix, C2)
+```
+
+**Object operations** go directly to the PG's nodes:
+
+```
+PutObject:
+  1. hash(bucket/key) % pg_count → PG
+  2. PG → nodes (via placement)
+  3. Prepend user metadata, EC-encode, write shards to PG's nodes
+  4. PG's primary node commits the object record to PG-local metadata
+  5. Done — one set of nodes, one round-trip for metadata
+
+GetObject:
+  1. hash(bucket/key) → PG → nodes
+  2. Read object record from any PG node (or primary)
+  3. Read k shards from PG's nodes
+  4. Reconstruct, strip metadata prefix, return
+
+HeadObject:
+  1. hash(bucket/key) → PG → nodes
+  2. Read object record from PG node (size, etag, etc.)
+  3. Read shard prefix for user metadata (same nodes)
+  4. Return
+```
+
+**Per-PG consensus**: Each PG needs its own mechanism for consistent metadata writes.
+The key question is whether this requires full Raft per PG or something lighter.
+
+#### Option 1: Per-PG Raft
+
+Each PG has a Raft group formed by its k+m nodes. With (4,2) and 6 nodes per PG, a
+quorum is 4.
+
+- Pro: Self-contained strong consistency per PG.
+- Con: 1024-4096 Raft groups running simultaneously — each with its own leader
+  election, log, term management, and snapshots. Enormous implementation and
+  operational complexity.
+
+**Not recommended** — too heavyweight for this use case.
+
+#### Option 2: Primary-based with epoch fencing (Ceph model)
+
+This is how Ceph handles PG consensus without per-PG Raft:
+
+1. **The global service** (a small Raft/Paxos group, 3-5 nodes) maintains the
+   cluster map with a monotonically increasing **epoch** number. This is the single
+   source of truth for cluster membership.
+
+2. **PG primary is determined by placement**, not election. The first node in the
+   placement output for that PG is the primary. No per-PG leader election needed —
+   primary is a deterministic function of (PG ID, cluster map).
+
+3. **Writes go to the primary**. The primary replicates to secondaries synchronously.
+   Once replicas acknowledge, the primary responds to the client. The primary
+   serializes all writes for this PG — giving per-key linearizability.
+
+4. **On failure**: The global service detects the failure (heartbeats), increments
+   the epoch, publishes a new cluster map. The new primary for affected PGs is
+   determined by placement (next eligible node in the list). No election.
+
+5. **Epoch fencing prevents split-brain**: If the old primary tries to accept writes
+   with a stale epoch, replicas reject it — they've seen a newer epoch. The epoch
+   acts as a fencing token. This is the key correctness mechanism.
+
+6. **Peering**: When a new primary takes over after a failure, it contacts the other
+   replicas to reconcile state ("what's the latest version of each object in this
+   PG?"). They exchange short PG operation logs and agree on the authoritative state.
+   This is simpler than full Raft log replay — it only happens after failures, not
+   during normal operation.
+
+- Pro: **No per-PG Raft.** No leader election, no log, no term management per PG.
+  The global service (one small Raft group) handles all the hard distributed systems
+  work. PGs are just primary-backup replication with epoch fencing.
+- Pro: Proven at massive scale (Ceph runs millions of PGs this way).
+- Pro: Primary determination is deterministic from the cluster map — instant
+  "election" on failure (just recompute placement with the new map).
+- Pro: Normal-case write path is simple: client → primary → replicate to secondaries
+  → ack. No consensus protocol in the write path.
+- Con: Relies on the global service for failure detection and epoch management. If the
+  global service is unavailable, PGs cannot handle failures (though existing primaries
+  continue serving).
+- Con: Peering after failures adds latency before a PG is available again (must
+  reconcile state with replicas).
+- Con: Must implement the peering protocol correctly — this is where correctness bugs
+  would live.
+
+#### Option 3: Leverage shard writes (C2 prepend, no separate metadata replication)
+
+With C2 (metadata prepended to data before EC encoding), writing k+m shards already
+replicates the metadata across all PG nodes as part of the shard data. The PG-local
+SQLite index is derived state — it can be rebuilt from the shards. Metadata
+consistency follows from shard write consistency. The local index is updated after
+shard writes succeed and serves as a cache/index.
+
+- Pro: No separate metadata replication mechanism at all.
+- Pro: The shard write path IS the metadata replication path.
+- Con: Conditional PUT still needs a serialization point — two concurrent PUTs to the
+  same key must be ordered. This requires a primary or lock, which brings us back to
+  Option 2.
+- Con: Rebuilding the index from shards after a failure is slow (must read all shards).
+
+**Option 3 works for the data path but not for conditional operations.** It can be
+combined with Option 2: the primary serializes writes (for conditional PUT ordering),
+the shard write replicates the data + metadata, and the local index is derived state.
+
+#### Recommended: Option 2 (primary-based with epoch fencing)
+
+This gives us per-key linearizability (the primary serializes writes per PG) without
+the overhead of running thousands of Raft groups. The global service handles the
+hard distributed systems work (failure detection, epoch management, map distribution).
+Combined with C2 (metadata in shard data), the local per-node metadata index is
+derived state that can be rebuilt from shards if needed.
+
+**Pros of per-PG metadata**:
+- **No separate metadata cluster to build and operate.** Eliminates an entire
+  subsystem. Storage nodes are the metadata nodes.
+- **Natural horizontal scaling.** Write throughput scales with PG count (each PG has
+  independent consensus). No single Raft leader bottleneck.
+- **Co-locality.** Metadata and data are on the same nodes. Fewer network round-trips
+  for PutObject and GetObject.
+- **PG migration moves everything together.** No split-brain between a metadata
+  cluster and storage nodes during topology changes.
+- **Disaster recovery is simpler.** Reconstruct k shards → get both data and metadata.
+  No separate metadata backup to manage.
+
+**Cons of per-PG metadata**:
+- **ListObjects requires fan-out.** Must query all PGs (or all nodes), merge-sort
+  results. With 1024 PGs, that's 1024 parallel queries. Bounded but expensive.
+  Options:
+  1. **Fan-out and merge**: Query all PG primaries, merge-sort. O(pg_count) queries
+     per LIST. Each query is cheap (local SQLite index scan). Can be parallelized.
+  2. **Global LIST index**: Maintain a secondary index for listing, updated
+     asynchronously after PG-level writes. LIST queries the global index. Slightly
+     stale — eventually consistent for LIST (AWS S3 was eventually consistent for
+     LIST until 2020). Strongly consistent for GET/PUT/DELETE.
+  3. **Hybrid**: Fan-out for small result sets, global index for large prefix scans.
+- **Bucket-level operations still need a global service.** CreateBucket, DeleteBucket,
+  ListBuckets, versioning config. This service is tiny but still needs consensus.
+- **Many small Raft groups.** If using per-PG Raft: 1024+ simultaneous Raft groups.
+  Each has its own leader election, log, snapshots. Implementation and operational
+  complexity.
+- **Strong LIST consistency is harder.** With a centralized metadata cluster,
+  ListObjects is a single query — trivially consistent. With per-PG metadata, LIST
+  must assemble results from multiple PGs, and a concurrent PutObject to one PG
+  might not be visible in the LIST if the query already passed that PG. Achieving
+  strong LIST consistency requires either a global snapshot or a two-phase LIST
+  protocol.
+
+### Centralized (current design) vs per-PG metadata
+
+| Property | Centralized metadata | Per-PG metadata |
+|---|---|---|
+| Write throughput | Single Raft leader (bottleneck) | Scales with PG count |
+| Read (Get/Head) | Two hops (metadata cluster + storage) | One hop (PG nodes) |
+| ListObjects | Single query, trivially consistent | Fan-out to all PGs, eventually consistent for v1 |
+| Operational complexity | Two systems (metadata cluster + storage) | One system (storage nodes do both) |
+| Failure blast radius | Metadata cluster failure → all ops fail | One PG failure → only that PG's objects |
+| Scaling model | Vertical (bigger metadata node) | Horizontal (more nodes = more PGs) |
+| Per-PG consensus | N/A (one Raft group) | Primary-based with epoch fencing (lightweight) |
+| Strong LIST consistency | Easy | Hard (requires coordination across PGs) |
+
+### Discussion
+
+Three key decisions have shifted the balance toward per-PG metadata:
+
+1. **Eventually consistent LIST is acceptable for v1.** AWS S3 was eventually
+   consistent for LIST for 14 years (2006-2020). This removes the strongest
+   argument for centralized metadata (trivially consistent LIST). Per-key strong
+   consistency (conditional PUT, read-after-write) is still mandatory and is
+   naturally provided by per-PG consensus.
+
+2. **Per-PG consensus does not require per-PG Raft.** Primary-based consensus with
+   epoch fencing (Option 2, Ceph model) eliminates the implementation complexity of
+   running thousands of Raft groups. The global service (one small Raft group) handles
+   failure detection and epoch management. PGs use simple primary-backup replication.
+
+3. **Per-PG metadata eliminates an entire subsystem.** No separate metadata cluster
+   to build, operate, or keep consistent with storage nodes. PG migration moves data
+   and metadata together. Disaster recovery is simpler (reconstruct shards → get both).
+
+**Current leaning: per-PG metadata (Architecture E) with primary-based consensus.**
+
+The centralized design remains a valid fallback if per-PG proves too complex during
+implementation. The key insurance policy: keep the per-object schema and operations
+identical regardless of where they live. If centralized is needed, it's the same
+schema in a single Raft group instead of distributed across PGs.
+
+Remaining concerns with per-PG:
+- **ListObjects fan-out**: 1024 parallel queries, merge-sort. Bounded but adds
+  latency. Can be mitigated with a global LIST index (secondary, eventually
+  consistent) for large prefix scans.
+- **Peering protocol correctness**: The primary-based consensus model requires a
+  correct peering implementation for failure recovery. This is where bugs would live.
+- **Global service as single point of failure for topology changes**: If the global
+  service is down, PGs cannot handle failures (though existing primaries continue
+  serving reads and writes).
 
 ---
 
 ## Consistency Model
 
-The territory map says "Strong preferred." For an S3-compatible system, this means:
+### Per-key consistency (priority)
 
-- **Read-after-write consistency**: A successful PutObject is immediately visible to
-  subsequent GetObject and ListObjects calls. AWS S3 provides this as of December 2020.
-- **Read-after-delete consistency**: A successful DeleteObject is immediately reflected.
-- **List consistency**: ListObjects reflects all completed writes and deletes.
+The most important consistency guarantee is **per-key strong consistency**:
 
-### Implications
+- **Read-after-write**: A successful PutObject is immediately visible to subsequent
+  GetObject and HeadObject calls for that key.
+- **Read-after-delete**: A successful DeleteObject is immediately reflected for that
+  key.
+- **Conditional PUT**: `If-None-Match: *` (create-only) and `If-Match` (update-only)
+  must be linearizable — two concurrent conditional PUTs to the same key must not
+  both succeed.
 
-Strong consistency requires that all metadata operations go through a single
-serialized log (Raft) or equivalent. Eventual consistency would allow stale reads
-but would violate S3's current consistency guarantees.
+Per-key consistency is critical for correctness and is what most applications depend
+on. It is naturally provided by per-PG consensus — all operations on a given key go
+to the same PG, which has a single serialization point.
 
-This means:
-- All writes (Put, Delete) go through Raft leader.
-- Reads (Get, Head, List) can be served from:
-  - **Leader only**: Simplest. Consistent. But leader becomes a bottleneck.
-  - **Any replica with linearizable read (ReadIndex)**: Raft ReadIndex protocol
-    confirms the leader is still the leader, then serves from local state. Lower
-    latency, distributed read load. One extra round-trip to leader per read.
-  - **Lease-based reads**: Leader grants time-based leases; replicas serve reads
-    within the lease. Fastest, but depends on clock synchronization.
+### LIST consistency (lower priority)
 
-**Recommendation**: Start with leader reads (simplest). Move to ReadIndex when read
-throughput becomes a bottleneck. Lease-based reads are an optimization for later.
+- **Strongly consistent LIST**: ListObjects reflects all completed writes and deletes
+  at the time the LIST is issued. AWS S3 provides this as of December 2020.
+- **Eventually consistent LIST**: ListObjects may not immediately reflect very recent
+  writes or deletes. A second LIST shortly after will see them.
+
+AWS S3 was eventually consistent for LIST for its first ~14 years (2006-2020). Many
+applications tolerate eventually consistent LIST. Making LIST strongly consistent is
+significantly harder in a distributed architecture.
+
+### How AWS S3 achieved strong consistency
+
+Reference: Werner Vogels, "Diving Deep on S3 Consistency" (April 2021).
+https://www.allthingsdistributed.com/2021/04/s3-strong-consistency.html
+
+S3's architecture has three components relevant to consistency:
+
+1. **Persistence tier**: The authoritative metadata store. Eventually consistent on
+   its own (replication lag across nodes).
+2. **Cache layer**: Serves most reads. Fast but potentially stale.
+3. **Witness**: A lightweight in-memory service that tracks recent writes. On every
+   read, the cache checks with the witness: "has this object been modified since my
+   cached version?" If stale, the cache refreshes from the persistence tier.
+
+The witness is the key insight: it's small, fast (in-memory, no disk I/O), and only
+tracks staleness — not the actual metadata. It acts as a "read barrier" that prevents
+stale reads without requiring the persistence tier itself to be strongly consistent.
+
+This approach is relevant to our design because it decouples per-key consistency
+(handled by the witness + cache) from the persistence tier's replication model.
+
+### Implications for our architecture
+
+**With centralized metadata cluster**: All operations go through a single Raft group.
+Both per-key and LIST consistency are trivial — Raft serializes everything.
+
+**With per-PG metadata (Architecture E)**:
+- Per-key consistency is natural — each PG has its own consensus point.
+- LIST consistency requires coordination across PGs. Options:
+  1. **Accept eventually consistent LIST** for v1. Most applications tolerate this.
+     LIST results may briefly miss very recent writes to other PGs. Per-key operations
+     (Get, Put, Delete, conditional Put) are still strongly consistent.
+  2. **Global LIST index with witness**: Maintain a secondary index for LIST queries,
+     with a witness mechanism to detect staleness. Adds complexity but achieves strong
+     LIST consistency.
+  3. **Fan-out with snapshot barrier**: Issue LIST to all PGs at a consistent point in
+     time (logical clock or barrier protocol). Complex to implement correctly.
+
+**Recommendation**: Per-key strong consistency is mandatory. Eventually consistent
+LIST is acceptable for v1 — it was good enough for S3 for 14 years. Strong LIST
+consistency can be added later via a witness-style mechanism or global index if
+needed.
 
 ---
 
 ## Consensus and Replication
+
+### Scope note
+
+This section describes the Raft-replicated SQLite approach. In the per-PG architecture
+(Architecture E, current leaning), this applies **only to the global service** (bucket
+table, cluster map, PG state — a few hundred records). Per-PG object metadata uses
+primary-based consensus with epoch fencing (see "Per-PG consensus" section above).
+
+In the centralized architecture, this applies to all metadata (millions of object
+records in a single Raft group).
+
+The design below is written for the general case and applies to both.
 
 ### Raft-replicated SQLite
 
@@ -356,7 +635,11 @@ needs (especially snapshot and membership change support).
 
 ## Schema Design
 
-### SQLite schema (per replica)
+With per-PG metadata (Architecture E), there are two schemas:
+- **Global service** (Raft-replicated, 3-5 nodes): buckets, pg_state, cluster_maps
+- **Per-PG** (on each PG's storage nodes): objects, multipart_uploads, multipart_parts
+
+### Global service schema (Raft-replicated SQLite)
 
 ```sql
 -- Bucket table
@@ -364,11 +647,40 @@ CREATE TABLE buckets (
     name          TEXT PRIMARY KEY,
     owner_id      INTEGER NOT NULL,
     created_at    INTEGER NOT NULL,  -- unix millis
+    region        INTEGER NOT NULL DEFAULT 0,  -- u16 enum, maps to region name via config
     versioning    INTEGER NOT NULL DEFAULT 0  -- 0=Disabled, 1=Enabled, 2=Suspended
 );
 
+-- Placement group state table
+-- Tracks PG → node mapping and migration status during topology changes.
+-- pg_count is a cluster-level constant set at creation time.
+CREATE TABLE pg_state (
+    pg_id             INTEGER PRIMARY KEY,  -- 0..pg_count-1
+    map_version       INTEGER NOT NULL,     -- cluster map version this PG was placed with
+    status            INTEGER NOT NULL DEFAULT 0,  -- 0=Stable, 1=Migrating, 2=Splitting (future)
+    -- node assignments are derived from placement(pg_id, cluster_map[map_version])
+    -- during migration, both map_version and map_version+1 assignments are valid
+    migration_started INTEGER              -- unix millis, NULL if not migrating
+);
+
+-- Cluster map history (recent versions only — old versions pruned after all PGs migrate)
+CREATE TABLE cluster_maps (
+    version       INTEGER PRIMARY KEY,
+    map_data      BLOB NOT NULL,          -- serialized ClusterMap (nodes, weights, topology)
+    created_at    INTEGER NOT NULL         -- unix millis
+);
+```
+
+### Per-PG schema (per storage node, one SQLite DB per PG)
+
+Each storage node has one SQLite database per PG it participates in. The PG primary
+replicates writes to secondaries. This schema is derived state — it can be rebuilt
+from shard data (C2 prepend) if needed.
+
+```sql
 -- Object table: one row per (bucket, key, version)
 -- For unversioned buckets, version_id is a fixed sentinel (e.g. "null")
+-- Objects are in this DB because hash(bucket/key) % pg_count = this PG's ID.
 CREATE TABLE objects (
     bucket        TEXT NOT NULL,
     key           TEXT NOT NULL,
@@ -380,7 +692,6 @@ CREATE TABLE objects (
     storage_class INTEGER NOT NULL DEFAULT 0,
     ec_k          INTEGER NOT NULL,
     ec_m          INTEGER NOT NULL,
-    placement_key BLOB NOT NULL,
     status        INTEGER NOT NULL DEFAULT 0,  -- 0=Live, 1=DeleteMarker, 2=PendingDelete
     PRIMARY KEY (bucket, key, version_id)
 );
@@ -390,6 +701,19 @@ CREATE INDEX idx_objects_list ON objects (bucket, key);
 
 -- Index for ListObjectVersions: all versions of an object
 CREATE INDEX idx_objects_versions ON objects (bucket, key, last_modified DESC);
+
+-- PG operation log (for peering after failures)
+-- Recent operations, retained for a configurable window.
+-- During peering, new primary exchanges oplog with replicas to reconcile state.
+CREATE TABLE pg_oplog (
+    seq           INTEGER PRIMARY KEY AUTOINCREMENT,
+    op_type       INTEGER NOT NULL,  -- 0=Put, 1=Delete, 2=DeleteMarker
+    bucket        TEXT NOT NULL,
+    key           TEXT NOT NULL,
+    version_id    TEXT NOT NULL,
+    epoch         INTEGER NOT NULL,  -- cluster map epoch when op was committed
+    timestamp     INTEGER NOT NULL   -- unix millis
+);
 
 -- Multipart uploads (in-progress)
 CREATE TABLE multipart_uploads (
@@ -405,13 +729,13 @@ CREATE TABLE multipart_uploads (
 CREATE INDEX idx_multipart_bucket ON multipart_uploads (bucket, key);
 
 -- Multipart parts (completed parts for an in-progress upload)
+-- No placement_key: PG is derived from the parent object's key
 CREATE TABLE multipart_parts (
     upload_id     TEXT NOT NULL,
     part_number   INTEGER NOT NULL,
     size          INTEGER NOT NULL,
     etag          BLOB NOT NULL,
     etag_kind     INTEGER NOT NULL,
-    placement_key BLOB NOT NULL,
     PRIMARY KEY (upload_id, part_number)
 );
 ```
@@ -437,9 +761,20 @@ CREATE TABLE multipart_parts (
   SHA-512. If we default to CRC64-NVME for internal etags, that's only 8 bytes per
   object — very compact.
 
-- **placement_key**: The key used for rendezvous hashing placement. This may be a hash
-  of the object key, or a PG ID, or a composite. The placement layer computes shard
-  locations from this key + the cluster map. Not interpreted by the metadata cluster.
+- **No placement_key in object records**: The PG is derived deterministically from
+  the object key: `pg_id = hash(bucket + "/" + key) % pg_count`. Shard locations are
+  derived from the PG's node mapping (looked up in `pg_state` + `cluster_maps`). This
+  keeps the per-object record minimal — no variable-length placement data.
+
+- **pg_state**: Tracks migration status per PG. In steady state, all PGs have
+  `status = Stable` and their `map_version` matches the current cluster map. During a
+  topology change, affected PGs transition to `Migrating` — reads try both old and new
+  node assignments. Once all shards for a PG are migrated, it returns to `Stable` with
+  the new `map_version`.
+
+- **cluster_maps**: History of recent cluster map versions. Old versions are retained
+  as long as any PG references them (i.e. has a `map_version` pointing to that
+  version). Once all PGs have migrated past a version, it can be pruned.
 
 - **status**: Live objects are returned by ListObjects. DeleteMarkers are only visible
   in ListObjectVersions. PendingDelete objects are being garbage collected (shards not
@@ -454,29 +789,34 @@ CREATE TABLE multipart_parts (
 
 ## Operations
 
+With per-PG metadata (Architecture E), object operations go to PG nodes. The PG
+primary serializes writes and replicates to secondaries using epoch-fenced
+primary-backup replication.
+
 ### PutObject
 
 ```
 1. Frontend receives object data + headers
 2. Frontend prepends user metadata to object data (metadata blob)
 3. Frontend EC-encodes the combined stream into k+m shards
-4. Placement layer determines shard → node assignments
-5. Frontend writes shards to storage nodes (parallel)
-6. Once sufficient shards are durably written (quorum or all):
-   7. Frontend proposes PutObjectMeta command to Raft leader
-   8. Raft commits the command
-   9. Leader applies: INSERT or UPDATE objects record
-   10. Return success to client
+4. Frontend derives PG: pg_id = hash(bucket + "/" + key) % pg_count
+5. Frontend looks up PG's current node mapping (from pg_state + cluster_map)
+6. Placement layer determines shard → node assignments within the PG's node set
+7. Frontend writes shards to storage nodes (parallel)
+8. Once sufficient shards are durably written (quorum or all):
+   9. PG primary commits the object record (replicates to secondaries)
+   10. Primary confirms write
+   11. Return success to client
 ```
 
 **Write ordering**: Shard data is written BEFORE the metadata record. If the frontend
-crashes between step 5 and step 7, orphan shards exist on storage nodes but the
-metadata cluster has no record. These orphans are cleaned up by the repair subsystem
-(see Garbage Collection below). This is safer than metadata-first, which would leave
-a metadata record pointing to missing shards.
+crashes between steps 7 and 9, orphan shards exist on storage nodes but no metadata
+record exists. These orphans are cleaned up by the repair subsystem (see Garbage
+Collection below). This is safer than metadata-first, which would leave a metadata
+record pointing to missing shards.
 
-**Atomicity**: The PutObject is not atomic across the metadata cluster and storage
-nodes. There is a window between shard writes and metadata commit where:
+**Atomicity**: The PutObject is not fully atomic. There is a window between shard
+writes and metadata commit where:
 - Shards exist but are not reachable (no metadata record yet).
 - A crash loses the metadata write — orphan shards need cleanup.
 
@@ -489,14 +829,19 @@ orphans and need garbage collection.
 ### GetObject
 
 ```
-1. Frontend queries metadata cluster: SELECT ... WHERE bucket=? AND key=?
-   (for latest live version)
-2. Metadata cluster returns: size, etag, ec_k, ec_m, placement_key, version_id
-3. Frontend computes shard locations from placement_key + cluster map
-4. Frontend reads k shards from storage nodes (parallel)
-5. Frontend reconstructs the original byte stream
-6. Frontend strips the metadata prefix, returns object data + headers to client
+1. Frontend derives PG: pg_id = hash(bucket + "/" + key) % pg_count
+2. Frontend looks up PG's node mapping from cluster map
+   (if PG is Migrating, try new mapping first, fall back to old)
+3. Frontend queries PG primary (or any replica for reads):
+   SELECT size, etag, ec_k, ec_m, version_id FROM objects WHERE ...
+4. PG node returns the object record
+5. Frontend reads k shards from PG's storage nodes (parallel)
+6. Frontend reconstructs the original byte stream
+7. Frontend strips the metadata prefix, returns object data + headers to client
 ```
+
+With per-PG metadata, steps 3-4 and 5-6 go to the same set of nodes. The metadata
+query and shard reads can be pipelined or combined.
 
 For range requests, the frontend computes which shard bytes correspond to the
 requested byte range (accounting for the metadata prefix offset) and reads only the
@@ -505,25 +850,23 @@ necessary portions.
 ### HeadObject
 
 ```
-1. Frontend queries metadata cluster: SELECT size, etag, last_modified, ...
-   WHERE bucket=? AND key=? (latest live version)
-2. Metadata cluster returns the fixed fields (size, etag, last-modified, etc.)
+1. Frontend derives PG, looks up node mapping
+2. Frontend queries PG node for object record (size, etag, last-modified, etc.)
 3. For user-defined metadata (content-type, x-amz-meta-*):
-   a. Frontend computes shard 0 location from placement_key + cluster map
-   b. Reads metadata prefix from shard 0 (or reconstructs from k shards if
-      shard 0 is unavailable or object is very small)
-   c. Parses user metadata from the prefix
-4. Returns combined response (metadata cluster fields + shard metadata fields)
+   a. Reads metadata prefix from shard 0 on same PG nodes (or reconstructs
+      from k shards if shard 0 is unavailable or object is very small)
+   b. Parses user metadata from the prefix
+4. Returns combined response (object record fields + shard metadata fields)
 ```
 
-HeadObject is two round-trips: one to the metadata cluster (fast), one to a storage
-node (small read). For large objects, step 3 is a partial read of shard 0. For small
-objects, it's a full k-shard reconstruction (but the shards are tiny).
+With per-PG co-location, HeadObject goes to the same set of nodes for both the
+metadata record and the shard prefix read. For large objects, step 3 is a small
+partial read. For small objects, it's a full k-shard reconstruction (but tiny).
 
 ### ListObjectsV2
 
 ```
-1. Frontend queries metadata cluster:
+1. Frontend fans out to all PG primaries:
    SELECT key, size, etag, last_modified, storage_class
    FROM objects
    WHERE bucket = ?
@@ -532,39 +875,44 @@ objects, it's a full k-shard reconstruction (but the shards are tiny).
      AND status = 0                 -- Live only
    ORDER BY key
    LIMIT ?                          -- MaxKeys (default 1000)
-2. If delimiter is specified, apply common-prefix grouping logic
-3. Return results to client
+2. Frontend merge-sorts results from all PGs
+3. If delimiter is specified, apply common-prefix grouping logic
+4. Return results to client
 ```
 
-ListObjects is served entirely from the metadata cluster. No storage node I/O. No
-user-defined metadata is returned (S3 spec does not include it in list responses).
+ListObjects requires fan-out to all PG primaries (or all nodes, each serving its
+PGs). This is the most expensive operation in the per-PG model. With 1024 PGs, it's
+1024 parallel queries — each cheap (local SQLite index scan), but the fan-out adds
+latency. No user-defined metadata is returned (S3 spec does not include it).
 
-This is the most performance-sensitive metadata operation for many workloads (e.g.
-tools that enumerate large buckets). SQLite B-tree index on (bucket, key) gives
-efficient prefix scans.
+SQLite B-tree index on (bucket, key) gives efficient prefix scans per PG. The
+merge-sort overhead is bounded by pg_count × result_limit.
+
+Eventually consistent for v1: a concurrent PutObject to one PG may not appear in a
+LIST that has already passed that PG. Per-key operations (Get, Put, Delete) are
+still strongly consistent.
 
 ### DeleteObject
 
 ```
 Unversioned bucket:
-1. Frontend proposes DeleteObjectMeta to Raft leader
-2. Raft commits
-3. Leader applies: UPDATE objects SET status = PendingDelete WHERE ...
+1. Frontend derives PG, sends to PG primary
+2. PG primary: UPDATE objects SET status = PendingDelete WHERE ...
+3. Primary replicates to secondaries
 4. Return success to client (object no longer visible in List/Get)
-5. Background: garbage collector reads PendingDelete records, deletes shards
-   from storage nodes, then DELETE the metadata record
+5. Background: PG primary's garbage collector deletes shards from PG's nodes,
+   then DELETEs the metadata record
 
 Versioned bucket:
-1. Frontend proposes InsertDeleteMarker to Raft leader
-2. Raft commits
-3. Leader applies: INSERT objects (status = DeleteMarker, ...)
+1. Frontend derives PG, sends to PG primary
+2. PG primary: INSERT objects (status = DeleteMarker, ...)
+3. Primary replicates to secondaries
 4. Return success + new version_id to client
 5. Previous version's shards are NOT deleted (still accessible by version_id)
 ```
 
 Delete is two-phase: metadata marks the object as deleted (fast, synchronous), then
-shard deletion happens asynchronously. This keeps the delete response fast and
-prevents the metadata cluster from blocking on storage node I/O.
+shard deletion happens asynchronously. This keeps the delete response fast.
 
 ### DeleteBucket
 
@@ -636,17 +984,19 @@ When an object is overwritten or deleted, its shards become orphans. The metadat
 cluster marks the old record as PendingDelete. A background garbage collector:
 
 ```
-1. Query metadata cluster for PendingDelete records (batched, rate-limited)
+1. PG primary queries its local PG database for PendingDelete records (batched,
+   rate-limited)
 2. For each PendingDelete record:
-   a. Compute shard locations from placement_key + cluster map
-   b. Send DeleteShard to each storage node
-   c. Once all shards confirmed deleted (or confirmed absent):
-      d. Delete the metadata record from the metadata cluster
-3. If a storage node is unreachable, retry later (do not delete the metadata
-   record until all shards are confirmed gone)
+   a. Send DeleteShard to each node in this PG's node set
+   b. Once all shards confirmed deleted (or confirmed absent):
+      c. DELETE the metadata record from the PG database
+      d. Replicate the deletion to secondaries
+3. If a node is unreachable, retry later (do not delete the metadata record
+   until all shards are confirmed gone)
 ```
 
-The garbage collector runs on the Raft leader (or a designated node). It must be
+With per-PG metadata, the garbage collector runs on each PG primary — it only needs
+to clean up shards for its own PG's objects, on its own PG's nodes. It must be
 idempotent — deleting a shard that's already gone returns success.
 
 ### Open question: GC timing
@@ -665,45 +1015,38 @@ interfere with client I/O.
 
 ## Cluster Membership and Availability
 
-### Raft cluster size
+### Global service (Raft cluster)
 
+The global service is a small Raft group responsible for bucket metadata, cluster maps,
+and PG state. With per-PG metadata (Architecture E), this is the only Raft group in
+the system.
+
+**Raft cluster size**:
 - **3 replicas**: Tolerates 1 failure. Minimum for production.
 - **5 replicas**: Tolerates 2 failures. Better for larger deployments.
 - **1 replica**: Development only. No fault tolerance.
 
-### Leader election and failover
+**Leader election and failover**: Raft handles leader election automatically. Typical
+election timeout: 1-5 seconds. During leader election, bucket operations and cluster
+map updates are blocked. Per-PG object operations (Get, Put, Delete) are NOT blocked
+— they go to PG primaries, not the global service.
 
-Raft handles leader election automatically. Typical election timeout: 1-5 seconds.
-During leader election, writes are blocked. Reads may also be blocked depending on
-the read strategy (leader reads are blocked; ReadIndex reads can proceed if a follower
-confirms the leader was recently alive).
+**Scaling**: The global service handles only bucket-level operations and cluster
+topology changes. This is low throughput — a single Raft group is sufficient even for
+very large deployments. The per-object write throughput scales with PG count (each PG
+has an independent primary).
 
-### Metadata cluster vs storage node count
+### Per-PG availability
 
-The metadata cluster is a small fixed-size Raft group (3-5 nodes). The storage node
-count can be much larger (tens to hundreds). These are independent — adding storage
-nodes does not affect the metadata cluster.
-
-The metadata cluster nodes can be co-located with storage nodes (same physical
-machines) or run on dedicated hardware. Co-location is simpler; dedicated hardware
-gives better isolation.
-
-### Open question: Metadata cluster scaling
-
-For very large deployments (millions of objects, high request rate), a single Raft
-group may become a bottleneck. Options:
-
-1. **Vertical scaling**: Faster SSD, more RAM for SQLite page cache. Goes far for
-   metadata-only workloads.
-2. **Read replicas**: Serve reads from followers (with ReadIndex). Distributes read
-   load. Writes still go through leader.
-3. **Sharded metadata**: Partition the namespace across multiple Raft groups (e.g. by
-   bucket hash or key prefix). Adds significant complexity (cross-shard operations
-   like ListBuckets, bucket rename).
-
-**Recommendation**: Start with a single Raft group. Vertical scaling + read replicas
-should handle most workloads. Sharding is deferred — if needed, it's a major
-architectural change that should be designed separately.
+Each PG's availability depends on its node set:
+- **Normal operation**: The PG primary serves reads and writes. Secondaries replicate.
+- **Primary failure**: The global service detects the failure, increments the epoch,
+  publishes a new cluster map. The new primary (next eligible node) takes over after
+  peering with replicas.
+- **Secondary failure**: The PG continues operating in degraded mode. Writes go to
+  remaining secondaries. Repair subsystem reconstructs missing shards on a new node.
+- **PG unavailability**: If the primary fails and no secondary can take over (below
+  quorum), the PG's objects are unavailable until recovery. Other PGs are unaffected.
 
 ---
 
@@ -734,19 +1077,20 @@ make it easy (expose a backup API or CLI command).
 
 ### Disaster recovery from shard data
 
-If the metadata cluster is completely lost and no backups exist, Architecture C
-(storage-node-design.md) allows reconstruction:
+With per-PG metadata, the per-PG SQLite databases are co-located with shard data.
+If a node's PG database is lost, it can be rebuilt from the shards:
 
-1. Scan all shards on all storage nodes.
+1. Scan all shards on the node.
 2. For C2 (prepend): reconstruct objects from k shards each, extract the metadata
    prefix.
-3. Rebuild the metadata cluster from the extracted metadata.
+3. Rebuild the PG database from the extracted metadata.
 4. This recovers: object keys, sizes, user metadata, content types, EC parameters.
 5. This does NOT recover: exact timestamps, version ordering (unless embedded in the
-   metadata prefix), bucket-level configuration.
+   metadata prefix).
 
-This is a last-resort recovery path. Normal operations depend on Raft replication
-and backups.
+For global service recovery (bucket table, cluster maps, PG state), standard Raft
+replication and backups apply. The global service data is small and changes
+infrequently.
 
 ---
 
@@ -754,24 +1098,37 @@ and backups.
 
 ### To HTTP Frontend
 
-The metadata cluster exposes an internal API (trait-based, like the storage node):
+With per-PG metadata, the frontend interacts with two services:
+
+**Global service** (for bucket operations and cluster topology):
 
 ```rust
 #[async_trait]
-pub trait MetadataStore {
+pub trait GlobalService {
     // Bucket operations
     async fn create_bucket(&self, req: CreateBucketReq) -> Result<(), MetadataError>;
     async fn delete_bucket(&self, bucket: &str) -> Result<(), MetadataError>;
     async fn head_bucket(&self, bucket: &str) -> Result<BucketInfo, MetadataError>;
     async fn list_buckets(&self, owner: u64) -> Result<Vec<BucketInfo>, MetadataError>;
 
+    // Cluster topology
+    async fn get_cluster_map(&self) -> Result<ClusterMap, MetadataError>;
+    async fn get_pg_state(&self, pg_id: u32) -> Result<PgState, MetadataError>;
+}
+```
+
+**PG primary** (for object operations — same node that stores shards):
+
+```rust
+#[async_trait]
+pub trait PgMetadataStore {
     // Object operations (namespace only — no data)
     async fn put_object_meta(&self, req: PutObjectMetaReq) -> Result<PutObjectMetaResp, MetadataError>;
     async fn get_object_meta(&self, bucket: &str, key: &str, version: Option<&str>)
         -> Result<ObjectRecord, MetadataError>;
     async fn delete_object_meta(&self, bucket: &str, key: &str, version: Option<&str>)
         -> Result<DeleteResult, MetadataError>;
-    async fn list_objects(&self, req: ListObjectsReq) -> Result<ListObjectsResp, MetadataError>;
+    async fn list_pg_objects(&self, req: ListPgObjectsReq) -> Result<ListPgObjectsResp, MetadataError>;
     async fn list_object_versions(&self, req: ListVersionsReq) -> Result<ListVersionsResp, MetadataError>;
 
     // Multipart operations
@@ -779,30 +1136,41 @@ pub trait MetadataStore {
     async fn put_part_meta(&self, req: PutPartMetaReq) -> Result<(), MetadataError>;
     async fn complete_multipart(&self, req: CompleteMultipartReq) -> Result<ObjectRecord, MetadataError>;
     async fn abort_multipart(&self, upload_id: &str) -> Result<(), MetadataError>;
-    async fn list_multipart_uploads(&self, req: ListMultipartReq) -> Result<ListMultipartResp, MetadataError>;
     async fn list_parts(&self, upload_id: &str) -> Result<Vec<PartInfo>, MetadataError>;
 }
 ```
 
+**ListObjects** is assembled by the frontend: fan-out `list_pg_objects` to all PG
+primaries (or a subset based on prefix → PG mapping if deterministic), merge-sort.
+
+For testing and the centralized fallback, a unified `MetadataStore` trait can wrap
+both interfaces (global service + PG metadata) into a single abstraction.
+
 ### To Placement Layer
 
-The metadata cluster does NOT call the placement layer directly. It stores the
-`placement_key` per object. The frontend uses the placement layer to compute shard
-locations from the placement_key. This keeps the metadata cluster decoupled from
-placement — it just stores and retrieves records.
+The global service stores cluster maps and PG state. The frontend derives the PG from
+the object key (`hash(bucket/key) % pg_count`), then uses the placement layer to
+compute the PG's node set from the cluster map. The PG primary is the first node in
+the placement output.
 
 ### To Storage Nodes
 
-The metadata cluster does NOT communicate directly with storage nodes. The frontend
-orchestrates shard reads/writes. The only exception is the garbage collector, which
-sends delete commands to storage nodes for orphan cleanup.
+With per-PG metadata, the PG primary IS a storage node. Object metadata operations
+and shard I/O are co-located. The frontend sends both shard writes and metadata
+commits to the same set of nodes.
+
+The garbage collector runs on PG primaries — each PG primary cleans up PendingDelete
+records for its own PG by deleting shards from its node set.
 
 ### To Repair Subsystem
 
-The repair subsystem queries the metadata cluster for:
-- PendingDelete records (garbage collection)
-- All live objects (for scrub verification — checking that expected shards exist)
-- Cluster map changes (for rebalance planning)
+The repair subsystem interacts with PG primaries for:
+- PendingDelete records (garbage collection per PG)
+- All live objects in a PG (for scrub verification)
+
+And with the global service for:
+- PG migration state (which PGs need shard migration after topology changes)
+- Cluster map history (old and new maps for computing migration plans)
 
 ---
 
@@ -838,6 +1206,15 @@ pub enum MetadataError {
     #[error("not leader: leader is node {leader_id}")]
     NotLeader { leader_id: u64 },
 
+    #[error("not pg primary: primary is node {primary_id}")]
+    NotPgPrimary { primary_id: u64 },
+
+    #[error("stale epoch: have {have}, current {current}")]
+    StaleEpoch { have: u64, current: u64 },
+
+    #[error("pg unavailable: pg {pg_id} is peering")]
+    PgPeering { pg_id: u32 },
+
     #[error("metadata store unavailable")]
     Unavailable,
 }
@@ -852,15 +1229,17 @@ per the memory policy.
 
 ## Configuration
 
+### Global service configuration
+
 ```rust
-pub struct MetadataClusterConfig {
+pub struct GlobalServiceConfig {
     /// Raft node ID for this replica.
     pub node_id: u64,
 
     /// Peer addresses for Raft cluster members.
     pub peers: Vec<(u64, SocketAddr)>,
 
-    /// Path to local SQLite database.
+    /// Path to local SQLite database (bucket table, cluster maps, PG state).
     pub db_path: PathBuf,
 
     /// Path to Raft log storage.
@@ -876,11 +1255,30 @@ pub struct MetadataClusterConfig {
     /// Raft heartbeat interval (millis).
     pub heartbeat_interval: u64,
 
-    /// Maximum concurrent read queries.
-    pub max_concurrent_reads: usize,
+    /// Failure detection interval for storage nodes (millis).
+    pub heartbeat_check_interval: u64,
 
     /// SQLite page cache size (pages).
     pub sqlite_cache_size: i64,
+}
+```
+
+### Per-node PG metadata configuration
+
+```rust
+pub struct PgMetadataConfig {
+    /// Path to per-PG SQLite databases (one per PG this node participates in).
+    /// Directory structure: {pg_db_dir}/{pg_id}.db
+    pub pg_db_dir: PathBuf,
+
+    /// Maximum concurrent read queries per PG.
+    pub max_concurrent_reads_per_pg: usize,
+
+    /// SQLite page cache size per PG database (pages).
+    pub sqlite_cache_size_per_pg: i64,
+
+    /// PG operation log retention (entries, for peering after failures).
+    pub pg_oplog_retention: u64,
 }
 ```
 
@@ -888,40 +1286,79 @@ pub struct MetadataClusterConfig {
 
 ## Observability
 
-Metrics to expose:
+### Global service metrics
 
-- `metadata_write_duration_seconds` (histogram): Raft write latency (propose → commit).
-- `metadata_read_duration_seconds` (histogram): Read query latency.
-- `metadata_objects_total` (gauge): Total object count.
-- `metadata_buckets_total` (gauge): Total bucket count.
-- `metadata_pending_deletes` (gauge): Objects awaiting GC.
-- `raft_term` (gauge): Current Raft term.
-- `raft_commit_index` (gauge): Latest committed log index.
-- `raft_applied_index` (gauge): Latest applied log index.
-- `raft_leader` (gauge): Current leader node ID.
-- `raft_proposals_total` (counter): Total Raft proposals.
-- `raft_proposal_failures_total` (counter): Failed proposals.
+- `global_raft_term` (gauge): Current Raft term.
+- `global_raft_commit_index` (gauge): Latest committed log index.
+- `global_raft_leader` (gauge): Current leader node ID.
+- `global_raft_proposals_total` (counter): Total Raft proposals.
+- `global_raft_proposal_failures_total` (counter): Failed proposals.
+- `global_buckets_total` (gauge): Total bucket count.
+- `global_cluster_map_epoch` (gauge): Current cluster map epoch.
+- `global_pgs_migrating` (gauge): PGs currently in migration.
+
+### Per-PG metrics (per storage node)
+
+- `pg_write_duration_seconds` (histogram, labels: pg_id): Write latency (primary commit + replication).
+- `pg_read_duration_seconds` (histogram, labels: pg_id): Read query latency.
+- `pg_objects_total` (gauge, labels: pg_id): Object count per PG.
+- `pg_pending_deletes` (gauge, labels: pg_id): Objects awaiting GC per PG.
+- `pg_is_primary` (gauge, labels: pg_id): 1 if this node is primary for the PG.
+- `pg_epoch` (gauge, labels: pg_id): Latest epoch seen by this PG.
+- `pg_replication_lag_entries` (gauge, labels: pg_id, replica): Replication lag to secondaries.
+- `pg_peering_duration_seconds` (histogram): Time spent in peering after primary failover.
 - `gc_shards_deleted_total` (counter): Shards deleted by GC.
 - `gc_records_cleaned_total` (counter): Metadata records removed by GC.
+
+### Aggregate metrics (computed from per-PG)
+
+- `metadata_objects_total` (gauge): Total object count (sum across all PGs on this node).
+- `list_fanout_duration_seconds` (histogram): ListObjects fan-out latency.
 
 ---
 
 ## Build Sequence
 
+### Phase 1: Local metadata operations (no distribution)
+
 1. **SQLite schema and local operations**: Define the schema. Implement
-   bucket/object CRUD against a local SQLite database (no Raft). This can be tested
-   immediately.
+   bucket/object CRUD against a local SQLite database. This can be tested
+   immediately with unit tests.
 2. **MetadataStore trait + in-memory implementation**: Define the trait. Implement
    `MemoryMetadataStore` for testing the frontend without persistence.
-3. **Raft integration**: Add openraft (or chosen library). Wire the application-level
-   state machine to SQLite. Test leader election, write replication, read consistency.
-4. **Snapshot and recovery**: Implement SQLite-based snapshots. Test follower catch-up
-   from snapshot.
-5. **Versioning**: Add version_id generation, delete markers, ListObjectVersions.
-6. **Multipart tracking**: Add multipart upload tables and operations.
-7. **Garbage collector**: Background process for PendingDelete cleanup.
-8. **Integration tests**: End-to-end with HTTP frontend and storage nodes. Simulate
-   leader failover during writes. Verify consistency under concurrent operations.
+3. **Versioning**: Add version_id generation (ULID), delete markers,
+   ListObjectVersions.
+4. **Multipart tracking**: Add multipart upload tables and operations.
+
+### Phase 2: Global service (Raft)
+
+5. **Raft integration for global service**: Add openraft (or chosen library). Wire
+   the application-level state machine to SQLite for bucket table, cluster map, and
+   PG state. Test leader election, write replication, read consistency.
+6. **Snapshot and recovery**: Implement SQLite-based snapshots for the global
+   service. Test follower catch-up from snapshot.
+7. **Cluster map distribution**: Global service publishes cluster maps to all
+   storage nodes. Nodes subscribe and receive epoch updates.
+
+### Phase 3: Per-PG metadata (primary-based consensus)
+
+8. **PG primary determination**: Implement primary selection from placement output.
+   Primary receives all writes for its PGs.
+9. **Primary-backup replication**: Primary replicates object records to secondaries.
+   Epoch fencing prevents stale primaries from accepting writes.
+10. **Peering protocol**: After primary failure, new primary reconciles state with
+    replicas. Exchange PG operation logs, agree on authoritative state.
+11. **Per-PG SQLite index**: Each storage node maintains a SQLite index for its PGs'
+    objects. Derived state — can be rebuilt from shards if needed.
+
+### Phase 4: Integration
+
+12. **Garbage collector**: Background process for PendingDelete cleanup.
+13. **ListObjects fan-out**: Frontend queries all PG primaries, merge-sorts results.
+    Eventually consistent for v1.
+14. **Integration tests**: End-to-end with HTTP frontend and storage nodes. Simulate
+    primary failover during writes. Verify per-key consistency under concurrent
+    operations. Test PG migration during topology changes.
 
 ---
 
@@ -929,15 +1366,17 @@ Metrics to expose:
 
 | # | Question | Current Leaning | Alternatives |
 |---|---|---|---|
-| 1 | Placement generation / rebalance tracking | Placement groups (PGs) with per-PG migration state | Per-object generation, two-phase map, try-both fallback |
-| 2 | Raft read strategy | Leader reads (simplest) | ReadIndex, lease-based |
-| 3 | State machine approach | Application-level commands (Approach 1) | WAL replication (Approach 2), existing library (Approach 3) |
-| 4 | Raft library | openraft | raft-rs (tikv), custom |
+| 1 | ~~Placement generation / rebalance tracking~~ | **Resolved: Placement groups (PGs)** with per-PG migration state. PG count set at cluster creation. | |
+| 2 | Raft read strategy (global service) | Leader reads (simplest) | ReadIndex, lease-based |
+| 3 | State machine approach (global service) | Application-level commands (Approach 1) | WAL replication (Approach 2), existing library (Approach 3) |
+| 4 | Raft library (global service) | openraft | raft-rs (tikv), custom |
 | 5 | Version ID format | ULID | UUIDv7, custom |
 | 6 | GC timing | Batched + rate-limited | Immediate |
-| 7 | Metadata cluster scaling | Single Raft group + vertical | Sharded metadata (deferred) |
+| 7 | Centralized vs per-PG metadata | **Leaning per-PG (Architecture E)**: primary-based consensus + relaxed LIST consistency removes main barriers | Centralized fallback if per-PG proves too complex |
 | 8 | ~~etag storage format~~ | **Resolved: Binary BLOB, max 64 bytes (512 bits) + etag_kind discriminator** | |
 | 9 | Error types — dynamic strings | Needs design | Bounded inline strings, numeric identifiers only |
+| 10 | Peering protocol design | Ceph-style PG log exchange | TBD — correctness-critical, needs careful design |
+| 11 | PG write quorum | All k+m secondaries ack (strongest) | Majority of replicas (faster, tolerates slow nodes) |
 
 ---
 
