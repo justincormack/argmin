@@ -196,7 +196,7 @@ Phase 5 — background:
 | Per-PG consensus | Per-PG Raft / primary-based with epoch fencing | **Primary-based with epoch fencing** (no per-PG Raft) |
 | Global service | SQLite+Raft | **Raft-replicated SQLite** with application-level state machine |
 | Placement algorithm | CRUSH / Rendezvous hashing | **Rendezvous hashing** (implemented) |
-| Placement groups | Yes / No | **Yes** — ~1024 PGs, set at cluster creation |
+| Placement groups | Yes / No | **Yes** — dynamic PG count via rendezvous hashing over PG set (~100-200 PGs/node) |
 | EC parameters | (k, m) — e.g., (4,2), (6,3), (8,4) | Configurable, default (4,2). **ISA-L** for encoding |
 | User metadata storage | In metadata index / prepended to shard data | **C2: prepend to data before EC** (metadata cluster stays lean) |
 | Consistency model | Strong / eventual | **Per-key strong** (mandatory). Eventually consistent LIST (v1) |

@@ -223,18 +223,130 @@ regardless of object count.
 **Resolved: Adopt placement groups.** The per-PG migration tracking is far more
 manageable than per-object metadata updates or multi-fallback read paths.
 
-PG count is configurable at cluster creation time, with a sensible default (e.g.
-1024 for small clusters, 4096+ for larger ones). PG count cannot change after
-creation without a data migration (PG split/merge), which is out of scope for v1.
-
 The per-object metadata record does NOT need a placement generation. It does not
-even need to store a placement_key — the PG is derived from the object key:
+even need to store a placement_key — the PG is derived from the object key.
+
+PG migration state is tracked in a separate, small table (see PG State Table below).
+
+### Open question: Fixed vs dynamic PG count
+
+#### Approach A: Fixed PG count (hash modulo)
 
 ```
 pg_id = hash(bucket + "/" + key) % pg_count
 ```
 
-PG migration state is tracked in a separate, small table (see PG State Table below).
+PG count set at cluster creation, cannot change without full data migration.
+
+- Pro: **O(1) lookup** — one hash, one modulo.
+- Pro: Simplest to implement. Well understood.
+- Con: **Must guess pg_count at creation time.** Too few → uneven distribution, huge
+  PGs. Too many → unnecessary overhead (per-PG SQLite, oplog, directory).
+- Con: **Cannot grow.** A cluster that starts with 6 nodes and 1024 PGs may later grow
+  to 60 nodes, where 1024 PGs is too few (~100 PGs per node → reasonable). But if it
+  grows to 600 nodes, 1024 PGs means ~1-2 PGs per node — too few for even load
+  distribution.
+- Con: Changing pg_count requires migrating every object (all PG assignments change).
+  This is Ceph's biggest operational pain point.
+
+Guideline: **~100-200 PGs per node** is the sweet spot. Less means uneven
+distribution; more means unnecessary per-PG overhead.
+
+#### Approach B: Power-of-2 PG splitting (Ceph approach)
+
+Start with 2^p PGs. To grow, increase p — each PG splits into two. Object assignment
+uses the top p bits of the hash:
+
+```
+pg_id = hash(key) >> (64 - p)
+```
+
+When p increases from 10 to 11, PG 42 (binary `0000101010`) splits into PG 42
+(binary `00000101010`) and PG 1066 (binary `10000101010`). Objects split roughly
+50/50 based on the next hash bit.
+
+- Pro: O(1) lookup.
+- Pro: Localized migration — one PG splits into two. Data moves only within the
+  splitting PG.
+- Pro: Can split individual PGs (not all at once) for finer granularity.
+- Con: Growth is in powers of 2 (coarse) unless doing per-PG splitting, which adds
+  complexity (some PGs at depth p, others at p+1; need a bit-tree to track state).
+- Con: Ceph has this and it's still operationally painful.
+- Con: Can't easily shrink (merge two PGs back into one).
+
+#### Approach C: Rendezvous hashing over the PG set (dynamic)
+
+Use the same rendezvous hashing that we already use for PG → node placement, but
+applied at the key → PG level:
+
+```
+pg_id = argmax_{pg in pg_set}(hash(key || pg_id_bytes))
+```
+
+The PG set is an explicit list in the cluster map. PGs can be added or removed
+dynamically. Rendezvous hashing naturally redistributes keys: adding a PG moves
+~1/(N+1) of all keys to the new PG, drawn proportionally from all existing PGs.
+
+Since PGs have equal weight (each represents an equal slice of key space), the
+formula simplifies to `argmax(hash(key || pg_id))` — **no logarithm needed**, unlike
+the weighted node placement. Just score each PG with a hash and pick the highest.
+
+**Lookup cost**: O(pg_count) hash operations per key. At ~5-10ns per hash (rapidhash),
+1000 PGs = ~5-10μs, 5000 PGs = ~25-50μs. Compare to network round-trip (~100μs+)
+and disk I/O (~100μs+ SSD). The PG lookup is not dominant. Can be optimized further
+with SIMD scoring if needed.
+
+**Dynamic growth model**:
+- Target: ~100-200 PGs per node (or a fixed PGs per TB)
+- When disks/nodes are added, the global service adds PGs to the set
+- Rendezvous hashing naturally redistributes: each new PG steals ~1/total_pgs of
+  keys from ALL existing PGs (distributed migration, small per-PG impact)
+- When nodes are removed, their PGs migrate to other nodes (PG→node placement
+  changes), but the PG set itself stays the same (keys don't move between PGs)
+
+**Migration during PG addition**:
+- New PG enters "backfilling" state in the cluster map
+- Each existing PG scans its objects: keys that now hash to the new PG are migrated
+  (shard data + metadata record)
+- During backfilling, reads for keys in the new PG fall back to the previous PG
+  (computed from the old cluster map without the new PG)
+- Once all keys are migrated, the new PG transitions to "active"
+- This is analogous to a node addition in consistent hashing — gradual, distributed
+
+**Comparison to PG splitting (Approach B)**:
+- Splitting: one PG → two PGs, data moves within one PG (localized)
+- Rendezvous addition: many PGs → one new PG (distributed, each loses a small slice)
+- Splitting is simpler to orchestrate (one source); rendezvous is more distributed
+  but each individual migration is smaller
+- Rendezvous allows arbitrary PG count growth (not just powers of 2)
+- Rendezvous naturally handles PG removal too (remove a PG, its keys redistribute)
+
+**Implementation note**: The placement crate already has the scoring infrastructure
+(rapidhash, deterministic tie-breaking). The key→PG rendezvous is a simpler version
+of the same algorithm — equal weights, no constraint, just argmax of hash scores.
+Can share the hash helper.
+
+#### Discussion
+
+| Property | A: Fixed modulo | B: Power-of-2 split | C: Rendezvous |
+|---|---|---|---|
+| Lookup cost | O(1) | O(1) | O(pg_count) hashes |
+| Growth granularity | None | Powers of 2 (or per-PG) | Any increment |
+| Migration locality | N/A (full rebuild) | Localized (1→2) | Distributed (N→1) |
+| Shrink support | No | Hard (merge) | Natural (remove PG) |
+| Implementation complexity | Trivial | Moderate (bit-tree) | Low (reuse rendezvous) |
+| Operational flexibility | None after creation | Moderate | High |
+
+**Current leaning: Approach C (rendezvous over PG set).** It reuses the same
+consistent hashing approach we already use for placement, avoids the "guess at
+creation time" problem, and allows the cluster to grow and shrink gracefully. The
+O(pg_count) lookup cost is acceptable for expected PG counts (1000-5000) and can be
+optimized later if needed.
+
+Approach A (fixed modulo) remains the v1 fallback if we want to defer dynamic PG
+work. It's trivial to implement and we can always migrate to Approach C later — the
+per-PG on-disk layout and metadata structures are the same regardless of how keys
+map to PGs.
 
 ---
 
@@ -651,15 +763,19 @@ CREATE TABLE buckets (
     versioning    INTEGER NOT NULL DEFAULT 0  -- 0=Disabled, 1=Enabled, 2=Suspended
 );
 
--- Placement group state table
--- Tracks PG → node mapping and migration status during topology changes.
--- pg_count is a cluster-level constant set at creation time.
+-- Placement group registry and state.
+-- With dynamic PG count (Approach C: rendezvous), PGs are an explicit set, not
+-- a fixed range. PGs are added when the cluster grows (new disks/nodes) and
+-- removed when it shrinks. The pg_state table IS the PG set — key→PG mapping
+-- is rendezvous_hash(key, all pg_ids in this table).
+-- With fixed PG count (Approach A fallback), pg_ids are 0..pg_count-1.
 CREATE TABLE pg_state (
-    pg_id             INTEGER PRIMARY KEY,  -- 0..pg_count-1
+    pg_id             INTEGER PRIMARY KEY,  -- unique PG identifier
     map_version       INTEGER NOT NULL,     -- cluster map version this PG was placed with
-    status            INTEGER NOT NULL DEFAULT 0,  -- 0=Stable, 1=Migrating, 2=Splitting (future)
+    status            INTEGER NOT NULL DEFAULT 0,  -- 0=Active, 1=Backfilling, 2=Migrating, 3=Draining
     -- node assignments are derived from placement(pg_id, cluster_map[map_version])
     -- during migration, both map_version and map_version+1 assignments are valid
+    created_at        INTEGER NOT NULL,     -- unix millis, when PG was created
     migration_started INTEGER              -- unix millis, NULL if not migrating
 );
 
@@ -680,7 +796,7 @@ from shard data (C2 prepend) if needed.
 ```sql
 -- Object table: one row per (bucket, key, version)
 -- For unversioned buckets, version_id is a fixed sentinel (e.g. "null")
--- Objects are in this DB because hash(bucket/key) % pg_count = this PG's ID.
+-- Objects are in this DB because they hash to this PG (via rendezvous or modulo).
 CREATE TABLE objects (
     bucket        TEXT NOT NULL,
     key           TEXT NOT NULL,
@@ -1366,7 +1482,8 @@ pub struct PgMetadataConfig {
 
 | # | Question | Current Leaning | Alternatives |
 |---|---|---|---|
-| 1 | ~~Placement generation / rebalance tracking~~ | **Resolved: Placement groups (PGs)** with per-PG migration state. PG count set at cluster creation. | |
+| 1 | ~~Placement generation / rebalance tracking~~ | **Resolved: Placement groups (PGs)** with per-PG migration state. | |
+| 1b | Fixed vs dynamic PG count | **Leaning: Rendezvous hashing over PG set** (Approach C) — PG count grows with cluster, ~100-200 PGs per node | Fixed modulo (A, v1 fallback), power-of-2 split (B) |
 | 2 | Raft read strategy (global service) | Leader reads (simplest) | ReadIndex, lease-based |
 | 3 | State machine approach (global service) | Application-level commands (Approach 1) | WAL replication (Approach 2), existing library (Approach 3) |
 | 4 | Raft library (global service) | openraft | raft-rs (tikv), custom |
