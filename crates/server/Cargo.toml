@@ -1,0 +1,21 @@
+[package]
+name = "server"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "argmin-s3"
+path = "src/main.rs"
+
+[dependencies]
+auth = { path = "../auth" }
+crc64 = { path = "../crc64" }
+ec = { path = "../ec" }
+storage = { path = "../storage" }
+rapidhash = "1"
+ring = "0.17"
+thiserror = "2"
+tiny_http = "0.12"
+
+[dev-dependencies]
+tempfile = "3"

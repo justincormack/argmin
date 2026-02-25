@@ -6,4 +6,6 @@ members = [
     "crates/crc64",
     "crates/placement",
     "crates/storage",
+    "crates/auth",
+    "crates/server",
 ]

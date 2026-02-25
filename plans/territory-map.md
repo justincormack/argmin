@@ -212,10 +212,10 @@ Phase 2 — storage layer:                                         [COMPLETE]
   5. Per-PG metadata (local)           (object records in per-PG SQLite, no replication) [done]
   6. Bucket metadata (local)           (bucket table in SQLite, no Raft) [done]
 
-Phase 3 — S3 server:
-  7. Auth / SigV4               (pure crypto, needed by HTTP frontend)
-  8. HTTP Frontend              (S3 API parsing, SigV4, XML responses)
-  9. Coordinator                (ties it all together: S3 op → EC → place → store → metadata)
+Phase 3 — S3 server:                                            [COMPLETE]
+  7. Auth / SigV4               (SigV4 verification with ring)             [done]
+  8. HTTP Frontend              (tiny_http, S3 routing, XML responses)      [done]
+  9. Coordinator                (S3 op → EC → PG → store → metadata)       [done]
 ```
 
 ### Post-v1-minimal (distributed)
