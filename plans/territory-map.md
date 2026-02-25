@@ -206,14 +206,14 @@ Phase 1 — leaf libraries (no deps, parallelizable):
   1. Erasure Coding Engine      (pure math, ISA-L wrapper)        [done]
   2. Placement / Topology       (pure math, rendezvous hashing)   [done]
   3. CRC64-NVME                 (ISA-L crc64_rocksoft_refl)       [bind in ec-sys]
-  4. Auth / SigV4               (pure crypto)
 
 Phase 2 — storage layer:
-  5. ShardStore trait + FileShardStore  (per-PG file I/O, CRC, SQLite shard index)
-  6. Per-PG metadata (local)           (object records in per-PG SQLite, no replication)
-  7. Bucket metadata (local)           (bucket table in SQLite, no Raft)
+  4. ShardStore trait + FileShardStore  (per-PG file I/O, CRC, SQLite shard index)
+  5. Per-PG metadata (local)           (object records in per-PG SQLite, no replication)
+  6. Bucket metadata (local)           (bucket table in SQLite, no Raft)
 
 Phase 3 — S3 server:
+  7. Auth / SigV4               (pure crypto, needed by HTTP frontend)
   8. HTTP Frontend              (S3 API parsing, SigV4, XML responses)
   9. Coordinator                (ties it all together: S3 op → EC → place → store → metadata)
 ```
@@ -238,7 +238,6 @@ Phase 5 — completeness:
 
 - **Phase 1 items 1 and 2 are already implemented.** CRC64-NVME just needs an FFI
   binding added to ec-sys (ISA-L's `crc64_rocksoft_refl` is the same algorithm).
-  Auth/SigV4 is an independent leaf task.
 - **Phase 2 is the core of v1-minimal.** The storage layer with per-PG SQLite is the
   foundation everything else builds on. The same SQLite schema and ShardStore trait
   will be used in the distributed version — we're just skipping replication for now.
