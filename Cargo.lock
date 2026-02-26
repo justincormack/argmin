@@ -18,6 +18,7 @@ checksum = "d92bec98840b8f03a5ff5413de5293bfcd8bf96467cf5452609f939ec6f5de16"
 name = "auth"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "ring",
  "thiserror",
 ]
@@ -76,6 +77,7 @@ name = "crc64"
 version = "0.1.0"
 dependencies = [
  "ec-sys",
+ "proptest",
 ]
 
 [[package]]
@@ -587,6 +589,7 @@ name = "storage"
 version = "0.1.0"
 dependencies = [
  "crc64",
+ "proptest",
  "rusqlite",
  "tempfile",
  "thiserror",

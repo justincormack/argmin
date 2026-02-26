@@ -407,3 +407,104 @@ fn file_metadata_zero_size() {
     let (_dir, store) = make_pg_store();
     metadata_zero_size_object(&store);
 }
+
+// --- Property-based tests ---
+
+#[cfg(test)]
+mod prop_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn insert_keys(store: &dyn PgMetadataStore, bucket: &str, keys: &[String]) {
+        for key in keys {
+            let req = PutObjectMetaReq {
+                bucket: bucket.to_string(),
+                key: key.clone(),
+                version_id: "null".to_string(),
+                size: 0,
+                etag: vec![],
+                etag_kind: 0,
+                ec_k: 4,
+                ec_m: 2,
+            };
+            store.put_object_meta(&req).unwrap();
+        }
+    }
+
+    fn list_all_keys(
+        store: &dyn PgMetadataStore,
+        bucket: &str,
+        prefix: Option<String>,
+        max_keys: u32,
+    ) -> Vec<String> {
+        let mut all = Vec::new();
+        let mut start_after: Option<String> = None;
+        for _ in 0..1000 {
+            let resp = store
+                .list_objects(&ListObjectsReq {
+                    bucket: bucket.to_string(),
+                    prefix: prefix.clone(),
+                    start_after: start_after.clone(),
+                    max_keys,
+                })
+                .unwrap();
+
+            for w in resp.objects.windows(2) {
+                assert!(w[0].key < w[1].key);
+            }
+
+            all.extend(resp.objects.iter().map(|o| o.key.clone()));
+            if !resp.is_truncated {
+                break;
+            }
+            assert!(resp.next_start_after.is_some());
+            start_after = resp.next_start_after;
+        }
+        all
+    }
+
+    proptest! {
+        #[test]
+        fn prop_metadata_pagination_roundtrip(
+            keys in proptest::collection::vec(
+                proptest::string::string_regex(r"[A-Za-z0-9._/-]{0,16}").unwrap(),
+                0..=40
+            ),
+            max_keys in 1u32..=10,
+        ) {
+            let store = crate::MemoryPgStore::new();
+            insert_keys(&store, "bucket", &keys);
+
+            let mut expected = keys.clone();
+            expected.sort();
+            expected.dedup();
+
+            let got = list_all_keys(&store, "bucket", None, max_keys);
+            prop_assert_eq!(got, expected);
+        }
+
+        #[test]
+        fn prop_metadata_prefix_subset(
+            keys in proptest::collection::vec(
+                proptest::string::string_regex(r"[A-Za-z0-9._/-]{0,16}").unwrap(),
+                0..=40
+            ),
+            prefix in proptest::string::string_regex(r"[A-Za-z0-9._/-]{0,8}").unwrap(),
+            max_keys in 1u32..=10,
+        ) {
+            let store = crate::MemoryPgStore::new();
+            insert_keys(&store, "bucket", &keys);
+
+            let mut expected: Vec<String> = keys
+                .iter()
+                .filter(|k| k.starts_with(&prefix))
+                .cloned()
+                .collect();
+            expected.sort();
+            expected.dedup();
+
+            let got = list_all_keys(&store, "bucket", Some(prefix), max_keys);
+            prop_assert_eq!(got, expected);
+        }
+    }
+}

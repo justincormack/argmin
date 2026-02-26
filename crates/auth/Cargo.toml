@@ -8,3 +8,4 @@ ring = "0.17"
 thiserror = "2"
 
 [dev-dependencies]
+proptest = "1"

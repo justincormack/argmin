@@ -158,6 +158,7 @@ pub struct PutObjectMetaReq {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn shard_status_from_u8_live() {
@@ -206,6 +207,34 @@ mod tests {
     fn shard_key_hex_prefix() {
         let key = ShardKey::new(&[0xDE; 16], 0, 0);
         assert_eq!(key.hex_prefix(), "de");
+    }
+
+    // ── Property-based tests ────────────────────────────────────────
+
+    proptest! {
+        #[test]
+        fn prop_shard_key_round_trip(
+            hash in any::<[u8; 16]>(),
+            version_id in any::<u64>(),
+            shard_index in any::<u8>(),
+        ) {
+            let key = ShardKey::new(&hash, version_id, shard_index);
+            let bytes = key.as_bytes();
+            let parsed = ShardKey::from_bytes(bytes).unwrap();
+            prop_assert_eq!(key, parsed);
+        }
+
+        #[test]
+        fn prop_shard_key_hex_length_and_prefix(
+            hash in any::<[u8; 16]>(),
+            version_id in any::<u64>(),
+            shard_index in any::<u8>(),
+        ) {
+            let key = ShardKey::new(&hash, version_id, shard_index);
+            let hex = key.hex();
+            prop_assert_eq!(hex.len(), SHARD_KEY_LEN * 2);
+            prop_assert_eq!(&hex[..2], &key.hex_prefix());
+        }
     }
 }
 

@@ -169,6 +169,7 @@ impl Default for Hasher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     // ── Standard test vectors ────────────────────────────────────────
 
@@ -372,5 +373,74 @@ mod tests {
             running = combine(running, checksum(&data[i..i + 1]), 1);
         }
         assert_eq!(running, checksum(&data));
+    }
+
+    // ── Property-based tests ────────────────────────────────────────
+
+    proptest! {
+        #[test]
+        fn prop_streaming_matches_oneshot(
+            data in proptest::collection::vec(any::<u8>(), 0..=2048),
+            mut splits in proptest::collection::vec(0usize..=2048, 0..=32),
+        ) {
+            let len = data.len();
+            // Normalize split points into a sorted unique list in [0, len].
+            splits.retain(|&i| i <= len);
+            splits.sort_unstable();
+            splits.dedup();
+            // Ensure 0 and len are included.
+            if splits.first().copied() != Some(0) {
+                splits.insert(0, 0);
+            }
+            if splits.last().copied() != Some(len) {
+                splits.push(len);
+            }
+
+            let mut hasher = Hasher::new();
+            for w in splits.windows(2) {
+                let start = w[0];
+                let end = w[1];
+                hasher.update(&data[start..end]);
+            }
+            prop_assert_eq!(hasher.finalize(), checksum(&data));
+        }
+
+        #[test]
+        fn prop_combine_matches_concat(
+            data in proptest::collection::vec(any::<u8>(), 0..=2048),
+            split in 0usize..=2048,
+        ) {
+            let len = data.len();
+            let split = split.min(len);
+            let (a, b) = data.split_at(split);
+            let crc_a = checksum(a);
+            let crc_b = checksum(b);
+            let combined = combine(crc_a, crc_b, b.len() as u64);
+            prop_assert_eq!(combined, checksum(&data));
+        }
+
+        #[test]
+        fn prop_combine_associative_three_parts(
+            data in proptest::collection::vec(any::<u8>(), 0..=2048),
+            a_end in 0usize..=2048,
+            b_end in 0usize..=2048,
+        ) {
+            let len = data.len();
+            let a_end = a_end.min(len);
+            let b_end = b_end.min(len);
+            let (a_end, b_end) = if a_end <= b_end { (a_end, b_end) } else { (b_end, a_end) };
+
+            let (a, rest) = data.split_at(a_end);
+            let (b, c) = rest.split_at(b_end - a_end);
+
+            let crc_a = checksum(a);
+            let crc_b = checksum(b);
+            let crc_c = checksum(c);
+
+            let left = combine(combine(crc_a, crc_b, b.len() as u64), crc_c, c.len() as u64);
+            let right = combine(crc_a, combine(crc_b, crc_c, c.len() as u64), (b.len() + c.len()) as u64);
+            prop_assert_eq!(left, right);
+            prop_assert_eq!(left, checksum(&data));
+        }
     }
 }

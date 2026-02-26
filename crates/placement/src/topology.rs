@@ -85,6 +85,7 @@ pub enum TopologyError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn level_constants() {
@@ -173,5 +174,59 @@ mod tests {
                 (Level::DISK, 0),
             ]
         );
+    }
+
+    // ── Property-based tests ────────────────────────────────────────
+
+    proptest! {
+        #[test]
+        fn prop_topology_key_sorts_and_is_order_independent(
+            segments in proptest::collection::vec((any::<u8>(), any::<u32>()), 0..=8),
+        ) {
+            // Ensure unique levels.
+            let mut seen = std::collections::BTreeSet::new();
+            for (lvl, _) in &segments {
+                if !seen.insert(*lvl) {
+                    prop_assume!(false);
+                }
+            }
+
+            let segs: Vec<(Level, u32)> =
+                segments.iter().map(|(l, v)| (Level(*l), *v)).collect();
+
+            let mut reversed = segs.clone();
+            reversed.reverse();
+
+            let a = TopologyKey::new(&segs).unwrap();
+            let b = TopologyKey::new(&reversed).unwrap();
+            prop_assert_eq!(&a, &b);
+
+            let ordered = a.segments();
+            for w in ordered.windows(2) {
+                prop_assert!(w[0].0 < w[1].0);
+            }
+        }
+
+        #[test]
+        fn prop_topology_key_duplicate_level_rejected(
+            segments in proptest::collection::vec((any::<u8>(), any::<u32>()), 1..=8),
+        ) {
+            // Ensure unique base levels.
+            let mut seen = std::collections::BTreeSet::new();
+            for (lvl, _) in &segments {
+                if !seen.insert(*lvl) {
+                    prop_assume!(false);
+                }
+            }
+
+            let mut dup = segments.clone();
+            let (lvl, _) = segments[0];
+            dup.push((lvl, 123));
+            let dup_segments: Vec<(Level, u32)> =
+                dup.iter().map(|(l, v)| (Level(*l), *v)).collect();
+
+            let err = TopologyKey::new(&dup_segments).unwrap_err();
+            prop_assert_eq!(err, TopologyError::DuplicateLevel(Level(lvl)));
+        }
     }
 }

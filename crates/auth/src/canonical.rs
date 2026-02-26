@@ -242,6 +242,7 @@ const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn sha256_empty() {
@@ -394,5 +395,128 @@ mod tests {
         assert!(parse_amz_date("20131324T000000Z").is_none()); // month 13
         assert!(parse_amz_date("20130532T000000Z").is_none()); // day 32
         assert!(parse_amz_date("20130524T250000Z").is_none()); // hour 25
+    }
+
+    // ── Property-based tests ────────────────────────────────────────
+
+    fn normalize_value_ref(value: &str) -> String {
+        let trimmed = value.trim();
+        let mut result = String::with_capacity(trimmed.len());
+        let mut prev_was_space = false;
+        for ch in trimmed.chars() {
+            if ch.is_ascii_whitespace() {
+                if !prev_was_space {
+                    result.push(' ');
+                    prev_was_space = true;
+                }
+            } else {
+                result.push(ch);
+                prev_was_space = false;
+            }
+        }
+        result
+    }
+
+    fn parse_canonical_headers(s: &str) -> Vec<(String, Vec<String>)> {
+        let mut out: Vec<(String, Vec<String>)> = Vec::new();
+        for line in s.split('\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let mut parts = line.splitn(2, ':');
+            let name = parts.next().unwrap_or("").to_string();
+            let value = parts.next().unwrap_or("");
+            let values = value.split(',').map(|v| v.to_string()).collect::<Vec<_>>();
+            out.push((name, values));
+        }
+        out
+    }
+
+    proptest! {
+        #[test]
+        fn prop_canonical_query_order_independent(
+            pairs in proptest::collection::vec(
+                (
+                    proptest::string::string_regex(r"[A-Za-z0-9._~% -]{0,16}").unwrap(),
+                    proptest::string::string_regex(r"[A-Za-z0-9._~% -]{0,16}").unwrap(),
+                ),
+                0..=16
+            ),
+        ) {
+            let make_query = |pairs: &[(String, String)]| {
+                pairs
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join("&")
+            };
+
+            let mut reversed = pairs.clone();
+            reversed.reverse();
+
+            let q1 = make_query(&pairs);
+            let q2 = make_query(&reversed);
+            prop_assert_eq!(canonical_query_string(&q1), canonical_query_string(&q2));
+        }
+
+        #[test]
+        fn prop_canonical_query_no_double_encode(
+            pairs in proptest::collection::vec(
+                (
+                    proptest::string::string_regex(r"[A-Za-z0-9._~ -]{0,16}").unwrap(),
+                    proptest::string::string_regex(r"[A-Za-z0-9._~ -]{0,16}").unwrap(),
+                ),
+                0..=16
+            ),
+        ) {
+            let make_query = |pairs: &[(String, String)]| {
+                pairs
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join("&")
+            };
+
+            let raw = make_query(&pairs);
+            let encoded_pairs: Vec<(String, String)> = pairs
+                .iter()
+                .map(|(k, v)| (uri_encode(k), uri_encode(v)))
+                .collect();
+            let encoded = make_query(&encoded_pairs);
+
+            prop_assert_eq!(canonical_query_string(&raw), canonical_query_string(&encoded));
+        }
+
+        #[test]
+        fn prop_canonical_headers_sorted_and_stable(
+            headers in proptest::collection::vec(
+                (
+                    proptest::string::string_regex(r"[a-z0-9-]{1,16}").unwrap(),
+                    proptest::string::string_regex(r"[A-Za-z0-9 \t]{0,32}").unwrap(),
+                ),
+                0..=32
+            ),
+        ) {
+            let canonical = canonical_headers(
+                &headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>()
+            );
+            let parsed = parse_canonical_headers(&canonical);
+
+            // Names must be sorted ascending.
+            for w in parsed.windows(2) {
+                prop_assert!(w[0].0 <= w[1].0);
+            }
+
+            // For each header name, values must appear in original order after normalization.
+            let mut expected: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+            for (name, value) in &headers {
+                expected.entry(name.clone()).or_default().push(normalize_value_ref(value));
+            }
+
+            for (name, values) in parsed {
+                let exp = expected.remove(&name).unwrap_or_default();
+                prop_assert_eq!(values, exp);
+            }
+        }
     }
 }
