@@ -68,10 +68,37 @@ impl HttpFrontend {
                 let info = self.coordinator.head_bucket(&bucket)?;
                 Ok(S3Response::head_bucket(&info))
             }
+            S3Operation::ListObjectsV1 { bucket } => {
+                let prefix = req.query_param("prefix");
+                let delimiter = req.query_param("delimiter");
+                let marker = req.query_param("marker");
+                let max_keys: u32 = req
+                    .query_param("max-keys")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1000);
+
+                let result = self.coordinator.list_objects_v2(
+                    &bucket,
+                    prefix.as_deref(),
+                    delimiter.as_deref(),
+                    marker.as_deref(),
+                    max_keys,
+                )?;
+                Ok(S3Response::list_objects_v1(
+                    &bucket,
+                    prefix.as_deref(),
+                    delimiter.as_deref(),
+                    marker.as_deref(),
+                    max_keys,
+                    &result,
+                ))
+            }
             S3Operation::ListObjectsV2 { bucket } => {
                 let prefix = req.query_param("prefix");
                 let delimiter = req.query_param("delimiter");
-                let continuation_token = req.query_param("continuation-token");
+                let continuation_token = req
+                    .query_param("continuation-token")
+                    .or_else(|| req.query_param("start-after"));
                 let max_keys: u32 = req
                     .query_param("max-keys")
                     .and_then(|s| s.parse().ok())

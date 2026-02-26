@@ -154,6 +154,19 @@ impl S3Response {
         Self::new(200).xml_body(body)
     }
 
+    /// Build a response for ListObjects v1.
+    pub fn list_objects_v1(
+        bucket: &str,
+        prefix: Option<&str>,
+        delimiter: Option<&str>,
+        marker: Option<&str>,
+        max_keys: u32,
+        result: &ListObjectsResult,
+    ) -> Self {
+        let body = xml::list_objects_v1_xml(bucket, prefix, delimiter, marker, max_keys, result);
+        Self::new(200).xml_body(body)
+    }
+
     /// Build an error response.
     pub fn error(err: &ServerError, resource: &str) -> Self {
         let body = xml::error_xml(
@@ -528,6 +541,31 @@ mod tests {
         assert!(body.contains("ListBucketResult"));
         assert!(body.contains("key1"));
         assert!(body.contains("<Size>42</Size>"));
+    }
+
+    // ── list_objects_v1 ───────────────────────────────────────────────
+
+    #[test]
+    fn list_objects_v1_response() {
+        let result = ListObjectsResult {
+            objects: vec![ListEntry {
+                key: "key1".into(),
+                size: 42,
+                etag: "\"etag1\"".into(),
+                last_modified: 0,
+            }],
+            common_prefixes: vec![],
+            is_truncated: false,
+            next_continuation_token: None,
+        };
+        let resp =
+            S3Response::list_objects_v1("bucket", Some("pre"), None, None, 1000, &result);
+        assert_eq!(resp.status_code, 200);
+        let body = String::from_utf8(resp.body).unwrap();
+        assert!(body.contains("ListBucketResult"));
+        assert!(body.contains("key1"));
+        assert!(body.contains("<Marker/>"));
+        assert!(!body.contains("<KeyCount>"));
     }
 
     // ── error ─────────────────────────────────────────────────────────

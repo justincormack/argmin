@@ -7,6 +7,13 @@ use crate::error::ServerError;
 /// Checked before reading the body to prevent OOM.
 const MAX_BODY_SIZE: usize = 256 * 1024 * 1024 + 64 * 1024;
 
+/// Validate a Content-Length header value. Rejects negative and non-numeric values.
+fn validate_content_length(value: &str) -> Result<u64, ServerError> {
+    value.parse::<u64>().map_err(|_| ServerError::InvalidRequest {
+        reason: format!("invalid Content-Length: {}", value),
+    })
+}
+
 /// Parsed S3 request data extracted from an HTTP request.
 pub struct S3Request {
     pub method: String,
@@ -44,6 +51,13 @@ impl S3Request {
                 )
             })
             .collect();
+
+        // Validate Content-Length header if present (reject negative/non-numeric)
+        if let Some((_, cl_value)) = headers.iter().find(|(k, _)| k == "content-length") {
+            if let Err(e) = validate_content_length(cl_value) {
+                return Err((e, request));
+            }
+        }
 
         // Check Content-Length before reading body
         let content_length = request.body_length().unwrap_or(0);
@@ -351,6 +365,26 @@ mod tests {
         assert_eq!(pairs.len(), 2);
         assert_eq!(pairs[0], ("host", "example.com"));
         assert_eq!(pairs[1], ("content-type", "text/plain"));
+    }
+
+    #[test]
+    fn validate_content_length_valid() {
+        assert_eq!(validate_content_length("0").unwrap(), 0);
+        assert_eq!(validate_content_length("42").unwrap(), 42);
+        assert_eq!(validate_content_length("1000000").unwrap(), 1000000);
+    }
+
+    #[test]
+    fn validate_content_length_negative() {
+        assert!(validate_content_length("-1").is_err());
+        assert!(validate_content_length("-100").is_err());
+    }
+
+    #[test]
+    fn validate_content_length_non_numeric() {
+        assert!(validate_content_length("abc").is_err());
+        assert!(validate_content_length("12.5").is_err());
+        assert!(validate_content_length("").is_err());
     }
 
     #[test]

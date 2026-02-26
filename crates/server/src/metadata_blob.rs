@@ -40,10 +40,10 @@ const STORED_HEADERS: &[&str] = &[
     "expires",
 ];
 
-/// Check if a string contains ASCII control characters (0x00-0x1F, 0x7F)
-/// that could enable header injection or response splitting.
-fn has_control_chars(s: &str) -> bool {
-    s.bytes().any(|b| b < 0x20 || b == 0x7f)
+/// Check if a string contains bytes invalid in HTTP headers:
+/// ASCII control characters (0x00-0x1F) or non-ASCII bytes (>= 0x7F).
+fn has_invalid_header_bytes(s: &str) -> bool {
+    s.bytes().any(|b| b < 0x20 || b >= 0x7f)
 }
 
 impl MetadataBlob {
@@ -63,10 +63,10 @@ impl MetadataBlob {
         for &(name, value) in headers {
             let lower = name.to_ascii_lowercase();
             if STORED_HEADERS.contains(&lower.as_str()) || lower.starts_with("x-amz-meta-") {
-                if has_control_chars(value) {
+                if has_invalid_header_bytes(value) {
                     return Err(ServerError::InvalidRequest {
                         reason: format!(
-                            "metadata value for '{}' contains control characters",
+                            "metadata value for '{}' contains invalid header bytes",
                             lower
                         ),
                     });
@@ -418,6 +418,19 @@ mod tests {
         assert!(MetadataBlob::from_headers(&headers).is_err());
 
         let headers = [("Content-Type", "text/plain\n")];
+        assert!(MetadataBlob::from_headers(&headers).is_err());
+    }
+
+    #[test]
+    fn from_headers_rejects_non_ascii() {
+        let headers = [("X-Amz-Meta-Name", "caf\u{00e9}")]; // "café"
+        assert!(MetadataBlob::from_headers(&headers).is_err());
+
+        let headers = [("Content-Type", "text/plain; charset=\u{00fc}")];
+        assert!(MetadataBlob::from_headers(&headers).is_err());
+
+        // DEL (0x7F) should also be rejected
+        let headers = [("X-Amz-Meta-Del", "val\x7f")];
         assert!(MetadataBlob::from_headers(&headers).is_err());
     }
 

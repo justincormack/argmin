@@ -83,13 +83,97 @@ pub fn list_objects_v2_xml(
     xml.push_str("</IsTruncated>");
 
     xml.push_str("<KeyCount>");
-    xml.push_str(&result.objects.len().to_string());
+    xml.push_str(&(result.objects.len() + result.common_prefixes.len()).to_string());
     xml.push_str("</KeyCount>");
 
     if let Some(ref token) = result.next_continuation_token {
         xml.push_str("<NextContinuationToken>");
         xml.push_str(&xml_escape(token));
         xml.push_str("</NextContinuationToken>");
+    }
+
+    for obj in &result.objects {
+        xml.push_str("<Contents>");
+        xml.push_str("<Key>");
+        xml.push_str(&xml_escape(&obj.key));
+        xml.push_str("</Key>");
+        xml.push_str("<LastModified>");
+        xml.push_str(&format_timestamp(obj.last_modified));
+        xml.push_str("</LastModified>");
+        xml.push_str("<ETag>");
+        xml.push_str(&xml_escape(&obj.etag));
+        xml.push_str("</ETag>");
+        xml.push_str("<Size>");
+        xml.push_str(&obj.size.to_string());
+        xml.push_str("</Size>");
+        xml.push_str("<StorageClass>STANDARD</StorageClass>");
+        xml.push_str("</Contents>");
+    }
+
+    for prefix in &result.common_prefixes {
+        xml.push_str("<CommonPrefixes><Prefix>");
+        xml.push_str(&xml_escape(prefix));
+        xml.push_str("</Prefix></CommonPrefixes>");
+    }
+
+    xml.push_str("</ListBucketResult>");
+    xml
+}
+
+/// Format a ListBucketResult (ListObjects v1) XML response.
+pub fn list_objects_v1_xml(
+    bucket: &str,
+    prefix: Option<&str>,
+    delimiter: Option<&str>,
+    marker: Option<&str>,
+    max_keys: u32,
+    result: &ListObjectsResult,
+) -> String {
+    let mut xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
+    );
+
+    xml.push_str("<Name>");
+    xml.push_str(&xml_escape(bucket));
+    xml.push_str("</Name>");
+
+    if let Some(p) = prefix {
+        xml.push_str("<Prefix>");
+        xml.push_str(&xml_escape(p));
+        xml.push_str("</Prefix>");
+    } else {
+        xml.push_str("<Prefix/>");
+    }
+
+    if let Some(m) = marker {
+        xml.push_str("<Marker>");
+        xml.push_str(&xml_escape(m));
+        xml.push_str("</Marker>");
+    } else {
+        xml.push_str("<Marker/>");
+    }
+
+    if let Some(d) = delimiter {
+        xml.push_str("<Delimiter>");
+        xml.push_str(&xml_escape(d));
+        xml.push_str("</Delimiter>");
+    }
+
+    xml.push_str("<MaxKeys>");
+    xml.push_str(&max_keys.to_string());
+    xml.push_str("</MaxKeys>");
+
+    xml.push_str("<IsTruncated>");
+    xml.push_str(if result.is_truncated { "true" } else { "false" });
+    xml.push_str("</IsTruncated>");
+
+    if result.is_truncated {
+        if let Some(ref token) = result.next_continuation_token {
+            xml.push_str("<NextMarker>");
+            xml.push_str(&xml_escape(token));
+            xml.push_str("</NextMarker>");
+        }
     }
 
     for obj in &result.objects {
@@ -239,6 +323,24 @@ mod tests {
     }
 
     #[test]
+    fn list_objects_xml_key_count_includes_prefixes() {
+        let result = ListObjectsResult {
+            objects: vec![ListEntry {
+                key: "root.txt".to_string(),
+                size: 10,
+                etag: "\"abc\"".to_string(),
+                last_modified: 0,
+            }],
+            common_prefixes: vec!["photos/".to_string(), "docs/".to_string()],
+            is_truncated: false,
+            next_continuation_token: None,
+        };
+        let xml = list_objects_v2_xml("bucket", None, Some("/"), 1000, &result);
+        // 1 object + 2 prefixes = 3
+        assert!(xml.contains("<KeyCount>3</KeyCount>"));
+    }
+
+    #[test]
     fn list_objects_xml_empty_prefix() {
         let result = ListObjectsResult {
             objects: vec![],
@@ -251,6 +353,87 @@ mod tests {
         assert!(xml.contains("<Prefix/>"));
         assert!(!xml.contains("<Delimiter>"));
         assert!(!xml.contains("<NextContinuationToken>"));
+    }
+
+    #[test]
+    fn list_objects_v1_xml_format() {
+        let result = ListObjectsResult {
+            objects: vec![ListEntry {
+                key: "my-key".to_string(),
+                size: 42,
+                etag: "\"abc123\"".to_string(),
+                last_modified: 1685000000000,
+            }],
+            common_prefixes: vec![],
+            is_truncated: false,
+            next_continuation_token: None,
+        };
+        let xml = list_objects_v1_xml("bucket", None, None, None, 1000, &result);
+        assert!(xml.contains("<Key>my-key</Key>"));
+        assert!(xml.contains("<Marker/>"));
+        assert!(xml.contains("ListBucketResult"));
+        // V1 should NOT have KeyCount or ContinuationToken
+        assert!(!xml.contains("<KeyCount>"));
+        assert!(!xml.contains("<ContinuationToken>"));
+    }
+
+    #[test]
+    fn list_objects_v1_xml_with_prefix_delimiter_and_common_prefixes() {
+        let result = ListObjectsResult {
+            objects: vec![ListEntry {
+                key: "photos/cat.jpg".to_string(),
+                size: 100,
+                etag: "\"aabbccdd\"".to_string(),
+                last_modified: 1685000000000,
+            }],
+            common_prefixes: vec!["photos/2024/".to_string()],
+            is_truncated: true,
+            next_continuation_token: Some("photos/cat.jpg".to_string()),
+        };
+        let xml = list_objects_v1_xml("bucket", Some("photos/"), Some("/"), Some("a"), 1, &result);
+        assert!(xml.contains("<Prefix>photos/</Prefix>"));
+        assert!(xml.contains("<Delimiter>/</Delimiter>"));
+        assert!(xml.contains("<Marker>a</Marker>"));
+        assert!(xml.contains("<IsTruncated>true</IsTruncated>"));
+        assert!(xml.contains("<NextMarker>photos/cat.jpg</NextMarker>"));
+        assert!(xml.contains("<CommonPrefixes><Prefix>photos/2024/</Prefix></CommonPrefixes>"));
+        // V1: no KeyCount, no ContinuationToken
+        assert!(!xml.contains("<KeyCount>"));
+        assert!(!xml.contains("<ContinuationToken>"));
+    }
+
+    #[test]
+    fn list_objects_v1_xml_empty_prefix_no_delimiter() {
+        let result = ListObjectsResult {
+            objects: vec![],
+            common_prefixes: vec![],
+            is_truncated: false,
+            next_continuation_token: None,
+        };
+        let xml = list_objects_v1_xml("bucket", None, None, None, 1000, &result);
+        assert!(xml.contains("<Prefix/>"));
+        assert!(xml.contains("<Marker/>"));
+        assert!(!xml.contains("<Delimiter>"));
+        assert!(!xml.contains("<NextMarker>"));
+    }
+
+    #[test]
+    fn list_objects_v1_xml_with_marker_and_truncation() {
+        let result = ListObjectsResult {
+            objects: vec![ListEntry {
+                key: "key2".to_string(),
+                size: 10,
+                etag: "\"etag\"".to_string(),
+                last_modified: 0,
+            }],
+            common_prefixes: vec![],
+            is_truncated: true,
+            next_continuation_token: Some("key2".to_string()),
+        };
+        let xml = list_objects_v1_xml("bucket", None, None, Some("key1"), 1, &result);
+        assert!(xml.contains("<Marker>key1</Marker>"));
+        assert!(xml.contains("<NextMarker>key2</NextMarker>"));
+        assert!(xml.contains("<IsTruncated>true</IsTruncated>"));
     }
 
     #[test]

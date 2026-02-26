@@ -99,9 +99,10 @@ impl Coordinator {
     // ── Bucket operations ─────────────────────────────────────────────
 
     pub fn create_bucket(&self, name: &str) -> Result<(), ServerError> {
-        self.bucket_db.create_bucket(name, 0).map_err(|e| match e {
-            storage::MetadataError::BucketAlreadyExists => ServerError::BucketAlreadyExists,
-            other => ServerError::Metadata(other),
+        self.bucket_db.create_bucket(name, 0).or_else(|e| match e {
+            // Idempotent: single-owner system, so re-creating is a no-op
+            storage::MetadataError::BucketAlreadyExists => Ok(()),
+            other => Err(ServerError::Metadata(other)),
         })
     }
 
@@ -439,6 +440,16 @@ impl Coordinator {
         // Verify bucket exists
         self.head_bucket(bucket)?;
 
+        // MaxKeys=0 is valid per S3 spec: return empty result
+        if max_keys == 0 {
+            return Ok(ListObjectsResult {
+                objects: Vec::new(),
+                common_prefixes: Vec::new(),
+                is_truncated: false,
+                next_continuation_token: None,
+            });
+        }
+
         // Bound per-PG queries. Without delimiter, max_keys+1 per PG is
         // sufficient: the global top max_keys entries can come from at most one
         // PG each, so max_keys+1 captures them all plus detects truncation.
@@ -604,13 +615,17 @@ mod tests {
     }
 
     #[test]
-    fn bucket_already_exists() {
+    fn create_bucket_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        let err = coord.create_bucket("bucket").unwrap_err();
-        assert!(matches!(err, ServerError::BucketAlreadyExists));
+        // Second create should succeed (idempotent for same owner)
+        coord.create_bucket("bucket").unwrap();
+
+        // Only one bucket should exist
+        let buckets = coord.list_buckets().unwrap();
+        assert_eq!(buckets.len(), 1);
     }
 
     #[test]
@@ -790,6 +805,21 @@ mod tests {
         assert_eq!(result.objects[0].key, "root.txt");
         assert!(result.common_prefixes.contains(&"photos/".to_string()));
         assert!(result.common_prefixes.contains(&"docs/".to_string()));
+    }
+
+    #[test]
+    fn put_get_object_trailing_slash_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+
+        coord.create_bucket("bucket").unwrap();
+        coord
+            .put_object("bucket", "folder/", b"data", &[])
+            .unwrap();
+
+        let obj = coord.get_object("bucket", "folder/").unwrap();
+        assert_eq!(obj.data, b"data");
+        assert_eq!(obj.size, 4);
     }
 
     #[test]
@@ -1038,6 +1068,39 @@ mod tests {
         assert_eq!(result.objects.len(), 1);
         assert!(!result.is_truncated);
         assert!(result.next_continuation_token.is_none());
+    }
+
+    #[test]
+    fn list_objects_max_keys_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+
+        coord.create_bucket("bucket").unwrap();
+        coord.put_object("bucket", "key1", b"data", &[]).unwrap();
+
+        let result = coord
+            .list_objects_v2("bucket", None, None, None, 0)
+            .unwrap();
+        assert!(result.objects.is_empty());
+        assert!(result.common_prefixes.is_empty());
+        assert!(!result.is_truncated);
+        assert!(result.next_continuation_token.is_none());
+    }
+
+    #[test]
+    fn list_objects_max_keys_zero_with_delimiter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+
+        coord.create_bucket("bucket").unwrap();
+        coord.put_object("bucket", "a/1", b"data", &[]).unwrap();
+
+        let result = coord
+            .list_objects_v2("bucket", None, Some("/"), None, 0)
+            .unwrap();
+        assert!(result.objects.is_empty());
+        assert!(result.common_prefixes.is_empty());
+        assert!(!result.is_truncated);
     }
 
     #[test]

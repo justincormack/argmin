@@ -8,6 +8,7 @@ pub enum S3Operation {
     CreateBucket { bucket: String },
     DeleteBucket { bucket: String },
     HeadBucket { bucket: String },
+    ListObjectsV1 { bucket: String },
     ListObjectsV2 { bucket: String },
     PutObject { bucket: String, key: String },
     GetObject { bucket: String, key: String },
@@ -72,14 +73,7 @@ fn validate_object_key(key: &str) -> Result<(), ServerError> {
 /// Route an HTTP request to an S3 operation.
 ///
 /// Path-style addressing only: `/<bucket>` or `/<bucket>/<key...>`.
-pub fn route(method: &str, path: &str, _query: &str) -> Result<S3Operation, ServerError> {
-    // Normalize path: remove trailing slash (except for root)
-    let path = if path.len() > 1 && path.ends_with('/') {
-        &path[..path.len() - 1]
-    } else {
-        path
-    };
-
+pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, ServerError> {
     // Split path into segments
     let trimmed = path.strip_prefix('/').unwrap_or(path);
 
@@ -118,11 +112,25 @@ pub fn route(method: &str, path: &str, _query: &str) -> Result<S3Operation, Serv
             bucket: bucket.to_string(),
         }),
         ("GET", None) => {
-            // GET /<bucket> = ListObjectsV2 (check for list-type=2 param)
-            // For simplicity, any GET on a bucket is ListObjectsV2
-            Ok(S3Operation::ListObjectsV2 {
-                bucket: bucket.to_string(),
-            })
+            // Check for list-type=2 → V2, otherwise → V1
+            let is_v2 = query
+                .split('&')
+                .filter(|s| !s.is_empty())
+                .any(|pair| {
+                    let mut parts = pair.splitn(2, '=');
+                    let key = parts.next().unwrap_or("");
+                    let val = parts.next().unwrap_or("");
+                    key == "list-type" && val == "2"
+                });
+            if is_v2 {
+                Ok(S3Operation::ListObjectsV2 {
+                    bucket: bucket.to_string(),
+                })
+            } else {
+                Ok(S3Operation::ListObjectsV1 {
+                    bucket: bucket.to_string(),
+                })
+            }
         }
 
         // Object-level operations
@@ -187,10 +195,60 @@ mod tests {
     }
 
     #[test]
-    fn list_objects() {
+    fn list_objects_v2() {
         assert_eq!(
             route("GET", "/mybucket", "list-type=2").unwrap(),
             S3Operation::ListObjectsV2 {
+                bucket: "mybucket".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn list_objects_v1_default() {
+        assert_eq!(
+            route("GET", "/mybucket", "").unwrap(),
+            S3Operation::ListObjectsV1 {
+                bucket: "mybucket".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn list_objects_v1_without_list_type() {
+        assert_eq!(
+            route("GET", "/mybucket", "prefix=foo").unwrap(),
+            S3Operation::ListObjectsV1 {
+                bucket: "mybucket".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn list_objects_v1_explicit_list_type_1() {
+        assert_eq!(
+            route("GET", "/mybucket", "list-type=1").unwrap(),
+            S3Operation::ListObjectsV1 {
+                bucket: "mybucket".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn list_objects_v2_with_other_params() {
+        assert_eq!(
+            route("GET", "/mybucket", "list-type=2&prefix=foo&max-keys=10").unwrap(),
+            S3Operation::ListObjectsV2 {
+                bucket: "mybucket".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn get_bucket_trailing_slash_is_list_v1() {
+        assert_eq!(
+            route("GET", "/mybucket/", "").unwrap(),
+            S3Operation::ListObjectsV1 {
                 bucket: "mybucket".to_string()
             }
         );
@@ -288,6 +346,38 @@ mod tests {
         assert!(route("GET", "/bucket/a", "").is_ok());
         assert!(route("GET", "/bucket/path/to/file.txt", "").is_ok());
         assert!(route("GET", "/bucket/key with spaces", "").is_ok());
+    }
+
+    #[test]
+    fn key_with_trailing_slash() {
+        assert_eq!(
+            route("PUT", "/bucket/key/", "").unwrap(),
+            S3Operation::PutObject {
+                bucket: "bucket".to_string(),
+                key: "key/".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn bucket_trailing_slash_is_bucket_op() {
+        assert_eq!(
+            route("HEAD", "/mybucket/", "").unwrap(),
+            S3Operation::HeadBucket {
+                bucket: "mybucket".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn nested_key_with_trailing_slash() {
+        assert_eq!(
+            route("GET", "/bucket/a/b/c/", "").unwrap(),
+            S3Operation::GetObject {
+                bucket: "bucket".to_string(),
+                key: "a/b/c/".to_string()
+            }
+        );
     }
 
     #[test]
