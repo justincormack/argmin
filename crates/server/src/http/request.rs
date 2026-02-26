@@ -140,7 +140,7 @@ impl S3Request {
 }
 
 /// Percent-decode a string (RFC 3986). Does NOT treat + as space.
-fn percent_decode(s: &str) -> String {
+pub(crate) fn percent_decode(s: &str) -> String {
     let mut result = Vec::with_capacity(s.len());
     let bytes = s.as_bytes();
     let mut i = 0;
@@ -156,6 +156,38 @@ fn percent_decode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&result).to_string()
+}
+
+/// Parse the `x-amz-copy-source` header value into `(bucket, key)`.
+///
+/// Accepts `[/]bucket/key[?versionId=...]`. Strips optional leading `/`
+/// and ignores `?versionId=...` (we don't support versioning).
+/// Both bucket and key are percent-decoded.
+pub(crate) fn parse_copy_source(header: &str) -> Result<(String, String), ServerError> {
+    // Strip optional leading slash
+    let s = header.strip_prefix('/').unwrap_or(header);
+
+    // Strip ?versionId=... query string
+    let s = match s.find('?') {
+        Some(pos) => &s[..pos],
+        None => s,
+    };
+
+    // Split into bucket/key at first '/'
+    let slash_pos = s.find('/').ok_or_else(|| ServerError::InvalidRequest {
+        reason: "x-amz-copy-source must contain bucket/key".to_string(),
+    })?;
+
+    let bucket = percent_decode(&s[..slash_pos]);
+    let key = percent_decode(&s[slash_pos + 1..]);
+
+    if key.is_empty() {
+        return Err(ServerError::InvalidRequest {
+            reason: "x-amz-copy-source key must not be empty".to_string(),
+        });
+    }
+
+    Ok((bucket, key))
 }
 
 fn hex_val(b: u8) -> Option<u8> {
@@ -385,5 +417,48 @@ mod tests {
         };
         assert_eq!(req.header("content-type"), None);
         assert_eq!(req.header("host"), Some("example.com"));
+    }
+
+    // ── parse_copy_source ────────────────────────────────────────────
+
+    #[test]
+    fn parse_copy_source_basic() {
+        let (bucket, key) = parse_copy_source("/bucket/key").unwrap();
+        assert_eq!(bucket, "bucket");
+        assert_eq!(key, "key");
+    }
+
+    #[test]
+    fn parse_copy_source_no_leading_slash() {
+        let (bucket, key) = parse_copy_source("bucket/key").unwrap();
+        assert_eq!(bucket, "bucket");
+        assert_eq!(key, "key");
+    }
+
+    #[test]
+    fn parse_copy_source_encoded() {
+        let (bucket, key) = parse_copy_source("/bucket/key%20name").unwrap();
+        assert_eq!(bucket, "bucket");
+        assert_eq!(key, "key name");
+    }
+
+    #[test]
+    fn parse_copy_source_nested_key() {
+        let (bucket, key) = parse_copy_source("/bucket/a/b/c").unwrap();
+        assert_eq!(bucket, "bucket");
+        assert_eq!(key, "a/b/c");
+    }
+
+    #[test]
+    fn parse_copy_source_version_id_stripped() {
+        let (bucket, key) = parse_copy_source("/bucket/key?versionId=xyz").unwrap();
+        assert_eq!(bucket, "bucket");
+        assert_eq!(key, "key");
+    }
+
+    #[test]
+    fn parse_copy_source_missing_key() {
+        assert!(parse_copy_source("/bucket").is_err());
+        assert!(parse_copy_source("bucket").is_err());
     }
 }

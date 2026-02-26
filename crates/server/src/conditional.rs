@@ -198,6 +198,68 @@ pub fn check_delete_conditions(
     Ok(())
 }
 
+/// Extract copy-source conditions from an S3 request's `x-amz-copy-source-if-*` headers.
+pub fn copy_source_condition_from_headers(req: &S3Request) -> ReadCondition {
+    ReadCondition {
+        if_match: req
+            .header("x-amz-copy-source-if-match")
+            .map(str::to_string),
+        if_none_match: req
+            .header("x-amz-copy-source-if-none-match")
+            .map(str::to_string),
+        if_modified_since: req
+            .header("x-amz-copy-source-if-modified-since")
+            .and_then(parse_http_date),
+        if_unmodified_since: req
+            .header("x-amz-copy-source-if-unmodified-since")
+            .and_then(parse_http_date),
+    }
+}
+
+/// Check source conditions for CopyObject.
+///
+/// Same evaluation order as read conditions (RFC 7232 §6), but all
+/// failures return `PreconditionFailed` (412) — never `NotModified`.
+pub fn check_copy_source_conditions(
+    cond: &ReadCondition,
+    etag: &str,
+    last_modified: u64,
+) -> Result<(), ServerError> {
+    // Step 1: If-Match
+    if let Some(ref required) = cond.if_match {
+        if !etags_match(required, etag) {
+            return Err(ServerError::PreconditionFailed);
+        }
+    }
+
+    // Step 2: If-Unmodified-Since (only if If-Match absent)
+    if cond.if_match.is_none() {
+        if let Some(since) = cond.if_unmodified_since {
+            if last_modified > since {
+                return Err(ServerError::PreconditionFailed);
+            }
+        }
+    }
+
+    // Step 3: If-None-Match — returns 412 (not 304)
+    if let Some(ref unwanted) = cond.if_none_match {
+        if etags_match(unwanted, etag) {
+            return Err(ServerError::PreconditionFailed);
+        }
+    }
+
+    // Step 4: If-Modified-Since (only if If-None-Match absent) — returns 412 (not 304)
+    if cond.if_none_match.is_none() {
+        if let Some(since) = cond.if_modified_since {
+            if last_modified <= since {
+                return Err(ServerError::PreconditionFailed);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 impl ReadCondition {
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -533,5 +595,68 @@ mod tests {
         };
         let err = check_read_conditions(&cond, &test_etag(), 1000).unwrap_err();
         assert!(matches!(err, ServerError::NotModified { .. }));
+    }
+
+    // ── Copy source conditions ──────────────────────────────────────
+
+    #[test]
+    fn copy_source_if_match_passes() {
+        let cond = ReadCondition {
+            if_match: Some(test_etag()),
+            ..Default::default()
+        };
+        assert!(check_copy_source_conditions(&cond, &test_etag(), 1000).is_ok());
+    }
+
+    #[test]
+    fn copy_source_if_match_fails() {
+        let cond = ReadCondition {
+            if_match: Some(other_etag()),
+            ..Default::default()
+        };
+        let err = check_copy_source_conditions(&cond, &test_etag(), 1000).unwrap_err();
+        assert!(matches!(err, ServerError::PreconditionFailed));
+    }
+
+    #[test]
+    fn copy_source_if_none_match_matching_returns_412() {
+        // Key difference from read: returns 412, NOT 304
+        let cond = ReadCondition {
+            if_none_match: Some(test_etag()),
+            ..Default::default()
+        };
+        let err = check_copy_source_conditions(&cond, &test_etag(), 1000).unwrap_err();
+        assert!(matches!(err, ServerError::PreconditionFailed));
+    }
+
+    #[test]
+    fn copy_source_if_none_match_passes() {
+        let cond = ReadCondition {
+            if_none_match: Some(other_etag()),
+            ..Default::default()
+        };
+        assert!(check_copy_source_conditions(&cond, &test_etag(), 1000).is_ok());
+    }
+
+    #[test]
+    fn copy_source_if_modified_since_not_modified_returns_412() {
+        let cond = ReadCondition {
+            if_modified_since: Some(2000),
+            ..Default::default()
+        };
+        // Object last_modified (1000) <= since (2000) → 412 (not 304)
+        let err = check_copy_source_conditions(&cond, &test_etag(), 1000).unwrap_err();
+        assert!(matches!(err, ServerError::PreconditionFailed));
+    }
+
+    #[test]
+    fn copy_source_if_unmodified_since_modified_returns_412() {
+        let cond = ReadCondition {
+            if_unmodified_since: Some(500),
+            ..Default::default()
+        };
+        // Object last_modified (1000) > since (500) → 412
+        let err = check_copy_source_conditions(&cond, &test_etag(), 1000).unwrap_err();
+        assert!(matches!(err, ServerError::PreconditionFailed));
     }
 }

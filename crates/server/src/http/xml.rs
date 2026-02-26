@@ -388,8 +388,21 @@ fn xml_escape(s: &str) -> String {
     out
 }
 
+/// Format a CopyObjectResult XML response.
+pub fn copy_object_result_xml(etag: &str, last_modified: u64) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <CopyObjectResult>\
+         <ETag>{}</ETag>\
+         <LastModified>{}</LastModified>\
+         </CopyObjectResult>",
+        xml_escape(etag),
+        format_timestamp(last_modified),
+    )
+}
+
 /// Format a unix millisecond timestamp as ISO 8601.
-fn format_timestamp(millis: u64) -> String {
+pub(crate) fn format_timestamp(millis: u64) -> String {
     let secs = millis / 1000;
     // Simple UTC formatting without pulling in chrono
     let days_since_epoch = secs / 86400;
@@ -776,5 +789,17 @@ mod tests {
     fn format_timestamp_epoch() {
         let ts = format_timestamp(0);
         assert_eq!(ts, "1970-01-01T00:00:00.000Z");
+    }
+
+    // ── copy_object_result_xml ────────────────────────────────────
+
+    #[test]
+    fn copy_object_result_xml_format() {
+        let xml = copy_object_result_xml("\"abcdef1234567890\"", 1705321845000);
+        assert!(xml.contains("<?xml"));
+        assert!(xml.contains("<CopyObjectResult>"));
+        assert!(xml.contains("<ETag>&quot;abcdef1234567890&quot;</ETag>"));
+        assert!(xml.contains("<LastModified>2024-01-15T12:30:45.000Z</LastModified>"));
+        assert!(xml.contains("</CopyObjectResult>"));
     }
 }

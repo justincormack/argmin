@@ -7,8 +7,8 @@ use storage::{
 };
 
 use crate::conditional::{
-    check_delete_conditions, check_read_conditions, check_write_conditions, DeleteCondition,
-    ReadCondition, WriteCondition,
+    check_copy_source_conditions, check_delete_conditions, check_read_conditions,
+    check_write_conditions, DeleteCondition, ReadCondition, WriteCondition,
 };
 use crate::error::ServerError;
 use crate::etag::{crc64_to_etag_bytes, etag_bytes_to_crc64, format_etag};
@@ -59,6 +59,22 @@ pub struct GetObjectRangeResult {
     pub last_modified: u64,
     pub range_start: u64,
     pub range_end: u64,
+}
+
+/// Metadata handling directive for `CopyObject`.
+#[derive(Debug, Clone, Copy)]
+pub enum MetadataDirective {
+    /// Preserve source object's metadata.
+    Copy,
+    /// Replace metadata with values from request headers.
+    Replace,
+}
+
+/// Result of a `CopyObject` operation.
+#[derive(Debug)]
+pub struct CopyObjectResult {
+    pub etag: String,
+    pub last_modified: u64,
 }
 
 /// Object entry for listing.
@@ -184,55 +200,27 @@ impl Coordinator {
 
     // ── Object operations ─────────────────────────────────────────────
 
-    /// Put an object into storage.
-    pub fn put_object(
+    /// Core write path: serialize metadata, EC-encode, write shards, record metadata.
+    /// Shared by `put_object` and `copy_object`.
+    fn write_object_inner(
         &self,
         bucket: &str,
         key: &str,
-        data: &[u8],
-        headers: &[(&str, &str)],
-        cond: &WriteCondition,
+        metadata_blob: &MetadataBlob,
+        user_data: &[u8],
     ) -> Result<PutObjectResult, ServerError> {
-        if data.len() as u64 > MAX_OBJECT_SIZE {
-            return Err(ServerError::ObjectTooLarge {
-                size: data.len() as u64,
-                max: MAX_OBJECT_SIZE,
-            });
-        }
-
-        // 1. Verify bucket exists
-        self.head_bucket(bucket)?;
-
-        // 1b. Check write conditions if any are set
-        if !cond.is_empty() {
-            let pg_id = derive_pg(bucket, key, self.pg_count);
-            let pg = self.storage_node.get_pg(pg_id)?;
-            let existing_etag = match pg.get_object_meta(bucket, key) {
-                Ok(record) => {
-                    let crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
-                    Some(format_etag(crc))
-                }
-                Err(storage::MetadataError::ObjectNotFound) => None,
-                Err(e) => return Err(ServerError::Metadata(e)),
-            };
-            check_write_conditions(cond, existing_etag.as_deref())?;
-        }
-
-        // 2. Build metadata blob
-        let metadata_blob = MetadataBlob::from_headers(headers)?;
-
-        // 3. Serialize blob
+        // 1. Serialize blob
         let blob_bytes = metadata_blob.serialize()?;
 
-        // 4. Concatenate: blob_bytes || user_data
-        let mut full_data = Vec::with_capacity(blob_bytes.len() + data.len());
+        // 2. Concatenate: blob_bytes || user_data
+        let mut full_data = Vec::with_capacity(blob_bytes.len() + user_data.len());
         full_data.extend_from_slice(&blob_bytes);
-        full_data.extend_from_slice(data);
+        full_data.extend_from_slice(user_data);
 
-        // 5. Compute ETag (CRC64 of full_data before padding)
+        // 3. Compute ETag (CRC64 of full_data before padding)
         let etag_crc = crc64::checksum(&full_data);
 
-        // 6. Pad to multiple of k for equal shard sizes
+        // 4. Pad to multiple of k for equal shard sizes
         let k = self.ec_config.data_shards as usize;
         let m = self.ec_config.parity_shards as usize;
         let remainder = full_data.len() % k;
@@ -241,27 +229,27 @@ impl Coordinator {
             full_data.resize(full_data.len() + pad, 0);
         }
 
-        // 7. Split into k data shards
+        // 5. Split into k data shards
         let shard_size = full_data.len() / k;
         let data_shards: Vec<&[u8]> = (0..k)
             .map(|i| &full_data[i * shard_size..(i + 1) * shard_size])
             .collect();
 
-        // 8. Allocate parity buffers and encode
+        // 6. Allocate parity buffers and encode
         let mut parity_bufs: Vec<Vec<u8>> = (0..m).map(|_| vec![0u8; shard_size]).collect();
         let mut parity_refs: Vec<&mut [u8]> =
             parity_bufs.iter_mut().map(|v| v.as_mut_slice()).collect();
         self.ec_codec.encode(&data_shards, &mut parity_refs)?;
 
-        // 9. Derive PG
+        // 7. Derive PG
         let pg_id = derive_pg(bucket, key, self.pg_count);
         let pg = self.storage_node.get_pg(pg_id)?;
 
-        // 10. Compute object_key_hash
+        // 8. Compute object_key_hash
         let okh = object_key_hash(bucket, key);
         let version_id: u64 = 0; // unversioned
 
-        // 11. Write all k+m shards, with cleanup on failure
+        // 9. Write all k+m shards, with cleanup on failure
         let mut written_shards: Vec<ShardKey> = Vec::with_capacity(k + m);
         let write_result: Result<(), ServerError> = (|| {
             for i in 0..(k + m) {
@@ -285,13 +273,13 @@ impl Coordinator {
             return Err(e);
         }
 
-        // 12. Record metadata
+        // 10. Record metadata
         let meta_result = pg.put_object_meta(&PutObjectMetaReq {
             bucket: bucket.to_string(),
             key: key.to_string(),
             version_id: "null".to_string(),
-            size: data.len() as u64,
-            total_size: (blob_bytes.len() + data.len()) as u64,
+            size: user_data.len() as u64,
+            total_size: (blob_bytes.len() + user_data.len()) as u64,
             etag: crc64_to_etag_bytes(etag_crc),
             etag_kind: 0,
             ec_k: self.ec_config.data_shards,
@@ -309,6 +297,175 @@ impl Coordinator {
         Ok(PutObjectResult {
             etag: format_etag(etag_crc),
             version_id: "null".to_string(),
+        })
+    }
+
+    /// Put an object into storage.
+    pub fn put_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        data: &[u8],
+        headers: &[(&str, &str)],
+        cond: &WriteCondition,
+    ) -> Result<PutObjectResult, ServerError> {
+        if data.len() as u64 > MAX_OBJECT_SIZE {
+            return Err(ServerError::ObjectTooLarge {
+                size: data.len() as u64,
+                max: MAX_OBJECT_SIZE,
+            });
+        }
+
+        // 1. Verify bucket exists
+        self.head_bucket(bucket)?;
+
+        // 2. Check write conditions if any are set
+        if !cond.is_empty() {
+            let pg_id = derive_pg(bucket, key, self.pg_count);
+            let pg = self.storage_node.get_pg(pg_id)?;
+            let existing_etag = match pg.get_object_meta(bucket, key) {
+                Ok(record) => {
+                    let crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
+                    Some(format_etag(crc))
+                }
+                Err(storage::MetadataError::ObjectNotFound) => None,
+                Err(e) => return Err(ServerError::Metadata(e)),
+            };
+            check_write_conditions(cond, existing_etag.as_deref())?;
+        }
+
+        // 3. Build metadata blob and write
+        let metadata_blob = MetadataBlob::from_headers(headers)?;
+        self.write_object_inner(bucket, key, &metadata_blob, data)
+    }
+
+    /// Copy an object from one location to another.
+    ///
+    /// Supports conditional headers on both source and destination,
+    /// and metadata directive (COPY preserves source metadata, REPLACE
+    /// uses new headers).
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_object(
+        &self,
+        src_bucket: &str,
+        src_key: &str,
+        dst_bucket: &str,
+        dst_key: &str,
+        src_cond: &ReadCondition,
+        dst_cond: &WriteCondition,
+        directive: MetadataDirective,
+        new_headers: &[(&str, &str)],
+    ) -> Result<CopyObjectResult, ServerError> {
+        // 1. Read source metadata
+        let src_pg_id = derive_pg(src_bucket, src_key, self.pg_count);
+        let src_pg = self.storage_node.get_pg(src_pg_id)?;
+        let src_record =
+            src_pg
+                .get_object_meta(src_bucket, src_key)
+                .map_err(|e| match e {
+                    storage::MetadataError::ObjectNotFound => ServerError::ObjectNotFound {
+                        bucket: src_bucket.to_string(),
+                        key: src_key.to_string(),
+                    },
+                    other => ServerError::Metadata(other),
+                })?;
+
+        let src_etag_crc = etag_bytes_to_crc64(&src_record.etag).unwrap_or(0);
+        let src_etag = format_etag(src_etag_crc);
+
+        // 2. Check source conditions
+        check_copy_source_conditions(src_cond, &src_etag, src_record.last_modified)?;
+
+        // 3. Read source data (full object: metadata blob + user data)
+        let src_okh = object_key_hash(src_bucket, src_key);
+        let version_id: u64 = 0;
+        let (src_metadata, user_data) = if src_record.total_size > 0 {
+            let total = src_record.total_size as usize;
+            let data = self
+                .read_range(src_pg, &src_okh, version_id, &src_record, 0, total - 1)
+                .map_err(|e| match e {
+                    ServerError::Store(storage::StoreError::NotFound) => {
+                        ServerError::ObjectNotFound {
+                            bucket: src_bucket.to_string(),
+                            key: src_key.to_string(),
+                        }
+                    }
+                    other => other,
+                })?;
+
+            let metadata_size = (src_record.total_size - src_record.size) as usize;
+            let (metadata, _) = MetadataBlob::deserialize(&data[..metadata_size])?;
+            let user_data = data[metadata_size..].to_vec();
+            (metadata, user_data)
+        } else {
+            // Legacy path: total_size == 0
+            let k = src_record.ec_k as usize;
+            let all_data_indices: Vec<usize> = (0..k).collect();
+            let (shard_data, shard_size) = self
+                .read_data_shards(src_pg, &src_okh, version_id, &src_record, &all_data_indices)
+                .map_err(|e| match e {
+                    ServerError::Store(storage::StoreError::NotFound) => {
+                        ServerError::ObjectNotFound {
+                            bucket: src_bucket.to_string(),
+                            key: src_key.to_string(),
+                        }
+                    }
+                    other => other,
+                })?;
+
+            let mut full_padded_data = Vec::with_capacity(k * shard_size);
+            for shard in &shard_data {
+                full_padded_data.extend_from_slice(shard);
+            }
+
+            let (metadata, blob_len) = MetadataBlob::deserialize(&full_padded_data)?;
+            let user_data_end = blob_len + src_record.size as usize;
+            if user_data_end > full_padded_data.len() {
+                return Err(ServerError::MetadataBlobError {
+                    reason: "data shorter than expected".to_string(),
+                });
+            }
+            let user_data = full_padded_data[blob_len..user_data_end].to_vec();
+            (metadata, user_data)
+        };
+
+        // 4. Verify dest bucket exists
+        self.head_bucket(dst_bucket)?;
+
+        // 5. Check dest write conditions
+        if !dst_cond.is_empty() {
+            let dst_pg_id = derive_pg(dst_bucket, dst_key, self.pg_count);
+            let dst_pg = self.storage_node.get_pg(dst_pg_id)?;
+            let existing_etag = match dst_pg.get_object_meta(dst_bucket, dst_key) {
+                Ok(record) => {
+                    let crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
+                    Some(format_etag(crc))
+                }
+                Err(storage::MetadataError::ObjectNotFound) => None,
+                Err(e) => return Err(ServerError::Metadata(e)),
+            };
+            check_write_conditions(dst_cond, existing_etag.as_deref())?;
+        }
+
+        // 6. Determine metadata
+        let metadata_blob = match directive {
+            MetadataDirective::Copy => src_metadata,
+            MetadataDirective::Replace => MetadataBlob::from_headers(new_headers)?,
+        };
+
+        // 7. Write destination object
+        let put_result = self.write_object_inner(dst_bucket, dst_key, &metadata_blob, &user_data)?;
+
+        // 8. Read back dest metadata to get the authoritative last_modified
+        let dst_pg_id = derive_pg(dst_bucket, dst_key, self.pg_count);
+        let dst_pg = self.storage_node.get_pg(dst_pg_id)?;
+        let dst_record = dst_pg.get_object_meta(dst_bucket, dst_key).map_err(|e| {
+            ServerError::Metadata(e)
+        })?;
+
+        Ok(CopyObjectResult {
+            etag: put_result.etag,
+            last_modified: dst_record.last_modified,
         })
     }
 
@@ -2355,5 +2512,305 @@ mod tests {
             .get_object_range("bucket", "key", ByteRange::Range { start: 0, end: 4 }, &cond)
             .unwrap();
         assert_eq!(result.data, b"Hello");
+    }
+
+    // ── CopyObject tests ──────────────────────────────────────────────
+
+    #[test]
+    fn copy_object_basic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let headers = [("Content-Type", "text/plain")];
+        coord
+            .put_object("bucket", "src", b"hello copy", &headers, NO_WRITE)
+            .unwrap();
+
+        let result = coord
+            .copy_object(
+                "bucket",
+                "src",
+                "bucket",
+                "dst",
+                NO_READ,
+                NO_WRITE,
+                MetadataDirective::Copy,
+                &[],
+            )
+            .unwrap();
+        assert!(!result.etag.is_empty());
+
+        let obj = coord.get_object("bucket", "dst", NO_READ).unwrap();
+        assert_eq!(obj.data, b"hello copy");
+    }
+
+    #[test]
+    fn copy_object_metadata_copy_directive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let headers = [("Content-Type", "image/png"), ("X-Amz-Meta-Author", "alice")];
+        coord
+            .put_object("bucket", "src", b"data", &headers, NO_WRITE)
+            .unwrap();
+
+        coord
+            .copy_object(
+                "bucket",
+                "src",
+                "bucket",
+                "dst",
+                NO_READ,
+                NO_WRITE,
+                MetadataDirective::Copy,
+                &[],
+            )
+            .unwrap();
+
+        let obj = coord.get_object("bucket", "dst", NO_READ).unwrap();
+        assert_eq!(obj.metadata.get("content-type"), Some("image/png"));
+        assert_eq!(obj.metadata.get("x-amz-meta-author"), Some("alice"));
+    }
+
+    #[test]
+    fn copy_object_metadata_replace_directive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let headers = [("Content-Type", "image/png"), ("X-Amz-Meta-Author", "alice")];
+        coord
+            .put_object("bucket", "src", b"data", &headers, NO_WRITE)
+            .unwrap();
+
+        let new_headers = [("Content-Type", "text/html"), ("X-Amz-Meta-Version", "2")];
+        coord
+            .copy_object(
+                "bucket",
+                "src",
+                "bucket",
+                "dst",
+                NO_READ,
+                NO_WRITE,
+                MetadataDirective::Replace,
+                &new_headers,
+            )
+            .unwrap();
+
+        let obj = coord.get_object("bucket", "dst", NO_READ).unwrap();
+        assert_eq!(obj.data, b"data");
+        assert_eq!(obj.metadata.get("content-type"), Some("text/html"));
+        assert_eq!(obj.metadata.get("x-amz-meta-version"), Some("2"));
+        // Old metadata should be gone
+        assert_eq!(obj.metadata.get("x-amz-meta-author"), None);
+    }
+
+    #[test]
+    fn copy_object_same_key_replace_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let headers = [("Content-Type", "text/plain")];
+        coord
+            .put_object("bucket", "key", b"data", &headers, NO_WRITE)
+            .unwrap();
+
+        let new_headers = [("Content-Type", "application/json")];
+        coord
+            .copy_object(
+                "bucket",
+                "key",
+                "bucket",
+                "key",
+                NO_READ,
+                NO_WRITE,
+                MetadataDirective::Replace,
+                &new_headers,
+            )
+            .unwrap();
+
+        let obj = coord.get_object("bucket", "key", NO_READ).unwrap();
+        assert_eq!(obj.data, b"data");
+        assert_eq!(
+            obj.metadata.get("content-type"),
+            Some("application/json")
+        );
+    }
+
+    #[test]
+    fn copy_object_source_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let err = coord
+            .copy_object(
+                "bucket",
+                "no-such-key",
+                "bucket",
+                "dst",
+                NO_READ,
+                NO_WRITE,
+                MetadataDirective::Copy,
+                &[],
+            )
+            .unwrap_err();
+        assert!(matches!(err, ServerError::ObjectNotFound { .. }));
+    }
+
+    #[test]
+    fn copy_object_dest_bucket_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+        coord
+            .put_object("bucket", "src", b"data", &[], NO_WRITE)
+            .unwrap();
+
+        let err = coord
+            .copy_object(
+                "bucket",
+                "src",
+                "no-bucket",
+                "dst",
+                NO_READ,
+                NO_WRITE,
+                MetadataDirective::Copy,
+                &[],
+            )
+            .unwrap_err();
+        assert!(matches!(err, ServerError::BucketNotFound { .. }));
+    }
+
+    #[test]
+    fn copy_object_source_if_match_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+        coord
+            .put_object("bucket", "src", b"data", &[], NO_WRITE)
+            .unwrap();
+
+        let src_cond = ReadCondition {
+            if_match: Some("\"0000000000000000\"".to_string()),
+            ..Default::default()
+        };
+        let err = coord
+            .copy_object(
+                "bucket",
+                "src",
+                "bucket",
+                "dst",
+                &src_cond,
+                NO_WRITE,
+                MetadataDirective::Copy,
+                &[],
+            )
+            .unwrap_err();
+        assert!(matches!(err, ServerError::PreconditionFailed));
+    }
+
+    #[test]
+    fn copy_object_dest_if_none_match_prevents_overwrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        coord
+            .put_object("bucket", "src", b"data", &[], NO_WRITE)
+            .unwrap();
+        coord
+            .put_object("bucket", "dst", b"existing", &[], NO_WRITE)
+            .unwrap();
+
+        let dst_cond = WriteCondition {
+            if_none_match_any: true,
+            ..Default::default()
+        };
+        let err = coord
+            .copy_object(
+                "bucket",
+                "src",
+                "bucket",
+                "dst",
+                NO_READ,
+                &dst_cond,
+                MetadataDirective::Copy,
+                &[],
+            )
+            .unwrap_err();
+        assert!(matches!(err, ServerError::PreconditionFailed));
+    }
+
+    #[test]
+    fn copy_object_dest_if_match_allows_update() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        coord
+            .put_object("bucket", "src", b"new data", &[], NO_WRITE)
+            .unwrap();
+        let existing = coord
+            .put_object("bucket", "dst", b"old data", &[], NO_WRITE)
+            .unwrap();
+
+        let dst_cond = WriteCondition {
+            if_match: Some(existing.etag),
+            ..Default::default()
+        };
+        let result = coord
+            .copy_object(
+                "bucket",
+                "src",
+                "bucket",
+                "dst",
+                NO_READ,
+                &dst_cond,
+                MetadataDirective::Copy,
+                &[],
+            )
+            .unwrap();
+        assert!(!result.etag.is_empty());
+
+        let obj = coord.get_object("bucket", "dst", NO_READ).unwrap();
+        assert_eq!(obj.data, b"new data");
+    }
+
+    #[test]
+    fn copy_object_cross_bucket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("src-bucket").unwrap();
+        coord.create_bucket("dst-bucket").unwrap();
+
+        let headers = [("Content-Type", "text/plain")];
+        coord
+            .put_object("src-bucket", "key", b"cross bucket data", &headers, NO_WRITE)
+            .unwrap();
+
+        coord
+            .copy_object(
+                "src-bucket",
+                "key",
+                "dst-bucket",
+                "key",
+                NO_READ,
+                NO_WRITE,
+                MetadataDirective::Copy,
+                &[],
+            )
+            .unwrap();
+
+        let obj = coord.get_object("dst-bucket", "key", NO_READ).unwrap();
+        assert_eq!(obj.data, b"cross bucket data");
+        assert_eq!(obj.metadata.get("content-type"), Some("text/plain"));
+
+        // Source should still exist
+        let src = coord.get_object("src-bucket", "key", NO_READ).unwrap();
+        assert_eq!(src.data, b"cross bucket data");
     }
 }

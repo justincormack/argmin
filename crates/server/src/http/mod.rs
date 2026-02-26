@@ -10,8 +10,10 @@ use auth::{parse_amz_date, parse_auth_header, verify_request, CredentialStore};
 use tiny_http::{Header, Response, StatusCode};
 
 use crate::conditional::{
-    delete_condition_from_headers, read_condition_from_headers, write_condition_from_headers,
+    copy_source_condition_from_headers, delete_condition_from_headers, read_condition_from_headers,
+    write_condition_from_headers,
 };
+use crate::coordinator::MetadataDirective;
 use crate::coordinator::Coordinator;
 use crate::error::ServerError;
 use request::S3Request;
@@ -132,16 +134,51 @@ impl HttpFrontend {
                 ))
             }
             S3Operation::PutObject { bucket, key } => {
-                let header_pairs: Vec<(&str, &str)> = req
-                    .headers
-                    .iter()
-                    .map(|(k, v)| (k.as_str(), v.as_str()))
-                    .collect();
-                let cond = write_condition_from_headers(req);
-                let result =
-                    self.coordinator
-                        .put_object(&bucket, &key, &req.body, &header_pairs, &cond)?;
-                Ok(S3Response::put_object(&result))
+                if let Some(copy_source) = req.header("x-amz-copy-source") {
+                    // CopyObject path
+                    let (src_bucket, src_key) =
+                        request::parse_copy_source(copy_source)?;
+                    let src_cond = copy_source_condition_from_headers(req);
+                    let dst_cond = write_condition_from_headers(req);
+                    let directive = match req.header("x-amz-metadata-directive") {
+                        Some(d) if d.eq_ignore_ascii_case("REPLACE") => {
+                            MetadataDirective::Replace
+                        }
+                        _ => MetadataDirective::Copy,
+                    };
+                    let header_pairs: Vec<(&str, &str)> = req
+                        .headers
+                        .iter()
+                        .map(|(k, v)| (k.as_str(), v.as_str()))
+                        .collect();
+                    let result = self.coordinator.copy_object(
+                        &src_bucket,
+                        &src_key,
+                        &bucket,
+                        &key,
+                        &src_cond,
+                        &dst_cond,
+                        directive,
+                        &header_pairs,
+                    )?;
+                    Ok(S3Response::copy_object(&result))
+                } else {
+                    // Normal PutObject path
+                    let header_pairs: Vec<(&str, &str)> = req
+                        .headers
+                        .iter()
+                        .map(|(k, v)| (k.as_str(), v.as_str()))
+                        .collect();
+                    let cond = write_condition_from_headers(req);
+                    let result = self.coordinator.put_object(
+                        &bucket,
+                        &key,
+                        &req.body,
+                        &header_pairs,
+                        &cond,
+                    )?;
+                    Ok(S3Response::put_object(&result))
+                }
             }
             S3Operation::GetObject { bucket, key } => {
                 let cond = read_condition_from_headers(req);

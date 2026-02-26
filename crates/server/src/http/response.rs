@@ -1,7 +1,7 @@
 /// Build HTTP responses for S3 operations.
 use crate::coordinator::{
-    DeleteObjectsResult, GetObjectRangeResult, GetObjectResult, HeadObjectResult,
-    ListObjectsResult, PutObjectResult,
+    CopyObjectResult, DeleteObjectsResult, GetObjectRangeResult, GetObjectResult,
+    HeadObjectResult, ListObjectsResult, PutObjectResult,
 };
 use crate::error::ServerError;
 use storage::BucketInfo;
@@ -50,6 +50,12 @@ impl S3Response {
         Self::new(200)
             .header("ETag", &result.etag)
             .header("x-amz-version-id", &result.version_id)
+    }
+
+    /// Build a response for a successful CopyObject.
+    pub fn copy_object(result: &CopyObjectResult) -> Self {
+        let body = xml::copy_object_result_xml(&result.etag, result.last_modified);
+        Self::new(200).xml_body(body)
     }
 
     /// Build a response for a successful GetObject.
