@@ -21,7 +21,7 @@ pub enum StoreError {
         source: std::io::Error,
     },
 
-    #[error("database error: {context}")]
+    #[error("database error: {context}: {source}")]
     Db {
         context: &'static str,
         #[source]
@@ -44,7 +44,7 @@ pub enum MetadataError {
     #[error("object not found")]
     ObjectNotFound,
 
-    #[error("database error: {context}")]
+    #[error("database error: {context}: {source}")]
     Db {
         context: &'static str,
         #[source]

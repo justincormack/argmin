@@ -98,7 +98,7 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
         };
     }
 
-    // Split into bucket and optional key
+    // Split into bucket and optional key (percent-decode key later)
     let (bucket, key) = match trimmed.find('/') {
         Some(pos) => {
             let bucket = &trimmed[..pos];
@@ -109,11 +109,13 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
     };
 
     validate_bucket_name(bucket)?;
-    if let Some(k) = key {
+
+    let decoded_key = key.map(crate::http::request::percent_decode);
+    if let Some(ref k) = decoded_key {
         validate_object_key(k)?;
     }
 
-    match (method, key) {
+    match (method, decoded_key) {
         // Bucket-level operations (no key)
         ("PUT", None) => Ok(S3Operation::CreateBucket {
             bucket: bucket.to_string(),
@@ -164,19 +166,19 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
         // Object-level operations
         ("PUT", Some(key)) => Ok(S3Operation::PutObject {
             bucket: bucket.to_string(),
-            key: key.to_string(),
+            key,
         }),
         ("GET", Some(key)) => Ok(S3Operation::GetObject {
             bucket: bucket.to_string(),
-            key: key.to_string(),
+            key,
         }),
         ("DELETE", Some(key)) => Ok(S3Operation::DeleteObject {
             bucket: bucket.to_string(),
-            key: key.to_string(),
+            key,
         }),
         ("HEAD", Some(key)) => Ok(S3Operation::HeadObject {
             bucket: bucket.to_string(),
-            key: key.to_string(),
+            key,
         }),
 
         _ => Err(ServerError::MethodNotAllowed),
