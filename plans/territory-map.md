@@ -218,6 +218,35 @@ Phase 3 — S3 server:                                            [COMPLETE]
   9. Coordinator                (S3 op → EC → PG → store → metadata)       [done]
 ```
 
+### Phase 3 implementation notes
+
+Deviations from the original plan discovered during implementation:
+
+- **Placement crate not used**: v1-minimal PG derivation is just `rapidhash(bucket/key) %
+  pg_count` — the full rendezvous hashing placer is for the distributed case (assigning
+  shards to different nodes). Server depends on `rapidhash` directly, not the `placement`
+  crate.
+- **`PutObjectMetaReq` has no `last_modified` field**: The storage layer's `put_object_meta`
+  upsert sets `last_modified` automatically. The coordinator doesn't need to compute it.
+- **`HeadObject` calls `get_object` internally**: Rather than a separate flow, it just calls
+  `get_object` and drops the body. Simpler and correct for v1-minimal where all shards are
+  local. Optimization (read only shard 0 prefix) still deferred.
+- **`GetObject` reads all k+m shards eagerly**: Rather than reading k data shards first and
+  falling back to parity, the implementation reads all shards up front and tracks which
+  succeed. Simpler for single-node where all shards are local.
+- **`request.rs` returns `(S3Request, tiny_http::Request)` tuple**: `tiny_http::Request`
+  consumes self in `respond()`, so the parsed request and the original request must both be
+  returned. The plan didn't account for this ownership constraint.
+- **ListObjectsV2 continuation token is just the last key**: Real S3 uses opaque
+  base64-encoded tokens. The current implementation passes the last key as `start_after` to
+  the storage layer. Will need fixing when real clients interact with the server.
+- **`delete_bucket` emptiness check is duplicated**: The coordinator fans out to all PGs to
+  check emptiness, but `SqliteBucketDb::delete_bucket` also has its own check. Only the
+  coordinator check matters since per-PG metadata is separate from the bucket DB.
+- **SigV4 signing key test vector was from `iam` service, not `s3`**: The standalone
+  `derive_signing_key` test had a wrong expected value. The e2e signature verification tests
+  (which use actual AWS-documented S3 signatures) pass, confirming correctness.
+
 ### Post-v1-minimal (distributed)
 
 ```
