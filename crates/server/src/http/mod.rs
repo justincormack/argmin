@@ -138,20 +138,22 @@ impl HttpFrontend {
         )?;
 
         // Enforce ±15 minute time skew on x-amz-date to prevent replay attacks.
+        // Reject malformed timestamps — skipping the check would weaken replay protection.
         if let Some(amz_date) = req.header("x-amz-date") {
-            if let Some(request_epoch) = parse_amz_date(amz_date) {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                let skew = if now > request_epoch {
-                    now - request_epoch
-                } else {
-                    request_epoch - now
-                };
-                if skew > 15 * 60 {
-                    return Err(ServerError::Auth(auth::AuthError::RequestExpired));
-                }
+            let request_epoch = parse_amz_date(amz_date).ok_or(ServerError::InvalidRequest {
+                reason: "malformed x-amz-date timestamp".to_string(),
+            })?;
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let skew = if now > request_epoch {
+                now - request_epoch
+            } else {
+                request_epoch - now
+            };
+            if skew > 15 * 60 {
+                return Err(ServerError::Auth(auth::AuthError::RequestExpired));
             }
         }
 
