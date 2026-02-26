@@ -12,3 +12,5 @@ tmp/
 .env
 # Obsidian notes checkout
 /notes/
+# data for buckets
+/data/
