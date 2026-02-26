@@ -9,6 +9,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use auth::{parse_amz_date, parse_auth_header, verify_request, CredentialStore};
 use tiny_http::{Header, Response, StatusCode};
 
+use crate::conditional::{
+    delete_condition_from_headers, read_condition_from_headers, write_condition_from_headers,
+};
 use crate::coordinator::Coordinator;
 use crate::error::ServerError;
 use request::S3Request;
@@ -37,6 +40,14 @@ impl HttpFrontend {
 
         match result {
             Ok(resp) => self.send_response(request, resp),
+            Err(ServerError::NotModified { ref etag, last_modified }) => {
+                let resp = S3Response::not_modified(etag, last_modified);
+                self.send_response(request, resp);
+            }
+            Err(ServerError::PreconditionFailed) => {
+                let resp = S3Response::precondition_failed();
+                self.send_response(request, resp);
+            }
             Err(err) => {
                 let resp = S3Response::error(&err, &s3req.path);
                 self.send_response(request, resp);
@@ -126,17 +137,19 @@ impl HttpFrontend {
                     .iter()
                     .map(|(k, v)| (k.as_str(), v.as_str()))
                     .collect();
+                let cond = write_condition_from_headers(req);
                 let result =
                     self.coordinator
-                        .put_object(&bucket, &key, &req.body, &header_pairs)?;
+                        .put_object(&bucket, &key, &req.body, &header_pairs, &cond)?;
                 Ok(S3Response::put_object(&result))
             }
             S3Operation::GetObject { bucket, key } => {
+                let cond = read_condition_from_headers(req);
                 if let Some(range_header) = req.header("range") {
                     let byte_range = crate::range::ByteRange::parse(range_header)?;
                     match self
                         .coordinator
-                        .get_object_range(&bucket, &key, byte_range)
+                        .get_object_range(&bucket, &key, byte_range, &cond)
                     {
                         Ok(result) => Ok(S3Response::get_object_range(result)),
                         Err(ServerError::InvalidRange { total_size }) => {
@@ -145,21 +158,24 @@ impl HttpFrontend {
                         Err(e) => Err(e),
                     }
                 } else {
-                    let result = self.coordinator.get_object(&bucket, &key)?;
+                    let result = self.coordinator.get_object(&bucket, &key, &cond)?;
                     Ok(S3Response::get_object(result))
                 }
             }
             S3Operation::DeleteObject { bucket, key } => {
-                self.coordinator.delete_object(&bucket, &key)?;
+                let cond = delete_condition_from_headers(req);
+                self.coordinator.delete_object(&bucket, &key, &cond)?;
                 Ok(S3Response::delete_object())
             }
             S3Operation::HeadObject { bucket, key } => {
-                let result = self.coordinator.head_object(&bucket, &key)?;
+                let cond = read_condition_from_headers(req);
+                let result = self.coordinator.head_object(&bucket, &key, &cond)?;
                 Ok(S3Response::head_object(&result))
             }
             S3Operation::DeleteObjects { bucket } => {
                 let (entries, quiet) = xml::parse_delete_objects_xml(&req.body)?;
-                let result = self.coordinator.delete_objects(&bucket, &entries)?;
+                let cond = delete_condition_from_headers(req);
+                let result = self.coordinator.delete_objects(&bucket, &entries, &cond)?;
                 Ok(S3Response::delete_objects(&result, quiet))
             }
             S3Operation::ListObjectVersions { bucket } => {

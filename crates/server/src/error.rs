@@ -41,6 +41,12 @@ pub enum ServerError {
 
     #[error("invalid range")]
     InvalidRange { total_size: u64 },
+
+    #[error("precondition failed")]
+    PreconditionFailed,
+
+    #[error("not modified")]
+    NotModified { etag: String, last_modified: u64 },
 }
 
 impl ServerError {
@@ -56,6 +62,8 @@ impl ServerError {
             Self::Auth(auth::AuthError::SignatureMismatch) => "SignatureDoesNotMatch",
             Self::Auth(auth::AuthError::RequestExpired) => "RequestTimeTooSkewed",
             Self::Auth(_) => "AccessDenied",
+            Self::PreconditionFailed => "PreconditionFailed",
+            Self::NotModified { .. } => "NotModified",
             Self::InvalidRequest { .. } => "InvalidRequest",
             Self::MetadataBlobError { .. } => "InternalError",
             Self::ObjectTooLarge { .. } => "EntityTooLarge",
@@ -79,6 +87,8 @@ impl ServerError {
             Self::ObjectTooLarge { .. } => 400,
             Self::MethodNotAllowed => 405,
             Self::InvalidRange { .. } => 416,
+            Self::PreconditionFailed => 412,
+            Self::NotModified { .. } => 304,
             _ => 500,
         }
     }
@@ -178,6 +188,28 @@ mod tests {
     #[test]
     fn http_status_416() {
         assert_eq!(ServerError::InvalidRange { total_size: 100 }.http_status(), 416);
+    }
+
+    #[test]
+    fn s3_error_code_precondition_failed() {
+        assert_eq!(ServerError::PreconditionFailed.s3_error_code(), "PreconditionFailed");
+    }
+
+    #[test]
+    fn http_status_412() {
+        assert_eq!(ServerError::PreconditionFailed.http_status(), 412);
+    }
+
+    #[test]
+    fn s3_error_code_not_modified() {
+        let err = ServerError::NotModified { etag: "\"abc\"".into(), last_modified: 0 };
+        assert_eq!(err.s3_error_code(), "NotModified");
+    }
+
+    #[test]
+    fn http_status_304() {
+        let err = ServerError::NotModified { etag: "\"abc\"".into(), last_modified: 0 };
+        assert_eq!(err.http_status(), 304);
     }
 
     #[test]

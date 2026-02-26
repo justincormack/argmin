@@ -6,6 +6,10 @@ use storage::{
     ShardKey, SqliteBucketDb,
 };
 
+use crate::conditional::{
+    check_delete_conditions, check_read_conditions, check_write_conditions, DeleteCondition,
+    ReadCondition, WriteCondition,
+};
 use crate::error::ServerError;
 use crate::etag::{crc64_to_etag_bytes, etag_bytes_to_crc64, format_etag};
 use crate::metadata_blob::MetadataBlob;
@@ -187,6 +191,7 @@ impl Coordinator {
         key: &str,
         data: &[u8],
         headers: &[(&str, &str)],
+        cond: &WriteCondition,
     ) -> Result<PutObjectResult, ServerError> {
         if data.len() as u64 > MAX_OBJECT_SIZE {
             return Err(ServerError::ObjectTooLarge {
@@ -197,6 +202,21 @@ impl Coordinator {
 
         // 1. Verify bucket exists
         self.head_bucket(bucket)?;
+
+        // 1b. Check write conditions if any are set
+        if !cond.is_empty() {
+            let pg_id = derive_pg(bucket, key, self.pg_count);
+            let pg = self.storage_node.get_pg(pg_id)?;
+            let existing_etag = match pg.get_object_meta(bucket, key) {
+                Ok(record) => {
+                    let crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
+                    Some(format_etag(crc))
+                }
+                Err(storage::MetadataError::ObjectNotFound) => None,
+                Err(e) => return Err(ServerError::Metadata(e)),
+            };
+            check_write_conditions(cond, existing_etag.as_deref())?;
+        }
 
         // 2. Build metadata blob
         let metadata_blob = MetadataBlob::from_headers(headers)?;
@@ -482,6 +502,7 @@ impl Coordinator {
         &self,
         bucket: &str,
         key: &str,
+        cond: &ReadCondition,
     ) -> Result<GetObjectResult, ServerError> {
         // 1. Derive PG, look up record
         let pg_id = derive_pg(bucket, key, self.pg_count);
@@ -498,6 +519,10 @@ impl Coordinator {
         let okh = object_key_hash(bucket, key);
         let version_id: u64 = 0;
         let etag_crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
+
+        // Check conditions before reading shard data
+        let etag_str = format_etag(etag_crc);
+        check_read_conditions(cond, &etag_str, record.last_modified)?;
 
         if record.total_size > 0 {
             // New path: use read_range to read only needed data shards
@@ -573,6 +598,7 @@ impl Coordinator {
         &self,
         bucket: &str,
         key: &str,
+        cond: &ReadCondition,
     ) -> Result<HeadObjectResult, ServerError> {
         let pg_id = derive_pg(bucket, key, self.pg_count);
         let pg = self.storage_node.get_pg(pg_id)?;
@@ -588,6 +614,10 @@ impl Coordinator {
         let okh = object_key_hash(bucket, key);
         let version_id: u64 = 0;
         let etag_crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
+
+        // Check conditions before reading shard data
+        let etag_str = format_etag(etag_crc);
+        check_read_conditions(cond, &etag_str, record.last_modified)?;
 
         if record.total_size > 0 {
             // New path: read only the metadata portion
@@ -682,6 +712,7 @@ impl Coordinator {
         bucket: &str,
         key: &str,
         range: ByteRange,
+        cond: &ReadCondition,
     ) -> Result<GetObjectRangeResult, ServerError> {
         let pg_id = derive_pg(bucket, key, self.pg_count);
         let pg = self.storage_node.get_pg(pg_id)?;
@@ -697,6 +728,10 @@ impl Coordinator {
         let okh = object_key_hash(bucket, key);
         let version_id: u64 = 0;
         let etag_crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
+
+        // Check conditions before reading shard data
+        let etag_str = format_etag(etag_crc);
+        check_read_conditions(cond, &etag_str, record.last_modified)?;
 
         // Resolve byte range against user data size
         let (user_start, user_end) = range
@@ -790,16 +825,33 @@ impl Coordinator {
     }
 
     /// Delete an object.
-    pub fn delete_object(&self, bucket: &str, key: &str) -> Result<(), ServerError> {
+    pub fn delete_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        cond: &DeleteCondition,
+    ) -> Result<(), ServerError> {
         let pg_id = derive_pg(bucket, key, self.pg_count);
         let pg = self.storage_node.get_pg(pg_id)?;
 
         // Look up the record to get EC params
         let record = match pg.get_object_meta(bucket, key) {
             Ok(r) => r,
-            Err(storage::MetadataError::ObjectNotFound) => return Ok(()), // idempotent
+            Err(storage::MetadataError::ObjectNotFound) => {
+                if !cond.is_empty() {
+                    return Err(ServerError::PreconditionFailed);
+                }
+                return Ok(()); // idempotent
+            }
             Err(e) => return Err(ServerError::Metadata(e)),
         };
+
+        // Check delete conditions
+        if !cond.is_empty() {
+            let etag_crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
+            let etag_str = format_etag(etag_crc);
+            check_delete_conditions(cond, &etag_str)?;
+        }
 
         let okh = object_key_hash(bucket, key);
         let version_id: u64 = 0;
@@ -973,6 +1025,7 @@ impl Coordinator {
         &self,
         bucket: &str,
         entries: &[crate::http::xml::DeleteObjectEntry],
+        cond: &DeleteCondition,
     ) -> Result<DeleteObjectsResult, ServerError> {
         self.head_bucket(bucket)?;
 
@@ -980,7 +1033,7 @@ impl Coordinator {
         let mut errors = Vec::new();
 
         for entry in entries {
-            match self.delete_object(bucket, &entry.key) {
+            match self.delete_object(bucket, &entry.key, cond) {
                 Ok(()) => {
                     deleted.push(DeletedObject {
                         key: entry.key.clone(),
@@ -1004,7 +1057,20 @@ impl Coordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conditional::{DeleteCondition, ReadCondition, WriteCondition};
     use std::path::{Path, PathBuf};
+
+    const NO_READ: &ReadCondition = &ReadCondition {
+        if_match: None,
+        if_none_match: None,
+        if_modified_since: None,
+        if_unmodified_since: None,
+    };
+    const NO_WRITE: &WriteCondition = &WriteCondition {
+        if_match: None,
+        if_none_match_any: false,
+    };
+    const NO_DELETE: &DeleteCondition = &DeleteCondition { if_match: None };
 
     fn setup_coordinator(dir: &Path) -> Coordinator {
         let pg_ids: Vec<u32> = (0..4).collect();
@@ -1056,7 +1122,7 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object("bucket", "key", b"data", &[])
+            .put_object("bucket", "key", b"data", &[], NO_WRITE)
             .unwrap();
 
         let err = coord.delete_bucket("bucket").unwrap_err();
@@ -1072,11 +1138,11 @@ mod tests {
 
         let headers = [("Content-Type", "text/plain")];
         let result = coord
-            .put_object("bucket", "hello.txt", b"Hello, world!", &headers)
+            .put_object("bucket", "hello.txt", b"Hello, world!", &headers, NO_WRITE)
             .unwrap();
         assert!(!result.etag.is_empty());
 
-        let obj = coord.get_object("bucket", "hello.txt").unwrap();
+        let obj = coord.get_object("bucket", "hello.txt", NO_READ).unwrap();
         assert_eq!(obj.data, b"Hello, world!");
         assert_eq!(obj.size, 13);
         assert_eq!(obj.metadata.get("content-type"), Some("text/plain"));
@@ -1095,10 +1161,10 @@ mod tests {
             ("X-Amz-Meta-Version", "42"),
         ];
         coord
-            .put_object("bucket", "obj", b"{}", &headers)
+            .put_object("bucket", "obj", b"{}", &headers, NO_WRITE)
             .unwrap();
 
-        let obj = coord.get_object("bucket", "obj").unwrap();
+        let obj = coord.get_object("bucket", "obj", NO_READ).unwrap();
         assert_eq!(obj.data, b"{}");
         assert_eq!(
             obj.metadata.get("content-type"),
@@ -1115,10 +1181,10 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object("bucket", "key", b"data", &[("Content-Type", "text/plain")])
+            .put_object("bucket", "key", b"data", &[("Content-Type", "text/plain")], NO_WRITE)
             .unwrap();
 
-        let head = coord.head_object("bucket", "key").unwrap();
+        let head = coord.head_object("bucket", "key", NO_READ).unwrap();
         assert_eq!(head.size, 4);
         assert_eq!(head.metadata.get("content-type"), Some("text/plain"));
     }
@@ -1129,10 +1195,10 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        coord.put_object("bucket", "key", b"v1", &[]).unwrap();
-        coord.put_object("bucket", "key", b"v2", &[]).unwrap();
+        coord.put_object("bucket", "key", b"v1", &[], NO_WRITE).unwrap();
+        coord.put_object("bucket", "key", b"v2", &[], NO_WRITE).unwrap();
 
-        let obj = coord.get_object("bucket", "key").unwrap();
+        let obj = coord.get_object("bucket", "key", NO_READ).unwrap();
         assert_eq!(obj.data, b"v2");
     }
 
@@ -1142,9 +1208,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        coord.put_object("bucket", "empty", b"", &[]).unwrap();
+        coord.put_object("bucket", "empty", b"", &[], NO_WRITE).unwrap();
 
-        let obj = coord.get_object("bucket", "empty").unwrap();
+        let obj = coord.get_object("bucket", "empty", NO_READ).unwrap();
         assert_eq!(obj.data, b"");
         assert_eq!(obj.size, 0);
     }
@@ -1155,10 +1221,10 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        coord.put_object("bucket", "key", b"data", &[]).unwrap();
-        coord.delete_object("bucket", "key").unwrap();
+        coord.put_object("bucket", "key", b"data", &[], NO_WRITE).unwrap();
+        coord.delete_object("bucket", "key", NO_DELETE).unwrap();
 
-        let err = coord.get_object("bucket", "key").unwrap_err();
+        let err = coord.get_object("bucket", "key", NO_READ).unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
     }
 
@@ -1169,7 +1235,7 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         // Should not error
-        coord.delete_object("bucket", "no-such-key").unwrap();
+        coord.delete_object("bucket", "no-such-key", NO_DELETE).unwrap();
     }
 
     #[test]
@@ -1178,9 +1244,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        coord.put_object("bucket", "a/1", b"1", &[]).unwrap();
-        coord.put_object("bucket", "a/2", b"2", &[]).unwrap();
-        coord.put_object("bucket", "b/1", b"3", &[]).unwrap();
+        coord.put_object("bucket", "a/1", b"1", &[], NO_WRITE).unwrap();
+        coord.put_object("bucket", "a/2", b"2", &[], NO_WRITE).unwrap();
+        coord.put_object("bucket", "b/1", b"3", &[], NO_WRITE).unwrap();
 
         let result = coord
             .list_objects_v2("bucket", None, None, None, 1000)
@@ -1198,9 +1264,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        coord.put_object("bucket", "photos/cat.jpg", b"cat", &[]).unwrap();
-        coord.put_object("bucket", "photos/dog.jpg", b"dog", &[]).unwrap();
-        coord.put_object("bucket", "docs/readme.md", b"md", &[]).unwrap();
+        coord.put_object("bucket", "photos/cat.jpg", b"cat", &[], NO_WRITE).unwrap();
+        coord.put_object("bucket", "photos/dog.jpg", b"dog", &[], NO_WRITE).unwrap();
+        coord.put_object("bucket", "docs/readme.md", b"md", &[], NO_WRITE).unwrap();
 
         let result = coord
             .list_objects_v2("bucket", Some("photos/"), None, None, 1000)
@@ -1214,10 +1280,10 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        coord.put_object("bucket", "photos/cat.jpg", b"cat", &[]).unwrap();
-        coord.put_object("bucket", "photos/dog.jpg", b"dog", &[]).unwrap();
-        coord.put_object("bucket", "docs/readme.md", b"md", &[]).unwrap();
-        coord.put_object("bucket", "root.txt", b"root", &[]).unwrap();
+        coord.put_object("bucket", "photos/cat.jpg", b"cat", &[], NO_WRITE).unwrap();
+        coord.put_object("bucket", "photos/dog.jpg", b"dog", &[], NO_WRITE).unwrap();
+        coord.put_object("bucket", "docs/readme.md", b"md", &[], NO_WRITE).unwrap();
+        coord.put_object("bucket", "root.txt", b"root", &[], NO_WRITE).unwrap();
 
         let result = coord
             .list_objects_v2("bucket", None, Some("/"), None, 1000)
@@ -1235,10 +1301,10 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object("bucket", "folder/", b"data", &[])
+            .put_object("bucket", "folder/", b"data", &[], NO_WRITE)
             .unwrap();
 
-        let obj = coord.get_object("bucket", "folder/").unwrap();
+        let obj = coord.get_object("bucket", "folder/", NO_READ).unwrap();
         assert_eq!(obj.data, b"data");
         assert_eq!(obj.size, 4);
     }
@@ -1306,14 +1372,14 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
         let data = b"This data should survive shard loss!";
         coord
-            .put_object("bucket", "resilient", data, &[])
+            .put_object("bucket", "resilient", data, &[], NO_WRITE)
             .unwrap();
 
         // Delete one data shard using the helper
         delete_shard_on_disk(tmp.path(), "bucket", "resilient", 0, 4);
 
         // Get should still succeed via EC reconstruction
-        let obj = coord.get_object("bucket", "resilient").unwrap();
+        let obj = coord.get_object("bucket", "resilient", NO_READ).unwrap();
         assert_eq!(obj.data, data);
     }
 
@@ -1324,11 +1390,11 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         let data = b"EC single shard loss test data";
-        coord.put_object("bucket", "obj1", data, &[]).unwrap();
+        coord.put_object("bucket", "obj1", data, &[], NO_WRITE).unwrap();
 
         delete_shard_on_disk(tmp.path(), "bucket", "obj1", 0, 4);
 
-        let obj = coord.get_object("bucket", "obj1").unwrap();
+        let obj = coord.get_object("bucket", "obj1", NO_READ).unwrap();
         assert_eq!(obj.data, data);
     }
 
@@ -1340,13 +1406,13 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         let data = b"EC m-shard loss limit test data";
-        coord.put_object("bucket", "obj2", data, &[]).unwrap();
+        coord.put_object("bucket", "obj2", data, &[], NO_WRITE).unwrap();
 
         // Delete 2 data shards (indices 0 and 1)
         delete_shard_on_disk(tmp.path(), "bucket", "obj2", 0, 4);
         delete_shard_on_disk(tmp.path(), "bucket", "obj2", 1, 4);
 
-        let obj = coord.get_object("bucket", "obj2").unwrap();
+        let obj = coord.get_object("bucket", "obj2", NO_READ).unwrap();
         assert_eq!(obj.data, data);
     }
 
@@ -1358,14 +1424,14 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         let data = b"EC m+1 shard loss test data";
-        coord.put_object("bucket", "obj3", data, &[]).unwrap();
+        coord.put_object("bucket", "obj3", data, &[], NO_WRITE).unwrap();
 
         // Delete 3 shards (indices 0, 1, 2)
         delete_shard_on_disk(tmp.path(), "bucket", "obj3", 0, 4);
         delete_shard_on_disk(tmp.path(), "bucket", "obj3", 1, 4);
         delete_shard_on_disk(tmp.path(), "bucket", "obj3", 2, 4);
 
-        let err = coord.get_object("bucket", "obj3").unwrap_err();
+        let err = coord.get_object("bucket", "obj3", NO_READ).unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
     }
 
@@ -1377,11 +1443,11 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         let data = b"EC corruption recovery test data";
-        coord.put_object("bucket", "obj4", data, &[]).unwrap();
+        coord.put_object("bucket", "obj4", data, &[], NO_WRITE).unwrap();
 
         corrupt_shard_on_disk(tmp.path(), "bucket", "obj4", 0, 4);
 
-        let obj = coord.get_object("bucket", "obj4").unwrap();
+        let obj = coord.get_object("bucket", "obj4", NO_READ).unwrap();
         assert_eq!(obj.data, data);
     }
 
@@ -1392,14 +1458,14 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         let data = b"Hello, World! Range test with EC recovery";
-        coord.put_object("bucket", "obj5", data, &[]).unwrap();
+        coord.put_object("bucket", "obj5", data, &[], NO_WRITE).unwrap();
 
         // Delete shard 0 (covers the beginning of the data)
         delete_shard_on_disk(tmp.path(), "bucket", "obj5", 0, 4);
 
         // Range get should still succeed via EC reconstruction
         let result = coord
-            .get_object_range("bucket", "obj5", ByteRange::Range { start: 0, end: 4 })
+            .get_object_range("bucket", "obj5", ByteRange::Range { start: 0, end: 4 }, NO_READ)
             .unwrap();
         assert_eq!(result.data, b"Hello");
     }
@@ -1412,12 +1478,12 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         let data = b"EC parity shard drop test";
-        coord.put_object("bucket", "obj6", data, &[]).unwrap();
+        coord.put_object("bucket", "obj6", data, &[], NO_WRITE).unwrap();
 
         // Delete first parity shard (index 4, since k=4)
         delete_shard_on_disk(tmp.path(), "bucket", "obj6", 4, 4);
 
-        let obj = coord.get_object("bucket", "obj6").unwrap();
+        let obj = coord.get_object("bucket", "obj6", NO_READ).unwrap();
         assert_eq!(obj.data, data);
     }
 
@@ -1426,7 +1492,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let coord = setup_coordinator(tmp.path());
 
-        let err = coord.put_object("no-such-bucket", "key", b"data", &[]).unwrap_err();
+        let err = coord.put_object("no-such-bucket", "key", b"data", &[], NO_WRITE).unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
     }
 
@@ -1436,7 +1502,7 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        let err = coord.get_object("bucket", "no-such-key").unwrap_err();
+        let err = coord.get_object("bucket", "no-such-key", NO_READ).unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
     }
 
@@ -1446,12 +1512,12 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        let result = coord.put_object("bucket", "key", b"data", &[]).unwrap();
+        let result = coord.put_object("bucket", "key", b"data", &[], NO_WRITE).unwrap();
 
-        let obj = coord.get_object("bucket", "key").unwrap();
+        let obj = coord.get_object("bucket", "key", NO_READ).unwrap();
         assert_eq!(result.etag, obj.etag);
 
-        let head = coord.head_object("bucket", "key").unwrap();
+        let head = coord.head_object("bucket", "key", NO_READ).unwrap();
         assert_eq!(result.etag, head.etag);
     }
 
@@ -1461,11 +1527,11 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        coord.put_object("bucket", "a/1", b"1", &[]).unwrap();
-        coord.put_object("bucket", "a/2", b"2", &[]).unwrap();
-        coord.put_object("bucket", "b/1", b"3", &[]).unwrap();
-        coord.put_object("bucket", "c/1", b"4", &[]).unwrap();
-        coord.put_object("bucket", "root.txt", b"5", &[]).unwrap();
+        coord.put_object("bucket", "a/1", b"1", &[], NO_WRITE).unwrap();
+        coord.put_object("bucket", "a/2", b"2", &[], NO_WRITE).unwrap();
+        coord.put_object("bucket", "b/1", b"3", &[], NO_WRITE).unwrap();
+        coord.put_object("bucket", "c/1", b"4", &[], NO_WRITE).unwrap();
+        coord.put_object("bucket", "root.txt", b"5", &[], NO_WRITE).unwrap();
 
         // First page: max_keys=2 with delimiter
         let result = coord
@@ -1500,7 +1566,7 @@ mod tests {
         for i in 0..10 {
             let key = format!("dir{}/file.txt", i);
             coord
-                .put_object("bucket", &key, b"data", &[])
+                .put_object("bucket", &key, b"data", &[], NO_WRITE)
                 .unwrap();
         }
 
@@ -1519,7 +1585,7 @@ mod tests {
 
         // Don't create bucket — put should fail at bucket check before writing shards
         let err = coord
-            .put_object("no-bucket", "key", b"data", &[])
+            .put_object("no-bucket", "key", b"data", &[], NO_WRITE)
             .unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
     }
@@ -1541,7 +1607,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
         for i in 0..5 {
             let key = format!("key-{:02}", i);
-            coord.put_object("bucket", &key, b"data", &[]).unwrap();
+            coord.put_object("bucket", &key, b"data", &[], NO_WRITE).unwrap();
         }
 
         // Request fewer than available
@@ -1561,7 +1627,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
         for i in 0..5 {
             let key = format!("key-{:02}", i);
-            coord.put_object("bucket", &key, b"data", &[]).unwrap();
+            coord.put_object("bucket", &key, b"data", &[], NO_WRITE).unwrap();
         }
 
         // First page
@@ -1595,10 +1661,10 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        coord.put_object("bucket", "photos/2024/jan.jpg", b"j", &[]).unwrap();
-        coord.put_object("bucket", "photos/2024/feb.jpg", b"f", &[]).unwrap();
-        coord.put_object("bucket", "photos/2025/mar.jpg", b"m", &[]).unwrap();
-        coord.put_object("bucket", "photos/top.jpg", b"t", &[]).unwrap();
+        coord.put_object("bucket", "photos/2024/jan.jpg", b"j", &[], NO_WRITE).unwrap();
+        coord.put_object("bucket", "photos/2024/feb.jpg", b"f", &[], NO_WRITE).unwrap();
+        coord.put_object("bucket", "photos/2025/mar.jpg", b"m", &[], NO_WRITE).unwrap();
+        coord.put_object("bucket", "photos/top.jpg", b"t", &[], NO_WRITE).unwrap();
 
         // List with prefix "photos/" and delimiter "/"
         let result = coord
@@ -1619,7 +1685,7 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        coord.put_object("bucket", "only-one", b"data", &[]).unwrap();
+        coord.put_object("bucket", "only-one", b"data", &[], NO_WRITE).unwrap();
 
         let result = coord
             .list_objects_v2("bucket", None, None, None, 1000)
@@ -1635,7 +1701,7 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        coord.put_object("bucket", "key1", b"data", &[]).unwrap();
+        coord.put_object("bucket", "key1", b"data", &[], NO_WRITE).unwrap();
 
         let result = coord
             .list_objects_v2("bucket", None, None, None, 0)
@@ -1652,7 +1718,7 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        coord.put_object("bucket", "a/1", b"data", &[]).unwrap();
+        coord.put_object("bucket", "a/1", b"data", &[], NO_WRITE).unwrap();
 
         let result = coord
             .list_objects_v2("bucket", None, Some("/"), None, 0)
@@ -1679,8 +1745,8 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        coord.put_object("bucket", "key1", b"data1", &[]).unwrap();
-        coord.put_object("bucket", "key2", b"data2", &[]).unwrap();
+        coord.put_object("bucket", "key1", b"data1", &[], NO_WRITE).unwrap();
+        coord.put_object("bucket", "key2", b"data2", &[], NO_WRITE).unwrap();
 
         let entries = vec![
             crate::http::xml::DeleteObjectEntry {
@@ -1698,13 +1764,13 @@ mod tests {
             },
         ];
 
-        let result = coord.delete_objects("bucket", &entries).unwrap();
+        let result = coord.delete_objects("bucket", &entries, NO_DELETE).unwrap();
         assert_eq!(result.deleted.len(), 3);
         assert!(result.errors.is_empty());
 
         // Verify objects are actually gone
-        assert!(coord.get_object("bucket", "key1").is_err());
-        assert!(coord.get_object("bucket", "key2").is_err());
+        assert!(coord.get_object("bucket", "key1", NO_READ).is_err());
+        assert!(coord.get_object("bucket", "key2", NO_READ).is_err());
     }
 
     #[test]
@@ -1717,7 +1783,7 @@ mod tests {
             version_id: None,
         }];
 
-        let err = coord.delete_objects("no-bucket", &entries).unwrap_err();
+        let err = coord.delete_objects("no-bucket", &entries, NO_DELETE).unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
     }
 
@@ -1734,9 +1800,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("test-bucket").unwrap();
-        coord.put_object("test-bucket", "dir/file1.txt", b"hello", &[]).unwrap();
-        coord.put_object("test-bucket", "dir/file2.txt", b"world", &[]).unwrap();
-        coord.put_object("test-bucket", "root.txt", b"root", &[]).unwrap();
+        coord.put_object("test-bucket", "dir/file1.txt", b"hello", &[], NO_WRITE).unwrap();
+        coord.put_object("test-bucket", "dir/file2.txt", b"world", &[], NO_WRITE).unwrap();
+        coord.put_object("test-bucket", "root.txt", b"root", &[], NO_WRITE).unwrap();
 
         // Step 1: ListObjectVersions — reuses list_objects_v2 with no delimiter
         let list_result = coord
@@ -1775,7 +1841,7 @@ mod tests {
         assert!(!quiet);
 
         // Step 5: Batch delete
-        let delete_result = coord.delete_objects("test-bucket", &entries).unwrap();
+        let delete_result = coord.delete_objects("test-bucket", &entries, NO_DELETE).unwrap();
         assert_eq!(delete_result.deleted.len(), 3);
         assert!(delete_result.errors.is_empty());
 
@@ -1796,7 +1862,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
         for i in 0..5 {
             let key = format!("key-{:02}", i);
-            coord.put_object("bucket", &key, b"data", &[]).unwrap();
+            coord.put_object("bucket", &key, b"data", &[], NO_WRITE).unwrap();
         }
 
         // Page 1: max_keys=2
@@ -1843,7 +1909,7 @@ mod tests {
         assert_eq!(entries.len(), 5);
         assert!(quiet);
 
-        let delete_result = coord.delete_objects("bucket", &entries).unwrap();
+        let delete_result = coord.delete_objects("bucket", &entries, NO_DELETE).unwrap();
         assert_eq!(delete_result.deleted.len(), 5);
         assert!(delete_result.errors.is_empty());
 
@@ -1877,7 +1943,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let err = coord
-            .put_object("bucket", "key", &vec![0u8; 256 * 1024 * 1024 + 1], &[]);
+            .put_object("bucket", "key", &vec![0u8; 256 * 1024 * 1024 + 1], &[], NO_WRITE);
         assert!(matches!(
             err,
             Err(ServerError::ObjectTooLarge { .. })
@@ -1960,12 +2026,12 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object("bucket", "key", b"Hello, World!", &[])
+            .put_object("bucket", "key", b"Hello, World!", &[], NO_WRITE)
             .unwrap();
 
         // bytes=0-4 → "Hello"
         let result = coord
-            .get_object_range("bucket", "key", ByteRange::Range { start: 0, end: 4 })
+            .get_object_range("bucket", "key", ByteRange::Range { start: 0, end: 4 }, NO_READ)
             .unwrap();
         assert_eq!(result.data, b"Hello");
         assert_eq!(result.range_start, 0);
@@ -1980,12 +2046,12 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object("bucket", "key", b"Hello, World!", &[])
+            .put_object("bucket", "key", b"Hello, World!", &[], NO_WRITE)
             .unwrap();
 
         // bytes=-6 → "World!"  (last 6 bytes)
         let result = coord
-            .get_object_range("bucket", "key", ByteRange::Suffix { length: 6 })
+            .get_object_range("bucket", "key", ByteRange::Suffix { length: 6 }, NO_READ)
             .unwrap();
         assert_eq!(result.data, b"World!");
         assert_eq!(result.range_start, 7);
@@ -1999,12 +2065,12 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object("bucket", "key", b"Hello, World!", &[])
+            .put_object("bucket", "key", b"Hello, World!", &[], NO_WRITE)
             .unwrap();
 
         // bytes=7- → "World!"
         let result = coord
-            .get_object_range("bucket", "key", ByteRange::FromStart { start: 7 })
+            .get_object_range("bucket", "key", ByteRange::FromStart { start: 7 }, NO_READ)
             .unwrap();
         assert_eq!(result.data, b"World!");
     }
@@ -2016,12 +2082,12 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object("bucket", "key", b"Hello", &[])
+            .put_object("bucket", "key", b"Hello", &[], NO_WRITE)
             .unwrap();
 
         // bytes=100- → unsatisfiable
         let err = coord
-            .get_object_range("bucket", "key", ByteRange::FromStart { start: 100 })
+            .get_object_range("bucket", "key", ByteRange::FromStart { start: 100 }, NO_READ)
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidRange { total_size: 5 }));
     }
@@ -2033,7 +2099,7 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object("bucket", "key", b"Hello", &[])
+            .put_object("bucket", "key", b"Hello", &[], NO_WRITE)
             .unwrap();
 
         // bytes=0-99999 on 5-byte object → clamp to 0-4
@@ -2045,10 +2111,249 @@ mod tests {
                     start: 0,
                     end: 99999,
                 },
+                NO_READ,
             )
             .unwrap();
         assert_eq!(result.data, b"Hello");
         assert_eq!(result.range_start, 0);
         assert_eq!(result.range_end, 4);
+    }
+
+    // ── Conditional request integration tests ────────────────────────
+
+    #[test]
+    fn put_if_none_match_star_creates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let cond = WriteCondition {
+            if_none_match_any: true,
+            ..Default::default()
+        };
+        let result = coord
+            .put_object("bucket", "new-key", b"data", &[], &cond)
+            .unwrap();
+        assert!(!result.etag.is_empty());
+    }
+
+    #[test]
+    fn put_if_none_match_star_rejects_overwrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+        coord
+            .put_object("bucket", "key", b"v1", &[], NO_WRITE)
+            .unwrap();
+
+        let cond = WriteCondition {
+            if_none_match_any: true,
+            ..Default::default()
+        };
+        let err = coord
+            .put_object("bucket", "key", b"v2", &[], &cond)
+            .unwrap_err();
+        assert!(matches!(err, ServerError::PreconditionFailed));
+    }
+
+    #[test]
+    fn put_if_match_updates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let r1 = coord
+            .put_object("bucket", "key", b"v1", &[], NO_WRITE)
+            .unwrap();
+        let cond = WriteCondition {
+            if_match: Some(r1.etag.clone()),
+            ..Default::default()
+        };
+        let r2 = coord
+            .put_object("bucket", "key", b"v2", &[], &cond)
+            .unwrap();
+        assert_ne!(r1.etag, r2.etag);
+
+        let obj = coord.get_object("bucket", "key", NO_READ).unwrap();
+        assert_eq!(obj.data, b"v2");
+    }
+
+    #[test]
+    fn put_if_match_stale_etag_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let r1 = coord
+            .put_object("bucket", "key", b"v1", &[], NO_WRITE)
+            .unwrap();
+        // Overwrite so etag changes
+        coord
+            .put_object("bucket", "key", b"v2", &[], NO_WRITE)
+            .unwrap();
+
+        let cond = WriteCondition {
+            if_match: Some(r1.etag),
+            ..Default::default()
+        };
+        let err = coord
+            .put_object("bucket", "key", b"v3", &[], &cond)
+            .unwrap_err();
+        assert!(matches!(err, ServerError::PreconditionFailed));
+    }
+
+    #[test]
+    fn get_if_match_returns_object() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let put = coord
+            .put_object("bucket", "key", b"data", &[], NO_WRITE)
+            .unwrap();
+        let cond = ReadCondition {
+            if_match: Some(put.etag),
+            ..Default::default()
+        };
+        let obj = coord.get_object("bucket", "key", &cond).unwrap();
+        assert_eq!(obj.data, b"data");
+    }
+
+    #[test]
+    fn get_if_match_wrong_etag_returns_412() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+        coord
+            .put_object("bucket", "key", b"data", &[], NO_WRITE)
+            .unwrap();
+
+        let cond = ReadCondition {
+            if_match: Some("\"0000000000000000\"".to_string()),
+            ..Default::default()
+        };
+        let err = coord.get_object("bucket", "key", &cond).unwrap_err();
+        assert!(matches!(err, ServerError::PreconditionFailed));
+    }
+
+    #[test]
+    fn get_if_none_match_returns_304() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let put = coord
+            .put_object("bucket", "key", b"data", &[], NO_WRITE)
+            .unwrap();
+        let cond = ReadCondition {
+            if_none_match: Some(put.etag),
+            ..Default::default()
+        };
+        let err = coord.get_object("bucket", "key", &cond).unwrap_err();
+        assert!(matches!(err, ServerError::NotModified { .. }));
+    }
+
+    #[test]
+    fn head_if_none_match_returns_304() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let put = coord
+            .put_object("bucket", "key", b"data", &[], NO_WRITE)
+            .unwrap();
+        let cond = ReadCondition {
+            if_none_match: Some(put.etag),
+            ..Default::default()
+        };
+        let err = coord.head_object("bucket", "key", &cond).unwrap_err();
+        assert!(matches!(err, ServerError::NotModified { .. }));
+    }
+
+    #[test]
+    fn delete_if_match_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let put = coord
+            .put_object("bucket", "key", b"data", &[], NO_WRITE)
+            .unwrap();
+        let cond = DeleteCondition {
+            if_match: Some(put.etag),
+        };
+        coord.delete_object("bucket", "key", &cond).unwrap();
+        assert!(coord.get_object("bucket", "key", NO_READ).is_err());
+    }
+
+    #[test]
+    fn delete_if_match_wrong_etag_returns_412() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+        coord
+            .put_object("bucket", "key", b"data", &[], NO_WRITE)
+            .unwrap();
+
+        let cond = DeleteCondition {
+            if_match: Some("\"0000000000000000\"".to_string()),
+        };
+        let err = coord
+            .delete_object("bucket", "key", &cond)
+            .unwrap_err();
+        assert!(matches!(err, ServerError::PreconditionFailed));
+    }
+
+    #[test]
+    fn delete_objects_if_match_per_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let p1 = coord
+            .put_object("bucket", "key1", b"data1", &[], NO_WRITE)
+            .unwrap();
+        coord
+            .put_object("bucket", "key2", b"data2", &[], NO_WRITE)
+            .unwrap();
+
+        // Use key1's etag for both entries; key2 will fail the condition
+        let cond = DeleteCondition {
+            if_match: Some(p1.etag),
+        };
+        let entries = vec![
+            crate::http::xml::DeleteObjectEntry {
+                key: "key1".to_string(),
+                version_id: None,
+            },
+            crate::http::xml::DeleteObjectEntry {
+                key: "key2".to_string(),
+                version_id: None,
+            },
+        ];
+        let result = coord.delete_objects("bucket", &entries, &cond).unwrap();
+        assert_eq!(result.deleted.len(), 1);
+        assert_eq!(result.deleted[0].key, "key1");
+        assert_eq!(result.errors.len(), 1);
+        assert_eq!(result.errors[0].key, "key2");
+    }
+
+    #[test]
+    fn range_get_if_match_returns_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let put = coord
+            .put_object("bucket", "key", b"Hello, World!", &[], NO_WRITE)
+            .unwrap();
+        let cond = ReadCondition {
+            if_match: Some(put.etag),
+            ..Default::default()
+        };
+        let result = coord
+            .get_object_range("bucket", "key", ByteRange::Range { start: 0, end: 4 }, &cond)
+            .unwrap();
+        assert_eq!(result.data, b"Hello");
     }
 }

@@ -243,6 +243,26 @@ impl S3Response {
         Self::new(200).xml_body(body)
     }
 
+    /// Build a 304 Not Modified response with ETag and Last-Modified headers, no body.
+    #[must_use]
+    pub fn not_modified(etag: &str, last_modified: u64) -> Self {
+        Self::new(304)
+            .header("ETag", etag)
+            .header("Last-Modified", &format_http_date(last_modified))
+    }
+
+    /// Build a 412 Precondition Failed response with XML error body.
+    #[must_use]
+    pub fn precondition_failed() -> Self {
+        let body = xml::error_xml(
+            "PreconditionFailed",
+            "At least one of the pre-conditions you specified did not hold",
+            "",
+            "request-id",
+        );
+        Self::new(412).xml_body(body)
+    }
+
     /// Build an error response.
     pub fn error(err: &ServerError, resource: &str) -> Self {
         let body = xml::error_xml(
@@ -287,10 +307,10 @@ fn format_http_date(millis: u64) -> String {
 
 /// Convert days since Unix epoch to (year, month, day).
 fn days_to_date(days: i64) -> (i64, u32, u32) {
-    let z = days + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
     let y = yoe as i64 + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
@@ -298,6 +318,50 @@ fn days_to_date(days: i64) -> (i64, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y, m, d)
+}
+
+/// Parse an RFC 7231 HTTP date (e.g. `"Thu, 01 Jan 1970 00:00:00 GMT"`) into unix milliseconds.
+/// Returns `None` for malformed dates. Only supports this one format (IMF-fixdate).
+pub(crate) fn parse_http_date(s: &str) -> Option<u64> {
+    // Format: "Day, DD Mon YYYY HH:MM:SS GMT"
+    let s = s.trim();
+    if s.len() < 29 || !s.ends_with("GMT") {
+        return None;
+    }
+
+    let day: u32 = s[5..7].parse().ok()?;
+    let month_str = &s[8..11];
+    let year: i64 = s[12..16].parse().ok()?;
+    let hours: u64 = s[17..19].parse().ok()?;
+    let minutes: u64 = s[20..22].parse().ok()?;
+    let seconds: u64 = s[23..25].parse().ok()?;
+
+    let months = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    #[allow(clippy::cast_possible_truncation)]
+    let month = months.iter().position(|&m| m == month_str)? as u32 + 1;
+
+    if hours >= 24 || minutes >= 60 || seconds >= 60 || day == 0 || day > 31 || month > 12 {
+        return None;
+    }
+
+    #[allow(clippy::cast_sign_loss)]
+    let secs = date_to_days(year, month, day) as u64 * 86400 + hours * 3600 + minutes * 60 + seconds;
+    Some(secs * 1000)
+}
+
+/// Convert (year, month, day) to days since Unix epoch. Inverse of `days_to_date`.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn date_to_days(year: i64, month: u32, day: u32) -> i64 {
+    // Civil calendar algorithm (inverse of days_to_date)
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u32;
+    let m = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * m + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe as i64 - 719_468
 }
 
 #[cfg(test)]
@@ -726,5 +790,78 @@ mod tests {
         let body = String::from_utf8(resp.body).unwrap();
         assert!(body.contains("ListVersionsResult"));
         assert!(body.contains("<VersionId>null</VersionId>"));
+    }
+
+    // ── parse_http_date ────────────────────────────────────────────
+
+    #[test]
+    fn parse_http_date_epoch() {
+        assert_eq!(parse_http_date("Thu, 01 Jan 1970 00:00:00 GMT"), Some(0));
+    }
+
+    #[test]
+    fn parse_http_date_known_date() {
+        assert_eq!(
+            parse_http_date("Mon, 15 Jan 2024 12:30:45 GMT"),
+            Some(1705321845000)
+        );
+    }
+
+    #[test]
+    fn parse_http_date_round_trip() {
+        let millis = 1705321845000u64;
+        let formatted = format_http_date(millis);
+        assert_eq!(parse_http_date(&formatted), Some(millis));
+    }
+
+    #[test]
+    fn parse_http_date_round_trip_epoch() {
+        let formatted = format_http_date(0);
+        assert_eq!(parse_http_date(&formatted), Some(0));
+    }
+
+    #[test]
+    fn parse_http_date_invalid() {
+        assert_eq!(parse_http_date("not a date"), None);
+        assert_eq!(parse_http_date(""), None);
+    }
+
+    #[test]
+    fn date_to_days_epoch() {
+        assert_eq!(date_to_days(1970, 1, 1), 0);
+    }
+
+    #[test]
+    fn date_to_days_round_trip() {
+        for d in [0i64, 1, 365, 10957, 11016, 19782] {
+            let (y, m, day) = days_to_date(d);
+            assert_eq!(date_to_days(y, m, day), d, "failed round-trip for day {d}");
+        }
+    }
+
+    // ── not_modified / precondition_failed ────────────────────────
+
+    #[test]
+    fn not_modified_response_has_etag_and_last_modified() {
+        let resp = S3Response::not_modified("\"abcdef1234567890\"", 1705321845000);
+        assert_eq!(resp.status_code, 304);
+        assert_eq!(find_header(&resp, "ETag"), Some("\"abcdef1234567890\""));
+        assert_eq!(
+            find_header(&resp, "Last-Modified"),
+            Some("Mon, 15 Jan 2024 12:30:45 GMT")
+        );
+        assert!(resp.body.is_empty());
+    }
+
+    #[test]
+    fn precondition_failed_response_412() {
+        let resp = S3Response::precondition_failed();
+        assert_eq!(resp.status_code, 412);
+        assert_eq!(
+            find_header(&resp, "Content-Type"),
+            Some("application/xml")
+        );
+        let body = String::from_utf8(resp.body).unwrap();
+        assert!(body.contains("PreconditionFailed"));
     }
 }
