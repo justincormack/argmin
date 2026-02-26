@@ -27,11 +27,42 @@ pub fn uri_encode(value: &str) -> String {
 }
 
 /// Percent-encode a URI path, preserving '/' separators.
+///
+/// This preserves any existing %XX sequences (uppercasing hex digits) to avoid
+/// double-encoding already-encoded bytes in the raw request path.
 pub fn uri_encode_path(path: &str) -> String {
-    path.split('/')
-        .map(uri_encode)
-        .collect::<Vec<_>>()
-        .join("/")
+    let bytes = path.as_bytes();
+    let mut encoded = String::with_capacity(path.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if byte == b'/' {
+            encoded.push('/');
+            i += 1;
+            continue;
+        }
+        if byte == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                encoded.push('%');
+                encoded.push(HEX_UPPER[hi as usize] as char);
+                encoded.push(HEX_UPPER[lo as usize] as char);
+                i += 3;
+                continue;
+            }
+        }
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => {
+                encoded.push('%');
+                encoded.push(HEX_UPPER[(byte >> 4) as usize] as char);
+                encoded.push(HEX_UPPER[(byte & 0x0f) as usize] as char);
+            }
+        }
+        i += 1;
+    }
+    encoded
 }
 
 /// Build the canonical request string per SigV4 spec.
@@ -278,6 +309,12 @@ mod tests {
     #[test]
     fn uri_encode_path_preserves_slashes() {
         assert_eq!(uri_encode_path("/bucket/my key"), "/bucket/my%20key");
+    }
+
+    #[test]
+    fn uri_encode_path_preserves_percent_encoding() {
+        assert_eq!(uri_encode_path("/bucket/1999%23"), "/bucket/1999%23");
+        assert_eq!(uri_encode_path("/bucket/%2f"), "/bucket/%2F");
     }
 
     #[test]
