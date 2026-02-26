@@ -60,6 +60,43 @@ impl LocalStorageNode {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn data_dir_accessor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = LocalStorageNode::open(tmp.path(), &[0, 1]).unwrap();
+        assert_eq!(node.data_dir(), tmp.path());
+    }
+
+    #[test]
+    fn get_pg_store_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = LocalStorageNode::open(tmp.path(), &[0, 1]).unwrap();
+        let result = node.get_pg_store(999);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn get_pg_valid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = LocalStorageNode::open(tmp.path(), &[0, 1, 2]).unwrap();
+        assert!(node.get_pg(0).is_ok());
+        assert!(node.get_pg(1).is_ok());
+        assert!(node.get_pg(2).is_ok());
+        assert!(node.get_pg(3).is_err());
+    }
+
+    #[test]
+    fn pg_ids_sorted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = LocalStorageNode::open(tmp.path(), &[5, 2, 8, 1]).unwrap();
+        assert_eq!(node.pg_ids(), &[1, 2, 5, 8]);
+    }
+}
+
 impl StorageNode for LocalStorageNode {
     fn get_pg_store(&self, pg_id: u32) -> Result<&dyn ShardStore, StoreError> {
         self.stores

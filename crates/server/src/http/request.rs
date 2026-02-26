@@ -245,4 +245,124 @@ mod tests {
         assert_eq!(req.query_param("max-keys"), Some("10".to_string()));
         assert_eq!(req.query_param("missing"), None);
     }
+
+    #[test]
+    fn percent_decode_truncated_escape() {
+        // % at end of string — not enough chars for a hex pair
+        assert_eq!(percent_decode("abc%"), "abc%");
+        assert_eq!(percent_decode("abc%2"), "abc%2");
+    }
+
+    #[test]
+    fn percent_decode_non_hex_after_percent() {
+        assert_eq!(percent_decode("%ZZ"), "%ZZ");
+        assert_eq!(percent_decode("%GH"), "%GH");
+    }
+
+    #[test]
+    fn percent_decode_uppercase_hex() {
+        assert_eq!(percent_decode("%2F"), "/");
+        assert_eq!(percent_decode("%2f"), "/");
+        assert_eq!(percent_decode("%3A"), ":");
+        assert_eq!(percent_decode("%3a"), ":");
+    }
+
+    #[test]
+    fn hex_val_digits() {
+        for d in b'0'..=b'9' {
+            assert_eq!(hex_val(d), Some(d - b'0'));
+        }
+    }
+
+    #[test]
+    fn hex_val_lower_alpha() {
+        for c in b'a'..=b'f' {
+            assert_eq!(hex_val(c), Some(c - b'a' + 10));
+        }
+    }
+
+    #[test]
+    fn hex_val_upper_alpha() {
+        for c in b'A'..=b'F' {
+            assert_eq!(hex_val(c), Some(c - b'A' + 10));
+        }
+    }
+
+    #[test]
+    fn hex_val_invalid() {
+        assert_eq!(hex_val(b'g'), None);
+        assert_eq!(hex_val(b'G'), None);
+        assert_eq!(hex_val(b' '), None);
+        assert_eq!(hex_val(b'/'), None);
+        assert_eq!(hex_val(b':'), None);
+    }
+
+    #[test]
+    fn query_param_empty_query_string() {
+        let req = S3Request {
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            query_string: String::new(),
+            headers: vec![],
+            body: vec![],
+        };
+        assert_eq!(req.query_param("anything"), None);
+    }
+
+    #[test]
+    fn query_param_no_equals() {
+        let req = S3Request {
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            query_string: "flagonly&key=val".to_string(),
+            headers: vec![],
+            body: vec![],
+        };
+        // "flagonly" with no = has empty value
+        assert_eq!(req.query_param("flagonly"), Some(String::new()));
+        assert_eq!(req.query_param("key"), Some("val".to_string()));
+    }
+
+    #[test]
+    fn query_param_match_not_first() {
+        let req = S3Request {
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            query_string: "a=1&b=2&c=3".to_string(),
+            headers: vec![],
+            body: vec![],
+        };
+        assert_eq!(req.query_param("c"), Some("3".to_string()));
+    }
+
+    #[test]
+    fn header_pairs_output() {
+        let req = S3Request {
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            query_string: String::new(),
+            headers: vec![
+                ("host".to_string(), "example.com".to_string()),
+                ("content-type".to_string(), "text/plain".to_string()),
+            ],
+            body: vec![],
+        };
+        let pairs = req.header_pairs();
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0], ("host", "example.com"));
+        assert_eq!(pairs[1], ("content-type", "text/plain"));
+    }
+
+    #[test]
+    fn header_returns_none_for_missing() {
+        let req = S3Request {
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            query_string: String::new(),
+            headers: vec![("host".to_string(), "example.com".to_string())],
+            body: vec![],
+        };
+        assert_eq!(req.header("content-type"), None);
+        assert_eq!(req.header("host"), Some("example.com"));
+    }
 }

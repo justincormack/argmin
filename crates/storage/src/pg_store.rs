@@ -570,3 +570,189 @@ fn fsync_dir(dir: &Path) -> std::io::Result<()> {
     f.sync_all()?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::traits::PgMetadataStore;
+
+    // ── prefix_end ────────────────────────────────────────────────────
+
+    #[test]
+    fn prefix_end_basic() {
+        assert_eq!(prefix_end("foo"), Some("fop".to_string()));
+    }
+
+    #[test]
+    fn prefix_end_empty() {
+        assert_eq!(prefix_end(""), None);
+    }
+
+    #[test]
+    fn prefix_end_del_char() {
+        // 0x7F (DEL) is valid in a Rust &str; incrementing gives 0x80 which
+        // is not valid UTF-8, so from_utf8 fails and prefix_end returns None.
+        let s = "\x7f";
+        assert_eq!(prefix_end(s), None);
+    }
+
+    #[test]
+    fn prefix_end_trailing_del() {
+        // "abc" + DEL(0x7F) → increment 0x7F to 0x80 → not valid UTF-8 → None
+        // So prefix_end returns None for this input (can't produce valid UTF-8 upper bound)
+        let s = "abc\x7f";
+        assert_eq!(prefix_end(s), None);
+    }
+
+    #[test]
+    fn prefix_end_tilde() {
+        // '~' is 0x7E, incrementing gives 0x7F which is valid UTF-8
+        assert_eq!(prefix_end("~"), Some("\x7f".to_string()));
+    }
+
+    // ── pg_id accessor ────────────────────────────────────────────────
+
+    #[test]
+    fn pg_id_accessor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = PgStore::open(tmp.path(), 42).unwrap();
+        assert_eq!(store.pg_id(), 42);
+    }
+
+    // ── list_objects with prefix + start_after ────────────────────────
+
+    #[test]
+    fn list_objects_prefix_and_start_after() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = PgStore::open(tmp.path(), 0).unwrap();
+
+        // Insert several objects
+        for key in &["photos/a.jpg", "photos/b.jpg", "photos/c.jpg", "docs/x"] {
+            store
+                .put_object_meta(&PutObjectMetaReq {
+                    bucket: "bucket".into(),
+                    key: key.to_string(),
+                    version_id: "null".into(),
+                    size: 10,
+                    etag: vec![0; 8],
+                    etag_kind: 0,
+                    ec_k: 4,
+                    ec_m: 2,
+                })
+                .unwrap();
+        }
+
+        // List with prefix=photos/ and start_after=photos/a.jpg
+        let resp = store
+            .list_objects(&ListObjectsReq {
+                bucket: "bucket".into(),
+                prefix: Some("photos/".into()),
+                start_after: Some("photos/a.jpg".into()),
+                max_keys: 10,
+            })
+            .unwrap();
+
+        assert_eq!(resp.objects.len(), 2);
+        assert_eq!(resp.objects[0].key, "photos/b.jpg");
+        assert_eq!(resp.objects[1].key, "photos/c.jpg");
+        assert!(!resp.is_truncated);
+    }
+
+    // ── stat_shard on quarantined shard ───────────────────────────────
+
+    #[test]
+    fn stat_shard_after_quarantine() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = PgStore::open(tmp.path(), 0).unwrap();
+
+        let key = ShardKey::new(&[0xAA; 16], 0, 0);
+        store.write_shard(&key, b"hello").unwrap();
+
+        // Corrupt the shard file on disk
+        let shard_path = store.shard_path(&key);
+        fs::write(&shard_path, b"corrupt data!!").unwrap();
+
+        // Read should fail with integrity error and quarantine the shard
+        let err = store.read_shard(&key).unwrap_err();
+        assert!(matches!(err, StoreError::IntegrityError { .. }));
+
+        // stat_shard should now return NotFound (quarantined)
+        let err = store.stat_shard(&key).unwrap_err();
+        assert!(matches!(err, StoreError::NotFound));
+    }
+
+    // ── stat_shard on live shard ──────────────────────────────────────
+
+    #[test]
+    fn stat_shard_live() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = PgStore::open(tmp.path(), 0).unwrap();
+
+        let key = ShardKey::new(&[0xBB; 16], 1, 0);
+        store.write_shard(&key, b"data").unwrap();
+
+        let stat = store.stat_shard(&key).unwrap();
+        assert_eq!(stat.size, 4);
+        assert_eq!(stat.crc64, crc64::checksum(b"data"));
+    }
+
+    // ── connection accessor ───────────────────────────────────────────
+
+    #[test]
+    fn connection_accessor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = PgStore::open(tmp.path(), 0).unwrap();
+        // Just verify we can call it without panicking
+        let _conn = store.connection();
+    }
+
+    // ── list_objects pagination ──────────────────────────────────────
+
+    #[test]
+    fn list_objects_pagination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = PgStore::open(tmp.path(), 0).unwrap();
+
+        for i in 0..5 {
+            store
+                .put_object_meta(&PutObjectMetaReq {
+                    bucket: "b".into(),
+                    key: format!("key-{:02}", i),
+                    version_id: "null".into(),
+                    size: 0,
+                    etag: vec![0; 8],
+                    etag_kind: 0,
+                    ec_k: 4,
+                    ec_m: 2,
+                })
+                .unwrap();
+        }
+
+        // First page
+        let resp = store
+            .list_objects(&ListObjectsReq {
+                bucket: "b".into(),
+                prefix: None,
+                start_after: None,
+                max_keys: 2,
+            })
+            .unwrap();
+        assert_eq!(resp.objects.len(), 2);
+        assert!(resp.is_truncated);
+        assert_eq!(resp.objects[0].key, "key-00");
+        assert_eq!(resp.objects[1].key, "key-01");
+
+        // Second page
+        let resp2 = store
+            .list_objects(&ListObjectsReq {
+                bucket: "b".into(),
+                prefix: None,
+                start_after: resp.next_start_after,
+                max_keys: 2,
+            })
+            .unwrap();
+        assert_eq!(resp2.objects.len(), 2);
+        assert!(resp2.is_truncated);
+        assert_eq!(resp2.objects[0].key, "key-02");
+    }
+}

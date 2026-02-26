@@ -155,6 +155,60 @@ pub struct PutObjectMetaReq {
     pub ec_m: u8,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shard_status_from_u8_live() {
+        assert_eq!(ShardStatus::from_u8(0), Some(ShardStatus::Live));
+    }
+
+    #[test]
+    fn shard_status_from_u8_deleting() {
+        assert_eq!(ShardStatus::from_u8(1), Some(ShardStatus::Deleting));
+    }
+
+    #[test]
+    fn shard_status_from_u8_quarantined() {
+        assert_eq!(ShardStatus::from_u8(2), Some(ShardStatus::Quarantined));
+    }
+
+    #[test]
+    fn shard_status_from_u8_invalid() {
+        assert_eq!(ShardStatus::from_u8(3), None);
+        assert_eq!(ShardStatus::from_u8(255), None);
+    }
+
+    #[test]
+    fn shard_key_debug_contains_hex() {
+        let key = ShardKey::new(&[0xAB; 16], 42, 3);
+        let debug = format!("{:?}", key);
+        assert!(debug.starts_with("ShardKey("));
+        assert!(debug.contains("ab")); // hex of 0xAB
+    }
+
+    #[test]
+    fn shard_key_round_trip() {
+        let key = ShardKey::new(&[1; 16], 12345, 7);
+        let bytes = key.as_bytes();
+        let key2 = ShardKey::from_bytes(bytes).unwrap();
+        assert_eq!(key, key2);
+    }
+
+    #[test]
+    fn shard_key_from_bytes_wrong_length() {
+        assert!(ShardKey::from_bytes(&[0; 10]).is_err());
+        assert!(ShardKey::from_bytes(&[0; 26]).is_err());
+    }
+
+    #[test]
+    fn shard_key_hex_prefix() {
+        let key = ShardKey::new(&[0xDE; 16], 0, 0);
+        assert_eq!(key.hex_prefix(), "de");
+    }
+}
+
 /// Request to list objects in a PG.
 pub struct ListObjectsReq {
     pub bucket: String,

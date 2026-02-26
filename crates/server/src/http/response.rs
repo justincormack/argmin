@@ -210,3 +210,362 @@ fn days_to_date(days: i64) -> (i64, u32, u32) {
     let y = if m <= 2 { y + 1 } else { y };
     (y, m, d)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::coordinator::{
+        GetObjectResult, HeadObjectResult, ListEntry, ListObjectsResult, PutObjectResult,
+    };
+    use crate::metadata_blob::{MetadataBlob, MetadataEntry};
+
+    fn find_header<'a>(resp: &'a S3Response, name: &str) -> Option<&'a str> {
+        resp.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    // ── format_http_date ──────────────────────────────────────────────
+
+    #[test]
+    fn format_http_date_epoch() {
+        assert_eq!(format_http_date(0), "Thu, 01 Jan 1970 00:00:00 GMT");
+    }
+
+    #[test]
+    fn format_http_date_known_date() {
+        // 2024-01-15 12:30:45 UTC
+        // seconds: 1705321845, millis: 1705321845000
+        assert_eq!(
+            format_http_date(1705321845000),
+            "Mon, 15 Jan 2024 12:30:45 GMT"
+        );
+    }
+
+    // ── days_to_date ──────────────────────────────────────────────────
+
+    #[test]
+    fn days_to_date_epoch() {
+        assert_eq!(days_to_date(0), (1970, 1, 1));
+    }
+
+    #[test]
+    fn days_to_date_leap_year_feb29() {
+        // 2000-02-29 is day 11016 since epoch
+        // 2000-01-01 is day 10957, Feb 29 = 10957 + 31 + 28 = 11016
+        assert_eq!(days_to_date(11016), (2000, 2, 29));
+    }
+
+    #[test]
+    fn days_to_date_year_boundary() {
+        // 1970-12-31 is day 364
+        assert_eq!(days_to_date(364), (1970, 12, 31));
+        // 1971-01-01 is day 365
+        assert_eq!(days_to_date(365), (1971, 1, 1));
+    }
+
+    #[test]
+    fn days_to_date_2024_leap() {
+        // 2024-02-29 — 2024 is a leap year
+        // 2024-01-01 is day 19723
+        // Feb 29 = 19723 + 31 + 28 = 19782
+        assert_eq!(days_to_date(19782), (2024, 2, 29));
+    }
+
+    // ── put_object ────────────────────────────────────────────────────
+
+    #[test]
+    fn put_object_response() {
+        let result = PutObjectResult {
+            etag: "\"abc123\"".to_string(),
+            version_id: "null".to_string(),
+        };
+        let resp = S3Response::put_object(&result);
+        assert_eq!(resp.status_code, 200);
+        assert_eq!(find_header(&resp, "ETag"), Some("\"abc123\""));
+        assert_eq!(find_header(&resp, "x-amz-version-id"), Some("null"));
+    }
+
+    // ── get_object ────────────────────────────────────────────────────
+
+    #[test]
+    fn get_object_with_content_type() {
+        let result = GetObjectResult {
+            data: b"hello".to_vec(),
+            metadata: MetadataBlob {
+                entries: vec![MetadataEntry {
+                    key: "content-type".into(),
+                    value: "text/plain".into(),
+                }],
+            },
+            etag: "\"etag\"".into(),
+            size: 5,
+            last_modified: 0,
+        };
+        let resp = S3Response::get_object(result);
+        assert_eq!(resp.status_code, 200);
+        assert_eq!(find_header(&resp, "Content-Type"), Some("text/plain"));
+        assert_eq!(resp.body, b"hello");
+    }
+
+    #[test]
+    fn get_object_default_content_type() {
+        let result = GetObjectResult {
+            data: b"data".to_vec(),
+            metadata: MetadataBlob::new(),
+            etag: "\"etag\"".into(),
+            size: 4,
+            last_modified: 0,
+        };
+        let resp = S3Response::get_object(result);
+        assert_eq!(
+            find_header(&resp, "Content-Type"),
+            Some("application/octet-stream")
+        );
+    }
+
+    #[test]
+    fn get_object_with_amz_meta_headers() {
+        let result = GetObjectResult {
+            data: vec![],
+            metadata: MetadataBlob {
+                entries: vec![MetadataEntry {
+                    key: "x-amz-meta-author".into(),
+                    value: "alice".into(),
+                }],
+            },
+            etag: "\"e\"".into(),
+            size: 0,
+            last_modified: 0,
+        };
+        let resp = S3Response::get_object(result);
+        assert_eq!(find_header(&resp, "x-amz-meta-author"), Some("alice"));
+    }
+
+    #[test]
+    fn get_object_with_all_standard_metadata() {
+        let result = GetObjectResult {
+            data: vec![],
+            metadata: MetadataBlob {
+                entries: vec![
+                    MetadataEntry { key: "content-type".into(), value: "text/html".into() },
+                    MetadataEntry { key: "content-encoding".into(), value: "gzip".into() },
+                    MetadataEntry { key: "cache-control".into(), value: "max-age=3600".into() },
+                    MetadataEntry { key: "content-disposition".into(), value: "attachment".into() },
+                    MetadataEntry { key: "content-language".into(), value: "en-US".into() },
+                    MetadataEntry { key: "expires".into(), value: "Thu, 01 Jan 2099 00:00:00 GMT".into() },
+                ],
+            },
+            etag: "\"e\"".into(),
+            size: 0,
+            last_modified: 0,
+        };
+        let resp = S3Response::get_object(result);
+        assert_eq!(find_header(&resp, "Content-Type"), Some("text/html"));
+        assert_eq!(find_header(&resp, "Content-Encoding"), Some("gzip"));
+        assert_eq!(find_header(&resp, "Cache-Control"), Some("max-age=3600"));
+        assert_eq!(find_header(&resp, "Content-Disposition"), Some("attachment"));
+        assert_eq!(find_header(&resp, "Content-Language"), Some("en-US"));
+        assert_eq!(find_header(&resp, "Expires"), Some("Thu, 01 Jan 2099 00:00:00 GMT"));
+    }
+
+    // ── head_object ───────────────────────────────────────────────────
+
+    #[test]
+    fn head_object_response() {
+        let result = HeadObjectResult {
+            metadata: MetadataBlob {
+                entries: vec![MetadataEntry {
+                    key: "content-type".into(),
+                    value: "image/png".into(),
+                }],
+            },
+            etag: "\"etag\"".into(),
+            size: 1024,
+            last_modified: 0,
+        };
+        let resp = S3Response::head_object(&result);
+        assert_eq!(resp.status_code, 200);
+        assert_eq!(find_header(&resp, "ETag"), Some("\"etag\""));
+        assert_eq!(find_header(&resp, "Content-Length"), Some("1024"));
+        assert_eq!(find_header(&resp, "Content-Type"), Some("image/png"));
+        assert!(resp.body.is_empty());
+    }
+
+    #[test]
+    fn head_object_default_content_type() {
+        let result = HeadObjectResult {
+            metadata: MetadataBlob::new(),
+            etag: "\"e\"".into(),
+            size: 0,
+            last_modified: 0,
+        };
+        let resp = S3Response::head_object(&result);
+        assert_eq!(
+            find_header(&resp, "Content-Type"),
+            Some("application/octet-stream")
+        );
+    }
+
+    #[test]
+    fn head_object_with_encoding_and_cache() {
+        let result = HeadObjectResult {
+            metadata: MetadataBlob {
+                entries: vec![
+                    MetadataEntry { key: "content-encoding".into(), value: "br".into() },
+                    MetadataEntry { key: "cache-control".into(), value: "no-cache".into() },
+                ],
+            },
+            etag: "\"e\"".into(),
+            size: 10,
+            last_modified: 0,
+        };
+        let resp = S3Response::head_object(&result);
+        assert_eq!(find_header(&resp, "Content-Encoding"), Some("br"));
+        assert_eq!(find_header(&resp, "Cache-Control"), Some("no-cache"));
+    }
+
+    #[test]
+    fn head_object_with_amz_meta() {
+        let result = HeadObjectResult {
+            metadata: MetadataBlob {
+                entries: vec![MetadataEntry {
+                    key: "x-amz-meta-tag".into(),
+                    value: "value".into(),
+                }],
+            },
+            etag: "\"e\"".into(),
+            size: 0,
+            last_modified: 0,
+        };
+        let resp = S3Response::head_object(&result);
+        assert_eq!(find_header(&resp, "x-amz-meta-tag"), Some("value"));
+    }
+
+    // ── delete_object ─────────────────────────────────────────────────
+
+    #[test]
+    fn delete_object_response() {
+        let resp = S3Response::delete_object();
+        assert_eq!(resp.status_code, 204);
+        assert!(resp.body.is_empty());
+    }
+
+    // ── create_bucket ─────────────────────────────────────────────────
+
+    #[test]
+    fn create_bucket_response() {
+        let resp = S3Response::create_bucket("my-bucket");
+        assert_eq!(resp.status_code, 200);
+        assert_eq!(find_header(&resp, "Location"), Some("/my-bucket"));
+    }
+
+    // ── delete_bucket ─────────────────────────────────────────────────
+
+    #[test]
+    fn delete_bucket_response() {
+        let resp = S3Response::delete_bucket();
+        assert_eq!(resp.status_code, 204);
+    }
+
+    // ── head_bucket ───────────────────────────────────────────────────
+
+    #[test]
+    fn head_bucket_response() {
+        let info = storage::BucketInfo {
+            name: "b".into(),
+            owner_id: 0,
+            created_at: 0,
+            region: 0,
+            versioning: 0,
+        };
+        let resp = S3Response::head_bucket(&info);
+        assert_eq!(resp.status_code, 200);
+    }
+
+    // ── list_buckets ──────────────────────────────────────────────────
+
+    #[test]
+    fn list_buckets_response() {
+        let buckets = vec![storage::BucketInfo {
+            name: "test-bucket".into(),
+            owner_id: 0,
+            created_at: 1000,
+            region: 0,
+            versioning: 0,
+        }];
+        let resp = S3Response::list_buckets(&buckets);
+        assert_eq!(resp.status_code, 200);
+        assert_eq!(
+            find_header(&resp, "Content-Type"),
+            Some("application/xml")
+        );
+        let body = String::from_utf8(resp.body).unwrap();
+        assert!(body.contains("<?xml"));
+        assert!(body.contains("test-bucket"));
+        assert!(body.contains("ListAllMyBucketsResult"));
+    }
+
+    // ── list_objects_v2 ───────────────────────────────────────────────
+
+    #[test]
+    fn list_objects_v2_response() {
+        let result = ListObjectsResult {
+            objects: vec![ListEntry {
+                key: "key1".into(),
+                size: 42,
+                etag: "\"etag1\"".into(),
+                last_modified: 0,
+            }],
+            common_prefixes: vec![],
+            is_truncated: false,
+            next_continuation_token: None,
+        };
+        let resp = S3Response::list_objects_v2("bucket", Some("pre"), None, 1000, &result);
+        assert_eq!(resp.status_code, 200);
+        let body = String::from_utf8(resp.body).unwrap();
+        assert!(body.contains("ListBucketResult"));
+        assert!(body.contains("key1"));
+        assert!(body.contains("<Size>42</Size>"));
+    }
+
+    // ── error ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn error_response_404() {
+        let err = ServerError::BucketNotFound { name: "b".into() };
+        let resp = S3Response::error(&err, "/b");
+        assert_eq!(resp.status_code, 404);
+        let body = String::from_utf8(resp.body).unwrap();
+        assert!(body.contains("NoSuchBucket"));
+    }
+
+    #[test]
+    fn error_response_403() {
+        let err = ServerError::Auth(auth::AuthError::MissingAuth);
+        let resp = S3Response::error(&err, "/");
+        assert_eq!(resp.status_code, 403);
+        let body = String::from_utf8(resp.body).unwrap();
+        assert!(body.contains("AccessDenied"));
+    }
+
+    #[test]
+    fn error_response_500() {
+        let err = ServerError::Store(storage::StoreError::NotFound);
+        let resp = S3Response::error(&err, "/x");
+        assert_eq!(resp.status_code, 500);
+        let body = String::from_utf8(resp.body).unwrap();
+        assert!(body.contains("InternalError"));
+    }
+
+    #[test]
+    fn error_response_has_xml_content_type() {
+        let err = ServerError::MethodNotAllowed;
+        let resp = S3Response::error(&err, "/");
+        assert_eq!(
+            find_header(&resp, "Content-Type"),
+            Some("application/xml")
+        );
+    }
+}

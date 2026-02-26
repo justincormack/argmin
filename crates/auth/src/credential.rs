@@ -42,3 +42,37 @@ impl Default for CredentialStore {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_missing_key() {
+        let store = CredentialStore::new();
+        assert!(store.get("nonexistent").is_none());
+    }
+
+    #[test]
+    fn add_then_get() {
+        let mut store = CredentialStore::new();
+        store.add("AKID".into(), SecretKey("secret123".into()));
+        let key = store.get("AKID").unwrap();
+        assert_eq!(key.0, "secret123");
+    }
+
+    #[test]
+    fn overwrite_key() {
+        let mut store = CredentialStore::new();
+        store.add("AKID".into(), SecretKey("first".into()));
+        store.add("AKID".into(), SecretKey("second".into()));
+        let key = store.get("AKID").unwrap();
+        assert_eq!(key.0, "second");
+    }
+
+    #[test]
+    fn default_is_empty() {
+        let store = CredentialStore::default();
+        assert!(store.get("anything").is_none());
+    }
+}
