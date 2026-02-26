@@ -62,6 +62,28 @@ pub struct ListObjectsResult {
     pub next_continuation_token: Option<String>,
 }
 
+/// Result entry for a successfully deleted object in a batch delete.
+#[derive(Debug)]
+pub struct DeletedObject {
+    pub key: String,
+    pub version_id: String,
+}
+
+/// Result entry for a failed deletion in a batch delete.
+#[derive(Debug)]
+pub struct DeleteError {
+    pub key: String,
+    pub code: String,
+    pub message: String,
+}
+
+/// Result of a DeleteObjects (batch delete) operation.
+#[derive(Debug)]
+pub struct DeleteObjectsResult {
+    pub deleted: Vec<DeletedObject>,
+    pub errors: Vec<DeleteError>,
+}
+
 /// The coordinator ties together EC, storage, and metadata.
 pub struct Coordinator {
     storage_node: LocalStorageNode,
@@ -577,6 +599,38 @@ impl Coordinator {
             is_truncated,
             next_continuation_token: next_token,
         })
+    }
+
+    /// Batch-delete objects.
+    pub fn delete_objects(
+        &self,
+        bucket: &str,
+        entries: &[crate::http::xml::DeleteObjectEntry],
+    ) -> Result<DeleteObjectsResult, ServerError> {
+        self.head_bucket(bucket)?;
+
+        let mut deleted = Vec::new();
+        let mut errors = Vec::new();
+
+        for entry in entries {
+            match self.delete_object(bucket, &entry.key) {
+                Ok(()) => {
+                    deleted.push(DeletedObject {
+                        key: entry.key.clone(),
+                        version_id: "null".to_string(),
+                    });
+                }
+                Err(e) => {
+                    errors.push(DeleteError {
+                        key: entry.key.clone(),
+                        code: e.s3_error_code().to_string(),
+                        message: e.to_string(),
+                    });
+                }
+            }
+        }
+
+        Ok(DeleteObjectsResult { deleted, errors })
     }
 }
 
@@ -1111,6 +1165,54 @@ mod tests {
         let err = coord
             .list_objects_v2("no-bucket", None, None, None, 1000)
             .unwrap_err();
+        assert!(matches!(err, ServerError::BucketNotFound { .. }));
+    }
+
+    #[test]
+    fn delete_objects_batch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+
+        coord.create_bucket("bucket").unwrap();
+        coord.put_object("bucket", "key1", b"data1", &[]).unwrap();
+        coord.put_object("bucket", "key2", b"data2", &[]).unwrap();
+
+        let entries = vec![
+            crate::http::xml::DeleteObjectEntry {
+                key: "key1".to_string(),
+                version_id: None,
+            },
+            crate::http::xml::DeleteObjectEntry {
+                key: "key2".to_string(),
+                version_id: None,
+            },
+            // key3 doesn't exist — should still succeed (idempotent)
+            crate::http::xml::DeleteObjectEntry {
+                key: "key3".to_string(),
+                version_id: None,
+            },
+        ];
+
+        let result = coord.delete_objects("bucket", &entries).unwrap();
+        assert_eq!(result.deleted.len(), 3);
+        assert!(result.errors.is_empty());
+
+        // Verify objects are actually gone
+        assert!(coord.get_object("bucket", "key1").is_err());
+        assert!(coord.get_object("bucket", "key2").is_err());
+    }
+
+    #[test]
+    fn delete_objects_nonexistent_bucket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+
+        let entries = vec![crate::http::xml::DeleteObjectEntry {
+            key: "key1".to_string(),
+            version_id: None,
+        }];
+
+        let err = coord.delete_objects("no-bucket", &entries).unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
     }
 

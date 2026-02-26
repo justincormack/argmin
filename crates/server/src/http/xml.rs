@@ -1,5 +1,6 @@
 /// Hand-formatted XML for S3 responses. No XML library dependency.
-use crate::coordinator::ListObjectsResult;
+use crate::coordinator::{DeleteError, DeletedObject, ListObjectsResult};
+use crate::error::ServerError;
 use storage::BucketInfo;
 
 /// Format an S3 error response XML.
@@ -201,6 +202,173 @@ pub fn list_objects_v1_xml(
     }
 
     xml.push_str("</ListBucketResult>");
+    xml
+}
+
+/// An entry in a DeleteObjects request.
+pub struct DeleteObjectEntry {
+    pub key: String,
+    pub version_id: Option<String>,
+}
+
+/// Parse a DeleteObjects XML request body.
+///
+/// Returns the list of object entries and the quiet flag.
+pub fn parse_delete_objects_xml(
+    data: &[u8],
+) -> Result<(Vec<DeleteObjectEntry>, bool), ServerError> {
+    let text = std::str::from_utf8(data).map_err(|_| ServerError::InvalidRequest {
+        reason: "invalid UTF-8 in delete XML body".to_string(),
+    })?;
+
+    // Require <Delete> wrapper
+    if !text.contains("<Delete") {
+        return Err(ServerError::InvalidRequest {
+            reason: "missing <Delete> element".to_string(),
+        });
+    }
+
+    // Detect quiet mode
+    let quiet = extract_tag_content(text, "Quiet")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+
+    // Parse <Object> blocks
+    let mut entries = Vec::new();
+    let mut search_from = 0;
+    while let Some(start) = text[search_from..].find("<Object>") {
+        let abs_start = search_from + start + "<Object>".len();
+        let end = text[abs_start..]
+            .find("</Object>")
+            .ok_or_else(|| ServerError::InvalidRequest {
+                reason: "unclosed <Object> element".to_string(),
+            })?;
+        let block = &text[abs_start..abs_start + end];
+
+        let key = extract_tag_content(block, "Key").ok_or_else(|| {
+            ServerError::InvalidRequest {
+                reason: "Object missing <Key> element".to_string(),
+            }
+        })?;
+        let version_id = extract_tag_content(block, "VersionId").map(|s| s.to_string());
+
+        entries.push(DeleteObjectEntry {
+            key: key.to_string(),
+            version_id,
+        });
+
+        search_from = abs_start + end + "</Object>".len();
+    }
+
+    Ok((entries, quiet))
+}
+
+/// Extract the text content of a simple XML tag (no attributes, no nesting).
+fn extract_tag_content<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{}>", tag);
+    let close = format!("</{}>", tag);
+    let start = xml.find(&open)? + open.len();
+    let end = xml[start..].find(&close)? + start;
+    Some(&xml[start..end])
+}
+
+/// Format a DeleteResult XML response.
+pub fn delete_objects_result_xml(
+    deleted: &[DeletedObject],
+    errors: &[DeleteError],
+    quiet: bool,
+) -> String {
+    let mut xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
+    );
+
+    if !quiet {
+        for d in deleted {
+            xml.push_str("<Deleted><Key>");
+            xml.push_str(&xml_escape(&d.key));
+            xml.push_str("</Key><VersionId>");
+            xml.push_str(&xml_escape(&d.version_id));
+            xml.push_str("</VersionId></Deleted>");
+        }
+    }
+
+    for e in errors {
+        xml.push_str("<Error><Key>");
+        xml.push_str(&xml_escape(&e.key));
+        xml.push_str("</Key><Code>");
+        xml.push_str(&xml_escape(&e.code));
+        xml.push_str("</Code><Message>");
+        xml.push_str(&xml_escape(&e.message));
+        xml.push_str("</Message></Error>");
+    }
+
+    xml.push_str("</DeleteResult>");
+    xml
+}
+
+/// Format a ListVersionsResult XML response (minimal, no real versioning).
+pub fn list_object_versions_xml(
+    bucket: &str,
+    prefix: Option<&str>,
+    key_marker: Option<&str>,
+    max_keys: u32,
+    result: &ListObjectsResult,
+) -> String {
+    let mut xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <ListVersionsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
+    );
+
+    xml.push_str("<Name>");
+    xml.push_str(&xml_escape(bucket));
+    xml.push_str("</Name>");
+
+    if let Some(p) = prefix {
+        xml.push_str("<Prefix>");
+        xml.push_str(&xml_escape(p));
+        xml.push_str("</Prefix>");
+    } else {
+        xml.push_str("<Prefix/>");
+    }
+
+    if let Some(km) = key_marker {
+        xml.push_str("<KeyMarker>");
+        xml.push_str(&xml_escape(km));
+        xml.push_str("</KeyMarker>");
+    } else {
+        xml.push_str("<KeyMarker/>");
+    }
+
+    xml.push_str("<MaxKeys>");
+    xml.push_str(&max_keys.to_string());
+    xml.push_str("</MaxKeys>");
+
+    xml.push_str("<IsTruncated>");
+    xml.push_str(if result.is_truncated { "true" } else { "false" });
+    xml.push_str("</IsTruncated>");
+
+    for obj in &result.objects {
+        xml.push_str("<Version>");
+        xml.push_str("<Key>");
+        xml.push_str(&xml_escape(&obj.key));
+        xml.push_str("</Key>");
+        xml.push_str("<VersionId>null</VersionId>");
+        xml.push_str("<IsLatest>true</IsLatest>");
+        xml.push_str("<LastModified>");
+        xml.push_str(&format_timestamp(obj.last_modified));
+        xml.push_str("</LastModified>");
+        xml.push_str("<ETag>");
+        xml.push_str(&xml_escape(&obj.etag));
+        xml.push_str("</ETag>");
+        xml.push_str("<Size>");
+        xml.push_str(&obj.size.to_string());
+        xml.push_str("</Size>");
+        xml.push_str("<StorageClass>STANDARD</StorageClass>");
+        xml.push_str("</Version>");
+    }
+
+    xml.push_str("</ListVersionsResult>");
     xml
 }
 
@@ -472,6 +640,129 @@ mod tests {
     #[test]
     fn xml_escape_special_chars() {
         assert_eq!(xml_escape("a&b<c>d\"e'f"), "a&amp;b&lt;c&gt;d&quot;e&apos;f");
+    }
+
+    // ── parse_delete_objects_xml ─────────────────────────────────────
+
+    #[test]
+    fn parse_delete_objects_basic() {
+        let xml = b"<Delete><Object><Key>key1</Key></Object><Object><Key>key2</Key></Object></Delete>";
+        let (entries, quiet) = parse_delete_objects_xml(xml).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].key, "key1");
+        assert_eq!(entries[1].key, "key2");
+        assert!(!quiet);
+    }
+
+    #[test]
+    fn parse_delete_objects_with_version_id() {
+        let xml = b"<Delete><Object><Key>key1</Key><VersionId>v1</VersionId></Object></Delete>";
+        let (entries, _) = parse_delete_objects_xml(xml).unwrap();
+        assert_eq!(entries[0].version_id.as_deref(), Some("v1"));
+    }
+
+    #[test]
+    fn parse_delete_objects_quiet_mode() {
+        let xml = b"<Delete><Quiet>true</Quiet><Object><Key>key1</Key></Object></Delete>";
+        let (_, quiet) = parse_delete_objects_xml(xml).unwrap();
+        assert!(quiet);
+    }
+
+    #[test]
+    fn parse_delete_objects_empty_body_rejected() {
+        assert!(parse_delete_objects_xml(b"").is_err());
+    }
+
+    #[test]
+    fn parse_delete_objects_missing_key_rejected() {
+        let xml = b"<Delete><Object><VersionId>v1</VersionId></Object></Delete>";
+        assert!(parse_delete_objects_xml(xml).is_err());
+    }
+
+    // ── delete_objects_result_xml ────────────────────────────────────
+
+    #[test]
+    fn delete_result_xml_with_deletions_and_errors() {
+        use crate::coordinator::{DeleteError, DeletedObject};
+        let deleted = vec![DeletedObject {
+            key: "key1".to_string(),
+            version_id: "null".to_string(),
+        }];
+        let errors = vec![DeleteError {
+            key: "key2".to_string(),
+            code: "AccessDenied".to_string(),
+            message: "Access Denied".to_string(),
+        }];
+        let xml = delete_objects_result_xml(&deleted, &errors, false);
+        assert!(xml.contains("<Deleted><Key>key1</Key>"));
+        assert!(xml.contains("<Error><Key>key2</Key>"));
+        assert!(xml.contains("<Code>AccessDenied</Code>"));
+        assert!(xml.contains("DeleteResult"));
+    }
+
+    #[test]
+    fn delete_result_xml_quiet_mode_omits_deleted() {
+        use crate::coordinator::DeletedObject;
+        let deleted = vec![DeletedObject {
+            key: "key1".to_string(),
+            version_id: "null".to_string(),
+        }];
+        let xml = delete_objects_result_xml(&deleted, &[], true);
+        assert!(!xml.contains("<Deleted>"));
+        assert!(xml.contains("DeleteResult"));
+    }
+
+    // ── list_object_versions_xml ────────────────────────────────────
+
+    #[test]
+    fn list_object_versions_xml_format() {
+        let result = ListObjectsResult {
+            objects: vec![ListEntry {
+                key: "my-key".to_string(),
+                size: 42,
+                etag: "\"abc123\"".to_string(),
+                last_modified: 1685000000000,
+            }],
+            common_prefixes: vec![],
+            is_truncated: false,
+            next_continuation_token: None,
+        };
+        let xml = list_object_versions_xml("bucket", None, None, 1000, &result);
+        assert!(xml.contains("ListVersionsResult"));
+        assert!(xml.contains("<Version>"));
+        assert!(xml.contains("<Key>my-key</Key>"));
+        assert!(xml.contains("<VersionId>null</VersionId>"));
+        assert!(xml.contains("<IsLatest>true</IsLatest>"));
+        assert!(xml.contains("<Size>42</Size>"));
+        assert!(xml.contains("<KeyMarker/>"));
+        assert!(!xml.contains("<KeyCount>"));
+    }
+
+    #[test]
+    fn list_object_versions_xml_empty() {
+        let result = ListObjectsResult {
+            objects: vec![],
+            common_prefixes: vec![],
+            is_truncated: false,
+            next_continuation_token: None,
+        };
+        let xml = list_object_versions_xml("bucket", None, None, 1000, &result);
+        assert!(xml.contains("ListVersionsResult"));
+        assert!(!xml.contains("<Version>"));
+    }
+
+    #[test]
+    fn list_object_versions_xml_with_prefix_and_key_marker() {
+        let result = ListObjectsResult {
+            objects: vec![],
+            common_prefixes: vec![],
+            is_truncated: false,
+            next_continuation_token: None,
+        };
+        let xml =
+            list_object_versions_xml("bucket", Some("photos/"), Some("key1"), 100, &result);
+        assert!(xml.contains("<Prefix>photos/</Prefix>"));
+        assert!(xml.contains("<KeyMarker>key1</KeyMarker>"));
     }
 
     #[test]

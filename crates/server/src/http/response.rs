@@ -1,5 +1,7 @@
 /// Build HTTP responses for S3 operations.
-use crate::coordinator::{GetObjectResult, HeadObjectResult, ListObjectsResult, PutObjectResult};
+use crate::coordinator::{
+    DeleteObjectsResult, GetObjectResult, HeadObjectResult, ListObjectsResult, PutObjectResult,
+};
 use crate::error::ServerError;
 use storage::BucketInfo;
 
@@ -164,6 +166,26 @@ impl S3Response {
         result: &ListObjectsResult,
     ) -> Self {
         let body = xml::list_objects_v1_xml(bucket, prefix, delimiter, marker, max_keys, result);
+        Self::new(200).xml_body(body)
+    }
+
+    /// Build a response for DeleteObjects (batch delete).
+    pub fn delete_objects(result: &DeleteObjectsResult, quiet: bool) -> Self {
+        let body =
+            xml::delete_objects_result_xml(&result.deleted, &result.errors, quiet);
+        Self::new(200).xml_body(body)
+    }
+
+    /// Build a response for ListObjectVersions.
+    pub fn list_object_versions(
+        bucket: &str,
+        prefix: Option<&str>,
+        key_marker: Option<&str>,
+        max_keys: u32,
+        result: &ListObjectsResult,
+    ) -> Self {
+        let body =
+            xml::list_object_versions_xml(bucket, prefix, key_marker, max_keys, result);
         Self::new(200).xml_body(body)
     }
 
@@ -605,5 +627,50 @@ mod tests {
             find_header(&resp, "Content-Type"),
             Some("application/xml")
         );
+    }
+
+    // ── delete_objects ───────────────────────────────────────────────
+
+    #[test]
+    fn delete_objects_response() {
+        use crate::coordinator::{DeleteObjectsResult, DeletedObject};
+        let result = DeleteObjectsResult {
+            deleted: vec![DeletedObject {
+                key: "key1".into(),
+                version_id: "null".into(),
+            }],
+            errors: vec![],
+        };
+        let resp = S3Response::delete_objects(&result, false);
+        assert_eq!(resp.status_code, 200);
+        assert_eq!(
+            find_header(&resp, "Content-Type"),
+            Some("application/xml")
+        );
+        let body = String::from_utf8(resp.body).unwrap();
+        assert!(body.contains("DeleteResult"));
+        assert!(body.contains("key1"));
+    }
+
+    // ── list_object_versions ────────────────────────────────────────
+
+    #[test]
+    fn list_object_versions_response() {
+        let result = ListObjectsResult {
+            objects: vec![ListEntry {
+                key: "key1".into(),
+                size: 42,
+                etag: "\"etag1\"".into(),
+                last_modified: 0,
+            }],
+            common_prefixes: vec![],
+            is_truncated: false,
+            next_continuation_token: None,
+        };
+        let resp = S3Response::list_object_versions("bucket", None, None, 1000, &result);
+        assert_eq!(resp.status_code, 200);
+        let body = String::from_utf8(resp.body).unwrap();
+        assert!(body.contains("ListVersionsResult"));
+        assert!(body.contains("<VersionId>null</VersionId>"));
     }
 }

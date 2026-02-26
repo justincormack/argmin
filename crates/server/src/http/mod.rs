@@ -142,6 +142,34 @@ impl HttpFrontend {
                 let result = self.coordinator.head_object(&bucket, &key)?;
                 Ok(S3Response::head_object(&result))
             }
+            S3Operation::DeleteObjects { bucket } => {
+                let (entries, quiet) = xml::parse_delete_objects_xml(&req.body)?;
+                let result = self.coordinator.delete_objects(&bucket, &entries)?;
+                Ok(S3Response::delete_objects(&result, quiet))
+            }
+            S3Operation::ListObjectVersions { bucket } => {
+                let prefix = req.query_param("prefix");
+                let key_marker = req.query_param("key-marker");
+                let max_keys: u32 = req
+                    .query_param("max-keys")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1000);
+
+                let result = self.coordinator.list_objects_v2(
+                    &bucket,
+                    prefix.as_deref(),
+                    None,
+                    key_marker.as_deref(),
+                    max_keys,
+                )?;
+                Ok(S3Response::list_object_versions(
+                    &bucket,
+                    prefix.as_deref(),
+                    key_marker.as_deref(),
+                    max_keys,
+                    &result,
+                ))
+            }
         }
     }
 

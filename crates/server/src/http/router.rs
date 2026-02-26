@@ -14,6 +14,8 @@ pub enum S3Operation {
     GetObject { bucket: String, key: String },
     DeleteObject { bucket: String, key: String },
     HeadObject { bucket: String, key: String },
+    DeleteObjects { bucket: String },
+    ListObjectVersions { bucket: String },
 }
 
 /// Validate an S3 bucket name per AWS rules.
@@ -70,6 +72,17 @@ fn validate_object_key(key: &str) -> Result<(), ServerError> {
     Ok(())
 }
 
+/// Check if a bare query parameter key is present (e.g. "delete" in "?delete").
+fn has_query_key(query: &str, target: &str) -> bool {
+    query
+        .split('&')
+        .filter(|s| !s.is_empty())
+        .any(|pair| {
+            let key = pair.splitn(2, '=').next().unwrap_or("");
+            key == target
+        })
+}
+
 /// Route an HTTP request to an S3 operation.
 ///
 /// Path-style addressing only: `/<bucket>` or `/<bucket>/<key...>`.
@@ -112,6 +125,12 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
             bucket: bucket.to_string(),
         }),
         ("GET", None) => {
+            // Check for ?versions → ListObjectVersions
+            if has_query_key(query, "versions") {
+                return Ok(S3Operation::ListObjectVersions {
+                    bucket: bucket.to_string(),
+                });
+            }
             // Check for list-type=2 → V2, otherwise → V1
             let is_v2 = query
                 .split('&')
@@ -130,6 +149,15 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
                 Ok(S3Operation::ListObjectsV1 {
                     bucket: bucket.to_string(),
                 })
+            }
+        }
+        ("POST", None) => {
+            if has_query_key(query, "delete") {
+                Ok(S3Operation::DeleteObjects {
+                    bucket: bucket.to_string(),
+                })
+            } else {
+                Err(ServerError::MethodNotAllowed)
             }
         }
 
@@ -385,5 +413,51 @@ mod tests {
         let long_key = "k".repeat(1025);
         let path = format!("/bucket/{}", long_key);
         assert!(route("GET", &path, "").is_err());
+    }
+
+    #[test]
+    fn delete_objects_post_with_delete_query() {
+        assert_eq!(
+            route("POST", "/mybucket", "delete").unwrap(),
+            S3Operation::DeleteObjects {
+                bucket: "mybucket".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn delete_objects_post_with_delete_query_and_other_params() {
+        assert_eq!(
+            route("POST", "/mybucket", "delete&foo=bar").unwrap(),
+            S3Operation::DeleteObjects {
+                bucket: "mybucket".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn post_without_delete_is_method_not_allowed() {
+        assert!(route("POST", "/mybucket", "").is_err());
+        assert!(route("POST", "/mybucket", "foo=bar").is_err());
+    }
+
+    #[test]
+    fn list_object_versions() {
+        assert_eq!(
+            route("GET", "/mybucket", "versions").unwrap(),
+            S3Operation::ListObjectVersions {
+                bucket: "mybucket".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn list_object_versions_with_params() {
+        assert_eq!(
+            route("GET", "/mybucket", "versions&prefix=foo&max-keys=10").unwrap(),
+            S3Operation::ListObjectVersions {
+                bucket: "mybucket".to_string()
+            }
+        );
     }
 }
