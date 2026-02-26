@@ -66,7 +66,9 @@ pub fn canonical_request(
 /// Sorts by header name, combines duplicate headers with comma-separated values,
 /// and collapses interior whitespace per the SigV4 spec.
 pub fn canonical_headers(headers: &[(&str, &str)]) -> String {
-    // Sort by header name
+    // Sort by header name. sort_by_key is a STABLE sort in Rust, so
+    // duplicate header values retain their original request order as
+    // required by SigV4.
     let mut sorted: Vec<(&str, &str)> = headers.to_vec();
     sorted.sort_by_key(|(name, _)| *name);
 

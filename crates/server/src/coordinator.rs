@@ -435,9 +435,16 @@ impl Coordinator {
         // Verify bucket exists
         self.head_bucket(bucket)?;
 
-        // Bound per-PG queries. We need max_keys+1 total to detect truncation,
-        // but each PG could have up to that many, so we ask each for max_keys+1.
-        let per_pg_limit = max_keys.saturating_add(1);
+        // Bound per-PG queries. Without delimiter, max_keys+1 per PG is
+        // sufficient: the global top max_keys entries can come from at most one
+        // PG each, so max_keys+1 captures them all plus detects truncation.
+        // With a delimiter, many raw keys can collapse into a single common
+        // prefix, so we cannot predict how many raw keys we need — fetch all.
+        let per_pg_limit = if delimiter.is_some() {
+            u32::MAX
+        } else {
+            max_keys.saturating_add(1)
+        };
 
         // Fan out to all PGs and collect results
         let mut all_objects: Vec<ObjectRecord> = Vec::new();
