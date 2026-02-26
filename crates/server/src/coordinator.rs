@@ -1216,6 +1216,145 @@ mod tests {
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
     }
 
+    /// Simulate the exact Ceph test suite cleanup workflow:
+    /// 1. Create bucket + objects
+    /// 2. GET /?versions → list_objects_v2 (no delimiter) to discover all keys
+    /// 3. Build DeleteObjects XML from the version listing
+    /// 4. Parse that XML back (as the server would)
+    /// 5. POST /?delete → delete_objects with parsed entries
+    /// 6. Verify bucket is empty and can be deleted
+    #[test]
+    fn ceph_cleanup_workflow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+
+        coord.create_bucket("test-bucket").unwrap();
+        coord.put_object("test-bucket", "dir/file1.txt", b"hello", &[]).unwrap();
+        coord.put_object("test-bucket", "dir/file2.txt", b"world", &[]).unwrap();
+        coord.put_object("test-bucket", "root.txt", b"root", &[]).unwrap();
+
+        // Step 1: ListObjectVersions — reuses list_objects_v2 with no delimiter
+        let list_result = coord
+            .list_objects_v2("test-bucket", None, None, None, 1000)
+            .unwrap();
+        assert_eq!(list_result.objects.len(), 3);
+
+        // Step 2: Build XML like Ceph cleanup would, using keys from listing
+        let versions_xml = crate::http::xml::list_object_versions_xml(
+            "test-bucket",
+            None,
+            None,
+            1000,
+            &list_result,
+        );
+        // Verify the XML has all three objects with version_id="null"
+        assert!(versions_xml.contains("<Key>dir/file1.txt</Key>"));
+        assert!(versions_xml.contains("<Key>dir/file2.txt</Key>"));
+        assert!(versions_xml.contains("<Key>root.txt</Key>"));
+        for _ in 0..3 {
+            assert!(versions_xml.contains("<VersionId>null</VersionId>"));
+        }
+
+        // Step 3: Build a DeleteObjects XML body from the listed keys
+        // (this is what the Ceph client sends)
+        let mut delete_xml = String::from("<Delete>");
+        for obj in &list_result.objects {
+            delete_xml.push_str(&format!("<Object><Key>{}</Key></Object>", obj.key));
+        }
+        delete_xml.push_str("</Delete>");
+
+        // Step 4: Parse the delete XML (as our server would on receiving the POST)
+        let (entries, quiet) =
+            crate::http::xml::parse_delete_objects_xml(delete_xml.as_bytes()).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert!(!quiet);
+
+        // Step 5: Batch delete
+        let delete_result = coord.delete_objects("test-bucket", &entries).unwrap();
+        assert_eq!(delete_result.deleted.len(), 3);
+        assert!(delete_result.errors.is_empty());
+
+        // Step 6: Bucket should now be empty and deletable
+        let list_after = coord
+            .list_objects_v2("test-bucket", None, None, None, 1000)
+            .unwrap();
+        assert!(list_after.objects.is_empty());
+        coord.delete_bucket("test-bucket").unwrap();
+    }
+
+    /// Same workflow but with paginated listing and quiet-mode delete.
+    #[test]
+    fn ceph_cleanup_workflow_paginated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+
+        coord.create_bucket("bucket").unwrap();
+        for i in 0..5 {
+            let key = format!("key-{:02}", i);
+            coord.put_object("bucket", &key, b"data", &[]).unwrap();
+        }
+
+        // Page 1: max_keys=2
+        let page1 = coord
+            .list_objects_v2("bucket", None, None, None, 2)
+            .unwrap();
+        assert_eq!(page1.objects.len(), 2);
+        assert!(page1.is_truncated);
+        let token = page1.next_continuation_token.clone().unwrap();
+
+        // Page 2
+        let page2 = coord
+            .list_objects_v2("bucket", None, None, Some(&token), 2)
+            .unwrap();
+        assert_eq!(page2.objects.len(), 2);
+        let token2 = page2.next_continuation_token.clone().unwrap();
+
+        // Page 3
+        let page3 = coord
+            .list_objects_v2("bucket", None, None, Some(&token2), 2)
+            .unwrap();
+        assert_eq!(page3.objects.len(), 1);
+        assert!(!page3.is_truncated);
+
+        // Collect all keys across pages
+        let all_keys: Vec<String> = page1
+            .objects
+            .iter()
+            .chain(page2.objects.iter())
+            .chain(page3.objects.iter())
+            .map(|o| o.key.clone())
+            .collect();
+        assert_eq!(all_keys.len(), 5);
+
+        // Build quiet-mode delete XML
+        let mut delete_xml = String::from("<Delete><Quiet>true</Quiet>");
+        for key in &all_keys {
+            delete_xml.push_str(&format!("<Object><Key>{}</Key></Object>", key));
+        }
+        delete_xml.push_str("</Delete>");
+
+        let (entries, quiet) =
+            crate::http::xml::parse_delete_objects_xml(delete_xml.as_bytes()).unwrap();
+        assert_eq!(entries.len(), 5);
+        assert!(quiet);
+
+        let delete_result = coord.delete_objects("bucket", &entries).unwrap();
+        assert_eq!(delete_result.deleted.len(), 5);
+        assert!(delete_result.errors.is_empty());
+
+        // Verify quiet-mode XML omits <Deleted> elements
+        let result_xml = crate::http::xml::delete_objects_result_xml(
+            &delete_result.deleted,
+            &delete_result.errors,
+            quiet,
+        );
+        assert!(!result_xml.contains("<Deleted>"));
+        assert!(result_xml.contains("DeleteResult"));
+
+        // Bucket is empty, can be deleted
+        coord.delete_bucket("bucket").unwrap();
+    }
+
     #[test]
     fn max_object_size_constant() {
         // Verify the size guard exists and the constant is 256 MB.
