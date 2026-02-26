@@ -135,6 +135,19 @@ impl HttpFrontend {
             &self.credentials,
         )?;
 
+        // Verify payload integrity: if the client provided an actual content hash
+        // (not UNSIGNED-PAYLOAD), recompute and compare to detect transit corruption.
+        if let Some(claimed) = req.header("x-amz-content-sha256") {
+            if claimed != "UNSIGNED-PAYLOAD" {
+                let actual = auth::canonical::sha256_hex(&req.body);
+                if actual != claimed {
+                    return Err(ServerError::InvalidRequest {
+                        reason: "payload content SHA-256 mismatch".to_string(),
+                    });
+                }
+            }
+        }
+
         Ok(())
     }
 

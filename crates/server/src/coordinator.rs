@@ -471,11 +471,13 @@ impl Coordinator {
             let prefix_str = prefix.unwrap_or("");
             let mut seen_prefixes = std::collections::HashSet::new();
 
-            for record in &all_objects {
+            let mut i = 0;
+            while i < all_objects.len() {
                 if entry_count >= max {
                     is_truncated = true;
                     break;
                 }
+                let record = &all_objects[i];
                 let after_prefix = &record.key[prefix_str.len()..];
                 if let Some(pos) = after_prefix.find(delim) {
                     let cp = format!(
@@ -483,7 +485,14 @@ impl Coordinator {
                         prefix_str,
                         &after_prefix[..pos + delim.len()]
                     );
-                    if seen_prefixes.insert(cp.clone()) {
+                    // Skip all remaining keys under this common prefix so the
+                    // continuation token advances past the entire group.
+                    let is_new = seen_prefixes.insert(cp.clone());
+                    while i < all_objects.len() && all_objects[i].key.starts_with(&cp) {
+                        last_key_seen = Some(all_objects[i].key.clone());
+                        i += 1;
+                    }
+                    if is_new {
                         common_prefixes.push(cp);
                         entry_count += 1;
                     }
@@ -496,8 +505,9 @@ impl Coordinator {
                         last_modified: record.last_modified,
                     });
                     entry_count += 1;
+                    last_key_seen = Some(record.key.clone());
+                    i += 1;
                 }
-                last_key_seen = Some(record.key.clone());
             }
         } else {
             for record in &all_objects {

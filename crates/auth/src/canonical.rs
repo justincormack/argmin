@@ -77,11 +77,11 @@ pub fn canonical_headers(headers: &[(&str, &str)]) -> String {
         result.push_str(name);
         result.push(':');
         // Collect all values for this header name
-        result.push_str(trim_header_value(sorted[i].1));
+        result.push_str(&normalize_header_value(sorted[i].1));
         i += 1;
         while i < sorted.len() && sorted[i].0 == name {
             result.push(',');
-            result.push_str(trim_header_value(sorted[i].1));
+            result.push_str(&normalize_header_value(sorted[i].1));
             i += 1;
         }
         result.push('\n');
@@ -91,15 +91,27 @@ pub fn canonical_headers(headers: &[(&str, &str)]) -> String {
 
 /// Trim leading/trailing whitespace and collapse interior runs of whitespace
 /// to a single space, per SigV4 canonical header value rules.
-fn trim_header_value(value: &str) -> &str {
-    // For most S3 headers, trim() is sufficient. Full interior whitespace
-    // collapsing is only needed for headers with quoted strings, which S3
-    // doesn't use in practice. We trim for correctness.
-    value.trim()
+fn normalize_header_value(value: &str) -> String {
+    let trimmed = value.trim();
+    let mut result = String::with_capacity(trimmed.len());
+    let mut prev_was_space = false;
+    for ch in trimmed.chars() {
+        if ch.is_ascii_whitespace() {
+            if !prev_was_space {
+                result.push(' ');
+                prev_was_space = true;
+            }
+        } else {
+            result.push(ch);
+            prev_was_space = false;
+        }
+    }
+    result
 }
 
 /// Build the canonical query string from raw query string.
-/// Parses, sorts by key then value, and re-encodes.
+/// Per SigV4: percent-decode raw pairs first, then re-encode with SigV4 rules.
+/// This avoids double-encoding when the incoming URL already has %XX sequences.
 pub fn canonical_query_string(query: &str) -> String {
     if query.is_empty() {
         return String::new();
@@ -111,7 +123,7 @@ pub fn canonical_query_string(query: &str) -> String {
             let mut parts = pair.splitn(2, '=');
             let key = parts.next().unwrap_or("");
             let val = parts.next().unwrap_or("");
-            (uri_encode(key), uri_encode(val))
+            (uri_encode(&percent_decode(key)), uri_encode(&percent_decode(val)))
         })
         .collect();
     pairs.sort();
@@ -120,6 +132,34 @@ pub fn canonical_query_string(query: &str) -> String {
         .map(|(k, v)| format!("{}={}", k, v))
         .collect::<Vec<_>>()
         .join("&")
+}
+
+/// Percent-decode a string (RFC 3986). Does NOT treat + as space.
+fn percent_decode(s: &str) -> String {
+    let mut result = Vec::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                result.push(hi << 4 | lo);
+                i += 3;
+                continue;
+            }
+        }
+        result.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&result).to_string()
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Build the string-to-sign per SigV4 spec.
@@ -241,6 +281,37 @@ mod tests {
         assert_eq!(
             result,
             "content-type:text/plain\nhost:example.com\n"
+        );
+    }
+
+    #[test]
+    fn canonical_headers_collapses_interior_whitespace() {
+        let headers = [
+            ("host", "example.com"),
+            ("x-amz-meta-desc", "  hello   world  foo  "),
+        ];
+        let result = canonical_headers(&headers);
+        assert_eq!(
+            result,
+            "host:example.com\nx-amz-meta-desc:hello world foo\n"
+        );
+    }
+
+    #[test]
+    fn canonical_query_string_no_double_encode() {
+        // prefix=photos%2F should NOT become prefix=photos%252F
+        assert_eq!(
+            canonical_query_string("prefix=photos%2F"),
+            "prefix=photos%2F"
+        );
+    }
+
+    #[test]
+    fn canonical_query_string_pre_encoded_mixed() {
+        // Mix of encoded and unencoded values
+        assert_eq!(
+            canonical_query_string("key=hello%20world&b=2&a=1"),
+            "a=1&b=2&key=hello%20world"
         );
     }
 }
