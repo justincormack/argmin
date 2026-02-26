@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS objects (
     key           TEXT NOT NULL,
     version_id    TEXT NOT NULL,
     size          INTEGER NOT NULL,
+    total_size    INTEGER NOT NULL DEFAULT 0,
     etag          BLOB NOT NULL,
     etag_kind     INTEGER NOT NULL,
     last_modified INTEGER NOT NULL,

@@ -118,6 +118,7 @@ impl PgMetadataStore for MemoryPgStore {
             key: req.key.clone(),
             version_id: req.version_id.clone(),
             size: req.size,
+            total_size: req.total_size,
             etag: req.etag.clone(),
             etag_kind: req.etag_kind,
             last_modified: now,

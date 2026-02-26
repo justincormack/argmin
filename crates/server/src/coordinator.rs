@@ -10,6 +10,7 @@ use crate::error::ServerError;
 use crate::etag::{crc64_to_etag_bytes, etag_bytes_to_crc64, format_etag};
 use crate::metadata_blob::MetadataBlob;
 use crate::pg::{derive_pg, object_key_hash};
+use crate::range::ByteRange;
 
 /// Maximum object size for single PUT (256 MB).
 const MAX_OBJECT_SIZE: u64 = 256 * 1024 * 1024;
@@ -42,6 +43,18 @@ pub struct HeadObjectResult {
     pub etag: String,
     pub size: u64,
     pub last_modified: u64,
+}
+
+/// Result of a range GetObject operation (206 Partial Content).
+#[derive(Debug)]
+pub struct GetObjectRangeResult {
+    pub data: Vec<u8>,
+    pub metadata: MetadataBlob,
+    pub etag: String,
+    pub size: u64,
+    pub last_modified: u64,
+    pub range_start: u64,
+    pub range_end: u64,
 }
 
 /// Object entry for listing.
@@ -258,6 +271,7 @@ impl Coordinator {
             key: key.to_string(),
             version_id: "null".to_string(),
             size: data.len() as u64,
+            total_size: (blob_bytes.len() + data.len()) as u64,
             etag: crc64_to_etag_bytes(etag_crc),
             etag_kind: 0,
             ec_k: self.ec_config.data_shards,
@@ -276,6 +290,191 @@ impl Coordinator {
             etag: format_etag(etag_crc),
             version_id: "null".to_string(),
         })
+    }
+
+    /// Read specific data shard indices from a PG, falling back to EC reconstruction
+    /// if any are missing. Always reads whole shards — each shard is CRC64-verified
+    /// by the underlying `read_shard()` call.
+    ///
+    /// Returns (shard_data_vec, shard_size) where shard_data_vec contains one Vec<u8>
+    /// per requested index in `needed`, in the same order.
+    fn read_data_shards(
+        &self,
+        pg: &storage::PgStore,
+        okh: &[u8; 16],
+        version_id: u64,
+        record: &ObjectRecord,
+        needed: &[usize],
+    ) -> Result<(Vec<Vec<u8>>, usize), ServerError> {
+        let k = record.ec_k as usize;
+        let m = record.ec_m as usize;
+
+        // Try reading just the needed shards first
+        let mut result_shards: Vec<Option<Vec<u8>>> = Vec::with_capacity(needed.len());
+        let mut all_present = true;
+        let mut shard_size = 0;
+
+        for &idx in needed {
+            let shard_key = ShardKey::new(okh, version_id, idx as u8);
+            match pg.read_shard(&shard_key) {
+                Ok(sd) => {
+                    shard_size = sd.data.len();
+                    result_shards.push(Some(sd.data));
+                }
+                Err(_) => {
+                    all_present = false;
+                    result_shards.push(None);
+                }
+            }
+        }
+
+        // Happy path: all needed shards present
+        if all_present {
+            let shards: Vec<Vec<u8>> = result_shards.into_iter().map(|s| s.unwrap()).collect();
+            if shards.is_empty() {
+                return Ok((shards, 0));
+            }
+            return Ok((shards, shard_size));
+        }
+
+        // Fallback: read all k+m shards for EC reconstruction
+        let mut all_shards: Vec<Option<Vec<u8>>> = Vec::with_capacity(k + m);
+        let mut present_count = 0;
+
+        for i in 0..(k + m) {
+            let shard_key = ShardKey::new(okh, version_id, i as u8);
+            match pg.read_shard(&shard_key) {
+                Ok(sd) => {
+                    shard_size = sd.data.len();
+                    all_shards.push(Some(sd.data));
+                    present_count += 1;
+                }
+                Err(_) => {
+                    all_shards.push(None);
+                }
+            }
+        }
+
+        if present_count < k {
+            return Err(ServerError::Store(storage::StoreError::NotFound));
+        }
+
+        // Find which of the needed data shards are missing
+        let missing_needed: Vec<usize> = needed
+            .iter()
+            .copied()
+            .filter(|&i| all_shards[i].is_none())
+            .collect();
+
+        if !missing_needed.is_empty() {
+            let present_indices: Vec<usize> = (0..(k + m))
+                .filter(|&i| all_shards[i].is_some())
+                .collect();
+            let present_refs: Vec<&[u8]> = present_indices
+                .iter()
+                .map(|&i| all_shards[i].as_ref().unwrap().as_slice())
+                .collect();
+
+            let tmp_codec;
+            let codec = if record.ec_k == self.ec_config.data_shards
+                && record.ec_m == self.ec_config.parity_shards
+            {
+                &self.ec_codec
+            } else {
+                let ec_config = EcConfig::new(record.ec_k, record.ec_m)?;
+                tmp_codec = ErasureCodec::new(ec_config)?;
+                &tmp_codec
+            };
+
+            let mut outputs: Vec<Vec<u8>> =
+                missing_needed.iter().map(|_| vec![0u8; shard_size]).collect();
+            let mut output_refs: Vec<&mut [u8]> =
+                outputs.iter_mut().map(|v| v.as_mut_slice()).collect();
+
+            codec.reconstruct(
+                &present_indices,
+                &present_refs,
+                &missing_needed,
+                &mut output_refs,
+            )?;
+
+            for (idx, &missing_idx) in missing_needed.iter().enumerate() {
+                all_shards[missing_idx] = Some(outputs[idx].clone());
+            }
+        }
+
+        // Extract just the needed shards in order
+        let shards: Vec<Vec<u8>> = needed
+            .iter()
+            .map(|&i| all_shards[i].take().unwrap())
+            .collect();
+
+        Ok((shards, shard_size))
+    }
+
+    /// Compute shard_size from total stored size and EC k.
+    ///
+    /// `total_size` is the pre-padding size (metadata + user data).
+    /// Returns the per-shard size after padding to a multiple of k.
+    fn compute_shard_size(total_size: u64, ec_k: u8) -> usize {
+        let k = ec_k as u64;
+        let padded = (total_size + k - 1) / k * k;
+        (padded / k) as usize
+    }
+
+    /// Compute data shard indices covering byte range [start, end] (inclusive) in the stored blob.
+    fn shards_for_byte_range(start: usize, end: usize, shard_size: usize, ec_k: u8) -> Vec<usize> {
+        if shard_size == 0 {
+            return vec![];
+        }
+        let first = start / shard_size;
+        let last = (end / shard_size).min(ec_k as usize - 1);
+        (first..=last).collect()
+    }
+
+    /// Read a byte range [start, end] (inclusive) from the stored blob (metadata + user data).
+    ///
+    /// Returns the requested bytes. Reads only the shards covering the range,
+    /// falling back to EC reconstruction if any are missing.
+    ///
+    /// **Integrity note:** Each shard is CRC64-verified on read by `read_shard()`.
+    /// There are no sub-shard checksums, so we must always read *whole* shards
+    /// and discard bytes outside the requested range after verification. This
+    /// means range requests that don't align to shard boundaries read more data
+    /// than strictly necessary — this is unavoidable without finer-grained checksums.
+    fn read_range(
+        &self,
+        pg: &storage::PgStore,
+        okh: &[u8; 16],
+        version_id: u64,
+        record: &ObjectRecord,
+        start: usize,
+        end: usize,
+    ) -> Result<Vec<u8>, ServerError> {
+        let shard_size = Self::compute_shard_size(record.total_size, record.ec_k);
+        if shard_size == 0 {
+            return Ok(vec![]);
+        }
+
+        let needed = Self::shards_for_byte_range(start, end, shard_size, record.ec_k);
+        if needed.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let (shard_data, _) = self.read_data_shards(pg, okh, version_id, record, &needed)?;
+
+        // Assemble the buffer covering the needed shards
+        let first_shard = needed[0];
+        let buf_start = first_shard * shard_size;
+        let mut buf = Vec::with_capacity(shard_data.len() * shard_size);
+        for shard in &shard_data {
+            buf.extend_from_slice(shard);
+        }
+
+        // Extract the requested range from the buffer
+        let local_start = start - buf_start;
+        let local_end = (end - buf_start).min(buf.len() - 1);
+        Ok(buf[local_start..=local_end].to_vec())
     }
 
     /// Get an object from storage.
@@ -298,96 +497,57 @@ impl Coordinator {
 
         let okh = object_key_hash(bucket, key);
         let version_id: u64 = 0;
-        let k = record.ec_k as usize;
-        let m = record.ec_m as usize;
+        let etag_crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
 
-        // 2. Read data shards; track failures
-        let mut shard_data: Vec<Option<Vec<u8>>> = Vec::with_capacity(k + m);
-        let mut present_count = 0;
+        if record.total_size > 0 {
+            // New path: use read_range to read only needed data shards
+            let total = record.total_size as usize;
+            let data = self
+                .read_range(pg, &okh, version_id, &record, 0, total - 1)
+                .map_err(|e| match e {
+                    ServerError::Store(storage::StoreError::NotFound) => {
+                        ServerError::ObjectNotFound {
+                            bucket: bucket.to_string(),
+                            key: key.to_string(),
+                        }
+                    }
+                    other => other,
+                })?;
 
-        for i in 0..(k + m) {
-            let shard_key = ShardKey::new(&okh, version_id, i as u8);
-            match pg.read_shard(&shard_key) {
-                Ok(sd) => {
-                    shard_data.push(Some(sd.data));
-                    present_count += 1;
-                }
-                Err(_) => {
-                    shard_data.push(None);
-                }
-            }
-        }
+            let metadata_size = (record.total_size - record.size) as usize;
+            let (metadata, _) = MetadataBlob::deserialize(&data[..metadata_size])?;
+            let user_data = data[metadata_size..].to_vec();
 
-        if present_count < k {
-            return Err(ServerError::ObjectNotFound {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
+            return Ok(GetObjectResult {
+                data: user_data,
+                metadata,
+                etag: format_etag(etag_crc),
+                size: record.size,
+                last_modified: record.last_modified,
             });
         }
 
-        // 3. Reconstruct missing data shards if needed
-        let shard_size = shard_data
-            .iter()
-            .find_map(|s| s.as_ref().map(|d| d.len()))
-            .unwrap_or(0);
+        // Legacy path: total_size == 0, read all k data shards
+        let k = record.ec_k as usize;
+        let all_data_indices: Vec<usize> = (0..k).collect();
+        let (shard_data, shard_size) =
+            self.read_data_shards(pg, &okh, version_id, &record, &all_data_indices)
+                .map_err(|e| match e {
+                    ServerError::Store(storage::StoreError::NotFound) => {
+                        ServerError::ObjectNotFound {
+                            bucket: bucket.to_string(),
+                            key: key.to_string(),
+                        }
+                    }
+                    other => other,
+                })?;
 
-        // Check if any data shards (0..k) are missing
-        let missing_data: Vec<usize> = (0..k)
-            .filter(|&i| shard_data[i].is_none())
-            .collect();
-
-        if !missing_data.is_empty() {
-            // Need to reconstruct
-            let present_indices: Vec<usize> = (0..(k + m))
-                .filter(|&i| shard_data[i].is_some())
-                .collect();
-            let present_refs: Vec<&[u8]> = present_indices
-                .iter()
-                .map(|&i| shard_data[i].as_ref().unwrap().as_slice())
-                .collect();
-
-            // Reuse the coordinator's codec if EC params match, otherwise build one.
-            // Objects written with different EC params (e.g. after config change)
-            // need a per-call codec.
-            let tmp_codec;
-            let codec = if record.ec_k == self.ec_config.data_shards
-                && record.ec_m == self.ec_config.parity_shards
-            {
-                &self.ec_codec
-            } else {
-                let ec_config = EcConfig::new(record.ec_k, record.ec_m)?;
-                tmp_codec = ErasureCodec::new(ec_config)?;
-                &tmp_codec
-            };
-
-            let mut outputs: Vec<Vec<u8>> =
-                missing_data.iter().map(|_| vec![0u8; shard_size]).collect();
-            let mut output_refs: Vec<&mut [u8]> =
-                outputs.iter_mut().map(|v| v.as_mut_slice()).collect();
-
-            codec.reconstruct(
-                &present_indices,
-                &present_refs,
-                &missing_data,
-                &mut output_refs,
-            )?;
-
-            // Fill in the missing data shards
-            for (idx, missing_idx) in missing_data.iter().enumerate() {
-                shard_data[*missing_idx] = Some(outputs[idx].clone());
-            }
-        }
-
-        // 4. Concatenate data shards
         let mut full_padded_data = Vec::with_capacity(k * shard_size);
-        for i in 0..k {
-            full_padded_data.extend_from_slice(shard_data[i].as_ref().unwrap());
+        for shard in &shard_data {
+            full_padded_data.extend_from_slice(shard);
         }
 
-        // 5. Deserialize metadata blob from front
         let (metadata, blob_len) = MetadataBlob::deserialize(&full_padded_data)?;
-
-        // 6. Extract user data
         let user_data_end = blob_len + record.size as usize;
         if user_data_end > full_padded_data.len() {
             return Err(ServerError::MetadataBlobError {
@@ -395,8 +555,6 @@ impl Coordinator {
             });
         }
         let user_data = full_padded_data[blob_len..user_data_end].to_vec();
-
-        let etag_crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
 
         Ok(GetObjectResult {
             data: user_data,
@@ -408,17 +566,226 @@ impl Coordinator {
     }
 
     /// Head object: returns metadata without body.
+    ///
+    /// When total_size is known, reads only the shards covering the metadata blob.
+    /// Falls back to shard-0-first approach for legacy objects (total_size == 0).
     pub fn head_object(
         &self,
         bucket: &str,
         key: &str,
     ) -> Result<HeadObjectResult, ServerError> {
-        let result = self.get_object(bucket, key)?;
+        let pg_id = derive_pg(bucket, key, self.pg_count);
+        let pg = self.storage_node.get_pg(pg_id)?;
+
+        let record = pg.get_object_meta(bucket, key).map_err(|e| match e {
+            storage::MetadataError::ObjectNotFound => ServerError::ObjectNotFound {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+            },
+            other => ServerError::Metadata(other),
+        })?;
+
+        let okh = object_key_hash(bucket, key);
+        let version_id: u64 = 0;
+        let etag_crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
+
+        if record.total_size > 0 {
+            // New path: read only the metadata portion
+            let metadata_size = (record.total_size - record.size) as usize;
+            let data = self
+                .read_range(pg, &okh, version_id, &record, 0, metadata_size - 1)
+                .map_err(|e| match e {
+                    ServerError::Store(storage::StoreError::NotFound) => {
+                        ServerError::ObjectNotFound {
+                            bucket: bucket.to_string(),
+                            key: key.to_string(),
+                        }
+                    }
+                    other => other,
+                })?;
+
+            let (metadata, _) = MetadataBlob::deserialize(&data)?;
+            return Ok(HeadObjectResult {
+                metadata,
+                etag: format_etag(etag_crc),
+                size: record.size,
+                last_modified: record.last_modified,
+            });
+        }
+
+        // Legacy path: total_size == 0, read shard 0 first
+        let (shards, shard_size) =
+            self.read_data_shards(pg, &okh, version_id, &record, &[0])
+                .map_err(|e| match e {
+                    ServerError::Store(storage::StoreError::NotFound) => {
+                        ServerError::ObjectNotFound {
+                            bucket: bucket.to_string(),
+                            key: key.to_string(),
+                        }
+                    }
+                    other => other,
+                })?;
+
+        let shard0 = &shards[0];
+        let k = record.ec_k as usize;
+
+        let need_more = if shard_size < 4 {
+            true
+        } else {
+            let blob_len =
+                u32::from_le_bytes([shard0[0], shard0[1], shard0[2], shard0[3]]) as usize;
+            blob_len > shard_size
+        };
+
+        if !need_more {
+            let (metadata, _) = MetadataBlob::deserialize(shard0)?;
+            return Ok(HeadObjectResult {
+                metadata,
+                etag: format_etag(etag_crc),
+                size: record.size,
+                last_modified: record.last_modified,
+            });
+        }
+
+        let all_data_indices: Vec<usize> = (0..k).collect();
+        let (shards, _) =
+            self.read_data_shards(pg, &okh, version_id, &record, &all_data_indices)
+                .map_err(|e| match e {
+                    ServerError::Store(storage::StoreError::NotFound) => {
+                        ServerError::ObjectNotFound {
+                            bucket: bucket.to_string(),
+                            key: key.to_string(),
+                        }
+                    }
+                    other => other,
+                })?;
+
+        let mut combined = Vec::with_capacity(k * shard_size);
+        for shard in &shards {
+            combined.extend_from_slice(shard);
+        }
+
+        let (metadata, _) = MetadataBlob::deserialize(&combined)?;
         Ok(HeadObjectResult {
-            metadata: result.metadata,
-            etag: result.etag,
-            size: result.size,
-            last_modified: result.last_modified,
+            metadata,
+            etag: format_etag(etag_crc),
+            size: record.size,
+            last_modified: record.last_modified,
+        })
+    }
+
+    /// Get a byte range of an object from storage (for HTTP Range requests).
+    ///
+    /// Returns 206 Partial Content data. Requires total_size to be set.
+    pub fn get_object_range(
+        &self,
+        bucket: &str,
+        key: &str,
+        range: ByteRange,
+    ) -> Result<GetObjectRangeResult, ServerError> {
+        let pg_id = derive_pg(bucket, key, self.pg_count);
+        let pg = self.storage_node.get_pg(pg_id)?;
+
+        let record = pg.get_object_meta(bucket, key).map_err(|e| match e {
+            storage::MetadataError::ObjectNotFound => ServerError::ObjectNotFound {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+            },
+            other => ServerError::Metadata(other),
+        })?;
+
+        let okh = object_key_hash(bucket, key);
+        let version_id: u64 = 0;
+        let etag_crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
+
+        // Resolve byte range against user data size
+        let (user_start, user_end) = range
+            .resolve(record.size)
+            .ok_or(ServerError::InvalidRange {
+                total_size: record.size,
+            })?;
+
+        if record.total_size > 0 {
+            let metadata_size = (record.total_size - record.size) as usize;
+
+            // Read metadata (always need it for response headers)
+            let meta_data = self
+                .read_range(pg, &okh, version_id, &record, 0, metadata_size - 1)
+                .map_err(|e| match e {
+                    ServerError::Store(storage::StoreError::NotFound) => {
+                        ServerError::ObjectNotFound {
+                            bucket: bucket.to_string(),
+                            key: key.to_string(),
+                        }
+                    }
+                    other => other,
+                })?;
+            let (metadata, _) = MetadataBlob::deserialize(&meta_data)?;
+
+            // Read user data range
+            let blob_start = metadata_size + user_start as usize;
+            let blob_end = metadata_size + user_end as usize;
+            let user_data = self
+                .read_range(pg, &okh, version_id, &record, blob_start, blob_end)
+                .map_err(|e| match e {
+                    ServerError::Store(storage::StoreError::NotFound) => {
+                        ServerError::ObjectNotFound {
+                            bucket: bucket.to_string(),
+                            key: key.to_string(),
+                        }
+                    }
+                    other => other,
+                })?;
+
+            return Ok(GetObjectRangeResult {
+                data: user_data,
+                metadata,
+                etag: format_etag(etag_crc),
+                size: record.size,
+                last_modified: record.last_modified,
+                range_start: user_start,
+                range_end: user_end,
+            });
+        }
+
+        // Legacy path: total_size == 0, fall back to full read
+        let k = record.ec_k as usize;
+        let all_data_indices: Vec<usize> = (0..k).collect();
+        let (shard_data, shard_size) =
+            self.read_data_shards(pg, &okh, version_id, &record, &all_data_indices)
+                .map_err(|e| match e {
+                    ServerError::Store(storage::StoreError::NotFound) => {
+                        ServerError::ObjectNotFound {
+                            bucket: bucket.to_string(),
+                            key: key.to_string(),
+                        }
+                    }
+                    other => other,
+                })?;
+
+        let mut full_padded_data = Vec::with_capacity(k * shard_size);
+        for shard in &shard_data {
+            full_padded_data.extend_from_slice(shard);
+        }
+
+        let (metadata, blob_len) = MetadataBlob::deserialize(&full_padded_data)?;
+        let data_start = blob_len + user_start as usize;
+        let data_end = blob_len + user_end as usize;
+        if data_end >= full_padded_data.len() {
+            return Err(ServerError::MetadataBlobError {
+                reason: "data shorter than expected".to_string(),
+            });
+        }
+        let user_data = full_padded_data[data_start..=data_end].to_vec();
+
+        Ok(GetObjectRangeResult {
+            data: user_data,
+            metadata,
+            etag: format_etag(etag_crc),
+            size: record.size,
+            last_modified: record.last_modified,
+            range_start: user_start,
+            range_end: user_end,
         })
     }
 
@@ -1377,5 +1744,173 @@ mod tests {
             err,
             Err(ServerError::ObjectTooLarge { .. })
         ));
+    }
+
+    // ── shard planning unit tests ──────────────────────────────────────
+
+    #[test]
+    fn compute_shard_size_exact_multiple() {
+        // 100 bytes, k=4 → no padding needed → 25 per shard
+        assert_eq!(Coordinator::compute_shard_size(100, 4), 25);
+    }
+
+    #[test]
+    fn compute_shard_size_needs_padding() {
+        // 101 bytes, k=4 → pad to 104 → 26 per shard
+        assert_eq!(Coordinator::compute_shard_size(101, 4), 26);
+    }
+
+    #[test]
+    fn compute_shard_size_small() {
+        // 1 byte, k=4 → pad to 4 → 1 per shard
+        assert_eq!(Coordinator::compute_shard_size(1, 4), 1);
+    }
+
+    #[test]
+    fn compute_shard_size_zero() {
+        // 0 bytes, k=4 → 0 per shard
+        assert_eq!(Coordinator::compute_shard_size(0, 4), 0);
+    }
+
+    #[test]
+    fn shards_for_byte_range_single_shard() {
+        // shard_size=25, range [0,24] → shard 0
+        assert_eq!(Coordinator::shards_for_byte_range(0, 24, 25, 4), vec![0]);
+    }
+
+    #[test]
+    fn shards_for_byte_range_spans_two() {
+        // shard_size=25, range [20,30] → shards 0,1
+        assert_eq!(Coordinator::shards_for_byte_range(20, 30, 25, 4), vec![0, 1]);
+    }
+
+    #[test]
+    fn shards_for_byte_range_all_shards() {
+        // shard_size=25, range [0,99] → shards 0,1,2,3
+        assert_eq!(
+            Coordinator::shards_for_byte_range(0, 99, 25, 4),
+            vec![0, 1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn shards_for_byte_range_last_shard_only() {
+        // shard_size=25, range [75,99] → shard 3
+        assert_eq!(Coordinator::shards_for_byte_range(75, 99, 25, 4), vec![3]);
+    }
+
+    #[test]
+    fn shards_for_byte_range_clamped_to_k() {
+        // end falls past last shard → clamp to k-1
+        assert_eq!(
+            Coordinator::shards_for_byte_range(75, 200, 25, 4),
+            vec![3]
+        );
+    }
+
+    #[test]
+    fn shards_for_byte_range_zero_shard_size() {
+        assert_eq!(Coordinator::shards_for_byte_range(0, 10, 0, 4), vec![]);
+    }
+
+    // ── range GET tests ────────────────────────────────────────────────
+
+    #[test]
+    fn get_object_range_basic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+
+        coord.create_bucket("bucket").unwrap();
+        coord
+            .put_object("bucket", "key", b"Hello, World!", &[])
+            .unwrap();
+
+        // bytes=0-4 → "Hello"
+        let result = coord
+            .get_object_range("bucket", "key", ByteRange::Range { start: 0, end: 4 })
+            .unwrap();
+        assert_eq!(result.data, b"Hello");
+        assert_eq!(result.range_start, 0);
+        assert_eq!(result.range_end, 4);
+        assert_eq!(result.size, 13);
+    }
+
+    #[test]
+    fn get_object_range_suffix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+
+        coord.create_bucket("bucket").unwrap();
+        coord
+            .put_object("bucket", "key", b"Hello, World!", &[])
+            .unwrap();
+
+        // bytes=-6 → "World!"  (last 6 bytes)
+        let result = coord
+            .get_object_range("bucket", "key", ByteRange::Suffix { length: 6 })
+            .unwrap();
+        assert_eq!(result.data, b"World!");
+        assert_eq!(result.range_start, 7);
+        assert_eq!(result.range_end, 12);
+    }
+
+    #[test]
+    fn get_object_range_from_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+
+        coord.create_bucket("bucket").unwrap();
+        coord
+            .put_object("bucket", "key", b"Hello, World!", &[])
+            .unwrap();
+
+        // bytes=7- → "World!"
+        let result = coord
+            .get_object_range("bucket", "key", ByteRange::FromStart { start: 7 })
+            .unwrap();
+        assert_eq!(result.data, b"World!");
+    }
+
+    #[test]
+    fn get_object_range_unsatisfiable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+
+        coord.create_bucket("bucket").unwrap();
+        coord
+            .put_object("bucket", "key", b"Hello", &[])
+            .unwrap();
+
+        // bytes=100- → unsatisfiable
+        let err = coord
+            .get_object_range("bucket", "key", ByteRange::FromStart { start: 100 })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::InvalidRange { total_size: 5 }));
+    }
+
+    #[test]
+    fn get_object_range_clamps_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+
+        coord.create_bucket("bucket").unwrap();
+        coord
+            .put_object("bucket", "key", b"Hello", &[])
+            .unwrap();
+
+        // bytes=0-99999 on 5-byte object → clamp to 0-4
+        let result = coord
+            .get_object_range(
+                "bucket",
+                "key",
+                ByteRange::Range {
+                    start: 0,
+                    end: 99999,
+                },
+            )
+            .unwrap();
+        assert_eq!(result.data, b"Hello");
+        assert_eq!(result.range_start, 0);
+        assert_eq!(result.range_end, 4);
     }
 }

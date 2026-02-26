@@ -1,6 +1,7 @@
 /// Build HTTP responses for S3 operations.
 use crate::coordinator::{
-    DeleteObjectsResult, GetObjectResult, HeadObjectResult, ListObjectsResult, PutObjectResult,
+    DeleteObjectsResult, GetObjectRangeResult, GetObjectResult, HeadObjectResult,
+    ListObjectsResult, PutObjectResult,
 };
 use crate::error::ServerError;
 use storage::BucketInfo;
@@ -55,7 +56,8 @@ impl S3Response {
     pub fn get_object(result: GetObjectResult) -> Self {
         let mut resp = Self::new(200)
             .header("ETag", &result.etag)
-            .header("Last-Modified", &format_http_date(result.last_modified));
+            .header("Last-Modified", &format_http_date(result.last_modified))
+            .header("Accept-Ranges", "bytes");
 
         // Add metadata headers
         if let Some(ct) = result.metadata.get("content-type") {
@@ -94,7 +96,8 @@ impl S3Response {
         let mut resp = Self::new(200)
             .header("ETag", &result.etag)
             .header("Content-Length", &result.size.to_string())
-            .header("Last-Modified", &format_http_date(result.last_modified));
+            .header("Last-Modified", &format_http_date(result.last_modified))
+            .header("Accept-Ranges", "bytes");
 
         if let Some(ct) = result.metadata.get("content-type") {
             resp = resp.header("Content-Type", ct);
@@ -115,6 +118,57 @@ impl S3Response {
         }
 
         resp
+    }
+
+    /// Build a response for a successful range GetObject (206 Partial Content).
+    pub fn get_object_range(result: GetObjectRangeResult) -> Self {
+        let content_range = format!(
+            "bytes {}-{}/{}",
+            result.range_start, result.range_end, result.size
+        );
+        let mut resp = Self::new(206)
+            .header("ETag", &result.etag)
+            .header("Last-Modified", &format_http_date(result.last_modified))
+            .header("Accept-Ranges", "bytes")
+            .header("Content-Range", &content_range);
+
+        if let Some(ct) = result.metadata.get("content-type") {
+            resp = resp.header("Content-Type", ct);
+        } else {
+            resp = resp.header("Content-Type", "application/octet-stream");
+        }
+        if let Some(ce) = result.metadata.get("content-encoding") {
+            resp = resp.header("Content-Encoding", ce);
+        }
+        if let Some(cc) = result.metadata.get("cache-control") {
+            resp = resp.header("Cache-Control", cc);
+        }
+        if let Some(cd) = result.metadata.get("content-disposition") {
+            resp = resp.header("Content-Disposition", cd);
+        }
+        if let Some(cl) = result.metadata.get("content-language") {
+            resp = resp.header("Content-Language", cl);
+        }
+        if let Some(ex) = result.metadata.get("expires") {
+            resp = resp.header("Expires", ex);
+        }
+
+        for entry in &result.metadata.entries {
+            if entry.key.starts_with("x-amz-meta-") {
+                resp = resp.header(&entry.key, &entry.value);
+            }
+        }
+
+        resp.data_body(result.data)
+    }
+
+    /// Build a 416 Range Not Satisfiable response.
+    pub fn range_not_satisfiable(total_size: u64) -> Self {
+        let content_range = format!("bytes */{}", total_size);
+        let body = xml::error_xml("InvalidRange", "The requested range is not satisfiable", "", "request-id");
+        Self::new(416)
+            .header("Content-Range", &content_range)
+            .xml_body(body)
     }
 
     /// Build a response for DeleteObject (204 No Content).

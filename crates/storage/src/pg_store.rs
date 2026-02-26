@@ -323,14 +323,15 @@ impl PgMetadataStore for PgStore {
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO objects \
-                 (bucket, key, version_id, size, etag, etag_kind, last_modified, \
+                 (bucket, key, version_id, size, total_size, etag, etag_kind, last_modified, \
                   storage_class, ec_k, ec_m, status) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, 0)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, 0)",
                 params![
                     req.bucket,
                     req.key,
                     req.version_id,
                     req.size as i64,
+                    req.total_size as i64,
                     req.etag,
                     req.etag_kind,
                     now as i64,
@@ -348,7 +349,7 @@ impl PgMetadataStore for PgStore {
     fn get_object_meta(&self, bucket: &str, key: &str) -> Result<ObjectRecord, MetadataError> {
         self.conn
             .query_row(
-                "SELECT bucket, key, version_id, size, etag, etag_kind, \
+                "SELECT bucket, key, version_id, size, total_size, etag, etag_kind, \
                  last_modified, storage_class, ec_k, ec_m, status \
                  FROM objects WHERE bucket = ?1 AND key = ?2 AND status = 0",
                 params![bucket, key],
@@ -358,13 +359,14 @@ impl PgMetadataStore for PgStore {
                         key: row.get(1)?,
                         version_id: row.get(2)?,
                         size: row.get::<_, i64>(3)? as u64,
-                        etag: row.get(4)?,
-                        etag_kind: row.get::<_, u8>(5)?,
-                        last_modified: row.get::<_, i64>(6)? as u64,
-                        storage_class: row.get::<_, u8>(7)?,
-                        ec_k: row.get::<_, u8>(8)?,
-                        ec_m: row.get::<_, u8>(9)?,
-                        status: row.get::<_, u8>(10)?,
+                        total_size: row.get::<_, i64>(4)? as u64,
+                        etag: row.get(5)?,
+                        etag_kind: row.get::<_, u8>(6)?,
+                        last_modified: row.get::<_, i64>(7)? as u64,
+                        storage_class: row.get::<_, u8>(8)?,
+                        ec_k: row.get::<_, u8>(9)?,
+                        ec_m: row.get::<_, u8>(10)?,
+                        status: row.get::<_, u8>(11)?,
                     })
                 },
             )
@@ -401,7 +403,7 @@ impl PgMetadataStore for PgStore {
                     let end = prefix_end(prefix);
                     match end {
                         Some(end) => (
-                            "SELECT bucket, key, version_id, size, etag, etag_kind, \
+                            "SELECT bucket, key, version_id, size, total_size, etag, etag_kind, \
                              last_modified, storage_class, ec_k, ec_m, status \
                              FROM objects \
                              WHERE bucket = ?1 AND key > ?2 AND key >= ?3 AND key < ?4 \
@@ -417,7 +419,7 @@ impl PgMetadataStore for PgStore {
                             ],
                         ),
                         None => (
-                            "SELECT bucket, key, version_id, size, etag, etag_kind, \
+                            "SELECT bucket, key, version_id, size, total_size, etag, etag_kind, \
                              last_modified, storage_class, ec_k, ec_m, status \
                              FROM objects \
                              WHERE bucket = ?1 AND key > ?2 AND key >= ?3 \
@@ -437,7 +439,7 @@ impl PgMetadataStore for PgStore {
                     let end = prefix_end(prefix);
                     match end {
                         Some(end) => (
-                            "SELECT bucket, key, version_id, size, etag, etag_kind, \
+                            "SELECT bucket, key, version_id, size, total_size, etag, etag_kind, \
                              last_modified, storage_class, ec_k, ec_m, status \
                              FROM objects \
                              WHERE bucket = ?1 AND key >= ?2 AND key < ?3 \
@@ -452,7 +454,7 @@ impl PgMetadataStore for PgStore {
                             ],
                         ),
                         None => (
-                            "SELECT bucket, key, version_id, size, etag, etag_kind, \
+                            "SELECT bucket, key, version_id, size, total_size, etag, etag_kind, \
                              last_modified, storage_class, ec_k, ec_m, status \
                              FROM objects \
                              WHERE bucket = ?1 AND key >= ?2 \
@@ -468,7 +470,7 @@ impl PgMetadataStore for PgStore {
                     }
                 }
                 (None, Some(start_after)) => (
-                    "SELECT bucket, key, version_id, size, etag, etag_kind, \
+                    "SELECT bucket, key, version_id, size, total_size, etag, etag_kind, \
                      last_modified, storage_class, ec_k, ec_m, status \
                      FROM objects \
                      WHERE bucket = ?1 AND key > ?2 \
@@ -482,7 +484,7 @@ impl PgMetadataStore for PgStore {
                     ],
                 ),
                 (None, None) => (
-                    "SELECT bucket, key, version_id, size, etag, etag_kind, \
+                    "SELECT bucket, key, version_id, size, total_size, etag, etag_kind, \
                      last_modified, storage_class, ec_k, ec_m, status \
                      FROM objects \
                      WHERE bucket = ?1 \
@@ -506,13 +508,14 @@ impl PgMetadataStore for PgStore {
                     key: row.get(1)?,
                     version_id: row.get(2)?,
                     size: row.get::<_, i64>(3)? as u64,
-                    etag: row.get(4)?,
-                    etag_kind: row.get::<_, u8>(5)?,
-                    last_modified: row.get::<_, i64>(6)? as u64,
-                    storage_class: row.get::<_, u8>(7)?,
-                    ec_k: row.get::<_, u8>(8)?,
-                    ec_m: row.get::<_, u8>(9)?,
-                    status: row.get::<_, u8>(10)?,
+                    total_size: row.get::<_, i64>(4)? as u64,
+                    etag: row.get(5)?,
+                    etag_kind: row.get::<_, u8>(6)?,
+                    last_modified: row.get::<_, i64>(7)? as u64,
+                    storage_class: row.get::<_, u8>(8)?,
+                    ec_k: row.get::<_, u8>(9)?,
+                    ec_m: row.get::<_, u8>(10)?,
+                    status: row.get::<_, u8>(11)?,
                 })
             })
             .map_err(|e| MetadataError::Db {
@@ -634,6 +637,7 @@ mod tests {
                     key: key.to_string(),
                     version_id: "null".into(),
                     size: 10,
+                    total_size: 0,
                     etag: vec![0; 8],
                     etag_kind: 0,
                     ec_k: 4,
@@ -720,6 +724,7 @@ mod tests {
                     key: format!("key-{:02}", i),
                     version_id: "null".into(),
                     size: 0,
+                    total_size: 0,
                     etag: vec![0; 8],
                     etag_kind: 0,
                     ec_k: 4,

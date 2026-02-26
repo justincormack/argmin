@@ -38,6 +38,9 @@ pub enum ServerError {
 
     #[error("method not allowed")]
     MethodNotAllowed,
+
+    #[error("invalid range")]
+    InvalidRange { total_size: u64 },
 }
 
 impl ServerError {
@@ -57,6 +60,7 @@ impl ServerError {
             Self::MetadataBlobError { .. } => "InternalError",
             Self::ObjectTooLarge { .. } => "EntityTooLarge",
             Self::MethodNotAllowed => "MethodNotAllowed",
+            Self::InvalidRange { .. } => "InvalidRange",
             Self::Store(_) => "InternalError",
             Self::Metadata(_) => "InternalError",
             Self::Ec(_) => "InternalError",
@@ -74,6 +78,7 @@ impl ServerError {
             Self::InvalidRequest { .. } => 400,
             Self::ObjectTooLarge { .. } => 400,
             Self::MethodNotAllowed => 405,
+            Self::InvalidRange { .. } => 416,
             _ => 500,
         }
     }
@@ -162,6 +167,17 @@ mod tests {
     #[test]
     fn s3_error_code_method_not_allowed() {
         assert_eq!(ServerError::MethodNotAllowed.s3_error_code(), "MethodNotAllowed");
+    }
+
+    #[test]
+    fn s3_error_code_invalid_range() {
+        let err = ServerError::InvalidRange { total_size: 100 };
+        assert_eq!(err.s3_error_code(), "InvalidRange");
+    }
+
+    #[test]
+    fn http_status_416() {
+        assert_eq!(ServerError::InvalidRange { total_size: 100 }.http_status(), 416);
     }
 
     #[test]

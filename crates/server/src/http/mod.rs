@@ -131,8 +131,22 @@ impl HttpFrontend {
                 Ok(S3Response::put_object(&result))
             }
             S3Operation::GetObject { bucket, key } => {
-                let result = self.coordinator.get_object(&bucket, &key)?;
-                Ok(S3Response::get_object(result))
+                if let Some(range_header) = req.header("range") {
+                    let byte_range = crate::range::ByteRange::parse(range_header)?;
+                    match self
+                        .coordinator
+                        .get_object_range(&bucket, &key, byte_range)
+                    {
+                        Ok(result) => Ok(S3Response::get_object_range(result)),
+                        Err(ServerError::InvalidRange { total_size }) => {
+                            Ok(S3Response::range_not_satisfiable(total_size))
+                        }
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    let result = self.coordinator.get_object(&bucket, &key)?;
+                    Ok(S3Response::get_object(result))
+                }
             }
             S3Operation::DeleteObject { bucket, key } => {
                 self.coordinator.delete_object(&bucket, &key)?;

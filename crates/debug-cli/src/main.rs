@@ -369,7 +369,7 @@ fn cmd_objects(
         };
 
         let mut sql = String::from(
-            "SELECT bucket, key, version_id, size, etag, etag_kind, \
+            "SELECT bucket, key, version_id, size, total_size, etag, etag_kind, \
              last_modified, ec_k, ec_m, status \
              FROM objects WHERE 1=1",
         );
@@ -401,18 +401,20 @@ fn cmd_objects(
             let key: String = row.get(1)?;
             let version_id: String = row.get(2)?;
             let size: u64 = row.get(3)?;
-            let etag: Vec<u8> = row.get(4)?;
-            let _etag_kind: i32 = row.get(5)?;
-            let last_modified: u64 = row.get(6)?;
-            let ec_k: u32 = row.get(7)?;
-            let ec_m: u32 = row.get(8)?;
-            let status: i32 = row.get(9)?;
+            let total_size: u64 = row.get(4)?;
+            let etag: Vec<u8> = row.get(5)?;
+            let _etag_kind: i32 = row.get(6)?;
+            let last_modified: u64 = row.get(7)?;
+            let ec_k: u32 = row.get(8)?;
+            let ec_m: u32 = row.get(9)?;
+            let status: i32 = row.get(10)?;
             Ok(vec![
                 pg_id.to_string(),
                 bucket,
                 key,
                 version_id,
                 format_size(size),
+                format_size(total_size),
                 format_etag(&etag),
                 format!("{}+{}", ec_k, ec_m),
                 format_timestamp_millis(last_modified),
@@ -433,7 +435,8 @@ fn cmd_objects(
 
     print_table(
         &[
-            "PG", "BUCKET", "KEY", "VERSION", "SIZE", "ETAG", "EC", "LAST_MODIFIED", "STATUS",
+            "PG", "BUCKET", "KEY", "VERSION", "SIZE", "TOTAL_SIZE", "ETAG", "EC",
+            "LAST_MODIFIED", "STATUS",
         ],
         &all_rows,
     );
