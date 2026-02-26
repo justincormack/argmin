@@ -40,6 +40,12 @@ const STORED_HEADERS: &[&str] = &[
     "expires",
 ];
 
+/// Check if a string contains ASCII control characters (0x00-0x1F, 0x7F)
+/// that could enable header injection or response splitting.
+fn has_control_chars(s: &str) -> bool {
+    s.bytes().any(|b| b < 0x20 || b == 0x7f)
+}
+
 impl MetadataBlob {
     /// Create an empty metadata blob.
     pub fn new() -> Self {
@@ -51,18 +57,27 @@ impl MetadataBlob {
     /// Build a metadata blob from request headers.
     /// Extracts content-type, content-encoding, cache-control, content-disposition,
     /// content-language, expires, and all x-amz-meta-* headers.
-    pub fn from_headers(headers: &[(&str, &str)]) -> Self {
+    /// Rejects values containing control characters to prevent header injection.
+    pub fn from_headers(headers: &[(&str, &str)]) -> Result<Self, ServerError> {
         let mut entries = Vec::new();
         for &(name, value) in headers {
             let lower = name.to_ascii_lowercase();
             if STORED_HEADERS.contains(&lower.as_str()) || lower.starts_with("x-amz-meta-") {
+                if has_control_chars(value) {
+                    return Err(ServerError::InvalidRequest {
+                        reason: format!(
+                            "metadata value for '{}' contains control characters",
+                            lower
+                        ),
+                    });
+                }
                 entries.push(MetadataEntry {
                     key: lower,
                     value: value.to_string(),
                 });
             }
         }
-        Self { entries }
+        Ok(Self { entries })
     }
 
     /// Serialize the blob to bytes.
@@ -345,7 +360,7 @@ mod tests {
             ("Cache-Control", "no-cache"),
             ("X-Amz-Meta-Version", "1"),
         ];
-        let blob = MetadataBlob::from_headers(&headers);
+        let blob = MetadataBlob::from_headers(&headers).unwrap();
         assert_eq!(blob.entries.len(), 4);
         assert_eq!(blob.get("content-type"), Some("text/html"));
         assert_eq!(blob.get("x-amz-meta-author"), Some("alice"));
@@ -392,5 +407,26 @@ mod tests {
         let data = blob.serialize().unwrap();
         let (decoded, _) = MetadataBlob::deserialize(&data).unwrap();
         assert_eq!(decoded.entries[0].value.len(), u16::MAX as usize);
+    }
+
+    #[test]
+    fn from_headers_rejects_control_chars() {
+        let headers = [("X-Amz-Meta-Evil", "value\r\nInjected: header")];
+        assert!(MetadataBlob::from_headers(&headers).is_err());
+
+        let headers = [("X-Amz-Meta-Null", "value\x00here")];
+        assert!(MetadataBlob::from_headers(&headers).is_err());
+
+        let headers = [("Content-Type", "text/plain\n")];
+        assert!(MetadataBlob::from_headers(&headers).is_err());
+    }
+
+    #[test]
+    fn from_headers_accepts_clean_values() {
+        let headers = [
+            ("Content-Type", "text/plain; charset=utf-8"),
+            ("X-Amz-Meta-Tag", "hello world 123 !@#$%"),
+        ];
+        assert!(MetadataBlob::from_headers(&headers).is_ok());
     }
 }

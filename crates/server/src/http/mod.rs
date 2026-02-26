@@ -4,7 +4,9 @@ pub mod response;
 pub mod router;
 pub mod xml;
 
-use auth::{parse_auth_header, verify_request, CredentialStore};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use auth::{parse_amz_date, parse_auth_header, verify_request, CredentialStore};
 use tiny_http::{Header, Response, StatusCode};
 
 use crate::coordinator::Coordinator;
@@ -134,6 +136,24 @@ impl HttpFrontend {
             &auth,
             &self.credentials,
         )?;
+
+        // Enforce ±15 minute time skew on x-amz-date to prevent replay attacks.
+        if let Some(amz_date) = req.header("x-amz-date") {
+            if let Some(request_epoch) = parse_amz_date(amz_date) {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let skew = if now > request_epoch {
+                    now - request_epoch
+                } else {
+                    request_epoch - now
+                };
+                if skew > 15 * 60 {
+                    return Err(ServerError::Auth(auth::AuthError::RequestExpired));
+                }
+            }
+        }
 
         // Verify payload integrity: if the client provided an actual content hash
         // (not UNSIGNED-PAYLOAD), recompute and compare to detect transit corruption.

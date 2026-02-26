@@ -15,6 +15,60 @@ pub enum S3Operation {
     HeadObject { bucket: String, key: String },
 }
 
+/// Validate an S3 bucket name per AWS rules.
+/// 3-63 characters, lowercase letters/digits/hyphens, no leading/trailing hyphen,
+/// no consecutive periods, not formatted as an IP address.
+fn validate_bucket_name(name: &str) -> Result<(), ServerError> {
+    if name.len() < 3 || name.len() > 63 {
+        return Err(ServerError::InvalidRequest {
+            reason: format!("bucket name must be 3-63 characters, got {}", name.len()),
+        });
+    }
+    if name.starts_with('-') || name.ends_with('-') {
+        return Err(ServerError::InvalidRequest {
+            reason: "bucket name must not start or end with a hyphen".to_string(),
+        });
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.')
+    {
+        return Err(ServerError::InvalidRequest {
+            reason: "bucket name must contain only lowercase letters, digits, hyphens, and periods"
+                .to_string(),
+        });
+    }
+    if name.contains("..") {
+        return Err(ServerError::InvalidRequest {
+            reason: "bucket name must not contain consecutive periods".to_string(),
+        });
+    }
+    // Reject IP-address-formatted names (4 groups of digits separated by periods)
+    let parts: Vec<&str> = name.split('.').collect();
+    if parts.len() == 4 && parts.iter().all(|p| p.parse::<u8>().is_ok()) {
+        return Err(ServerError::InvalidRequest {
+            reason: "bucket name must not be formatted as an IP address".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Validate an S3 object key.
+/// 1-1024 bytes, no null bytes.
+fn validate_object_key(key: &str) -> Result<(), ServerError> {
+    if key.is_empty() || key.len() > 1024 {
+        return Err(ServerError::InvalidRequest {
+            reason: format!("object key must be 1-1024 bytes, got {}", key.len()),
+        });
+    }
+    if key.as_bytes().contains(&0) {
+        return Err(ServerError::InvalidRequest {
+            reason: "object key must not contain null bytes".to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Route an HTTP request to an S3 operation.
 ///
 /// Path-style addressing only: `/<bucket>` or `/<bucket>/<key...>`.
@@ -47,10 +101,9 @@ pub fn route(method: &str, path: &str, _query: &str) -> Result<S3Operation, Serv
         None => (trimmed, None),
     };
 
-    if bucket.is_empty() {
-        return Err(ServerError::InvalidRequest {
-            reason: "empty bucket name".to_string(),
-        });
+    validate_bucket_name(bucket)?;
+    if let Some(k) = key {
+        validate_object_key(k)?;
     }
 
     match (method, key) {
@@ -201,5 +254,46 @@ mod tests {
     #[test]
     fn method_not_allowed_root() {
         assert!(route("PUT", "/", "").is_err());
+    }
+
+    #[test]
+    fn valid_bucket_names() {
+        assert!(route("HEAD", "/my-bucket", "").is_ok());
+        assert!(route("HEAD", "/abc", "").is_ok());
+        assert!(route("HEAD", "/my.bucket.name", "").is_ok());
+        assert!(route("HEAD", "/123", "").is_ok());
+    }
+
+    #[test]
+    fn invalid_bucket_names() {
+        // Too short
+        assert!(route("HEAD", "/ab", "").is_err());
+        // Too long (64 chars)
+        let long = "/".to_string() + &"a".repeat(64);
+        assert!(route("HEAD", &long, "").is_err());
+        // Leading hyphen
+        assert!(route("HEAD", "/-bucket", "").is_err());
+        // Trailing hyphen
+        assert!(route("HEAD", "/bucket-", "").is_err());
+        // Uppercase
+        assert!(route("HEAD", "/MyBucket", "").is_err());
+        // Consecutive periods
+        assert!(route("HEAD", "/my..bucket", "").is_err());
+        // IP address format
+        assert!(route("HEAD", "/192.168.1.1", "").is_err());
+    }
+
+    #[test]
+    fn valid_object_keys() {
+        assert!(route("GET", "/bucket/a", "").is_ok());
+        assert!(route("GET", "/bucket/path/to/file.txt", "").is_ok());
+        assert!(route("GET", "/bucket/key with spaces", "").is_ok());
+    }
+
+    #[test]
+    fn object_key_too_long() {
+        let long_key = "k".repeat(1025);
+        let path = format!("/bucket/{}", long_key);
+        assert!(route("GET", &path, "").is_err());
     }
 }

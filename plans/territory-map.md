@@ -247,6 +247,45 @@ Deviations from the original plan discovered during implementation:
   `derive_signing_key` test had a wrong expected value. The e2e signature verification tests
   (which use actual AWS-documented S3 signatures) pass, confirming correctness.
 
+### Security hardening — implemented in Phase 3
+
+- **SigV4 time-skew check**: Rejects requests where `x-amz-date` is more than ±15 minutes
+  from server time (prevents replay attacks).
+- **Metadata value sanitization**: `from_headers` rejects values containing ASCII control
+  characters (0x00-0x1F, 0x7F) to prevent header injection / response splitting.
+- **Bucket name validation**: Enforces S3 naming rules (3-63 chars, lowercase
+  alphanumeric/hyphens/periods, no IP format, no leading/trailing hyphen).
+- **Object key validation**: 1-1024 bytes, no null bytes.
+- **Payload integrity**: When `x-amz-content-sha256` contains an actual hash (not
+  `UNSIGNED-PAYLOAD`), the server recomputes SHA-256 and compares to detect transit corruption.
+
+### Security hardening — deferred (known gaps)
+
+These are documented trade-offs for v1-minimal, not oversights:
+
+- **Per-connection rate limiting / request throttling**: The single-threaded sync server has
+  no concurrency, so traditional rate limiting doesn't apply. A malicious client can still
+  exhaust memory by sending many max-size requests serially. Mitigation requires async I/O
+  and connection management (Phase 4+).
+- **Authorization model**: Any valid access key has full admin access. v1-minimal is
+  single-tenant by design. Multi-tenant authorization (IAM policies, bucket policies, ACLs)
+  is Phase 5+ scope.
+- **Host header validation**: Path-style-only routing means Host is not used for bucket
+  resolution. SigV4 signs the Host header so tampering fails signature verification. Explicit
+  host allowlisting becomes relevant when virtual-hosted-style is added.
+- **ETag includes internal metadata**: CRC64 is computed over (metadata blob + user data)
+  before EC encoding, so the ETag leaks a checksum that includes internal metadata. This was
+  a deliberate design choice: the ETag is an opaque integrity token, not a crypto hash. If
+  S3 compatibility requires MD5-of-user-payload for single-part uploads, we can add a
+  separate client-facing ETag derived from user data only (Phase 5).
+- **Non-atomic object deletion**: Shards are deleted before metadata. A crash between shard
+  deletion and metadata deletion leaves a dangling record that will fail on read. Fix:
+  add a "pending-delete" tombstone status in PgStore metadata, delete shards, then finalize
+  the tombstone. This is a storage schema change (Phase 4+).
+- **Error response sanitization**: Some error messages include user-supplied values (bucket
+  names, key names) in XML error responses. Low risk since XML-escaping is applied, but
+  should be tightened if user-controlled strings grow in scope.
+
 ### Post-v1-minimal (distributed)
 
 ```

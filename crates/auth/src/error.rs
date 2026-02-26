@@ -12,4 +12,6 @@ pub enum AuthError {
     SignatureMismatch,
     #[error("missing required signed header: {header}")]
     MissingSignedHeader { header: &'static str },
+    #[error("request timestamp is too far from server time")]
+    RequestExpired,
 }

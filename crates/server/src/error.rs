@@ -51,6 +51,7 @@ impl ServerError {
             Self::Auth(auth::AuthError::MissingAuth) => "AccessDenied",
             Self::Auth(auth::AuthError::UnknownAccessKey) => "InvalidAccessKeyId",
             Self::Auth(auth::AuthError::SignatureMismatch) => "SignatureDoesNotMatch",
+            Self::Auth(auth::AuthError::RequestExpired) => "RequestTimeTooSkewed",
             Self::Auth(_) => "AccessDenied",
             Self::InvalidRequest { .. } => "InvalidRequest",
             Self::MetadataBlobError { .. } => "InternalError",

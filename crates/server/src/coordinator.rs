@@ -163,7 +163,7 @@ impl Coordinator {
         self.head_bucket(bucket)?;
 
         // 2. Build metadata blob
-        let metadata_blob = MetadataBlob::from_headers(headers);
+        let metadata_blob = MetadataBlob::from_headers(headers)?;
 
         // 3. Serialize blob
         let blob_bytes = metadata_blob.serialize()?;

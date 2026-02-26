@@ -177,6 +177,56 @@ pub fn string_to_sign(timestamp: &str, scope: &str, canonical_request_hash: &str
     )
 }
 
+/// Parse an ISO 8601 SigV4 timestamp ("YYYYMMDDTHHMMSSz") into Unix epoch seconds.
+/// Returns None if the format is invalid.
+pub fn parse_amz_date(ts: &str) -> Option<u64> {
+    // Expected format: "20130524T000000Z" (exactly 16 chars)
+    if ts.len() != 16 || ts.as_bytes()[8] != b'T' || ts.as_bytes()[15] != b'Z' {
+        return None;
+    }
+    let year: u32 = ts[0..4].parse().ok()?;
+    let month: u32 = ts[4..6].parse().ok()?;
+    let day: u32 = ts[6..8].parse().ok()?;
+    let hour: u32 = ts[9..11].parse().ok()?;
+    let min: u32 = ts[11..13].parse().ok()?;
+    let sec: u32 = ts[13..15].parse().ok()?;
+
+    if month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || min > 59 || sec > 59 {
+        return None;
+    }
+
+    // Days from epoch (1970-01-01) to the given date
+    let days = days_since_epoch(year, month, day)?;
+    Some(days as u64 * 86400 + hour as u64 * 3600 + min as u64 * 60 + sec as u64)
+}
+
+/// Days from 1970-01-01 to the given date.
+fn days_since_epoch(year: u32, month: u32, day: u32) -> Option<u64> {
+    if year < 1970 {
+        return None;
+    }
+    // Cumulative days before each month (non-leap)
+    const MONTH_DAYS: [u32; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+
+    let mut days: u64 = 0;
+    // Full years
+    for y in 1970..year {
+        days += if is_leap(y) { 366 } else { 365 };
+    }
+    // Months in current year
+    days += MONTH_DAYS[(month - 1) as usize] as u64;
+    // Leap day adjustment
+    if month > 2 && is_leap(year) {
+        days += 1;
+    }
+    days += (day - 1) as u64;
+    Some(days)
+}
+
+fn is_leap(y: u32) -> bool {
+    y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for &b in bytes {
@@ -315,5 +365,34 @@ mod tests {
             canonical_query_string("key=hello%20world&b=2&a=1"),
             "a=1&b=2&key=hello%20world"
         );
+    }
+
+    #[test]
+    fn parse_amz_date_valid() {
+        // 2013-05-24 00:00:00 UTC
+        let epoch = parse_amz_date("20130524T000000Z").unwrap();
+        // Known: 2013-05-24 is day 15849 since 1970-01-01
+        assert_eq!(epoch, 1369353600);
+    }
+
+    #[test]
+    fn parse_amz_date_with_time() {
+        let epoch = parse_amz_date("20130524T120000Z").unwrap();
+        assert_eq!(epoch, 1369353600 + 12 * 3600);
+    }
+
+    #[test]
+    fn parse_amz_date_invalid_format() {
+        assert!(parse_amz_date("").is_none());
+        assert!(parse_amz_date("2013-05-24T00:00:00Z").is_none());
+        assert!(parse_amz_date("not-a-timestamp").is_none());
+        assert!(parse_amz_date("20130524T000000").is_none()); // missing Z
+    }
+
+    #[test]
+    fn parse_amz_date_invalid_values() {
+        assert!(parse_amz_date("20131324T000000Z").is_none()); // month 13
+        assert!(parse_amz_date("20130532T000000Z").is_none()); // day 32
+        assert!(parse_amz_date("20130524T250000Z").is_none()); // hour 25
     }
 }
