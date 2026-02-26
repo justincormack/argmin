@@ -65,8 +65,8 @@ pub fn combine(crc_a: u64, crc_b: u64, len_b: u64) -> u64 {
 
     // odd = operator for 1 zero bit
     odd[0] = POLY;
-    for i in 1..64 {
-        odd[i] = 1u64 << (i - 1);
+    for (i, slot) in odd.iter_mut().enumerate().skip(1) {
+        *slot = 1u64 << (i - 1);
     }
 
     // even = operator for 2 zero bits

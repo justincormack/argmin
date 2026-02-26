@@ -561,7 +561,7 @@ fn prefix_end(prefix: &str) -> Option<String> {
     while let Some(last) = end.pop() {
         if last < 0xFF {
             end.push(last + 1);
-            return Some(String::from_utf8(end).ok()?);
+            return String::from_utf8(end).ok();
         }
     }
     None

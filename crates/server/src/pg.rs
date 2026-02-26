@@ -1,5 +1,4 @@
 /// PG derivation: maps (bucket, key) to a placement group ID.
-
 /// Derive the PG ID for a given bucket and key.
 ///
 /// pg_id = rapidhash(bucket + "/" + key) % pg_count

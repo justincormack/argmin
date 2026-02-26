@@ -418,7 +418,7 @@ impl Coordinator {
     /// Returns the per-shard size after padding to a multiple of k.
     fn compute_shard_size(total_size: u64, ec_k: u8) -> usize {
         let k = ec_k as u64;
-        let padded = (total_size + k - 1) / k * k;
+        let padded = total_size.div_ceil(k) * k;
         (padded / k) as usize
     }
 

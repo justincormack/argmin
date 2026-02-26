@@ -1,5 +1,4 @@
 /// Storage layer error types.
-
 /// Shard-level storage errors.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {

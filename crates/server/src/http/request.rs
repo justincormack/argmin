@@ -28,9 +28,7 @@ impl S3Request {
     ///
     /// Checks Content-Length before reading the body to prevent OOM.
     /// Returns an error if the body exceeds the size limit or cannot be read.
-    pub fn from_http(
-        mut request: tiny_http::Request,
-    ) -> Result<(Self, tiny_http::Request), (ServerError, tiny_http::Request)> {
+    pub fn from_http(request: &mut tiny_http::Request) -> Result<Self, ServerError> {
         let method = request.method().as_str().to_string();
         let url = request.url().to_string();
 
@@ -54,44 +52,33 @@ impl S3Request {
 
         // Validate Content-Length header if present (reject negative/non-numeric)
         if let Some((_, cl_value)) = headers.iter().find(|(k, _)| k == "content-length") {
-            if let Err(e) = validate_content_length(cl_value) {
-                return Err((e, request));
-            }
+            validate_content_length(cl_value)?;
         }
 
         // Check Content-Length before reading body
         let content_length = request.body_length().unwrap_or(0);
         if content_length > MAX_BODY_SIZE {
-            return Err((
-                ServerError::ObjectTooLarge {
-                    size: content_length as u64,
-                    max: MAX_BODY_SIZE as u64,
-                },
-                request,
-            ));
+            return Err(ServerError::ObjectTooLarge {
+                size: content_length as u64,
+                max: MAX_BODY_SIZE as u64,
+            });
         }
 
         // Read body with bounded size
         let mut body = Vec::with_capacity(content_length);
         let mut reader = request.as_reader().take(MAX_BODY_SIZE as u64 + 1);
-        if let Err(_) = reader.read_to_end(&mut body) {
-            return Err((
-                ServerError::InvalidRequest {
-                    reason: "failed to read request body".to_string(),
-                },
-                request,
-            ));
+        if reader.read_to_end(&mut body).is_err() {
+            return Err(ServerError::InvalidRequest {
+                reason: "failed to read request body".to_string(),
+            });
         }
 
         // Double-check actual bytes read (handles chunked transfer without Content-Length)
         if body.len() > MAX_BODY_SIZE {
-            return Err((
-                ServerError::ObjectTooLarge {
-                    size: body.len() as u64,
-                    max: MAX_BODY_SIZE as u64,
-                },
-                request,
-            ));
+            return Err(ServerError::ObjectTooLarge {
+                size: body.len() as u64,
+                max: MAX_BODY_SIZE as u64,
+            });
         }
 
         let s3req = S3Request {
@@ -102,7 +89,7 @@ impl S3Request {
             body,
         };
 
-        Ok((s3req, request))
+        Ok(s3req)
     }
 
     /// Get a header value by lowercase name.

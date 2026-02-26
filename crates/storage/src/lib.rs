@@ -4,7 +4,6 @@
 /// per-PG object metadata in SQLite, and a global bucket table.
 ///
 /// All IO is synchronous. Single-node, single-process for v1-minimal.
-
 pub mod bucket_db;
 pub mod error;
 pub mod memory_store;

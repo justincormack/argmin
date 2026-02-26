@@ -1,5 +1,4 @@
 /// ETag formatting: CRC64-NVME value to/from quoted hex string.
-
 /// Format a CRC64-NVME value as a quoted hex ETag string.
 ///
 /// Example: `format_etag(0xABCDEF1234567890)` → `"\"abcdef1234567890\""`

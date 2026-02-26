@@ -24,9 +24,10 @@ pub struct HttpFrontend {
 impl HttpFrontend {
     /// Handle a single HTTP request.
     pub fn handle_request(&self, request: tiny_http::Request) {
-        let (s3req, request) = match S3Request::from_http(request) {
-            Ok(pair) => pair,
-            Err((err, request)) => {
+        let mut request = request;
+        let s3req = match S3Request::from_http(&mut request) {
+            Ok(req) => req,
+            Err(err) => {
                 let resp = S3Response::error(&err, "");
                 self.send_response(request, resp);
                 return;
@@ -216,11 +217,7 @@ impl HttpFrontend {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            let skew = if now > request_epoch {
-                now - request_epoch
-            } else {
-                request_epoch - now
-            };
+            let skew = now.abs_diff(request_epoch);
             if skew > 15 * 60 {
                 return Err(ServerError::Auth(auth::AuthError::RequestExpired));
             }

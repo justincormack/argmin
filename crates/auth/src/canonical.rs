@@ -29,7 +29,7 @@ pub fn uri_encode(value: &str) -> String {
 /// Percent-encode a URI path, preserving '/' separators.
 pub fn uri_encode_path(path: &str) -> String {
     path.split('/')
-        .map(|segment| uri_encode(segment))
+        .map(uri_encode)
         .collect::<Vec<_>>()
         .join("/")
 }
@@ -191,7 +191,12 @@ pub fn parse_amz_date(ts: &str) -> Option<u64> {
     let min: u32 = ts[11..13].parse().ok()?;
     let sec: u32 = ts[13..15].parse().ok()?;
 
-    if month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || min > 59 || sec > 59 {
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || min > 59
+        || sec > 59
+    {
         return None;
     }
 
@@ -224,7 +229,7 @@ fn days_since_epoch(year: u32, month: u32, day: u32) -> Option<u64> {
 }
 
 fn is_leap(y: u32) -> bool {
-    y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)
+    y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400))
 }
 
 fn hex_encode(bytes: &[u8]) -> String {

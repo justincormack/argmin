@@ -2,6 +2,9 @@ use std::sync::Arc;
 use crate::cluster::NodeInfo;
 use crate::topology::Level;
 
+pub type GroupKeyFn = dyn Fn(&NodeInfo) -> u64 + Send + Sync;
+pub type AdmitFn = dyn Fn(usize, &NodeInfo) -> Admission + Send + Sync;
+
 /// The admission decision returned by a placement constraint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Admission {
@@ -38,8 +41,8 @@ pub enum Admission {
 /// **`admit`** — called once per candidate node during `place()` (ZONE_HOT).
 /// Must not allocate. Must implement a partition matroid (see above).
 pub struct PlacementConstraint {
-    pub group_key: Arc<dyn Fn(&NodeInfo) -> u64 + Send + Sync>,
-    pub admit: Arc<dyn Fn(usize, &NodeInfo) -> Admission + Send + Sync>,
+    pub group_key: Arc<GroupKeyFn>,
+    pub admit: Arc<AdmitFn>,
 }
 
 impl PlacementConstraint {

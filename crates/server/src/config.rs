@@ -1,5 +1,4 @@
 /// Server configuration, loaded from environment variables.
-
 /// Configuration for the S3 server.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {

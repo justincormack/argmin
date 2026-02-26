@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use crate::cluster::{ClusterMap, NodeId, NodeInfo};
 use crate::config::{PlacementConfig, PlacementError};
-use crate::constraint::{Admission, PlacementConstraint};
+use crate::constraint::{Admission, AdmitFn, PlacementConstraint};
 use crate::hash::score;
 use crate::MAX_SHARDS;
 
@@ -27,7 +27,7 @@ pub struct Placer {
     /// Node info paired with precomputed group_key (computed at ZONE_INIT, not hot path).
     nodes: Vec<(NodeInfo, u64)>,
     /// The admit function from the constraint. group_key is not needed after new().
-    admit: Arc<dyn Fn(usize, &NodeInfo) -> Admission + Send + Sync>,
+    admit: Arc<AdmitFn>,
 }
 
 impl std::fmt::Debug for Placer {
@@ -164,8 +164,8 @@ impl Placer {
             });
         }
 
-        for i in 0..total {
-            out[i] = cands[i].node_id;
+        for (out_slot, cand) in out.iter_mut().zip(cands.iter().take(total)) {
+            *out_slot = cand.node_id;
         }
         Ok(())
     }
@@ -173,9 +173,9 @@ impl Placer {
 
 /// Return the count of candidates in the buffer whose group_key matches `gk`.
 fn gc_get(gc: &[(u64, u8)], gc_len: usize, gk: u64) -> u8 {
-    for i in 0..gc_len {
-        if gc[i].0 == gk {
-            return gc[i].1;
+    for &(key, count) in gc.iter().take(gc_len) {
+        if key == gk {
+            return count;
         }
     }
     0
@@ -183,9 +183,9 @@ fn gc_get(gc: &[(u64, u8)], gc_len: usize, gk: u64) -> u8 {
 
 /// Find or insert `gk` in the group-count list and increment its count.
 fn gc_inc(gc: &mut [(u64, u8)], gc_len: &mut usize, gk: u64) {
-    for i in 0..*gc_len {
-        if gc[i].0 == gk {
-            gc[i].1 += 1;
+    for (key, count) in gc.iter_mut().take(*gc_len) {
+        if *key == gk {
+            *count += 1;
             return;
         }
     }
@@ -196,16 +196,16 @@ fn gc_inc(gc: &mut [(u64, u8)], gc_len: &mut usize, gk: u64) {
 
 /// Decrement the count for `gk`. Remove the entry if count reaches 0.
 fn gc_dec(gc: &mut [(u64, u8)], gc_len: &mut usize, gk: u64) {
-    for i in 0..*gc_len {
-        if gc[i].0 == gk {
-            if gc[i].1 <= 1 {
+    for (i, (key, count)) in gc.iter_mut().take(*gc_len).enumerate() {
+        if *key == gk {
+            if *count <= 1 {
                 // Remove by shifting remaining entries left.
                 for j in i..*gc_len - 1 {
                     gc[j] = gc[j + 1];
                 }
                 *gc_len -= 1;
             } else {
-                gc[i].1 -= 1;
+                *count -= 1;
             }
             return;
         }
@@ -217,9 +217,9 @@ fn gc_dec(gc: &mut [(u64, u8)], gc_len: &mut usize, gk: u64) {
 fn find_worst(cands: &[Candidate], cand_len: usize) -> usize {
     let mut worst_idx = 0;
     let mut worst_score = cands[0].score;
-    for i in 1..cand_len {
-        if cands[i].score > worst_score {
-            worst_score = cands[i].score;
+    for (i, cand) in cands.iter().enumerate().take(cand_len).skip(1) {
+        if cand.score > worst_score {
+            worst_score = cand.score;
             worst_idx = i;
         }
     }
@@ -231,9 +231,9 @@ fn find_worst(cands: &[Candidate], cand_len: usize) -> usize {
 fn find_worst_in_group(cands: &[Candidate], cand_len: usize, gk: u64) -> Option<usize> {
     let mut worst_idx: Option<usize> = None;
     let mut worst_score = f64::NEG_INFINITY;
-    for i in 0..cand_len {
-        if cands[i].group_key == gk && cands[i].score > worst_score {
-            worst_score = cands[i].score;
+    for (i, cand) in cands.iter().enumerate().take(cand_len) {
+        if cand.group_key == gk && cand.score > worst_score {
+            worst_score = cand.score;
             worst_idx = Some(i);
         }
     }

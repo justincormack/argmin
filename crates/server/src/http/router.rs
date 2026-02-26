@@ -78,7 +78,7 @@ fn has_query_key(query: &str, target: &str) -> bool {
         .split('&')
         .filter(|s| !s.is_empty())
         .any(|pair| {
-            let key = pair.splitn(2, '=').next().unwrap_or("");
+            let key = pair.split('=').next().unwrap_or("");
             key == target
         })
 }

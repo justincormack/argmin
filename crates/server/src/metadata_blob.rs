@@ -43,7 +43,7 @@ const STORED_HEADERS: &[&str] = &[
 /// Check if a string contains bytes invalid in HTTP headers:
 /// ASCII control characters (0x00-0x1F) or non-ASCII bytes (>= 0x7F).
 fn has_invalid_header_bytes(s: &str) -> bool {
-    s.bytes().any(|b| b < 0x20 || b >= 0x7f)
+    s.bytes().any(|b| !(0x20..0x7f).contains(&b))
 }
 
 impl MetadataBlob {

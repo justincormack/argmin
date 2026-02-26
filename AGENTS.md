@@ -22,3 +22,7 @@ new dependencies.
 We are designing a highly reliable system so we need to have full trust in it. We need a very comprehensive
 set of tests, and will look at different test methodologies, formal methods, fuzz testing and so on as needed.
 
+## Cleanliness
+
+Make sure `cargo clippy` is clean, even if it is pedantic. Always run tests after making changes and make sure
+they still pass. Review your code to make sure it is clear, correct and secure.
