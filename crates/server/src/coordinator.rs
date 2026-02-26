@@ -1004,7 +1004,7 @@ impl Coordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     fn setup_coordinator(dir: &Path) -> Coordinator {
         let pg_ids: Vec<u32> = (0..4).collect();
@@ -1243,6 +1243,61 @@ mod tests {
         assert_eq!(obj.size, 4);
     }
 
+    // ── Disk manipulation helpers for EC tests ────────────────────────
+
+    /// Compute shard file path on disk for a given object and shard index.
+    fn shard_file_path(
+        data_dir: &Path,
+        bucket: &str,
+        key: &str,
+        shard_index: u8,
+        pg_count: u32,
+    ) -> PathBuf {
+        let pg_id = derive_pg(bucket, key, pg_count);
+        let okh = object_key_hash(bucket, key);
+        let version_id: u64 = 0;
+        let shard_key = ShardKey::new(&okh, version_id, shard_index);
+        data_dir
+            .join(format!("pg-{pg_id:04}"))
+            .join("shards")
+            .join(shard_key.hex_prefix())
+            .join(shard_key.hex())
+    }
+
+    /// Delete a specific shard file from disk.
+    fn delete_shard_on_disk(
+        data_dir: &Path,
+        bucket: &str,
+        key: &str,
+        shard_index: u8,
+        pg_count: u32,
+    ) {
+        let path = shard_file_path(data_dir, bucket, key, shard_index, pg_count);
+        std::fs::remove_file(&path).unwrap_or_else(|e| {
+            panic!("failed to delete shard {shard_index} at {}: {e}", path.display())
+        });
+    }
+
+    /// Corrupt a specific shard file on disk (flip first byte).
+    /// PgStore's read_shard will detect CRC mismatch.
+    fn corrupt_shard_on_disk(
+        data_dir: &Path,
+        bucket: &str,
+        key: &str,
+        shard_index: u8,
+        pg_count: u32,
+    ) {
+        let path = shard_file_path(data_dir, bucket, key, shard_index, pg_count);
+        let mut data = std::fs::read(&path).unwrap_or_else(|e| {
+            panic!("failed to read shard {shard_index} at {}: {e}", path.display())
+        });
+        assert!(!data.is_empty(), "shard file is empty");
+        data[0] ^= 0xFF;
+        std::fs::write(&path, &data).unwrap();
+    }
+
+    // ── EC fault injection tests ────────────────────────────────────
+
     #[test]
     fn ec_reconstruction_after_shard_loss() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1254,32 +1309,115 @@ mod tests {
             .put_object("bucket", "resilient", data, &[])
             .unwrap();
 
-        // Find and delete one data shard file on disk
-        let pg_id = derive_pg("bucket", "resilient", 4);
-        let pg_dir = tmp.path().join(format!("pg-{pg_id:04}"));
-        let shards_dir = pg_dir.join("shards");
-
-        // Delete the first shard file we find
-        let mut deleted = false;
-        for entry in std::fs::read_dir(&shards_dir).unwrap() {
-            let prefix_dir = entry.unwrap().path();
-            if prefix_dir.is_dir() {
-                for shard_entry in std::fs::read_dir(&prefix_dir).unwrap() {
-                    let shard_path = shard_entry.unwrap().path();
-                    if shard_path.is_file() && !deleted {
-                        std::fs::remove_file(&shard_path).unwrap();
-                        deleted = true;
-                    }
-                }
-            }
-            if deleted {
-                break;
-            }
-        }
-        assert!(deleted, "should have deleted a shard file");
+        // Delete one data shard using the helper
+        delete_shard_on_disk(tmp.path(), "bucket", "resilient", 0, 4);
 
         // Get should still succeed via EC reconstruction
         let obj = coord.get_object("bucket", "resilient").unwrap();
+        assert_eq!(obj.data, data);
+    }
+
+    #[test]
+    fn ec_drop_one_data_shard_get() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+
+        coord.create_bucket("bucket").unwrap();
+        let data = b"EC single shard loss test data";
+        coord.put_object("bucket", "obj1", data, &[]).unwrap();
+
+        delete_shard_on_disk(tmp.path(), "bucket", "obj1", 0, 4);
+
+        let obj = coord.get_object("bucket", "obj1").unwrap();
+        assert_eq!(obj.data, data);
+    }
+
+    #[test]
+    fn ec_drop_m_shards_at_limit() {
+        // Config: k=4, m=2. Dropping exactly m=2 shards should still recover.
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+
+        coord.create_bucket("bucket").unwrap();
+        let data = b"EC m-shard loss limit test data";
+        coord.put_object("bucket", "obj2", data, &[]).unwrap();
+
+        // Delete 2 data shards (indices 0 and 1)
+        delete_shard_on_disk(tmp.path(), "bucket", "obj2", 0, 4);
+        delete_shard_on_disk(tmp.path(), "bucket", "obj2", 1, 4);
+
+        let obj = coord.get_object("bucket", "obj2").unwrap();
+        assert_eq!(obj.data, data);
+    }
+
+    #[test]
+    fn ec_drop_m_plus_one_shards_fails() {
+        // Config: k=4, m=2. Dropping m+1=3 shards should fail.
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+
+        coord.create_bucket("bucket").unwrap();
+        let data = b"EC m+1 shard loss test data";
+        coord.put_object("bucket", "obj3", data, &[]).unwrap();
+
+        // Delete 3 shards (indices 0, 1, 2)
+        delete_shard_on_disk(tmp.path(), "bucket", "obj3", 0, 4);
+        delete_shard_on_disk(tmp.path(), "bucket", "obj3", 1, 4);
+        delete_shard_on_disk(tmp.path(), "bucket", "obj3", 2, 4);
+
+        let err = coord.get_object("bucket", "obj3").unwrap_err();
+        assert!(matches!(err, ServerError::ObjectNotFound { .. }));
+    }
+
+    #[test]
+    fn ec_corrupt_one_data_shard_recovery() {
+        // Corrupt shard 0 on disk. PgStore detects CRC mismatch, EC reconstructs.
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+
+        coord.create_bucket("bucket").unwrap();
+        let data = b"EC corruption recovery test data";
+        coord.put_object("bucket", "obj4", data, &[]).unwrap();
+
+        corrupt_shard_on_disk(tmp.path(), "bucket", "obj4", 0, 4);
+
+        let obj = coord.get_object("bucket", "obj4").unwrap();
+        assert_eq!(obj.data, data);
+    }
+
+    #[test]
+    fn ec_range_get_with_missing_shard() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+
+        coord.create_bucket("bucket").unwrap();
+        let data = b"Hello, World! Range test with EC recovery";
+        coord.put_object("bucket", "obj5", data, &[]).unwrap();
+
+        // Delete shard 0 (covers the beginning of the data)
+        delete_shard_on_disk(tmp.path(), "bucket", "obj5", 0, 4);
+
+        // Range get should still succeed via EC reconstruction
+        let result = coord
+            .get_object_range("bucket", "obj5", ByteRange::Range { start: 0, end: 4 })
+            .unwrap();
+        assert_eq!(result.data, b"Hello");
+    }
+
+    #[test]
+    fn ec_drop_parity_shard_data_still_works() {
+        // Delete parity shard (index k=4). Only data shards needed for normal read.
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+
+        coord.create_bucket("bucket").unwrap();
+        let data = b"EC parity shard drop test";
+        coord.put_object("bucket", "obj6", data, &[]).unwrap();
+
+        // Delete first parity shard (index 4, since k=4)
+        delete_shard_on_disk(tmp.path(), "bucket", "obj6", 4, 4);
+
+        let obj = coord.get_object("bucket", "obj6").unwrap();
         assert_eq!(obj.data, data);
     }
 

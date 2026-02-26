@@ -44,6 +44,36 @@ impl MemoryPgStore {
             .unwrap_or_default()
             .as_millis() as u64
     }
+
+    /// Corrupt stored shard data without updating CRC.
+    /// Subsequent read_shard will detect CRC mismatch → IntegrityError.
+    /// Uses a simple LCG seeded by `seed` to pick `flip_count` byte positions to XOR.
+    /// Returns false if the shard doesn't exist.
+    #[cfg(test)]
+    pub fn corrupt_shard_data(&self, key: &ShardKey, flip_count: u8, seed: u64) -> bool {
+        let mut shards = self.shards.borrow_mut();
+        let Some(record) = shards.get_mut(key) else {
+            return false;
+        };
+        if record.data.is_empty() || flip_count == 0 {
+            return true;
+        }
+        // Simple LCG: state = state * 6364136223846793005 + 1
+        let mut state = seed;
+        for _ in 0..flip_count {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let pos = (state >> 33) as usize % record.data.len();
+            record.data[pos] ^= 0xFF;
+        }
+        true
+    }
+
+    /// Remove a shard directly (bypass delete_shard trait method).
+    /// Returns false if the shard didn't exist.
+    #[cfg(test)]
+    pub fn remove_shard(&self, key: &ShardKey) -> bool {
+        self.shards.borrow_mut().remove(key).is_some()
+    }
 }
 
 impl Default for MemoryPgStore {

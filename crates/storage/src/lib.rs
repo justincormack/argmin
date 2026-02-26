@@ -23,4 +23,7 @@ pub use traits::{GlobalService, PgMetadataStore, ShardStore, StorageNode};
 pub use types::*;
 
 #[cfg(test)]
+pub mod test_util;
+
+#[cfg(test)]
 mod tests;
