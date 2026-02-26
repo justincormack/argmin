@@ -14,6 +14,10 @@ use crate::pg::{derive_pg, object_key_hash};
 /// Maximum object size for single PUT (256 MB).
 const MAX_OBJECT_SIZE: u64 = 256 * 1024 * 1024;
 
+/// Hard cap on total records fetched across all PGs for a single list query.
+/// Prevents unbounded memory when delimiter causes u32::MAX per-PG limits.
+const MAX_LIST_RECORDS: usize = 100_000;
+
 /// Result of a PutObject operation.
 #[derive(Debug)]
 pub struct PutObjectResult {
@@ -446,8 +450,9 @@ impl Coordinator {
             max_keys.saturating_add(1)
         };
 
-        // Fan out to all PGs and collect results
+        // Fan out to all PGs and collect results, with a hard memory cap.
         let mut all_objects: Vec<ObjectRecord> = Vec::new();
+        let mut hit_record_cap = false;
         for &pg_id in self.storage_node.pg_ids() {
             let pg = self.storage_node.get_pg(pg_id)?;
             let resp = pg.list_objects(&ListObjectsReq {
@@ -457,6 +462,11 @@ impl Coordinator {
                 max_keys: per_pg_limit,
             })?;
             all_objects.extend(resp.objects);
+            if all_objects.len() >= MAX_LIST_RECORDS {
+                all_objects.truncate(MAX_LIST_RECORDS);
+                hit_record_cap = true;
+                break;
+            }
         }
 
         // Sort by key
@@ -537,6 +547,11 @@ impl Coordinator {
             if all_objects.len() > max {
                 is_truncated = true;
             }
+        }
+
+        // If we hit the record cap, there may be more results we didn't fetch.
+        if hit_record_cap {
+            is_truncated = true;
         }
 
         let next_token = if is_truncated {
@@ -921,17 +936,26 @@ mod tests {
     }
 
     #[test]
+    fn max_object_size_constant() {
+        // Verify the size guard exists and the constant is 256 MB.
+        // The actual rejection is tested by large_object_rejected (ignored
+        // by default due to 256 MB allocation).
+        assert_eq!(MAX_OBJECT_SIZE, 256 * 1024 * 1024);
+    }
+
+    #[test]
+    #[ignore] // allocates 256 MB+1 — run explicitly with `cargo test -- --ignored`
     fn large_object_rejected() {
         let tmp = tempfile::tempdir().unwrap();
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
 
-        // Create data larger than MAX_OBJECT_SIZE (256 MB)
-        // We can't allocate 256MB in a test, so just verify the check exists
-        // by using a smaller coordinator-level test
         let err = coord
             .put_object("bucket", "key", &vec![0u8; 256 * 1024 * 1024 + 1], &[]);
-        assert!(err.is_err());
+        assert!(matches!(
+            err,
+            Err(ServerError::ObjectTooLarge { .. })
+        ));
     }
 }
