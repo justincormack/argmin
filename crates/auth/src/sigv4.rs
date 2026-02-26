@@ -390,6 +390,98 @@ mod tests {
     }
 
     #[test]
+    fn parse_auth_header_wrong_suffix() {
+        // 5 parts but last is not "aws4_request"
+        let header = "AWS4-HMAC-SHA256 Credential=AKID/20130524/us-east-1/s3/wrong_suffix, SignedHeaders=host, Signature=abc";
+        assert!(matches!(parse_auth_header(header), Err(AuthError::MalformedAuth)));
+    }
+
+    #[test]
+    fn parse_auth_header_missing_signed_headers() {
+        let header = "AWS4-HMAC-SHA256 Credential=AKID/20130524/us-east-1/s3/aws4_request, Signature=abc";
+        assert!(matches!(parse_auth_header(header), Err(AuthError::MalformedAuth)));
+    }
+
+    #[test]
+    fn parse_auth_header_missing_signature() {
+        let header = "AWS4-HMAC-SHA256 Credential=AKID/20130524/us-east-1/s3/aws4_request, SignedHeaders=host";
+        assert!(matches!(parse_auth_header(header), Err(AuthError::MalformedAuth)));
+    }
+
+    #[test]
+    fn verify_request_missing_host_header() {
+        let store = example_store();
+        let auth_header = "AWS4-HMAC-SHA256 \
+            Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, \
+            SignedHeaders=host;x-amz-content-sha256;x-amz-date, \
+            Signature=abc";
+        let auth = parse_auth_header(auth_header).unwrap();
+        // Provide x-amz-date and x-amz-content-sha256 but NOT host
+        let headers = [
+            ("x-amz-content-sha256", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+            ("x-amz-date", "20130524T000000Z"),
+        ];
+        let result = verify_request("GET", "/", "", &headers, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", &auth, &store);
+        assert!(matches!(result, Err(AuthError::MissingSignedHeader { header: "host" })));
+    }
+
+    #[test]
+    fn verify_request_missing_amz_date_header() {
+        let store = example_store();
+        let auth_header = "AWS4-HMAC-SHA256 \
+            Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, \
+            SignedHeaders=host;x-amz-content-sha256;x-amz-date, \
+            Signature=abc";
+        let auth = parse_auth_header(auth_header).unwrap();
+        // Provide host and x-amz-content-sha256 but NOT x-amz-date
+        let headers = [
+            ("host", "example.com"),
+            ("x-amz-content-sha256", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+        ];
+        let result = verify_request("GET", "/", "", &headers, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", &auth, &store);
+        assert!(matches!(result, Err(AuthError::MissingSignedHeader { header: "x-amz-date" })));
+    }
+
+    #[test]
+    fn verify_request_missing_content_sha256_header() {
+        let store = example_store();
+        let auth_header = "AWS4-HMAC-SHA256 \
+            Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, \
+            SignedHeaders=host;x-amz-content-sha256;x-amz-date, \
+            Signature=abc";
+        let auth = parse_auth_header(auth_header).unwrap();
+        // Provide host and x-amz-date but NOT x-amz-content-sha256
+        let headers = [
+            ("host", "example.com"),
+            ("x-amz-date", "20130524T000000Z"),
+        ];
+        let result = verify_request("GET", "/", "", &headers, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", &auth, &store);
+        assert!(matches!(result, Err(AuthError::MissingSignedHeader { header: "x-amz-content-sha256" })));
+    }
+
+    #[test]
+    fn verify_request_missing_optional_header_is_lenient() {
+        // A signed header that is not host/x-amz-date/x-amz-content-sha256
+        // should be silently skipped if not present.
+        let store = example_store();
+        let auth_header = "AWS4-HMAC-SHA256 \
+            Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, \
+            SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-custom-header, \
+            Signature=abc";
+        let auth = parse_auth_header(auth_header).unwrap();
+        let headers = [
+            ("host", "example.com"),
+            ("x-amz-content-sha256", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+            ("x-amz-date", "20130524T000000Z"),
+            // x-custom-header is NOT present — should be skipped, not an error
+        ];
+        let result = verify_request("GET", "/", "", &headers, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", &auth, &store);
+        // Should NOT fail with MissingSignedHeader — it'll fail with SignatureMismatch
+        // because the signature "abc" is wrong, but it should get past the header check.
+        assert!(matches!(result, Err(AuthError::SignatureMismatch)));
+    }
+
+    #[test]
     fn unknown_access_key_fails() {
         let store = example_store();
 

@@ -125,6 +125,20 @@ Note: `prefix_end` is private — tests go in the existing `#[cfg(test)]` module
 - **`http/mod.rs`** (242 lines, 0%): `authenticate()` and `dispatch()` take `&S3Request` so they're technically unit-testable by constructing `S3Request` manually with a `Coordinator`. However, `Coordinator::new` needs a real `LocalStorageNode` + `SqliteBucketDb` + `ErasureCodec`, making these closer to integration tests. Defer to a follow-up.
 - **`main.rs`** (81 lines, 0%): Binary entry point, not unit-testable.
 - **`ec/src/codec.rs`** (93% → higher): The missed lines are mostly error paths for invalid EC parameters that ISA-L rejects. Low priority.
+- **`coordinator.rs` error-path branch coverage**: Branch coverage for coordinator.rs
+  remains at ~67% because the remaining ~20 missed branches are error/failure paths that
+  cannot be triggered with the current concrete storage layer. These include:
+  - Shard write failure mid-way through put_object (and the cleanup loop)
+  - Metadata write failure after shards are written (and the cleanup loop)
+  - Insufficient shards for reconstruction (present_count < k) without disk corruption
+  - EC config mismatch between stored object and current config (tmp_codec path)
+  - Data shorter than expected after deserialization (user_data_end > full_padded_data.len())
+  - The MAX_LIST_RECORDS cap (hit_record_cap) requiring 100K+ objects
+
+  To test these we need either: (a) trait-based mocking of the storage layer so tests can
+  inject errors at specific points, or (b) a fault-injection framework (e.g. failpoints)
+  that can make individual I/O operations fail on demand. This should be addressed when
+  we refactor the storage traits or introduce integration-level fault testing.
 
 ## Estimated Impact
 

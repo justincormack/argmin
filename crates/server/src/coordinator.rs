@@ -936,6 +936,122 @@ mod tests {
     }
 
     #[test]
+    fn delete_nonexistent_bucket_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+
+        let err = coord.delete_bucket("no-such-bucket").unwrap_err();
+        assert!(matches!(err, ServerError::BucketNotFound { .. }));
+    }
+
+    #[test]
+    fn list_objects_no_delimiter_truncated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+
+        coord.create_bucket("bucket").unwrap();
+        for i in 0..5 {
+            let key = format!("key-{:02}", i);
+            coord.put_object("bucket", &key, b"data", &[]).unwrap();
+        }
+
+        // Request fewer than available
+        let result = coord
+            .list_objects_v2("bucket", None, None, None, 3)
+            .unwrap();
+        assert_eq!(result.objects.len(), 3);
+        assert!(result.is_truncated);
+        assert!(result.next_continuation_token.is_some());
+    }
+
+    #[test]
+    fn list_objects_no_delimiter_with_continuation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+
+        coord.create_bucket("bucket").unwrap();
+        for i in 0..5 {
+            let key = format!("key-{:02}", i);
+            coord.put_object("bucket", &key, b"data", &[]).unwrap();
+        }
+
+        // First page
+        let page1 = coord
+            .list_objects_v2("bucket", None, None, None, 2)
+            .unwrap();
+        assert_eq!(page1.objects.len(), 2);
+        assert!(page1.is_truncated);
+        let token = page1.next_continuation_token.as_ref().unwrap();
+
+        // Second page using continuation token
+        let page2 = coord
+            .list_objects_v2("bucket", None, None, Some(token), 2)
+            .unwrap();
+        assert_eq!(page2.objects.len(), 2);
+        assert!(page2.is_truncated);
+        let token2 = page2.next_continuation_token.as_ref().unwrap();
+
+        // Third page — should get remainder
+        let page3 = coord
+            .list_objects_v2("bucket", None, None, Some(token2), 2)
+            .unwrap();
+        assert_eq!(page3.objects.len(), 1);
+        assert!(!page3.is_truncated);
+        assert!(page3.next_continuation_token.is_none());
+    }
+
+    #[test]
+    fn list_objects_prefix_with_delimiter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+
+        coord.create_bucket("bucket").unwrap();
+        coord.put_object("bucket", "photos/2024/jan.jpg", b"j", &[]).unwrap();
+        coord.put_object("bucket", "photos/2024/feb.jpg", b"f", &[]).unwrap();
+        coord.put_object("bucket", "photos/2025/mar.jpg", b"m", &[]).unwrap();
+        coord.put_object("bucket", "photos/top.jpg", b"t", &[]).unwrap();
+
+        // List with prefix "photos/" and delimiter "/"
+        let result = coord
+            .list_objects_v2("bucket", Some("photos/"), Some("/"), None, 1000)
+            .unwrap();
+        // top.jpg is a direct child, 2024/ and 2025/ are common prefixes
+        assert_eq!(result.objects.len(), 1);
+        assert_eq!(result.objects[0].key, "photos/top.jpg");
+        assert_eq!(result.common_prefixes.len(), 2);
+        assert!(result.common_prefixes.contains(&"photos/2024/".to_string()));
+        assert!(result.common_prefixes.contains(&"photos/2025/".to_string()));
+        assert!(!result.is_truncated);
+    }
+
+    #[test]
+    fn list_objects_not_truncated_no_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+
+        coord.create_bucket("bucket").unwrap();
+        coord.put_object("bucket", "only-one", b"data", &[]).unwrap();
+
+        let result = coord
+            .list_objects_v2("bucket", None, None, None, 1000)
+            .unwrap();
+        assert_eq!(result.objects.len(), 1);
+        assert!(!result.is_truncated);
+        assert!(result.next_continuation_token.is_none());
+    }
+
+    #[test]
+    fn list_objects_nonexistent_bucket_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+
+        let err = coord
+            .list_objects_v2("no-bucket", None, None, None, 1000)
+            .unwrap_err();
+        assert!(matches!(err, ServerError::BucketNotFound { .. }));
+    }
+
+    #[test]
     fn max_object_size_constant() {
         // Verify the size guard exists and the constant is 256 MB.
         // The actual rejection is tested by large_object_rejected (ignored

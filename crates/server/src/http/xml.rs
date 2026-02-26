@@ -218,6 +218,75 @@ mod tests {
     }
 
     #[test]
+    fn list_objects_xml_with_prefix_delimiter_and_truncation() {
+        let result = ListObjectsResult {
+            objects: vec![ListEntry {
+                key: "photos/cat.jpg".to_string(),
+                size: 100,
+                etag: "\"aabbccdd\"".to_string(),
+                last_modified: 1685000000000,
+            }],
+            common_prefixes: vec!["photos/2024/".to_string()],
+            is_truncated: true,
+            next_continuation_token: Some("photos/cat.jpg".to_string()),
+        };
+        let xml = list_objects_v2_xml("bucket", Some("photos/"), Some("/"), 1, &result);
+        assert!(xml.contains("<Prefix>photos/</Prefix>"));
+        assert!(xml.contains("<Delimiter>/</Delimiter>"));
+        assert!(xml.contains("<IsTruncated>true</IsTruncated>"));
+        assert!(xml.contains("<NextContinuationToken>photos/cat.jpg</NextContinuationToken>"));
+        assert!(xml.contains("<CommonPrefixes><Prefix>photos/2024/</Prefix></CommonPrefixes>"));
+    }
+
+    #[test]
+    fn list_objects_xml_empty_prefix() {
+        let result = ListObjectsResult {
+            objects: vec![],
+            common_prefixes: vec![],
+            is_truncated: false,
+            next_continuation_token: None,
+        };
+        // With prefix=None → should produce <Prefix/>
+        let xml = list_objects_v2_xml("bucket", None, None, 1000, &result);
+        assert!(xml.contains("<Prefix/>"));
+        assert!(!xml.contains("<Delimiter>"));
+        assert!(!xml.contains("<NextContinuationToken>"));
+    }
+
+    #[test]
+    fn days_to_date_pre_epoch() {
+        // 1969-12-31 is day -1 from epoch
+        let (y, m, d) = days_to_date(-1);
+        assert_eq!((y, m, d), (1969, 12, 31));
+    }
+
+    #[test]
+    fn days_to_date_january() {
+        // 2024-01-15: mp >= 10 branch, m <= 2 branch (January)
+        // 2024-01-01 = day 19723 from epoch
+        // 2024-01-15 = day 19737
+        let (y, m, d) = days_to_date(19737);
+        assert_eq!((y, m, d), (2024, 1, 15));
+    }
+
+    #[test]
+    fn days_to_date_february() {
+        // 2024-02-15: m <= 2 branch (February)
+        // 2024-02-15 = day 19768
+        let (y, m, d) = days_to_date(19768);
+        assert_eq!((y, m, d), (2024, 2, 15));
+    }
+
+    #[test]
+    fn format_timestamp_january_date() {
+        // 2024-01-15T12:30:45.000Z
+        // days=19737, time=12*3600+30*60+45=45045
+        // total seconds = 19737*86400 + 45045 = 1705321845
+        let ts = format_timestamp(1705321845000);
+        assert_eq!(ts, "2024-01-15T12:30:45.000Z");
+    }
+
+    #[test]
     fn xml_escape_special_chars() {
         assert_eq!(xml_escape("a&b<c>d\"e'f"), "a&amp;b&lt;c&gt;d&quot;e&apos;f");
     }

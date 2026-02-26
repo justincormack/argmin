@@ -72,6 +72,13 @@ mod tests {
     }
 
     #[test]
+    fn etag_bytes_to_crc64_wrong_length() {
+        assert_eq!(etag_bytes_to_crc64(&[]), None);
+        assert_eq!(etag_bytes_to_crc64(&[1, 2, 3]), None);
+        assert_eq!(etag_bytes_to_crc64(&[0; 9]), None);
+    }
+
+    #[test]
     fn crc64_bytes_round_trip() {
         let crc = 0xAE8B14860A799888u64;
         let bytes = crc64_to_etag_bytes(crc);
