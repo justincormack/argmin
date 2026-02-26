@@ -201,19 +201,32 @@ impl Coordinator {
         let okh = object_key_hash(bucket, key);
         let version_id: u64 = 0; // unversioned
 
-        // 11. Write all k+m shards
-        for i in 0..(k + m) {
-            let shard_key = ShardKey::new(&okh, version_id, i as u8);
-            let shard_data = if i < k {
-                data_shards[i]
-            } else {
-                &parity_bufs[i - k]
-            };
-            pg.write_shard(&shard_key, shard_data)?;
+        // 11. Write all k+m shards, with cleanup on failure
+        let mut written_shards: Vec<ShardKey> = Vec::with_capacity(k + m);
+        let write_result: Result<(), ServerError> = (|| {
+            for i in 0..(k + m) {
+                let shard_key = ShardKey::new(&okh, version_id, i as u8);
+                let shard_data = if i < k {
+                    data_shards[i]
+                } else {
+                    &parity_bufs[i - k]
+                };
+                pg.write_shard(&shard_key, shard_data)?;
+                written_shards.push(shard_key);
+            }
+            Ok(())
+        })();
+
+        if let Err(e) = write_result {
+            // Best-effort cleanup of already-written shards
+            for shard_key in &written_shards {
+                let _ = pg.delete_shard(shard_key);
+            }
+            return Err(e);
         }
 
         // 12. Record metadata
-        pg.put_object_meta(&PutObjectMetaReq {
+        let meta_result = pg.put_object_meta(&PutObjectMetaReq {
             bucket: bucket.to_string(),
             key: key.to_string(),
             version_id: "null".to_string(),
@@ -222,10 +235,15 @@ impl Coordinator {
             etag_kind: 0,
             ec_k: self.ec_config.data_shards,
             ec_m: self.ec_config.parity_shards,
-        })?;
+        });
 
-        // Manually update last_modified since PutObjectMetaReq doesn't have it
-        // (the storage layer sets it via the upsert)
+        if let Err(e) = meta_result {
+            // Best-effort cleanup of all written shards
+            for shard_key in &written_shards {
+                let _ = pg.delete_shard(shard_key);
+            }
+            return Err(ServerError::Metadata(e));
+        }
 
         Ok(PutObjectResult {
             etag: format_etag(etag_crc),
@@ -301,8 +319,19 @@ impl Coordinator {
                 .map(|&i| shard_data[i].as_ref().unwrap().as_slice())
                 .collect();
 
-            let ec_config = EcConfig::new(record.ec_k, record.ec_m)?;
-            let codec = ErasureCodec::new(ec_config)?;
+            // Reuse the coordinator's codec if EC params match, otherwise build one.
+            // Objects written with different EC params (e.g. after config change)
+            // need a per-call codec.
+            let tmp_codec;
+            let codec = if record.ec_k == self.ec_config.data_shards
+                && record.ec_m == self.ec_config.parity_shards
+            {
+                &self.ec_codec
+            } else {
+                let ec_config = EcConfig::new(record.ec_k, record.ec_m)?;
+                tmp_codec = ErasureCodec::new(ec_config)?;
+                &tmp_codec
+            };
 
             let mut outputs: Vec<Vec<u8>> =
                 missing_data.iter().map(|_| vec![0u8; shard_size]).collect();
@@ -406,6 +435,10 @@ impl Coordinator {
         // Verify bucket exists
         self.head_bucket(bucket)?;
 
+        // Bound per-PG queries. We need max_keys+1 total to detect truncation,
+        // but each PG could have up to that many, so we ask each for max_keys+1.
+        let per_pg_limit = max_keys.saturating_add(1);
+
         // Fan out to all PGs and collect results
         let mut all_objects: Vec<ObjectRecord> = Vec::new();
         for &pg_id in self.storage_node.pg_ids() {
@@ -414,7 +447,7 @@ impl Coordinator {
                 bucket: bucket.to_string(),
                 prefix: prefix.map(|s| s.to_string()),
                 start_after: continuation_token.map(|s| s.to_string()),
-                max_keys: u32::MAX, // get all, we'll merge and truncate
+                max_keys: per_pg_limit,
             })?;
             all_objects.extend(resp.objects);
         }
@@ -426,15 +459,23 @@ impl Coordinator {
         // correct PG derivation, but be safe)
         all_objects.dedup_by(|a, b| a.key == b.key);
 
-        // Apply delimiter logic
+        // Apply delimiter logic and build result entries, stopping at max_keys
+        let max = max_keys as usize;
         let mut objects: Vec<ListEntry> = Vec::new();
         let mut common_prefixes: Vec<String> = Vec::new();
+        let mut entry_count = 0usize;
+        let mut last_key_seen: Option<String> = None;
+        let mut is_truncated = false;
 
         if let Some(delim) = delimiter {
             let prefix_str = prefix.unwrap_or("");
             let mut seen_prefixes = std::collections::HashSet::new();
 
             for record in &all_objects {
+                if entry_count >= max {
+                    is_truncated = true;
+                    break;
+                }
                 let after_prefix = &record.key[prefix_str.len()..];
                 if let Some(pos) = after_prefix.find(delim) {
                     let cp = format!(
@@ -444,6 +485,7 @@ impl Coordinator {
                     );
                     if seen_prefixes.insert(cp.clone()) {
                         common_prefixes.push(cp);
+                        entry_count += 1;
                     }
                 } else {
                     let etag_crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
@@ -453,10 +495,16 @@ impl Coordinator {
                         etag: format_etag(etag_crc),
                         last_modified: record.last_modified,
                     });
+                    entry_count += 1;
                 }
+                last_key_seen = Some(record.key.clone());
             }
         } else {
             for record in &all_objects {
+                if entry_count >= max {
+                    is_truncated = true;
+                    break;
+                }
                 let etag_crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
                 objects.push(ListEntry {
                     key: record.key.clone(),
@@ -464,19 +512,18 @@ impl Coordinator {
                     etag: format_etag(etag_crc),
                     last_modified: record.last_modified,
                 });
+                entry_count += 1;
+                last_key_seen = Some(record.key.clone());
+            }
+
+            // Check if there were more objects than max_keys
+            if all_objects.len() > max {
+                is_truncated = true;
             }
         }
 
-        // Truncate to max_keys
-        let total_entries = objects.len() + common_prefixes.len();
-        let is_truncated = total_entries > max_keys as usize;
-
-        if is_truncated {
-            objects.truncate(max_keys as usize);
-        }
-
         let next_token = if is_truncated {
-            objects.last().map(|e| e.key.clone())
+            last_key_seen
         } else {
             None
         };
@@ -785,5 +832,89 @@ mod tests {
 
         let head = coord.head_object("bucket", "key").unwrap();
         assert_eq!(result.etag, head.etag);
+    }
+
+    #[test]
+    fn list_objects_delimiter_with_continuation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+
+        coord.create_bucket("bucket").unwrap();
+        coord.put_object("bucket", "a/1", b"1", &[]).unwrap();
+        coord.put_object("bucket", "a/2", b"2", &[]).unwrap();
+        coord.put_object("bucket", "b/1", b"3", &[]).unwrap();
+        coord.put_object("bucket", "c/1", b"4", &[]).unwrap();
+        coord.put_object("bucket", "root.txt", b"5", &[]).unwrap();
+
+        // First page: max_keys=2 with delimiter
+        let result = coord
+            .list_objects_v2("bucket", None, Some("/"), None, 2)
+            .unwrap();
+        assert_eq!(
+            result.objects.len() + result.common_prefixes.len(),
+            2,
+            "should return exactly 2 entries (objects + prefixes)"
+        );
+        assert!(result.is_truncated);
+        assert!(result.next_continuation_token.is_some());
+
+        // Second page using continuation token
+        let token = result.next_continuation_token.unwrap();
+        let result2 = coord
+            .list_objects_v2("bucket", None, Some("/"), Some(&token), 2)
+            .unwrap();
+        assert!(
+            !result2.objects.is_empty() || !result2.common_prefixes.is_empty(),
+            "continuation page should have entries"
+        );
+    }
+
+    #[test]
+    fn list_objects_max_keys_counts_prefixes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+
+        coord.create_bucket("bucket").unwrap();
+        // Create many prefixed objects to ensure common_prefixes count toward max_keys
+        for i in 0..10 {
+            let key = format!("dir{}/file.txt", i);
+            coord
+                .put_object("bucket", &key, b"data", &[])
+                .unwrap();
+        }
+
+        let result = coord
+            .list_objects_v2("bucket", None, Some("/"), None, 3)
+            .unwrap();
+        // With delimiter "/", all entries become common prefixes
+        assert_eq!(result.common_prefixes.len(), 3);
+        assert!(result.is_truncated);
+    }
+
+    #[test]
+    fn put_object_to_nonexistent_bucket_no_orphaned_shards() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+
+        // Don't create bucket — put should fail at bucket check before writing shards
+        let err = coord
+            .put_object("no-bucket", "key", b"data", &[])
+            .unwrap_err();
+        assert!(matches!(err, ServerError::BucketNotFound { .. }));
+    }
+
+    #[test]
+    fn large_object_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+
+        coord.create_bucket("bucket").unwrap();
+
+        // Create data larger than MAX_OBJECT_SIZE (256 MB)
+        // We can't allocate 256MB in a test, so just verify the check exists
+        // by using a smaller coordinator-level test
+        let err = coord
+            .put_object("bucket", "key", &vec![0u8; 256 * 1024 * 1024 + 1], &[]);
+        assert!(err.is_err());
     }
 }

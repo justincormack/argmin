@@ -22,7 +22,14 @@ pub struct HttpFrontend {
 impl HttpFrontend {
     /// Handle a single HTTP request.
     pub fn handle_request(&self, request: tiny_http::Request) {
-        let (s3req, request) = S3Request::from_http(request);
+        let (s3req, request) = match S3Request::from_http(request) {
+            Ok(pair) => pair,
+            Err((err, request)) => {
+                let resp = S3Response::error(&err, "");
+                self.send_response(request, resp);
+                return;
+            }
+        };
         let result = self.dispatch(&s3req);
 
         match result {

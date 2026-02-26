@@ -120,33 +120,33 @@ pub fn verify_request(
         .get(&auth.credential.access_key_id)
         .ok_or(AuthError::UnknownAccessKey)?;
 
-    // Extract signed headers in order
+    // Extract signed headers — collect all values for each header name
+    // to handle duplicate headers (values combined by canonical_headers).
     let mut signed_header_pairs: Vec<(&str, &str)> = Vec::new();
     for signed_name in &auth.signed_headers {
-        let value = headers
-            .iter()
-            .find(|(name, _)| name == signed_name)
-            .map(|(_, v)| *v);
-        match value {
-            Some(v) => signed_header_pairs.push((signed_name.as_str(), v)),
-            None => {
-                // "host" is always required
-                if signed_name == "host" {
-                    return Err(AuthError::MissingSignedHeader { header: "host" });
-                }
-                if signed_name == "x-amz-date" {
-                    return Err(AuthError::MissingSignedHeader {
-                        header: "x-amz-date",
-                    });
-                }
-                if signed_name == "x-amz-content-sha256" {
-                    return Err(AuthError::MissingSignedHeader {
-                        header: "x-amz-content-sha256",
-                    });
-                }
-                // For other headers, skip if not present (lenient)
-                continue;
+        let mut found = false;
+        for (name, value) in headers {
+            if *name == signed_name.as_str() {
+                signed_header_pairs.push((signed_name.as_str(), *value));
+                found = true;
             }
+        }
+        if !found {
+            // Required headers must be present
+            if signed_name == "host" {
+                return Err(AuthError::MissingSignedHeader { header: "host" });
+            }
+            if signed_name == "x-amz-date" {
+                return Err(AuthError::MissingSignedHeader {
+                    header: "x-amz-date",
+                });
+            }
+            if signed_name == "x-amz-content-sha256" {
+                return Err(AuthError::MissingSignedHeader {
+                    header: "x-amz-content-sha256",
+                });
+            }
+            // For other headers, skip if not present (lenient)
         }
     }
 

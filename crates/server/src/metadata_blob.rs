@@ -67,6 +67,37 @@ impl MetadataBlob {
 
     /// Serialize the blob to bytes.
     pub fn serialize(&self) -> Result<Vec<u8>, ServerError> {
+        // Validate field widths before serializing
+        if self.entries.len() > u16::MAX as usize {
+            return Err(ServerError::MetadataBlobError {
+                reason: format!(
+                    "too many metadata entries: {} (max {})",
+                    self.entries.len(),
+                    u16::MAX
+                ),
+            });
+        }
+        for entry in &self.entries {
+            if entry.key.len() > u16::MAX as usize {
+                return Err(ServerError::MetadataBlobError {
+                    reason: format!(
+                        "metadata key too long: {} bytes (max {})",
+                        entry.key.len(),
+                        u16::MAX
+                    ),
+                });
+            }
+            if entry.value.len() > u16::MAX as usize {
+                return Err(ServerError::MetadataBlobError {
+                    reason: format!(
+                        "metadata value too long: {} bytes (max {})",
+                        entry.value.len(),
+                        u16::MAX
+                    ),
+                });
+            }
+        }
+
         // Calculate total size
         let mut body_size = 1 + 2; // version + entry_count
         for entry in &self.entries {
@@ -326,5 +357,40 @@ mod tests {
     fn get_missing_key() {
         let blob = MetadataBlob::new();
         assert_eq!(blob.get("content-type"), None);
+    }
+
+    #[test]
+    fn serialize_rejects_oversized_value() {
+        let blob = MetadataBlob {
+            entries: vec![MetadataEntry {
+                key: "k".to_string(),
+                value: "x".repeat(u16::MAX as usize + 1),
+            }],
+        };
+        assert!(blob.serialize().is_err());
+    }
+
+    #[test]
+    fn serialize_rejects_oversized_key() {
+        let blob = MetadataBlob {
+            entries: vec![MetadataEntry {
+                key: "k".repeat(u16::MAX as usize + 1),
+                value: "v".to_string(),
+            }],
+        };
+        assert!(blob.serialize().is_err());
+    }
+
+    #[test]
+    fn serialize_accepts_max_u16_value() {
+        let blob = MetadataBlob {
+            entries: vec![MetadataEntry {
+                key: "k".to_string(),
+                value: "x".repeat(u16::MAX as usize),
+            }],
+        };
+        let data = blob.serialize().unwrap();
+        let (decoded, _) = MetadataBlob::deserialize(&data).unwrap();
+        assert_eq!(decoded.entries[0].value.len(), u16::MAX as usize);
     }
 }
