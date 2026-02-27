@@ -375,55 +375,22 @@ impl Coordinator {
         // 3. Read source data (full object: metadata blob + user data)
         let src_okh = object_key_hash(src_bucket, src_key);
         let version_id: u64 = 0;
-        let (src_metadata, user_data) = if src_record.total_size > 0 {
-            let total = src_record.total_size as usize;
-            let data = self
-                .read_range(src_pg, &src_okh, version_id, &src_record, 0, total - 1)
-                .map_err(|e| match e {
-                    ServerError::Store(storage::StoreError::NotFound) => {
-                        ServerError::ObjectNotFound {
-                            bucket: src_bucket.to_string(),
-                            key: src_key.to_string(),
-                        }
+        let total = src_record.total_size as usize;
+        let data = self
+            .read_range(src_pg, &src_okh, version_id, &src_record, 0, total - 1)
+            .map_err(|e| match e {
+                ServerError::Store(storage::StoreError::NotFound) => {
+                    ServerError::ObjectNotFound {
+                        bucket: src_bucket.to_string(),
+                        key: src_key.to_string(),
                     }
-                    other => other,
-                })?;
+                }
+                other => other,
+            })?;
 
-            let metadata_size = (src_record.total_size - src_record.size) as usize;
-            let (metadata, _) = MetadataBlob::deserialize(&data[..metadata_size])?;
-            let user_data = data[metadata_size..].to_vec();
-            (metadata, user_data)
-        } else {
-            // Legacy path: total_size == 0
-            let k = src_record.ec_k as usize;
-            let all_data_indices: Vec<usize> = (0..k).collect();
-            let (shard_data, shard_size) = self
-                .read_data_shards(src_pg, &src_okh, version_id, &src_record, &all_data_indices)
-                .map_err(|e| match e {
-                    ServerError::Store(storage::StoreError::NotFound) => {
-                        ServerError::ObjectNotFound {
-                            bucket: src_bucket.to_string(),
-                            key: src_key.to_string(),
-                        }
-                    }
-                    other => other,
-                })?;
-
-            let mut full_padded_data = Vec::with_capacity(k * shard_size);
-            for shard in &shard_data {
-                full_padded_data.extend_from_slice(shard);
-            }
-
-            let (metadata, blob_len) = MetadataBlob::deserialize(&full_padded_data)?;
-            let user_data_end = blob_len + src_record.size as usize;
-            if user_data_end > full_padded_data.len() {
-                return Err(ServerError::MetadataBlobError {
-                    reason: "data shorter than expected".to_string(),
-                });
-            }
-            let user_data = full_padded_data[blob_len..user_data_end].to_vec();
-            (metadata, user_data)
-        };
+        let metadata_size = (src_record.total_size - src_record.size) as usize;
+        let (src_metadata, _) = MetadataBlob::deserialize(&data[..metadata_size])?;
+        let user_data = data[metadata_size..].to_vec();
 
         // 4. Verify dest bucket exists
         self.head_bucket(dst_bucket)?;
@@ -679,60 +646,22 @@ impl Coordinator {
         let etag_str = format_etag(etag_crc);
         check_read_conditions(cond, &etag_str, record.last_modified)?;
 
-        if record.total_size > 0 {
-            // New path: use read_range to read only needed data shards
-            let total = record.total_size as usize;
-            let data = self
-                .read_range(pg, &okh, version_id, &record, 0, total - 1)
-                .map_err(|e| match e {
-                    ServerError::Store(storage::StoreError::NotFound) => {
-                        ServerError::ObjectNotFound {
-                            bucket: bucket.to_string(),
-                            key: key.to_string(),
-                        }
-                    }
-                    other => other,
-                })?;
-
-            let metadata_size = (record.total_size - record.size) as usize;
-            let (metadata, _) = MetadataBlob::deserialize(&data[..metadata_size])?;
-            let user_data = data[metadata_size..].to_vec();
-
-            return Ok(GetObjectResult {
-                data: user_data,
-                metadata,
-                etag: format_etag(etag_crc),
-                size: record.size,
-                last_modified: record.last_modified,
-            });
-        }
-
-        // Legacy path: total_size == 0, read all k data shards
-        let k = record.ec_k as usize;
-        let all_data_indices: Vec<usize> = (0..k).collect();
-        let (shard_data, shard_size) = self
-            .read_data_shards(pg, &okh, version_id, &record, &all_data_indices)
+        let total = record.total_size as usize;
+        let data = self
+            .read_range(pg, &okh, version_id, &record, 0, total - 1)
             .map_err(|e| match e {
-                ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
-                    bucket: bucket.to_string(),
-                    key: key.to_string(),
-                },
+                ServerError::Store(storage::StoreError::NotFound) => {
+                    ServerError::ObjectNotFound {
+                        bucket: bucket.to_string(),
+                        key: key.to_string(),
+                    }
+                }
                 other => other,
             })?;
 
-        let mut full_padded_data = Vec::with_capacity(k * shard_size);
-        for shard in &shard_data {
-            full_padded_data.extend_from_slice(shard);
-        }
-
-        let (metadata, blob_len) = MetadataBlob::deserialize(&full_padded_data)?;
-        let user_data_end = blob_len + record.size as usize;
-        if user_data_end > full_padded_data.len() {
-            return Err(ServerError::MetadataBlobError {
-                reason: "data shorter than expected".to_string(),
-            });
-        }
-        let user_data = full_padded_data[blob_len..user_data_end].to_vec();
+        let metadata_size = (record.total_size - record.size) as usize;
+        let (metadata, _) = MetadataBlob::deserialize(&data[..metadata_size])?;
+        let user_data = data[metadata_size..].to_vec();
 
         Ok(GetObjectResult {
             data: user_data,
@@ -745,8 +674,7 @@ impl Coordinator {
 
     /// Head object: returns metadata without body.
     ///
-    /// When total_size is known, reads only the shards covering the metadata blob.
-    /// Falls back to shard-0-first approach for legacy objects (total_size == 0).
+    /// Reads only the shards covering the metadata blob.
     pub fn head_object(
         &self,
         bucket: &str,
@@ -772,79 +700,20 @@ impl Coordinator {
         let etag_str = format_etag(etag_crc);
         check_read_conditions(cond, &etag_str, record.last_modified)?;
 
-        if record.total_size > 0 {
-            // New path: read only the metadata portion
-            let metadata_size = (record.total_size - record.size) as usize;
-            let data = self
-                .read_range(pg, &okh, version_id, &record, 0, metadata_size - 1)
-                .map_err(|e| match e {
-                    ServerError::Store(storage::StoreError::NotFound) => {
-                        ServerError::ObjectNotFound {
-                            bucket: bucket.to_string(),
-                            key: key.to_string(),
-                        }
+        let metadata_size = (record.total_size - record.size) as usize;
+        let data = self
+            .read_range(pg, &okh, version_id, &record, 0, metadata_size - 1)
+            .map_err(|e| match e {
+                ServerError::Store(storage::StoreError::NotFound) => {
+                    ServerError::ObjectNotFound {
+                        bucket: bucket.to_string(),
+                        key: key.to_string(),
                     }
-                    other => other,
-                })?;
-
-            let (metadata, _) = MetadataBlob::deserialize(&data)?;
-            return Ok(HeadObjectResult {
-                metadata,
-                etag: format_etag(etag_crc),
-                size: record.size,
-                last_modified: record.last_modified,
-            });
-        }
-
-        // Legacy path: total_size == 0, read shard 0 first
-        let (shards, shard_size) = self
-            .read_data_shards(pg, &okh, version_id, &record, &[0])
-            .map_err(|e| match e {
-                ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
-                    bucket: bucket.to_string(),
-                    key: key.to_string(),
-                },
+                }
                 other => other,
             })?;
 
-        let shard0 = &shards[0];
-        let k = record.ec_k as usize;
-
-        let need_more = if shard_size < 4 {
-            true
-        } else {
-            let blob_len =
-                u32::from_le_bytes([shard0[0], shard0[1], shard0[2], shard0[3]]) as usize;
-            blob_len > shard_size
-        };
-
-        if !need_more {
-            let (metadata, _) = MetadataBlob::deserialize(shard0)?;
-            return Ok(HeadObjectResult {
-                metadata,
-                etag: format_etag(etag_crc),
-                size: record.size,
-                last_modified: record.last_modified,
-            });
-        }
-
-        let all_data_indices: Vec<usize> = (0..k).collect();
-        let (shards, _) = self
-            .read_data_shards(pg, &okh, version_id, &record, &all_data_indices)
-            .map_err(|e| match e {
-                ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
-                    bucket: bucket.to_string(),
-                    key: key.to_string(),
-                },
-                other => other,
-            })?;
-
-        let mut combined = Vec::with_capacity(k * shard_size);
-        for shard in &shards {
-            combined.extend_from_slice(shard);
-        }
-
-        let (metadata, _) = MetadataBlob::deserialize(&combined)?;
+        let (metadata, _) = MetadataBlob::deserialize(&data)?;
         Ok(HeadObjectResult {
             metadata,
             etag: format_etag(etag_crc),
@@ -855,7 +724,7 @@ impl Coordinator {
 
     /// Get a byte range of an object from storage (for HTTP Range requests).
     ///
-    /// Returns 206 Partial Content data. Requires total_size to be set.
+    /// Returns 206 Partial Content data.
     pub fn get_object_range(
         &self,
         bucket: &str,
@@ -890,76 +759,36 @@ impl Coordinator {
                     total_size: record.size,
                 })?;
 
-        if record.total_size > 0 {
-            let metadata_size = (record.total_size - record.size) as usize;
+        let metadata_size = (record.total_size - record.size) as usize;
 
-            // Read metadata (always need it for response headers)
-            let meta_data = self
-                .read_range(pg, &okh, version_id, &record, 0, metadata_size - 1)
-                .map_err(|e| match e {
-                    ServerError::Store(storage::StoreError::NotFound) => {
-                        ServerError::ObjectNotFound {
-                            bucket: bucket.to_string(),
-                            key: key.to_string(),
-                        }
-                    }
-                    other => other,
-                })?;
-            let (metadata, _) = MetadataBlob::deserialize(&meta_data)?;
-
-            // Read user data range
-            let blob_start = metadata_size + user_start as usize;
-            let blob_end = metadata_size + user_end as usize;
-            let user_data = self
-                .read_range(pg, &okh, version_id, &record, blob_start, blob_end)
-                .map_err(|e| match e {
-                    ServerError::Store(storage::StoreError::NotFound) => {
-                        ServerError::ObjectNotFound {
-                            bucket: bucket.to_string(),
-                            key: key.to_string(),
-                        }
-                    }
-                    other => other,
-                })?;
-
-            return Ok(GetObjectRangeResult {
-                data: user_data,
-                metadata,
-                etag: format_etag(etag_crc),
-                size: record.size,
-                last_modified: record.last_modified,
-                range_start: user_start,
-                range_end: user_end,
-            });
-        }
-
-        // Legacy path: total_size == 0, fall back to full read
-        let k = record.ec_k as usize;
-        let all_data_indices: Vec<usize> = (0..k).collect();
-        let (shard_data, shard_size) = self
-            .read_data_shards(pg, &okh, version_id, &record, &all_data_indices)
+        // Read metadata (always need it for response headers)
+        let meta_data = self
+            .read_range(pg, &okh, version_id, &record, 0, metadata_size - 1)
             .map_err(|e| match e {
-                ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
-                    bucket: bucket.to_string(),
-                    key: key.to_string(),
-                },
+                ServerError::Store(storage::StoreError::NotFound) => {
+                    ServerError::ObjectNotFound {
+                        bucket: bucket.to_string(),
+                        key: key.to_string(),
+                    }
+                }
                 other => other,
             })?;
+        let (metadata, _) = MetadataBlob::deserialize(&meta_data)?;
 
-        let mut full_padded_data = Vec::with_capacity(k * shard_size);
-        for shard in &shard_data {
-            full_padded_data.extend_from_slice(shard);
-        }
-
-        let (metadata, blob_len) = MetadataBlob::deserialize(&full_padded_data)?;
-        let data_start = blob_len + user_start as usize;
-        let data_end = blob_len + user_end as usize;
-        if data_end >= full_padded_data.len() {
-            return Err(ServerError::MetadataBlobError {
-                reason: "data shorter than expected".to_string(),
-            });
-        }
-        let user_data = full_padded_data[data_start..=data_end].to_vec();
+        // Read user data range
+        let blob_start = metadata_size + user_start as usize;
+        let blob_end = metadata_size + user_end as usize;
+        let user_data = self
+            .read_range(pg, &okh, version_id, &record, blob_start, blob_end)
+            .map_err(|e| match e {
+                ServerError::Store(storage::StoreError::NotFound) => {
+                    ServerError::ObjectNotFound {
+                        bucket: bucket.to_string(),
+                        key: key.to_string(),
+                    }
+                }
+                other => other,
+            })?;
 
         Ok(GetObjectRangeResult {
             data: user_data,
