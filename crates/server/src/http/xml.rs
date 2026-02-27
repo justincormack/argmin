@@ -6,6 +6,21 @@ use storage::BucketInfo;
 
 use super::response::format_version_id;
 
+/// Format a POST Object 201 response XML.
+pub fn post_response_xml(bucket: &str, key: &str, etag: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <PostResponse>\
+         <Bucket>{}</Bucket>\
+         <Key>{}</Key>\
+         <ETag>{}</ETag>\
+         </PostResponse>",
+        xml_escape(bucket),
+        xml_escape(key),
+        xml_escape(etag),
+    )
+}
+
 /// Format an S3 error response XML.
 pub fn error_xml(code: &str, message: &str, resource: &str, request_id: &str) -> String {
     format!(

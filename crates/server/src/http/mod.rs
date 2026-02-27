@@ -1,4 +1,5 @@
 /// HTTP frontend: parses requests, authenticates, dispatches to coordinator.
+pub mod multipart;
 pub mod request;
 pub mod response;
 pub mod router;
@@ -282,6 +283,9 @@ impl HttpFrontend {
                 let state = self.coordinator.get_bucket_versioning(&bucket)?;
                 Ok(S3Response::get_bucket_versioning(state))
             }
+            S3Operation::PostObject { bucket } => {
+                self.handle_post_object(req, auth, &bucket)
+            }
             S3Operation::ListObjectVersions { bucket } => {
                 self.authorize_bucket_read(auth, &bucket)?;
                 let prefix = req.query_param("prefix");
@@ -403,6 +407,153 @@ impl HttpFrontend {
         } else {
             Err(ServerError::Auth(auth::AuthError::AccessDenied))
         }
+    }
+
+    fn handle_post_object(
+        &self,
+        req: &S3Request,
+        auth: &AuthContext,
+        bucket: &str,
+    ) -> Result<S3Response, ServerError> {
+        // Extract multipart boundary from Content-Type
+        let content_type = req.header("content-type").ok_or_else(|| {
+            ServerError::InvalidRequest {
+                reason: "POST Object requires Content-Type: multipart/form-data".to_string(),
+            }
+        })?;
+        let boundary =
+            multipart::extract_boundary(content_type).ok_or_else(|| {
+                ServerError::InvalidRequest {
+                    reason: "POST Object requires multipart/form-data with boundary".to_string(),
+                }
+            })?;
+
+        // Parse the multipart form
+        let form = multipart::parse_multipart(&req.body, boundary)?;
+
+        // Authenticate using form fields (SigV2 POST auth)
+        let post_auth = auth::authenticate_post(
+            form.field("AWSAccessKeyId"),
+            form.field("policy"),
+            form.field("signature"),
+            &self.credentials,
+        )
+        .map_err(|e| match e {
+            // Partial auth fields (e.g. AWSAccessKeyId present but no signature) = bad request
+            auth::AuthError::MissingAuth => ServerError::InvalidRequest {
+                reason: "missing required POST authentication fields".to_string(),
+            },
+            other => ServerError::Auth(other),
+        })?;
+
+        // Resolve object key (with ${filename} substitution) before policy validation
+        let key = form.resolve_key()?;
+
+        // Validate policy if present
+        if let Some(policy_b64) = form.field("policy") {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+
+            // Build form field pairs for policy validation, using the resolved key
+            let mut field_pairs: Vec<(&str, &str)> = form
+                .fields
+                .iter()
+                .filter(|(k, _)| !k.eq_ignore_ascii_case("key"))
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            field_pairs.push(("key", &key));
+
+            auth::validate_post_policy(
+                policy_b64,
+                &field_pairs,
+                form.file_data.len(),
+                bucket,
+                now,
+            )
+            .map_err(|e| match &e {
+                // Structural/format errors → 400
+                auth::PostPolicyError::Malformed(_) => ServerError::InvalidRequest {
+                    reason: e.to_string(),
+                },
+                // Content-length-range violations → 400
+                auth::PostPolicyError::ConditionFailed("content-length-range") => {
+                    ServerError::InvalidRequest {
+                        reason: e.to_string(),
+                    }
+                }
+                // Other condition failures and expiration → 403
+                auth::PostPolicyError::Expired | auth::PostPolicyError::ConditionFailed(_) => {
+                    ServerError::Auth(auth::AuthError::AccessDenied)
+                }
+            })?;
+        }
+
+        // Use POST auth context if authenticated, otherwise fall back to header auth
+        let effective_auth = if post_auth.mode != AuthMode::Anonymous {
+            &post_auth
+        } else {
+            auth
+        };
+
+        // Authorize write access
+        self.authorize_bucket_write(effective_auth, bucket)?;
+
+        // Verify checksum if provided
+        if let Some(checksum_b64) = form.field("x-amz-checksum-sha256") {
+            use base64::Engine;
+            let digest = ring::digest::digest(&ring::digest::SHA256, &form.file_data);
+            let actual_b64 =
+                base64::engine::general_purpose::STANDARD.encode(digest.as_ref());
+            if checksum_b64 != actual_b64 {
+                return Err(ServerError::InvalidRequest {
+                    reason: "checksum mismatch".to_string(),
+                });
+            }
+        }
+
+        // Build metadata headers from form fields
+        let mut header_pairs: Vec<(String, String)> = Vec::new();
+        if let Some(ct) = form.field("Content-Type") {
+            header_pairs.push(("content-type".to_string(), ct.to_string()));
+        }
+        // Pass through x-amz-meta-* fields
+        for (k, v) in &form.fields {
+            if k.to_ascii_lowercase().starts_with("x-amz-meta-") {
+                header_pairs.push((k.to_ascii_lowercase(), v.clone()));
+            }
+        }
+        // Also pass cache-control, content-disposition, etc.
+        for name in &[
+            "cache-control",
+            "content-disposition",
+            "content-encoding",
+            "content-language",
+            "expires",
+        ] {
+            if let Some(val) = form.field(name) {
+                header_pairs.push((name.to_string(), val.to_string()));
+            }
+        }
+        let hp_refs: Vec<(&str, &str)> = header_pairs
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+
+        // Call put_object (same as PUT)
+        let cond = crate::conditional::WriteCondition::default();
+        let result =
+            self.coordinator
+                .put_object(bucket, &key, &form.file_data, &hp_refs, &cond)?;
+
+        // Build response based on success_action_status
+        let success_status = form
+            .field("success_action_status")
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(204);
+
+        Ok(S3Response::post_object(&result, bucket, &key, success_status))
     }
 
     fn send_response(&self, request: tiny_http::Request, resp: S3Response) {

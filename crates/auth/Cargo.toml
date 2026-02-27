@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+base64 = "0.22"
 ring = "0.17"
+serde_json = "1"
 thiserror = "2"
 
 [dev-dependencies]

@@ -12,6 +12,7 @@ auth = { path = "../auth" }
 crc64 = { path = "../crc64" }
 ec = { path = "../ec" }
 storage = { path = "../storage" }
+base64 = "0.22"
 rapidhash = "1"
 ring = "0.17"
 thiserror = "2"

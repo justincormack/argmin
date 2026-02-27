@@ -66,6 +66,34 @@ impl S3Response {
         resp
     }
 
+    /// Build a response for a successful POST Object.
+    ///
+    /// `success_status`: one of 200, 201, 204 (default).
+    /// For 201, an XML body with bucket/key/etag is returned.
+    pub fn post_object(
+        result: &PutObjectResult,
+        bucket: &str,
+        key: &str,
+        success_status: u16,
+    ) -> Self {
+        let status = match success_status {
+            200 | 201 => success_status,
+            _ => 204,
+        };
+        let mut resp = if status == 201 {
+            let body = xml::post_response_xml(bucket, key, &result.etag);
+            Self::new(201).xml_body(body)
+        } else {
+            Self::new(status)
+        };
+        resp = resp.header("ETag", &result.etag);
+        if result.version_id != 0 {
+            let vid = format_version_id(result.version_id);
+            resp = resp.header("x-amz-version-id", &vid);
+        }
+        resp
+    }
+
     /// Build a response for a successful CopyObject.
     pub fn copy_object(result: &CopyObjectResult) -> Self {
         let body = xml::copy_object_result_xml(&result.etag, result.last_modified);

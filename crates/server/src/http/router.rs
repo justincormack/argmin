@@ -14,6 +14,7 @@ pub enum S3Operation {
     GetObject { bucket: String, key: String },
     DeleteObject { bucket: String, key: String },
     HeadObject { bucket: String, key: String },
+    PostObject { bucket: String },
     DeleteObjects { bucket: String },
     ListObjectVersions { bucket: String },
     PutBucketVersioning { bucket: String },
@@ -181,7 +182,9 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
                     bucket: bucket.to_string(),
                 })
             } else {
-                Err(ServerError::MethodNotAllowed)
+                Ok(S3Operation::PostObject {
+                    bucket: bucket.to_string(),
+                })
             }
         }
 
@@ -471,9 +474,19 @@ mod tests {
     }
 
     #[test]
-    fn post_without_delete_is_method_not_allowed() {
-        assert!(route("POST", "/mybucket", "").is_err());
-        assert!(route("POST", "/mybucket", "foo=bar").is_err());
+    fn post_object() {
+        assert_eq!(
+            route("POST", "/mybucket", "").unwrap(),
+            S3Operation::PostObject {
+                bucket: "mybucket".to_string()
+            }
+        );
+        assert_eq!(
+            route("POST", "/mybucket", "foo=bar").unwrap(),
+            S3Operation::PostObject {
+                bucket: "mybucket".to_string()
+            }
+        );
     }
 
     #[test]

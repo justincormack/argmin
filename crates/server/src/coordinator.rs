@@ -2470,7 +2470,8 @@ mod tests {
 
     #[test]
     fn shards_for_byte_range_zero_shard_size() {
-        assert_eq!(Coordinator::shards_for_byte_range(0, 10, 0, 4), vec![]);
+        let empty: Vec<usize> = vec![];
+        assert_eq!(Coordinator::shards_for_byte_range(0, 10, 0, 4), empty);
     }
 
     // ── range GET tests ────────────────────────────────────────────────
