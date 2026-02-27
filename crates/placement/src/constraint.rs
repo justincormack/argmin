@@ -1,6 +1,6 @@
-use std::sync::Arc;
 use crate::cluster::NodeInfo;
 use crate::topology::Level;
+use std::sync::Arc;
 
 pub type GroupKeyFn = dyn Fn(&NodeInfo) -> u64 + Send + Sync;
 pub type AdmitFn = dyn Fn(usize, &NodeInfo) -> Admission + Send + Sync;
@@ -55,7 +55,10 @@ impl PlacementConstraint {
     pub fn level_cap(level: Level, max: usize) -> Self {
         PlacementConstraint {
             group_key: Arc::new(move |node| {
-                node.location.level(level).map(|v| v as u64).unwrap_or(u64::MAX)
+                node.location
+                    .level(level)
+                    .map(|v| v as u64)
+                    .unwrap_or(u64::MAX)
             }),
             admit: Arc::new(move |same_group_count, new_node| {
                 if new_node.location.level(level).is_none() {

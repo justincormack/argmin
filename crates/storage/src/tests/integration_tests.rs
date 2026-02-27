@@ -34,7 +34,9 @@ fn shard_and_metadata_roundtrip() {
     assert_eq!(read.data, shard_data);
     assert_eq!(read.crc64, ack.crc64);
 
-    let obj = store.get_object_meta("test-bucket", "my/object.txt").unwrap();
+    let obj = store
+        .get_object_meta("test-bucket", "my/object.txt")
+        .unwrap();
     assert_eq!(obj.size, shard_data.len() as u64);
     assert_eq!(obj.etag, ack.crc64.to_be_bytes().to_vec());
 }

@@ -53,89 +53,6 @@ impl SqliteBucketDb {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::traits::GlobalService;
-
-    #[test]
-    fn connection_accessor() {
-        let db = SqliteBucketDb::open_in_memory().unwrap();
-        let _conn = db.connection();
-    }
-
-    #[test]
-    fn open_bad_path() {
-        let result = SqliteBucketDb::open(std::path::Path::new(
-            "/nonexistent/deeply/nested/path/db.sqlite",
-        ));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn list_buckets_multiple() {
-        let db = SqliteBucketDb::open_in_memory().unwrap();
-        db.create_bucket("alpha", 1).unwrap();
-        db.create_bucket("beta", 1).unwrap();
-        db.create_bucket("gamma", 1).unwrap();
-
-        let buckets = db.list_buckets(1).unwrap();
-        assert_eq!(buckets.len(), 3);
-        // Sorted by name
-        assert_eq!(buckets[0].name, "alpha");
-        assert_eq!(buckets[1].name, "beta");
-        assert_eq!(buckets[2].name, "gamma");
-        // All have correct owner
-        for b in &buckets {
-            assert_eq!(b.owner_id, 1);
-            assert_eq!(b.versioning, 0);
-            assert_eq!(b.region, 0);
-        }
-    }
-
-    #[test]
-    fn head_bucket_fields() {
-        let db = SqliteBucketDb::open_in_memory().unwrap();
-        db.create_bucket("test", 42).unwrap();
-
-        let info = db.head_bucket("test").unwrap();
-        assert_eq!(info.name, "test");
-        assert_eq!(info.owner_id, 42);
-        assert!(info.created_at > 0);
-        assert_eq!(info.region, 0);
-        assert_eq!(info.versioning, 0);
-    }
-
-    #[test]
-    fn head_bucket_not_found() {
-        let db = SqliteBucketDb::open_in_memory().unwrap();
-        let err = db.head_bucket("nope").unwrap_err();
-        assert!(matches!(err, MetadataError::BucketNotFound { .. }));
-    }
-
-    #[test]
-    fn list_buckets_by_owner() {
-        let db = SqliteBucketDb::open_in_memory().unwrap();
-        db.create_bucket("owner1-b", 1).unwrap();
-        db.create_bucket("owner2-b", 2).unwrap();
-
-        let b1 = db.list_buckets(1).unwrap();
-        assert_eq!(b1.len(), 1);
-        assert_eq!(b1[0].name, "owner1-b");
-
-        let b2 = db.list_buckets(2).unwrap();
-        assert_eq!(b2.len(), 1);
-        assert_eq!(b2[0].name, "owner2-b");
-    }
-
-    #[test]
-    fn delete_nonexistent_bucket() {
-        let db = SqliteBucketDb::open_in_memory().unwrap();
-        let err = db.delete_bucket("nope").unwrap_err();
-        assert!(matches!(err, MetadataError::BucketNotFound { .. }));
-    }
-}
-
 impl GlobalService for SqliteBucketDb {
     fn create_bucket(&self, name: &str, owner_id: u64) -> Result<(), MetadataError> {
         let now = std::time::SystemTime::now()
@@ -259,5 +176,88 @@ impl GlobalService for SqliteBucketDb {
         }
 
         Ok(buckets)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::traits::GlobalService;
+
+    #[test]
+    fn connection_accessor() {
+        let db = SqliteBucketDb::open_in_memory().unwrap();
+        let _conn = db.connection();
+    }
+
+    #[test]
+    fn open_bad_path() {
+        let result = SqliteBucketDb::open(std::path::Path::new(
+            "/nonexistent/deeply/nested/path/db.sqlite",
+        ));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn list_buckets_multiple() {
+        let db = SqliteBucketDb::open_in_memory().unwrap();
+        db.create_bucket("alpha", 1).unwrap();
+        db.create_bucket("beta", 1).unwrap();
+        db.create_bucket("gamma", 1).unwrap();
+
+        let buckets = db.list_buckets(1).unwrap();
+        assert_eq!(buckets.len(), 3);
+        // Sorted by name
+        assert_eq!(buckets[0].name, "alpha");
+        assert_eq!(buckets[1].name, "beta");
+        assert_eq!(buckets[2].name, "gamma");
+        // All have correct owner
+        for b in &buckets {
+            assert_eq!(b.owner_id, 1);
+            assert_eq!(b.versioning, 0);
+            assert_eq!(b.region, 0);
+        }
+    }
+
+    #[test]
+    fn head_bucket_fields() {
+        let db = SqliteBucketDb::open_in_memory().unwrap();
+        db.create_bucket("test", 42).unwrap();
+
+        let info = db.head_bucket("test").unwrap();
+        assert_eq!(info.name, "test");
+        assert_eq!(info.owner_id, 42);
+        assert!(info.created_at > 0);
+        assert_eq!(info.region, 0);
+        assert_eq!(info.versioning, 0);
+    }
+
+    #[test]
+    fn head_bucket_not_found() {
+        let db = SqliteBucketDb::open_in_memory().unwrap();
+        let err = db.head_bucket("nope").unwrap_err();
+        assert!(matches!(err, MetadataError::BucketNotFound { .. }));
+    }
+
+    #[test]
+    fn list_buckets_by_owner() {
+        let db = SqliteBucketDb::open_in_memory().unwrap();
+        db.create_bucket("owner1-b", 1).unwrap();
+        db.create_bucket("owner2-b", 2).unwrap();
+
+        let b1 = db.list_buckets(1).unwrap();
+        assert_eq!(b1.len(), 1);
+        assert_eq!(b1[0].name, "owner1-b");
+
+        let b2 = db.list_buckets(2).unwrap();
+        assert_eq!(b2.len(), 1);
+        assert_eq!(b2[0].name, "owner2-b");
+    }
+
+    #[test]
+    fn delete_nonexistent_bucket() {
+        let db = SqliteBucketDb::open_in_memory().unwrap();
+        let err = db.delete_bucket("nope").unwrap_err();
+        assert!(matches!(err, MetadataError::BucketNotFound { .. }));
     }
 }

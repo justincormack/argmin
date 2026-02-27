@@ -41,9 +41,7 @@ pub fn read_condition_from_headers(req: &S3Request) -> ReadCondition {
 
 /// Extract write conditions from an S3 request's headers.
 pub fn write_condition_from_headers(req: &S3Request) -> WriteCondition {
-    let if_none_match_any = req
-        .header("if-none-match")
-        .is_some_and(|s| s.trim() == "*");
+    let if_none_match_any = req.header("if-none-match").is_some_and(|s| s.trim() == "*");
     WriteCondition {
         if_match: req.header("if-match").map(str::to_string),
         if_none_match_any,
@@ -183,10 +181,7 @@ pub fn check_write_conditions(
 /// # Errors
 ///
 /// Returns `PreconditionFailed` (412) if the etag does not match.
-pub fn check_delete_conditions(
-    cond: &DeleteCondition,
-    etag: &str,
-) -> Result<(), ServerError> {
+pub fn check_delete_conditions(cond: &DeleteCondition, etag: &str) -> Result<(), ServerError> {
     if let Some(ref required_etag) = cond.if_match {
         if required_etag.trim() == "*" {
             return Ok(());
@@ -201,9 +196,7 @@ pub fn check_delete_conditions(
 /// Extract copy-source conditions from an S3 request's `x-amz-copy-source-if-*` headers.
 pub fn copy_source_condition_from_headers(req: &S3Request) -> ReadCondition {
     ReadCondition {
-        if_match: req
-            .header("x-amz-copy-source-if-match")
-            .map(str::to_string),
+        if_match: req.header("x-amz-copy-source-if-match").map(str::to_string),
         if_none_match: req
             .header("x-amz-copy-source-if-none-match")
             .map(str::to_string),
@@ -399,8 +392,7 @@ mod tests {
             if_none_match_any: true,
             ..Default::default()
         };
-        let err =
-            check_write_conditions(&cond, Some(&test_etag())).unwrap_err();
+        let err = check_write_conditions(&cond, Some(&test_etag())).unwrap_err();
         assert!(matches!(err, ServerError::PreconditionFailed));
     }
 
@@ -428,8 +420,7 @@ mod tests {
             if_match: Some(other_etag()),
             ..Default::default()
         };
-        let err =
-            check_write_conditions(&cond, Some(&test_etag())).unwrap_err();
+        let err = check_write_conditions(&cond, Some(&test_etag())).unwrap_err();
         assert!(matches!(err, ServerError::PreconditionFailed));
     }
 

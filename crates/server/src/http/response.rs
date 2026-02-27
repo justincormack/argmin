@@ -1,7 +1,7 @@
 /// Build HTTP responses for S3 operations.
 use crate::coordinator::{
-    CopyObjectResult, DeleteObjectsResult, GetObjectRangeResult, GetObjectResult,
-    HeadObjectResult, ListObjectsResult, PutObjectResult,
+    CopyObjectResult, DeleteObjectsResult, GetObjectRangeResult, GetObjectResult, HeadObjectResult,
+    ListObjectsResult, PutObjectResult,
 };
 use crate::error::ServerError;
 use storage::BucketInfo;
@@ -116,6 +116,15 @@ impl S3Response {
         if let Some(cc) = result.metadata.get("cache-control") {
             resp = resp.header("Cache-Control", cc);
         }
+        if let Some(cd) = result.metadata.get("content-disposition") {
+            resp = resp.header("Content-Disposition", cd);
+        }
+        if let Some(cl) = result.metadata.get("content-language") {
+            resp = resp.header("Content-Language", cl);
+        }
+        if let Some(ex) = result.metadata.get("expires") {
+            resp = resp.header("Expires", ex);
+        }
 
         for entry in &result.metadata.entries {
             if entry.key.starts_with("x-amz-meta-") {
@@ -171,7 +180,12 @@ impl S3Response {
     /// Build a 416 Range Not Satisfiable response.
     pub fn range_not_satisfiable(total_size: u64) -> Self {
         let content_range = format!("bytes */{}", total_size);
-        let body = xml::error_xml("InvalidRange", "The requested range is not satisfiable", "", "request-id");
+        let body = xml::error_xml(
+            "InvalidRange",
+            "The requested range is not satisfiable",
+            "",
+            "request-id",
+        );
         Self::new(416)
             .header("Content-Range", &content_range)
             .xml_body(body)
@@ -205,14 +219,29 @@ impl S3Response {
     }
 
     /// Build a response for ListObjectsV2.
+    #[allow(clippy::too_many_arguments)]
     pub fn list_objects_v2(
         bucket: &str,
         prefix: Option<&str>,
         delimiter: Option<&str>,
+        encoding_type: Option<&str>,
+        continuation_token: Option<&str>,
+        start_after: Option<&str>,
+        fetch_owner: bool,
         max_keys: u32,
         result: &ListObjectsResult,
     ) -> Self {
-        let body = xml::list_objects_v2_xml(bucket, prefix, delimiter, max_keys, result);
+        let body = xml::list_objects_v2_xml(
+            bucket,
+            prefix,
+            delimiter,
+            encoding_type,
+            continuation_token,
+            start_after,
+            fetch_owner,
+            max_keys,
+            result,
+        );
         Self::new(200).xml_body(body)
     }
 
@@ -222,17 +251,25 @@ impl S3Response {
         prefix: Option<&str>,
         delimiter: Option<&str>,
         marker: Option<&str>,
+        encoding_type: Option<&str>,
         max_keys: u32,
         result: &ListObjectsResult,
     ) -> Self {
-        let body = xml::list_objects_v1_xml(bucket, prefix, delimiter, marker, max_keys, result);
+        let body = xml::list_objects_v1_xml(
+            bucket,
+            prefix,
+            delimiter,
+            marker,
+            encoding_type,
+            max_keys,
+            result,
+        );
         Self::new(200).xml_body(body)
     }
 
     /// Build a response for DeleteObjects (batch delete).
     pub fn delete_objects(result: &DeleteObjectsResult, quiet: bool) -> Self {
-        let body =
-            xml::delete_objects_result_xml(&result.deleted, &result.errors, quiet);
+        let body = xml::delete_objects_result_xml(&result.deleted, &result.errors, quiet);
         Self::new(200).xml_body(body)
     }
 
@@ -244,8 +281,7 @@ impl S3Response {
         max_keys: u32,
         result: &ListObjectsResult,
     ) -> Self {
-        let body =
-            xml::list_object_versions_xml(bucket, prefix, key_marker, max_keys, result);
+        let body = xml::list_object_versions_xml(bucket, prefix, key_marker, max_keys, result);
         Self::new(200).xml_body(body)
     }
 
@@ -271,12 +307,18 @@ impl S3Response {
 
     /// Build an error response.
     pub fn error(err: &ServerError, resource: &str) -> Self {
-        let body = xml::error_xml(
-            err.s3_error_code(),
-            &err.to_string(),
-            resource,
-            "request-id",
-        );
+        let fallback;
+        let message = match err {
+            ServerError::InvalidRequest { reason } => reason.as_str(),
+            ServerError::InvalidArgument { reason } => reason.as_str(),
+            ServerError::InvalidBucketName { reason } => reason.as_str(),
+            ServerError::MetadataBlobError { reason } => reason.as_str(),
+            _ => {
+                fallback = err.to_string();
+                fallback.as_str()
+            }
+        };
+        let body = xml::error_xml(err.s3_error_code(), message, resource, "request-id");
         Self::new(err.http_status()).xml_body(body)
     }
 }
@@ -295,8 +337,7 @@ fn format_http_date(millis: u64) -> String {
 
     let (year, month, day) = days_to_date(days_since_epoch as i64);
     let months = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov",
-        "Dec",
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
 
     format!(
@@ -353,7 +394,8 @@ pub(crate) fn parse_http_date(s: &str) -> Option<u64> {
     }
 
     #[allow(clippy::cast_sign_loss)]
-    let secs = date_to_days(year, month, day) as u64 * 86400 + hours * 3600 + minutes * 60 + seconds;
+    let secs =
+        date_to_days(year, month, day) as u64 * 86400 + hours * 3600 + minutes * 60 + seconds;
     Some(secs * 1000)
 }
 
@@ -508,12 +550,30 @@ mod tests {
             data: vec![],
             metadata: MetadataBlob {
                 entries: vec![
-                    MetadataEntry { key: "content-type".into(), value: "text/html".into() },
-                    MetadataEntry { key: "content-encoding".into(), value: "gzip".into() },
-                    MetadataEntry { key: "cache-control".into(), value: "max-age=3600".into() },
-                    MetadataEntry { key: "content-disposition".into(), value: "attachment".into() },
-                    MetadataEntry { key: "content-language".into(), value: "en-US".into() },
-                    MetadataEntry { key: "expires".into(), value: "Thu, 01 Jan 2099 00:00:00 GMT".into() },
+                    MetadataEntry {
+                        key: "content-type".into(),
+                        value: "text/html".into(),
+                    },
+                    MetadataEntry {
+                        key: "content-encoding".into(),
+                        value: "gzip".into(),
+                    },
+                    MetadataEntry {
+                        key: "cache-control".into(),
+                        value: "max-age=3600".into(),
+                    },
+                    MetadataEntry {
+                        key: "content-disposition".into(),
+                        value: "attachment".into(),
+                    },
+                    MetadataEntry {
+                        key: "content-language".into(),
+                        value: "en-US".into(),
+                    },
+                    MetadataEntry {
+                        key: "expires".into(),
+                        value: "Thu, 01 Jan 2099 00:00:00 GMT".into(),
+                    },
                 ],
             },
             etag: "\"e\"".into(),
@@ -524,9 +584,15 @@ mod tests {
         assert_eq!(find_header(&resp, "Content-Type"), Some("text/html"));
         assert_eq!(find_header(&resp, "Content-Encoding"), Some("gzip"));
         assert_eq!(find_header(&resp, "Cache-Control"), Some("max-age=3600"));
-        assert_eq!(find_header(&resp, "Content-Disposition"), Some("attachment"));
+        assert_eq!(
+            find_header(&resp, "Content-Disposition"),
+            Some("attachment")
+        );
         assert_eq!(find_header(&resp, "Content-Language"), Some("en-US"));
-        assert_eq!(find_header(&resp, "Expires"), Some("Thu, 01 Jan 2099 00:00:00 GMT"));
+        assert_eq!(
+            find_header(&resp, "Expires"),
+            Some("Thu, 01 Jan 2099 00:00:00 GMT")
+        );
     }
 
     // ── head_object ───────────────────────────────────────────────────
@@ -572,8 +638,14 @@ mod tests {
         let result = HeadObjectResult {
             metadata: MetadataBlob {
                 entries: vec![
-                    MetadataEntry { key: "content-encoding".into(), value: "br".into() },
-                    MetadataEntry { key: "cache-control".into(), value: "no-cache".into() },
+                    MetadataEntry {
+                        key: "content-encoding".into(),
+                        value: "br".into(),
+                    },
+                    MetadataEntry {
+                        key: "cache-control".into(),
+                        value: "no-cache".into(),
+                    },
                 ],
             },
             etag: "\"e\"".into(),
@@ -656,10 +728,7 @@ mod tests {
         }];
         let resp = S3Response::list_buckets(&buckets);
         assert_eq!(resp.status_code, 200);
-        assert_eq!(
-            find_header(&resp, "Content-Type"),
-            Some("application/xml")
-        );
+        assert_eq!(find_header(&resp, "Content-Type"), Some("application/xml"));
         let body = String::from_utf8(resp.body).unwrap();
         assert!(body.contains("<?xml"));
         assert!(body.contains("test-bucket"));
@@ -680,8 +749,19 @@ mod tests {
             common_prefixes: vec![],
             is_truncated: false,
             next_continuation_token: None,
+            owner_id: 1,
         };
-        let resp = S3Response::list_objects_v2("bucket", Some("pre"), None, 1000, &result);
+        let resp = S3Response::list_objects_v2(
+            "bucket",
+            Some("pre"),
+            None,
+            None,
+            None,
+            None,
+            false,
+            1000,
+            &result,
+        );
         assert_eq!(resp.status_code, 200);
         let body = String::from_utf8(resp.body).unwrap();
         assert!(body.contains("ListBucketResult"));
@@ -703,9 +783,10 @@ mod tests {
             common_prefixes: vec![],
             is_truncated: false,
             next_continuation_token: None,
+            owner_id: 1,
         };
         let resp =
-            S3Response::list_objects_v1("bucket", Some("pre"), None, None, 1000, &result);
+            S3Response::list_objects_v1("bucket", Some("pre"), None, None, None, 1000, &result);
         assert_eq!(resp.status_code, 200);
         let body = String::from_utf8(resp.body).unwrap();
         assert!(body.contains("ListBucketResult"));
@@ -747,10 +828,7 @@ mod tests {
     fn error_response_has_xml_content_type() {
         let err = ServerError::MethodNotAllowed;
         let resp = S3Response::error(&err, "/");
-        assert_eq!(
-            find_header(&resp, "Content-Type"),
-            Some("application/xml")
-        );
+        assert_eq!(find_header(&resp, "Content-Type"), Some("application/xml"));
     }
 
     // ── delete_objects ───────────────────────────────────────────────
@@ -767,10 +845,7 @@ mod tests {
         };
         let resp = S3Response::delete_objects(&result, false);
         assert_eq!(resp.status_code, 200);
-        assert_eq!(
-            find_header(&resp, "Content-Type"),
-            Some("application/xml")
-        );
+        assert_eq!(find_header(&resp, "Content-Type"), Some("application/xml"));
         let body = String::from_utf8(resp.body).unwrap();
         assert!(body.contains("DeleteResult"));
         assert!(body.contains("key1"));
@@ -790,6 +865,7 @@ mod tests {
             common_prefixes: vec![],
             is_truncated: false,
             next_continuation_token: None,
+            owner_id: 1,
         };
         let resp = S3Response::list_object_versions("bucket", None, None, 1000, &result);
         assert_eq!(resp.status_code, 200);
@@ -863,10 +939,7 @@ mod tests {
     fn precondition_failed_response_412() {
         let resp = S3Response::precondition_failed();
         assert_eq!(resp.status_code, 412);
-        assert_eq!(
-            find_header(&resp, "Content-Type"),
-            Some("application/xml")
-        );
+        assert_eq!(find_header(&resp, "Content-Type"), Some("application/xml"));
         let body = String::from_utf8(resp.body).unwrap();
         assert!(body.contains("PreconditionFailed"));
     }

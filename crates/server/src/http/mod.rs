@@ -13,8 +13,8 @@ use crate::conditional::{
     copy_source_condition_from_headers, delete_condition_from_headers, read_condition_from_headers,
     write_condition_from_headers,
 };
-use crate::coordinator::MetadataDirective;
 use crate::coordinator::Coordinator;
+use crate::coordinator::MetadataDirective;
 use crate::error::ServerError;
 use request::S3Request;
 use response::S3Response;
@@ -42,7 +42,10 @@ impl HttpFrontend {
 
         match result {
             Ok(resp) => self.send_response(request, resp),
-            Err(ServerError::NotModified { ref etag, last_modified }) => {
+            Err(ServerError::NotModified {
+                ref etag,
+                last_modified,
+            }) => {
                 let resp = S3Response::not_modified(etag, last_modified);
                 self.send_response(request, resp);
             }
@@ -84,12 +87,16 @@ impl HttpFrontend {
             }
             S3Operation::ListObjectsV1 { bucket } => {
                 let prefix = req.query_param("prefix");
-                let delimiter = req.query_param("delimiter");
+                let delimiter = req.query_param("delimiter").filter(|d| !d.is_empty());
                 let marker = req.query_param("marker");
-                let max_keys: u32 = req
-                    .query_param("max-keys")
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(1000);
+                let encoding_type = req.query_param("encoding-type");
+                let allow_unordered = req.query_param("allow-unordered");
+                if allow_unordered.is_some() && delimiter.is_some() {
+                    return Err(ServerError::InvalidArgument {
+                        reason: "allow-unordered is not supported with delimiter".to_string(),
+                    });
+                }
+                let max_keys: u32 = parse_max_keys(req.query_param("max-keys"))?;
 
                 let result = self.coordinator.list_objects_v2(
                     &bucket,
@@ -103,32 +110,49 @@ impl HttpFrontend {
                     prefix.as_deref(),
                     delimiter.as_deref(),
                     marker.as_deref(),
+                    encoding_type.as_deref(),
                     max_keys,
                     &result,
                 ))
             }
             S3Operation::ListObjectsV2 { bucket } => {
                 let prefix = req.query_param("prefix");
-                let delimiter = req.query_param("delimiter");
-                let continuation_token = req
-                    .query_param("continuation-token")
-                    .or_else(|| req.query_param("start-after"));
-                let max_keys: u32 = req
-                    .query_param("max-keys")
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(1000);
+                let delimiter = req.query_param("delimiter").filter(|d| !d.is_empty());
+                let encoding_type = req.query_param("encoding-type");
+                let fetch_owner = req
+                    .query_param("fetch-owner")
+                    .map(|v| v == "true" || v == "1" || v == "True")
+                    .unwrap_or(false);
+                let allow_unordered = req.query_param("allow-unordered");
+                if allow_unordered.is_some() && delimiter.is_some() {
+                    return Err(ServerError::InvalidArgument {
+                        reason: "allow-unordered is not supported with delimiter".to_string(),
+                    });
+                }
+
+                let continuation_token_raw = req.query_param("continuation-token");
+                let start_after_raw = req.query_param("start-after");
+                let continuation_token = continuation_token_raw
+                    .as_deref()
+                    .or(start_after_raw.as_deref())
+                    .filter(|v| !v.is_empty());
+                let max_keys: u32 = parse_max_keys(req.query_param("max-keys"))?;
 
                 let result = self.coordinator.list_objects_v2(
                     &bucket,
                     prefix.as_deref(),
                     delimiter.as_deref(),
-                    continuation_token.as_deref(),
+                    continuation_token,
                     max_keys,
                 )?;
                 Ok(S3Response::list_objects_v2(
                     &bucket,
                     prefix.as_deref(),
                     delimiter.as_deref(),
+                    encoding_type.as_deref(),
+                    continuation_token_raw.as_deref(),
+                    start_after_raw.as_deref(),
+                    fetch_owner,
                     max_keys,
                     &result,
                 ))
@@ -136,14 +160,11 @@ impl HttpFrontend {
             S3Operation::PutObject { bucket, key } => {
                 if let Some(copy_source) = req.header("x-amz-copy-source") {
                     // CopyObject path
-                    let (src_bucket, src_key) =
-                        request::parse_copy_source(copy_source)?;
+                    let (src_bucket, src_key) = request::parse_copy_source(copy_source)?;
                     let src_cond = copy_source_condition_from_headers(req);
                     let dst_cond = write_condition_from_headers(req);
                     let directive = match req.header("x-amz-metadata-directive") {
-                        Some(d) if d.eq_ignore_ascii_case("REPLACE") => {
-                            MetadataDirective::Replace
-                        }
+                        Some(d) if d.eq_ignore_ascii_case("REPLACE") => MetadataDirective::Replace,
                         _ => MetadataDirective::Copy,
                     };
                     let header_pairs: Vec<(&str, &str)> = req
@@ -293,8 +314,8 @@ impl HttpFrontend {
     }
 
     fn send_response(&self, request: tiny_http::Request, resp: S3Response) {
-        let mut response = Response::from_data(resp.body)
-            .with_status_code(StatusCode(resp.status_code));
+        let mut response =
+            Response::from_data(resp.body).with_status_code(StatusCode(resp.status_code));
 
         for (name, value) in &resp.headers {
             if let Ok(header) = Header::from_bytes(name.as_bytes(), value.as_bytes()) {
@@ -303,5 +324,14 @@ impl HttpFrontend {
         }
 
         let _ = request.respond(response);
+    }
+}
+
+fn parse_max_keys(raw: Option<String>) -> Result<u32, ServerError> {
+    match raw {
+        None => Ok(1000),
+        Some(s) => s.parse::<u32>().map_err(|_| ServerError::InvalidArgument {
+            reason: "invalid max-keys".to_string(),
+        }),
     }
 }

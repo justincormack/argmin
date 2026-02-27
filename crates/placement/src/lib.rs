@@ -1,15 +1,15 @@
-pub mod topology;
 pub mod cluster;
 pub mod config;
 pub mod constraint;
 mod hash;
 mod placer;
+pub mod topology;
 
-pub use topology::{Level, TopologyKey, TopologyError};
-pub use cluster::{NodeId, NodeInfo, ClusterMap};
+pub use cluster::{ClusterMap, NodeId, NodeInfo};
 pub use config::{PlacementConfig, PlacementError};
 pub use constraint::{Admission, PlacementConstraint};
 pub use placer::Placer;
+pub use topology::{Level, TopologyError, TopologyKey};
 
 /// Maximum number of shards supported by the placement engine.
 /// Stack arrays in `place()` are sized to this constant.

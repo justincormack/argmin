@@ -60,6 +60,19 @@ impl LocalStorageNode {
     }
 }
 
+impl StorageNode for LocalStorageNode {
+    fn get_pg_store(&self, pg_id: u32) -> Result<&dyn ShardStore, StoreError> {
+        self.stores
+            .get(&pg_id)
+            .map(|s| s as &dyn ShardStore)
+            .ok_or(StoreError::PgNotFound { pg_id })
+    }
+
+    fn pg_ids(&self) -> &[u32] {
+        &self.pg_id_list
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,18 +107,5 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let node = LocalStorageNode::open(tmp.path(), &[5, 2, 8, 1]).unwrap();
         assert_eq!(node.pg_ids(), &[1, 2, 5, 8]);
-    }
-}
-
-impl StorageNode for LocalStorageNode {
-    fn get_pg_store(&self, pg_id: u32) -> Result<&dyn ShardStore, StoreError> {
-        self.stores
-            .get(&pg_id)
-            .map(|s| s as &dyn ShardStore)
-            .ok_or(StoreError::PgNotFound { pg_id })
-    }
-
-    fn pg_ids(&self) -> &[u32] {
-        &self.pg_id_list
     }
 }

@@ -8,7 +8,7 @@ pub struct SecretKey(pub String);
 #[derive(Debug, Clone)]
 pub struct CredentialScope {
     pub access_key_id: String,
-    pub date: String,    // YYYYMMDD
+    pub date: String, // YYYYMMDD
     pub region: String,
     pub service: String, // "s3"
 }

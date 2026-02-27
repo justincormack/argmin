@@ -34,7 +34,9 @@ fn metadata_put_get_delete(store: &dyn PgMetadataStore) {
     // Delete
     store.delete_object_meta("test-bucket", "test-key").unwrap();
 
-    let err = store.get_object_meta("test-bucket", "test-key").unwrap_err();
+    let err = store
+        .get_object_meta("test-bucket", "test-key")
+        .unwrap_err();
     assert!(matches!(err, crate::MetadataError::ObjectNotFound));
 }
 
@@ -71,9 +73,7 @@ fn metadata_put_overwrites(store: &dyn PgMetadataStore) {
 }
 
 fn metadata_get_nonexistent(store: &dyn PgMetadataStore) {
-    let err = store
-        .get_object_meta("no-bucket", "no-key")
-        .unwrap_err();
+    let err = store.get_object_meta("no-bucket", "no-key").unwrap_err();
     assert!(matches!(err, crate::MetadataError::ObjectNotFound));
 }
 

@@ -158,6 +158,21 @@ pub struct PutObjectMetaReq {
     pub ec_m: u8,
 }
 
+/// Request to list objects in a PG.
+pub struct ListObjectsReq {
+    pub bucket: String,
+    pub prefix: Option<String>,
+    pub start_after: Option<String>,
+    pub max_keys: u32,
+}
+
+/// Response from a list objects query.
+pub struct ListObjectsResp {
+    pub objects: Vec<ObjectRecord>,
+    pub is_truncated: bool,
+    pub next_start_after: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,19 +254,4 @@ mod tests {
             prop_assert_eq!(&hex[..2], &key.hex_prefix());
         }
     }
-}
-
-/// Request to list objects in a PG.
-pub struct ListObjectsReq {
-    pub bucket: String,
-    pub prefix: Option<String>,
-    pub start_after: Option<String>,
-    pub max_keys: u32,
-}
-
-/// Response from a list objects query.
-pub struct ListObjectsResp {
-    pub objects: Vec<ObjectRecord>,
-    pub is_truncated: bool,
-    pub next_start_after: Option<String>,
 }

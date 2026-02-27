@@ -9,9 +9,11 @@ const MAX_BODY_SIZE: usize = 256 * 1024 * 1024 + 64 * 1024;
 
 /// Validate a Content-Length header value. Rejects negative and non-numeric values.
 fn validate_content_length(value: &str) -> Result<u64, ServerError> {
-    value.parse::<u64>().map_err(|_| ServerError::InvalidRequest {
-        reason: format!("invalid Content-Length: {}", value),
-    })
+    value
+        .parse::<u64>()
+        .map_err(|_| ServerError::InvalidRequest {
+            reason: format!("invalid Content-Length: {}", value),
+        })
 }
 
 /// Parsed S3 request data extracted from an HTTP request.
@@ -139,8 +141,8 @@ impl S3Request {
     }
 }
 
-/// Percent-decode a string (RFC 3986). Does NOT treat + as space.
-pub(crate) fn percent_decode(s: &str) -> String {
+/// Percent-decode a string (RFC 3986) into raw bytes. Does NOT treat + as space.
+pub(crate) fn percent_decode_bytes(s: &str) -> Vec<u8> {
     let mut result = Vec::with_capacity(s.len());
     let bytes = s.as_bytes();
     let mut i = 0;
@@ -155,7 +157,20 @@ pub(crate) fn percent_decode(s: &str) -> String {
         result.push(bytes[i]);
         i += 1;
     }
-    String::from_utf8_lossy(&result).to_string()
+    result
+}
+
+/// Percent-decode a string (RFC 3986) into UTF-8, rejecting invalid sequences.
+pub(crate) fn percent_decode_strict(s: &str) -> Result<String, ServerError> {
+    let bytes = percent_decode_bytes(s);
+    String::from_utf8(bytes).map_err(|_| ServerError::InvalidRequest {
+        reason: "Couldn't parse the specified URI.".to_string(),
+    })
+}
+
+/// Percent-decode a string (RFC 3986). Does NOT treat + as space.
+pub(crate) fn percent_decode(s: &str) -> String {
+    String::from_utf8_lossy(&percent_decode_bytes(s)).to_string()
 }
 
 /// Parse the `x-amz-copy-source` header value into `(bucket, key)`.
@@ -209,12 +224,10 @@ mod tests {
             method: "PUT".to_string(),
             path: "/bucket/key".to_string(),
             query_string: String::new(),
-            headers: vec![
-                (
-                    "x-amz-content-sha256".to_string(),
-                    "UNSIGNED-PAYLOAD".to_string(),
-                ),
-            ],
+            headers: vec![(
+                "x-amz-content-sha256".to_string(),
+                "UNSIGNED-PAYLOAD".to_string(),
+            )],
             body: b"some data".to_vec(),
         };
         assert_eq!(req.body_hash(), "UNSIGNED-PAYLOAD");
@@ -226,10 +239,7 @@ mod tests {
             method: "PUT".to_string(),
             path: "/bucket/key".to_string(),
             query_string: String::new(),
-            headers: vec![(
-                "x-amz-content-sha256".to_string(),
-                "abc123".to_string(),
-            )],
+            headers: vec![("x-amz-content-sha256".to_string(), "abc123".to_string())],
             body: b"data".to_vec(),
         };
         assert_eq!(req.body_hash(), "abc123");

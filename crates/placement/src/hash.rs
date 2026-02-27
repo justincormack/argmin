@@ -1,5 +1,5 @@
-use rapidhash::v3::{RapidSecrets, RapidStreamHasherV3};
 use crate::cluster::NodeId;
+use rapidhash::v3::{RapidSecrets, RapidStreamHasherV3};
 
 /// Fixed secrets for placement hashing. Using a constant seed gives stable,
 /// reproducible output across all invocations and all platforms.

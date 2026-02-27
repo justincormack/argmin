@@ -1,6 +1,7 @@
 /// Hand-formatted XML for S3 responses. No XML library dependency.
 use crate::coordinator::{DeleteError, DeletedObject, ListObjectsResult};
 use crate::error::ServerError;
+use auth::canonical::uri_encode_path;
 use storage::BucketInfo;
 
 /// Format an S3 error response XML.
@@ -45,10 +46,15 @@ pub fn list_buckets_xml(buckets: &[BucketInfo], owner_id: &str) -> String {
 }
 
 /// Format a ListBucketResult (ListObjectsV2) XML response.
+#[allow(clippy::too_many_arguments)]
 pub fn list_objects_v2_xml(
     bucket: &str,
     prefix: Option<&str>,
     delimiter: Option<&str>,
+    encoding_type: Option<&str>,
+    continuation_token: Option<&str>,
+    start_after: Option<&str>,
+    fetch_owner: bool,
     max_keys: u32,
     result: &ListObjectsResult,
 ) -> String {
@@ -75,6 +81,24 @@ pub fn list_objects_v2_xml(
         xml.push_str("</Delimiter>");
     }
 
+    if let Some(e) = encoding_type {
+        xml.push_str("<EncodingType>");
+        xml.push_str(&xml_escape(e));
+        xml.push_str("</EncodingType>");
+    }
+
+    if let Some(t) = continuation_token {
+        xml.push_str("<ContinuationToken>");
+        xml.push_str(&xml_escape(t));
+        xml.push_str("</ContinuationToken>");
+    }
+
+    if let Some(s) = start_after {
+        xml.push_str("<StartAfter>");
+        xml.push_str(&xml_escape(s));
+        xml.push_str("</StartAfter>");
+    }
+
     xml.push_str("<MaxKeys>");
     xml.push_str(&max_keys.to_string());
     xml.push_str("</MaxKeys>");
@@ -93,10 +117,13 @@ pub fn list_objects_v2_xml(
         xml.push_str("</NextContinuationToken>");
     }
 
+    let owner_id = result.owner_id.to_string();
+    let owner_name = owner_id.clone();
+
     for obj in &result.objects {
         xml.push_str("<Contents>");
         xml.push_str("<Key>");
-        xml.push_str(&xml_escape(&obj.key));
+        xml.push_str(&xml_escape(&encode_value(&obj.key, encoding_type)));
         xml.push_str("</Key>");
         xml.push_str("<LastModified>");
         xml.push_str(&format_timestamp(obj.last_modified));
@@ -108,12 +135,19 @@ pub fn list_objects_v2_xml(
         xml.push_str(&obj.size.to_string());
         xml.push_str("</Size>");
         xml.push_str("<StorageClass>STANDARD</StorageClass>");
+        if fetch_owner {
+            xml.push_str("<Owner><ID>");
+            xml.push_str(&xml_escape(&owner_id));
+            xml.push_str("</ID><DisplayName>");
+            xml.push_str(&xml_escape(&owner_name));
+            xml.push_str("</DisplayName></Owner>");
+        }
         xml.push_str("</Contents>");
     }
 
     for prefix in &result.common_prefixes {
         xml.push_str("<CommonPrefixes><Prefix>");
-        xml.push_str(&xml_escape(prefix));
+        xml.push_str(&xml_escape(&encode_value(prefix, encoding_type)));
         xml.push_str("</Prefix></CommonPrefixes>");
     }
 
@@ -127,6 +161,7 @@ pub fn list_objects_v1_xml(
     prefix: Option<&str>,
     delimiter: Option<&str>,
     marker: Option<&str>,
+    encoding_type: Option<&str>,
     max_keys: u32,
     result: &ListObjectsResult,
 ) -> String {
@@ -161,6 +196,12 @@ pub fn list_objects_v1_xml(
         xml.push_str("</Delimiter>");
     }
 
+    if let Some(e) = encoding_type {
+        xml.push_str("<EncodingType>");
+        xml.push_str(&xml_escape(e));
+        xml.push_str("</EncodingType>");
+    }
+
     xml.push_str("<MaxKeys>");
     xml.push_str(&max_keys.to_string());
     xml.push_str("</MaxKeys>");
@@ -177,10 +218,13 @@ pub fn list_objects_v1_xml(
         }
     }
 
+    let owner_id = result.owner_id.to_string();
+    let owner_name = owner_id.clone();
+
     for obj in &result.objects {
         xml.push_str("<Contents>");
         xml.push_str("<Key>");
-        xml.push_str(&xml_escape(&obj.key));
+        xml.push_str(&xml_escape(&encode_value(&obj.key, encoding_type)));
         xml.push_str("</Key>");
         xml.push_str("<LastModified>");
         xml.push_str(&format_timestamp(obj.last_modified));
@@ -192,12 +236,17 @@ pub fn list_objects_v1_xml(
         xml.push_str(&obj.size.to_string());
         xml.push_str("</Size>");
         xml.push_str("<StorageClass>STANDARD</StorageClass>");
+        xml.push_str("<Owner><ID>");
+        xml.push_str(&xml_escape(&owner_id));
+        xml.push_str("</ID><DisplayName>");
+        xml.push_str(&xml_escape(&owner_name));
+        xml.push_str("</DisplayName></Owner>");
         xml.push_str("</Contents>");
     }
 
     for prefix in &result.common_prefixes {
         xml.push_str("<CommonPrefixes><Prefix>");
-        xml.push_str(&xml_escape(prefix));
+        xml.push_str(&xml_escape(&encode_value(prefix, encoding_type)));
         xml.push_str("</Prefix></CommonPrefixes>");
     }
 
@@ -238,26 +287,29 @@ pub fn parse_delete_objects_xml(
     let mut search_from = 0;
     while let Some(start) = text[search_from..].find("<Object>") {
         let abs_start = search_from + start + "<Object>".len();
-        let end = text[abs_start..]
-            .find("</Object>")
-            .ok_or_else(|| ServerError::InvalidRequest {
-                reason: "unclosed <Object> element".to_string(),
-            })?;
+        let end =
+            text[abs_start..]
+                .find("</Object>")
+                .ok_or_else(|| ServerError::InvalidRequest {
+                    reason: "unclosed <Object> element".to_string(),
+                })?;
         let block = &text[abs_start..abs_start + end];
 
-        let key = extract_tag_content(block, "Key").ok_or_else(|| {
-            ServerError::InvalidRequest {
-                reason: "Object missing <Key> element".to_string(),
-            }
+        let key = extract_tag_content(block, "Key").ok_or_else(|| ServerError::InvalidRequest {
+            reason: "Object missing <Key> element".to_string(),
         })?;
-        let version_id = extract_tag_content(block, "VersionId").map(|s| s.to_string());
+        let key = xml_unescape(key);
+        let version_id = extract_tag_content(block, "VersionId").map(xml_unescape);
 
-        entries.push(DeleteObjectEntry {
-            key: key.to_string(),
-            version_id,
-        });
+        entries.push(DeleteObjectEntry { key, version_id });
 
         search_from = abs_start + end + "</Object>".len();
+    }
+
+    if entries.len() > 1000 {
+        return Err(ServerError::InvalidRequest {
+            reason: "delete objects list too large (max 1000)".to_string(),
+        });
     }
 
     Ok((entries, quiet))
@@ -372,6 +424,13 @@ pub fn list_object_versions_xml(
     xml
 }
 
+fn encode_value(value: &str, encoding_type: Option<&str>) -> String {
+    match encoding_type {
+        Some("url") => uri_encode_path(value),
+        _ => value.to_string(),
+    }
+}
+
 /// Escape special XML characters.
 fn xml_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -383,6 +442,39 @@ fn xml_escape(s: &str) -> String {
             '"' => out.push_str("&quot;"),
             '\'' => out.push_str("&apos;"),
             _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Unescape XML entity references used in S3 delete payloads.
+fn xml_unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '&' {
+            out.push(ch);
+            continue;
+        }
+        let mut entity = String::new();
+        while let Some(&c) = chars.peek() {
+            chars.next();
+            if c == ';' {
+                break;
+            }
+            entity.push(c);
+        }
+        match entity.as_str() {
+            "amp" => out.push('&'),
+            "lt" => out.push('<'),
+            "gt" => out.push('>'),
+            "quot" => out.push('"'),
+            "apos" => out.push('\''),
+            _ => {
+                out.push('&');
+                out.push_str(&entity);
+                out.push(';');
+            }
         }
     }
     out
@@ -443,7 +535,12 @@ mod tests {
 
     #[test]
     fn error_xml_format() {
-        let xml = error_xml("NoSuchBucket", "The bucket does not exist", "/mybucket", "req-1");
+        let xml = error_xml(
+            "NoSuchBucket",
+            "The bucket does not exist",
+            "/mybucket",
+            "req-1",
+        );
         assert!(xml.contains("<Code>NoSuchBucket</Code>"));
         assert!(xml.contains("<Message>The bucket does not exist</Message>"));
         assert!(xml.contains("<?xml"));
@@ -475,8 +572,9 @@ mod tests {
             common_prefixes: vec![],
             is_truncated: false,
             next_continuation_token: None,
+            owner_id: 1,
         };
-        let xml = list_objects_v2_xml("bucket", None, None, 1000, &result);
+        let xml = list_objects_v2_xml("bucket", None, None, None, None, None, false, 1000, &result);
         assert!(xml.contains("<Key>my-key</Key>"));
         assert!(xml.contains("<Size>42</Size>"));
         assert!(xml.contains("ListBucketResult"));
@@ -494,8 +592,19 @@ mod tests {
             common_prefixes: vec!["photos/2024/".to_string()],
             is_truncated: true,
             next_continuation_token: Some("photos/cat.jpg".to_string()),
+            owner_id: 1,
         };
-        let xml = list_objects_v2_xml("bucket", Some("photos/"), Some("/"), 1, &result);
+        let xml = list_objects_v2_xml(
+            "bucket",
+            Some("photos/"),
+            Some("/"),
+            None,
+            None,
+            None,
+            false,
+            1,
+            &result,
+        );
         assert!(xml.contains("<Prefix>photos/</Prefix>"));
         assert!(xml.contains("<Delimiter>/</Delimiter>"));
         assert!(xml.contains("<IsTruncated>true</IsTruncated>"));
@@ -515,8 +624,19 @@ mod tests {
             common_prefixes: vec!["photos/".to_string(), "docs/".to_string()],
             is_truncated: false,
             next_continuation_token: None,
+            owner_id: 1,
         };
-        let xml = list_objects_v2_xml("bucket", None, Some("/"), 1000, &result);
+        let xml = list_objects_v2_xml(
+            "bucket",
+            None,
+            Some("/"),
+            None,
+            None,
+            None,
+            false,
+            1000,
+            &result,
+        );
         // 1 object + 2 prefixes = 3
         assert!(xml.contains("<KeyCount>3</KeyCount>"));
     }
@@ -528,9 +648,10 @@ mod tests {
             common_prefixes: vec![],
             is_truncated: false,
             next_continuation_token: None,
+            owner_id: 1,
         };
         // With prefix=None → should produce <Prefix/>
-        let xml = list_objects_v2_xml("bucket", None, None, 1000, &result);
+        let xml = list_objects_v2_xml("bucket", None, None, None, None, None, false, 1000, &result);
         assert!(xml.contains("<Prefix/>"));
         assert!(!xml.contains("<Delimiter>"));
         assert!(!xml.contains("<NextContinuationToken>"));
@@ -548,8 +669,9 @@ mod tests {
             common_prefixes: vec![],
             is_truncated: false,
             next_continuation_token: None,
+            owner_id: 1,
         };
-        let xml = list_objects_v1_xml("bucket", None, None, None, 1000, &result);
+        let xml = list_objects_v1_xml("bucket", None, None, None, None, 1000, &result);
         assert!(xml.contains("<Key>my-key</Key>"));
         assert!(xml.contains("<Marker/>"));
         assert!(xml.contains("ListBucketResult"));
@@ -570,8 +692,17 @@ mod tests {
             common_prefixes: vec!["photos/2024/".to_string()],
             is_truncated: true,
             next_continuation_token: Some("photos/cat.jpg".to_string()),
+            owner_id: 1,
         };
-        let xml = list_objects_v1_xml("bucket", Some("photos/"), Some("/"), Some("a"), 1, &result);
+        let xml = list_objects_v1_xml(
+            "bucket",
+            Some("photos/"),
+            Some("/"),
+            Some("a"),
+            None,
+            1,
+            &result,
+        );
         assert!(xml.contains("<Prefix>photos/</Prefix>"));
         assert!(xml.contains("<Delimiter>/</Delimiter>"));
         assert!(xml.contains("<Marker>a</Marker>"));
@@ -590,8 +721,9 @@ mod tests {
             common_prefixes: vec![],
             is_truncated: false,
             next_continuation_token: None,
+            owner_id: 1,
         };
-        let xml = list_objects_v1_xml("bucket", None, None, None, 1000, &result);
+        let xml = list_objects_v1_xml("bucket", None, None, None, None, 1000, &result);
         assert!(xml.contains("<Prefix/>"));
         assert!(xml.contains("<Marker/>"));
         assert!(!xml.contains("<Delimiter>"));
@@ -610,8 +742,9 @@ mod tests {
             common_prefixes: vec![],
             is_truncated: true,
             next_continuation_token: Some("key2".to_string()),
+            owner_id: 1,
         };
-        let xml = list_objects_v1_xml("bucket", None, None, Some("key1"), 1, &result);
+        let xml = list_objects_v1_xml("bucket", None, None, Some("key1"), None, 1, &result);
         assert!(xml.contains("<Marker>key1</Marker>"));
         assert!(xml.contains("<NextMarker>key2</NextMarker>"));
         assert!(xml.contains("<IsTruncated>true</IsTruncated>"));
@@ -652,14 +785,18 @@ mod tests {
 
     #[test]
     fn xml_escape_special_chars() {
-        assert_eq!(xml_escape("a&b<c>d\"e'f"), "a&amp;b&lt;c&gt;d&quot;e&apos;f");
+        assert_eq!(
+            xml_escape("a&b<c>d\"e'f"),
+            "a&amp;b&lt;c&gt;d&quot;e&apos;f"
+        );
     }
 
     // ── parse_delete_objects_xml ─────────────────────────────────────
 
     #[test]
     fn parse_delete_objects_basic() {
-        let xml = b"<Delete><Object><Key>key1</Key></Object><Object><Key>key2</Key></Object></Delete>";
+        let xml =
+            b"<Delete><Object><Key>key1</Key></Object><Object><Key>key2</Key></Object></Delete>";
         let (entries, quiet) = parse_delete_objects_xml(xml).unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].key, "key1");
@@ -739,6 +876,7 @@ mod tests {
             common_prefixes: vec![],
             is_truncated: false,
             next_continuation_token: None,
+            owner_id: 1,
         };
         let xml = list_object_versions_xml("bucket", None, None, 1000, &result);
         assert!(xml.contains("ListVersionsResult"));
@@ -758,6 +896,7 @@ mod tests {
             common_prefixes: vec![],
             is_truncated: false,
             next_continuation_token: None,
+            owner_id: 1,
         };
         let xml = list_object_versions_xml("bucket", None, None, 1000, &result);
         assert!(xml.contains("ListVersionsResult"));
@@ -771,9 +910,9 @@ mod tests {
             common_prefixes: vec![],
             is_truncated: false,
             next_continuation_token: None,
+            owner_id: 1,
         };
-        let xml =
-            list_object_versions_xml("bucket", Some("photos/"), Some("key1"), 100, &result);
+        let xml = list_object_versions_xml("bucket", Some("photos/"), Some("key1"), 100, &result);
         assert!(xml.contains("<Prefix>photos/</Prefix>"));
         assert!(xml.contains("<KeyMarker>key1</KeyMarker>"));
     }

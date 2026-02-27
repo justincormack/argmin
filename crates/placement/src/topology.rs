@@ -19,10 +19,10 @@ use thiserror::Error;
 pub struct Level(pub u8);
 
 impl Level {
-    pub const ZONE:    Level = Level(16);
-    pub const RACK:    Level = Level(32);
+    pub const ZONE: Level = Level(16);
+    pub const RACK: Level = Level(32);
     pub const MACHINE: Level = Level(48);
-    pub const DISK:    Level = Level(64);
+    pub const DISK: Level = Level(64);
 }
 
 /// The physical location of a node, as an ordered list of (Level, id) segments.

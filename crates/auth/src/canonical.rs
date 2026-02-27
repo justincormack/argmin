@@ -156,7 +156,10 @@ pub fn canonical_query_string(query: &str) -> String {
             let mut parts = pair.splitn(2, '=');
             let key = parts.next().unwrap_or("");
             let val = parts.next().unwrap_or("");
-            (uri_encode(&percent_decode(key)), uri_encode(&percent_decode(val)))
+            (
+                uri_encode(&percent_decode(key)),
+                uri_encode(&percent_decode(val)),
+            )
         })
         .collect();
     pairs.sort();
@@ -222,12 +225,7 @@ pub fn parse_amz_date(ts: &str) -> Option<u64> {
     let min: u32 = ts[11..13].parse().ok()?;
     let sec: u32 = ts[13..15].parse().ok()?;
 
-    if !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
-        || hour > 23
-        || min > 59
-        || sec > 59
-    {
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec > 59 {
         return None;
     }
 
@@ -319,10 +317,7 @@ mod tests {
 
     #[test]
     fn canonical_query_string_sorts() {
-        assert_eq!(
-            canonical_query_string("b=2&a=1"),
-            "a=1&b=2"
-        );
+        assert_eq!(canonical_query_string("b=2&a=1"), "a=1&b=2");
     }
 
     #[test]
@@ -332,10 +327,7 @@ mod tests {
 
     #[test]
     fn canonical_query_string_encodes() {
-        assert_eq!(
-            canonical_query_string("key=val ue"),
-            "key=val%20ue"
-        );
+        assert_eq!(canonical_query_string("key=val ue"), "key=val%20ue");
     }
 
     #[test]
@@ -360,10 +352,7 @@ mod tests {
             ("x-amz-meta-tag", "beta"),
         ];
         let result = canonical_headers(&headers);
-        assert_eq!(
-            result,
-            "host:example.com\nx-amz-meta-tag:alpha,beta\n"
-        );
+        assert_eq!(result, "host:example.com\nx-amz-meta-tag:alpha,beta\n");
     }
 
     #[test]
@@ -373,10 +362,7 @@ mod tests {
             ("content-type", " text/plain "),
         ];
         let result = canonical_headers(&headers);
-        assert_eq!(
-            result,
-            "content-type:text/plain\nhost:example.com\n"
-        );
+        assert_eq!(result, "content-type:text/plain\nhost:example.com\n");
     }
 
     #[test]

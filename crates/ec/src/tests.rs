@@ -1,6 +1,6 @@
-use crate::{EcConfig, EcError, ErasureCodec, VerifyResult, MAX_TOTAL_SHARDS};
 use crate::codec::check_shard_size;
 use crate::self_test;
+use crate::{EcConfig, EcError, ErasureCodec, VerifyResult, MAX_TOTAL_SHARDS};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -40,7 +40,9 @@ fn config_valid_cases() {
 fn config_zero_data_shards() {
     assert_eq!(
         EcConfig::new(0, 2),
-        Err(EcError::InvalidConfig { reason: "data_shards must be >= 1" })
+        Err(EcError::InvalidConfig {
+            reason: "data_shards must be >= 1"
+        })
     );
 }
 
@@ -48,7 +50,9 @@ fn config_zero_data_shards() {
 fn config_zero_parity_shards() {
     assert_eq!(
         EcConfig::new(2, 0),
-        Err(EcError::InvalidConfig { reason: "parity_shards must be >= 1" })
+        Err(EcError::InvalidConfig {
+            reason: "parity_shards must be >= 1"
+        })
     );
 }
 
@@ -90,7 +94,10 @@ fn encode_all_zeros_gives_zero_parity() {
     let data: Vec<Vec<u8>> = (0..4).map(|_| vec![0u8; 512]).collect();
     let parity = encode(&codec, &data);
     for p in &parity {
-        assert!(p.iter().all(|&b| b == 0), "expected zero parity for zero data");
+        assert!(
+            p.iter().all(|&b| b == 0),
+            "expected zero parity for zero data"
+        );
     }
 }
 
@@ -103,7 +110,10 @@ fn encode_wrong_data_shard_count() {
     let mut parity_refs: Vec<&mut [u8]> = parity.iter_mut().map(|v| v.as_mut_slice()).collect();
     assert_eq!(
         codec.encode(&data_refs, &mut parity_refs),
-        Err(EcError::ShardCount { expected: 4, got: 3 })
+        Err(EcError::ShardCount {
+            expected: 4,
+            got: 3
+        })
     );
 }
 
@@ -116,7 +126,10 @@ fn encode_wrong_parity_shard_count() {
     let mut parity_refs: Vec<&mut [u8]> = parity.iter_mut().map(|v| v.as_mut_slice()).collect();
     assert_eq!(
         codec.encode(&data_refs, &mut parity_refs),
-        Err(EcError::ShardCount { expected: 2, got: 1 })
+        Err(EcError::ShardCount {
+            expected: 2,
+            got: 1
+        })
     );
 }
 
@@ -154,7 +167,12 @@ fn zero_length_verify_ok() {
     let data_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
     let parity_refs: Vec<&[u8]> = parity.iter().map(|v| v.as_slice()).collect();
     let mut scratch = vec![]; // shard_size=0, scratch can be empty
-    assert_eq!(codec.verify(&data_refs, &parity_refs, &mut scratch).unwrap(), VerifyResult::Ok);
+    assert_eq!(
+        codec
+            .verify(&data_refs, &parity_refs, &mut scratch)
+            .unwrap(),
+        VerifyResult::Ok
+    );
 }
 
 #[test]
@@ -182,7 +200,9 @@ fn zero_length_full_roundtrip() {
     let mut out0: Vec<u8> = vec![];
     let mut out1: Vec<u8> = vec![];
     let mut outputs: Vec<&mut [u8]> = vec![out0.as_mut_slice(), out1.as_mut_slice()];
-    assert!(codec.reconstruct(&[2, 3], &present, &[0, 1], &mut outputs).is_ok());
+    assert!(codec
+        .reconstruct(&[2, 3], &present, &[0, 1], &mut outputs)
+        .is_ok());
     // Both reconstructed shards should be empty.
     assert_eq!(out0, data[0]);
     assert_eq!(out1, data[1]);
@@ -198,7 +218,12 @@ fn verify_after_encode_passes() {
     let data_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
     let parity_refs: Vec<&[u8]> = parity.iter().map(|v| v.as_slice()).collect();
     let mut scratch = vec![0u8; 2 * 1024]; // m * shard_size
-    assert_eq!(codec.verify(&data_refs, &parity_refs, &mut scratch).unwrap(), VerifyResult::Ok);
+    assert_eq!(
+        codec
+            .verify(&data_refs, &parity_refs, &mut scratch)
+            .unwrap(),
+        VerifyResult::Ok
+    );
 }
 
 #[test]
@@ -211,7 +236,12 @@ fn verify_detects_corrupt_parity() {
     let parity_refs: Vec<&[u8]> = parity.iter().map(|v| v.as_slice()).collect();
     let mut scratch = vec![0u8; 2 * 1024];
     // parity shard 0 has index k+0 = 4
-    assert_eq!(codec.verify(&data_refs, &parity_refs, &mut scratch).unwrap(), VerifyResult::Mismatch(4));
+    assert_eq!(
+        codec
+            .verify(&data_refs, &parity_refs, &mut scratch)
+            .unwrap(),
+        VerifyResult::Mismatch(4)
+    );
 }
 
 #[test]
@@ -223,7 +253,12 @@ fn verify_detects_corrupt_second_parity() {
     let data_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
     let parity_refs: Vec<&[u8]> = parity.iter().map(|v| v.as_slice()).collect();
     let mut scratch = vec![0u8; 2 * 1024];
-    assert_eq!(codec.verify(&data_refs, &parity_refs, &mut scratch).unwrap(), VerifyResult::Mismatch(5));
+    assert_eq!(
+        codec
+            .verify(&data_refs, &parity_refs, &mut scratch)
+            .unwrap(),
+        VerifyResult::Mismatch(5)
+    );
 }
 
 #[test]
@@ -237,7 +272,12 @@ fn verify_after_restore_passes() {
     let data_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
     let parity_refs: Vec<&[u8]> = parity.iter().map(|v| v.as_slice()).collect();
     let mut scratch = vec![0u8; 2 * 256];
-    assert_eq!(codec.verify(&data_refs, &parity_refs, &mut scratch).unwrap(), VerifyResult::Ok);
+    assert_eq!(
+        codec
+            .verify(&data_refs, &parity_refs, &mut scratch)
+            .unwrap(),
+        VerifyResult::Ok
+    );
 }
 
 #[test]
@@ -250,7 +290,10 @@ fn verify_scratch_too_small() {
     let mut scratch = vec![0u8; 2 * 256 - 1]; // one byte short
     assert!(matches!(
         codec.verify(&data_refs, &parity_refs, &mut scratch),
-        Err(EcError::ScratchTooSmall { required: 512, provided: 511 })
+        Err(EcError::ScratchTooSmall {
+            required: 512,
+            provided: 511
+        })
     ));
 }
 
@@ -265,7 +308,12 @@ fn verify_scratch_can_be_reused() {
         let parity = encode(&codec, &data);
         let data_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
         let parity_refs: Vec<&[u8]> = parity.iter().map(|v| v.as_slice()).collect();
-        assert_eq!(codec.verify(&data_refs, &parity_refs, &mut scratch).unwrap(), VerifyResult::Ok);
+        assert_eq!(
+            codec
+                .verify(&data_refs, &parity_refs, &mut scratch)
+                .unwrap(),
+            VerifyResult::Ok
+        );
     }
 }
 
@@ -313,15 +361,18 @@ fn exhaustive_reconstruct(data_shards: u8, parity_shards: u8, shard_size: usize)
     let all_shards: Vec<Vec<u8>> = data.iter().chain(parity.iter()).cloned().collect();
 
     for present_combo in combinations(total, k) {
-        let recover: Vec<usize> =
-            (0..total).filter(|i| !present_combo.contains(i)).collect();
+        let recover: Vec<usize> = (0..total).filter(|i| !present_combo.contains(i)).collect();
 
-        let present_data: Vec<&[u8]> =
-            present_combo.iter().map(|&i| all_shards[i].as_slice()).collect();
+        let present_data: Vec<&[u8]> = present_combo
+            .iter()
+            .map(|&i| all_shards[i].as_slice())
+            .collect();
         let mut output_storage: Vec<Vec<u8>> =
             recover.iter().map(|_| vec![0u8; shard_size]).collect();
-        let mut outputs: Vec<&mut [u8]> =
-            output_storage.iter_mut().map(|v| v.as_mut_slice()).collect();
+        let mut outputs: Vec<&mut [u8]> = output_storage
+            .iter_mut()
+            .map(|v| v.as_mut_slice())
+            .collect();
 
         codec
             .reconstruct(&present_combo, &present_data, &recover, &mut outputs)
@@ -334,13 +385,9 @@ fn exhaustive_reconstruct(data_shards: u8, parity_shards: u8, shard_size: usize)
 
         for (out_idx, &shard_idx) in recover.iter().enumerate() {
             assert_eq!(
-                output_storage[out_idx],
-                all_shards[shard_idx],
+                output_storage[out_idx], all_shards[shard_idx],
                 "config ({},{}) shard {} mismatch, present={:?}",
-                k,
-                m,
-                shard_idx,
-                present_combo
+                k, m, shard_idx, present_combo
             );
         }
     }
@@ -383,7 +430,9 @@ fn reconstruct_recover_only_parity() {
     let mut out0 = vec![0u8; 512];
     let mut out1 = vec![0u8; 512];
     let mut outputs: Vec<&mut [u8]> = vec![out0.as_mut_slice(), out1.as_mut_slice()];
-    codec.reconstruct(&[0, 1, 2, 3], &data_refs, &[4, 5], &mut outputs).unwrap();
+    codec
+        .reconstruct(&[0, 1, 2, 3], &data_refs, &[4, 5], &mut outputs)
+        .unwrap();
     assert_eq!(out0, parity[0]);
     assert_eq!(out1, parity[1]);
 }
@@ -394,7 +443,9 @@ fn reconstruct_empty_recover_indices_is_noop() {
     let data = make_data(4, 128);
     let data_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
     let mut outputs: Vec<&mut [u8]> = vec![];
-    assert!(codec.reconstruct(&[0, 1, 2, 3], &data_refs, &[], &mut outputs).is_ok());
+    assert!(codec
+        .reconstruct(&[0, 1, 2, 3], &data_refs, &[], &mut outputs)
+        .is_ok());
 }
 
 #[test]
@@ -414,7 +465,9 @@ fn reconstruct_more_than_k_present_uses_first_k() {
     ];
     let mut out5 = vec![0u8; 256];
     let mut outputs: Vec<&mut [u8]> = vec![out5.as_mut_slice()];
-    codec.reconstruct(&[0, 1, 2, 3, 4], &present_refs, &[5], &mut outputs).unwrap();
+    codec
+        .reconstruct(&[0, 1, 2, 3, 4], &present_refs, &[5], &mut outputs)
+        .unwrap();
     assert_eq!(out5, parity[1]);
 }
 
@@ -492,7 +545,10 @@ fn reconstruct_present_data_length_mismatch() {
     let mut outputs: Vec<&mut [u8]> = vec![];
     assert!(matches!(
         codec.reconstruct(&[0, 1, 2, 3], &data_refs, &[], &mut outputs),
-        Err(EcError::ShardCount { expected: 4, got: 3 })
+        Err(EcError::ShardCount {
+            expected: 4,
+            got: 3
+        })
     ));
 }
 
@@ -505,7 +561,10 @@ fn reconstruct_outputs_length_mismatch() {
     let mut outputs: Vec<&mut [u8]> = vec![out.as_mut_slice()]; // 1 output for 2 recover indices
     assert!(matches!(
         codec.reconstruct(&[0, 1, 2, 3], &data_refs, &[4, 5], &mut outputs),
-        Err(EcError::ShardCount { expected: 2, got: 1 })
+        Err(EcError::ShardCount {
+            expected: 2,
+            got: 1
+        })
     ));
 }
 
@@ -554,12 +613,18 @@ fn single_byte_shards_roundtrip() {
     let parity = encode(&codec, &data);
     // Drop shards 0 and 1; reconstruct from shards 2,3,4,5
     let all: Vec<Vec<u8>> = data.iter().chain(parity.iter()).cloned().collect();
-    let present_refs: Vec<&[u8]> =
-        vec![all[2].as_slice(), all[3].as_slice(), all[4].as_slice(), all[5].as_slice()];
+    let present_refs: Vec<&[u8]> = vec![
+        all[2].as_slice(),
+        all[3].as_slice(),
+        all[4].as_slice(),
+        all[5].as_slice(),
+    ];
     let mut out0 = vec![0u8; 1];
     let mut out1 = vec![0u8; 1];
     let mut outputs: Vec<&mut [u8]> = vec![out0.as_mut_slice(), out1.as_mut_slice()];
-    codec.reconstruct(&[2, 3, 4, 5], &present_refs, &[0, 1], &mut outputs).unwrap();
+    codec
+        .reconstruct(&[2, 3, 4, 5], &present_refs, &[0, 1], &mut outputs)
+        .unwrap();
     assert_eq!(out0, data[0]);
     assert_eq!(out1, data[1]);
 }
@@ -622,7 +687,10 @@ mod alloc_tests {
         // Vec for data_refs and parity_refs are allowed (caller infrastructure, not codec internals).
         // The codec itself must not allocate. We check that the number is bounded and small.
         // (Two Vec::new() calls = 2 allocs for the ref slices above, both by caller.)
-        assert_eq!(allocs, 2, "codec encode should not allocate beyond caller ref vecs");
+        assert_eq!(
+            allocs, 2,
+            "codec encode should not allocate beyond caller ref vecs"
+        );
     }
 
     #[test]
@@ -635,10 +703,15 @@ mod alloc_tests {
         let allocs = count_allocs(|| {
             let data_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
             let parity_refs: Vec<&[u8]> = parity.iter().map(|v| v.as_slice()).collect();
-            codec.verify(&data_refs, &parity_refs, &mut scratch).unwrap();
+            codec
+                .verify(&data_refs, &parity_refs, &mut scratch)
+                .unwrap();
         });
 
-        assert_eq!(allocs, 2, "codec verify should not allocate beyond caller ref vecs");
+        assert_eq!(
+            allocs, 2,
+            "codec verify should not allocate beyond caller ref vecs"
+        );
     }
 
     #[test]
@@ -651,13 +724,22 @@ mod alloc_tests {
         let mut out5 = vec![0u8; 4096];
 
         let allocs = count_allocs(|| {
-            let present_refs: Vec<&[u8]> =
-                vec![all[0].as_slice(), all[1].as_slice(), all[2].as_slice(), all[3].as_slice()];
+            let present_refs: Vec<&[u8]> = vec![
+                all[0].as_slice(),
+                all[1].as_slice(),
+                all[2].as_slice(),
+                all[3].as_slice(),
+            ];
             let mut outputs: Vec<&mut [u8]> = vec![out4.as_mut_slice(), out5.as_mut_slice()];
-            codec.reconstruct(&[0, 1, 2, 3], &present_refs, &[4, 5], &mut outputs).unwrap();
+            codec
+                .reconstruct(&[0, 1, 2, 3], &present_refs, &[4, 5], &mut outputs)
+                .unwrap();
         });
 
-        assert_eq!(allocs, 2, "codec reconstruct should not allocate beyond caller ref vecs");
+        assert_eq!(
+            allocs, 2,
+            "codec reconstruct should not allocate beyond caller ref vecs"
+        );
     }
 }
 

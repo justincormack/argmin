@@ -1,6 +1,6 @@
-use std::sync::Arc;
-use crate::topology::{Level, TopologyKey};
 use crate::config::PlacementError;
+use crate::topology::{Level, TopologyKey};
+use std::sync::Arc;
 
 /// Opaque identifier for a storage node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -64,7 +64,9 @@ impl ClusterMap {
         sorted.sort_unstable_by_key(|n| n.id);
         for w in sorted.windows(2) {
             if w[0].id == w[1].id {
-                return Err(PlacementError::DuplicateNodeId { id: w[0].id.as_u32() });
+                return Err(PlacementError::DuplicateNodeId {
+                    id: w[0].id.as_u32(),
+                });
             }
         }
         Ok(ClusterMap(Arc::new(sorted)))
@@ -92,7 +94,11 @@ impl ClusterMap {
 
     /// Sum of weights across all active nodes.
     pub fn total_weight(&self) -> f64 {
-        self.0.iter().filter(|n| n.weight > 0.0).map(|n| n.weight).sum()
+        self.0
+            .iter()
+            .filter(|n| n.weight > 0.0)
+            .map(|n| n.weight)
+            .sum()
     }
 
     pub(crate) fn nodes(&self) -> &[NodeInfo] {
@@ -114,7 +120,10 @@ mod tests {
 
     #[test]
     fn empty_cluster() {
-        assert_eq!(ClusterMap::new(&[]).unwrap_err(), PlacementError::EmptyCluster);
+        assert_eq!(
+            ClusterMap::new(&[]).unwrap_err(),
+            PlacementError::EmptyCluster
+        );
     }
 
     #[test]

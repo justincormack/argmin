@@ -128,7 +128,7 @@ impl FaultyPgStore {
     fn make_io_error(msg: &'static str) -> StoreError {
         StoreError::Io {
             context: msg,
-            source: std::io::Error::new(std::io::ErrorKind::Other, "fault injection"),
+            source: std::io::Error::other("fault injection"),
         }
     }
 }

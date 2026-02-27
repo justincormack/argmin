@@ -32,10 +32,14 @@ impl EcConfig {
     /// Create and validate a config.
     pub fn new(data_shards: u8, parity_shards: u8) -> Result<Self, EcError> {
         if data_shards == 0 {
-            return Err(EcError::InvalidConfig { reason: "data_shards must be >= 1" });
+            return Err(EcError::InvalidConfig {
+                reason: "data_shards must be >= 1",
+            });
         }
         if parity_shards == 0 {
-            return Err(EcError::InvalidConfig { reason: "parity_shards must be >= 1" });
+            return Err(EcError::InvalidConfig {
+                reason: "parity_shards must be >= 1",
+            });
         }
         let total = data_shards as usize + parity_shards as usize;
         if total > MAX_TOTAL_SHARDS {
@@ -43,7 +47,10 @@ impl EcConfig {
                 reason: "data_shards + parity_shards exceeds MAX_TOTAL_SHARDS",
             });
         }
-        Ok(Self { data_shards, parity_shards })
+        Ok(Self {
+            data_shards,
+            parity_shards,
+        })
     }
 
     /// Total number of shards (k + m).
@@ -76,7 +83,11 @@ pub enum EcError {
     ShardCount { expected: usize, got: usize },
 
     #[error("shard size mismatch at shard {index}: expected {expected} bytes, got {got}")]
-    ShardSizeMismatch { index: usize, expected: usize, got: usize },
+    ShardSizeMismatch {
+        index: usize,
+        expected: usize,
+        got: usize,
+    },
 
     #[error("insufficient shards for reconstruction: need {need}, have {have}")]
     InsufficientShards { need: usize, have: usize },
@@ -145,11 +156,7 @@ impl ErasureCodec {
         // to encode_matrix, and ec_init_tables reads the parity rows from that buffer
         // and writes exactly 32*k*m bytes to encode_tables.
         unsafe {
-            ec_sys::gf_gen_cauchy1_matrix(
-                encode_matrix.as_mut_ptr(),
-                total as i32,
-                k as i32,
-            );
+            ec_sys::gf_gen_cauchy1_matrix(encode_matrix.as_mut_ptr(), total as i32, k as i32);
             // Parity rows start at offset k*k within encode_matrix.
             ec_sys::ec_init_tables(
                 k as i32,
@@ -159,7 +166,11 @@ impl ErasureCodec {
             );
         }
 
-        Ok(Self { config, encode_matrix, encode_tables })
+        Ok(Self {
+            config,
+            encode_matrix,
+            encode_tables,
+        })
     }
 
     /// Returns the config this codec was built for.
@@ -183,7 +194,7 @@ impl ErasureCodec {
         (self.config.parity_shards as usize).saturating_mul(shard_size)
     }
 
-// ── Hot path ──────────────────────────────────────────────────────────────
+    // ── Hot path ──────────────────────────────────────────────────────────────
 
     /// Encode k data shards into m parity shards.
     ///
@@ -200,10 +211,16 @@ impl ErasureCodec {
         let m = self.config.parity_shards as usize;
 
         if data.len() != k {
-            return Err(EcError::ShardCount { expected: k, got: data.len() });
+            return Err(EcError::ShardCount {
+                expected: k,
+                got: data.len(),
+            });
         }
         if parity.len() != m {
-            return Err(EcError::ShardCount { expected: m, got: parity.len() });
+            return Err(EcError::ShardCount {
+                expected: m,
+                got: parity.len(),
+            });
         }
 
         let shard_size = data[0].len();
@@ -233,8 +250,7 @@ impl ErasureCodec {
 
         // Build pointer arrays on the stack (k + m ≤ 32 pointers).
         let mut data_ptrs: [*mut u8; MAX_TOTAL_SHARDS] = [std::ptr::null_mut(); MAX_TOTAL_SHARDS];
-        let mut parity_ptrs: [*mut u8; MAX_TOTAL_SHARDS] =
-            [std::ptr::null_mut(); MAX_TOTAL_SHARDS];
+        let mut parity_ptrs: [*mut u8; MAX_TOTAL_SHARDS] = [std::ptr::null_mut(); MAX_TOTAL_SHARDS];
 
         for (i, s) in data.iter().enumerate() {
             data_ptrs[i] = s.as_ptr() as *mut u8;
@@ -285,10 +301,16 @@ impl ErasureCodec {
         let m = self.config.parity_shards as usize;
 
         if data.len() != k {
-            return Err(EcError::ShardCount { expected: k, got: data.len() });
+            return Err(EcError::ShardCount {
+                expected: k,
+                got: data.len(),
+            });
         }
         if parity.len() != m {
-            return Err(EcError::ShardCount { expected: m, got: parity.len() });
+            return Err(EcError::ShardCount {
+                expected: m,
+                got: parity.len(),
+            });
         }
 
         let shard_size = data[0].len();
@@ -317,7 +339,10 @@ impl ErasureCodec {
         // saturated value exceeds any real allocation so ScratchTooSmall is returned.
         let required = m.saturating_mul(shard_size);
         if scratch.len() < required {
-            return Err(EcError::ScratchTooSmall { required, provided: scratch.len() });
+            return Err(EcError::ScratchTooSmall {
+                required,
+                provided: scratch.len(),
+            });
         }
 
         if shard_size == 0 {
@@ -356,8 +381,7 @@ impl ErasureCodec {
 
         for i in 0..m {
             // Safety: tmp_parity_ptrs[i] points to shard_size bytes within `scratch`.
-            let computed =
-                unsafe { std::slice::from_raw_parts(tmp_parity_ptrs[i], shard_size) };
+            let computed = unsafe { std::slice::from_raw_parts(tmp_parity_ptrs[i], shard_size) };
             if computed != parity[i] {
                 return Ok(VerifyResult::Mismatch(k + i));
             }
@@ -514,7 +538,11 @@ pub fn self_test() -> Result<(), EcError> {
     codec.encode(&data_refs, &mut parity_refs)?;
 
     let mut scratch = vec![0u8; codec.verify_scratch_size(shard_size)];
-    match codec.verify(&data_refs, &parity.iter().map(|v| v.as_slice()).collect::<Vec<_>>(), &mut scratch)? {
+    match codec.verify(
+        &data_refs,
+        &parity.iter().map(|v| v.as_slice()).collect::<Vec<_>>(),
+        &mut scratch,
+    )? {
         VerifyResult::Ok => {}
         VerifyResult::Mismatch(idx) => {
             return Err(EcError::SmokeTestFailed {
@@ -532,8 +560,10 @@ pub fn self_test() -> Result<(), EcError> {
     ];
     let recover_indices: Vec<usize> = vec![1, k + 1];
     let mut recovered_data = vec![vec![0u8; shard_size]; recover_indices.len()];
-    let mut recovered_refs: Vec<&mut [u8]> =
-        recovered_data.iter_mut().map(|v| v.as_mut_slice()).collect();
+    let mut recovered_refs: Vec<&mut [u8]> = recovered_data
+        .iter_mut()
+        .map(|v| v.as_mut_slice())
+        .collect();
 
     codec.reconstruct(
         &present_indices,

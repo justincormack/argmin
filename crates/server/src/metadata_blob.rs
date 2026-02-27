@@ -160,8 +160,7 @@ impl MetadataBlob {
         }
 
         // Read total length
-        let total_len =
-            u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        let total_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
         if total_len < MIN_BLOB_SIZE || total_len > data.len() {
             return Err(ServerError::MetadataBlobError {
                 reason: format!(
@@ -185,8 +184,7 @@ impl MetadataBlob {
         }
 
         // entry_count
-        let entry_count =
-            u16::from_le_bytes([blob_data[pos], blob_data[pos + 1]]) as usize;
+        let entry_count = u16::from_le_bytes([blob_data[pos], blob_data[pos + 1]]) as usize;
         pos += 2;
 
         let mut entries = Vec::with_capacity(entry_count);
@@ -196,8 +194,7 @@ impl MetadataBlob {
                     reason: "truncated metadata blob (key_len)".to_string(),
                 });
             }
-            let key_len =
-                u16::from_le_bytes([blob_data[pos], blob_data[pos + 1]]) as usize;
+            let key_len = u16::from_le_bytes([blob_data[pos], blob_data[pos + 1]]) as usize;
             pos += 2;
 
             if pos + key_len > total_len {
@@ -217,8 +214,7 @@ impl MetadataBlob {
                     reason: "truncated metadata blob (val_len)".to_string(),
                 });
             }
-            let val_len =
-                u16::from_le_bytes([blob_data[pos], blob_data[pos + 1]]) as usize;
+            let val_len = u16::from_le_bytes([blob_data[pos], blob_data[pos + 1]]) as usize;
             pos += 2;
 
             if pos + val_len > total_len {
@@ -354,7 +350,7 @@ mod tests {
     fn from_headers_filters_correctly() {
         let headers = [
             ("Content-Type", "text/html"),
-            ("Content-Length", "42"),           // not stored
+            ("Content-Length", "42"),          // not stored
             ("Authorization", "AWS4-HMAC..."), // not stored
             ("X-Amz-Meta-Author", "alice"),
             ("Cache-Control", "no-cache"),

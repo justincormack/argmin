@@ -187,7 +187,10 @@ impl ShardStore for PgStore {
                 source: e,
             })?;
 
-        Ok(WriteAck { crc64: crc, stored_size })
+        Ok(WriteAck {
+            crc64: crc,
+            stored_size,
+        })
     }
 
     fn read_shard(&self, key: &ShardKey) -> Result<ShardData, StoreError> {
@@ -294,7 +297,15 @@ impl ShardStore for PgStore {
                 "SELECT data_size, crc64_nvme, created_at, last_verified, status \
                  FROM shards WHERE shard_key = ?1",
                 params![key.as_bytes().as_slice()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .optional()
             .map_err(|e| StoreError::Db {
@@ -495,7 +506,8 @@ impl PgMetadataStore for PgStore {
                 ),
             };
 
-        let params_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
         let mut stmt = self.conn.prepare(&sql).map_err(|e| MetadataError::Db {
             context: "prepare list objects",
             source: e,

@@ -30,6 +30,11 @@ pub enum ServerError {
     #[error("invalid request: {reason}")]
     InvalidRequest { reason: String },
 
+    #[error("invalid argument: {reason}")]
+    InvalidArgument { reason: String },
+
+    #[error("invalid bucket name: {reason}")]
+    InvalidBucketName { reason: String },
     #[error("metadata blob error: {reason}")]
     MetadataBlobError { reason: String },
 
@@ -65,6 +70,8 @@ impl ServerError {
             Self::PreconditionFailed => "PreconditionFailed",
             Self::NotModified { .. } => "NotModified",
             Self::InvalidRequest { .. } => "InvalidRequest",
+            Self::InvalidArgument { .. } => "InvalidArgument",
+            Self::InvalidBucketName { .. } => "InvalidBucketName",
             Self::MetadataBlobError { .. } => "InternalError",
             Self::ObjectTooLarge { .. } => "EntityTooLarge",
             Self::MethodNotAllowed => "MethodNotAllowed",
@@ -83,7 +90,9 @@ impl ServerError {
             Self::BucketNotEmpty => 409,
             Self::ObjectNotFound { .. } => 404,
             Self::Auth(_) => 403,
-            Self::InvalidRequest { .. } => 400,
+            Self::InvalidRequest { .. }
+            | Self::InvalidArgument { .. }
+            | Self::InvalidBucketName { .. } => 400,
             Self::ObjectTooLarge { .. } => 400,
             Self::MethodNotAllowed => 405,
             Self::InvalidRange { .. } => 416,
@@ -106,17 +115,26 @@ mod tests {
 
     #[test]
     fn s3_error_code_bucket_already_exists() {
-        assert_eq!(ServerError::BucketAlreadyExists.s3_error_code(), "BucketAlreadyOwnedByYou");
+        assert_eq!(
+            ServerError::BucketAlreadyExists.s3_error_code(),
+            "BucketAlreadyOwnedByYou"
+        );
     }
 
     #[test]
     fn s3_error_code_bucket_not_empty() {
-        assert_eq!(ServerError::BucketNotEmpty.s3_error_code(), "BucketNotEmpty");
+        assert_eq!(
+            ServerError::BucketNotEmpty.s3_error_code(),
+            "BucketNotEmpty"
+        );
     }
 
     #[test]
     fn s3_error_code_object_not_found() {
-        let err = ServerError::ObjectNotFound { bucket: "b".into(), key: "k".into() };
+        let err = ServerError::ObjectNotFound {
+            bucket: "b".into(),
+            key: "k".into(),
+        };
         assert_eq!(err.s3_error_code(), "NoSuchKey");
     }
 
@@ -158,25 +176,35 @@ mod tests {
 
     #[test]
     fn s3_error_code_invalid_request() {
-        let err = ServerError::InvalidRequest { reason: "bad".into() };
+        let err = ServerError::InvalidRequest {
+            reason: "bad".into(),
+        };
         assert_eq!(err.s3_error_code(), "InvalidRequest");
     }
 
     #[test]
     fn s3_error_code_metadata_blob_error() {
-        let err = ServerError::MetadataBlobError { reason: "corrupt".into() };
+        let err = ServerError::MetadataBlobError {
+            reason: "corrupt".into(),
+        };
         assert_eq!(err.s3_error_code(), "InternalError");
     }
 
     #[test]
     fn s3_error_code_object_too_large() {
-        let err = ServerError::ObjectTooLarge { size: 1000, max: 500 };
+        let err = ServerError::ObjectTooLarge {
+            size: 1000,
+            max: 500,
+        };
         assert_eq!(err.s3_error_code(), "EntityTooLarge");
     }
 
     #[test]
     fn s3_error_code_method_not_allowed() {
-        assert_eq!(ServerError::MethodNotAllowed.s3_error_code(), "MethodNotAllowed");
+        assert_eq!(
+            ServerError::MethodNotAllowed.s3_error_code(),
+            "MethodNotAllowed"
+        );
     }
 
     #[test]
@@ -187,12 +215,18 @@ mod tests {
 
     #[test]
     fn http_status_416() {
-        assert_eq!(ServerError::InvalidRange { total_size: 100 }.http_status(), 416);
+        assert_eq!(
+            ServerError::InvalidRange { total_size: 100 }.http_status(),
+            416
+        );
     }
 
     #[test]
     fn s3_error_code_precondition_failed() {
-        assert_eq!(ServerError::PreconditionFailed.s3_error_code(), "PreconditionFailed");
+        assert_eq!(
+            ServerError::PreconditionFailed.s3_error_code(),
+            "PreconditionFailed"
+        );
     }
 
     #[test]
@@ -202,13 +236,19 @@ mod tests {
 
     #[test]
     fn s3_error_code_not_modified() {
-        let err = ServerError::NotModified { etag: "\"abc\"".into(), last_modified: 0 };
+        let err = ServerError::NotModified {
+            etag: "\"abc\"".into(),
+            last_modified: 0,
+        };
         assert_eq!(err.s3_error_code(), "NotModified");
     }
 
     #[test]
     fn http_status_304() {
-        let err = ServerError::NotModified { etag: "\"abc\"".into(), last_modified: 0 };
+        let err = ServerError::NotModified {
+            etag: "\"abc\"".into(),
+            last_modified: 0,
+        };
         assert_eq!(err.http_status(), 304);
     }
 
@@ -232,8 +272,18 @@ mod tests {
 
     #[test]
     fn http_status_404() {
-        assert_eq!(ServerError::BucketNotFound { name: "b".into() }.http_status(), 404);
-        assert_eq!(ServerError::ObjectNotFound { bucket: "b".into(), key: "k".into() }.http_status(), 404);
+        assert_eq!(
+            ServerError::BucketNotFound { name: "b".into() }.http_status(),
+            404
+        );
+        assert_eq!(
+            ServerError::ObjectNotFound {
+                bucket: "b".into(),
+                key: "k".into()
+            }
+            .http_status(),
+            404
+        );
     }
 
     #[test]
@@ -244,13 +294,22 @@ mod tests {
 
     #[test]
     fn http_status_403() {
-        assert_eq!(ServerError::Auth(auth::AuthError::MissingAuth).http_status(), 403);
+        assert_eq!(
+            ServerError::Auth(auth::AuthError::MissingAuth).http_status(),
+            403
+        );
     }
 
     #[test]
     fn http_status_400() {
-        assert_eq!(ServerError::InvalidRequest { reason: "x".into() }.http_status(), 400);
-        assert_eq!(ServerError::ObjectTooLarge { size: 1, max: 0 }.http_status(), 400);
+        assert_eq!(
+            ServerError::InvalidRequest { reason: "x".into() }.http_status(),
+            400
+        );
+        assert_eq!(
+            ServerError::ObjectTooLarge { size: 1, max: 0 }.http_status(),
+            400
+        );
     }
 
     #[test]
@@ -261,9 +320,18 @@ mod tests {
     #[test]
     fn http_status_500_wildcard() {
         assert_eq!(ServerError::Store(StoreError::NotFound).http_status(), 500);
-        assert_eq!(ServerError::Metadata(MetadataError::ObjectNotFound).http_status(), 500);
-        assert_eq!(ServerError::MetadataBlobError { reason: "x".into() }.http_status(), 500);
-        assert_eq!(ServerError::Ec(ec::EcError::InvalidConfig { reason: "x" }).http_status(), 500);
+        assert_eq!(
+            ServerError::Metadata(MetadataError::ObjectNotFound).http_status(),
+            500
+        );
+        assert_eq!(
+            ServerError::MetadataBlobError { reason: "x".into() }.http_status(),
+            500
+        );
+        assert_eq!(
+            ServerError::Ec(ec::EcError::InvalidConfig { reason: "x" }).http_status(),
+            500
+        );
     }
 
     #[test]
@@ -292,10 +360,15 @@ mod tests {
 
     #[test]
     fn display_messages() {
-        let err = ServerError::BucketNotFound { name: "test".into() };
+        let err = ServerError::BucketNotFound {
+            name: "test".into(),
+        };
         assert!(err.to_string().contains("test"));
 
-        let err = ServerError::ObjectNotFound { bucket: "b".into(), key: "k".into() };
+        let err = ServerError::ObjectNotFound {
+            bucket: "b".into(),
+            key: "k".into(),
+        };
         assert!(err.to_string().contains("b/k"));
 
         let err = ServerError::ObjectTooLarge { size: 100, max: 50 };

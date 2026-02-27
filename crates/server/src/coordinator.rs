@@ -2,8 +2,8 @@
 use ec::{EcConfig, ErasureCodec};
 use storage::traits::{GlobalService, PgMetadataStore, ShardStore, StorageNode};
 use storage::{
-    BucketInfo, ListObjectsReq, LocalStorageNode, ObjectRecord, PutObjectMetaReq,
-    ShardKey, SqliteBucketDb,
+    BucketInfo, ListObjectsReq, LocalStorageNode, ObjectRecord, PutObjectMetaReq, ShardKey,
+    SqliteBucketDb,
 };
 
 use crate::conditional::{
@@ -93,6 +93,7 @@ pub struct ListObjectsResult {
     pub common_prefixes: Vec<String>,
     pub is_truncated: bool,
     pub next_continuation_token: Option<String>,
+    pub owner_id: u64,
 }
 
 /// Result entry for a successfully deleted object in a batch delete.
@@ -177,9 +178,7 @@ impl Coordinator {
         }
 
         self.bucket_db.delete_bucket(name).map_err(|e| match e {
-            storage::MetadataError::BucketNotFound { name } => {
-                ServerError::BucketNotFound { name }
-            }
+            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound { name },
             storage::MetadataError::BucketNotEmpty => ServerError::BucketNotEmpty,
             other => ServerError::Metadata(other),
         })
@@ -187,9 +186,7 @@ impl Coordinator {
 
     pub fn head_bucket(&self, name: &str) -> Result<BucketInfo, ServerError> {
         self.bucket_db.head_bucket(name).map_err(|e| match e {
-            storage::MetadataError::BucketNotFound { name } => {
-                ServerError::BucketNotFound { name }
-            }
+            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound { name },
             other => ServerError::Metadata(other),
         })
     }
@@ -359,16 +356,15 @@ impl Coordinator {
         // 1. Read source metadata
         let src_pg_id = derive_pg(src_bucket, src_key, self.pg_count);
         let src_pg = self.storage_node.get_pg(src_pg_id)?;
-        let src_record =
-            src_pg
-                .get_object_meta(src_bucket, src_key)
-                .map_err(|e| match e {
-                    storage::MetadataError::ObjectNotFound => ServerError::ObjectNotFound {
-                        bucket: src_bucket.to_string(),
-                        key: src_key.to_string(),
-                    },
-                    other => ServerError::Metadata(other),
-                })?;
+        let src_record = src_pg
+            .get_object_meta(src_bucket, src_key)
+            .map_err(|e| match e {
+                storage::MetadataError::ObjectNotFound => ServerError::ObjectNotFound {
+                    bucket: src_bucket.to_string(),
+                    key: src_key.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })?;
 
         let src_etag_crc = etag_bytes_to_crc64(&src_record.etag).unwrap_or(0);
         let src_etag = format_etag(src_etag_crc);
@@ -454,14 +450,15 @@ impl Coordinator {
         };
 
         // 7. Write destination object
-        let put_result = self.write_object_inner(dst_bucket, dst_key, &metadata_blob, &user_data)?;
+        let put_result =
+            self.write_object_inner(dst_bucket, dst_key, &metadata_blob, &user_data)?;
 
         // 8. Read back dest metadata to get the authoritative last_modified
         let dst_pg_id = derive_pg(dst_bucket, dst_key, self.pg_count);
         let dst_pg = self.storage_node.get_pg(dst_pg_id)?;
-        let dst_record = dst_pg.get_object_meta(dst_bucket, dst_key).map_err(|e| {
-            ServerError::Metadata(e)
-        })?;
+        let dst_record = dst_pg
+            .get_object_meta(dst_bucket, dst_key)
+            .map_err(|e| ServerError::Metadata(e))?;
 
         Ok(CopyObjectResult {
             etag: put_result.etag,
@@ -544,9 +541,8 @@ impl Coordinator {
             .collect();
 
         if !missing_needed.is_empty() {
-            let present_indices: Vec<usize> = (0..(k + m))
-                .filter(|&i| all_shards[i].is_some())
-                .collect();
+            let present_indices: Vec<usize> =
+                (0..(k + m)).filter(|&i| all_shards[i].is_some()).collect();
             let present_refs: Vec<&[u8]> = present_indices
                 .iter()
                 .map(|&i| all_shards[i].as_ref().unwrap().as_slice())
@@ -563,8 +559,10 @@ impl Coordinator {
                 &tmp_codec
             };
 
-            let mut outputs: Vec<Vec<u8>> =
-                missing_needed.iter().map(|_| vec![0u8; shard_size]).collect();
+            let mut outputs: Vec<Vec<u8>> = missing_needed
+                .iter()
+                .map(|_| vec![0u8; shard_size])
+                .collect();
             let mut output_refs: Vec<&mut [u8]> =
                 outputs.iter_mut().map(|v| v.as_mut_slice()).collect();
 
@@ -712,17 +710,15 @@ impl Coordinator {
         // Legacy path: total_size == 0, read all k data shards
         let k = record.ec_k as usize;
         let all_data_indices: Vec<usize> = (0..k).collect();
-        let (shard_data, shard_size) =
-            self.read_data_shards(pg, &okh, version_id, &record, &all_data_indices)
-                .map_err(|e| match e {
-                    ServerError::Store(storage::StoreError::NotFound) => {
-                        ServerError::ObjectNotFound {
-                            bucket: bucket.to_string(),
-                            key: key.to_string(),
-                        }
-                    }
-                    other => other,
-                })?;
+        let (shard_data, shard_size) = self
+            .read_data_shards(pg, &okh, version_id, &record, &all_data_indices)
+            .map_err(|e| match e {
+                ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                },
+                other => other,
+            })?;
 
         let mut full_padded_data = Vec::with_capacity(k * shard_size);
         for shard in &shard_data {
@@ -801,17 +797,15 @@ impl Coordinator {
         }
 
         // Legacy path: total_size == 0, read shard 0 first
-        let (shards, shard_size) =
-            self.read_data_shards(pg, &okh, version_id, &record, &[0])
-                .map_err(|e| match e {
-                    ServerError::Store(storage::StoreError::NotFound) => {
-                        ServerError::ObjectNotFound {
-                            bucket: bucket.to_string(),
-                            key: key.to_string(),
-                        }
-                    }
-                    other => other,
-                })?;
+        let (shards, shard_size) = self
+            .read_data_shards(pg, &okh, version_id, &record, &[0])
+            .map_err(|e| match e {
+                ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                },
+                other => other,
+            })?;
 
         let shard0 = &shards[0];
         let k = record.ec_k as usize;
@@ -835,17 +829,15 @@ impl Coordinator {
         }
 
         let all_data_indices: Vec<usize> = (0..k).collect();
-        let (shards, _) =
-            self.read_data_shards(pg, &okh, version_id, &record, &all_data_indices)
-                .map_err(|e| match e {
-                    ServerError::Store(storage::StoreError::NotFound) => {
-                        ServerError::ObjectNotFound {
-                            bucket: bucket.to_string(),
-                            key: key.to_string(),
-                        }
-                    }
-                    other => other,
-                })?;
+        let (shards, _) = self
+            .read_data_shards(pg, &okh, version_id, &record, &all_data_indices)
+            .map_err(|e| match e {
+                ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                },
+                other => other,
+            })?;
 
         let mut combined = Vec::with_capacity(k * shard_size);
         for shard in &shards {
@@ -891,11 +883,12 @@ impl Coordinator {
         check_read_conditions(cond, &etag_str, record.last_modified)?;
 
         // Resolve byte range against user data size
-        let (user_start, user_end) = range
-            .resolve(record.size)
-            .ok_or(ServerError::InvalidRange {
-                total_size: record.size,
-            })?;
+        let (user_start, user_end) =
+            range
+                .resolve(record.size)
+                .ok_or(ServerError::InvalidRange {
+                    total_size: record.size,
+                })?;
 
         if record.total_size > 0 {
             let metadata_size = (record.total_size - record.size) as usize;
@@ -943,17 +936,15 @@ impl Coordinator {
         // Legacy path: total_size == 0, fall back to full read
         let k = record.ec_k as usize;
         let all_data_indices: Vec<usize> = (0..k).collect();
-        let (shard_data, shard_size) =
-            self.read_data_shards(pg, &okh, version_id, &record, &all_data_indices)
-                .map_err(|e| match e {
-                    ServerError::Store(storage::StoreError::NotFound) => {
-                        ServerError::ObjectNotFound {
-                            bucket: bucket.to_string(),
-                            key: key.to_string(),
-                        }
-                    }
-                    other => other,
-                })?;
+        let (shard_data, shard_size) = self
+            .read_data_shards(pg, &okh, version_id, &record, &all_data_indices)
+            .map_err(|e| match e {
+                ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                },
+                other => other,
+            })?;
 
         let mut full_padded_data = Vec::with_capacity(k * shard_size);
         for shard in &shard_data {
@@ -1036,7 +1027,7 @@ impl Coordinator {
         max_keys: u32,
     ) -> Result<ListObjectsResult, ServerError> {
         // Verify bucket exists
-        self.head_bucket(bucket)?;
+        let bucket_info = self.head_bucket(bucket)?;
 
         // MaxKeys=0 is valid per S3 spec: return empty result
         if max_keys == 0 {
@@ -1045,6 +1036,7 @@ impl Coordinator {
                 common_prefixes: Vec::new(),
                 is_truncated: false,
                 next_continuation_token: None,
+                owner_id: bucket_info.owner_id,
             });
         }
 
@@ -1090,8 +1082,9 @@ impl Coordinator {
         let mut objects: Vec<ListEntry> = Vec::new();
         let mut common_prefixes: Vec<String> = Vec::new();
         let mut entry_count = 0usize;
-        let mut last_key_seen: Option<String> = None;
+        let mut last_entry: Option<String> = None;
         let mut is_truncated = false;
+        let token = continuation_token;
 
         if let Some(delim) = delimiter {
             let prefix_str = prefix.unwrap_or("");
@@ -1106,32 +1099,30 @@ impl Coordinator {
                 let record = &all_objects[i];
                 let after_prefix = &record.key[prefix_str.len()..];
                 if let Some(pos) = after_prefix.find(delim) {
-                    let cp = format!(
-                        "{}{}",
-                        prefix_str,
-                        &after_prefix[..pos + delim.len()]
-                    );
+                    let cp = format!("{}{}", prefix_str, &after_prefix[..pos + delim.len()]);
                     // Skip all remaining keys under this common prefix so the
                     // continuation token advances past the entire group.
                     let is_new = seen_prefixes.insert(cp.clone());
                     while i < all_objects.len() && all_objects[i].key.starts_with(&cp) {
-                        last_key_seen = Some(all_objects[i].key.clone());
                         i += 1;
                     }
-                    if is_new {
-                        common_prefixes.push(cp);
+                    if is_new && token.is_none_or(|t| cp.as_str() > t) {
+                        common_prefixes.push(cp.clone());
                         entry_count += 1;
+                        last_entry = Some(cp);
                     }
                 } else {
-                    let etag_crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
-                    objects.push(ListEntry {
-                        key: record.key.clone(),
-                        size: record.size,
-                        etag: format_etag(etag_crc),
-                        last_modified: record.last_modified,
-                    });
-                    entry_count += 1;
-                    last_key_seen = Some(record.key.clone());
+                    if token.is_none_or(|t| record.key.as_str() > t) {
+                        let etag_crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
+                        objects.push(ListEntry {
+                            key: record.key.clone(),
+                            size: record.size,
+                            etag: format_etag(etag_crc),
+                            last_modified: record.last_modified,
+                        });
+                        entry_count += 1;
+                        last_entry = Some(record.key.clone());
+                    }
                     i += 1;
                 }
             }
@@ -1141,19 +1132,21 @@ impl Coordinator {
                     is_truncated = true;
                     break;
                 }
-                let etag_crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
-                objects.push(ListEntry {
-                    key: record.key.clone(),
-                    size: record.size,
-                    etag: format_etag(etag_crc),
-                    last_modified: record.last_modified,
-                });
-                entry_count += 1;
-                last_key_seen = Some(record.key.clone());
+                if token.is_none_or(|t| record.key.as_str() > t) {
+                    let etag_crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
+                    objects.push(ListEntry {
+                        key: record.key.clone(),
+                        size: record.size,
+                        etag: format_etag(etag_crc),
+                        last_modified: record.last_modified,
+                    });
+                    entry_count += 1;
+                    last_entry = Some(record.key.clone());
+                }
             }
 
-            // Check if there were more objects than max_keys
-            if all_objects.len() > max {
+            // Check if there were more objects than max_keys (only if no token).
+            if token.is_none() && all_objects.len() > max {
                 is_truncated = true;
             }
         }
@@ -1163,17 +1156,14 @@ impl Coordinator {
             is_truncated = true;
         }
 
-        let next_token = if is_truncated {
-            last_key_seen
-        } else {
-            None
-        };
+        let next_token = if is_truncated { last_entry } else { None };
 
         Ok(ListObjectsResult {
             objects,
             common_prefixes,
             is_truncated,
             next_continuation_token: next_token,
+            owner_id: bucket_info.owner_id,
         })
     }
 
@@ -1234,7 +1224,14 @@ mod tests {
         let storage_node = LocalStorageNode::open(dir, &pg_ids).unwrap();
         let bucket_db = SqliteBucketDb::open_in_memory().unwrap();
         let ec_config = EcConfig::new(4, 2).unwrap();
-        Coordinator::new(storage_node, bucket_db, ec_config, 4, "us-east-1".to_string()).unwrap()
+        Coordinator::new(
+            storage_node,
+            bucket_db,
+            ec_config,
+            4,
+            "us-east-1".to_string(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1323,10 +1320,7 @@ mod tests {
 
         let obj = coord.get_object("bucket", "obj", NO_READ).unwrap();
         assert_eq!(obj.data, b"{}");
-        assert_eq!(
-            obj.metadata.get("content-type"),
-            Some("application/json")
-        );
+        assert_eq!(obj.metadata.get("content-type"), Some("application/json"));
         assert_eq!(obj.metadata.get("x-amz-meta-author"), Some("alice"));
         assert_eq!(obj.metadata.get("x-amz-meta-version"), Some("42"));
     }
@@ -1338,7 +1332,13 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object("bucket", "key", b"data", &[("Content-Type", "text/plain")], NO_WRITE)
+            .put_object(
+                "bucket",
+                "key",
+                b"data",
+                &[("Content-Type", "text/plain")],
+                NO_WRITE,
+            )
             .unwrap();
 
         let head = coord.head_object("bucket", "key", NO_READ).unwrap();
@@ -1352,8 +1352,12 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        coord.put_object("bucket", "key", b"v1", &[], NO_WRITE).unwrap();
-        coord.put_object("bucket", "key", b"v2", &[], NO_WRITE).unwrap();
+        coord
+            .put_object("bucket", "key", b"v1", &[], NO_WRITE)
+            .unwrap();
+        coord
+            .put_object("bucket", "key", b"v2", &[], NO_WRITE)
+            .unwrap();
 
         let obj = coord.get_object("bucket", "key", NO_READ).unwrap();
         assert_eq!(obj.data, b"v2");
@@ -1365,7 +1369,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        coord.put_object("bucket", "empty", b"", &[], NO_WRITE).unwrap();
+        coord
+            .put_object("bucket", "empty", b"", &[], NO_WRITE)
+            .unwrap();
 
         let obj = coord.get_object("bucket", "empty", NO_READ).unwrap();
         assert_eq!(obj.data, b"");
@@ -1378,7 +1384,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        coord.put_object("bucket", "key", b"data", &[], NO_WRITE).unwrap();
+        coord
+            .put_object("bucket", "key", b"data", &[], NO_WRITE)
+            .unwrap();
         coord.delete_object("bucket", "key", NO_DELETE).unwrap();
 
         let err = coord.get_object("bucket", "key", NO_READ).unwrap_err();
@@ -1392,7 +1400,9 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         // Should not error
-        coord.delete_object("bucket", "no-such-key", NO_DELETE).unwrap();
+        coord
+            .delete_object("bucket", "no-such-key", NO_DELETE)
+            .unwrap();
     }
 
     #[test]
@@ -1401,9 +1411,15 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        coord.put_object("bucket", "a/1", b"1", &[], NO_WRITE).unwrap();
-        coord.put_object("bucket", "a/2", b"2", &[], NO_WRITE).unwrap();
-        coord.put_object("bucket", "b/1", b"3", &[], NO_WRITE).unwrap();
+        coord
+            .put_object("bucket", "a/1", b"1", &[], NO_WRITE)
+            .unwrap();
+        coord
+            .put_object("bucket", "a/2", b"2", &[], NO_WRITE)
+            .unwrap();
+        coord
+            .put_object("bucket", "b/1", b"3", &[], NO_WRITE)
+            .unwrap();
 
         let result = coord
             .list_objects_v2("bucket", None, None, None, 1000)
@@ -1421,9 +1437,15 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        coord.put_object("bucket", "photos/cat.jpg", b"cat", &[], NO_WRITE).unwrap();
-        coord.put_object("bucket", "photos/dog.jpg", b"dog", &[], NO_WRITE).unwrap();
-        coord.put_object("bucket", "docs/readme.md", b"md", &[], NO_WRITE).unwrap();
+        coord
+            .put_object("bucket", "photos/cat.jpg", b"cat", &[], NO_WRITE)
+            .unwrap();
+        coord
+            .put_object("bucket", "photos/dog.jpg", b"dog", &[], NO_WRITE)
+            .unwrap();
+        coord
+            .put_object("bucket", "docs/readme.md", b"md", &[], NO_WRITE)
+            .unwrap();
 
         let result = coord
             .list_objects_v2("bucket", Some("photos/"), None, None, 1000)
@@ -1437,10 +1459,18 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        coord.put_object("bucket", "photos/cat.jpg", b"cat", &[], NO_WRITE).unwrap();
-        coord.put_object("bucket", "photos/dog.jpg", b"dog", &[], NO_WRITE).unwrap();
-        coord.put_object("bucket", "docs/readme.md", b"md", &[], NO_WRITE).unwrap();
-        coord.put_object("bucket", "root.txt", b"root", &[], NO_WRITE).unwrap();
+        coord
+            .put_object("bucket", "photos/cat.jpg", b"cat", &[], NO_WRITE)
+            .unwrap();
+        coord
+            .put_object("bucket", "photos/dog.jpg", b"dog", &[], NO_WRITE)
+            .unwrap();
+        coord
+            .put_object("bucket", "docs/readme.md", b"md", &[], NO_WRITE)
+            .unwrap();
+        coord
+            .put_object("bucket", "root.txt", b"root", &[], NO_WRITE)
+            .unwrap();
 
         let result = coord
             .list_objects_v2("bucket", None, Some("/"), None, 1000)
@@ -1497,7 +1527,10 @@ mod tests {
     ) {
         let path = shard_file_path(data_dir, bucket, key, shard_index, pg_count);
         std::fs::remove_file(&path).unwrap_or_else(|e| {
-            panic!("failed to delete shard {shard_index} at {}: {e}", path.display())
+            panic!(
+                "failed to delete shard {shard_index} at {}: {e}",
+                path.display()
+            )
         });
     }
 
@@ -1512,7 +1545,10 @@ mod tests {
     ) {
         let path = shard_file_path(data_dir, bucket, key, shard_index, pg_count);
         let mut data = std::fs::read(&path).unwrap_or_else(|e| {
-            panic!("failed to read shard {shard_index} at {}: {e}", path.display())
+            panic!(
+                "failed to read shard {shard_index} at {}: {e}",
+                path.display()
+            )
         });
         assert!(!data.is_empty(), "shard file is empty");
         data[0] ^= 0xFF;
@@ -1547,7 +1583,9 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         let data = b"EC single shard loss test data";
-        coord.put_object("bucket", "obj1", data, &[], NO_WRITE).unwrap();
+        coord
+            .put_object("bucket", "obj1", data, &[], NO_WRITE)
+            .unwrap();
 
         delete_shard_on_disk(tmp.path(), "bucket", "obj1", 0, 4);
 
@@ -1563,7 +1601,9 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         let data = b"EC m-shard loss limit test data";
-        coord.put_object("bucket", "obj2", data, &[], NO_WRITE).unwrap();
+        coord
+            .put_object("bucket", "obj2", data, &[], NO_WRITE)
+            .unwrap();
 
         // Delete 2 data shards (indices 0 and 1)
         delete_shard_on_disk(tmp.path(), "bucket", "obj2", 0, 4);
@@ -1581,7 +1621,9 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         let data = b"EC m+1 shard loss test data";
-        coord.put_object("bucket", "obj3", data, &[], NO_WRITE).unwrap();
+        coord
+            .put_object("bucket", "obj3", data, &[], NO_WRITE)
+            .unwrap();
 
         // Delete 3 shards (indices 0, 1, 2)
         delete_shard_on_disk(tmp.path(), "bucket", "obj3", 0, 4);
@@ -1600,7 +1642,9 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         let data = b"EC corruption recovery test data";
-        coord.put_object("bucket", "obj4", data, &[], NO_WRITE).unwrap();
+        coord
+            .put_object("bucket", "obj4", data, &[], NO_WRITE)
+            .unwrap();
 
         corrupt_shard_on_disk(tmp.path(), "bucket", "obj4", 0, 4);
 
@@ -1615,14 +1659,21 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         let data = b"Hello, World! Range test with EC recovery";
-        coord.put_object("bucket", "obj5", data, &[], NO_WRITE).unwrap();
+        coord
+            .put_object("bucket", "obj5", data, &[], NO_WRITE)
+            .unwrap();
 
         // Delete shard 0 (covers the beginning of the data)
         delete_shard_on_disk(tmp.path(), "bucket", "obj5", 0, 4);
 
         // Range get should still succeed via EC reconstruction
         let result = coord
-            .get_object_range("bucket", "obj5", ByteRange::Range { start: 0, end: 4 }, NO_READ)
+            .get_object_range(
+                "bucket",
+                "obj5",
+                ByteRange::Range { start: 0, end: 4 },
+                NO_READ,
+            )
             .unwrap();
         assert_eq!(result.data, b"Hello");
     }
@@ -1635,7 +1686,9 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         let data = b"EC parity shard drop test";
-        coord.put_object("bucket", "obj6", data, &[], NO_WRITE).unwrap();
+        coord
+            .put_object("bucket", "obj6", data, &[], NO_WRITE)
+            .unwrap();
 
         // Delete first parity shard (index 4, since k=4)
         delete_shard_on_disk(tmp.path(), "bucket", "obj6", 4, 4);
@@ -1649,7 +1702,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let coord = setup_coordinator(tmp.path());
 
-        let err = coord.put_object("no-such-bucket", "key", b"data", &[], NO_WRITE).unwrap_err();
+        let err = coord
+            .put_object("no-such-bucket", "key", b"data", &[], NO_WRITE)
+            .unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
     }
 
@@ -1659,7 +1714,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        let err = coord.get_object("bucket", "no-such-key", NO_READ).unwrap_err();
+        let err = coord
+            .get_object("bucket", "no-such-key", NO_READ)
+            .unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
     }
 
@@ -1669,7 +1726,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        let result = coord.put_object("bucket", "key", b"data", &[], NO_WRITE).unwrap();
+        let result = coord
+            .put_object("bucket", "key", b"data", &[], NO_WRITE)
+            .unwrap();
 
         let obj = coord.get_object("bucket", "key", NO_READ).unwrap();
         assert_eq!(result.etag, obj.etag);
@@ -1684,11 +1743,21 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        coord.put_object("bucket", "a/1", b"1", &[], NO_WRITE).unwrap();
-        coord.put_object("bucket", "a/2", b"2", &[], NO_WRITE).unwrap();
-        coord.put_object("bucket", "b/1", b"3", &[], NO_WRITE).unwrap();
-        coord.put_object("bucket", "c/1", b"4", &[], NO_WRITE).unwrap();
-        coord.put_object("bucket", "root.txt", b"5", &[], NO_WRITE).unwrap();
+        coord
+            .put_object("bucket", "a/1", b"1", &[], NO_WRITE)
+            .unwrap();
+        coord
+            .put_object("bucket", "a/2", b"2", &[], NO_WRITE)
+            .unwrap();
+        coord
+            .put_object("bucket", "b/1", b"3", &[], NO_WRITE)
+            .unwrap();
+        coord
+            .put_object("bucket", "c/1", b"4", &[], NO_WRITE)
+            .unwrap();
+        coord
+            .put_object("bucket", "root.txt", b"5", &[], NO_WRITE)
+            .unwrap();
 
         // First page: max_keys=2 with delimiter
         let result = coord
@@ -1764,7 +1833,9 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
         for i in 0..5 {
             let key = format!("key-{:02}", i);
-            coord.put_object("bucket", &key, b"data", &[], NO_WRITE).unwrap();
+            coord
+                .put_object("bucket", &key, b"data", &[], NO_WRITE)
+                .unwrap();
         }
 
         // Request fewer than available
@@ -1784,7 +1855,9 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
         for i in 0..5 {
             let key = format!("key-{:02}", i);
-            coord.put_object("bucket", &key, b"data", &[], NO_WRITE).unwrap();
+            coord
+                .put_object("bucket", &key, b"data", &[], NO_WRITE)
+                .unwrap();
         }
 
         // First page
@@ -1818,10 +1891,18 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        coord.put_object("bucket", "photos/2024/jan.jpg", b"j", &[], NO_WRITE).unwrap();
-        coord.put_object("bucket", "photos/2024/feb.jpg", b"f", &[], NO_WRITE).unwrap();
-        coord.put_object("bucket", "photos/2025/mar.jpg", b"m", &[], NO_WRITE).unwrap();
-        coord.put_object("bucket", "photos/top.jpg", b"t", &[], NO_WRITE).unwrap();
+        coord
+            .put_object("bucket", "photos/2024/jan.jpg", b"j", &[], NO_WRITE)
+            .unwrap();
+        coord
+            .put_object("bucket", "photos/2024/feb.jpg", b"f", &[], NO_WRITE)
+            .unwrap();
+        coord
+            .put_object("bucket", "photos/2025/mar.jpg", b"m", &[], NO_WRITE)
+            .unwrap();
+        coord
+            .put_object("bucket", "photos/top.jpg", b"t", &[], NO_WRITE)
+            .unwrap();
 
         // List with prefix "photos/" and delimiter "/"
         let result = coord
@@ -1842,7 +1923,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        coord.put_object("bucket", "only-one", b"data", &[], NO_WRITE).unwrap();
+        coord
+            .put_object("bucket", "only-one", b"data", &[], NO_WRITE)
+            .unwrap();
 
         let result = coord
             .list_objects_v2("bucket", None, None, None, 1000)
@@ -1858,7 +1941,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        coord.put_object("bucket", "key1", b"data", &[], NO_WRITE).unwrap();
+        coord
+            .put_object("bucket", "key1", b"data", &[], NO_WRITE)
+            .unwrap();
 
         let result = coord
             .list_objects_v2("bucket", None, None, None, 0)
@@ -1875,7 +1960,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        coord.put_object("bucket", "a/1", b"data", &[], NO_WRITE).unwrap();
+        coord
+            .put_object("bucket", "a/1", b"data", &[], NO_WRITE)
+            .unwrap();
 
         let result = coord
             .list_objects_v2("bucket", None, Some("/"), None, 0)
@@ -1902,8 +1989,12 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        coord.put_object("bucket", "key1", b"data1", &[], NO_WRITE).unwrap();
-        coord.put_object("bucket", "key2", b"data2", &[], NO_WRITE).unwrap();
+        coord
+            .put_object("bucket", "key1", b"data1", &[], NO_WRITE)
+            .unwrap();
+        coord
+            .put_object("bucket", "key2", b"data2", &[], NO_WRITE)
+            .unwrap();
 
         let entries = vec![
             crate::http::xml::DeleteObjectEntry {
@@ -1940,7 +2031,9 @@ mod tests {
             version_id: None,
         }];
 
-        let err = coord.delete_objects("no-bucket", &entries, NO_DELETE).unwrap_err();
+        let err = coord
+            .delete_objects("no-bucket", &entries, NO_DELETE)
+            .unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
     }
 
@@ -1957,9 +2050,15 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("test-bucket").unwrap();
-        coord.put_object("test-bucket", "dir/file1.txt", b"hello", &[], NO_WRITE).unwrap();
-        coord.put_object("test-bucket", "dir/file2.txt", b"world", &[], NO_WRITE).unwrap();
-        coord.put_object("test-bucket", "root.txt", b"root", &[], NO_WRITE).unwrap();
+        coord
+            .put_object("test-bucket", "dir/file1.txt", b"hello", &[], NO_WRITE)
+            .unwrap();
+        coord
+            .put_object("test-bucket", "dir/file2.txt", b"world", &[], NO_WRITE)
+            .unwrap();
+        coord
+            .put_object("test-bucket", "root.txt", b"root", &[], NO_WRITE)
+            .unwrap();
 
         // Step 1: ListObjectVersions — reuses list_objects_v2 with no delimiter
         let list_result = coord
@@ -1998,7 +2097,9 @@ mod tests {
         assert!(!quiet);
 
         // Step 5: Batch delete
-        let delete_result = coord.delete_objects("test-bucket", &entries, NO_DELETE).unwrap();
+        let delete_result = coord
+            .delete_objects("test-bucket", &entries, NO_DELETE)
+            .unwrap();
         assert_eq!(delete_result.deleted.len(), 3);
         assert!(delete_result.errors.is_empty());
 
@@ -2019,7 +2120,9 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
         for i in 0..5 {
             let key = format!("key-{:02}", i);
-            coord.put_object("bucket", &key, b"data", &[], NO_WRITE).unwrap();
+            coord
+                .put_object("bucket", &key, b"data", &[], NO_WRITE)
+                .unwrap();
         }
 
         // Page 1: max_keys=2
@@ -2099,12 +2202,14 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
 
-        let err = coord
-            .put_object("bucket", "key", &vec![0u8; 256 * 1024 * 1024 + 1], &[], NO_WRITE);
-        assert!(matches!(
-            err,
-            Err(ServerError::ObjectTooLarge { .. })
-        ));
+        let err = coord.put_object(
+            "bucket",
+            "key",
+            &vec![0u8; 256 * 1024 * 1024 + 1],
+            &[],
+            NO_WRITE,
+        );
+        assert!(matches!(err, Err(ServerError::ObjectTooLarge { .. })));
     }
 
     // ── shard planning unit tests ──────────────────────────────────────
@@ -2142,7 +2247,10 @@ mod tests {
     #[test]
     fn shards_for_byte_range_spans_two() {
         // shard_size=25, range [20,30] → shards 0,1
-        assert_eq!(Coordinator::shards_for_byte_range(20, 30, 25, 4), vec![0, 1]);
+        assert_eq!(
+            Coordinator::shards_for_byte_range(20, 30, 25, 4),
+            vec![0, 1]
+        );
     }
 
     #[test]
@@ -2163,10 +2271,7 @@ mod tests {
     #[test]
     fn shards_for_byte_range_clamped_to_k() {
         // end falls past last shard → clamp to k-1
-        assert_eq!(
-            Coordinator::shards_for_byte_range(75, 200, 25, 4),
-            vec![3]
-        );
+        assert_eq!(Coordinator::shards_for_byte_range(75, 200, 25, 4), vec![3]);
     }
 
     #[test]
@@ -2188,7 +2293,12 @@ mod tests {
 
         // bytes=0-4 → "Hello"
         let result = coord
-            .get_object_range("bucket", "key", ByteRange::Range { start: 0, end: 4 }, NO_READ)
+            .get_object_range(
+                "bucket",
+                "key",
+                ByteRange::Range { start: 0, end: 4 },
+                NO_READ,
+            )
             .unwrap();
         assert_eq!(result.data, b"Hello");
         assert_eq!(result.range_start, 0);
@@ -2244,7 +2354,12 @@ mod tests {
 
         // bytes=100- → unsatisfiable
         let err = coord
-            .get_object_range("bucket", "key", ByteRange::FromStart { start: 100 }, NO_READ)
+            .get_object_range(
+                "bucket",
+                "key",
+                ByteRange::FromStart { start: 100 },
+                NO_READ,
+            )
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidRange { total_size: 5 }));
     }
@@ -2455,9 +2570,7 @@ mod tests {
         let cond = DeleteCondition {
             if_match: Some("\"0000000000000000\"".to_string()),
         };
-        let err = coord
-            .delete_object("bucket", "key", &cond)
-            .unwrap_err();
+        let err = coord.delete_object("bucket", "key", &cond).unwrap_err();
         assert!(matches!(err, ServerError::PreconditionFailed));
     }
 
@@ -2509,7 +2622,12 @@ mod tests {
             ..Default::default()
         };
         let result = coord
-            .get_object_range("bucket", "key", ByteRange::Range { start: 0, end: 4 }, &cond)
+            .get_object_range(
+                "bucket",
+                "key",
+                ByteRange::Range { start: 0, end: 4 },
+                &cond,
+            )
             .unwrap();
         assert_eq!(result.data, b"Hello");
     }
@@ -2551,7 +2669,10 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
-        let headers = [("Content-Type", "image/png"), ("X-Amz-Meta-Author", "alice")];
+        let headers = [
+            ("Content-Type", "image/png"),
+            ("X-Amz-Meta-Author", "alice"),
+        ];
         coord
             .put_object("bucket", "src", b"data", &headers, NO_WRITE)
             .unwrap();
@@ -2580,7 +2701,10 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
-        let headers = [("Content-Type", "image/png"), ("X-Amz-Meta-Author", "alice")];
+        let headers = [
+            ("Content-Type", "image/png"),
+            ("X-Amz-Meta-Author", "alice"),
+        ];
         coord
             .put_object("bucket", "src", b"data", &headers, NO_WRITE)
             .unwrap();
@@ -2634,10 +2758,7 @@ mod tests {
 
         let obj = coord.get_object("bucket", "key", NO_READ).unwrap();
         assert_eq!(obj.data, b"data");
-        assert_eq!(
-            obj.metadata.get("content-type"),
-            Some("application/json")
-        );
+        assert_eq!(obj.metadata.get("content-type"), Some("application/json"));
     }
 
     #[test]
@@ -2789,7 +2910,13 @@ mod tests {
 
         let headers = [("Content-Type", "text/plain")];
         coord
-            .put_object("src-bucket", "key", b"cross bucket data", &headers, NO_WRITE)
+            .put_object(
+                "src-bucket",
+                "key",
+                b"cross bucket data",
+                &headers,
+                NO_WRITE,
+            )
             .unwrap();
 
         coord

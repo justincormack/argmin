@@ -25,8 +25,9 @@ fn node_rm(id: u32, rack: u32, machine: u32, weight: f64) -> NodeInfo {
 
 /// Build a cluster: node_count nodes spread across rack_count racks.
 fn build_cluster(node_count: u32, rack_count: u32, weight: f64) -> ClusterMap {
-    let nodes: Vec<NodeInfo> =
-        (0..node_count).map(|i| node(i, i % rack_count, weight)).collect();
+    let nodes: Vec<NodeInfo> = (0..node_count)
+        .map(|i| node(i, i % rack_count, weight))
+        .collect();
     ClusterMap::new(&nodes).unwrap()
 }
 
@@ -101,7 +102,10 @@ fn no_duplicate_nodes() {
         let out = place_once(&placer, &seed.to_le_bytes());
         let mut seen = std::collections::BTreeSet::new();
         for &nid in &out {
-            assert!(seen.insert(nid), "duplicate node {nid:?} in placement for seed {seed}");
+            assert!(
+                seen.insert(nid),
+                "duplicate node {nid:?} in placement for seed {seed}"
+            );
         }
     }
 }
@@ -178,7 +182,10 @@ fn level_cap_zone_one_per_zone() {
         // The two selected nodes must be from different zones
         let zone0 = out[0].as_u32() / 2;
         let zone1 = out[1].as_u32() / 2;
-        assert_ne!(zone0, zone1, "two shards landed in same zone for seed {seed}");
+        assert_ne!(
+            zone0, zone1,
+            "two shards landed in same zone for seed {seed}"
+        );
     }
 }
 
@@ -186,9 +193,7 @@ fn level_cap_zone_one_per_zone() {
 fn level_cap_machine() {
     // 4 racks × 2 machines per rack × 1 node per machine = 8 nodes
     // Place 4 shards with cap 1 per machine
-    let nodes: Vec<NodeInfo> = (0..8u32)
-        .map(|i| node_rm(i, i / 2, i, 1.0))
-        .collect();
+    let nodes: Vec<NodeInfo> = (0..8u32).map(|i| node_rm(i, i / 2, i, 1.0)).collect();
     let map = ClusterMap::new(&nodes).unwrap();
     let placer = Placer::new(
         PlacementConfig::new(4).unwrap(),
@@ -202,7 +207,10 @@ fn level_cap_machine() {
         let mut machines = std::collections::BTreeSet::new();
         for &nid in &out {
             let machine = nid.as_u32(); // 1 node per machine, machine id == node id
-            assert!(machines.insert(machine), "machine collision for seed {seed}");
+            assert!(
+                machines.insert(machine),
+                "machine collision for seed {seed}"
+            );
         }
     }
 }
@@ -242,7 +250,9 @@ fn constraint_satisfiable_three_racks() {
     .unwrap();
     // Should succeed for any key
     for seed in 0u32..100 {
-        assert!(placer.place(&seed.to_le_bytes(), &mut vec![NodeId::new(0); 6]).is_ok());
+        assert!(placer
+            .place(&seed.to_le_bytes(), &mut [NodeId::new(0); 6])
+            .is_ok());
     }
 }
 
@@ -350,8 +360,7 @@ fn custom_partition_matroid_constraint() {
             }
         }),
     };
-    let placer =
-        Placer::new(PlacementConfig::new(6).unwrap(), &map, constraint).unwrap();
+    let placer = Placer::new(PlacementConfig::new(6).unwrap(), &map, constraint).unwrap();
 
     for seed in 0u32..100 {
         let out = place_once(&placer, &seed.to_le_bytes());
@@ -362,7 +371,10 @@ fn custom_partition_matroid_constraint() {
             *group_counts.entry(rack).or_default() += 1;
         }
         for (&rack, &count) in &group_counts {
-            assert!(count <= machine_cap, "rack {rack} has {count} shards (max {machine_cap})");
+            assert!(
+                count <= machine_cap,
+                "rack {rack} has {count} shards (max {machine_cap})"
+            );
         }
     }
 }
@@ -387,20 +399,21 @@ fn contract_violation_output_is_valid() {
     let cc = call_count.clone();
     let map = build_cluster(12, 3, 1.0);
     let bad_constraint = PlacementConstraint {
-        group_key: std::sync::Arc::new(|node| {
-            node.location.level(Level::RACK).unwrap_or(0) as u64
-        }),
+        group_key: std::sync::Arc::new(|node| node.location.level(Level::RACK).unwrap_or(0) as u64),
         // VIOLATION: returns Global for the first 6 admit() calls regardless of
         // which group is being evaluated, and Constrained for all subsequent calls.
         // The per-group cap is not fixed — it depends on how many other groups
         // were evaluated first, which the algorithm's correctness proof cannot handle.
         admit: std::sync::Arc::new(move |_same_group, _node| {
             let n = cc.fetch_add(1, Ordering::Relaxed);
-            if n < 6 { Admission::Global } else { Admission::Constrained }
+            if n < 6 {
+                Admission::Global
+            } else {
+                Admission::Constrained
+            }
         }),
     };
-    let placer =
-        Placer::new(PlacementConfig::new(6).unwrap(), &map, bad_constraint).unwrap();
+    let placer = Placer::new(PlacementConfig::new(6).unwrap(), &map, bad_constraint).unwrap();
 
     let mut out = vec![NodeId::new(0); 6];
     match placer.place(b"key", &mut out) {
@@ -408,7 +421,10 @@ fn contract_violation_output_is_valid() {
             // If it succeeds, output must be structurally valid.
             let mut seen = std::collections::BTreeSet::new();
             for &nid in &out {
-                assert!(seen.insert(nid), "duplicate node in output from bad constraint");
+                assert!(
+                    seen.insert(nid),
+                    "duplicate node in output from bad constraint"
+                );
             }
         }
         Err(PlacementError::ConstraintUnsatisfiable { .. }) => {
@@ -514,7 +530,10 @@ mod alloc_tests {
         let allocs = count_allocs(|| {
             placer.place(b"test-key", &mut out).unwrap();
         });
-        assert_eq!(allocs, 0, "place() must not allocate with rack_cap constraint");
+        assert_eq!(
+            allocs, 0,
+            "place() must not allocate with rack_cap constraint"
+        );
     }
 
     #[test]
@@ -548,7 +567,10 @@ mod alloc_tests {
         let allocs = count_allocs(|| {
             placer.place(b"test-key", &mut out).unwrap();
         });
-        assert_eq!(allocs, 0, "place() must not allocate even for large clusters");
+        assert_eq!(
+            allocs, 0,
+            "place() must not allocate even for large clusters"
+        );
     }
 
     #[test]
@@ -572,7 +594,10 @@ mod alloc_tests {
         let allocs = count_allocs(|| {
             placer.place(b"test-key", &mut out).unwrap();
         });
-        assert_eq!(allocs, 0, "place() must not allocate with custom closure constraint");
+        assert_eq!(
+            allocs, 0,
+            "place() must not allocate with custom closure constraint"
+        );
     }
 }
 
@@ -600,7 +625,7 @@ mod prop_tests {
             let map = ClusterMap::new(&nodes).unwrap();
 
             // Set cap high enough to always be satisfiable
-            let max_per_rack = ((total_shards as u32 + rack_count - 1) / rack_count) as usize;
+            let max_per_rack = (total_shards as u32).div_ceil(rack_count) as usize;
 
             let placer = match Placer::new(
                 PlacementConfig::new(total_shards).unwrap(),
@@ -625,7 +650,7 @@ mod prop_tests {
                         let rack = nid.as_u32() % rack_count;
                         *rack_counts.entry(rack).or_default() += 1;
                     }
-                    for (_, &count) in &rack_counts {
+                    for &count in rack_counts.values() {
                         prop_assert!(count <= max_per_rack);
                     }
                 }

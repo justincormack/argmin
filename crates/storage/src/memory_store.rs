@@ -1,9 +1,9 @@
+use std::cell::RefCell;
 /// In-memory PG store for testing. No disk I/O.
 ///
 /// Implements both `ShardStore` and `PgMetadataStore` backed by `HashMap`s.
 /// Still computes and verifies CRC64 for correctness testing.
 use std::collections::HashMap;
-use std::cell::RefCell;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{MetadataError, StoreError};

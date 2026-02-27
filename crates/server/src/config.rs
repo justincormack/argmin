@@ -35,10 +35,8 @@ impl ServerConfig {
         let secret_access_key = get("ARGMIN_SECRET_ACCESS_KEY")
             .ok_or_else(|| "ARGMIN_SECRET_ACCESS_KEY is required".to_string())?;
 
-        let listen_addr = get("ARGMIN_LISTEN_ADDR")
-            .unwrap_or_else(|| "127.0.0.1:9000".to_string());
-        let data_dir = get("ARGMIN_DATA_DIR")
-            .unwrap_or_else(|| "./data".to_string());
+        let listen_addr = get("ARGMIN_LISTEN_ADDR").unwrap_or_else(|| "127.0.0.1:9000".to_string());
+        let data_dir = get("ARGMIN_DATA_DIR").unwrap_or_else(|| "./data".to_string());
         let pg_count: u32 = get("ARGMIN_PG_COUNT")
             .unwrap_or_else(|| "16".to_string())
             .parse()
@@ -51,8 +49,7 @@ impl ServerConfig {
             .unwrap_or_else(|| "2".to_string())
             .parse()
             .map_err(|e| format!("invalid ARGMIN_EC_M: {}", e))?;
-        let region = get("ARGMIN_REGION")
-            .unwrap_or_else(|| "us-east-1".to_string());
+        let region = get("ARGMIN_REGION").unwrap_or_else(|| "us-east-1".to_string());
 
         if pg_count == 0 {
             return Err("ARGMIN_PG_COUNT must be > 0".to_string());
@@ -77,7 +74,12 @@ mod tests {
     use std::collections::HashMap;
 
     fn make_env<'a>(overrides: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
-        move |key| overrides.iter().find(|(k, _)| *k == key).map(|(_, v)| v.to_string())
+        move |key| {
+            overrides
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.to_string())
+        }
     }
 
     fn required_only() -> HashMap<&'static str, &'static str> {
@@ -93,19 +95,15 @@ mod tests {
 
     #[test]
     fn missing_access_key_id() {
-        let err = ServerConfig::from_lookup(make_env(&[
-            ("ARGMIN_SECRET_ACCESS_KEY", "s"),
-        ]))
-        .unwrap_err();
+        let err =
+            ServerConfig::from_lookup(make_env(&[("ARGMIN_SECRET_ACCESS_KEY", "s")])).unwrap_err();
         assert!(err.contains("ARGMIN_ACCESS_KEY_ID"));
     }
 
     #[test]
     fn missing_secret_access_key() {
-        let err = ServerConfig::from_lookup(make_env(&[
-            ("ARGMIN_ACCESS_KEY_ID", "a"),
-        ]))
-        .unwrap_err();
+        let err =
+            ServerConfig::from_lookup(make_env(&[("ARGMIN_ACCESS_KEY_ID", "a")])).unwrap_err();
         assert!(err.contains("ARGMIN_SECRET_ACCESS_KEY"));
     }
 

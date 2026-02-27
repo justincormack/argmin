@@ -76,11 +76,7 @@ pub(crate) fn reconstruct_shards(
     // SAFETY: ISA-L's gf_invert_matrix reads and writes exactly k*k bytes in
     // the provided buffers and does not access memory beyond those arrays.
     let rc = unsafe {
-        ec_sys::gf_invert_matrix(
-            sub_matrix.as_mut_ptr(),
-            inv_matrix.as_mut_ptr(),
-            k as i32,
-        )
+        ec_sys::gf_invert_matrix(sub_matrix.as_mut_ptr(), inv_matrix.as_mut_ptr(), k as i32)
     };
     if rc != 0 {
         return Err(EcError::SingularMatrix);
@@ -96,7 +92,10 @@ pub(crate) fn reconstruct_shards(
         for j in 0..k {
             let mut val = 0u8;
             for col in 0..k {
-                val = gf_add(val, gf_mul(encode_matrix[r * k + col], inv_matrix[col * k + j]));
+                val = gf_add(
+                    val,
+                    gf_mul(encode_matrix[r * k + col], inv_matrix[col * k + j]),
+                );
             }
             recovery_matrix[out_row * k + j] = val;
         }

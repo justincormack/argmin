@@ -56,16 +56,25 @@ mod tests {
 
     #[test]
     fn invalid_total_shards_zero() {
-        assert_eq!(PlacementConfig::new(0), Err(PlacementError::InvalidTotalShards));
+        assert_eq!(
+            PlacementConfig::new(0),
+            Err(PlacementError::InvalidTotalShards)
+        );
     }
 
     #[test]
     fn invalid_total_shards_too_large() {
-        assert_eq!(PlacementConfig::new(33), Err(PlacementError::InvalidTotalShards));
+        assert_eq!(
+            PlacementConfig::new(33),
+            Err(PlacementError::InvalidTotalShards)
+        );
     }
 
     #[test]
     fn invalid_total_shards_max_u8() {
-        assert_eq!(PlacementConfig::new(255), Err(PlacementError::InvalidTotalShards));
+        assert_eq!(
+            PlacementConfig::new(255),
+            Err(PlacementError::InvalidTotalShards)
+        );
     }
 }

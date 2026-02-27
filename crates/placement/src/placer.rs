@@ -1,9 +1,9 @@
-use std::sync::Arc;
 use crate::cluster::{ClusterMap, NodeId, NodeInfo};
 use crate::config::{PlacementConfig, PlacementError};
 use crate::constraint::{Admission, AdmitFn, PlacementConstraint};
 use crate::hash::score;
 use crate::MAX_SHARDS;
+use std::sync::Arc;
 
 /// A single entry in the candidate buffer.
 #[derive(Clone, Copy)]
@@ -66,7 +66,11 @@ impl Placer {
                 (n.clone(), gk)
             })
             .collect();
-        Ok(Placer { config, nodes, admit: constraint.admit })
+        Ok(Placer {
+            config,
+            nodes,
+            admit: constraint.admit,
+        })
     }
 
     pub fn config(&self) -> PlacementConfig {
@@ -126,8 +130,11 @@ impl Placer {
                 Admission::Global => {
                     if cand_len < total {
                         // Buffer has space: append unconditionally.
-                        cands[cand_len] =
-                            Candidate { score: s, node_id: node.id, group_key: gk };
+                        cands[cand_len] = Candidate {
+                            score: s,
+                            node_id: node.id,
+                            group_key: gk,
+                        };
                         cand_len += 1;
                         gc_inc(&mut gc, &mut gc_len, gk);
                     } else {
@@ -136,8 +143,11 @@ impl Placer {
                         if s < cands[wi].score {
                             let old_gk = cands[wi].group_key;
                             gc_dec(&mut gc, &mut gc_len, old_gk);
-                            cands[wi] =
-                                Candidate { score: s, node_id: node.id, group_key: gk };
+                            cands[wi] = Candidate {
+                                score: s,
+                                node_id: node.id,
+                                group_key: gk,
+                            };
                             gc_inc(&mut gc, &mut gc_len, gk);
                         }
                     }
@@ -149,8 +159,11 @@ impl Placer {
                     if let Some(wi) = find_worst_in_group(&cands, cand_len, gk) {
                         if s < cands[wi].score {
                             // Replace within group; group count is unchanged.
-                            cands[wi] =
-                                Candidate { score: s, node_id: node.id, group_key: gk };
+                            cands[wi] = Candidate {
+                                score: s,
+                                node_id: node.id,
+                                group_key: gk,
+                            };
                         }
                     }
                 }
@@ -294,9 +307,21 @@ mod unit_tests {
     #[test]
     fn find_worst_basic() {
         let cands = [
-            Candidate { score: 2.0, node_id: NodeId::new(0), group_key: 0 },
-            Candidate { score: 5.0, node_id: NodeId::new(1), group_key: 0 },
-            Candidate { score: 1.0, node_id: NodeId::new(2), group_key: 0 },
+            Candidate {
+                score: 2.0,
+                node_id: NodeId::new(0),
+                group_key: 0,
+            },
+            Candidate {
+                score: 5.0,
+                node_id: NodeId::new(1),
+                group_key: 0,
+            },
+            Candidate {
+                score: 1.0,
+                node_id: NodeId::new(2),
+                group_key: 0,
+            },
         ];
         assert_eq!(find_worst(&cands, 3), 1);
     }
@@ -304,9 +329,21 @@ mod unit_tests {
     #[test]
     fn find_worst_in_group_basic() {
         let cands = [
-            Candidate { score: 2.0, node_id: NodeId::new(0), group_key: 1 },
-            Candidate { score: 5.0, node_id: NodeId::new(1), group_key: 2 },
-            Candidate { score: 3.0, node_id: NodeId::new(2), group_key: 1 },
+            Candidate {
+                score: 2.0,
+                node_id: NodeId::new(0),
+                group_key: 1,
+            },
+            Candidate {
+                score: 5.0,
+                node_id: NodeId::new(1),
+                group_key: 2,
+            },
+            Candidate {
+                score: 3.0,
+                node_id: NodeId::new(2),
+                group_key: 1,
+            },
         ];
         // Worst in group 1: index 2 (score 3.0 > 2.0)
         assert_eq!(find_worst_in_group(&cands, 3, 1), Some(2));
@@ -330,7 +367,10 @@ mod unit_tests {
         let mut out = [NodeId::new(0); 5];
         assert_eq!(
             placer.place(b"key", &mut out),
-            Err(PlacementError::OutputLengthMismatch { got: 5, expected: 6 })
+            Err(PlacementError::OutputLengthMismatch {
+                got: 5,
+                expected: 6
+            })
         );
     }
 
@@ -346,7 +386,10 @@ mod unit_tests {
         let mut out = [NodeId::new(0); 7];
         assert_eq!(
             placer.place(b"key", &mut out),
-            Err(PlacementError::OutputLengthMismatch { got: 7, expected: 6 })
+            Err(PlacementError::OutputLengthMismatch {
+                got: 7,
+                expected: 6
+            })
         );
     }
 
@@ -362,7 +405,10 @@ mod unit_tests {
                 PlacementConstraint::none()
             )
             .unwrap_err(),
-            PlacementError::TooFewNodes { shards: 6, nodes: 4 }
+            PlacementError::TooFewNodes {
+                shards: 6,
+                nodes: 4
+            }
         );
     }
 
@@ -377,7 +423,10 @@ mod unit_tests {
                 PlacementConstraint::none()
             )
             .unwrap_err(),
-            PlacementError::TooFewNodes { shards: 6, nodes: 0 }
+            PlacementError::TooFewNodes {
+                shards: 6,
+                nodes: 0
+            }
         );
     }
 }

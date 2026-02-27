@@ -360,10 +360,7 @@ fn cmd_objects(
         let conn = match open_readonly(meta_path) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!(
-                    "warning: cannot open {}: {e}",
-                    meta_path.display()
-                );
+                eprintln!("warning: cannot open {}: {e}", meta_path.display());
                 continue;
             }
         };
@@ -435,8 +432,16 @@ fn cmd_objects(
 
     print_table(
         &[
-            "PG", "BUCKET", "KEY", "VERSION", "SIZE", "TOTAL_SIZE", "ETAG", "EC",
-            "LAST_MODIFIED", "STATUS",
+            "PG",
+            "BUCKET",
+            "KEY",
+            "VERSION",
+            "SIZE",
+            "TOTAL_SIZE",
+            "ETAG",
+            "EC",
+            "LAST_MODIFIED",
+            "STATUS",
         ],
         &all_rows,
     );
@@ -465,10 +470,7 @@ fn cmd_shards(data_dir: &Path, pg_filter: Option<u32>) {
         let conn = match open_readonly(meta_path) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!(
-                    "warning: cannot open {}: {e}",
-                    meta_path.display()
-                );
+                eprintln!("warning: cannot open {}: {e}", meta_path.display());
                 continue;
             }
         };
@@ -492,12 +494,13 @@ fn cmd_shards(data_dir: &Path, pg_filter: Option<u32>) {
             let last_verified: Option<i64> = row.get(4)?;
             let status: i32 = row.get(5)?;
 
-            let shard_hex = shard_key
-                .iter()
-                .fold(String::with_capacity(shard_key.len() * 2), |mut s, b| {
-                    write!(s, "{:02x}", b).unwrap();
-                    s
-                });
+            let shard_hex =
+                shard_key
+                    .iter()
+                    .fold(String::with_capacity(shard_key.len() * 2), |mut s, b| {
+                        write!(s, "{:02x}", b).unwrap();
+                        s
+                    });
 
             Ok(vec![
                 pg_id.to_string(),
@@ -525,7 +528,13 @@ fn cmd_shards(data_dir: &Path, pg_filter: Option<u32>) {
 
     print_table(
         &[
-            "PG", "SHARD_KEY", "SIZE", "CRC64", "CREATED", "LAST_VERIFIED", "STATUS",
+            "PG",
+            "SHARD_KEY",
+            "SIZE",
+            "CRC64",
+            "CREATED",
+            "LAST_VERIFIED",
+            "STATUS",
         ],
         &all_rows,
     );
@@ -566,10 +575,7 @@ fn cmd_summary(data_dir: &Path) {
         let conn = match open_readonly(meta_path) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!(
-                    "warning: cannot open {}: {e}",
-                    meta_path.display()
-                );
+                eprintln!("warning: cannot open {}: {e}", meta_path.display());
                 continue;
             }
         };
@@ -647,10 +653,7 @@ mod tests {
 
     #[test]
     fn test_format_timestamp_secs_known() {
-        assert_eq!(
-            format_timestamp_secs(1705318245),
-            "2024-01-15T11:30:45Z"
-        );
+        assert_eq!(format_timestamp_secs(1705318245), "2024-01-15T11:30:45Z");
     }
 
     #[test]

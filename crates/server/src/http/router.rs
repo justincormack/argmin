@@ -23,12 +23,12 @@ pub enum S3Operation {
 /// no consecutive periods, not formatted as an IP address.
 fn validate_bucket_name(name: &str) -> Result<(), ServerError> {
     if name.len() < 3 || name.len() > 63 {
-        return Err(ServerError::InvalidRequest {
+        return Err(ServerError::InvalidBucketName {
             reason: format!("bucket name must be 3-63 characters, got {}", name.len()),
         });
     }
     if name.starts_with('-') || name.ends_with('-') {
-        return Err(ServerError::InvalidRequest {
+        return Err(ServerError::InvalidBucketName {
             reason: "bucket name must not start or end with a hyphen".to_string(),
         });
     }
@@ -36,20 +36,25 @@ fn validate_bucket_name(name: &str) -> Result<(), ServerError> {
         .bytes()
         .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.')
     {
-        return Err(ServerError::InvalidRequest {
+        return Err(ServerError::InvalidBucketName {
             reason: "bucket name must contain only lowercase letters, digits, hyphens, and periods"
                 .to_string(),
         });
     }
     if name.contains("..") {
-        return Err(ServerError::InvalidRequest {
+        return Err(ServerError::InvalidBucketName {
             reason: "bucket name must not contain consecutive periods".to_string(),
+        });
+    }
+    if name.contains(".-") || name.contains("-.") {
+        return Err(ServerError::InvalidBucketName {
+            reason: "bucket name must not contain dot-dash or dash-dot".to_string(),
         });
     }
     // Reject IP-address-formatted names (4 groups of digits separated by periods)
     let parts: Vec<&str> = name.split('.').collect();
     if parts.len() == 4 && parts.iter().all(|p| p.parse::<u8>().is_ok()) {
-        return Err(ServerError::InvalidRequest {
+        return Err(ServerError::InvalidBucketName {
             reason: "bucket name must not be formatted as an IP address".to_string(),
         });
     }
@@ -69,18 +74,23 @@ fn validate_object_key(key: &str) -> Result<(), ServerError> {
             reason: "object key must not contain null bytes".to_string(),
         });
     }
+    if key.chars().any(|c| {
+        let code = c as u32;
+        (code <= 0x1F) || (0x7F..=0x9F).contains(&code)
+    }) {
+        return Err(ServerError::InvalidRequest {
+            reason: "Couldn't parse the specified URI.".to_string(),
+        });
+    }
     Ok(())
 }
 
 /// Check if a bare query parameter key is present (e.g. "delete" in "?delete").
 fn has_query_key(query: &str, target: &str) -> bool {
-    query
-        .split('&')
-        .filter(|s| !s.is_empty())
-        .any(|pair| {
-            let key = pair.split('=').next().unwrap_or("");
-            key == target
-        })
+    query.split('&').filter(|s| !s.is_empty()).any(|pair| {
+        let key = pair.split('=').next().unwrap_or("");
+        key == target
+    })
 }
 
 /// Route an HTTP request to an S3 operation.
@@ -110,7 +120,9 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
 
     validate_bucket_name(bucket)?;
 
-    let decoded_key = key.map(crate::http::request::percent_decode);
+    let decoded_key = key
+        .map(crate::http::request::percent_decode_strict)
+        .transpose()?;
     if let Some(ref k) = decoded_key {
         validate_object_key(k)?;
     }
@@ -134,15 +146,12 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
                 });
             }
             // Check for list-type=2 → V2, otherwise → V1
-            let is_v2 = query
-                .split('&')
-                .filter(|s| !s.is_empty())
-                .any(|pair| {
-                    let mut parts = pair.splitn(2, '=');
-                    let key = parts.next().unwrap_or("");
-                    let val = parts.next().unwrap_or("");
-                    key == "list-type" && val == "2"
-                });
+            let is_v2 = query.split('&').filter(|s| !s.is_empty()).any(|pair| {
+                let mut parts = pair.splitn(2, '=');
+                let key = parts.next().unwrap_or("");
+                let val = parts.next().unwrap_or("");
+                key == "list-type" && val == "2"
+            });
             if is_v2 {
                 Ok(S3Operation::ListObjectsV2 {
                     bucket: bucket.to_string(),
@@ -376,6 +385,17 @@ mod tests {
         assert!(route("GET", "/bucket/a", "").is_ok());
         assert!(route("GET", "/bucket/path/to/file.txt", "").is_ok());
         assert!(route("GET", "/bucket/key with spaces", "").is_ok());
+    }
+
+    #[test]
+    fn object_key_rejects_control_chars() {
+        let err = route("GET", "/bucket/\u{008A}-", "").unwrap_err();
+        match err {
+            ServerError::InvalidRequest { reason } => {
+                assert_eq!(reason, "Couldn't parse the specified URI.");
+            }
+            _ => panic!("expected InvalidRequest, got {err:?}"),
+        }
     }
 
     #[test]

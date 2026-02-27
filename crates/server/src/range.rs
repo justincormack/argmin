@@ -19,9 +19,11 @@ impl ByteRange {
     ///
     /// Only supports a single range. Returns an error for multi-range or malformed values.
     pub fn parse(header: &str) -> Result<Self, ServerError> {
-        let spec = header.strip_prefix("bytes=").ok_or_else(|| ServerError::InvalidRequest {
-            reason: "Range header must start with 'bytes='".to_string(),
-        })?;
+        let spec = header
+            .strip_prefix("bytes=")
+            .ok_or_else(|| ServerError::InvalidRequest {
+                reason: "Range header must start with 'bytes='".to_string(),
+            })?;
 
         // Reject multi-range
         if spec.contains(',') {
@@ -40,9 +42,11 @@ impl ByteRange {
         match (before.is_empty(), after.is_empty()) {
             // bytes=-N (suffix)
             (true, false) => {
-                let length = after.parse::<u64>().map_err(|_| ServerError::InvalidRequest {
-                    reason: "invalid suffix range".to_string(),
-                })?;
+                let length = after
+                    .parse::<u64>()
+                    .map_err(|_| ServerError::InvalidRequest {
+                        reason: "invalid suffix range".to_string(),
+                    })?;
                 if length == 0 {
                     return Err(ServerError::InvalidRequest {
                         reason: "suffix range length must be non-zero".to_string(),
@@ -52,19 +56,25 @@ impl ByteRange {
             }
             // bytes=start-
             (false, true) => {
-                let start = before.parse::<u64>().map_err(|_| ServerError::InvalidRequest {
-                    reason: "invalid range start".to_string(),
-                })?;
+                let start = before
+                    .parse::<u64>()
+                    .map_err(|_| ServerError::InvalidRequest {
+                        reason: "invalid range start".to_string(),
+                    })?;
                 Ok(ByteRange::FromStart { start })
             }
             // bytes=start-end
             (false, false) => {
-                let start = before.parse::<u64>().map_err(|_| ServerError::InvalidRequest {
-                    reason: "invalid range start".to_string(),
-                })?;
-                let end = after.parse::<u64>().map_err(|_| ServerError::InvalidRequest {
-                    reason: "invalid range end".to_string(),
-                })?;
+                let start = before
+                    .parse::<u64>()
+                    .map_err(|_| ServerError::InvalidRequest {
+                        reason: "invalid range start".to_string(),
+                    })?;
+                let end = after
+                    .parse::<u64>()
+                    .map_err(|_| ServerError::InvalidRequest {
+                        reason: "invalid range end".to_string(),
+                    })?;
                 if start > end {
                     return Err(ServerError::InvalidRequest {
                         reason: "range start exceeds end".to_string(),
@@ -195,7 +205,10 @@ mod tests {
 
     #[test]
     fn resolve_range_unsatisfiable() {
-        let r = ByteRange::Range { start: 200, end: 300 };
+        let r = ByteRange::Range {
+            start: 200,
+            end: 300,
+        };
         assert_eq!(r.resolve(100), None);
     }
 
