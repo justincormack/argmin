@@ -25,4 +25,9 @@ set of tests, and will look at different test methodologies, formal methods, fuz
 ## Cleanliness
 
 Make sure `cargo clippy` is clean, even if it is pedantic. Always run tests after making changes and make sure
-they still pass. Review your code to make sure it is clear, correct and secure.
+they still pass. Review your code to make sure it is clear, correct and secure. Always run `cargo fmt`.
+
+## Diary
+
+We keep a diary os the work we did. This is a historical record, so only append to it. We will update this at
+the end of the day, not after every work session.
