@@ -1,8 +1,10 @@
 /// Hand-formatted XML for S3 responses. No XML library dependency.
-use crate::coordinator::{DeleteError, DeletedObject, ListObjectsResult};
+use crate::coordinator::{DeleteError, DeletedObject, ListObjectVersionsResult, ListObjectsResult};
 use crate::error::ServerError;
 use auth::canonical::uri_encode_path;
 use storage::BucketInfo;
+
+use super::response::format_version_id;
 
 /// Format an S3 error response XML.
 pub fn error_xml(code: &str, message: &str, resource: &str, request_id: &str) -> String {
@@ -404,13 +406,13 @@ pub fn get_bucket_versioning_xml(state: u8) -> String {
     xml
 }
 
-/// Format a ListVersionsResult XML response (minimal, no real versioning).
+/// Format a ListVersionsResult XML response.
 pub fn list_object_versions_xml(
     bucket: &str,
     prefix: Option<&str>,
     key_marker: Option<&str>,
     max_keys: u32,
-    result: &ListObjectsResult,
+    result: &ListObjectVersionsResult,
 ) -> String {
     let mut xml = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -437,6 +439,8 @@ pub fn list_object_versions_xml(
         xml.push_str("<KeyMarker/>");
     }
 
+    xml.push_str("<VersionIdMarker/>");
+
     xml.push_str("<MaxKeys>");
     xml.push_str(&max_keys.to_string());
     xml.push_str("</MaxKeys>");
@@ -445,24 +449,60 @@ pub fn list_object_versions_xml(
     xml.push_str(if result.is_truncated { "true" } else { "false" });
     xml.push_str("</IsTruncated>");
 
-    for obj in &result.objects {
-        xml.push_str("<Version>");
-        xml.push_str("<Key>");
-        xml.push_str(&xml_escape(&obj.key));
-        xml.push_str("</Key>");
-        xml.push_str("<VersionId>null</VersionId>");
-        xml.push_str("<IsLatest>true</IsLatest>");
-        xml.push_str("<LastModified>");
-        xml.push_str(&format_timestamp(obj.last_modified));
-        xml.push_str("</LastModified>");
-        xml.push_str("<ETag>");
-        xml.push_str(&xml_escape(&obj.etag));
-        xml.push_str("</ETag>");
-        xml.push_str("<Size>");
-        xml.push_str(&obj.size.to_string());
-        xml.push_str("</Size>");
-        xml.push_str("<StorageClass>STANDARD</StorageClass>");
-        xml.push_str("</Version>");
+    if let Some(ref nkm) = result.next_key_marker {
+        xml.push_str("<NextKeyMarker>");
+        xml.push_str(&xml_escape(nkm));
+        xml.push_str("</NextKeyMarker>");
+    }
+
+    if let Some(nvm) = result.next_version_id_marker {
+        xml.push_str("<NextVersionIdMarker>");
+        xml.push_str(&format_version_id(nvm));
+        xml.push_str("</NextVersionIdMarker>");
+    }
+
+    for entry in &result.versions {
+        let vid = format_version_id(entry.version_id);
+        let is_latest = if entry.is_latest { "true" } else { "false" };
+
+        if entry.is_delete_marker {
+            xml.push_str("<DeleteMarker>");
+            xml.push_str("<Key>");
+            xml.push_str(&xml_escape(&entry.key));
+            xml.push_str("</Key>");
+            xml.push_str("<VersionId>");
+            xml.push_str(&vid);
+            xml.push_str("</VersionId>");
+            xml.push_str("<IsLatest>");
+            xml.push_str(is_latest);
+            xml.push_str("</IsLatest>");
+            xml.push_str("<LastModified>");
+            xml.push_str(&format_timestamp(entry.last_modified));
+            xml.push_str("</LastModified>");
+            xml.push_str("</DeleteMarker>");
+        } else {
+            xml.push_str("<Version>");
+            xml.push_str("<Key>");
+            xml.push_str(&xml_escape(&entry.key));
+            xml.push_str("</Key>");
+            xml.push_str("<VersionId>");
+            xml.push_str(&vid);
+            xml.push_str("</VersionId>");
+            xml.push_str("<IsLatest>");
+            xml.push_str(is_latest);
+            xml.push_str("</IsLatest>");
+            xml.push_str("<LastModified>");
+            xml.push_str(&format_timestamp(entry.last_modified));
+            xml.push_str("</LastModified>");
+            xml.push_str("<ETag>");
+            xml.push_str(&xml_escape(&entry.etag));
+            xml.push_str("</ETag>");
+            xml.push_str("<Size>");
+            xml.push_str(&entry.size.to_string());
+            xml.push_str("</Size>");
+            xml.push_str("<StorageClass>STANDARD</StorageClass>");
+            xml.push_str("</Version>");
+        }
     }
 
     xml.push_str("</ListVersionsResult>");
@@ -913,17 +953,20 @@ mod tests {
 
     #[test]
     fn list_object_versions_xml_format() {
-        let result = ListObjectsResult {
-            objects: vec![ListEntry {
+        use crate::coordinator::{ListObjectVersionsResult, VersionEntry};
+        let result = ListObjectVersionsResult {
+            versions: vec![VersionEntry {
                 key: "my-key".to_string(),
+                version_id: 0,
+                is_latest: true,
                 size: 42,
                 etag: "\"abc123\"".to_string(),
                 last_modified: 1685000000000,
+                is_delete_marker: false,
             }],
-            common_prefixes: vec![],
             is_truncated: false,
-            next_continuation_token: None,
-            owner_id: 1,
+            next_key_marker: None,
+            next_version_id_marker: None,
         };
         let xml = list_object_versions_xml("bucket", None, None, 1000, &result);
         assert!(xml.contains("ListVersionsResult"));
@@ -938,12 +981,12 @@ mod tests {
 
     #[test]
     fn list_object_versions_xml_empty() {
-        let result = ListObjectsResult {
-            objects: vec![],
-            common_prefixes: vec![],
+        use crate::coordinator::ListObjectVersionsResult;
+        let result = ListObjectVersionsResult {
+            versions: vec![],
             is_truncated: false,
-            next_continuation_token: None,
-            owner_id: 1,
+            next_key_marker: None,
+            next_version_id_marker: None,
         };
         let xml = list_object_versions_xml("bucket", None, None, 1000, &result);
         assert!(xml.contains("ListVersionsResult"));
@@ -952,12 +995,12 @@ mod tests {
 
     #[test]
     fn list_object_versions_xml_with_prefix_and_key_marker() {
-        let result = ListObjectsResult {
-            objects: vec![],
-            common_prefixes: vec![],
+        use crate::coordinator::ListObjectVersionsResult;
+        let result = ListObjectVersionsResult {
+            versions: vec![],
             is_truncated: false,
-            next_continuation_token: None,
-            owner_id: 1,
+            next_key_marker: None,
+            next_version_id_marker: None,
         };
         let xml = list_object_versions_xml("bucket", Some("photos/"), Some("key1"), 100, &result);
         assert!(xml.contains("<Prefix>photos/</Prefix>"));

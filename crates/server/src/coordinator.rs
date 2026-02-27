@@ -2,8 +2,8 @@
 use ec::{EcConfig, ErasureCodec};
 use storage::traits::{GlobalService, PgMetadataStore, ShardStore, StorageNode};
 use storage::{
-    BucketInfo, ListObjectsReq, LocalStorageNode, ObjectRecord, PutObjectMetaReq, ShardKey,
-    SqliteBucketDb,
+    BucketInfo, ListObjectVersionsReq, ListObjectsReq, LocalStorageNode, ObjectRecord,
+    PutObjectMetaReq, ShardKey, SqliteBucketDb,
 };
 
 use crate::conditional::{
@@ -61,6 +61,7 @@ pub struct GetObjectRangeResult {
     pub last_modified: u64,
     pub range_start: u64,
     pub range_end: u64,
+    pub version_id: u64,
 }
 
 /// Metadata handling directive for `CopyObject`.
@@ -96,6 +97,27 @@ pub struct ListObjectsResult {
     pub is_truncated: bool,
     pub next_continuation_token: Option<String>,
     pub owner_id: u64,
+}
+
+/// Entry in a ListObjectVersions result.
+#[derive(Debug, Clone)]
+pub struct VersionEntry {
+    pub key: String,
+    pub version_id: u64,
+    pub is_latest: bool,
+    pub size: u64,
+    pub etag: String,
+    pub last_modified: u64,
+    pub is_delete_marker: bool,
+}
+
+/// Result of a ListObjectVersions operation.
+#[derive(Debug)]
+pub struct ListObjectVersionsResult {
+    pub versions: Vec<VersionEntry>,
+    pub is_truncated: bool,
+    pub next_key_marker: Option<String>,
+    pub next_version_id_marker: Option<u64>,
 }
 
 /// Result of a DeleteObject operation.
@@ -241,6 +263,7 @@ impl Coordinator {
         key: &str,
         metadata_blob: &MetadataBlob,
         user_data: &[u8],
+        version_id: u64,
     ) -> Result<PutObjectResult, ServerError> {
         // 1. Serialize blob
         let blob_bytes = metadata_blob.serialize()?;
@@ -277,7 +300,6 @@ impl Coordinator {
         // 7. Derive PGs: metadata and shards may go to different PGs
         let meta_pg_id = derive_pg(bucket, key, self.pg_count);
         let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
-        let version_id: u64 = 0; // unversioned
         let shard_pg_id = derive_pg_shards(bucket, key, version_id, self.pg_count);
         let shard_pg = self.storage_node.get_pg(shard_pg_id)?;
 
@@ -312,7 +334,7 @@ impl Coordinator {
         let meta_result = meta_pg.put_object_meta(&PutObjectMetaReq {
             bucket: bucket.to_string(),
             key: key.to_string(),
-            version_id: 0,
+            version_id,
             status: 0,
             size: user_data.len() as u64,
             total_size: (blob_bytes.len() + user_data.len()) as u64,
@@ -332,7 +354,7 @@ impl Coordinator {
 
         Ok(PutObjectResult {
             etag: format_etag(etag_crc),
-            version_id: 0,
+            version_id,
         })
     }
 
@@ -352,8 +374,8 @@ impl Coordinator {
             });
         }
 
-        // 1. Verify bucket exists
-        self.head_bucket(bucket)?;
+        // 1. Verify bucket exists and get versioning state
+        let bucket_info = self.head_bucket(bucket)?;
 
         // 2. Check write conditions if any are set
         if !cond.is_empty() {
@@ -370,9 +392,19 @@ impl Coordinator {
             check_write_conditions(cond, existing_etag.as_deref())?;
         }
 
-        // 3. Build metadata blob and write
+        // 3. Determine version_id based on bucket versioning state
+        let version_id = if bucket_info.versioning == 1 {
+            // Enabled: generate next version_id
+            let meta_pg_id = derive_pg(bucket, key, self.pg_count);
+            let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
+            meta_pg.next_version_id(bucket, key)?
+        } else {
+            0 // Disabled or Suspended: null version
+        };
+
+        // 4. Build metadata blob and write
         let metadata_blob = MetadataBlob::from_headers(headers)?;
-        self.write_object_inner(bucket, key, &metadata_blob, data)
+        self.write_object_inner(bucket, key, &metadata_blob, data, version_id)
     }
 
     /// Copy an object from one location to another.
@@ -458,11 +490,21 @@ impl Coordinator {
             MetadataDirective::Replace => MetadataBlob::from_headers(new_headers)?,
         };
 
-        // 7. Write destination object
-        let put_result =
-            self.write_object_inner(dst_bucket, dst_key, &metadata_blob, &user_data)?;
+        // 7. Determine version_id for destination
+        let dst_bucket_info = self.head_bucket(dst_bucket)?;
+        let dst_version_id = if dst_bucket_info.versioning == 1 {
+            let dst_meta_pg_id = derive_pg(dst_bucket, dst_key, self.pg_count);
+            let dst_meta_pg = self.storage_node.get_pg(dst_meta_pg_id)?;
+            dst_meta_pg.next_version_id(dst_bucket, dst_key)?
+        } else {
+            0
+        };
 
-        // 8. Read back dest metadata to get the authoritative last_modified
+        // 8. Write destination object
+        let put_result =
+            self.write_object_inner(dst_bucket, dst_key, &metadata_blob, &user_data, dst_version_id)?;
+
+        // 9. Read back dest metadata to get the authoritative last_modified
         let dst_pg_id = derive_pg(dst_bucket, dst_key, self.pg_count);
         let dst_pg = self.storage_node.get_pg(dst_pg_id)?;
         let dst_record = dst_pg
@@ -666,19 +708,32 @@ impl Coordinator {
         &self,
         bucket: &str,
         key: &str,
+        version_id: Option<u64>,
         cond: &ReadCondition,
     ) -> Result<GetObjectResult, ServerError> {
         // 1. Derive metadata PG, look up record
         let meta_pg_id = derive_pg(bucket, key, self.pg_count);
         let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
 
-        let record = meta_pg.get_object_meta(bucket, key).map_err(|e| match e {
+        let record = match version_id {
+            Some(vid) => meta_pg.get_object_version(bucket, key, vid),
+            None => meta_pg.get_object_meta(bucket, key),
+        }
+        .map_err(|e| match e {
             storage::MetadataError::ObjectNotFound => ServerError::ObjectNotFound {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
             },
             other => ServerError::Metadata(other),
         })?;
+
+        // If latest version is a delete marker, return 404
+        if record.status == 1 {
+            return Err(ServerError::ObjectNotFound {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+            });
+        }
 
         let okh = object_key_hash(bucket, key);
         let version_id = record.version_id;
@@ -726,18 +781,31 @@ impl Coordinator {
         &self,
         bucket: &str,
         key: &str,
+        version_id: Option<u64>,
         cond: &ReadCondition,
     ) -> Result<HeadObjectResult, ServerError> {
         let meta_pg_id = derive_pg(bucket, key, self.pg_count);
         let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
 
-        let record = meta_pg.get_object_meta(bucket, key).map_err(|e| match e {
+        let record = match version_id {
+            Some(vid) => meta_pg.get_object_version(bucket, key, vid),
+            None => meta_pg.get_object_meta(bucket, key),
+        }
+        .map_err(|e| match e {
             storage::MetadataError::ObjectNotFound => ServerError::ObjectNotFound {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
             },
             other => ServerError::Metadata(other),
         })?;
+
+        // If latest version is a delete marker, return 404
+        if record.status == 1 {
+            return Err(ServerError::ObjectNotFound {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+            });
+        }
 
         let okh = object_key_hash(bucket, key);
         let version_id = record.version_id;
@@ -780,19 +848,32 @@ impl Coordinator {
         &self,
         bucket: &str,
         key: &str,
+        version_id: Option<u64>,
         range: ByteRange,
         cond: &ReadCondition,
     ) -> Result<GetObjectRangeResult, ServerError> {
         let meta_pg_id = derive_pg(bucket, key, self.pg_count);
         let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
 
-        let record = meta_pg.get_object_meta(bucket, key).map_err(|e| match e {
+        let record = match version_id {
+            Some(vid) => meta_pg.get_object_version(bucket, key, vid),
+            None => meta_pg.get_object_meta(bucket, key),
+        }
+        .map_err(|e| match e {
             storage::MetadataError::ObjectNotFound => ServerError::ObjectNotFound {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
             },
             other => ServerError::Metadata(other),
         })?;
+
+        // If latest version is a delete marker, return 404
+        if record.status == 1 {
+            return Err(ServerError::ObjectNotFound {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+            });
+        }
 
         let okh = object_key_hash(bucket, key);
         let version_id = record.version_id;
@@ -852,6 +933,7 @@ impl Coordinator {
             last_modified: record.last_modified,
             range_start: user_start,
             range_end: user_end,
+            version_id: record.version_id,
         })
     }
 
@@ -860,52 +942,115 @@ impl Coordinator {
         &self,
         bucket: &str,
         key: &str,
+        request_version_id: Option<u64>,
         cond: &DeleteCondition,
     ) -> Result<DeleteObjectResult, ServerError> {
+        let bucket_info = self.head_bucket(bucket)?;
         let meta_pg_id = derive_pg(bucket, key, self.pg_count);
         let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
 
-        // Look up the record to get EC params
-        let record = match meta_pg.get_object_meta(bucket, key) {
-            Ok(r) => r,
-            Err(storage::MetadataError::ObjectNotFound) => {
+        match (bucket_info.versioning, request_version_id) {
+            // Unversioned bucket: physical delete (current behavior)
+            (0, _) => {
+                // Look up the record to get EC params
+                let record = match meta_pg.get_object_meta(bucket, key) {
+                    Ok(r) => r,
+                    Err(storage::MetadataError::ObjectNotFound) => {
+                        if !cond.is_empty() {
+                            return Err(ServerError::PreconditionFailed);
+                        }
+                        return Ok(DeleteObjectResult {
+                            version_id: 0,
+                            delete_marker: false,
+                        }); // idempotent
+                    }
+                    Err(e) => return Err(ServerError::Metadata(e)),
+                };
+
+                // Check delete conditions
                 if !cond.is_empty() {
-                    return Err(ServerError::PreconditionFailed);
+                    let etag_crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
+                    let etag_str = format_etag(etag_crc);
+                    check_delete_conditions(cond, &etag_str)?;
                 }
-                return Ok(DeleteObjectResult {
+
+                let okh = object_key_hash(bucket, key);
+                let vid = record.version_id;
+                let shard_pg_id = derive_pg_shards(bucket, key, vid, self.pg_count);
+                let shard_pg = self.storage_node.get_pg(shard_pg_id)?;
+                let total = record.ec_k as usize + record.ec_m as usize;
+
+                // Delete all shards (idempotent)
+                for i in 0..total {
+                    let shard_key = ShardKey::new(&okh, vid, i as u8);
+                    shard_pg.delete_shard(&shard_key)?;
+                }
+
+                // Delete metadata record
+                meta_pg.delete_object_meta(bucket, key)?;
+
+                Ok(DeleteObjectResult {
                     version_id: 0,
                     delete_marker: false,
-                }); // idempotent
+                })
             }
-            Err(e) => return Err(ServerError::Metadata(e)),
-        };
 
-        // Check delete conditions
-        if !cond.is_empty() {
-            let etag_crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
-            let etag_str = format_etag(etag_crc);
-            check_delete_conditions(cond, &etag_str)?;
+            // Versioned/Suspended + specific versionId: permanent delete that version
+            (_, Some(vid)) => {
+                let record = match meta_pg.get_object_version(bucket, key, vid) {
+                    Ok(r) => r,
+                    Err(storage::MetadataError::ObjectNotFound) => {
+                        return Ok(DeleteObjectResult {
+                            version_id: vid,
+                            delete_marker: false,
+                        });
+                    }
+                    Err(e) => return Err(ServerError::Metadata(e)),
+                };
+
+                // Delete shards if it's a live object (not a delete marker)
+                if record.status == 0 {
+                    let okh = object_key_hash(bucket, key);
+                    let shard_pg_id = derive_pg_shards(bucket, key, vid, self.pg_count);
+                    let shard_pg = self.storage_node.get_pg(shard_pg_id)?;
+                    let total = record.ec_k as usize + record.ec_m as usize;
+                    for i in 0..total {
+                        let shard_key = ShardKey::new(&okh, vid, i as u8);
+                        shard_pg.delete_shard(&shard_key)?;
+                    }
+                }
+
+                let is_delete_marker = record.status == 1;
+                meta_pg.delete_object_version(bucket, key, vid)?;
+
+                Ok(DeleteObjectResult {
+                    version_id: vid,
+                    delete_marker: is_delete_marker,
+                })
+            }
+
+            // Versioned/Suspended + no versionId: insert delete marker
+            (_, None) => {
+                let marker_vid = meta_pg.next_version_id(bucket, key)?;
+                meta_pg.put_object_meta(&PutObjectMetaReq {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                    version_id: marker_vid,
+                    status: 1,
+                    size: 0,
+                    total_size: 0,
+                    etag: vec![],
+                    etag_kind: 0,
+                    ec_k: 0,
+                    ec_m: 0,
+                })?;
+
+                Ok(DeleteObjectResult {
+                    version_id: marker_vid,
+                    delete_marker: true,
+                })
+            }
         }
-
-        let okh = object_key_hash(bucket, key);
-        let version_id = record.version_id;
-        let shard_pg_id = derive_pg_shards(bucket, key, version_id, self.pg_count);
-        let shard_pg = self.storage_node.get_pg(shard_pg_id)?;
-        let total = record.ec_k as usize + record.ec_m as usize;
-
-        // Delete all shards (idempotent)
-        for i in 0..total {
-            let shard_key = ShardKey::new(&okh, version_id, i as u8);
-            shard_pg.delete_shard(&shard_key)?;
-        }
-
-        // Delete metadata record
-        meta_pg.delete_object_meta(bucket, key)?;
-
-        Ok(DeleteObjectResult {
-            version_id: 0,
-            delete_marker: false,
-        })
     }
 
     /// List objects in a bucket (ListObjectsV2).
@@ -1058,6 +1203,88 @@ impl Coordinator {
         })
     }
 
+    /// List object versions in a bucket.
+    pub fn list_object_versions(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+        key_marker: Option<&str>,
+        version_id_marker: Option<u64>,
+        max_keys: u32,
+    ) -> Result<ListObjectVersionsResult, ServerError> {
+        let _bucket_info = self.head_bucket(bucket)?;
+
+        if max_keys == 0 {
+            return Ok(ListObjectVersionsResult {
+                versions: Vec::new(),
+                is_truncated: false,
+                next_key_marker: None,
+                next_version_id_marker: None,
+            });
+        }
+
+        // Fan out to all PGs and collect version records
+        let mut all_versions: Vec<ObjectRecord> = Vec::new();
+        for &pg_id in self.storage_node.pg_ids() {
+            let pg = self.storage_node.get_pg(pg_id)?;
+            let resp = pg.list_object_versions(&ListObjectVersionsReq {
+                bucket: bucket.to_string(),
+                prefix: prefix.map(|s| s.to_string()),
+                key_marker: key_marker.map(|s| s.to_string()),
+                version_id_marker,
+                max_keys: max_keys.saturating_add(1),
+            })?;
+            all_versions.extend(resp.versions);
+        }
+
+        // Sort by (key ASC, version_id DESC)
+        all_versions.sort_by(|a, b| a.key.cmp(&b.key).then(b.version_id.cmp(&a.version_id)));
+
+        // Build result entries, tracking is_latest per key
+        let max = max_keys as usize;
+        let mut versions: Vec<VersionEntry> = Vec::new();
+        let mut last_key: Option<&str> = None;
+
+        for record in &all_versions {
+            if versions.len() >= max {
+                break;
+            }
+            let is_latest = last_key.is_none_or(|k| k != record.key);
+            if is_latest {
+                last_key = Some(&record.key);
+            }
+
+            let etag_crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
+            versions.push(VersionEntry {
+                key: record.key.clone(),
+                version_id: record.version_id,
+                is_latest,
+                size: record.size,
+                etag: format_etag(etag_crc),
+                last_modified: record.last_modified,
+                is_delete_marker: record.status == 1,
+            });
+        }
+
+        let is_truncated = all_versions.len() > max;
+        let (next_key_marker, next_version_id_marker) = if is_truncated {
+            if let Some(last) = versions.last() {
+                (Some(last.key.clone()), Some(last.version_id))
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
+
+        Ok(ListObjectVersionsResult {
+            versions,
+            is_truncated,
+            next_key_marker,
+            next_version_id_marker,
+        })
+    }
+
     /// Batch-delete objects.
     pub fn delete_objects(
         &self,
@@ -1071,7 +1298,10 @@ impl Coordinator {
         let mut errors = Vec::new();
 
         for entry in entries {
-            match self.delete_object(bucket, &entry.key, cond) {
+            let vid = entry.version_id.as_deref().and_then(|v| {
+                if v == "null" { Some(0) } else { v.parse::<u64>().ok() }
+            });
+            match self.delete_object(bucket, &entry.key, vid, cond) {
                 Ok(result) => {
                     deleted.push(DeletedObject {
                         key: entry.key.clone(),
@@ -1188,7 +1418,7 @@ mod tests {
             .unwrap();
         assert!(!result.etag.is_empty());
 
-        let obj = coord.get_object("bucket", "hello.txt", NO_READ).unwrap();
+        let obj = coord.get_object("bucket", "hello.txt", None, NO_READ).unwrap();
         assert_eq!(obj.data, b"Hello, world!");
         assert_eq!(obj.size, 13);
         assert_eq!(obj.metadata.get("content-type"), Some("text/plain"));
@@ -1210,7 +1440,7 @@ mod tests {
             .put_object("bucket", "obj", b"{}", &headers, NO_WRITE)
             .unwrap();
 
-        let obj = coord.get_object("bucket", "obj", NO_READ).unwrap();
+        let obj = coord.get_object("bucket", "obj", None, NO_READ).unwrap();
         assert_eq!(obj.data, b"{}");
         assert_eq!(obj.metadata.get("content-type"), Some("application/json"));
         assert_eq!(obj.metadata.get("x-amz-meta-author"), Some("alice"));
@@ -1233,7 +1463,7 @@ mod tests {
             )
             .unwrap();
 
-        let head = coord.head_object("bucket", "key", NO_READ).unwrap();
+        let head = coord.head_object("bucket", "key", None, NO_READ).unwrap();
         assert_eq!(head.size, 4);
         assert_eq!(head.metadata.get("content-type"), Some("text/plain"));
     }
@@ -1251,7 +1481,7 @@ mod tests {
             .put_object("bucket", "key", b"v2", &[], NO_WRITE)
             .unwrap();
 
-        let obj = coord.get_object("bucket", "key", NO_READ).unwrap();
+        let obj = coord.get_object("bucket", "key", None, NO_READ).unwrap();
         assert_eq!(obj.data, b"v2");
     }
 
@@ -1265,7 +1495,7 @@ mod tests {
             .put_object("bucket", "empty", b"", &[], NO_WRITE)
             .unwrap();
 
-        let obj = coord.get_object("bucket", "empty", NO_READ).unwrap();
+        let obj = coord.get_object("bucket", "empty", None, NO_READ).unwrap();
         assert_eq!(obj.data, b"");
         assert_eq!(obj.size, 0);
     }
@@ -1279,9 +1509,9 @@ mod tests {
         coord
             .put_object("bucket", "key", b"data", &[], NO_WRITE)
             .unwrap();
-        coord.delete_object("bucket", "key", NO_DELETE).unwrap();
+        coord.delete_object("bucket", "key", None, NO_DELETE).unwrap();
 
-        let err = coord.get_object("bucket", "key", NO_READ).unwrap_err();
+        let err = coord.get_object("bucket", "key", None, NO_READ).unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
     }
 
@@ -1293,7 +1523,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
         // Should not error
         coord
-            .delete_object("bucket", "no-such-key", NO_DELETE)
+            .delete_object("bucket", "no-such-key", None, NO_DELETE)
             .unwrap();
     }
 
@@ -1383,7 +1613,7 @@ mod tests {
             .put_object("bucket", "folder/", b"data", &[], NO_WRITE)
             .unwrap();
 
-        let obj = coord.get_object("bucket", "folder/", NO_READ).unwrap();
+        let obj = coord.get_object("bucket", "folder/", None, NO_READ).unwrap();
         assert_eq!(obj.data, b"data");
         assert_eq!(obj.size, 4);
     }
@@ -1464,7 +1694,7 @@ mod tests {
         delete_shard_on_disk(tmp.path(), "bucket", "resilient", 0, 4);
 
         // Get should still succeed via EC reconstruction
-        let obj = coord.get_object("bucket", "resilient", NO_READ).unwrap();
+        let obj = coord.get_object("bucket", "resilient", None, NO_READ).unwrap();
         assert_eq!(obj.data, data);
     }
 
@@ -1481,7 +1711,7 @@ mod tests {
 
         delete_shard_on_disk(tmp.path(), "bucket", "obj1", 0, 4);
 
-        let obj = coord.get_object("bucket", "obj1", NO_READ).unwrap();
+        let obj = coord.get_object("bucket", "obj1", None, NO_READ).unwrap();
         assert_eq!(obj.data, data);
     }
 
@@ -1501,7 +1731,7 @@ mod tests {
         delete_shard_on_disk(tmp.path(), "bucket", "obj2", 0, 4);
         delete_shard_on_disk(tmp.path(), "bucket", "obj2", 1, 4);
 
-        let obj = coord.get_object("bucket", "obj2", NO_READ).unwrap();
+        let obj = coord.get_object("bucket", "obj2", None, NO_READ).unwrap();
         assert_eq!(obj.data, data);
     }
 
@@ -1522,7 +1752,7 @@ mod tests {
         delete_shard_on_disk(tmp.path(), "bucket", "obj3", 1, 4);
         delete_shard_on_disk(tmp.path(), "bucket", "obj3", 2, 4);
 
-        let err = coord.get_object("bucket", "obj3", NO_READ).unwrap_err();
+        let err = coord.get_object("bucket", "obj3", None, NO_READ).unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
     }
 
@@ -1540,7 +1770,7 @@ mod tests {
 
         corrupt_shard_on_disk(tmp.path(), "bucket", "obj4", 0, 4);
 
-        let obj = coord.get_object("bucket", "obj4", NO_READ).unwrap();
+        let obj = coord.get_object("bucket", "obj4", None, NO_READ).unwrap();
         assert_eq!(obj.data, data);
     }
 
@@ -1561,9 +1791,7 @@ mod tests {
         // Range get should still succeed via EC reconstruction
         let result = coord
             .get_object_range(
-                "bucket",
-                "obj5",
-                ByteRange::Range { start: 0, end: 4 },
+                "bucket", "obj5", None, ByteRange::Range { start: 0, end: 4 },
                 NO_READ,
             )
             .unwrap();
@@ -1585,7 +1813,7 @@ mod tests {
         // Delete first parity shard (index 4, since k=4)
         delete_shard_on_disk(tmp.path(), "bucket", "obj6", 4, 4);
 
-        let obj = coord.get_object("bucket", "obj6", NO_READ).unwrap();
+        let obj = coord.get_object("bucket", "obj6", None, NO_READ).unwrap();
         assert_eq!(obj.data, data);
     }
 
@@ -1607,7 +1835,7 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         let err = coord
-            .get_object("bucket", "no-such-key", NO_READ)
+            .get_object("bucket", "no-such-key", None, NO_READ)
             .unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
     }
@@ -1622,10 +1850,10 @@ mod tests {
             .put_object("bucket", "key", b"data", &[], NO_WRITE)
             .unwrap();
 
-        let obj = coord.get_object("bucket", "key", NO_READ).unwrap();
+        let obj = coord.get_object("bucket", "key", None, NO_READ).unwrap();
         assert_eq!(result.etag, obj.etag);
 
-        let head = coord.head_object("bucket", "key", NO_READ).unwrap();
+        let head = coord.head_object("bucket", "key", None, NO_READ).unwrap();
         assert_eq!(result.etag, head.etag);
     }
 
@@ -1909,8 +2137,8 @@ mod tests {
         assert!(result.errors.is_empty());
 
         // Verify objects are actually gone
-        assert!(coord.get_object("bucket", "key1", NO_READ).is_err());
-        assert!(coord.get_object("bucket", "key2", NO_READ).is_err());
+        assert!(coord.get_object("bucket", "key1", None, NO_READ).is_err());
+        assert!(coord.get_object("bucket", "key2", None, NO_READ).is_err());
     }
 
     #[test]
@@ -1952,11 +2180,11 @@ mod tests {
             .put_object("test-bucket", "root.txt", b"root", &[], NO_WRITE)
             .unwrap();
 
-        // Step 1: ListObjectVersions — reuses list_objects_v2 with no delimiter
-        let list_result = coord
-            .list_objects_v2("test-bucket", None, None, None, 1000)
+        // Step 1: ListObjectVersions
+        let versions_result = coord
+            .list_object_versions("test-bucket", None, None, None, 1000)
             .unwrap();
-        assert_eq!(list_result.objects.len(), 3);
+        assert_eq!(versions_result.versions.len(), 3);
 
         // Step 2: Build XML like Ceph cleanup would, using keys from listing
         let versions_xml = crate::http::xml::list_object_versions_xml(
@@ -1964,7 +2192,7 @@ mod tests {
             None,
             None,
             1000,
-            &list_result,
+            &versions_result,
         );
         // Verify the XML has all three objects with version_id="null"
         assert!(versions_xml.contains("<Key>dir/file1.txt</Key>"));
@@ -1973,6 +2201,12 @@ mod tests {
         for _ in 0..3 {
             assert!(versions_xml.contains("<VersionId>null</VersionId>"));
         }
+
+        // Also verify we can still list for the delete step below
+        let list_result = coord
+            .list_objects_v2("test-bucket", None, None, None, 1000)
+            .unwrap();
+        assert_eq!(list_result.objects.len(), 3);
 
         // Step 3: Build a DeleteObjects XML body from the listed keys
         // (this is what the Ceph client sends)
@@ -2186,9 +2420,7 @@ mod tests {
         // bytes=0-4 → "Hello"
         let result = coord
             .get_object_range(
-                "bucket",
-                "key",
-                ByteRange::Range { start: 0, end: 4 },
+                "bucket", "key", None, ByteRange::Range { start: 0, end: 4 },
                 NO_READ,
             )
             .unwrap();
@@ -2210,7 +2442,7 @@ mod tests {
 
         // bytes=-6 → "World!"  (last 6 bytes)
         let result = coord
-            .get_object_range("bucket", "key", ByteRange::Suffix { length: 6 }, NO_READ)
+            .get_object_range("bucket", "key", None, ByteRange::Suffix { length: 6 }, NO_READ)
             .unwrap();
         assert_eq!(result.data, b"World!");
         assert_eq!(result.range_start, 7);
@@ -2229,7 +2461,7 @@ mod tests {
 
         // bytes=7- → "World!"
         let result = coord
-            .get_object_range("bucket", "key", ByteRange::FromStart { start: 7 }, NO_READ)
+            .get_object_range("bucket", "key", None, ByteRange::FromStart { start: 7 }, NO_READ)
             .unwrap();
         assert_eq!(result.data, b"World!");
     }
@@ -2247,10 +2479,7 @@ mod tests {
         // bytes=100- → unsatisfiable
         let err = coord
             .get_object_range(
-                "bucket",
-                "key",
-                ByteRange::FromStart { start: 100 },
-                NO_READ,
+                "bucket", "key", None, ByteRange::FromStart { start: 100 }, NO_READ,
             )
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidRange { total_size: 5 }));
@@ -2269,11 +2498,8 @@ mod tests {
         // bytes=0-99999 on 5-byte object → clamp to 0-4
         let result = coord
             .get_object_range(
-                "bucket",
-                "key",
-                ByteRange::Range {
-                    start: 0,
-                    end: 99999,
+                "bucket", "key", None, ByteRange::Range {
+                    start: 0, end: 99999,
                 },
                 NO_READ,
             )
@@ -2338,7 +2564,7 @@ mod tests {
             .unwrap();
         assert_ne!(r1.etag, r2.etag);
 
-        let obj = coord.get_object("bucket", "key", NO_READ).unwrap();
+        let obj = coord.get_object("bucket", "key", None, NO_READ).unwrap();
         assert_eq!(obj.data, b"v2");
     }
 
@@ -2379,7 +2605,7 @@ mod tests {
             if_match: Some(put.etag),
             ..Default::default()
         };
-        let obj = coord.get_object("bucket", "key", &cond).unwrap();
+        let obj = coord.get_object("bucket", "key", None, &cond).unwrap();
         assert_eq!(obj.data, b"data");
     }
 
@@ -2396,7 +2622,7 @@ mod tests {
             if_match: Some("\"0000000000000000\"".to_string()),
             ..Default::default()
         };
-        let err = coord.get_object("bucket", "key", &cond).unwrap_err();
+        let err = coord.get_object("bucket", "key", None, &cond).unwrap_err();
         assert!(matches!(err, ServerError::PreconditionFailed));
     }
 
@@ -2413,7 +2639,7 @@ mod tests {
             if_none_match: Some(put.etag),
             ..Default::default()
         };
-        let err = coord.get_object("bucket", "key", &cond).unwrap_err();
+        let err = coord.get_object("bucket", "key", None, &cond).unwrap_err();
         assert!(matches!(err, ServerError::NotModified { .. }));
     }
 
@@ -2430,7 +2656,7 @@ mod tests {
             if_none_match: Some(put.etag),
             ..Default::default()
         };
-        let err = coord.head_object("bucket", "key", &cond).unwrap_err();
+        let err = coord.head_object("bucket", "key", None, &cond).unwrap_err();
         assert!(matches!(err, ServerError::NotModified { .. }));
     }
 
@@ -2446,8 +2672,8 @@ mod tests {
         let cond = DeleteCondition {
             if_match: Some(put.etag),
         };
-        coord.delete_object("bucket", "key", &cond).unwrap();
-        assert!(coord.get_object("bucket", "key", NO_READ).is_err());
+        coord.delete_object("bucket", "key", None, &cond).unwrap();
+        assert!(coord.get_object("bucket", "key", None, NO_READ).is_err());
     }
 
     #[test]
@@ -2462,7 +2688,7 @@ mod tests {
         let cond = DeleteCondition {
             if_match: Some("\"0000000000000000\"".to_string()),
         };
-        let err = coord.delete_object("bucket", "key", &cond).unwrap_err();
+        let err = coord.delete_object("bucket", "key", None, &cond).unwrap_err();
         assert!(matches!(err, ServerError::PreconditionFailed));
     }
 
@@ -2515,9 +2741,7 @@ mod tests {
         };
         let result = coord
             .get_object_range(
-                "bucket",
-                "key",
-                ByteRange::Range { start: 0, end: 4 },
+                "bucket", "key", None, ByteRange::Range { start: 0, end: 4 },
                 &cond,
             )
             .unwrap();
@@ -2551,7 +2775,7 @@ mod tests {
             .unwrap();
         assert!(!result.etag.is_empty());
 
-        let obj = coord.get_object("bucket", "dst", NO_READ).unwrap();
+        let obj = coord.get_object("bucket", "dst", None, NO_READ).unwrap();
         assert_eq!(obj.data, b"hello copy");
     }
 
@@ -2582,7 +2806,7 @@ mod tests {
             )
             .unwrap();
 
-        let obj = coord.get_object("bucket", "dst", NO_READ).unwrap();
+        let obj = coord.get_object("bucket", "dst", None, NO_READ).unwrap();
         assert_eq!(obj.metadata.get("content-type"), Some("image/png"));
         assert_eq!(obj.metadata.get("x-amz-meta-author"), Some("alice"));
     }
@@ -2615,7 +2839,7 @@ mod tests {
             )
             .unwrap();
 
-        let obj = coord.get_object("bucket", "dst", NO_READ).unwrap();
+        let obj = coord.get_object("bucket", "dst", None, NO_READ).unwrap();
         assert_eq!(obj.data, b"data");
         assert_eq!(obj.metadata.get("content-type"), Some("text/html"));
         assert_eq!(obj.metadata.get("x-amz-meta-version"), Some("2"));
@@ -2648,7 +2872,7 @@ mod tests {
             )
             .unwrap();
 
-        let obj = coord.get_object("bucket", "key", NO_READ).unwrap();
+        let obj = coord.get_object("bucket", "key", None, NO_READ).unwrap();
         assert_eq!(obj.data, b"data");
         assert_eq!(obj.metadata.get("content-type"), Some("application/json"));
     }
@@ -2789,7 +3013,7 @@ mod tests {
             .unwrap();
         assert!(!result.etag.is_empty());
 
-        let obj = coord.get_object("bucket", "dst", NO_READ).unwrap();
+        let obj = coord.get_object("bucket", "dst", None, NO_READ).unwrap();
         assert_eq!(obj.data, b"new data");
     }
 
@@ -2824,12 +3048,12 @@ mod tests {
             )
             .unwrap();
 
-        let obj = coord.get_object("dst-bucket", "key", NO_READ).unwrap();
+        let obj = coord.get_object("dst-bucket", "key", None, NO_READ).unwrap();
         assert_eq!(obj.data, b"cross bucket data");
         assert_eq!(obj.metadata.get("content-type"), Some("text/plain"));
 
         // Source should still exist
-        let src = coord.get_object("src-bucket", "key", NO_READ).unwrap();
+        let src = coord.get_object("src-bucket", "key", None, NO_READ).unwrap();
         assert_eq!(src.data, b"cross bucket data");
     }
 
@@ -2919,7 +3143,7 @@ mod tests {
         coord
             .put_object("bucket", "key", b"data", &[], NO_WRITE)
             .unwrap();
-        let obj = coord.get_object("bucket", "key", NO_READ).unwrap();
+        let obj = coord.get_object("bucket", "key", None, NO_READ).unwrap();
         assert_eq!(obj.version_id, 0);
     }
 
@@ -2932,7 +3156,7 @@ mod tests {
         coord
             .put_object("bucket", "key", b"data", &[], NO_WRITE)
             .unwrap();
-        let head = coord.head_object("bucket", "key", NO_READ).unwrap();
+        let head = coord.head_object("bucket", "key", None, NO_READ).unwrap();
         assert_eq!(head.version_id, 0);
     }
 
@@ -2945,7 +3169,7 @@ mod tests {
         coord
             .put_object("bucket", "key", b"data", &[], NO_WRITE)
             .unwrap();
-        let result = coord.delete_object("bucket", "key", NO_DELETE).unwrap();
+        let result = coord.delete_object("bucket", "key", None, NO_DELETE).unwrap();
         assert_eq!(result.version_id, 0);
         assert!(!result.delete_marker);
     }

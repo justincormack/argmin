@@ -1,7 +1,7 @@
 /// Build HTTP responses for S3 operations.
 use crate::coordinator::{
-    CopyObjectResult, DeleteObjectsResult, GetObjectRangeResult, GetObjectResult, HeadObjectResult,
-    ListObjectsResult, PutObjectResult,
+    CopyObjectResult, DeleteObjectResult, DeleteObjectsResult, GetObjectRangeResult,
+    GetObjectResult, HeadObjectResult, ListObjectVersionsResult, ListObjectsResult, PutObjectResult,
 };
 use crate::error::ServerError;
 use storage::BucketInfo;
@@ -72,10 +72,12 @@ impl S3Response {
 
     /// Build a response for a successful GetObject.
     pub fn get_object(result: GetObjectResult) -> Self {
+        let vid = format_version_id(result.version_id);
         let mut resp = Self::new(200)
             .header("ETag", &result.etag)
             .header("Last-Modified", &format_http_date(result.last_modified))
-            .header("Accept-Ranges", "bytes");
+            .header("Accept-Ranges", "bytes")
+            .header("x-amz-version-id", &vid);
 
         // Add metadata headers
         if let Some(ct) = result.metadata.get("content-type") {
@@ -111,11 +113,13 @@ impl S3Response {
 
     /// Build a response for a successful HeadObject.
     pub fn head_object(result: &HeadObjectResult) -> Self {
+        let vid = format_version_id(result.version_id);
         let mut resp = Self::new(200)
             .header("ETag", &result.etag)
             .header("Content-Length", &result.size.to_string())
             .header("Last-Modified", &format_http_date(result.last_modified))
-            .header("Accept-Ranges", "bytes");
+            .header("Accept-Ranges", "bytes")
+            .header("x-amz-version-id", &vid);
 
         if let Some(ct) = result.metadata.get("content-type") {
             resp = resp.header("Content-Type", ct);
@@ -153,11 +157,13 @@ impl S3Response {
             "bytes {}-{}/{}",
             result.range_start, result.range_end, result.size
         );
+        let vid = format_version_id(result.version_id);
         let mut resp = Self::new(206)
             .header("ETag", &result.etag)
             .header("Last-Modified", &format_http_date(result.last_modified))
             .header("Accept-Ranges", "bytes")
-            .header("Content-Range", &content_range);
+            .header("Content-Range", &content_range)
+            .header("x-amz-version-id", &vid);
 
         if let Some(ct) = result.metadata.get("content-type") {
             resp = resp.header("Content-Type", ct);
@@ -204,8 +210,13 @@ impl S3Response {
     }
 
     /// Build a response for DeleteObject (204 No Content).
-    pub fn delete_object() -> Self {
-        Self::new(204)
+    pub fn delete_object(result: &DeleteObjectResult) -> Self {
+        let vid = format_version_id(result.version_id);
+        let mut resp = Self::new(204).header("x-amz-version-id", &vid);
+        if result.delete_marker {
+            resp = resp.header("x-amz-delete-marker", "true");
+        }
+        resp
     }
 
     /// Build a response for CreateBucket.
@@ -302,7 +313,7 @@ impl S3Response {
         prefix: Option<&str>,
         key_marker: Option<&str>,
         max_keys: u32,
-        result: &ListObjectsResult,
+        result: &ListObjectVersionsResult,
     ) -> Self {
         let body = xml::list_object_versions_xml(bucket, prefix, key_marker, max_keys, result);
         Self::new(200).xml_body(body)
@@ -709,8 +720,14 @@ mod tests {
 
     #[test]
     fn delete_object_response() {
-        let resp = S3Response::delete_object();
+        use crate::coordinator::DeleteObjectResult;
+        let result = DeleteObjectResult {
+            version_id: 0,
+            delete_marker: false,
+        };
+        let resp = S3Response::delete_object(&result);
         assert_eq!(resp.status_code, 204);
+        assert_eq!(find_header(&resp, "x-amz-version-id"), Some("null"));
         assert!(resp.body.is_empty());
     }
 
@@ -887,17 +904,20 @@ mod tests {
 
     #[test]
     fn list_object_versions_response() {
-        let result = ListObjectsResult {
-            objects: vec![ListEntry {
+        use crate::coordinator::{ListObjectVersionsResult, VersionEntry};
+        let result = ListObjectVersionsResult {
+            versions: vec![VersionEntry {
                 key: "key1".into(),
+                version_id: 0,
+                is_latest: true,
                 size: 42,
                 etag: "\"etag1\"".into(),
                 last_modified: 0,
+                is_delete_marker: false,
             }],
-            common_prefixes: vec![],
             is_truncated: false,
-            next_continuation_token: None,
-            owner_id: 1,
+            next_key_marker: None,
+            next_version_id_marker: None,
         };
         let resp = S3Response::list_object_versions("bucket", None, None, 1000, &result);
         assert_eq!(resp.status_code, 200);

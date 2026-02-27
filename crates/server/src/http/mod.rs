@@ -20,6 +20,13 @@ use request::S3Request;
 use response::S3Response;
 use router::{route, S3Operation};
 
+/// Parse versionId query parameter from an S3 request.
+fn parse_version_id(req: &S3Request) -> Option<u64> {
+    req.query_param("versionId").and_then(|v| {
+        if v == "null" { Some(0) } else { v.parse::<u64>().ok() }
+    })
+}
+
 /// The HTTP frontend that handles incoming requests.
 pub struct HttpFrontend {
     pub coordinator: Coordinator,
@@ -203,11 +210,12 @@ impl HttpFrontend {
             }
             S3Operation::GetObject { bucket, key } => {
                 let cond = read_condition_from_headers(req);
+                let vid = parse_version_id(req);
                 if let Some(range_header) = req.header("range") {
                     let byte_range = crate::range::ByteRange::parse(range_header)?;
                     match self
                         .coordinator
-                        .get_object_range(&bucket, &key, byte_range, &cond)
+                        .get_object_range(&bucket, &key, vid, byte_range, &cond)
                     {
                         Ok(result) => Ok(S3Response::get_object_range(result)),
                         Err(ServerError::InvalidRange { total_size }) => {
@@ -216,18 +224,20 @@ impl HttpFrontend {
                         Err(e) => Err(e),
                     }
                 } else {
-                    let result = self.coordinator.get_object(&bucket, &key, &cond)?;
+                    let result = self.coordinator.get_object(&bucket, &key, vid, &cond)?;
                     Ok(S3Response::get_object(result))
                 }
             }
             S3Operation::DeleteObject { bucket, key } => {
                 let cond = delete_condition_from_headers(req);
-                self.coordinator.delete_object(&bucket, &key, &cond)?;
-                Ok(S3Response::delete_object())
+                let vid = parse_version_id(req);
+                let result = self.coordinator.delete_object(&bucket, &key, vid, &cond)?;
+                Ok(S3Response::delete_object(&result))
             }
             S3Operation::HeadObject { bucket, key } => {
                 let cond = read_condition_from_headers(req);
-                let result = self.coordinator.head_object(&bucket, &key, &cond)?;
+                let vid = parse_version_id(req);
+                let result = self.coordinator.head_object(&bucket, &key, vid, &cond)?;
                 Ok(S3Response::head_object(&result))
             }
             S3Operation::DeleteObjects { bucket } => {
@@ -248,16 +258,19 @@ impl HttpFrontend {
             S3Operation::ListObjectVersions { bucket } => {
                 let prefix = req.query_param("prefix");
                 let key_marker = req.query_param("key-marker");
+                let version_id_marker = req
+                    .query_param("version-id-marker")
+                    .and_then(|s| s.parse::<u64>().ok());
                 let max_keys: u32 = req
                     .query_param("max-keys")
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(1000);
 
-                let result = self.coordinator.list_objects_v2(
+                let result = self.coordinator.list_object_versions(
                     &bucket,
                     prefix.as_deref(),
-                    None,
                     key_marker.as_deref(),
+                    version_id_marker,
                     max_keys,
                 )?;
                 Ok(S3Response::list_object_versions(
