@@ -467,7 +467,7 @@ impl Coordinator {
         let dst_pg = self.storage_node.get_pg(dst_pg_id)?;
         let dst_record = dst_pg
             .get_object_meta(dst_bucket, dst_key)
-            .map_err(|e| ServerError::Metadata(e))?;
+            .map_err(ServerError::Metadata)?;
 
         Ok(CopyObjectResult {
             etag: put_result.etag,
