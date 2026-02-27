@@ -91,7 +91,12 @@ pub trait PgMetadataStore {
 /// version it becomes Raft-replicated.
 pub trait GlobalService {
     /// Create a new bucket.
-    fn create_bucket(&self, name: &str, owner_id: u64) -> Result<(), MetadataError>;
+    fn create_bucket(
+        &self,
+        name: &str,
+        owner_principal: &str,
+        public_read: bool,
+    ) -> Result<(), MetadataError>;
 
     /// Delete a bucket. Fails if the bucket is not empty.
     fn delete_bucket(&self, name: &str) -> Result<(), MetadataError>;
@@ -100,7 +105,7 @@ pub trait GlobalService {
     fn head_bucket(&self, name: &str) -> Result<BucketInfo, MetadataError>;
 
     /// List all buckets owned by the given owner.
-    fn list_buckets(&self, owner_id: u64) -> Result<Vec<BucketInfo>, MetadataError>;
+    fn list_buckets(&self, owner_principal: &str) -> Result<Vec<BucketInfo>, MetadataError>;
 
     /// Set bucket versioning state.
     ///

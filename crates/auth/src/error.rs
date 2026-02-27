@@ -6,10 +6,20 @@ pub enum AuthError {
     MissingAuth,
     #[error("malformed Authorization header")]
     MalformedAuth,
+    #[error("missing query auth parameter: {param}")]
+    MissingQueryParam { param: &'static str },
+    #[error("invalid query auth parameter: {param}")]
+    InvalidQueryParam { param: &'static str },
     #[error("unknown access key id")]
     UnknownAccessKey,
+    #[error("access denied")]
+    AccessDenied,
     #[error("signature mismatch")]
     SignatureMismatch,
+    #[error("invalid session token")]
+    InvalidToken,
+    #[error("token expired")]
+    ExpiredToken,
     #[error("missing required signed header: {header}")]
     MissingSignedHeader { header: &'static str },
     #[error("request timestamp is too far from server time")]

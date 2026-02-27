@@ -24,15 +24,15 @@ pub fn error_xml(code: &str, message: &str, resource: &str, request_id: &str) ->
 }
 
 /// Format a ListAllMyBucketsResult XML response.
-pub fn list_buckets_xml(buckets: &[BucketInfo], owner_id: &str) -> String {
+pub fn list_buckets_xml(buckets: &[BucketInfo], owner_principal: &str) -> String {
     let mut xml = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <ListAllMyBucketsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
          <Owner><ID>",
     );
-    xml.push_str(&xml_escape(owner_id));
+    xml.push_str(&xml_escape(owner_principal));
     xml.push_str("</ID><DisplayName>");
-    xml.push_str(&xml_escape(owner_id));
+    xml.push_str(&xml_escape(owner_principal));
     xml.push_str("</DisplayName></Owner><Buckets>");
 
     for bucket in buckets {
@@ -119,7 +119,7 @@ pub fn list_objects_v2_xml(
         xml.push_str("</NextContinuationToken>");
     }
 
-    let owner_id = result.owner_id.to_string();
+    let owner_id = result.owner_principal.clone();
     let owner_name = owner_id.clone();
 
     for obj in &result.objects {
@@ -220,7 +220,7 @@ pub fn list_objects_v1_xml(
         }
     }
 
-    let owner_id = result.owner_id.to_string();
+    let owner_id = result.owner_principal.clone();
     let owner_name = owner_id.clone();
 
     for obj in &result.objects {
@@ -635,10 +635,11 @@ mod tests {
     fn list_buckets_xml_format() {
         let buckets = vec![BucketInfo {
             name: "test-bucket".to_string(),
-            owner_id: 0,
+            owner_principal: "owner".to_string(),
             created_at: 1685000000000,
             region: 0,
             versioning: 0,
+            public_read: false,
         }];
         let xml = list_buckets_xml(&buckets, "owner");
         assert!(xml.contains("<Name>test-bucket</Name>"));
@@ -657,7 +658,7 @@ mod tests {
             common_prefixes: vec![],
             is_truncated: false,
             next_continuation_token: None,
-            owner_id: 1,
+            owner_principal: "owner".to_string(),
         };
         let xml = list_objects_v2_xml("bucket", None, None, None, None, None, false, 1000, &result);
         assert!(xml.contains("<Key>my-key</Key>"));
@@ -677,7 +678,7 @@ mod tests {
             common_prefixes: vec!["photos/2024/".to_string()],
             is_truncated: true,
             next_continuation_token: Some("photos/cat.jpg".to_string()),
-            owner_id: 1,
+            owner_principal: "owner".to_string(),
         };
         let xml = list_objects_v2_xml(
             "bucket",
@@ -709,7 +710,7 @@ mod tests {
             common_prefixes: vec!["photos/".to_string(), "docs/".to_string()],
             is_truncated: false,
             next_continuation_token: None,
-            owner_id: 1,
+            owner_principal: "owner".to_string(),
         };
         let xml = list_objects_v2_xml(
             "bucket",
@@ -733,7 +734,7 @@ mod tests {
             common_prefixes: vec![],
             is_truncated: false,
             next_continuation_token: None,
-            owner_id: 1,
+            owner_principal: "owner".to_string(),
         };
         // With prefix=None → should produce <Prefix/>
         let xml = list_objects_v2_xml("bucket", None, None, None, None, None, false, 1000, &result);
@@ -754,7 +755,7 @@ mod tests {
             common_prefixes: vec![],
             is_truncated: false,
             next_continuation_token: None,
-            owner_id: 1,
+            owner_principal: "owner".to_string(),
         };
         let xml = list_objects_v1_xml("bucket", None, None, None, None, 1000, &result);
         assert!(xml.contains("<Key>my-key</Key>"));
@@ -777,7 +778,7 @@ mod tests {
             common_prefixes: vec!["photos/2024/".to_string()],
             is_truncated: true,
             next_continuation_token: Some("photos/cat.jpg".to_string()),
-            owner_id: 1,
+            owner_principal: "owner".to_string(),
         };
         let xml = list_objects_v1_xml(
             "bucket",
@@ -806,7 +807,7 @@ mod tests {
             common_prefixes: vec![],
             is_truncated: false,
             next_continuation_token: None,
-            owner_id: 1,
+            owner_principal: "owner".to_string(),
         };
         let xml = list_objects_v1_xml("bucket", None, None, None, None, 1000, &result);
         assert!(xml.contains("<Prefix/>"));
@@ -827,7 +828,7 @@ mod tests {
             common_prefixes: vec![],
             is_truncated: true,
             next_continuation_token: Some("key2".to_string()),
-            owner_id: 1,
+            owner_principal: "owner".to_string(),
         };
         let xml = list_objects_v1_xml("bucket", None, None, Some("key1"), None, 1, &result);
         assert!(xml.contains("<Marker>key1</Marker>"));

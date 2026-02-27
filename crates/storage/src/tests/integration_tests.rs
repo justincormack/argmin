@@ -98,7 +98,9 @@ fn full_lifecycle() {
 
     // Create bucket DB.
     let bucket_db = crate::SqliteBucketDb::open(&dir.path().join("buckets.db")).unwrap();
-    bucket_db.create_bucket("my-bucket", 1).unwrap();
+    bucket_db
+        .create_bucket("my-bucket", "owner-1", false)
+        .unwrap();
 
     // Create storage node.
     let node = crate::LocalStorageNode::open(&dir.path().join("data"), &[0]).unwrap();

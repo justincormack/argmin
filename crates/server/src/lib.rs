@@ -1,3 +1,4 @@
+pub mod authz;
 pub mod conditional;
 pub mod config;
 pub mod coordinator;

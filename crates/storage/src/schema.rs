@@ -41,11 +41,12 @@ CREATE INDEX IF NOT EXISTS idx_objects_versions ON objects (bucket, key, version
 /// Global bucket metadata table.
 const CREATE_BUCKETS_TABLE: &str = "\
 CREATE TABLE IF NOT EXISTS buckets (
-    name          TEXT PRIMARY KEY,
-    owner_id      INTEGER NOT NULL,
-    created_at    INTEGER NOT NULL,
-    region        INTEGER NOT NULL DEFAULT 0,
-    versioning    INTEGER NOT NULL DEFAULT 0
+    name             TEXT PRIMARY KEY,
+    owner_principal  TEXT NOT NULL,
+    created_at       INTEGER NOT NULL,
+    region           INTEGER NOT NULL DEFAULT 0,
+    versioning       INTEGER NOT NULL DEFAULT 0,
+    public_read      INTEGER NOT NULL DEFAULT 0
 )";
 
 /// SQLite pragmas for per-PG databases: WAL mode, NORMAL synchronous.

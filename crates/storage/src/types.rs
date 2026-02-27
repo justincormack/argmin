@@ -137,12 +137,13 @@ pub struct ObjectRecord {
 #[derive(Debug, Clone)]
 pub struct BucketInfo {
     pub name: String,
-    pub owner_id: u64,
+    pub owner_principal: String,
     /// Creation timestamp (unix milliseconds).
     pub created_at: u64,
     pub region: u16,
     /// 0 = Disabled, 1 = Enabled, 2 = Suspended.
     pub versioning: u8,
+    pub public_read: bool,
 }
 
 /// Request to store object metadata.

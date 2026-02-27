@@ -247,8 +247,8 @@ impl S3Response {
     }
 
     /// Build a response for ListBuckets.
-    pub fn list_buckets(buckets: &[BucketInfo]) -> Self {
-        let body = xml::list_buckets_xml(buckets, "default-owner");
+    pub fn list_buckets(buckets: &[BucketInfo], owner_principal: &str) -> Self {
+        let body = xml::list_buckets_xml(buckets, owner_principal);
         Self::new(200).xml_body(body)
     }
 
@@ -754,10 +754,11 @@ mod tests {
     fn head_bucket_response() {
         let info = storage::BucketInfo {
             name: "b".into(),
-            owner_id: 0,
+            owner_principal: "owner".into(),
             created_at: 0,
             region: 0,
             versioning: 0,
+            public_read: false,
         };
         let resp = S3Response::head_bucket(&info);
         assert_eq!(resp.status_code, 200);
@@ -769,12 +770,13 @@ mod tests {
     fn list_buckets_response() {
         let buckets = vec![storage::BucketInfo {
             name: "test-bucket".into(),
-            owner_id: 0,
+            owner_principal: "owner".into(),
             created_at: 1000,
             region: 0,
             versioning: 0,
+            public_read: false,
         }];
-        let resp = S3Response::list_buckets(&buckets);
+        let resp = S3Response::list_buckets(&buckets, "owner");
         assert_eq!(resp.status_code, 200);
         assert_eq!(find_header(&resp, "Content-Type"), Some("application/xml"));
         let body = String::from_utf8(resp.body).unwrap();
@@ -797,7 +799,7 @@ mod tests {
             common_prefixes: vec![],
             is_truncated: false,
             next_continuation_token: None,
-            owner_id: 1,
+            owner_principal: "owner".into(),
         };
         let resp = S3Response::list_objects_v2(
             "bucket",
@@ -831,7 +833,7 @@ mod tests {
             common_prefixes: vec![],
             is_truncated: false,
             next_continuation_token: None,
-            owner_id: 1,
+            owner_principal: "owner".into(),
         };
         let resp =
             S3Response::list_objects_v1("bucket", Some("pre"), None, None, None, 1000, &result);

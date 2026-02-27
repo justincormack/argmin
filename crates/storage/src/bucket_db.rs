@@ -54,15 +54,20 @@ impl SqliteBucketDb {
 }
 
 impl GlobalService for SqliteBucketDb {
-    fn create_bucket(&self, name: &str, owner_id: u64) -> Result<(), MetadataError> {
+    fn create_bucket(
+        &self,
+        name: &str,
+        owner_principal: &str,
+        public_read: bool,
+    ) -> Result<(), MetadataError> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as i64;
 
         let result = self.conn.execute(
-            "INSERT INTO buckets (name, owner_id, created_at) VALUES (?1, ?2, ?3)",
-            params![name, owner_id as i64, now],
+            "INSERT INTO buckets (name, owner_principal, created_at, public_read) VALUES (?1, ?2, ?3, ?4)",
+            params![name, owner_principal, now, if public_read { 1 } else { 0 }],
         );
 
         match result {
@@ -117,16 +122,17 @@ impl GlobalService for SqliteBucketDb {
     fn head_bucket(&self, name: &str) -> Result<BucketInfo, MetadataError> {
         self.conn
             .query_row(
-                "SELECT name, owner_id, created_at, region, versioning \
+                "SELECT name, owner_principal, created_at, region, versioning, public_read \
                  FROM buckets WHERE name = ?1",
                 params![name],
                 |row| {
                     Ok(BucketInfo {
                         name: row.get(0)?,
-                        owner_id: row.get::<_, i64>(1)? as u64,
+                        owner_principal: row.get(1)?,
                         created_at: row.get::<_, i64>(2)? as u64,
                         region: row.get::<_, i64>(3)? as u16,
                         versioning: row.get::<_, i64>(4)? as u8,
+                        public_read: row.get::<_, i64>(5)? != 0,
                     })
                 },
             )
@@ -179,12 +185,12 @@ impl GlobalService for SqliteBucketDb {
         Ok(())
     }
 
-    fn list_buckets(&self, owner_id: u64) -> Result<Vec<BucketInfo>, MetadataError> {
+    fn list_buckets(&self, owner_principal: &str) -> Result<Vec<BucketInfo>, MetadataError> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT name, owner_id, created_at, region, versioning \
-                 FROM buckets WHERE owner_id = ?1 ORDER BY name ASC",
+                "SELECT name, owner_principal, created_at, region, versioning, public_read \
+                 FROM buckets WHERE owner_principal = ?1 ORDER BY name ASC",
             )
             .map_err(|e| MetadataError::Db {
                 context: "prepare list buckets",
@@ -192,13 +198,14 @@ impl GlobalService for SqliteBucketDb {
             })?;
 
         let rows = stmt
-            .query_map(params![owner_id as i64], |row| {
+            .query_map(params![owner_principal], |row| {
                 Ok(BucketInfo {
                     name: row.get(0)?,
-                    owner_id: row.get::<_, i64>(1)? as u64,
+                    owner_principal: row.get(1)?,
                     created_at: row.get::<_, i64>(2)? as u64,
                     region: row.get::<_, i64>(3)? as u16,
                     versioning: row.get::<_, i64>(4)? as u8,
+                    public_read: row.get::<_, i64>(5)? != 0,
                 })
             })
             .map_err(|e| MetadataError::Db {
@@ -240,11 +247,11 @@ mod tests {
     #[test]
     fn list_buckets_multiple() {
         let db = SqliteBucketDb::open_in_memory().unwrap();
-        db.create_bucket("alpha", 1).unwrap();
-        db.create_bucket("beta", 1).unwrap();
-        db.create_bucket("gamma", 1).unwrap();
+        db.create_bucket("alpha", "owner-1", false).unwrap();
+        db.create_bucket("beta", "owner-1", false).unwrap();
+        db.create_bucket("gamma", "owner-1", false).unwrap();
 
-        let buckets = db.list_buckets(1).unwrap();
+        let buckets = db.list_buckets("owner-1").unwrap();
         assert_eq!(buckets.len(), 3);
         // Sorted by name
         assert_eq!(buckets[0].name, "alpha");
@@ -252,23 +259,25 @@ mod tests {
         assert_eq!(buckets[2].name, "gamma");
         // All have correct owner
         for b in &buckets {
-            assert_eq!(b.owner_id, 1);
+            assert_eq!(b.owner_principal, "owner-1");
             assert_eq!(b.versioning, 0);
             assert_eq!(b.region, 0);
+            assert!(!b.public_read);
         }
     }
 
     #[test]
     fn head_bucket_fields() {
         let db = SqliteBucketDb::open_in_memory().unwrap();
-        db.create_bucket("test", 42).unwrap();
+        db.create_bucket("test", "owner-42", true).unwrap();
 
         let info = db.head_bucket("test").unwrap();
         assert_eq!(info.name, "test");
-        assert_eq!(info.owner_id, 42);
+        assert_eq!(info.owner_principal, "owner-42");
         assert!(info.created_at > 0);
         assert_eq!(info.region, 0);
         assert_eq!(info.versioning, 0);
+        assert!(info.public_read);
     }
 
     #[test]
@@ -281,14 +290,14 @@ mod tests {
     #[test]
     fn list_buckets_by_owner() {
         let db = SqliteBucketDb::open_in_memory().unwrap();
-        db.create_bucket("owner1-b", 1).unwrap();
-        db.create_bucket("owner2-b", 2).unwrap();
+        db.create_bucket("owner1-b", "owner-1", false).unwrap();
+        db.create_bucket("owner2-b", "owner-2", false).unwrap();
 
-        let b1 = db.list_buckets(1).unwrap();
+        let b1 = db.list_buckets("owner-1").unwrap();
         assert_eq!(b1.len(), 1);
         assert_eq!(b1[0].name, "owner1-b");
 
-        let b2 = db.list_buckets(2).unwrap();
+        let b2 = db.list_buckets("owner-2").unwrap();
         assert_eq!(b2.len(), 1);
         assert_eq!(b2[0].name, "owner2-b");
     }
@@ -298,5 +307,14 @@ mod tests {
         let db = SqliteBucketDb::open_in_memory().unwrap();
         let err = db.delete_bucket("nope").unwrap_err();
         assert!(matches!(err, MetadataError::BucketNotFound { .. }));
+    }
+
+    #[test]
+    fn create_bucket_public_read_flag_persists() {
+        let db = SqliteBucketDb::open_in_memory().unwrap();
+        db.create_bucket("public-bucket", "owner", true).unwrap();
+
+        let info = db.head_bucket("public-bucket").unwrap();
+        assert!(info.public_read);
     }
 }

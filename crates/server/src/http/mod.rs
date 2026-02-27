@@ -6,9 +6,10 @@ pub mod xml;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use auth::{parse_amz_date, parse_auth_header, verify_request, CredentialStore};
+use auth::{authenticate_request, AuthContext, AuthMode, CredentialStore};
 use tiny_http::{Header, Response, StatusCode};
 
+use crate::authz::{can_read_bucket, can_write_bucket, ResourceVisibility};
 use crate::conditional::{
     copy_source_condition_from_headers, delete_condition_from_headers, read_condition_from_headers,
     write_condition_from_headers,
@@ -45,7 +46,11 @@ impl HttpFrontend {
                 return;
             }
         };
-        let result = self.dispatch(&s3req);
+        let auth = self.authenticate(&s3req);
+        let result = match auth {
+            Ok(auth) => self.dispatch(&s3req, &auth),
+            Err(err) => Err(err),
+        };
 
         match result {
             Ok(resp) => self.send_response(request, resp),
@@ -67,32 +72,36 @@ impl HttpFrontend {
         }
     }
 
-    fn dispatch(&self, req: &S3Request) -> Result<S3Response, ServerError> {
-        // Authenticate
-        self.authenticate(req)?;
-
+    fn dispatch(&self, req: &S3Request, auth: &AuthContext) -> Result<S3Response, ServerError> {
         // Route
         let operation = route(&req.method, &req.path, &req.query_string)?;
 
         // Dispatch to coordinator
         match operation {
             S3Operation::ListBuckets => {
-                let buckets = self.coordinator.list_buckets()?;
-                Ok(S3Response::list_buckets(&buckets))
+                let owner_principal = self.require_principal(auth)?;
+                let buckets = self.coordinator.list_buckets_for_owner(owner_principal)?;
+                Ok(S3Response::list_buckets(&buckets, owner_principal))
             }
             S3Operation::CreateBucket { bucket } => {
-                self.coordinator.create_bucket(&bucket)?;
+                let owner_principal = self.require_principal(auth)?;
+                let public_read = parse_bucket_acl(req)?;
+                self.coordinator
+                    .create_bucket_for_owner(owner_principal, &bucket, public_read)?;
                 Ok(S3Response::create_bucket(&bucket))
             }
             S3Operation::DeleteBucket { bucket } => {
+                self.authorize_bucket_write(auth, &bucket)?;
                 self.coordinator.delete_bucket(&bucket)?;
                 Ok(S3Response::delete_bucket())
             }
             S3Operation::HeadBucket { bucket } => {
+                self.authorize_bucket_read(auth, &bucket)?;
                 let info = self.coordinator.head_bucket(&bucket)?;
                 Ok(S3Response::head_bucket(&info))
             }
             S3Operation::ListObjectsV1 { bucket } => {
+                self.authorize_bucket_read(auth, &bucket)?;
                 let prefix = req.query_param("prefix");
                 let delimiter = req.query_param("delimiter").filter(|d| !d.is_empty());
                 let marker = req.query_param("marker");
@@ -123,6 +132,7 @@ impl HttpFrontend {
                 ))
             }
             S3Operation::ListObjectsV2 { bucket } => {
+                self.authorize_bucket_read(auth, &bucket)?;
                 let prefix = req.query_param("prefix");
                 let delimiter = req.query_param("delimiter").filter(|d| !d.is_empty());
                 let encoding_type = req.query_param("encoding-type");
@@ -168,6 +178,8 @@ impl HttpFrontend {
                 if let Some(copy_source) = req.header("x-amz-copy-source") {
                     // CopyObject path
                     let (src_bucket, src_key) = request::parse_copy_source(copy_source)?;
+                    self.authorize_bucket_write(auth, &bucket)?;
+                    self.authorize_bucket_read(auth, &src_bucket)?;
                     let src_cond = copy_source_condition_from_headers(req);
                     let dst_cond = write_condition_from_headers(req);
                     let directive = match req.header("x-amz-metadata-directive") {
@@ -192,6 +204,7 @@ impl HttpFrontend {
                     Ok(S3Response::copy_object(&result))
                 } else {
                     // Normal PutObject path
+                    self.authorize_bucket_write(auth, &bucket)?;
                     let header_pairs: Vec<(&str, &str)> = req
                         .headers
                         .iter()
@@ -209,6 +222,7 @@ impl HttpFrontend {
                 }
             }
             S3Operation::GetObject { bucket, key } => {
+                self.authorize_bucket_read(auth, &bucket)?;
                 let cond = read_condition_from_headers(req);
                 let vid = parse_version_id(req);
                 if let Some(range_header) = req.header("range") {
@@ -229,33 +243,39 @@ impl HttpFrontend {
                 }
             }
             S3Operation::DeleteObject { bucket, key } => {
+                self.authorize_bucket_write(auth, &bucket)?;
                 let cond = delete_condition_from_headers(req);
                 let vid = parse_version_id(req);
                 let result = self.coordinator.delete_object(&bucket, &key, vid, &cond)?;
                 Ok(S3Response::delete_object(&result))
             }
             S3Operation::HeadObject { bucket, key } => {
+                self.authorize_bucket_read(auth, &bucket)?;
                 let cond = read_condition_from_headers(req);
                 let vid = parse_version_id(req);
                 let result = self.coordinator.head_object(&bucket, &key, vid, &cond)?;
                 Ok(S3Response::head_object(&result))
             }
             S3Operation::DeleteObjects { bucket } => {
+                self.authorize_bucket_write(auth, &bucket)?;
                 let (entries, quiet) = xml::parse_delete_objects_xml(&req.body)?;
                 let cond = delete_condition_from_headers(req);
                 let result = self.coordinator.delete_objects(&bucket, &entries, &cond)?;
                 Ok(S3Response::delete_objects(&result, quiet))
             }
             S3Operation::PutBucketVersioning { bucket } => {
+                self.authorize_bucket_write(auth, &bucket)?;
                 let versioning_state = xml::parse_versioning_config_xml(&req.body)?;
                 self.coordinator.put_bucket_versioning(&bucket, versioning_state)?;
                 Ok(S3Response::put_bucket_versioning())
             }
             S3Operation::GetBucketVersioning { bucket } => {
+                self.authorize_bucket_read(auth, &bucket)?;
                 let state = self.coordinator.get_bucket_versioning(&bucket)?;
                 Ok(S3Response::get_bucket_versioning(state))
             }
             S3Operation::ListObjectVersions { bucket } => {
+                self.authorize_bucket_read(auth, &bucket)?;
                 let prefix = req.query_param("prefix");
                 let key_marker = req.query_param("key-marker");
                 let version_id_marker = req
@@ -284,35 +304,44 @@ impl HttpFrontend {
         }
     }
 
-    fn authenticate(&self, req: &S3Request) -> Result<(), ServerError> {
-        let auth_header = req
-            .header("authorization")
-            .ok_or(ServerError::Auth(auth::AuthError::MissingAuth))?;
-
-        let auth = parse_auth_header(auth_header)?;
-        let body_hash = req.body_hash();
+    fn authenticate(&self, req: &S3Request) -> Result<AuthContext, ServerError> {
         let header_pairs = req.header_pairs();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
 
-        verify_request(
+        let auth_result = authenticate_request(
             &req.method,
             &req.path,
             &req.query_string,
             &header_pairs,
-            &body_hash,
-            &auth,
+            &req.body,
             &self.credentials,
-        )?;
+            self.coordinator.region(),
+            "s3",
+            now,
+        );
+
+        let auth = match auth_result {
+            Ok(auth) => auth,
+            Err(auth::AuthError::MissingAuth) => AuthContext {
+                mode: AuthMode::Anonymous,
+                access_key_id: None,
+                principal: None,
+                request_epoch_secs: None,
+            },
+            Err(err) => return Err(ServerError::Auth(err)),
+        };
 
         // Enforce ±15 minute time skew on x-amz-date to prevent replay attacks.
         // Reject malformed timestamps — skipping the check would weaken replay protection.
-        if let Some(amz_date) = req.header("x-amz-date") {
-            let request_epoch = parse_amz_date(amz_date).ok_or(ServerError::InvalidRequest {
-                reason: "malformed x-amz-date timestamp".to_string(),
-            })?;
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
+        if req.header("x-amz-date").is_some() {
+            let request_epoch = auth
+                .request_epoch_secs
+                .ok_or(ServerError::InvalidRequest {
+                    reason: "malformed x-amz-date timestamp".to_string(),
+                })?;
             let skew = now.abs_diff(request_epoch);
             if skew > 15 * 60 {
                 return Err(ServerError::Auth(auth::AuthError::RequestExpired));
@@ -332,7 +361,40 @@ impl HttpFrontend {
             }
         }
 
-        Ok(())
+        Ok(auth)
+    }
+
+    fn require_principal<'a>(&self, auth: &'a AuthContext) -> Result<&'a str, ServerError> {
+        auth.principal
+            .as_deref()
+            .ok_or(ServerError::Auth(auth::AuthError::AccessDenied))
+    }
+
+    fn authorize_bucket_read(&self, auth: &AuthContext, bucket: &str) -> Result<(), ServerError> {
+        let info = self.coordinator.head_bucket(bucket)?;
+        let visibility = if info.public_read {
+            ResourceVisibility::PublicRead
+        } else {
+            ResourceVisibility::Private
+        };
+        if can_read_bucket(auth, &info.owner_principal, visibility) {
+            Ok(())
+        } else {
+            Err(ServerError::Auth(auth::AuthError::AccessDenied))
+        }
+    }
+
+    fn authorize_bucket_write(
+        &self,
+        auth: &AuthContext,
+        bucket: &str,
+    ) -> Result<(), ServerError> {
+        let info = self.coordinator.head_bucket(bucket)?;
+        if can_write_bucket(auth, &info.owner_principal) {
+            Ok(())
+        } else {
+            Err(ServerError::Auth(auth::AuthError::AccessDenied))
+        }
     }
 
     fn send_response(&self, request: tiny_http::Request, resp: S3Response) {
@@ -354,6 +416,16 @@ fn parse_max_keys(raw: Option<String>) -> Result<u32, ServerError> {
         None => Ok(1000),
         Some(s) => s.parse::<u32>().map_err(|_| ServerError::InvalidArgument {
             reason: "invalid max-keys".to_string(),
+        }),
+    }
+}
+
+fn parse_bucket_acl(req: &S3Request) -> Result<bool, ServerError> {
+    match req.header("x-amz-acl") {
+        None | Some("private") => Ok(false),
+        Some("public-read") => Ok(true),
+        Some(other) => Err(ServerError::InvalidArgument {
+            reason: format!("unsupported x-amz-acl value: {other}"),
         }),
     }
 }

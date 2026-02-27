@@ -118,9 +118,13 @@ pub fn verify_request(
     store: &CredentialStore,
 ) -> Result<String, AuthError> {
     // Look up the secret key
-    let secret = store
-        .get(&auth.credential.access_key_id)
+    let record = store
+        .get_record(&auth.credential.access_key_id)
         .ok_or(AuthError::UnknownAccessKey)?;
+    if !record.enabled {
+        return Err(AuthError::UnknownAccessKey);
+    }
+    let secret = &record.secret_key;
 
     // Extract signed headers — collect all values for each header name
     // to handle duplicate headers (values combined by canonical_headers).

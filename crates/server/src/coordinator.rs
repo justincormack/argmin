@@ -96,7 +96,7 @@ pub struct ListObjectsResult {
     pub common_prefixes: Vec<String>,
     pub is_truncated: bool,
     pub next_continuation_token: Option<String>,
-    pub owner_id: u64,
+    pub owner_principal: String,
 }
 
 /// Entry in a ListObjectVersions result.
@@ -187,11 +187,28 @@ impl Coordinator {
     // ── Bucket operations ─────────────────────────────────────────────
 
     pub fn create_bucket(&self, name: &str) -> Result<(), ServerError> {
-        self.bucket_db.create_bucket(name, 0).or_else(|e| match e {
-            // Idempotent: single-owner system, so re-creating is a no-op
-            storage::MetadataError::BucketAlreadyExists => Ok(()),
-            other => Err(ServerError::Metadata(other)),
-        })
+        self.create_bucket_for_owner("default-owner", name, false)
+    }
+
+    pub fn create_bucket_for_owner(
+        &self,
+        owner_principal: &str,
+        name: &str,
+        public_read: bool,
+    ) -> Result<(), ServerError> {
+        self.bucket_db
+            .create_bucket(name, owner_principal, public_read)
+            .or_else(|e| match e {
+                storage::MetadataError::BucketAlreadyExists => {
+                    let existing = self.head_bucket(name)?;
+                    if existing.owner_principal == owner_principal {
+                        Ok(())
+                    } else {
+                        Err(ServerError::BucketAlreadyExists)
+                    }
+                }
+                other => Err(ServerError::Metadata(other)),
+            })
     }
 
     pub fn delete_bucket(&self, name: &str) -> Result<(), ServerError> {
@@ -224,7 +241,14 @@ impl Coordinator {
     }
 
     pub fn list_buckets(&self) -> Result<Vec<BucketInfo>, ServerError> {
-        Ok(self.bucket_db.list_buckets(0)?)
+        self.list_buckets_for_owner("default-owner")
+    }
+
+    pub fn list_buckets_for_owner(
+        &self,
+        owner_principal: &str,
+    ) -> Result<Vec<BucketInfo>, ServerError> {
+        Ok(self.bucket_db.list_buckets(owner_principal)?)
     }
 
     pub fn put_bucket_versioning(&self, name: &str, state: u8) -> Result<(), ServerError> {
@@ -1072,7 +1096,7 @@ impl Coordinator {
                 common_prefixes: Vec::new(),
                 is_truncated: false,
                 next_continuation_token: None,
-                owner_id: bucket_info.owner_id,
+                owner_principal: bucket_info.owner_principal,
             });
         }
 
@@ -1199,7 +1223,7 @@ impl Coordinator {
             common_prefixes,
             is_truncated,
             next_continuation_token: next_token,
-            owner_id: bucket_info.owner_id,
+            owner_principal: bucket_info.owner_principal,
         })
     }
 
@@ -1389,6 +1413,43 @@ mod tests {
         // Only one bucket should exist
         let buckets = coord.list_buckets().unwrap();
         assert_eq!(buckets.len(), 1);
+    }
+
+    #[test]
+    fn create_bucket_different_owner_conflicts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        let err = coord
+            .create_bucket_for_owner("owner-b", "bucket", false)
+            .unwrap_err();
+        assert!(matches!(err, ServerError::BucketAlreadyExists));
+    }
+
+    #[test]
+    fn list_buckets_scoped_by_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+
+        coord
+            .create_bucket_for_owner("owner-a", "bucket-a", false)
+            .unwrap();
+        coord
+            .create_bucket_for_owner("owner-b", "bucket-b", false)
+            .unwrap();
+
+        let a = coord.list_buckets_for_owner("owner-a").unwrap();
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].name, "bucket-a");
+        assert_eq!(a[0].owner_principal, "owner-a");
+
+        let b = coord.list_buckets_for_owner("owner-b").unwrap();
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].name, "bucket-b");
+        assert_eq!(b[0].owner_principal, "owner-b");
     }
 
     #[test]
