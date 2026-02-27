@@ -191,7 +191,7 @@ fn authenticate_presigned(
             param: "X-Amz-Expires",
         });
     }
-    if now_epoch_secs > request_epoch.saturating_add(expires) {
+    if expires == 0 || now_epoch_secs > request_epoch.saturating_add(expires) {
         return Err(AuthError::RequestExpired);
     }
 

@@ -347,6 +347,9 @@ pub fn delete_objects_result_xml(
             xml.push_str("</VersionId>");
             if d.delete_marker {
                 xml.push_str("<DeleteMarker>true</DeleteMarker>");
+                xml.push_str("<DeleteMarkerVersionId>");
+                xml.push_str(&xml_escape(&vid));
+                xml.push_str("</DeleteMarkerVersionId>");
             }
             xml.push_str("</Deleted>");
         }

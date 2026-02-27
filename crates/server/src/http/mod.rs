@@ -65,6 +65,12 @@ impl HttpFrontend {
                 let resp = S3Response::precondition_failed();
                 self.send_response(request, resp);
             }
+            Err(ref err @ ServerError::DeleteMarkerHit { .. }) => {
+                let mut resp = S3Response::error(err, &s3req.path);
+                resp.headers
+                    .push(("x-amz-delete-marker".to_string(), "true".to_string()));
+                self.send_response(request, resp);
+            }
             Err(err) => {
                 let resp = S3Response::error(&err, &s3req.path);
                 self.send_response(request, resp);
@@ -239,7 +245,9 @@ impl HttpFrontend {
                     }
                 } else {
                     let result = self.coordinator.get_object(&bucket, &key, vid, &cond)?;
-                    Ok(S3Response::get_object(result))
+                    let mut resp = S3Response::get_object(result);
+                    apply_response_overrides(&mut resp, req);
+                    Ok(resp)
                 }
             }
             S3Operation::DeleteObject { bucket, key } => {
@@ -417,6 +425,24 @@ fn parse_max_keys(raw: Option<String>) -> Result<u32, ServerError> {
         Some(s) => s.parse::<u32>().map_err(|_| ServerError::InvalidArgument {
             reason: "invalid max-keys".to_string(),
         }),
+    }
+}
+
+/// Apply response-* query parameter overrides to a GET response.
+fn apply_response_overrides(resp: &mut S3Response, req: &S3Request) {
+    let overrides: &[(&str, &str)] = &[
+        ("response-content-type", "Content-Type"),
+        ("response-content-disposition", "Content-Disposition"),
+        ("response-content-encoding", "Content-Encoding"),
+        ("response-content-language", "Content-Language"),
+        ("response-cache-control", "Cache-Control"),
+        ("response-expires", "Expires"),
+    ];
+    for &(param, header_name) in overrides {
+        if let Some(value) = req.query_param(param) {
+            resp.headers.retain(|(k, _)| !k.eq_ignore_ascii_case(header_name));
+            resp.headers.push((header_name.to_string(), value));
+        }
     }
 }
 

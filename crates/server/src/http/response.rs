@@ -58,10 +58,12 @@ impl S3Response {
 
     /// Build a response for a successful PutObject.
     pub fn put_object(result: &PutObjectResult) -> Self {
-        let vid = format_version_id(result.version_id);
-        Self::new(200)
-            .header("ETag", &result.etag)
-            .header("x-amz-version-id", &vid)
+        let mut resp = Self::new(200).header("ETag", &result.etag);
+        if result.version_id != 0 {
+            let vid = format_version_id(result.version_id);
+            resp = resp.header("x-amz-version-id", &vid);
+        }
+        resp
     }
 
     /// Build a response for a successful CopyObject.
@@ -72,12 +74,14 @@ impl S3Response {
 
     /// Build a response for a successful GetObject.
     pub fn get_object(result: GetObjectResult) -> Self {
-        let vid = format_version_id(result.version_id);
         let mut resp = Self::new(200)
             .header("ETag", &result.etag)
             .header("Last-Modified", &format_http_date(result.last_modified))
-            .header("Accept-Ranges", "bytes")
-            .header("x-amz-version-id", &vid);
+            .header("Accept-Ranges", "bytes");
+        if result.version_id != 0 {
+            let vid = format_version_id(result.version_id);
+            resp = resp.header("x-amz-version-id", &vid);
+        }
 
         // Add metadata headers
         if let Some(ct) = result.metadata.get("content-type") {
@@ -113,13 +117,15 @@ impl S3Response {
 
     /// Build a response for a successful HeadObject.
     pub fn head_object(result: &HeadObjectResult) -> Self {
-        let vid = format_version_id(result.version_id);
         let mut resp = Self::new(200)
             .header("ETag", &result.etag)
             .header("Content-Length", &result.size.to_string())
             .header("Last-Modified", &format_http_date(result.last_modified))
-            .header("Accept-Ranges", "bytes")
-            .header("x-amz-version-id", &vid);
+            .header("Accept-Ranges", "bytes");
+        if result.version_id != 0 {
+            let vid = format_version_id(result.version_id);
+            resp = resp.header("x-amz-version-id", &vid);
+        }
 
         if let Some(ct) = result.metadata.get("content-type") {
             resp = resp.header("Content-Type", ct);
@@ -157,13 +163,15 @@ impl S3Response {
             "bytes {}-{}/{}",
             result.range_start, result.range_end, result.size
         );
-        let vid = format_version_id(result.version_id);
         let mut resp = Self::new(206)
             .header("ETag", &result.etag)
             .header("Last-Modified", &format_http_date(result.last_modified))
             .header("Accept-Ranges", "bytes")
-            .header("Content-Range", &content_range)
-            .header("x-amz-version-id", &vid);
+            .header("Content-Range", &content_range);
+        if result.version_id != 0 {
+            let vid = format_version_id(result.version_id);
+            resp = resp.header("x-amz-version-id", &vid);
+        }
 
         if let Some(ct) = result.metadata.get("content-type") {
             resp = resp.header("Content-Type", ct);
@@ -211,8 +219,11 @@ impl S3Response {
 
     /// Build a response for DeleteObject (204 No Content).
     pub fn delete_object(result: &DeleteObjectResult) -> Self {
-        let vid = format_version_id(result.version_id);
-        let mut resp = Self::new(204).header("x-amz-version-id", &vid);
+        let mut resp = Self::new(204);
+        if result.version_id != 0 {
+            let vid = format_version_id(result.version_id);
+            resp = resp.header("x-amz-version-id", &vid);
+        }
         if result.delete_marker {
             resp = resp.header("x-amz-delete-marker", "true");
         }
@@ -519,7 +530,20 @@ mod tests {
         let resp = S3Response::put_object(&result);
         assert_eq!(resp.status_code, 200);
         assert_eq!(find_header(&resp, "ETag"), Some("\"abc123\""));
-        assert_eq!(find_header(&resp, "x-amz-version-id"), Some("null"));
+        // version_id=0 means unversioned — no x-amz-version-id header
+        assert_eq!(find_header(&resp, "x-amz-version-id"), None);
+    }
+
+    #[test]
+    fn put_object_response_versioned() {
+        let result = PutObjectResult {
+            etag: "\"abc123\"".to_string(),
+            version_id: 42,
+        };
+        let resp = S3Response::put_object(&result);
+        assert_eq!(resp.status_code, 200);
+        assert_eq!(find_header(&resp, "ETag"), Some("\"abc123\""));
+        assert_eq!(find_header(&resp, "x-amz-version-id"), Some("42"));
     }
 
     // ── get_object ────────────────────────────────────────────────────
@@ -727,8 +751,22 @@ mod tests {
         };
         let resp = S3Response::delete_object(&result);
         assert_eq!(resp.status_code, 204);
-        assert_eq!(find_header(&resp, "x-amz-version-id"), Some("null"));
+        // version_id=0 means unversioned — no x-amz-version-id header
+        assert_eq!(find_header(&resp, "x-amz-version-id"), None);
         assert!(resp.body.is_empty());
+    }
+
+    #[test]
+    fn delete_object_versioned_with_marker() {
+        use crate::coordinator::DeleteObjectResult;
+        let result = DeleteObjectResult {
+            version_id: 5,
+            delete_marker: true,
+        };
+        let resp = S3Response::delete_object(&result);
+        assert_eq!(resp.status_code, 204);
+        assert_eq!(find_header(&resp, "x-amz-version-id"), Some("5"));
+        assert_eq!(find_header(&resp, "x-amz-delete-marker"), Some("true"));
     }
 
     // ── create_bucket ─────────────────────────────────────────────────

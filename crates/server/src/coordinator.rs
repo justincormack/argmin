@@ -413,6 +413,13 @@ impl Coordinator {
                 Err(storage::MetadataError::ObjectNotFound) => None,
                 Err(e) => return Err(ServerError::Metadata(e)),
             };
+            // If-Match: * on non-existent object → 404 (not 412)
+            if cond.if_match.as_deref() == Some("*") && existing_etag.is_none() {
+                return Err(ServerError::ObjectNotFound {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                });
+            }
             check_write_conditions(cond, existing_etag.as_deref())?;
         }
 
@@ -751,9 +758,9 @@ impl Coordinator {
             other => ServerError::Metadata(other),
         })?;
 
-        // If latest version is a delete marker, return 404
+        // If latest version is a delete marker, return 404 with x-amz-delete-marker
         if record.status == 1 {
-            return Err(ServerError::ObjectNotFound {
+            return Err(ServerError::DeleteMarkerHit {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
             });
@@ -823,9 +830,9 @@ impl Coordinator {
             other => ServerError::Metadata(other),
         })?;
 
-        // If latest version is a delete marker, return 404
+        // If latest version is a delete marker, return 404 with x-amz-delete-marker
         if record.status == 1 {
-            return Err(ServerError::ObjectNotFound {
+            return Err(ServerError::DeleteMarkerHit {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
             });
@@ -891,9 +898,9 @@ impl Coordinator {
             other => ServerError::Metadata(other),
         })?;
 
-        // If latest version is a delete marker, return 404
+        // If latest version is a delete marker, return 404 with x-amz-delete-marker
         if record.status == 1 {
-            return Err(ServerError::ObjectNotFound {
+            return Err(ServerError::DeleteMarkerHit {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
             });

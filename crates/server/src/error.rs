@@ -15,6 +15,9 @@ pub enum ServerError {
     #[error("object not found: {bucket}/{key}")]
     ObjectNotFound { bucket: String, key: String },
 
+    #[error("delete marker hit: {bucket}/{key}")]
+    DeleteMarkerHit { bucket: String, key: String },
+
     #[error("storage error: {0}")]
     Store(#[from] StoreError),
 
@@ -59,9 +62,10 @@ impl ServerError {
     pub fn s3_error_code(&self) -> &'static str {
         match self {
             Self::BucketNotFound { .. } => "NoSuchBucket",
-            Self::BucketAlreadyExists => "BucketAlreadyOwnedByYou",
+            Self::BucketAlreadyExists => "BucketAlreadyExists",
             Self::BucketNotEmpty => "BucketNotEmpty",
             Self::ObjectNotFound { .. } => "NoSuchKey",
+            Self::DeleteMarkerHit { .. } => "NoSuchKey",
             Self::Auth(auth::AuthError::MissingAuth) => "AccessDenied",
             Self::Auth(auth::AuthError::UnknownAccessKey) => "InvalidAccessKeyId",
             Self::Auth(auth::AuthError::SignatureMismatch) => "SignatureDoesNotMatch",
@@ -89,6 +93,7 @@ impl ServerError {
             Self::BucketAlreadyExists => 409,
             Self::BucketNotEmpty => 409,
             Self::ObjectNotFound { .. } => 404,
+            Self::DeleteMarkerHit { .. } => 404,
             Self::Auth(_) => 403,
             Self::InvalidRequest { .. }
             | Self::InvalidArgument { .. }
@@ -117,7 +122,7 @@ mod tests {
     fn s3_error_code_bucket_already_exists() {
         assert_eq!(
             ServerError::BucketAlreadyExists.s3_error_code(),
-            "BucketAlreadyOwnedByYou"
+            "BucketAlreadyExists"
         );
     }
 
