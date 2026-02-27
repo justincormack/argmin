@@ -140,6 +140,45 @@ impl GlobalService for SqliteBucketDb {
             })
     }
 
+    fn put_bucket_versioning(&self, name: &str, state: u8) -> Result<(), MetadataError> {
+        // Get current versioning state
+        let current: u8 = self
+            .conn
+            .query_row(
+                "SELECT versioning FROM buckets WHERE name = ?1",
+                params![name],
+                |row| row.get::<_, i64>(0).map(|v| v as u8),
+            )
+            .optional()
+            .map_err(|e| MetadataError::Db {
+                context: "get bucket versioning",
+                source: e,
+            })?
+            .ok_or(MetadataError::BucketNotFound {
+                name: name.to_string(),
+            })?;
+
+        // Validate transition: cannot go back to Disabled (0) from Enabled (1) or Suspended (2)
+        if state == 0 && current != 0 {
+            return Err(MetadataError::InvalidVersioningTransition {
+                from: current,
+                to: state,
+            });
+        }
+
+        self.conn
+            .execute(
+                "UPDATE buckets SET versioning = ?1 WHERE name = ?2",
+                params![state as i64, name],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "put bucket versioning",
+                source: e,
+            })?;
+
+        Ok(())
+    }
+
     fn list_buckets(&self, owner_id: u64) -> Result<Vec<BucketInfo>, MetadataError> {
         let mut stmt = self
             .conn

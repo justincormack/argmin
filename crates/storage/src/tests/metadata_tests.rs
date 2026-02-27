@@ -6,7 +6,8 @@ fn metadata_put_get_delete(store: &dyn PgMetadataStore) {
     let req = PutObjectMetaReq {
         bucket: "test-bucket".to_string(),
         key: "test-key".to_string(),
-        version_id: "null".to_string(),
+        version_id: 0,
+        status: 0,
         size: 1024,
         total_size: 0,
         etag: vec![0xAB, 0xCD],
@@ -22,7 +23,7 @@ fn metadata_put_get_delete(store: &dyn PgMetadataStore) {
     let obj = store.get_object_meta("test-bucket", "test-key").unwrap();
     assert_eq!(obj.bucket, "test-bucket");
     assert_eq!(obj.key, "test-key");
-    assert_eq!(obj.version_id, "null");
+    assert_eq!(obj.version_id, 0);
     assert_eq!(obj.size, 1024);
     assert_eq!(obj.etag, vec![0xAB, 0xCD]);
     assert_eq!(obj.etag_kind, 0);
@@ -44,7 +45,8 @@ fn metadata_put_overwrites(store: &dyn PgMetadataStore) {
     let req1 = PutObjectMetaReq {
         bucket: "b".to_string(),
         key: "k".to_string(),
-        version_id: "null".to_string(),
+        version_id: 0,
+        status: 0,
         size: 100,
         total_size: 0,
         etag: vec![1],
@@ -57,7 +59,8 @@ fn metadata_put_overwrites(store: &dyn PgMetadataStore) {
     let req2 = PutObjectMetaReq {
         bucket: "b".to_string(),
         key: "k".to_string(),
-        version_id: "null".to_string(),
+        version_id: 0,
+        status: 0,
         size: 200,
         total_size: 0,
         etag: vec![2],
@@ -82,7 +85,8 @@ fn metadata_list_basic(store: &dyn PgMetadataStore) {
         let req = PutObjectMetaReq {
             bucket: "list-bucket".to_string(),
             key: format!("obj-{i:02}"),
-            version_id: "null".to_string(),
+            version_id: 0,
+        status: 0,
             size: i * 100,
             total_size: 0,
             etag: vec![i as u8],
@@ -115,7 +119,8 @@ fn metadata_list_with_prefix(store: &dyn PgMetadataStore) {
         let req = PutObjectMetaReq {
             bucket: "prefix-bucket".to_string(),
             key: key.to_string(),
-            version_id: "null".to_string(),
+            version_id: 0,
+        status: 0,
             size: 100,
             total_size: 0,
             etag: vec![0],
@@ -144,7 +149,8 @@ fn metadata_list_pagination(store: &dyn PgMetadataStore) {
         let req = PutObjectMetaReq {
             bucket: "page-bucket".to_string(),
             key: format!("item-{i:02}"),
-            version_id: "null".to_string(),
+            version_id: 0,
+        status: 0,
             size: 0,
             total_size: 0,
             etag: vec![],
@@ -234,7 +240,8 @@ fn metadata_empty_key(store: &dyn PgMetadataStore) {
     let req = PutObjectMetaReq {
         bucket: "b".to_string(),
         key: "".to_string(),
-        version_id: "null".to_string(),
+        version_id: 0,
+        status: 0,
         size: 0,
         total_size: 0,
         etag: vec![],
@@ -254,7 +261,8 @@ fn metadata_long_key(store: &dyn PgMetadataStore) {
     let req = PutObjectMetaReq {
         bucket: "b".to_string(),
         key: long_key.clone(),
-        version_id: "null".to_string(),
+        version_id: 0,
+        status: 0,
         size: 0,
         total_size: 0,
         etag: vec![],
@@ -272,7 +280,8 @@ fn metadata_zero_size_object(store: &dyn PgMetadataStore) {
     let req = PutObjectMetaReq {
         bucket: "b".to_string(),
         key: "empty-obj".to_string(),
-        version_id: "null".to_string(),
+        version_id: 0,
+        status: 0,
         size: 0,
         total_size: 0,
         etag: vec![],
@@ -429,7 +438,8 @@ mod prop_tests {
             let req = PutObjectMetaReq {
                 bucket: bucket.to_string(),
                 key: key.clone(),
-                version_id: "null".to_string(),
+                version_id: 0,
+        status: 0,
                 size: 0,
                 total_size: 0,
                 etag: vec![],

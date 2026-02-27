@@ -13,7 +13,7 @@ use crate::conditional::{
 use crate::error::ServerError;
 use crate::etag::{crc64_to_etag_bytes, etag_bytes_to_crc64, format_etag};
 use crate::metadata_blob::MetadataBlob;
-use crate::pg::{derive_pg, object_key_hash};
+use crate::pg::{derive_pg, derive_pg_shards, object_key_hash};
 use crate::range::ByteRange;
 
 /// Maximum object size for single PUT (256 MB).
@@ -27,7 +27,7 @@ const MAX_LIST_RECORDS: usize = 100_000;
 #[derive(Debug)]
 pub struct PutObjectResult {
     pub etag: String,
-    pub version_id: String,
+    pub version_id: u64,
 }
 
 /// Result of a GetObject operation.
@@ -38,6 +38,7 @@ pub struct GetObjectResult {
     pub etag: String,
     pub size: u64,
     pub last_modified: u64,
+    pub version_id: u64,
 }
 
 /// Result of a HeadObject operation.
@@ -47,6 +48,7 @@ pub struct HeadObjectResult {
     pub etag: String,
     pub size: u64,
     pub last_modified: u64,
+    pub version_id: u64,
 }
 
 /// Result of a range GetObject operation (206 Partial Content).
@@ -96,11 +98,19 @@ pub struct ListObjectsResult {
     pub owner_id: u64,
 }
 
+/// Result of a DeleteObject operation.
+#[derive(Debug)]
+pub struct DeleteObjectResult {
+    pub version_id: u64,
+    pub delete_marker: bool,
+}
+
 /// Result entry for a successfully deleted object in a batch delete.
 #[derive(Debug)]
 pub struct DeletedObject {
     pub key: String,
-    pub version_id: String,
+    pub version_id: u64,
+    pub delete_marker: bool,
 }
 
 /// Result entry for a failed deletion in a batch delete.
@@ -195,6 +205,32 @@ impl Coordinator {
         Ok(self.bucket_db.list_buckets(0)?)
     }
 
+    pub fn put_bucket_versioning(&self, name: &str, state: u8) -> Result<(), ServerError> {
+        // Verify bucket exists
+        self.head_bucket(name)?;
+        self.bucket_db
+            .put_bucket_versioning(name, state)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => {
+                    ServerError::BucketNotFound { name }
+                }
+                storage::MetadataError::InvalidVersioningTransition { from, to } => {
+                    ServerError::InvalidRequest {
+                        reason: format!(
+                            "invalid versioning transition from {} to {}",
+                            from, to
+                        ),
+                    }
+                }
+                other => ServerError::Metadata(other),
+            })
+    }
+
+    pub fn get_bucket_versioning(&self, name: &str) -> Result<u8, ServerError> {
+        let info = self.head_bucket(name)?;
+        Ok(info.versioning)
+    }
+
     // ── Object operations ─────────────────────────────────────────────
 
     /// Core write path: serialize metadata, EC-encode, write shards, record metadata.
@@ -238,13 +274,15 @@ impl Coordinator {
             parity_bufs.iter_mut().map(|v| v.as_mut_slice()).collect();
         self.ec_codec.encode(&data_shards, &mut parity_refs)?;
 
-        // 7. Derive PG
-        let pg_id = derive_pg(bucket, key, self.pg_count);
-        let pg = self.storage_node.get_pg(pg_id)?;
+        // 7. Derive PGs: metadata and shards may go to different PGs
+        let meta_pg_id = derive_pg(bucket, key, self.pg_count);
+        let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
+        let version_id: u64 = 0; // unversioned
+        let shard_pg_id = derive_pg_shards(bucket, key, version_id, self.pg_count);
+        let shard_pg = self.storage_node.get_pg(shard_pg_id)?;
 
         // 8. Compute object_key_hash
         let okh = object_key_hash(bucket, key);
-        let version_id: u64 = 0; // unversioned
 
         // 9. Write all k+m shards, with cleanup on failure
         let mut written_shards: Vec<ShardKey> = Vec::with_capacity(k + m);
@@ -256,7 +294,7 @@ impl Coordinator {
                 } else {
                     &parity_bufs[i - k]
                 };
-                pg.write_shard(&shard_key, shard_data)?;
+                shard_pg.write_shard(&shard_key, shard_data)?;
                 written_shards.push(shard_key);
             }
             Ok(())
@@ -265,16 +303,17 @@ impl Coordinator {
         if let Err(e) = write_result {
             // Best-effort cleanup of already-written shards
             for shard_key in &written_shards {
-                let _ = pg.delete_shard(shard_key);
+                let _ = shard_pg.delete_shard(shard_key);
             }
             return Err(e);
         }
 
-        // 10. Record metadata
-        let meta_result = pg.put_object_meta(&PutObjectMetaReq {
+        // 10. Record metadata (to metadata PG)
+        let meta_result = meta_pg.put_object_meta(&PutObjectMetaReq {
             bucket: bucket.to_string(),
             key: key.to_string(),
-            version_id: "null".to_string(),
+            version_id: 0,
+            status: 0,
             size: user_data.len() as u64,
             total_size: (blob_bytes.len() + user_data.len()) as u64,
             etag: crc64_to_etag_bytes(etag_crc),
@@ -286,14 +325,14 @@ impl Coordinator {
         if let Err(e) = meta_result {
             // Best-effort cleanup of all written shards
             for shard_key in &written_shards {
-                let _ = pg.delete_shard(shard_key);
+                let _ = shard_pg.delete_shard(shard_key);
             }
             return Err(ServerError::Metadata(e));
         }
 
         Ok(PutObjectResult {
             etag: format_etag(etag_crc),
-            version_id: "null".to_string(),
+            version_id: 0,
         })
     }
 
@@ -353,10 +392,10 @@ impl Coordinator {
         directive: MetadataDirective,
         new_headers: &[(&str, &str)],
     ) -> Result<CopyObjectResult, ServerError> {
-        // 1. Read source metadata
-        let src_pg_id = derive_pg(src_bucket, src_key, self.pg_count);
-        let src_pg = self.storage_node.get_pg(src_pg_id)?;
-        let src_record = src_pg
+        // 1. Read source metadata from metadata PG
+        let src_meta_pg_id = derive_pg(src_bucket, src_key, self.pg_count);
+        let src_meta_pg = self.storage_node.get_pg(src_meta_pg_id)?;
+        let src_record = src_meta_pg
             .get_object_meta(src_bucket, src_key)
             .map_err(|e| match e {
                 storage::MetadataError::ObjectNotFound => ServerError::ObjectNotFound {
@@ -372,12 +411,15 @@ impl Coordinator {
         // 2. Check source conditions
         check_copy_source_conditions(src_cond, &src_etag, src_record.last_modified)?;
 
-        // 3. Read source data (full object: metadata blob + user data)
+        // 3. Read source data from shard PG
         let src_okh = object_key_hash(src_bucket, src_key);
-        let version_id: u64 = 0;
+        let version_id = src_record.version_id;
+        let src_shard_pg_id =
+            derive_pg_shards(src_bucket, src_key, version_id, self.pg_count);
+        let src_shard_pg = self.storage_node.get_pg(src_shard_pg_id)?;
         let total = src_record.total_size as usize;
         let data = self
-            .read_range(src_pg, &src_okh, version_id, &src_record, 0, total - 1)
+            .read_range(src_shard_pg, &src_okh, version_id, &src_record, 0, total - 1)
             .map_err(|e| match e {
                 ServerError::Store(storage::StoreError::NotFound) => {
                     ServerError::ObjectNotFound {
@@ -626,11 +668,11 @@ impl Coordinator {
         key: &str,
         cond: &ReadCondition,
     ) -> Result<GetObjectResult, ServerError> {
-        // 1. Derive PG, look up record
-        let pg_id = derive_pg(bucket, key, self.pg_count);
-        let pg = self.storage_node.get_pg(pg_id)?;
+        // 1. Derive metadata PG, look up record
+        let meta_pg_id = derive_pg(bucket, key, self.pg_count);
+        let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
 
-        let record = pg.get_object_meta(bucket, key).map_err(|e| match e {
+        let record = meta_pg.get_object_meta(bucket, key).map_err(|e| match e {
             storage::MetadataError::ObjectNotFound => ServerError::ObjectNotFound {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
@@ -639,16 +681,20 @@ impl Coordinator {
         })?;
 
         let okh = object_key_hash(bucket, key);
-        let version_id: u64 = 0;
+        let version_id = record.version_id;
         let etag_crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
 
         // Check conditions before reading shard data
         let etag_str = format_etag(etag_crc);
         check_read_conditions(cond, &etag_str, record.last_modified)?;
 
+        // 2. Derive shard PG and read data
+        let shard_pg_id = derive_pg_shards(bucket, key, version_id, self.pg_count);
+        let shard_pg = self.storage_node.get_pg(shard_pg_id)?;
+
         let total = record.total_size as usize;
         let data = self
-            .read_range(pg, &okh, version_id, &record, 0, total - 1)
+            .read_range(shard_pg, &okh, version_id, &record, 0, total - 1)
             .map_err(|e| match e {
                 ServerError::Store(storage::StoreError::NotFound) => {
                     ServerError::ObjectNotFound {
@@ -669,6 +715,7 @@ impl Coordinator {
             etag: format_etag(etag_crc),
             size: record.size,
             last_modified: record.last_modified,
+            version_id: record.version_id,
         })
     }
 
@@ -681,10 +728,10 @@ impl Coordinator {
         key: &str,
         cond: &ReadCondition,
     ) -> Result<HeadObjectResult, ServerError> {
-        let pg_id = derive_pg(bucket, key, self.pg_count);
-        let pg = self.storage_node.get_pg(pg_id)?;
+        let meta_pg_id = derive_pg(bucket, key, self.pg_count);
+        let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
 
-        let record = pg.get_object_meta(bucket, key).map_err(|e| match e {
+        let record = meta_pg.get_object_meta(bucket, key).map_err(|e| match e {
             storage::MetadataError::ObjectNotFound => ServerError::ObjectNotFound {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
@@ -693,16 +740,19 @@ impl Coordinator {
         })?;
 
         let okh = object_key_hash(bucket, key);
-        let version_id: u64 = 0;
+        let version_id = record.version_id;
         let etag_crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
 
         // Check conditions before reading shard data
         let etag_str = format_etag(etag_crc);
         check_read_conditions(cond, &etag_str, record.last_modified)?;
 
+        let shard_pg_id = derive_pg_shards(bucket, key, version_id, self.pg_count);
+        let shard_pg = self.storage_node.get_pg(shard_pg_id)?;
+
         let metadata_size = (record.total_size - record.size) as usize;
         let data = self
-            .read_range(pg, &okh, version_id, &record, 0, metadata_size - 1)
+            .read_range(shard_pg, &okh, version_id, &record, 0, metadata_size - 1)
             .map_err(|e| match e {
                 ServerError::Store(storage::StoreError::NotFound) => {
                     ServerError::ObjectNotFound {
@@ -719,6 +769,7 @@ impl Coordinator {
             etag: format_etag(etag_crc),
             size: record.size,
             last_modified: record.last_modified,
+            version_id: record.version_id,
         })
     }
 
@@ -732,10 +783,10 @@ impl Coordinator {
         range: ByteRange,
         cond: &ReadCondition,
     ) -> Result<GetObjectRangeResult, ServerError> {
-        let pg_id = derive_pg(bucket, key, self.pg_count);
-        let pg = self.storage_node.get_pg(pg_id)?;
+        let meta_pg_id = derive_pg(bucket, key, self.pg_count);
+        let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
 
-        let record = pg.get_object_meta(bucket, key).map_err(|e| match e {
+        let record = meta_pg.get_object_meta(bucket, key).map_err(|e| match e {
             storage::MetadataError::ObjectNotFound => ServerError::ObjectNotFound {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
@@ -744,7 +795,7 @@ impl Coordinator {
         })?;
 
         let okh = object_key_hash(bucket, key);
-        let version_id: u64 = 0;
+        let version_id = record.version_id;
         let etag_crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
 
         // Check conditions before reading shard data
@@ -759,11 +810,14 @@ impl Coordinator {
                     total_size: record.size,
                 })?;
 
+        let shard_pg_id = derive_pg_shards(bucket, key, version_id, self.pg_count);
+        let shard_pg = self.storage_node.get_pg(shard_pg_id)?;
+
         let metadata_size = (record.total_size - record.size) as usize;
 
         // Read metadata (always need it for response headers)
         let meta_data = self
-            .read_range(pg, &okh, version_id, &record, 0, metadata_size - 1)
+            .read_range(shard_pg, &okh, version_id, &record, 0, metadata_size - 1)
             .map_err(|e| match e {
                 ServerError::Store(storage::StoreError::NotFound) => {
                     ServerError::ObjectNotFound {
@@ -779,7 +833,7 @@ impl Coordinator {
         let blob_start = metadata_size + user_start as usize;
         let blob_end = metadata_size + user_end as usize;
         let user_data = self
-            .read_range(pg, &okh, version_id, &record, blob_start, blob_end)
+            .read_range(shard_pg, &okh, version_id, &record, blob_start, blob_end)
             .map_err(|e| match e {
                 ServerError::Store(storage::StoreError::NotFound) => {
                     ServerError::ObjectNotFound {
@@ -807,18 +861,21 @@ impl Coordinator {
         bucket: &str,
         key: &str,
         cond: &DeleteCondition,
-    ) -> Result<(), ServerError> {
-        let pg_id = derive_pg(bucket, key, self.pg_count);
-        let pg = self.storage_node.get_pg(pg_id)?;
+    ) -> Result<DeleteObjectResult, ServerError> {
+        let meta_pg_id = derive_pg(bucket, key, self.pg_count);
+        let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
 
         // Look up the record to get EC params
-        let record = match pg.get_object_meta(bucket, key) {
+        let record = match meta_pg.get_object_meta(bucket, key) {
             Ok(r) => r,
             Err(storage::MetadataError::ObjectNotFound) => {
                 if !cond.is_empty() {
                     return Err(ServerError::PreconditionFailed);
                 }
-                return Ok(()); // idempotent
+                return Ok(DeleteObjectResult {
+                    version_id: 0,
+                    delete_marker: false,
+                }); // idempotent
             }
             Err(e) => return Err(ServerError::Metadata(e)),
         };
@@ -831,19 +888,24 @@ impl Coordinator {
         }
 
         let okh = object_key_hash(bucket, key);
-        let version_id: u64 = 0;
+        let version_id = record.version_id;
+        let shard_pg_id = derive_pg_shards(bucket, key, version_id, self.pg_count);
+        let shard_pg = self.storage_node.get_pg(shard_pg_id)?;
         let total = record.ec_k as usize + record.ec_m as usize;
 
         // Delete all shards (idempotent)
         for i in 0..total {
             let shard_key = ShardKey::new(&okh, version_id, i as u8);
-            pg.delete_shard(&shard_key)?;
+            shard_pg.delete_shard(&shard_key)?;
         }
 
         // Delete metadata record
-        pg.delete_object_meta(bucket, key)?;
+        meta_pg.delete_object_meta(bucket, key)?;
 
-        Ok(())
+        Ok(DeleteObjectResult {
+            version_id: 0,
+            delete_marker: false,
+        })
     }
 
     /// List objects in a bucket (ListObjectsV2).
@@ -1010,10 +1072,11 @@ impl Coordinator {
 
         for entry in entries {
             match self.delete_object(bucket, &entry.key, cond) {
-                Ok(()) => {
+                Ok(result) => {
                     deleted.push(DeletedObject {
                         key: entry.key.clone(),
-                        version_id: "null".to_string(),
+                        version_id: result.version_id,
+                        delete_marker: result.delete_marker,
                     });
                 }
                 Err(e) => {
@@ -1335,9 +1398,9 @@ mod tests {
         shard_index: u8,
         pg_count: u32,
     ) -> PathBuf {
-        let pg_id = derive_pg(bucket, key, pg_count);
-        let okh = object_key_hash(bucket, key);
         let version_id: u64 = 0;
+        let pg_id = derive_pg_shards(bucket, key, version_id, pg_count);
+        let okh = object_key_hash(bucket, key);
         let shard_key = ShardKey::new(&okh, version_id, shard_index);
         data_dir
             .join(format!("pg-{pg_id:04}"))
@@ -2768,5 +2831,122 @@ mod tests {
         // Source should still exist
         let src = coord.get_object("src-bucket", "key", NO_READ).unwrap();
         assert_eq!(src.data, b"cross bucket data");
+    }
+
+    // ── Bucket versioning tests ──────────────────────────────────────
+
+    #[test]
+    fn bucket_versioning_default_disabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let state = coord.get_bucket_versioning("bucket").unwrap();
+        assert_eq!(state, 0);
+    }
+
+    #[test]
+    fn bucket_versioning_enable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        coord.put_bucket_versioning("bucket", 1).unwrap();
+        assert_eq!(coord.get_bucket_versioning("bucket").unwrap(), 1);
+    }
+
+    #[test]
+    fn bucket_versioning_enable_then_suspend() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        coord.put_bucket_versioning("bucket", 1).unwrap();
+        coord.put_bucket_versioning("bucket", 2).unwrap();
+        assert_eq!(coord.get_bucket_versioning("bucket").unwrap(), 2);
+    }
+
+    #[test]
+    fn bucket_versioning_suspend_then_enable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        coord.put_bucket_versioning("bucket", 1).unwrap();
+        coord.put_bucket_versioning("bucket", 2).unwrap();
+        coord.put_bucket_versioning("bucket", 1).unwrap();
+        assert_eq!(coord.get_bucket_versioning("bucket").unwrap(), 1);
+    }
+
+    #[test]
+    fn bucket_versioning_cannot_disable_from_enabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        coord.put_bucket_versioning("bucket", 1).unwrap();
+        let err = coord.put_bucket_versioning("bucket", 0).unwrap_err();
+        assert!(matches!(err, ServerError::InvalidRequest { .. }));
+    }
+
+    #[test]
+    fn bucket_versioning_nonexistent_bucket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+
+        let err = coord.put_bucket_versioning("no-bucket", 1).unwrap_err();
+        assert!(matches!(err, ServerError::BucketNotFound { .. }));
+    }
+
+    #[test]
+    fn put_object_returns_version_id_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let result = coord
+            .put_object("bucket", "key", b"data", &[], NO_WRITE)
+            .unwrap();
+        assert_eq!(result.version_id, 0);
+    }
+
+    #[test]
+    fn get_object_returns_version_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        coord
+            .put_object("bucket", "key", b"data", &[], NO_WRITE)
+            .unwrap();
+        let obj = coord.get_object("bucket", "key", NO_READ).unwrap();
+        assert_eq!(obj.version_id, 0);
+    }
+
+    #[test]
+    fn head_object_returns_version_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        coord
+            .put_object("bucket", "key", b"data", &[], NO_WRITE)
+            .unwrap();
+        let head = coord.head_object("bucket", "key", NO_READ).unwrap();
+        assert_eq!(head.version_id, 0);
+    }
+
+    #[test]
+    fn delete_object_returns_result() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        coord
+            .put_object("bucket", "key", b"data", &[], NO_WRITE)
+            .unwrap();
+        let result = coord.delete_object("bucket", "key", NO_DELETE).unwrap();
+        assert_eq!(result.version_id, 0);
+        assert!(!result.delete_marker);
     }
 }

@@ -232,12 +232,41 @@ impl PgMetadataStore for FaultyPgStore {
         self.inner.get_object_meta(bucket, key)
     }
 
+    fn get_object_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: u64,
+    ) -> Result<ObjectRecord, MetadataError> {
+        self.inner.get_object_version(bucket, key, version_id)
+    }
+
     fn delete_object_meta(&self, bucket: &str, key: &str) -> Result<(), MetadataError> {
         self.inner.delete_object_meta(bucket, key)
     }
 
+    fn delete_object_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: u64,
+    ) -> Result<(), MetadataError> {
+        self.inner.delete_object_version(bucket, key, version_id)
+    }
+
     fn list_objects(&self, req: &ListObjectsReq) -> Result<ListObjectsResp, MetadataError> {
         self.inner.list_objects(req)
+    }
+
+    fn list_object_versions(
+        &self,
+        req: &ListObjectVersionsReq,
+    ) -> Result<ListObjectVersionsResp, MetadataError> {
+        self.inner.list_object_versions(req)
+    }
+
+    fn next_version_id(&self, bucket: &str, key: &str) -> Result<u64, MetadataError> {
+        self.inner.next_version_id(bucket, key)
     }
 }
 
@@ -380,7 +409,8 @@ mod tests {
             .put_object_meta(&PutObjectMetaReq {
                 bucket: "b".to_string(),
                 key: "k".to_string(),
-                version_id: "null".to_string(),
+                version_id: 0,
+                status: 0,
                 size: 100,
                 total_size: 110,
                 etag: vec![1, 2, 3],

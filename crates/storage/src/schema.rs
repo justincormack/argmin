@@ -17,7 +17,7 @@ const CREATE_OBJECTS_TABLE: &str = "\
 CREATE TABLE IF NOT EXISTS objects (
     bucket        TEXT NOT NULL,
     key           TEXT NOT NULL,
-    version_id    TEXT NOT NULL,
+    version_id    INTEGER NOT NULL,
     size          INTEGER NOT NULL,
     total_size    INTEGER NOT NULL DEFAULT 0,
     etag          BLOB NOT NULL,
@@ -33,6 +33,10 @@ CREATE TABLE IF NOT EXISTS objects (
 /// Index for list operations: bucket + key ordering.
 const CREATE_OBJECTS_LIST_INDEX: &str = "\
 CREATE INDEX IF NOT EXISTS idx_objects_list ON objects (bucket, key)";
+
+/// Index for version queries: bucket + key + version_id descending for fast latest-version lookup.
+const CREATE_OBJECTS_VERSIONS_INDEX: &str = "\
+CREATE INDEX IF NOT EXISTS idx_objects_versions ON objects (bucket, key, version_id DESC)";
 
 /// Global bucket metadata table.
 const CREATE_BUCKETS_TABLE: &str = "\
@@ -66,6 +70,7 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(CREATE_SHARDS_TABLE, [])?;
     conn.execute(CREATE_OBJECTS_TABLE, [])?;
     conn.execute(CREATE_OBJECTS_LIST_INDEX, [])?;
+    conn.execute(CREATE_OBJECTS_VERSIONS_INDEX, [])?;
     Ok(())
 }
 

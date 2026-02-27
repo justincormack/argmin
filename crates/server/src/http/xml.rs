@@ -337,11 +337,16 @@ pub fn delete_objects_result_xml(
 
     if !quiet {
         for d in deleted {
+            let vid = super::response::format_version_id(d.version_id);
             xml.push_str("<Deleted><Key>");
             xml.push_str(&xml_escape(&d.key));
             xml.push_str("</Key><VersionId>");
-            xml.push_str(&xml_escape(&d.version_id));
-            xml.push_str("</VersionId></Deleted>");
+            xml.push_str(&xml_escape(&vid));
+            xml.push_str("</VersionId>");
+            if d.delete_marker {
+                xml.push_str("<DeleteMarker>true</DeleteMarker>");
+            }
+            xml.push_str("</Deleted>");
         }
     }
 
@@ -356,6 +361,46 @@ pub fn delete_objects_result_xml(
     }
 
     xml.push_str("</DeleteResult>");
+    xml
+}
+
+/// Parse a PutBucketVersioning XML request body.
+///
+/// Returns the versioning state: 1 = Enabled, 2 = Suspended.
+pub fn parse_versioning_config_xml(data: &[u8]) -> Result<u8, ServerError> {
+    let text = std::str::from_utf8(data).map_err(|_| ServerError::InvalidRequest {
+        reason: "invalid UTF-8 in versioning XML body".to_string(),
+    })?;
+
+    if let Some(status) = extract_tag_content(text, "Status") {
+        match status {
+            "Enabled" => Ok(1),
+            "Suspended" => Ok(2),
+            other => Err(ServerError::InvalidRequest {
+                reason: format!("invalid versioning status: {}", other),
+            }),
+        }
+    } else {
+        Err(ServerError::InvalidRequest {
+            reason: "missing <Status> element in versioning configuration".to_string(),
+        })
+    }
+}
+
+/// Format a GetBucketVersioning XML response.
+pub fn get_bucket_versioning_xml(state: u8) -> String {
+    let mut xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
+    );
+
+    match state {
+        1 => xml.push_str("<Status>Enabled</Status>"),
+        2 => xml.push_str("<Status>Suspended</Status>"),
+        _ => {} // Disabled (0): empty element per S3 spec
+    }
+
+    xml.push_str("</VersioningConfiguration>");
     xml
 }
 
@@ -836,7 +881,8 @@ mod tests {
         use crate::coordinator::{DeleteError, DeletedObject};
         let deleted = vec![DeletedObject {
             key: "key1".to_string(),
-            version_id: "null".to_string(),
+            version_id: 0,
+            delete_marker: false,
         }];
         let errors = vec![DeleteError {
             key: "key2".to_string(),
@@ -855,7 +901,8 @@ mod tests {
         use crate::coordinator::DeletedObject;
         let deleted = vec![DeletedObject {
             key: "key1".to_string(),
-            version_id: "null".to_string(),
+            version_id: 0,
+            delete_marker: false,
         }];
         let xml = delete_objects_result_xml(&deleted, &[], true);
         assert!(!xml.contains("<Deleted>"));
@@ -940,5 +987,50 @@ mod tests {
         assert!(xml.contains("<ETag>&quot;abcdef1234567890&quot;</ETag>"));
         assert!(xml.contains("<LastModified>2024-01-15T12:30:45.000Z</LastModified>"));
         assert!(xml.contains("</CopyObjectResult>"));
+    }
+
+    // ── versioning XML ──────────────────────────────────────────────
+
+    #[test]
+    fn parse_versioning_enabled() {
+        let xml = b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>";
+        assert_eq!(parse_versioning_config_xml(xml).unwrap(), 1);
+    }
+
+    #[test]
+    fn parse_versioning_suspended() {
+        let xml = b"<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>";
+        assert_eq!(parse_versioning_config_xml(xml).unwrap(), 2);
+    }
+
+    #[test]
+    fn parse_versioning_invalid_status() {
+        let xml = b"<VersioningConfiguration><Status>Invalid</Status></VersioningConfiguration>";
+        assert!(parse_versioning_config_xml(xml).is_err());
+    }
+
+    #[test]
+    fn parse_versioning_missing_status() {
+        let xml = b"<VersioningConfiguration></VersioningConfiguration>";
+        assert!(parse_versioning_config_xml(xml).is_err());
+    }
+
+    #[test]
+    fn get_bucket_versioning_disabled() {
+        let xml = get_bucket_versioning_xml(0);
+        assert!(xml.contains("VersioningConfiguration"));
+        assert!(!xml.contains("<Status>"));
+    }
+
+    #[test]
+    fn get_bucket_versioning_enabled() {
+        let xml = get_bucket_versioning_xml(1);
+        assert!(xml.contains("<Status>Enabled</Status>"));
+    }
+
+    #[test]
+    fn get_bucket_versioning_suspended() {
+        let xml = get_bucket_versioning_xml(2);
+        assert!(xml.contains("<Status>Suspended</Status>"));
     }
 }

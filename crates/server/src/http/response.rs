@@ -8,6 +8,17 @@ use storage::BucketInfo;
 
 use super::xml;
 
+/// Format a version_id for S3 API responses.
+/// version_id 0 is the null version (displayed as "null").
+/// Non-zero version IDs are displayed as decimal strings.
+pub fn format_version_id(version_id: u64) -> String {
+    if version_id == 0 {
+        "null".to_string()
+    } else {
+        version_id.to_string()
+    }
+}
+
 /// An HTTP response to send back.
 pub struct S3Response {
     pub status_code: u16,
@@ -47,9 +58,10 @@ impl S3Response {
 
     /// Build a response for a successful PutObject.
     pub fn put_object(result: &PutObjectResult) -> Self {
+        let vid = format_version_id(result.version_id);
         Self::new(200)
             .header("ETag", &result.etag)
-            .header("x-amz-version-id", &result.version_id)
+            .header("x-amz-version-id", &vid)
     }
 
     /// Build a response for a successful CopyObject.
@@ -210,6 +222,17 @@ impl S3Response {
     pub fn head_bucket(info: &BucketInfo) -> Self {
         let _ = info; // We could add x-amz-bucket-region etc.
         Self::new(200)
+    }
+
+    /// Build a response for PutBucketVersioning.
+    pub fn put_bucket_versioning() -> Self {
+        Self::new(200)
+    }
+
+    /// Build a response for GetBucketVersioning.
+    pub fn get_bucket_versioning(state: u8) -> Self {
+        let body = xml::get_bucket_versioning_xml(state);
+        Self::new(200).xml_body(body)
     }
 
     /// Build a response for ListBuckets.
@@ -480,7 +503,7 @@ mod tests {
     fn put_object_response() {
         let result = PutObjectResult {
             etag: "\"abc123\"".to_string(),
-            version_id: "null".to_string(),
+            version_id: 0,
         };
         let resp = S3Response::put_object(&result);
         assert_eq!(resp.status_code, 200);
@@ -503,6 +526,7 @@ mod tests {
             etag: "\"etag\"".into(),
             size: 5,
             last_modified: 0,
+            version_id: 0,
         };
         let resp = S3Response::get_object(result);
         assert_eq!(resp.status_code, 200);
@@ -518,6 +542,7 @@ mod tests {
             etag: "\"etag\"".into(),
             size: 4,
             last_modified: 0,
+            version_id: 0,
         };
         let resp = S3Response::get_object(result);
         assert_eq!(
@@ -539,6 +564,7 @@ mod tests {
             etag: "\"e\"".into(),
             size: 0,
             last_modified: 0,
+            version_id: 0,
         };
         let resp = S3Response::get_object(result);
         assert_eq!(find_header(&resp, "x-amz-meta-author"), Some("alice"));
@@ -579,6 +605,7 @@ mod tests {
             etag: "\"e\"".into(),
             size: 0,
             last_modified: 0,
+            version_id: 0,
         };
         let resp = S3Response::get_object(result);
         assert_eq!(find_header(&resp, "Content-Type"), Some("text/html"));
@@ -609,6 +636,7 @@ mod tests {
             etag: "\"etag\"".into(),
             size: 1024,
             last_modified: 0,
+            version_id: 0,
         };
         let resp = S3Response::head_object(&result);
         assert_eq!(resp.status_code, 200);
@@ -625,6 +653,7 @@ mod tests {
             etag: "\"e\"".into(),
             size: 0,
             last_modified: 0,
+            version_id: 0,
         };
         let resp = S3Response::head_object(&result);
         assert_eq!(
@@ -651,6 +680,7 @@ mod tests {
             etag: "\"e\"".into(),
             size: 10,
             last_modified: 0,
+            version_id: 0,
         };
         let resp = S3Response::head_object(&result);
         assert_eq!(find_header(&resp, "Content-Encoding"), Some("br"));
@@ -669,6 +699,7 @@ mod tests {
             etag: "\"e\"".into(),
             size: 0,
             last_modified: 0,
+            version_id: 0,
         };
         let resp = S3Response::head_object(&result);
         assert_eq!(find_header(&resp, "x-amz-meta-tag"), Some("value"));
@@ -839,7 +870,8 @@ mod tests {
         let result = DeleteObjectsResult {
             deleted: vec![DeletedObject {
                 key: "key1".into(),
-                version_id: "null".into(),
+                version_id: 0,
+                delete_marker: false,
             }],
             errors: vec![],
         };

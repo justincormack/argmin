@@ -19,7 +19,8 @@ fn shard_and_metadata_roundtrip() {
     let req = PutObjectMetaReq {
         bucket: "test-bucket".to_string(),
         key: "my/object.txt".to_string(),
-        version_id: "null".to_string(),
+        version_id: 0,
+        status: 0,
         size: shard_data.len() as u64,
         total_size: 0,
         etag: ack.crc64.to_be_bytes().to_vec(),
@@ -112,7 +113,8 @@ fn full_lifecycle() {
     pg.put_object_meta(&PutObjectMetaReq {
         bucket: "my-bucket".to_string(),
         key: "greeting.txt".to_string(),
-        version_id: "null".to_string(),
+        version_id: 0,
+        status: 0,
         size: data.len() as u64,
         total_size: 0,
         etag: ack.crc64.to_be_bytes().to_vec(),
@@ -162,7 +164,8 @@ fn pg_store_persistence() {
             .put_object_meta(&PutObjectMetaReq {
                 bucket: "b".to_string(),
                 key: "k".to_string(),
-                version_id: "null".to_string(),
+                version_id: 0,
+        status: 0,
                 size: data.len() as u64,
                 total_size: 0,
                 etag: vec![1],

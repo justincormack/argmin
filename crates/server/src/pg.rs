@@ -8,6 +8,18 @@ pub fn derive_pg(bucket: &str, key: &str, pg_count: u32) -> u32 {
     (hash % pg_count as u64) as u32
 }
 
+/// Derive the PG ID for shard data placement.
+///
+/// Includes the version_id so different versions of the same key
+/// can have their shards distributed across different PGs.
+///
+/// pg_id = rapidhash(bucket + "/" + key + "/" + version_id) % pg_count
+pub fn derive_pg_shards(bucket: &str, key: &str, version_id: u64, pg_count: u32) -> u32 {
+    let full_key = format!("{}/{}/{}", bucket, key, version_id);
+    let hash = rapidhash::rapidhash(full_key.as_bytes());
+    (hash % pg_count as u64) as u32
+}
+
 /// Compute the 16-byte object key hash used in ShardKey construction.
 ///
 /// Uses SHA-256 truncated to 16 bytes for deterministic, well-distributed hashing.
@@ -55,6 +67,35 @@ mod tests {
         for count in &counts {
             assert!(*count > 0, "at least one PG got no objects: {:?}", counts);
         }
+    }
+
+    #[test]
+    fn derive_pg_shards_deterministic() {
+        let a = derive_pg_shards("mybucket", "mykey", 1, 16);
+        let b = derive_pg_shards("mybucket", "mykey", 1, 16);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn derive_pg_shards_within_range() {
+        for pg_count in [1, 4, 16, 256] {
+            for i in 0..100 {
+                let key = format!("key-{}", i);
+                let pg = derive_pg_shards("bucket", &key, i, pg_count);
+                assert!(pg < pg_count);
+            }
+        }
+    }
+
+    #[test]
+    fn derive_pg_shards_different_versions_may_differ() {
+        // Different versions of the same key can map to different PGs
+        let pg_count = 256;
+        let pg_v0 = derive_pg_shards("bucket", "key", 0, pg_count);
+        let pg_v1 = derive_pg_shards("bucket", "key", 1, pg_count);
+        let pg_v2 = derive_pg_shards("bucket", "key", 2, pg_count);
+        // At least some should differ with 256 PGs
+        assert!(pg_v0 != pg_v1 || pg_v1 != pg_v2, "all versions mapped to same PG");
     }
 
     #[test]

@@ -116,7 +116,7 @@ impl ShardStatus {
 pub struct ObjectRecord {
     pub bucket: String,
     pub key: String,
-    pub version_id: String,
+    pub version_id: u64,
     pub size: u64,
     /// Total stored size: metadata blob + user data, before EC padding.
     pub total_size: u64,
@@ -149,13 +149,15 @@ pub struct BucketInfo {
 pub struct PutObjectMetaReq {
     pub bucket: String,
     pub key: String,
-    pub version_id: String,
+    pub version_id: u64,
     pub size: u64,
     pub total_size: u64,
     pub etag: Vec<u8>,
     pub etag_kind: u8,
     pub ec_k: u8,
     pub ec_m: u8,
+    /// 0 = Live, 1 = DeleteMarker.
+    pub status: u8,
 }
 
 /// Request to list objects in a PG.
@@ -171,6 +173,23 @@ pub struct ListObjectsResp {
     pub objects: Vec<ObjectRecord>,
     pub is_truncated: bool,
     pub next_start_after: Option<String>,
+}
+
+/// Request to list all object versions in a PG.
+pub struct ListObjectVersionsReq {
+    pub bucket: String,
+    pub prefix: Option<String>,
+    pub key_marker: Option<String>,
+    pub version_id_marker: Option<u64>,
+    pub max_keys: u32,
+}
+
+/// Response from a list object versions query.
+pub struct ListObjectVersionsResp {
+    pub versions: Vec<ObjectRecord>,
+    pub is_truncated: bool,
+    pub next_key_marker: Option<String>,
+    pub next_version_id_marker: Option<u64>,
 }
 
 #[cfg(test)]

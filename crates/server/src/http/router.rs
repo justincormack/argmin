@@ -16,6 +16,8 @@ pub enum S3Operation {
     HeadObject { bucket: String, key: String },
     DeleteObjects { bucket: String },
     ListObjectVersions { bucket: String },
+    PutBucketVersioning { bucket: String },
+    GetBucketVersioning { bucket: String },
 }
 
 /// Validate an S3 bucket name per AWS rules.
@@ -129,6 +131,11 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
 
     match (method, decoded_key) {
         // Bucket-level operations (no key)
+        ("PUT", None) if has_query_key(query, "versioning") => {
+            Ok(S3Operation::PutBucketVersioning {
+                bucket: bucket.to_string(),
+            })
+        }
         ("PUT", None) => Ok(S3Operation::CreateBucket {
             bucket: bucket.to_string(),
         }),
@@ -139,6 +146,12 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
             bucket: bucket.to_string(),
         }),
         ("GET", None) => {
+            // Check for ?versioning → GetBucketVersioning
+            if has_query_key(query, "versioning") {
+                return Ok(S3Operation::GetBucketVersioning {
+                    bucket: bucket.to_string(),
+                });
+            }
             // Check for ?versions → ListObjectVersions
             if has_query_key(query, "versions") {
                 return Ok(S3Operation::ListObjectVersions {
@@ -478,6 +491,37 @@ mod tests {
         assert_eq!(
             route("GET", "/mybucket", "versions&prefix=foo&max-keys=10").unwrap(),
             S3Operation::ListObjectVersions {
+                bucket: "mybucket".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn put_bucket_versioning() {
+        assert_eq!(
+            route("PUT", "/mybucket", "versioning").unwrap(),
+            S3Operation::PutBucketVersioning {
+                bucket: "mybucket".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn get_bucket_versioning() {
+        assert_eq!(
+            route("GET", "/mybucket", "versioning").unwrap(),
+            S3Operation::GetBucketVersioning {
+                bucket: "mybucket".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn put_bucket_versioning_takes_priority_over_create() {
+        // PUT /bucket?versioning should be PutBucketVersioning, not CreateBucket
+        assert_eq!(
+            route("PUT", "/mybucket", "versioning").unwrap(),
+            S3Operation::PutBucketVersioning {
                 bucket: "mybucket".to_string()
             }
         );

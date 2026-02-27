@@ -331,29 +331,59 @@ impl ShardStore for PgStore {
 impl PgMetadataStore for PgStore {
     fn put_object_meta(&self, req: &PutObjectMetaReq) -> Result<(), MetadataError> {
         let now = PgStore::now_millis();
-        self.conn
-            .execute(
-                "INSERT OR REPLACE INTO objects \
-                 (bucket, key, version_id, size, total_size, etag, etag_kind, last_modified, \
-                  storage_class, ec_k, ec_m, status) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, 0)",
-                params![
-                    req.bucket,
-                    req.key,
-                    req.version_id,
-                    req.size as i64,
-                    req.total_size as i64,
-                    req.etag,
-                    req.etag_kind,
-                    now as i64,
-                    req.ec_k,
-                    req.ec_m,
-                ],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "put object meta",
-                source: e,
-            })?;
+        if req.version_id == 0 {
+            // Unversioned: INSERT OR REPLACE (overwrite null version)
+            self.conn
+                .execute(
+                    "INSERT OR REPLACE INTO objects \
+                     (bucket, key, version_id, size, total_size, etag, etag_kind, last_modified, \
+                      storage_class, ec_k, ec_m, status) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11)",
+                    params![
+                        req.bucket,
+                        req.key,
+                        req.version_id as i64,
+                        req.size as i64,
+                        req.total_size as i64,
+                        req.etag,
+                        req.etag_kind,
+                        now as i64,
+                        req.ec_k,
+                        req.ec_m,
+                        req.status,
+                    ],
+                )
+                .map_err(|e| MetadataError::Db {
+                    context: "put object meta",
+                    source: e,
+                })?;
+        } else {
+            // Versioned: INSERT only (new version)
+            self.conn
+                .execute(
+                    "INSERT INTO objects \
+                     (bucket, key, version_id, size, total_size, etag, etag_kind, last_modified, \
+                      storage_class, ec_k, ec_m, status) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11)",
+                    params![
+                        req.bucket,
+                        req.key,
+                        req.version_id as i64,
+                        req.size as i64,
+                        req.total_size as i64,
+                        req.etag,
+                        req.etag_kind,
+                        now as i64,
+                        req.ec_k,
+                        req.ec_m,
+                        req.status,
+                    ],
+                )
+                .map_err(|e| MetadataError::Db {
+                    context: "put object meta (versioned)",
+                    source: e,
+                })?;
+        }
         Ok(())
     }
 
@@ -362,13 +392,14 @@ impl PgMetadataStore for PgStore {
             .query_row(
                 "SELECT bucket, key, version_id, size, total_size, etag, etag_kind, \
                  last_modified, storage_class, ec_k, ec_m, status \
-                 FROM objects WHERE bucket = ?1 AND key = ?2 AND status = 0",
+                 FROM objects WHERE bucket = ?1 AND key = ?2 \
+                 ORDER BY version_id DESC LIMIT 1",
                 params![bucket, key],
                 |row| {
                     Ok(ObjectRecord {
                         bucket: row.get(0)?,
                         key: row.get(1)?,
-                        version_id: row.get(2)?,
+                        version_id: row.get::<_, i64>(2)? as u64,
                         size: row.get::<_, i64>(3)? as u64,
                         total_size: row.get::<_, i64>(4)? as u64,
                         etag: row.get(5)?,
@@ -389,6 +420,43 @@ impl PgMetadataStore for PgStore {
             .ok_or(MetadataError::ObjectNotFound)
     }
 
+    fn get_object_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: u64,
+    ) -> Result<ObjectRecord, MetadataError> {
+        self.conn
+            .query_row(
+                "SELECT bucket, key, version_id, size, total_size, etag, etag_kind, \
+                 last_modified, storage_class, ec_k, ec_m, status \
+                 FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
+                params![bucket, key, version_id as i64],
+                |row| {
+                    Ok(ObjectRecord {
+                        bucket: row.get(0)?,
+                        key: row.get(1)?,
+                        version_id: row.get::<_, i64>(2)? as u64,
+                        size: row.get::<_, i64>(3)? as u64,
+                        total_size: row.get::<_, i64>(4)? as u64,
+                        etag: row.get(5)?,
+                        etag_kind: row.get::<_, u8>(6)?,
+                        last_modified: row.get::<_, i64>(7)? as u64,
+                        storage_class: row.get::<_, u8>(8)?,
+                        ec_k: row.get::<_, u8>(9)?,
+                        ec_m: row.get::<_, u8>(10)?,
+                        status: row.get::<_, u8>(11)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| MetadataError::Db {
+                context: "get object version",
+                source: e,
+            })?
+            .ok_or(MetadataError::ObjectNotFound)
+    }
+
     fn delete_object_meta(&self, bucket: &str, key: &str) -> Result<(), MetadataError> {
         self.conn
             .execute(
@@ -402,109 +470,70 @@ impl PgMetadataStore for PgStore {
         Ok(())
     }
 
+    fn delete_object_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: u64,
+    ) -> Result<(), MetadataError> {
+        self.conn
+            .execute(
+                "DELETE FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
+                params![bucket, key, version_id as i64],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "delete object version",
+                source: e,
+            })?;
+        Ok(())
+    }
+
     fn list_objects(&self, req: &ListObjectsReq) -> Result<ListObjectsResp, MetadataError> {
-        // Fetch one extra row to determine truncation.
+        // Use a CTE to find the latest version per key, then filter to live objects.
+        // This correctly handles versioned buckets where delete markers hide keys.
         let limit = req.max_keys as i64 + 1;
 
-        let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) =
-            match (&req.prefix, &req.start_after) {
-                (Some(prefix), Some(start_after)) => {
-                    // Prefix match: key >= start_after AND key LIKE 'prefix%'
-                    // Use key > start_after for ListObjectsV2 semantics.
-                    let end = prefix_end(prefix);
-                    match end {
-                        Some(end) => (
-                            "SELECT bucket, key, version_id, size, total_size, etag, etag_kind, \
-                             last_modified, storage_class, ec_k, ec_m, status \
-                             FROM objects \
-                             WHERE bucket = ?1 AND key > ?2 AND key >= ?3 AND key < ?4 \
-                             AND status = 0 \
-                             ORDER BY key ASC LIMIT ?5"
-                                .to_string(),
-                            vec![
-                                Box::new(req.bucket.clone()),
-                                Box::new(start_after.clone()),
-                                Box::new(prefix.clone()),
-                                Box::new(end),
-                                Box::new(limit),
-                            ],
-                        ),
-                        None => (
-                            "SELECT bucket, key, version_id, size, total_size, etag, etag_kind, \
-                             last_modified, storage_class, ec_k, ec_m, status \
-                             FROM objects \
-                             WHERE bucket = ?1 AND key > ?2 AND key >= ?3 \
-                             AND status = 0 \
-                             ORDER BY key ASC LIMIT ?4"
-                                .to_string(),
-                            vec![
-                                Box::new(req.bucket.clone()),
-                                Box::new(start_after.clone()),
-                                Box::new(prefix.clone()),
-                                Box::new(limit),
-                            ],
-                        ),
-                    }
-                }
-                (Some(prefix), None) => {
-                    let end = prefix_end(prefix);
-                    match end {
-                        Some(end) => (
-                            "SELECT bucket, key, version_id, size, total_size, etag, etag_kind, \
-                             last_modified, storage_class, ec_k, ec_m, status \
-                             FROM objects \
-                             WHERE bucket = ?1 AND key >= ?2 AND key < ?3 \
-                             AND status = 0 \
-                             ORDER BY key ASC LIMIT ?4"
-                                .to_string(),
-                            vec![
-                                Box::new(req.bucket.clone()),
-                                Box::new(prefix.clone()),
-                                Box::new(end),
-                                Box::new(limit),
-                            ],
-                        ),
-                        None => (
-                            "SELECT bucket, key, version_id, size, total_size, etag, etag_kind, \
-                             last_modified, storage_class, ec_k, ec_m, status \
-                             FROM objects \
-                             WHERE bucket = ?1 AND key >= ?2 \
-                             AND status = 0 \
-                             ORDER BY key ASC LIMIT ?3"
-                                .to_string(),
-                            vec![
-                                Box::new(req.bucket.clone()),
-                                Box::new(prefix.clone()),
-                                Box::new(limit),
-                            ],
-                        ),
-                    }
-                }
-                (None, Some(start_after)) => (
-                    "SELECT bucket, key, version_id, size, total_size, etag, etag_kind, \
-                     last_modified, storage_class, ec_k, ec_m, status \
-                     FROM objects \
-                     WHERE bucket = ?1 AND key > ?2 \
-                     AND status = 0 \
-                     ORDER BY key ASC LIMIT ?3"
-                        .to_string(),
-                    vec![
-                        Box::new(req.bucket.clone()),
-                        Box::new(start_after.clone()),
-                        Box::new(limit),
-                    ],
-                ),
-                (None, None) => (
-                    "SELECT bucket, key, version_id, size, total_size, etag, etag_kind, \
-                     last_modified, storage_class, ec_k, ec_m, status \
-                     FROM objects \
-                     WHERE bucket = ?1 \
-                     AND status = 0 \
-                     ORDER BY key ASC LIMIT ?2"
-                        .to_string(),
-                    vec![Box::new(req.bucket.clone()), Box::new(limit)],
-                ),
-            };
+        // Build WHERE clause fragments for key filtering
+        let mut where_clauses = vec!["o.bucket = ?1".to_string()];
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> =
+            vec![Box::new(req.bucket.clone())];
+        let mut param_idx = 2;
+
+        if let Some(ref start_after) = req.start_after {
+            where_clauses.push(format!("o.key > ?{param_idx}"));
+            params_vec.push(Box::new(start_after.clone()));
+            param_idx += 1;
+        }
+
+        if let Some(ref prefix) = req.prefix {
+            where_clauses.push(format!("o.key >= ?{param_idx}"));
+            params_vec.push(Box::new(prefix.clone()));
+            param_idx += 1;
+
+            if let Some(end) = prefix_end(prefix) {
+                where_clauses.push(format!("o.key < ?{param_idx}"));
+                params_vec.push(Box::new(end));
+                param_idx += 1;
+            }
+        }
+
+        let where_str = where_clauses.join(" AND ");
+
+        let sql = format!(
+            "WITH latest AS ( \
+                SELECT bucket, key, MAX(version_id) AS max_vid \
+                FROM objects \
+                WHERE bucket = ?1 \
+                GROUP BY bucket, key \
+            ) \
+            SELECT o.bucket, o.key, o.version_id, o.size, o.total_size, o.etag, o.etag_kind, \
+                   o.last_modified, o.storage_class, o.ec_k, o.ec_m, o.status \
+            FROM objects o \
+            INNER JOIN latest l ON o.bucket = l.bucket AND o.key = l.key AND o.version_id = l.max_vid \
+            WHERE {where_str} AND o.status = 0 \
+            ORDER BY o.key ASC LIMIT ?{param_idx}"
+        );
+        params_vec.push(Box::new(limit));
 
         let params_refs: Vec<&dyn rusqlite::types::ToSql> =
             params_vec.iter().map(|p| p.as_ref()).collect();
@@ -518,7 +547,7 @@ impl PgMetadataStore for PgStore {
                 Ok(ObjectRecord {
                     bucket: row.get(0)?,
                     key: row.get(1)?,
-                    version_id: row.get(2)?,
+                    version_id: row.get::<_, i64>(2)? as u64,
                     size: row.get::<_, i64>(3)? as u64,
                     total_size: row.get::<_, i64>(4)? as u64,
                     etag: row.get(5)?,
@@ -559,6 +588,136 @@ impl PgMetadataStore for PgStore {
             is_truncated,
             next_start_after,
         })
+    }
+
+    fn list_object_versions(
+        &self,
+        req: &ListObjectVersionsReq,
+    ) -> Result<ListObjectVersionsResp, MetadataError> {
+        let limit = req.max_keys as i64 + 1;
+
+        let mut where_clauses = vec!["bucket = ?1".to_string()];
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> =
+            vec![Box::new(req.bucket.clone())];
+        let mut param_idx = 2;
+
+        if let Some(ref key_marker) = req.key_marker {
+            if let Some(vid_marker) = req.version_id_marker {
+                // Resume after (key_marker, vid_marker)
+                where_clauses.push(format!(
+                    "(key > ?{} OR (key = ?{} AND version_id < ?{}))",
+                    param_idx,
+                    param_idx,
+                    param_idx + 1
+                ));
+                params_vec.push(Box::new(key_marker.clone()));
+                params_vec.push(Box::new(vid_marker as i64));
+                param_idx += 2;
+            } else {
+                where_clauses.push(format!("key > ?{param_idx}"));
+                params_vec.push(Box::new(key_marker.clone()));
+                param_idx += 1;
+            }
+        }
+
+        if let Some(ref prefix) = req.prefix {
+            where_clauses.push(format!("key >= ?{param_idx}"));
+            params_vec.push(Box::new(prefix.clone()));
+            param_idx += 1;
+
+            if let Some(end) = prefix_end(prefix) {
+                where_clauses.push(format!("key < ?{param_idx}"));
+                params_vec.push(Box::new(end));
+                param_idx += 1;
+            }
+        }
+
+        let where_str = where_clauses.join(" AND ");
+
+        let sql = format!(
+            "SELECT bucket, key, version_id, size, total_size, etag, etag_kind, \
+             last_modified, storage_class, ec_k, ec_m, status \
+             FROM objects \
+             WHERE {where_str} \
+             ORDER BY key ASC, version_id DESC LIMIT ?{param_idx}"
+        );
+        params_vec.push(Box::new(limit));
+
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = self.conn.prepare(&sql).map_err(|e| MetadataError::Db {
+            context: "prepare list object versions",
+            source: e,
+        })?;
+
+        let rows = stmt
+            .query_map(params_refs.as_slice(), |row| {
+                Ok(ObjectRecord {
+                    bucket: row.get(0)?,
+                    key: row.get(1)?,
+                    version_id: row.get::<_, i64>(2)? as u64,
+                    size: row.get::<_, i64>(3)? as u64,
+                    total_size: row.get::<_, i64>(4)? as u64,
+                    etag: row.get(5)?,
+                    etag_kind: row.get::<_, u8>(6)?,
+                    last_modified: row.get::<_, i64>(7)? as u64,
+                    storage_class: row.get::<_, u8>(8)?,
+                    ec_k: row.get::<_, u8>(9)?,
+                    ec_m: row.get::<_, u8>(10)?,
+                    status: row.get::<_, u8>(11)?,
+                })
+            })
+            .map_err(|e| MetadataError::Db {
+                context: "list object versions query",
+                source: e,
+            })?;
+
+        let mut versions: Vec<ObjectRecord> = Vec::new();
+        for row in rows {
+            versions.push(row.map_err(|e| MetadataError::Db {
+                context: "list object versions row",
+                source: e,
+            })?);
+        }
+
+        let is_truncated = versions.len() as i64 > req.max_keys as i64;
+        if is_truncated {
+            versions.truncate(req.max_keys as usize);
+        }
+
+        let (next_key_marker, next_version_id_marker) = if is_truncated {
+            versions
+                .last()
+                .map(|o| (Some(o.key.clone()), Some(o.version_id)))
+                .unwrap_or((None, None))
+        } else {
+            (None, None)
+        };
+
+        Ok(ListObjectVersionsResp {
+            versions,
+            is_truncated,
+            next_key_marker,
+            next_version_id_marker,
+        })
+    }
+
+    fn next_version_id(&self, bucket: &str, key: &str) -> Result<u64, MetadataError> {
+        let max: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT MAX(version_id) FROM objects WHERE bucket = ?1 AND key = ?2",
+                params![bucket, key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| MetadataError::Db {
+                context: "next version id",
+                source: e,
+            })?
+            .flatten();
+
+        Ok(max.map(|v| v as u64 + 1).unwrap_or(1))
     }
 }
 
@@ -647,7 +806,8 @@ mod tests {
                 .put_object_meta(&PutObjectMetaReq {
                     bucket: "bucket".into(),
                     key: key.to_string(),
-                    version_id: "null".into(),
+                    version_id: 0,
+                    status: 0,
                     size: 10,
                     total_size: 0,
                     etag: vec![0; 8],
@@ -734,7 +894,8 @@ mod tests {
                 .put_object_meta(&PutObjectMetaReq {
                     bucket: "b".into(),
                     key: format!("key-{:02}", i),
-                    version_id: "null".into(),
+                    version_id: 0,
+                    status: 0,
                     size: 0,
                     total_size: 0,
                     etag: vec![0; 8],

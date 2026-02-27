@@ -44,6 +44,9 @@ pub enum MetadataError {
     #[error("object not found")]
     ObjectNotFound,
 
+    #[error("invalid versioning transition from {from} to {to}")]
+    InvalidVersioningTransition { from: u8, to: u8 },
+
     #[error("database error: {context}: {source}")]
     Db {
         context: &'static str,

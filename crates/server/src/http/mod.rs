@@ -236,6 +236,15 @@ impl HttpFrontend {
                 let result = self.coordinator.delete_objects(&bucket, &entries, &cond)?;
                 Ok(S3Response::delete_objects(&result, quiet))
             }
+            S3Operation::PutBucketVersioning { bucket } => {
+                let versioning_state = xml::parse_versioning_config_xml(&req.body)?;
+                self.coordinator.put_bucket_versioning(&bucket, versioning_state)?;
+                Ok(S3Response::put_bucket_versioning())
+            }
+            S3Operation::GetBucketVersioning { bucket } => {
+                let state = self.coordinator.get_bucket_versioning(&bucket)?;
+                Ok(S3Response::get_bucket_versioning(state))
+            }
             S3Operation::ListObjectVersions { bucket } => {
                 let prefix = req.query_param("prefix");
                 let key_marker = req.query_param("key-marker");
