@@ -98,5 +98,11 @@ async fn main() {
         config.region
     );
 
-    server::http::serve::serve(listener, frontends, config.max_connections).await;
+    server::http::serve::serve(
+        listener,
+        frontends,
+        config.max_connections,
+        server::http::serve::ServeConfig::default(),
+    )
+    .await;
 }

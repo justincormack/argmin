@@ -20,28 +20,37 @@ use super::s3_response_to_hyper;
 use super::HttpFrontend;
 use crate::error::ServerError;
 
-/// Time allowed for a client to send request headers. Also serves as the
-/// idle timeout between keep-alive requests — after sending a response,
-/// hyper waits this long for the next request's headers before closing.
-/// Protects against slowloris attacks and idle connections pinning permits.
-const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Tunable timeouts for the HTTP serve layer.
+pub struct ServeConfig {
+    /// Time allowed for a client to send request headers. Also serves as the
+    /// idle timeout between keep-alive requests.
+    pub header_read_timeout: Duration,
+    /// Time a request will wait for a processing slot before being shed with
+    /// 503 SlowDown.
+    pub request_wait_timeout: Duration,
+    /// Per-frame idle timeout for body reads. Resets on every chunk so
+    /// slow-but-steady uploads complete; only truly stalled connections are
+    /// killed.
+    pub body_idle_timeout: Duration,
+}
 
-/// Time a request will wait for a processing slot before being shed with
-/// 503 SlowDown. Keeps overload latency deterministic.
-const REQUEST_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+impl Default for ServeConfig {
+    fn default() -> Self {
+        Self {
+            header_read_timeout: Duration::from_secs(30),
+            request_wait_timeout: Duration::from_secs(5),
+            body_idle_timeout: Duration::from_secs(30),
+        }
+    }
+}
 
-/// Idle timeout for body reads: if no new data frame arrives within this
-/// window the connection is considered stalled. Unlike a hard total timeout,
-/// this resets on every chunk so legitimate slow-but-steady uploads complete
-/// successfully regardless of total transfer time. Only truly idle
-/// connections are killed, freeing the request permit they hold.
-const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Shared server state: frontend pool, round-robin counter, and request semaphore.
+/// Shared server state: frontend pool, round-robin counter, request semaphore,
+/// and timeout configuration.
 struct ServerState {
     pool: Vec<Mutex<HttpFrontend>>,
     counter: AtomicUsize,
     request_semaphore: Semaphore,
+    config: ServeConfig,
 }
 
 /// Run the HTTP server, accepting connections and dispatching to the frontend pool.
@@ -54,14 +63,21 @@ struct ServerState {
 /// Connection-level timeouts prevent idle/slow clients from pinning slots.
 /// Requests that cannot acquire a processing slot within REQUEST_WAIT_TIMEOUT
 /// are shed with 503 SlowDown.
-pub async fn serve(listener: TcpListener, frontends: Vec<HttpFrontend>, max_connections: u32) {
+pub async fn serve(
+    listener: TcpListener,
+    frontends: Vec<HttpFrontend>,
+    max_connections: u32,
+    config: ServeConfig,
+) {
     assert!(!frontends.is_empty(), "at least one frontend required");
     let pool_size = frontends.len();
 
+    let header_read_timeout = config.header_read_timeout;
     let state = Arc::new(ServerState {
         pool: frontends.into_iter().map(Mutex::new).collect(),
         counter: AtomicUsize::new(0),
         request_semaphore: Semaphore::new(pool_size),
+        config,
     });
 
     let conn_semaphore = Arc::new(Semaphore::new(max_connections as usize));
@@ -97,7 +113,7 @@ pub async fn serve(listener: TcpListener, frontends: Vec<HttpFrontend>, max_conn
             // permit without killing active transfers.
             let _ = http1::Builder::new()
                 .timer(TokioTimer::new())
-                .header_read_timeout(HEADER_READ_TIMEOUT)
+                .header_read_timeout(header_read_timeout)
                 .serve_connection(
                     io,
                     service_fn(move |req: Request<Incoming>| {
@@ -137,21 +153,25 @@ async fn handle(
     // If all workers are busy, shed load with 503 after a brief wait.
     // The permit is held in this async function (not moved into spawn_blocking)
     // and released when the function returns.
-    let _req_permit =
-        match tokio::time::timeout(REQUEST_WAIT_TIMEOUT, state.request_semaphore.acquire()).await {
-            Ok(Ok(permit)) => permit,
-            _ => {
-                let resp = S3Response::error(&ServerError::SlowDown, "");
-                return Ok(s3_response_to_hyper(resp));
-            }
-        };
+    let _req_permit = match tokio::time::timeout(
+        state.config.request_wait_timeout,
+        state.request_semaphore.acquire(),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => permit,
+        _ => {
+            let resp = S3Response::error(&ServerError::SlowDown, "");
+            return Ok(s3_response_to_hyper(resp));
+        }
+    };
 
     let (parts, body) = req.into_parts();
 
     // Collect body with size limit and per-frame idle timeout.
     // The idle timeout resets on every data frame, so slow-but-steady uploads
     // complete successfully; only truly stalled connections are killed.
-    let body_bytes = match collect_body(body).await {
+    let body_bytes = match collect_body(body, state.config.body_idle_timeout).await {
         Ok(bytes) => bytes,
         Err(err) => {
             return Ok(s3_response_to_hyper(S3Response::error(&err, "")));
@@ -205,12 +225,12 @@ async fn handle(
 /// Each call to `frame()` is individually wrapped in a timeout that resets on
 /// every chunk. A client sending data steadily (even slowly) will never be
 /// timed out; only truly stalled connections are killed.
-async fn collect_body(body: Incoming) -> Result<Bytes, ServerError> {
+async fn collect_body(body: Incoming, idle_timeout: Duration) -> Result<Bytes, ServerError> {
     let mut limited = Limited::new(body, MAX_BODY_SIZE);
     let mut data = Vec::new();
 
     loop {
-        match tokio::time::timeout(BODY_IDLE_TIMEOUT, limited.frame()).await {
+        match tokio::time::timeout(idle_timeout, limited.frame()).await {
             // Got a data/trailers frame
             Ok(Some(Ok(frame))) => {
                 if let Some(chunk) = frame.data_ref() {

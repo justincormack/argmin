@@ -78,7 +78,12 @@ impl TestServer {
             .collect();
 
         // Spawn the server as a background task
-        let server_task = tokio::spawn(server::http::serve::serve(listener, frontends, 64));
+        let server_task = tokio::spawn(server::http::serve::serve(
+            listener,
+            frontends,
+            64,
+            server::http::serve::ServeConfig::default(),
+        ));
 
         TestServer {
             endpoint,

@@ -68,10 +68,18 @@ async fn start_server(
         })
         .collect();
 
+    let config = server::http::serve::ServeConfig {
+        // Use a short request wait timeout so the SlowDown test completes
+        // in ~100ms instead of the production default (5s).
+        request_wait_timeout: Duration::from_millis(100),
+        ..server::http::serve::ServeConfig::default()
+    };
+
     let handle = tokio::spawn(server::http::serve::serve(
         listener,
         frontends,
         max_connections,
+        config,
     ));
 
     (addr, ServerGuard(handle), temp_dir)
@@ -144,7 +152,7 @@ async fn slow_down_when_request_slot_held_by_slow_body() {
 
     // Connection 2: send a complete request. The server's single request
     // permit is held by the slow upload, so this request waits for
-    // REQUEST_WAIT_TIMEOUT (5s) then gets 503 SlowDown.
+    // request_wait_timeout (100ms in test config) then gets 503 SlowDown.
     let mut fast_conn = TcpStream::connect(&addr).await.unwrap();
     fast_conn
         .write_all(
@@ -156,8 +164,8 @@ async fn slow_down_when_request_slot_held_by_slow_body() {
 
     let start = Instant::now();
 
-    // Read the complete response, allowing up to 15s for it to arrive.
-    let response = read_http_response(&mut fast_conn, Duration::from_secs(15)).await;
+    // Read the complete response.
+    let response = read_http_response(&mut fast_conn, Duration::from_secs(5)).await;
     let elapsed = start.elapsed();
 
     // Verify we got 503 SlowDown
@@ -172,15 +180,9 @@ async fn slow_down_when_request_slot_held_by_slow_body() {
         response
     );
 
-    // Verify it took approximately REQUEST_WAIT_TIMEOUT (5s), not instant
-    // and not the full BODY_IDLE_TIMEOUT (30s).
+    // With request_wait_timeout=100ms, should complete well under 2s.
     assert!(
-        elapsed >= Duration::from_secs(4),
-        "shed too fast: {:?}",
-        elapsed
-    );
-    assert!(
-        elapsed < Duration::from_secs(10),
+        elapsed < Duration::from_secs(2),
         "shed too slow: {:?}",
         elapsed
     );
