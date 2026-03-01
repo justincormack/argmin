@@ -557,8 +557,11 @@ impl HttpFrontend {
     }
 
     fn send_response(&self, request: tiny_http::Request, resp: S3Response) {
-        let mut response =
-            Response::from_data(resp.body).with_status_code(StatusCode(resp.status_code));
+        // S3 clients expect Content-Length-framed payloads for regular object APIs.
+        // Disable tiny_http's default chunked transfer for large responses.
+        let mut response = Response::from_data(resp.body)
+            .with_status_code(StatusCode(resp.status_code))
+            .with_chunked_threshold(usize::MAX);
 
         for (name, value) in &resp.headers {
             if let Ok(header) = Header::from_bytes(name.as_bytes(), value.as_bytes()) {

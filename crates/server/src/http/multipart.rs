@@ -274,7 +274,7 @@ mod tests {
     #[test]
     fn parse_simple_form() {
         let boundary = "----WebKitBoundary";
-        let body = format!(
+        let body =
             "------WebKitBoundary\r\n\
              Content-Disposition: form-data; name=\"key\"\r\n\
              \r\n\
@@ -285,7 +285,7 @@ mod tests {
              \r\n\
              hello world\r\n\
              ------WebKitBoundary--\r\n"
-        );
+                .to_string();
         let result = parse_multipart(body.as_bytes(), boundary).unwrap();
         assert_eq!(result.fields.len(), 1);
         assert_eq!(result.fields[0].0, "key");
@@ -297,7 +297,7 @@ mod tests {
     #[test]
     fn parse_multiple_fields() {
         let boundary = "boundary";
-        let body = format!(
+        let body =
             "--boundary\r\n\
              Content-Disposition: form-data; name=\"key\"\r\n\
              \r\n\
@@ -315,7 +315,7 @@ mod tests {
              \r\n\
              bar\r\n\
              --boundary--\r\n"
-        );
+                .to_string();
         let result = parse_multipart(body.as_bytes(), boundary).unwrap();
         assert_eq!(result.fields.len(), 3);
         assert_eq!(result.field("key"), Some("foo.txt"));
