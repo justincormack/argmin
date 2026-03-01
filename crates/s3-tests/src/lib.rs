@@ -70,7 +70,7 @@ impl TestContext {
             }
         } else {
             // Local server mode
-            let server = TestServer::start();
+            let server = TestServer::start().await;
             let client = build_client(
                 server.endpoint(),
                 server::TEST_ACCESS_KEY,

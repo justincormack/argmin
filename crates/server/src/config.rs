@@ -10,6 +10,8 @@ pub struct ServerConfig {
     pub access_key_id: String,
     pub secret_access_key: String,
     pub region: String,
+    pub workers: u32,
+    pub max_connections: u32,
 }
 
 impl ServerConfig {
@@ -23,6 +25,8 @@ impl ServerConfig {
     ///   ARGMIN_EC_K (4)
     ///   ARGMIN_EC_M (2)
     ///   ARGMIN_REGION (us-east-1)
+    ///   ARGMIN_WORKERS (4)
+    ///   ARGMIN_MAX_CONNECTIONS (512)
     pub fn from_env() -> Result<Self, String> {
         Self::from_lookup(|key| std::env::var(key).ok())
     }
@@ -50,9 +54,23 @@ impl ServerConfig {
             .parse()
             .map_err(|e| format!("invalid ARGMIN_EC_M: {}", e))?;
         let region = get("ARGMIN_REGION").unwrap_or_else(|| "us-east-1".to_string());
+        let workers: u32 = get("ARGMIN_WORKERS")
+            .unwrap_or_else(|| "4".to_string())
+            .parse()
+            .map_err(|e| format!("invalid ARGMIN_WORKERS: {}", e))?;
+        let max_connections: u32 = get("ARGMIN_MAX_CONNECTIONS")
+            .unwrap_or_else(|| "512".to_string())
+            .parse()
+            .map_err(|e| format!("invalid ARGMIN_MAX_CONNECTIONS: {}", e))?;
 
         if pg_count == 0 {
             return Err("ARGMIN_PG_COUNT must be > 0".to_string());
+        }
+        if workers == 0 {
+            return Err("ARGMIN_WORKERS must be > 0".to_string());
+        }
+        if max_connections == 0 {
+            return Err("ARGMIN_MAX_CONNECTIONS must be > 0".to_string());
         }
 
         Ok(Self {
@@ -64,6 +82,8 @@ impl ServerConfig {
             access_key_id,
             secret_access_key,
             region,
+            workers,
+            max_connections,
         })
     }
 }
@@ -117,6 +137,8 @@ mod tests {
         assert_eq!(cfg.ec_k, 4);
         assert_eq!(cfg.ec_m, 2);
         assert_eq!(cfg.region, "us-east-1");
+        assert_eq!(cfg.workers, 4);
+        assert_eq!(cfg.max_connections, 512);
         assert_eq!(cfg.access_key_id, "AKID");
         assert_eq!(cfg.secret_access_key, "SECRET");
     }
@@ -140,8 +162,42 @@ mod tests {
         assert_eq!(cfg.ec_k, 8);
         assert_eq!(cfg.ec_m, 4);
         assert_eq!(cfg.region, "eu-west-1");
+        assert_eq!(cfg.workers, 4); // not overridden, uses default
         assert_eq!(cfg.access_key_id, "mykey");
         assert_eq!(cfg.secret_access_key, "mysecret");
+    }
+
+    #[test]
+    fn custom_workers() {
+        let cfg = ServerConfig::from_lookup(make_env(&[
+            ("ARGMIN_ACCESS_KEY_ID", "a"),
+            ("ARGMIN_SECRET_ACCESS_KEY", "s"),
+            ("ARGMIN_WORKERS", "8"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.workers, 8);
+    }
+
+    #[test]
+    fn workers_zero() {
+        let err = ServerConfig::from_lookup(make_env(&[
+            ("ARGMIN_ACCESS_KEY_ID", "a"),
+            ("ARGMIN_SECRET_ACCESS_KEY", "s"),
+            ("ARGMIN_WORKERS", "0"),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("ARGMIN_WORKERS must be > 0"));
+    }
+
+    #[test]
+    fn invalid_workers() {
+        let err = ServerConfig::from_lookup(make_env(&[
+            ("ARGMIN_ACCESS_KEY_ID", "a"),
+            ("ARGMIN_SECRET_ACCESS_KEY", "s"),
+            ("ARGMIN_WORKERS", "abc"),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("ARGMIN_WORKERS"));
     }
 
     #[test]
@@ -186,5 +242,38 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(err.contains("ARGMIN_EC_M"));
+    }
+
+    #[test]
+    fn custom_max_connections() {
+        let cfg = ServerConfig::from_lookup(make_env(&[
+            ("ARGMIN_ACCESS_KEY_ID", "a"),
+            ("ARGMIN_SECRET_ACCESS_KEY", "s"),
+            ("ARGMIN_MAX_CONNECTIONS", "1024"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.max_connections, 1024);
+    }
+
+    #[test]
+    fn max_connections_zero() {
+        let err = ServerConfig::from_lookup(make_env(&[
+            ("ARGMIN_ACCESS_KEY_ID", "a"),
+            ("ARGMIN_SECRET_ACCESS_KEY", "s"),
+            ("ARGMIN_MAX_CONNECTIONS", "0"),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("ARGMIN_MAX_CONNECTIONS must be > 0"));
+    }
+
+    #[test]
+    fn invalid_max_connections() {
+        let err = ServerConfig::from_lookup(make_env(&[
+            ("ARGMIN_ACCESS_KEY_ID", "a"),
+            ("ARGMIN_SECRET_ACCESS_KEY", "s"),
+            ("ARGMIN_MAX_CONNECTIONS", "not_a_number"),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("ARGMIN_MAX_CONNECTIONS"));
     }
 }

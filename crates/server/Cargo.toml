@@ -16,7 +16,12 @@ base64 = "0.22"
 rapidhash = "1"
 ring = "0.17"
 thiserror = "2"
-tiny_http = "0.12"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+http = "1"
+bytes = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "time"] }
 
 [dev-dependencies]
 tempfile = "3"

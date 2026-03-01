@@ -19,8 +19,5 @@ aws-credential-types = "1"
 # Async runtime (required by AWS SDK)
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
-# HTTP server (same as server crate)
-tiny_http = "0.12"
-
 # Test infrastructure
 tempfile = "3"

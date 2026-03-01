@@ -1,11 +1,9 @@
-/// Parse tiny_http::Request into structured S3 request data.
-use std::io::Read;
-
+/// Parse HTTP requests into structured S3 request data.
 use crate::error::ServerError;
 
 /// Maximum request body size (256 MB + headroom for metadata blob).
-/// Checked before reading the body to prevent OOM.
-const MAX_BODY_SIZE: usize = 256 * 1024 * 1024 + 64 * 1024;
+/// Used by the serve layer for body size limiting.
+pub(crate) const MAX_BODY_SIZE: usize = 256 * 1024 * 1024 + 64 * 1024;
 
 /// Validate a Content-Length header value. Rejects negative and non-numeric values.
 fn validate_content_length(value: &str) -> Result<u64, ServerError> {
@@ -26,72 +24,40 @@ pub struct S3Request {
 }
 
 impl S3Request {
-    /// Parse a tiny_http::Request into an S3Request.
+    /// Parse hyper request parts and collected body into an S3Request.
     ///
-    /// Checks Content-Length before reading the body to prevent OOM.
-    /// Returns an error if the body exceeds the size limit or cannot be read.
-    pub fn from_http(request: &mut tiny_http::Request) -> Result<Self, ServerError> {
-        let method = request.method().as_str().to_string();
-        let url = request.url().to_string();
-
-        // Split URL into path and query
-        let (path, query_string) = match url.find('?') {
-            Some(pos) => (url[..pos].to_string(), url[pos + 1..].to_string()),
-            None => (url, String::new()),
-        };
+    /// Body size limiting is done by the caller (serve layer) via `http_body_util::Limited`.
+    pub fn from_hyper(
+        parts: &http::request::Parts,
+        body: bytes::Bytes,
+    ) -> Result<Self, ServerError> {
+        let method = parts.method.as_str().to_string();
+        let path = parts.uri.path().to_string();
+        let query_string = parts.uri.query().unwrap_or("").to_string();
 
         // Extract headers as lowercase name/value pairs
-        let headers: Vec<(String, String)> = request
-            .headers()
-            .iter()
-            .map(|h| {
-                (
-                    h.field.as_str().as_str().to_ascii_lowercase(),
-                    h.value.as_str().to_string(),
-                )
-            })
-            .collect();
+        let mut headers = Vec::with_capacity(parts.headers.len());
+        for (name, value) in &parts.headers {
+            let val_str = value.to_str().map_err(|_| ServerError::InvalidRequest {
+                reason: format!("non-ASCII header value for {}", name),
+            })?;
+            headers.push((name.as_str().to_string(), val_str.to_string()));
+        }
 
         // Validate Content-Length header if present (reject negative/non-numeric)
         if let Some((_, cl_value)) = headers.iter().find(|(k, _)| k == "content-length") {
             validate_content_length(cl_value)?;
         }
 
-        // Check Content-Length before reading body
-        let content_length = request.body_length().unwrap_or(0);
-        if content_length > MAX_BODY_SIZE {
-            return Err(ServerError::ObjectTooLarge {
-                size: content_length as u64,
-                max: MAX_BODY_SIZE as u64,
-            });
-        }
+        let body = body.to_vec();
 
-        // Read body with bounded size
-        let mut body = Vec::with_capacity(content_length);
-        let mut reader = request.as_reader().take(MAX_BODY_SIZE as u64 + 1);
-        if reader.read_to_end(&mut body).is_err() {
-            return Err(ServerError::InvalidRequest {
-                reason: "failed to read request body".to_string(),
-            });
-        }
-
-        // Double-check actual bytes read (handles chunked transfer without Content-Length)
-        if body.len() > MAX_BODY_SIZE {
-            return Err(ServerError::ObjectTooLarge {
-                size: body.len() as u64,
-                max: MAX_BODY_SIZE as u64,
-            });
-        }
-
-        let s3req = S3Request {
+        Ok(S3Request {
             method,
             path,
             query_string,
             headers,
             body,
-        };
-
-        Ok(s3req)
+        })
     }
 
     /// Get a header value by lowercase name.

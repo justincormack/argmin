@@ -55,6 +55,9 @@ pub enum ServerError {
 
     #[error("not modified")]
     NotModified { etag: String, last_modified: u64 },
+
+    #[error("please reduce your request rate")]
+    SlowDown,
 }
 
 impl ServerError {
@@ -80,6 +83,7 @@ impl ServerError {
             Self::ObjectTooLarge { .. } => "EntityTooLarge",
             Self::MethodNotAllowed => "MethodNotAllowed",
             Self::InvalidRange { .. } => "InvalidRange",
+            Self::SlowDown => "SlowDown",
             Self::Store(_) => "InternalError",
             Self::Metadata(_) => "InternalError",
             Self::Ec(_) => "InternalError",
@@ -103,6 +107,7 @@ impl ServerError {
             Self::InvalidRange { .. } => 416,
             Self::PreconditionFailed => 412,
             Self::NotModified { .. } => 304,
+            Self::SlowDown => 503,
             _ => 500,
         }
     }
@@ -361,6 +366,16 @@ mod tests {
     fn from_ec_error() {
         let err: ServerError = ec::EcError::InvalidConfig { reason: "x" }.into();
         assert!(matches!(err, ServerError::Ec(_)));
+    }
+
+    #[test]
+    fn s3_error_code_slow_down() {
+        assert_eq!(ServerError::SlowDown.s3_error_code(), "SlowDown");
+    }
+
+    #[test]
+    fn http_status_503() {
+        assert_eq!(ServerError::SlowDown.http_status(), 503);
     }
 
     #[test]

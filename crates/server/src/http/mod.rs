@@ -3,12 +3,14 @@ pub mod multipart;
 pub mod request;
 pub mod response;
 pub mod router;
+pub mod serve;
 pub mod xml;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use auth::{authenticate_request, AuthContext, AuthMode, CredentialStore};
-use tiny_http::{Header, Response, StatusCode};
+use bytes::Bytes;
+use http_body_util::Full;
 
 use crate::authz::{can_read_bucket, can_write_bucket, ResourceVisibility};
 use crate::conditional::{
@@ -40,46 +42,31 @@ pub struct HttpFrontend {
 }
 
 impl HttpFrontend {
-    /// Handle a single HTTP request.
-    pub fn handle_request(&self, request: tiny_http::Request) {
-        let mut request = request;
-        let s3req = match S3Request::from_http(&mut request) {
-            Ok(req) => req,
-            Err(err) => {
-                let resp = S3Response::error(&err, "");
-                self.send_response(request, resp);
-                return;
-            }
-        };
-        let auth = self.authenticate(&s3req);
+    /// Handle a parsed S3 request: authenticate, dispatch, and return the response.
+    ///
+    /// The caller (serve layer) is responsible for parsing the HTTP request into
+    /// an S3Request and converting the S3Response back to an HTTP response.
+    pub fn handle_s3_request(&self, s3req: &S3Request) -> S3Response {
+        let auth = self.authenticate(s3req);
         let result = match auth {
-            Ok(auth) => self.dispatch(&s3req, &auth),
+            Ok(auth) => self.dispatch(s3req, &auth),
             Err(err) => Err(err),
         };
 
         match result {
-            Ok(resp) => self.send_response(request, resp),
+            Ok(resp) => resp,
             Err(ServerError::NotModified {
                 ref etag,
                 last_modified,
-            }) => {
-                let resp = S3Response::not_modified(etag, last_modified);
-                self.send_response(request, resp);
-            }
-            Err(ServerError::PreconditionFailed) => {
-                let resp = S3Response::precondition_failed();
-                self.send_response(request, resp);
-            }
+            }) => S3Response::not_modified(etag, last_modified),
+            Err(ServerError::PreconditionFailed) => S3Response::precondition_failed(),
             Err(ref err @ ServerError::DeleteMarkerHit { .. }) => {
                 let mut resp = S3Response::error(err, &s3req.path);
                 resp.headers
                     .push(("x-amz-delete-marker".to_string(), "true".to_string()));
-                self.send_response(request, resp);
+                resp
             }
-            Err(err) => {
-                let resp = S3Response::error(&err, &s3req.path);
-                self.send_response(request, resp);
-            }
+            Err(err) => S3Response::error(&err, &s3req.path),
         }
     }
 
@@ -549,22 +536,17 @@ impl HttpFrontend {
             success_status,
         ))
     }
+}
 
-    fn send_response(&self, request: tiny_http::Request, resp: S3Response) {
-        // S3 clients expect Content-Length-framed payloads for regular object APIs.
-        // Disable tiny_http's default chunked transfer for large responses.
-        let mut response = Response::from_data(resp.body)
-            .with_status_code(StatusCode(resp.status_code))
-            .with_chunked_threshold(usize::MAX);
-
-        for (name, value) in &resp.headers {
-            if let Ok(header) = Header::from_bytes(name.as_bytes(), value.as_bytes()) {
-                response.add_header(header);
-            }
-        }
-
-        let _ = request.respond(response);
+/// Convert an S3Response into a hyper-compatible HTTP response.
+pub fn s3_response_to_hyper(resp: S3Response) -> http::Response<Full<Bytes>> {
+    let mut builder = http::Response::builder().status(resp.status_code);
+    for (name, value) in &resp.headers {
+        builder = builder.header(name.as_str(), value.as_str());
     }
+    builder
+        .body(Full::new(Bytes::from(resp.body)))
+        .expect("response builder should not fail")
 }
 
 fn parse_max_keys(raw: Option<String>) -> Result<u32, ServerError> {
