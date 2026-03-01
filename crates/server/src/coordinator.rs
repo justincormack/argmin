@@ -262,10 +262,7 @@ impl Coordinator {
                 }
                 storage::MetadataError::InvalidVersioningTransition { from, to } => {
                     ServerError::InvalidRequest {
-                        reason: format!(
-                            "invalid versioning transition from {} to {}",
-                            from, to
-                        ),
+                        reason: format!("invalid versioning transition from {} to {}", from, to),
                     }
                 }
                 other => ServerError::Metadata(other),
@@ -477,19 +474,23 @@ impl Coordinator {
         // 3. Read source data from shard PG
         let src_okh = object_key_hash(src_bucket, src_key);
         let version_id = src_record.version_id;
-        let src_shard_pg_id =
-            derive_pg_shards(src_bucket, src_key, version_id, self.pg_count);
+        let src_shard_pg_id = derive_pg_shards(src_bucket, src_key, version_id, self.pg_count);
         let src_shard_pg = self.storage_node.get_pg(src_shard_pg_id)?;
         let total = src_record.total_size as usize;
         let data = self
-            .read_range(src_shard_pg, &src_okh, version_id, &src_record, 0, total - 1)
+            .read_range(
+                src_shard_pg,
+                &src_okh,
+                version_id,
+                &src_record,
+                0,
+                total - 1,
+            )
             .map_err(|e| match e {
-                ServerError::Store(storage::StoreError::NotFound) => {
-                    ServerError::ObjectNotFound {
-                        bucket: src_bucket.to_string(),
-                        key: src_key.to_string(),
-                    }
-                }
+                ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
+                    bucket: src_bucket.to_string(),
+                    key: src_key.to_string(),
+                },
                 other => other,
             })?;
 
@@ -532,8 +533,13 @@ impl Coordinator {
         };
 
         // 8. Write destination object
-        let put_result =
-            self.write_object_inner(dst_bucket, dst_key, &metadata_blob, &user_data, dst_version_id)?;
+        let put_result = self.write_object_inner(
+            dst_bucket,
+            dst_key,
+            &metadata_blob,
+            &user_data,
+            dst_version_id,
+        )?;
 
         // 9. Read back dest metadata to get the authoritative last_modified
         let dst_pg_id = derive_pg(dst_bucket, dst_key, self.pg_count);
@@ -782,12 +788,10 @@ impl Coordinator {
         let data = self
             .read_range(shard_pg, &okh, version_id, &record, 0, total - 1)
             .map_err(|e| match e {
-                ServerError::Store(storage::StoreError::NotFound) => {
-                    ServerError::ObjectNotFound {
-                        bucket: bucket.to_string(),
-                        key: key.to_string(),
-                    }
-                }
+                ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                },
                 other => other,
             })?;
 
@@ -853,12 +857,10 @@ impl Coordinator {
         let data = self
             .read_range(shard_pg, &okh, version_id, &record, 0, metadata_size - 1)
             .map_err(|e| match e {
-                ServerError::Store(storage::StoreError::NotFound) => {
-                    ServerError::ObjectNotFound {
-                        bucket: bucket.to_string(),
-                        key: key.to_string(),
-                    }
-                }
+                ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                },
                 other => other,
             })?;
 
@@ -931,12 +933,10 @@ impl Coordinator {
         let meta_data = self
             .read_range(shard_pg, &okh, version_id, &record, 0, metadata_size - 1)
             .map_err(|e| match e {
-                ServerError::Store(storage::StoreError::NotFound) => {
-                    ServerError::ObjectNotFound {
-                        bucket: bucket.to_string(),
-                        key: key.to_string(),
-                    }
-                }
+                ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                },
                 other => other,
             })?;
         let (metadata, _) = MetadataBlob::deserialize(&meta_data)?;
@@ -947,12 +947,10 @@ impl Coordinator {
         let user_data = self
             .read_range(shard_pg, &okh, version_id, &record, blob_start, blob_end)
             .map_err(|e| match e {
-                ServerError::Store(storage::StoreError::NotFound) => {
-                    ServerError::ObjectNotFound {
-                        bucket: bucket.to_string(),
-                        key: key.to_string(),
-                    }
-                }
+                ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                },
                 other => other,
             })?;
 
@@ -1330,7 +1328,11 @@ impl Coordinator {
 
         for entry in entries {
             let vid = entry.version_id.as_deref().and_then(|v| {
-                if v == "null" { Some(0) } else { v.parse::<u64>().ok() }
+                if v == "null" {
+                    Some(0)
+                } else {
+                    v.parse::<u64>().ok()
+                }
             });
             match self.delete_object(bucket, &entry.key, vid, cond) {
                 Ok(result) => {
@@ -1486,7 +1488,9 @@ mod tests {
             .unwrap();
         assert!(!result.etag.is_empty());
 
-        let obj = coord.get_object("bucket", "hello.txt", None, NO_READ).unwrap();
+        let obj = coord
+            .get_object("bucket", "hello.txt", None, NO_READ)
+            .unwrap();
         assert_eq!(obj.data, b"Hello, world!");
         assert_eq!(obj.size, 13);
         assert_eq!(obj.metadata.get("content-type"), Some("text/plain"));
@@ -1577,9 +1581,13 @@ mod tests {
         coord
             .put_object("bucket", "key", b"data", &[], NO_WRITE)
             .unwrap();
-        coord.delete_object("bucket", "key", None, NO_DELETE).unwrap();
+        coord
+            .delete_object("bucket", "key", None, NO_DELETE)
+            .unwrap();
 
-        let err = coord.get_object("bucket", "key", None, NO_READ).unwrap_err();
+        let err = coord
+            .get_object("bucket", "key", None, NO_READ)
+            .unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
     }
 
@@ -1681,7 +1689,9 @@ mod tests {
             .put_object("bucket", "folder/", b"data", &[], NO_WRITE)
             .unwrap();
 
-        let obj = coord.get_object("bucket", "folder/", None, NO_READ).unwrap();
+        let obj = coord
+            .get_object("bucket", "folder/", None, NO_READ)
+            .unwrap();
         assert_eq!(obj.data, b"data");
         assert_eq!(obj.size, 4);
     }
@@ -1762,7 +1772,9 @@ mod tests {
         delete_shard_on_disk(tmp.path(), "bucket", "resilient", 0, 4);
 
         // Get should still succeed via EC reconstruction
-        let obj = coord.get_object("bucket", "resilient", None, NO_READ).unwrap();
+        let obj = coord
+            .get_object("bucket", "resilient", None, NO_READ)
+            .unwrap();
         assert_eq!(obj.data, data);
     }
 
@@ -1820,7 +1832,9 @@ mod tests {
         delete_shard_on_disk(tmp.path(), "bucket", "obj3", 1, 4);
         delete_shard_on_disk(tmp.path(), "bucket", "obj3", 2, 4);
 
-        let err = coord.get_object("bucket", "obj3", None, NO_READ).unwrap_err();
+        let err = coord
+            .get_object("bucket", "obj3", None, NO_READ)
+            .unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
     }
 
@@ -1859,7 +1873,10 @@ mod tests {
         // Range get should still succeed via EC reconstruction
         let result = coord
             .get_object_range(
-                "bucket", "obj5", None, ByteRange::Range { start: 0, end: 4 },
+                "bucket",
+                "obj5",
+                None,
+                ByteRange::Range { start: 0, end: 4 },
                 NO_READ,
             )
             .unwrap();
@@ -2489,7 +2506,10 @@ mod tests {
         // bytes=0-4 → "Hello"
         let result = coord
             .get_object_range(
-                "bucket", "key", None, ByteRange::Range { start: 0, end: 4 },
+                "bucket",
+                "key",
+                None,
+                ByteRange::Range { start: 0, end: 4 },
                 NO_READ,
             )
             .unwrap();
@@ -2511,7 +2531,13 @@ mod tests {
 
         // bytes=-6 → "World!"  (last 6 bytes)
         let result = coord
-            .get_object_range("bucket", "key", None, ByteRange::Suffix { length: 6 }, NO_READ)
+            .get_object_range(
+                "bucket",
+                "key",
+                None,
+                ByteRange::Suffix { length: 6 },
+                NO_READ,
+            )
             .unwrap();
         assert_eq!(result.data, b"World!");
         assert_eq!(result.range_start, 7);
@@ -2530,7 +2556,13 @@ mod tests {
 
         // bytes=7- → "World!"
         let result = coord
-            .get_object_range("bucket", "key", None, ByteRange::FromStart { start: 7 }, NO_READ)
+            .get_object_range(
+                "bucket",
+                "key",
+                None,
+                ByteRange::FromStart { start: 7 },
+                NO_READ,
+            )
             .unwrap();
         assert_eq!(result.data, b"World!");
     }
@@ -2548,7 +2580,11 @@ mod tests {
         // bytes=100- → unsatisfiable
         let err = coord
             .get_object_range(
-                "bucket", "key", None, ByteRange::FromStart { start: 100 }, NO_READ,
+                "bucket",
+                "key",
+                None,
+                ByteRange::FromStart { start: 100 },
+                NO_READ,
             )
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidRange { total_size: 5 }));
@@ -2567,8 +2603,12 @@ mod tests {
         // bytes=0-99999 on 5-byte object → clamp to 0-4
         let result = coord
             .get_object_range(
-                "bucket", "key", None, ByteRange::Range {
-                    start: 0, end: 99999,
+                "bucket",
+                "key",
+                None,
+                ByteRange::Range {
+                    start: 0,
+                    end: 99999,
                 },
                 NO_READ,
             )
@@ -2757,7 +2797,9 @@ mod tests {
         let cond = DeleteCondition {
             if_match: Some("\"0000000000000000\"".to_string()),
         };
-        let err = coord.delete_object("bucket", "key", None, &cond).unwrap_err();
+        let err = coord
+            .delete_object("bucket", "key", None, &cond)
+            .unwrap_err();
         assert!(matches!(err, ServerError::PreconditionFailed));
     }
 
@@ -2810,7 +2852,10 @@ mod tests {
         };
         let result = coord
             .get_object_range(
-                "bucket", "key", None, ByteRange::Range { start: 0, end: 4 },
+                "bucket",
+                "key",
+                None,
+                ByteRange::Range { start: 0, end: 4 },
                 &cond,
             )
             .unwrap();
@@ -3117,12 +3162,16 @@ mod tests {
             )
             .unwrap();
 
-        let obj = coord.get_object("dst-bucket", "key", None, NO_READ).unwrap();
+        let obj = coord
+            .get_object("dst-bucket", "key", None, NO_READ)
+            .unwrap();
         assert_eq!(obj.data, b"cross bucket data");
         assert_eq!(obj.metadata.get("content-type"), Some("text/plain"));
 
         // Source should still exist
-        let src = coord.get_object("src-bucket", "key", None, NO_READ).unwrap();
+        let src = coord
+            .get_object("src-bucket", "key", None, NO_READ)
+            .unwrap();
         assert_eq!(src.data, b"cross bucket data");
     }
 
@@ -3238,7 +3287,9 @@ mod tests {
         coord
             .put_object("bucket", "key", b"data", &[], NO_WRITE)
             .unwrap();
-        let result = coord.delete_object("bucket", "key", None, NO_DELETE).unwrap();
+        let result = coord
+            .delete_object("bucket", "key", None, NO_DELETE)
+            .unwrap();
         assert_eq!(result.version_id, 0);
         assert!(!result.delete_marker);
     }

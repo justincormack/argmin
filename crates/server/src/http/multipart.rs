@@ -130,9 +130,10 @@ fn parse_part(
     let body = &part[header_end + 4..];
 
     // Parse Content-Disposition to get name and optional filename
-    let header_str = std::str::from_utf8(header_bytes).map_err(|_| ServerError::InvalidRequest {
-        reason: "invalid UTF-8 in multipart headers".to_string(),
-    })?;
+    let header_str =
+        std::str::from_utf8(header_bytes).map_err(|_| ServerError::InvalidRequest {
+            reason: "invalid UTF-8 in multipart headers".to_string(),
+        })?;
 
     let (name, fname) = parse_content_disposition(header_str)?;
 
@@ -141,10 +142,9 @@ fn parse_part(
         *file_data = body.to_vec();
         *file_name = fname;
     } else {
-        let value =
-            std::str::from_utf8(body).map_err(|_| ServerError::InvalidRequest {
-                reason: format!("invalid UTF-8 in form field '{name}'"),
-            })?;
+        let value = std::str::from_utf8(body).map_err(|_| ServerError::InvalidRequest {
+            reason: format!("invalid UTF-8 in form field '{name}'"),
+        })?;
         fields.push((name, value.to_string()));
     }
 
@@ -193,9 +193,7 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || needle.len() > haystack.len() {
         return None;
     }
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 impl PostFormData {
@@ -265,17 +263,13 @@ mod tests {
 
     #[test]
     fn extract_boundary_wrong_type() {
-        assert_eq!(
-            extract_boundary("text/plain; boundary=abc"),
-            None
-        );
+        assert_eq!(extract_boundary("text/plain; boundary=abc"), None);
     }
 
     #[test]
     fn parse_simple_form() {
         let boundary = "----WebKitBoundary";
-        let body =
-            "------WebKitBoundary\r\n\
+        let body = "------WebKitBoundary\r\n\
              Content-Disposition: form-data; name=\"key\"\r\n\
              \r\n\
              test.txt\r\n\
@@ -285,7 +279,7 @@ mod tests {
              \r\n\
              hello world\r\n\
              ------WebKitBoundary--\r\n"
-                .to_string();
+            .to_string();
         let result = parse_multipart(body.as_bytes(), boundary).unwrap();
         assert_eq!(result.fields.len(), 1);
         assert_eq!(result.fields[0].0, "key");
@@ -297,8 +291,7 @@ mod tests {
     #[test]
     fn parse_multiple_fields() {
         let boundary = "boundary";
-        let body =
-            "--boundary\r\n\
+        let body = "--boundary\r\n\
              Content-Disposition: form-data; name=\"key\"\r\n\
              \r\n\
              foo.txt\r\n\
@@ -315,7 +308,7 @@ mod tests {
              \r\n\
              bar\r\n\
              --boundary--\r\n"
-                .to_string();
+            .to_string();
         let result = parse_multipart(body.as_bytes(), boundary).unwrap();
         assert_eq!(result.fields.len(), 3);
         assert_eq!(result.field("key"), Some("foo.txt"));

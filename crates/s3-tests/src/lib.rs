@@ -12,9 +12,8 @@ use aws_sdk_s3::Client;
 ///
 /// All tests must use `RT.block_on(async { ... })` rather than `#[tokio::test]`
 /// to ensure the AWS SDK client's connection pool stays on a single runtime.
-pub static RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
-    tokio::runtime::Runtime::new().expect("create tokio runtime")
-});
+pub static RT: LazyLock<tokio::runtime::Runtime> =
+    LazyLock::new(|| tokio::runtime::Runtime::new().expect("create tokio runtime"));
 
 /// Shared test context for all tests in a binary.
 ///
@@ -61,8 +60,8 @@ impl TestContext {
                 .expect("S3_TEST_ACCESS_KEY required with S3_TEST_ENDPOINT");
             let secret_key = std::env::var("S3_TEST_SECRET_KEY")
                 .expect("S3_TEST_SECRET_KEY required with S3_TEST_ENDPOINT");
-            let region = std::env::var("S3_TEST_REGION")
-                .unwrap_or_else(|_| "us-east-1".to_string());
+            let region =
+                std::env::var("S3_TEST_REGION").unwrap_or_else(|_| "us-east-1".to_string());
 
             let client = build_client(&endpoint, &access_key, &secret_key, &region).await;
             TestContext {
@@ -92,18 +91,11 @@ impl TestContext {
     }
 }
 
-async fn build_client(
-    endpoint: &str,
-    access_key: &str,
-    secret_key: &str,
-    region: &str,
-) -> Client {
+async fn build_client(endpoint: &str, access_key: &str, secret_key: &str, region: &str) -> Client {
     use std::time::Duration;
 
     let creds = aws_credential_types::Credentials::new(
-        access_key,
-        secret_key,
-        None, // session token
+        access_key, secret_key, None, // session token
         None, // expiry
         "s3-tests",
     );

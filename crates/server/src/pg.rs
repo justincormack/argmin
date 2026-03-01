@@ -95,7 +95,10 @@ mod tests {
         let pg_v1 = derive_pg_shards("bucket", "key", 1, pg_count);
         let pg_v2 = derive_pg_shards("bucket", "key", 2, pg_count);
         // At least some should differ with 256 PGs
-        assert!(pg_v0 != pg_v1 || pg_v1 != pg_v2, "all versions mapped to same PG");
+        assert!(
+            pg_v0 != pg_v1 || pg_v1 != pg_v2,
+            "all versions mapped to same PG"
+        );
     }
 
     #[test]

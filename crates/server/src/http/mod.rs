@@ -25,7 +25,11 @@ use router::{route, S3Operation};
 /// Parse versionId query parameter from an S3 request.
 fn parse_version_id(req: &S3Request) -> Option<u64> {
     req.query_param("versionId").and_then(|v| {
-        if v == "null" { Some(0) } else { v.parse::<u64>().ok() }
+        if v == "null" {
+            Some(0)
+        } else {
+            v.parse::<u64>().ok()
+        }
     })
 }
 
@@ -275,7 +279,8 @@ impl HttpFrontend {
             S3Operation::PutBucketVersioning { bucket } => {
                 self.authorize_bucket_write(auth, &bucket)?;
                 let versioning_state = xml::parse_versioning_config_xml(&req.body)?;
-                self.coordinator.put_bucket_versioning(&bucket, versioning_state)?;
+                self.coordinator
+                    .put_bucket_versioning(&bucket, versioning_state)?;
                 Ok(S3Response::put_bucket_versioning())
             }
             S3Operation::GetBucketVersioning { bucket } => {
@@ -283,9 +288,7 @@ impl HttpFrontend {
                 let state = self.coordinator.get_bucket_versioning(&bucket)?;
                 Ok(S3Response::get_bucket_versioning(state))
             }
-            S3Operation::PostObject { bucket } => {
-                self.handle_post_object(req, auth, &bucket)
-            }
+            S3Operation::PostObject { bucket } => self.handle_post_object(req, auth, &bucket),
             S3Operation::ListObjectVersions { bucket } => {
                 self.authorize_bucket_read(auth, &bucket)?;
                 let prefix = req.query_param("prefix");
@@ -349,11 +352,9 @@ impl HttpFrontend {
         // Enforce ±15 minute time skew on x-amz-date to prevent replay attacks.
         // Reject malformed timestamps — skipping the check would weaken replay protection.
         if req.header("x-amz-date").is_some() {
-            let request_epoch = auth
-                .request_epoch_secs
-                .ok_or(ServerError::InvalidRequest {
-                    reason: "malformed x-amz-date timestamp".to_string(),
-                })?;
+            let request_epoch = auth.request_epoch_secs.ok_or(ServerError::InvalidRequest {
+                reason: "malformed x-amz-date timestamp".to_string(),
+            })?;
             let skew = now.abs_diff(request_epoch);
             if skew > 15 * 60 {
                 return Err(ServerError::Auth(auth::AuthError::RequestExpired));
@@ -396,11 +397,7 @@ impl HttpFrontend {
         }
     }
 
-    fn authorize_bucket_write(
-        &self,
-        auth: &AuthContext,
-        bucket: &str,
-    ) -> Result<(), ServerError> {
+    fn authorize_bucket_write(&self, auth: &AuthContext, bucket: &str) -> Result<(), ServerError> {
         let info = self.coordinator.head_bucket(bucket)?;
         if can_write_bucket(auth, &info.owner_principal) {
             Ok(())
@@ -416,17 +413,16 @@ impl HttpFrontend {
         bucket: &str,
     ) -> Result<S3Response, ServerError> {
         // Extract multipart boundary from Content-Type
-        let content_type = req.header("content-type").ok_or_else(|| {
+        let content_type =
+            req.header("content-type")
+                .ok_or_else(|| ServerError::InvalidRequest {
+                    reason: "POST Object requires Content-Type: multipart/form-data".to_string(),
+                })?;
+        let boundary = multipart::extract_boundary(content_type).ok_or_else(|| {
             ServerError::InvalidRequest {
-                reason: "POST Object requires Content-Type: multipart/form-data".to_string(),
+                reason: "POST Object requires multipart/form-data with boundary".to_string(),
             }
         })?;
-        let boundary =
-            multipart::extract_boundary(content_type).ok_or_else(|| {
-                ServerError::InvalidRequest {
-                    reason: "POST Object requires multipart/form-data with boundary".to_string(),
-                }
-            })?;
 
         // Parse the multipart form
         let form = multipart::parse_multipart(&req.body, boundary)?;
@@ -465,29 +461,23 @@ impl HttpFrontend {
                 .collect();
             field_pairs.push(("key", &key));
 
-            auth::validate_post_policy(
-                policy_b64,
-                &field_pairs,
-                form.file_data.len(),
-                bucket,
-                now,
-            )
-            .map_err(|e| match &e {
-                // Structural/format errors → 400
-                auth::PostPolicyError::Malformed(_) => ServerError::InvalidRequest {
-                    reason: e.to_string(),
-                },
-                // Content-length-range violations → 400
-                auth::PostPolicyError::ConditionFailed("content-length-range") => {
-                    ServerError::InvalidRequest {
+            auth::validate_post_policy(policy_b64, &field_pairs, form.file_data.len(), bucket, now)
+                .map_err(|e| match &e {
+                    // Structural/format errors → 400
+                    auth::PostPolicyError::Malformed(_) => ServerError::InvalidRequest {
                         reason: e.to_string(),
+                    },
+                    // Content-length-range violations → 400
+                    auth::PostPolicyError::ConditionFailed("content-length-range") => {
+                        ServerError::InvalidRequest {
+                            reason: e.to_string(),
+                        }
                     }
-                }
-                // Other condition failures and expiration → 403
-                auth::PostPolicyError::Expired | auth::PostPolicyError::ConditionFailed(_) => {
-                    ServerError::Auth(auth::AuthError::AccessDenied)
-                }
-            })?;
+                    // Other condition failures and expiration → 403
+                    auth::PostPolicyError::Expired | auth::PostPolicyError::ConditionFailed(_) => {
+                        ServerError::Auth(auth::AuthError::AccessDenied)
+                    }
+                })?;
         }
 
         // Use POST auth context if authenticated, otherwise fall back to header auth
@@ -504,8 +494,7 @@ impl HttpFrontend {
         if let Some(checksum_b64) = form.field("x-amz-checksum-sha256") {
             use base64::Engine;
             let digest = ring::digest::digest(&ring::digest::SHA256, &form.file_data);
-            let actual_b64 =
-                base64::engine::general_purpose::STANDARD.encode(digest.as_ref());
+            let actual_b64 = base64::engine::general_purpose::STANDARD.encode(digest.as_ref());
             if checksum_b64 != actual_b64 {
                 return Err(ServerError::InvalidRequest {
                     reason: "checksum mismatch".to_string(),
@@ -543,9 +532,9 @@ impl HttpFrontend {
 
         // Call put_object (same as PUT)
         let cond = crate::conditional::WriteCondition::default();
-        let result =
-            self.coordinator
-                .put_object(bucket, &key, &form.file_data, &hp_refs, &cond)?;
+        let result = self
+            .coordinator
+            .put_object(bucket, &key, &form.file_data, &hp_refs, &cond)?;
 
         // Build response based on success_action_status
         let success_status = form
@@ -553,7 +542,12 @@ impl HttpFrontend {
             .and_then(|s| s.parse::<u16>().ok())
             .unwrap_or(204);
 
-        Ok(S3Response::post_object(&result, bucket, &key, success_status))
+        Ok(S3Response::post_object(
+            &result,
+            bucket,
+            &key,
+            success_status,
+        ))
     }
 
     fn send_response(&self, request: tiny_http::Request, resp: S3Response) {
@@ -594,7 +588,8 @@ fn apply_response_overrides(resp: &mut S3Response, req: &S3Request) {
     ];
     for &(param, header_name) in overrides {
         if let Some(value) = req.query_param(param) {
-            resp.headers.retain(|(k, _)| !k.eq_ignore_ascii_case(header_name));
+            resp.headers
+                .retain(|(k, _)| !k.eq_ignore_ascii_case(header_name));
             resp.headers.push((header_name.to_string(), value));
         }
     }

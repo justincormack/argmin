@@ -92,8 +92,15 @@ fn authenticate_header(
         Some(hash) => hash.to_string(),
         None => sha256_hex(body),
     };
-    let access_key_id =
-        verify_request(method, path, query_string, headers, &body_hash, &parsed, store)?;
+    let access_key_id = verify_request(
+        method,
+        path,
+        query_string,
+        headers,
+        &body_hash,
+        &parsed,
+        store,
+    )?;
     let record = store
         .get_record(&access_key_id)
         .ok_or(AuthError::UnknownAccessKey)?;
@@ -124,22 +131,20 @@ fn authenticate_presigned(
     expected_service: &str,
     now_epoch_secs: u64,
 ) -> Result<AuthContext, AuthError> {
-    let algorithm = query_param(query_string, "X-Amz-Algorithm").ok_or(
-        AuthError::MissingQueryParam {
+    let algorithm =
+        query_param(query_string, "X-Amz-Algorithm").ok_or(AuthError::MissingQueryParam {
             param: "X-Amz-Algorithm",
-        },
-    )?;
+        })?;
     if algorithm != "AWS4-HMAC-SHA256" {
         return Err(AuthError::InvalidQueryParam {
             param: "X-Amz-Algorithm",
         });
     }
 
-    let credential_raw = query_param(query_string, "X-Amz-Credential").ok_or(
-        AuthError::MissingQueryParam {
+    let credential_raw =
+        query_param(query_string, "X-Amz-Credential").ok_or(AuthError::MissingQueryParam {
             param: "X-Amz-Credential",
-        },
-    )?;
+        })?;
     let credential = parse_credential_scope(&credential_raw)?;
     if !expected_region.is_empty() && credential.region != expected_region {
         return Err(AuthError::InvalidQueryParam {
@@ -152,11 +157,10 @@ fn authenticate_presigned(
         });
     }
 
-    let signed_headers_raw = query_param(query_string, "X-Amz-SignedHeaders").ok_or(
-        AuthError::MissingQueryParam {
+    let signed_headers_raw =
+        query_param(query_string, "X-Amz-SignedHeaders").ok_or(AuthError::MissingQueryParam {
             param: "X-Amz-SignedHeaders",
-        },
-    )?;
+        })?;
     let signed_headers: Vec<String> = signed_headers_raw
         .split(';')
         .filter(|s| !s.is_empty())
@@ -168,15 +172,13 @@ fn authenticate_presigned(
         });
     }
 
-    let request_date = query_param(query_string, "X-Amz-Date").ok_or(
-        AuthError::MissingQueryParam {
-            param: "X-Amz-Date",
-        },
-    )?;
-    let request_epoch =
-        parse_amz_date(&request_date).ok_or(AuthError::InvalidQueryParam {
+    let request_date =
+        query_param(query_string, "X-Amz-Date").ok_or(AuthError::MissingQueryParam {
             param: "X-Amz-Date",
         })?;
+    let request_epoch = parse_amz_date(&request_date).ok_or(AuthError::InvalidQueryParam {
+        param: "X-Amz-Date",
+    })?;
 
     let expires = query_param(query_string, "X-Amz-Expires")
         .ok_or(AuthError::MissingQueryParam {
@@ -195,11 +197,10 @@ fn authenticate_presigned(
         return Err(AuthError::RequestExpired);
     }
 
-    let signature = query_param(query_string, "X-Amz-Signature").ok_or(
-        AuthError::MissingQueryParam {
+    let signature =
+        query_param(query_string, "X-Amz-Signature").ok_or(AuthError::MissingQueryParam {
             param: "X-Amz-Signature",
-        },
-    )?;
+        })?;
 
     let record = store
         .get_record(&credential.access_key_id)
@@ -214,8 +215,7 @@ fn authenticate_presigned(
     let signed_header_pairs = collect_signed_headers(&signed_headers, headers)?;
     let canonical_hdrs = canonical_headers(&signed_header_pairs);
     let signed_headers_joined = signed_headers.join(";");
-    let canonical_qs =
-        canonical_query_string(&query_without_signature(query_string));
+    let canonical_qs = canonical_query_string(&query_without_signature(query_string));
     let body_hash = match header_value(headers, "x-amz-content-sha256") {
         Some("UNSIGNED-PAYLOAD") => "UNSIGNED-PAYLOAD".to_string(),
         Some(hash) => hash.to_string(),
@@ -331,18 +331,15 @@ fn validate_record_token_and_expiry(
 }
 
 fn query_param(query: &str, name: &str) -> Option<String> {
-    query
-        .split('&')
-        .filter(|s| !s.is_empty())
-        .find_map(|pair| {
-            let mut parts = pair.splitn(2, '=');
-            let key = parts.next()?;
-            if key != name {
-                return None;
-            }
-            let val = parts.next().unwrap_or("");
-            Some(percent_decode(val))
-        })
+    query.split('&').filter(|s| !s.is_empty()).find_map(|pair| {
+        let mut parts = pair.splitn(2, '=');
+        let key = parts.next()?;
+        if key != name {
+            return None;
+        }
+        let val = parts.next().unwrap_or("");
+        Some(percent_decode(val))
+    })
 }
 
 fn query_without_signature(query: &str) -> String {
@@ -392,10 +389,7 @@ fn hex_encode_lower(bytes: &[u8]) -> String {
 }
 
 fn header_value<'a>(headers: &[(&'a str, &'a str)], name: &str) -> Option<&'a str> {
-    headers
-        .iter()
-        .find(|(k, _)| *k == name)
-        .map(|(_, v)| *v)
+    headers.iter().find(|(k, _)| *k == name).map(|(_, v)| *v)
 }
 
 #[cfg(test)]
@@ -435,10 +429,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ctx.mode, AuthMode::HeaderSigV4);
-        assert_eq!(
-            ctx.access_key_id.as_deref(),
-            Some("AKIAIOSFODNN7EXAMPLE")
-        );
+        assert_eq!(ctx.access_key_id.as_deref(), Some("AKIAIOSFODNN7EXAMPLE"));
         assert_eq!(ctx.principal.as_deref(), Some("AKIAIOSFODNN7EXAMPLE"));
         assert_eq!(ctx.request_epoch_secs, Some(1_369_353_600));
     }
@@ -447,10 +438,8 @@ mod tests {
     fn authenticate_missing_auth_header() {
         let store = example_store();
         let headers = [("host", "examplebucket.s3.amazonaws.com")];
-        let err = authenticate_request(
-            "GET", "/", "", &headers, b"", &store, "us-east-1", "s3", 0,
-        )
-        .unwrap_err();
+        let err = authenticate_request("GET", "/", "", &headers, b"", &store, "us-east-1", "s3", 0)
+            .unwrap_err();
         assert!(matches!(err, AuthError::MissingAuth));
     }
 
@@ -477,8 +466,13 @@ mod tests {
             "us-east-1",
             "s3",
         );
-        let sig =
-            hex_encode_lower(hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, key.as_ref()), sts.as_bytes()).as_ref());
+        let sig = hex_encode_lower(
+            hmac::sign(
+                &hmac::Key::new(hmac::HMAC_SHA256, key.as_ref()),
+                sts.as_bytes(),
+            )
+            .as_ref(),
+        );
 
         let full_query = format!("{query}&X-Amz-Signature={sig}");
         let ctx = authenticate_request(
@@ -494,10 +488,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ctx.mode, AuthMode::PresignedSigV4);
-        assert_eq!(
-            ctx.access_key_id.as_deref(),
-            Some("AKIAIOSFODNN7EXAMPLE")
-        );
+        assert_eq!(ctx.access_key_id.as_deref(), Some("AKIAIOSFODNN7EXAMPLE"));
     }
 
     #[test]
@@ -523,8 +514,13 @@ mod tests {
             "us-east-1",
             "s3",
         );
-        let sig =
-            hex_encode_lower(hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, key.as_ref()), sts.as_bytes()).as_ref());
+        let sig = hex_encode_lower(
+            hmac::sign(
+                &hmac::Key::new(hmac::HMAC_SHA256, key.as_ref()),
+                sts.as_bytes(),
+            )
+            .as_ref(),
+        );
 
         let full_query = format!("{query}&X-Amz-Signature={sig}");
         let err = authenticate_request(

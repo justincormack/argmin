@@ -167,7 +167,7 @@ fn pg_store_persistence() {
                 bucket: "b".to_string(),
                 key: "k".to_string(),
                 version_id: 0,
-        status: 0,
+                status: 0,
                 size: data.len() as u64,
                 total_size: 0,
                 etag: vec![1],

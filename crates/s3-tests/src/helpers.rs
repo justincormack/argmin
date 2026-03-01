@@ -25,11 +25,7 @@ fn timestamp_millis() -> u64 {
 /// Create a bucket and populate it with `n` objects named "key0", "key1", ...
 ///
 /// Returns the bucket name and the list of keys.
-pub async fn create_objects(
-    client: &Client,
-    prefix: &str,
-    n: usize,
-) -> (String, Vec<String>) {
+pub async fn create_objects(client: &Client, prefix: &str, n: usize) -> (String, Vec<String>) {
     let bucket = unique_bucket();
     client
         .create_bucket()

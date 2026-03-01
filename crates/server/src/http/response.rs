@@ -1,7 +1,8 @@
 /// Build HTTP responses for S3 operations.
 use crate::coordinator::{
     CopyObjectResult, DeleteObjectResult, DeleteObjectsResult, GetObjectRangeResult,
-    GetObjectResult, HeadObjectResult, ListObjectVersionsResult, ListObjectsResult, PutObjectResult,
+    GetObjectResult, HeadObjectResult, ListObjectVersionsResult, ListObjectsResult,
+    PutObjectResult,
 };
 use crate::error::ServerError;
 use storage::BucketInfo;

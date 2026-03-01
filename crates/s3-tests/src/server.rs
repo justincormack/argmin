@@ -76,8 +76,7 @@ impl TestServer {
                     LocalStorageNode::open(&data_path, &pg_ids).expect("open storage node");
 
                 let bucket_db_path = data_path.join("buckets.db");
-                let bucket_db =
-                    SqliteBucketDb::open(&bucket_db_path).expect("open bucket db");
+                let bucket_db = SqliteBucketDb::open(&bucket_db_path).expect("open bucket db");
 
                 let coordinator = Coordinator::new(
                     storage_node,

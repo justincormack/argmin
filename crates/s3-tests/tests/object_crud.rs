@@ -5,12 +5,7 @@ use s3_tests::{unique_bucket, CTX};
 async fn setup_bucket() -> String {
     let client = CTX.client();
     let bucket = unique_bucket();
-    client
-        .create_bucket()
-        .bucket(&bucket)
-        .send()
-        .await
-        .unwrap();
+    client.create_bucket().bucket(&bucket).send().await.unwrap();
     bucket
 }
 
@@ -190,12 +185,7 @@ fn test_object_read_nonexistent_bucket() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        let result = client
-            .get_object()
-            .bucket(&bucket)
-            .key("key")
-            .send()
-            .await;
+        let result = client.get_object().bucket(&bucket).key("key").send().await;
         assert!(result.is_err());
     });
 }

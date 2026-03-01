@@ -99,8 +99,8 @@ pub fn validate_post_policy(
         .decode(policy_b64)
         .map_err(|_| PostPolicyError::Malformed("invalid base64"))?;
 
-    let policy_str =
-        std::str::from_utf8(&policy_bytes).map_err(|_| PostPolicyError::Malformed("invalid UTF-8"))?;
+    let policy_str = std::str::from_utf8(&policy_bytes)
+        .map_err(|_| PostPolicyError::Malformed("invalid UTF-8"))?;
 
     let policy: serde_json::Value =
         serde_json::from_str(policy_str).map_err(|_| PostPolicyError::Malformed("invalid JSON"))?;
@@ -152,19 +152,21 @@ pub fn validate_post_policy(
                 }
             }
             if arr.len() == 3 {
-                let op = arr[0]
-                    .as_str()
-                    .ok_or(PostPolicyError::Malformed("condition operator must be string"))?;
+                let op = arr[0].as_str().ok_or(PostPolicyError::Malformed(
+                    "condition operator must be string",
+                ))?;
                 if op.eq_ignore_ascii_case("starts-with") {
-                    let field_ref = arr[1]
-                        .as_str()
-                        .ok_or(PostPolicyError::Malformed("starts-with field must be string"))?;
-                    let prefix = arr[2]
-                        .as_str()
-                        .ok_or(PostPolicyError::Malformed("starts-with prefix must be string"))?;
+                    let field_ref = arr[1].as_str().ok_or(PostPolicyError::Malformed(
+                        "starts-with field must be string",
+                    ))?;
+                    let prefix = arr[2].as_str().ok_or(PostPolicyError::Malformed(
+                        "starts-with prefix must be string",
+                    ))?;
                     let field_name = field_ref
                         .strip_prefix('$')
-                        .ok_or(PostPolicyError::Malformed("field reference must start with $"))?
+                        .ok_or(PostPolicyError::Malformed(
+                            "field reference must start with $",
+                        ))?
                         .to_ascii_lowercase();
                     let form_val = find_field(form_fields, &field_name).unwrap_or("");
                     if !form_val.starts_with(prefix) {
@@ -179,7 +181,9 @@ pub fn validate_post_policy(
                         .ok_or(PostPolicyError::Malformed("eq value must be string"))?;
                     let field_name = field_ref
                         .strip_prefix('$')
-                        .ok_or(PostPolicyError::Malformed("field reference must start with $"))?
+                        .ok_or(PostPolicyError::Malformed(
+                            "field reference must start with $",
+                        ))?
                         .to_ascii_lowercase();
                     let form_val = find_field(form_fields, &field_name);
                     if form_val != Some(expected) {
@@ -187,12 +191,12 @@ pub fn validate_post_policy(
                     }
                 } else if op == "content-length-range" {
                     // Reject negative values (as_i64 check) and non-integer values
-                    let min_i = arr[1]
-                        .as_i64()
-                        .ok_or(PostPolicyError::Malformed("content-length-range min must be integer"))?;
-                    let max_i = arr[2]
-                        .as_i64()
-                        .ok_or(PostPolicyError::Malformed("content-length-range max must be integer"))?;
+                    let min_i = arr[1].as_i64().ok_or(PostPolicyError::Malformed(
+                        "content-length-range min must be integer",
+                    ))?;
+                    let max_i = arr[2].as_i64().ok_or(PostPolicyError::Malformed(
+                        "content-length-range max must be integer",
+                    ))?;
                     if min_i < 0 || max_i < 0 {
                         return Err(PostPolicyError::Malformed(
                             "content-length-range values must be non-negative",
@@ -304,10 +308,7 @@ mod tests {
 
         // Compute expected signature
         let mac = hmac::sign(
-            &hmac::Key::new(
-                hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY,
-                b"testSecretKey456",
-            ),
+            &hmac::Key::new(hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, b"testSecretKey456"),
             policy_b64.as_bytes(),
         );
         let sig = base64::engine::general_purpose::STANDARD.encode(mac.as_ref());
@@ -319,22 +320,14 @@ mod tests {
             &store,
         )
         .unwrap();
-        assert_eq!(
-            ctx.access_key_id.as_deref(),
-            Some("testAccessKey123")
-        );
+        assert_eq!(ctx.access_key_id.as_deref(), Some("testAccessKey123"));
     }
 
     #[test]
     fn bad_access_key() {
         let store = test_store();
-        let err = authenticate_post(
-            Some("badkey"),
-            Some("policy"),
-            Some("sig"),
-            &store,
-        )
-        .unwrap_err();
+        let err =
+            authenticate_post(Some("badkey"), Some("policy"), Some("sig"), &store).unwrap_err();
         assert!(matches!(err, AuthError::UnknownAccessKey));
     }
 
