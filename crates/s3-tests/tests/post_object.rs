@@ -237,7 +237,7 @@ fn test_post_object_authenticated_request() {
         let field_refs: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
         let (status, _) = post_object(&bucket, &field_refs, file_data, "test.txt");
-        assert!(status == 200 || status == 204, "expected 200 or 204, got {}", status);
+        assert_eq!(status, 204, "expected 204, got {}", status);
 
         // Verify via GET
         let resp = client
@@ -267,7 +267,7 @@ fn test_post_object_authenticated_no_content_type() {
         let field_refs: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
         let (status, _) = post_object(&bucket, &field_refs, file_data, "test.bin");
-        assert!(status == 200 || status == 204, "expected 200 or 204, got {}", status);
+        assert_eq!(status, 204, "expected 204, got {}", status);
 
         client.delete_object().bucket(&bucket).key(key).send().await.unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
@@ -291,7 +291,7 @@ fn test_post_object_set_content_type() {
         let field_refs: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
         let (status, _) = post_object(&bucket, &field_refs, file_data, "test.txt");
-        assert!(status == 200 || status == 204, "expected 200 or 204, got {}", status);
+        assert_eq!(status, 204, "expected 204, got {}", status);
 
         let resp = client
             .get_object()
@@ -325,7 +325,7 @@ fn test_post_object_empty_body() {
         let field_refs: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
         let (status, _) = post_object(&bucket, &field_refs, b"", "empty.txt");
-        assert!(status == 200 || status == 204, "expected 200 or 204, got {}", status);
+        assert_eq!(status, 204, "expected 204, got {}", status);
 
         let resp = client
             .get_object()
@@ -349,14 +349,21 @@ fn test_post_object_set_success_code() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = setup_bucket().await;
-        let key = "post-default-success";
+        let key = "post-success-201";
 
-        // Default success code (no success_action_status) should return 204
-        let fields = sigv4_fields(&bucket, key, &[]);
+        let mut fields = sigv4_fields(
+            &bucket,
+            key,
+            &[serde_json::json!(["starts-with", "$success_action_status", ""])],
+        );
+        fields.push(("success_action_status".to_string(), "201".to_string()));
         let field_refs: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
-        let (status, _) = post_object(&bucket, &field_refs, b"data", "test.txt");
-        assert_eq!(status, 204, "expected 204, got {}", status);
+        let (status, body) = post_object(&bucket, &field_refs, b"data", "test.txt");
+        assert_eq!(status, 201, "expected 201, got {}", status);
+        assert!(body.contains("<Bucket>"), "expected Bucket in XML: {}", body);
+        assert!(body.contains("<Key>"), "expected Key in XML: {}", body);
+        assert!(body.contains("<ETag>"), "expected ETag in XML: {}", body);
 
         client.delete_object().bucket(&bucket).key(key).send().await.unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
@@ -480,7 +487,7 @@ fn test_post_object_set_key_from_filename() {
         ];
 
         let (status, _) = post_object(&bucket, &fields, b"file content", file_name);
-        assert!(status == 200 || status == 204, "expected 200/204, got {}", status);
+        assert_eq!(status, 204, "expected 204, got {}", status);
 
         // Verify the key was resolved
         let resp = client
@@ -810,9 +817,9 @@ fn test_post_object_expires_is_case_sensitive() {
 // ── Policy: conditions ──────────────────────────────────────────────────
 
 #[test]
+#[ignore = "not implemented: POST policy empty conditions rejection"]
 fn test_post_object_empty_conditions() {
     s3_tests::run(async {
-        let client = CTX.client();
         let bucket = setup_bucket().await;
         let key = "post-empty-cond";
 
@@ -822,7 +829,7 @@ fn test_post_object_empty_conditions() {
         let region = CTX.region();
         let credential = format!("{}/{}/{}/s3/aws4_request", access_key, short_date, region);
 
-        // Empty conditions array
+        // Empty conditions array — S3 rejects this because bucket/key are not validated
         let policy_b64 = make_policy_raw(
             &epoch_to_iso8601(
                 SystemTime::now()
@@ -845,10 +852,10 @@ fn test_post_object_empty_conditions() {
         ];
 
         let (status, _) = post_object(&bucket, &fields, b"data", "test.txt");
-        assert!(status == 200 || status == 204, "expected 200/204, got {}", status);
+        assert_eq!(status, 400, "expected 400, got {}", status);
 
-        client.delete_object().bucket(&bucket).key(key).send().await.unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        let _ = CTX.client().delete_object().bucket(&bucket).key(key).send().await;
+        CTX.client().delete_bucket().bucket(&bucket).send().await.unwrap();
     });
 }
 
@@ -890,6 +897,7 @@ fn test_post_object_missing_conditions_list() {
 }
 
 #[test]
+#[ignore = "not implemented: POST policy condition key case sensitivity"]
 fn test_post_object_condition_is_case_sensitive() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;
@@ -901,8 +909,8 @@ fn test_post_object_condition_is_case_sensitive() {
         let region = CTX.region();
         let credential = format!("{}/{}/{}/s3/aws4_request", access_key, short_date, region);
 
-        // "Bucket" (capital B) in condition — field matching is case-insensitive
-        // but the S3 spec expects "bucket" to match the bucket
+        // "Bucket" (capital B) in condition — S3 condition keys are case-sensitive,
+        // so "Bucket" does not match "bucket" and should be rejected.
         let policy_b64 = make_policy_raw(
             &epoch_to_iso8601(
                 SystemTime::now()
@@ -928,10 +936,9 @@ fn test_post_object_condition_is_case_sensitive() {
         ];
 
         let (status, _) = post_object(&bucket, &fields, b"data", "test.txt");
-        // "Bucket" is lowercased to "bucket" so this should work
-        assert!(status == 200 || status == 204, "expected 200/204, got {}", status);
+        assert_eq!(status, 400, "expected 400, got {}", status);
 
-        CTX.client().delete_object().bucket(&bucket).key(key).send().await.unwrap();
+        let _ = CTX.client().delete_object().bucket(&bucket).key(key).send().await;
         CTX.client().delete_bucket().bucket(&bucket).send().await.unwrap();
     });
 }
@@ -975,7 +982,7 @@ fn test_post_object_case_insensitive_condition_fields() {
         ];
 
         let (status, _) = post_object(&bucket, &fields, b"data", "test.txt");
-        assert!(status == 200 || status == 204, "expected 200/204, got {}", status);
+        assert_eq!(status, 204, "expected 204, got {}", status);
 
         client.delete_object().bucket(&bucket).key(key).send().await.unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
@@ -993,7 +1000,7 @@ fn test_post_object_escaped_field_values() {
         let field_refs: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
         let (status, _) = post_object(&bucket, &field_refs, b"data", "test.txt");
-        assert!(status == 200 || status == 204, "expected 200/204, got {}", status);
+        assert_eq!(status, 204, "expected 204, got {}", status);
 
         let resp = client
             .get_object()
@@ -1011,6 +1018,7 @@ fn test_post_object_escaped_field_values() {
 }
 
 #[test]
+#[ignore = "not implemented: POST policy extra-field rejection"]
 fn test_post_object_missing_policy_condition() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;
@@ -1038,10 +1046,7 @@ fn test_post_object_missing_policy_condition() {
         ];
 
         let (status, _) = post_object(&bucket, &fields, b"data", "test.txt");
-        // This may succeed (some S3 impls ignore extra fields) or fail with 403
-        // Our server currently doesn't enforce extra-field rejection
-        assert!(status == 200 || status == 204 || status == 403,
-            "expected 200/204/403, got {}", status);
+        assert_eq!(status, 403, "expected 403, got {}", status);
 
         // Cleanup
         let _ = CTX.client().delete_object().bucket(&bucket).key(key).send().await;
@@ -1156,7 +1161,7 @@ fn test_post_object_starts_with() {
         field_refs.push(("Content-Type", "text/html"));
 
         let (status, _) = post_object(&bucket, &field_refs, b"<html>", "test.html");
-        assert!(status == 200 || status == 204, "expected 200/204, got {}", status);
+        assert_eq!(status, 204, "expected 204, got {}", status);
 
         client.delete_object().bucket(&bucket).key(key).send().await.unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
@@ -1179,7 +1184,7 @@ fn test_post_object_eq_condition() {
         field_refs.push(("Content-Type", "application/json"));
 
         let (status, _) = post_object(&bucket, &field_refs, b"{}", "data.json");
-        assert!(status == 200 || status == 204, "expected 200/204, got {}", status);
+        assert_eq!(status, 204, "expected 204, got {}", status);
 
         client.delete_object().bucket(&bucket).key(key).send().await.unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
@@ -1203,7 +1208,7 @@ fn test_post_object_content_length_range() {
         let field_refs: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
         let (status, _) = post_object(&bucket, &field_refs, b"hello", "test.txt");
-        assert!(status == 200 || status == 204, "expected 200/204, got {}", status);
+        assert_eq!(status, 204, "expected 204, got {}", status);
 
         client.delete_object().bucket(&bucket).key(key).send().await.unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
@@ -1322,7 +1327,7 @@ fn test_post_object_metadata() {
         let field_refs: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
         let (status, _) = post_object(&bucket, &field_refs, b"data", "test.txt");
-        assert!(status == 200 || status == 204, "expected 200/204, got {}", status);
+        assert_eq!(status, 204, "expected 204, got {}", status);
 
         // Verify metadata via HEAD
         let resp = client
@@ -1353,7 +1358,7 @@ fn test_post_object_user_specified_header() {
         let field_refs: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
         let (status, _) = post_object(&bucket, &field_refs, b"data", "test.txt");
-        assert!(status == 200 || status == 204, "expected 200/204, got {}", status);
+        assert_eq!(status, 204, "expected 204, got {}", status);
 
         client.delete_object().bucket(&bucket).key(key).send().await.unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
@@ -1373,7 +1378,7 @@ fn test_post_object_ignored_header() {
         let field_refs: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
         let (status, _) = post_object(&bucket, &field_refs, b"data", "test.txt");
-        assert!(status == 200 || status == 204, "expected 200/204, got {}", status);
+        assert_eq!(status, 204, "expected 204, got {}", status);
 
         // Verify object was created
         let resp = client
@@ -1449,6 +1454,7 @@ fn test_post_object_upload_checksum() {
         let digest = ring::digest::digest(&ring::digest::SHA256, file_data);
         let checksum_b64 = base64::engine::general_purpose::STANDARD.encode(digest.as_ref());
 
+        // Valid checksum → 204
         let mut fields = sigv4_fields(
             &bucket,
             key,
@@ -1458,7 +1464,21 @@ fn test_post_object_upload_checksum() {
         let field_refs: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
         let (status, _) = post_object(&bucket, &field_refs, file_data, "test.txt");
-        assert!(status == 200 || status == 204, "expected 200/204, got {}", status);
+        assert_eq!(status, 204, "expected 204, got {}", status);
+
+        // Bad checksum → 400
+        let bad_key = "post-checksum-bad";
+        let bad_checksum = base64::engine::general_purpose::STANDARD.encode(b"wrong-digest-value-here!!!!!!!!");
+        let mut bad_fields = sigv4_fields(
+            &bucket,
+            bad_key,
+            &[serde_json::json!(["starts-with", "$x-amz-checksum-sha256", ""])],
+        );
+        bad_fields.push(("x-amz-checksum-sha256".to_string(), bad_checksum));
+        let bad_field_refs: Vec<(&str, &str)> = bad_fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
+        let (bad_status, _) = post_object(&bucket, &bad_field_refs, file_data, "test.txt");
+        assert_eq!(bad_status, 400, "expected 400 for bad checksum, got {}", bad_status);
 
         client.delete_object().bucket(&bucket).key(key).send().await.unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
@@ -1483,7 +1503,7 @@ fn test_post_object_upload_larger_than_chunk() {
         let field_refs: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
         let (status, _) = post_object(&bucket, &field_refs, &file_data, "large.bin");
-        assert!(status == 200 || status == 204, "expected 200/204, got {}", status);
+        assert_eq!(status, 204, "expected 204, got {}", status);
 
         let resp = client
             .get_object()
@@ -1525,7 +1545,7 @@ fn test_post_object_invalid_access_key() {
         ];
 
         let (status, _) = post_object(&bucket, &fields, b"data", "test.txt");
-        assert!(status == 400 || status == 403, "expected 400 or 403, got {}", status);
+        assert_eq!(status, 403, "expected 403, got {}", status);
 
         CTX.client().delete_bucket().bucket(&bucket).send().await.unwrap();
     });
@@ -1546,7 +1566,7 @@ fn test_post_object_invalid_content_length_argument() {
         let field_refs: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
         let (status, _) = post_object(&bucket, &field_refs, b"data", "test.txt");
-        assert!(status == 400 || status == 403, "expected 400 or 403, got {}", status);
+        assert_eq!(status, 400, "expected 400, got {}", status);
 
         CTX.client().delete_bucket().bucket(&bucket).send().await.unwrap();
     });
@@ -1586,7 +1606,7 @@ fn test_post_object_missing_expires_condition() {
         ];
 
         let (status, _) = post_object(&bucket, &fields, b"data", "test.txt");
-        assert!(status == 400 || status == 403, "expected 400 or 403, got {}", status);
+        assert_eq!(status, 400, "expected 400, got {}", status);
 
         CTX.client().delete_bucket().bucket(&bucket).send().await.unwrap();
     });

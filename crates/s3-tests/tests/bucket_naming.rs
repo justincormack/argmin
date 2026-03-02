@@ -1,5 +1,5 @@
 use aws_sdk_s3::primitives::ByteStream;
-use s3_tests::{unique_bucket, CTX};
+use s3_tests::{err_status, unique_bucket, CTX};
 
 // ── Good names ──────────────────────────────────────────────────────────
 
@@ -214,7 +214,7 @@ fn test_bucket_create_naming_dns_dash_at_end() {
     s3_tests::run(async {
         let client = CTX.client();
         let result = client.create_bucket().bucket("foo-").send().await;
-        assert!(result.is_err());
+        assert_eq!(err_status(&result), 400);
     });
 }
 
@@ -252,7 +252,7 @@ fn test_bucket_create_naming_dns_underscore() {
     s3_tests::run(async {
         let client = CTX.client();
         let result = client.create_bucket().bucket("foo_bar").send().await;
-        assert!(result.is_err());
+        assert_eq!(err_status(&result), 400);
     });
 }
 
@@ -290,7 +290,7 @@ fn test_bucket_create_naming_dns_dot_dot() {
     s3_tests::run(async {
         let client = CTX.client();
         let result = client.create_bucket().bucket("foo..bar").send().await;
-        assert!(result.is_err());
+        assert_eq!(err_status(&result), 400);
     });
 }
 
@@ -299,7 +299,7 @@ fn test_bucket_create_naming_dns_dot_dash() {
     s3_tests::run(async {
         let client = CTX.client();
         let result = client.create_bucket().bucket("foo.-bar").send().await;
-        assert!(result.is_err());
+        assert_eq!(err_status(&result), 400);
     });
 }
 
@@ -308,7 +308,7 @@ fn test_bucket_create_naming_dns_dash_dot() {
     s3_tests::run(async {
         let client = CTX.client();
         let result = client.create_bucket().bucket("foo-.bar").send().await;
-        assert!(result.is_err());
+        assert_eq!(err_status(&result), 400);
     });
 }
 

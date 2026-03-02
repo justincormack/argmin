@@ -1,6 +1,6 @@
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::primitives::DateTime;
-use s3_tests::{unique_bucket, CTX};
+use s3_tests::{err_status, unique_bucket, CTX};
 
 /// Create a bucket, returning its name.
 async fn setup_bucket() -> String {
@@ -69,7 +69,7 @@ fn test_get_object_ifmatch_failed() {
             .if_match("\"0000000000000000\"")
             .send()
             .await;
-        assert!(result.is_err(), "expected 412 PreconditionFailed");
+        assert_eq!(err_status(&result), 412);
 
         cleanup(&bucket, &["obj"]).await;
     });
@@ -200,7 +200,7 @@ fn test_get_object_ifmodifiedsince_failed() {
             .if_modified_since(future)
             .send()
             .await;
-        assert!(result.is_err(), "expected 304 NotModified");
+        assert_eq!(err_status(&result), 304);
 
         cleanup(&bucket, &["obj"]).await;
     });
@@ -379,7 +379,7 @@ fn test_put_object_ifnonmatch_overwrite_existed_failed() {
             .body(ByteStream::from_static(b"overwrite"))
             .send()
             .await;
-        assert!(result.is_err(), "expected 412 PreconditionFailed");
+        assert_eq!(err_status(&result), 412);
 
         // Verify original content unchanged
         let resp = CTX.client()
@@ -444,7 +444,7 @@ fn test_put_object_ifmatch_failed() {
             .body(ByteStream::from_static(b"v2"))
             .send()
             .await;
-        assert!(result.is_err(), "expected 412 PreconditionFailed");
+        assert_eq!(err_status(&result), 412);
 
         // Verify original content unchanged
         let resp = CTX.client()
@@ -466,7 +466,7 @@ fn test_put_object_ifmatch_nonexisted_failed() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;
 
-        // Object doesn't exist → If-Match cannot be satisfied → 412
+        // Object doesn't exist → If-Match fails with 404 NoSuchKey
         let result = CTX.client()
             .put_object()
             .bucket(&bucket)
@@ -475,7 +475,7 @@ fn test_put_object_ifmatch_nonexisted_failed() {
             .body(ByteStream::from_static(b"data"))
             .send()
             .await;
-        assert!(result.is_err(), "expected 412 PreconditionFailed");
+        assert_eq!(err_status(&result), 404);
 
         cleanup(&bucket, &[]).await;
     });
@@ -506,7 +506,7 @@ fn test_delete_object_ifmatch_good() {
             .key("obj")
             .send()
             .await;
-        assert!(result.is_err());
+        assert_eq!(err_status(&result), 404);
 
         cleanup(&bucket, &[]).await;
     });
@@ -904,7 +904,7 @@ fn test_copy_object_ifmatch_failed() {
             .if_match("\"0000000000000000\"")
             .send()
             .await;
-        assert!(result.is_err(), "expected 412 PreconditionFailed");
+        assert_eq!(err_status(&result), 412);
 
         cleanup(&bucket, &["src", "dst"]).await;
     });
@@ -971,28 +971,30 @@ fn test_copy_object_ifnonematch_failed() {
 fn test_delete_object_if_match() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;
-        let etag = put_object(&bucket, "obj", b"hello").await;
+        put_object(&bucket, "obj", b"hello").await;
 
-        // Basic delete with If-Match
-        CTX.client()
+        // Delete with wrong If-Match → 412
+        let result = CTX.client()
             .delete_object()
             .bucket(&bucket)
             .key("obj")
-            .if_match(&etag)
+            .if_match("\"0000000000000000\"")
             .send()
-            .await
-            .unwrap();
+            .await;
+        assert_eq!(err_status(&result), 412);
 
-        // Verify deleted
-        let result = CTX.client()
+        // Verify object still exists
+        let resp = CTX.client()
             .get_object()
             .bucket(&bucket)
             .key("obj")
             .send()
-            .await;
-        assert!(result.is_err());
+            .await
+            .unwrap();
+        let data = resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], b"hello");
 
-        cleanup(&bucket, &[]).await;
+        cleanup(&bucket, &["obj"]).await;
     });
 }
 

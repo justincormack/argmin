@@ -410,8 +410,8 @@ impl Coordinator {
                 Err(storage::MetadataError::ObjectNotFound) => None,
                 Err(e) => return Err(ServerError::Metadata(e)),
             };
-            // If-Match: * on non-existent object → 404 (not 412)
-            if cond.if_match.as_deref() == Some("*") && existing_etag.is_none() {
+            // If-Match on non-existent object → 404 (AWS returns NoSuchKey, not 412)
+            if cond.if_match.is_some() && existing_etag.is_none() {
                 return Err(ServerError::ObjectNotFound {
                     bucket: bucket.to_string(),
                     key: key.to_string(),

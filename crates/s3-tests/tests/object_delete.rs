@@ -1,6 +1,6 @@
 use aws_sdk_s3::types::{Delete, ObjectIdentifier};
 use s3_tests::{
-    create_objects, create_objects_with_keys, delete_all_and_bucket, unique_bucket, CTX,
+    create_objects, create_objects_with_keys, delete_all_and_bucket, err_status, unique_bucket, CTX,
 };
 
 // ── Local helpers ───────────────────────────────────────────────────
@@ -321,7 +321,7 @@ fn test_multi_object_delete_key_limit() {
             .delete(delete)
             .send()
             .await;
-        assert!(result.is_err(), "expected error for >1000 keys");
+        assert_eq!(err_status(&result), 400);
 
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
@@ -381,7 +381,7 @@ fn test_multi_objectv2_delete_key_limit() {
             .delete(delete)
             .send()
             .await;
-        assert!(result.is_err(), "expected error for >1000 keys");
+        assert_eq!(err_status(&result), 400);
 
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
@@ -402,6 +402,6 @@ fn test_object_delete_key_bucket_gone() {
             .key("somekey")
             .send()
             .await;
-        assert!(result.is_err());
+        assert_eq!(err_status(&result), 404);
     });
 }

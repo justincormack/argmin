@@ -1,6 +1,6 @@
 use aws_sdk_s3::types::EncodingType;
 use s3_tests::{
-    create_objects, create_objects_with_keys, delete_all_and_bucket, unique_bucket, CTX,
+    create_objects, create_objects_with_keys, delete_all_and_bucket, err_status, unique_bucket, CTX,
 };
 
 // ── Test data sets ──────────────────────────────────────────────────
@@ -1845,7 +1845,7 @@ fn test_bucket_list_maxkeys_invalid() {
             .send()
             .await;
         // AWS returns 400 for invalid max-keys
-        assert!(result.is_err(), "expected error for negative max-keys");
+        assert_eq!(err_status(&result), 400);
 
         delete_all_and_bucket(client, &bucket, &keys).await;
     });

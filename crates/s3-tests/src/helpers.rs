@@ -114,3 +114,18 @@ pub fn assert_s3_err_code<T, E: std::fmt::Debug>(
         }
     }
 }
+
+/// Extract the HTTP status code from an S3 SDK error.
+///
+/// Panics if the result is `Ok` or if the error has no raw HTTP response.
+pub fn err_status<T, E: std::fmt::Debug>(
+    result: &Result<T, aws_sdk_s3::error::SdkError<E>>,
+) -> u16 {
+    match result {
+        Ok(_) => panic!("expected error, got Ok"),
+        Err(sdk_err) => sdk_err
+            .raw_response()
+            .map(|r| r.status().as_u16())
+            .unwrap_or_else(|| panic!("error has no raw HTTP response: {:?}", sdk_err)),
+    }
+}

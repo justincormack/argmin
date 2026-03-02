@@ -1,5 +1,5 @@
 use aws_sdk_s3::primitives::ByteStream;
-use s3_tests::{unique_bucket, CTX};
+use s3_tests::{err_status, unique_bucket, CTX};
 
 // ── CreateBucket ─────────────────────────────────────────────────────
 
@@ -51,7 +51,7 @@ fn test_bucket_delete_notexist() {
         let client = CTX.client();
         let bucket = unique_bucket();
         let result = client.delete_bucket().bucket(&bucket).send().await;
-        assert!(result.is_err());
+        assert_eq!(err_status(&result), 404);
     });
 }
 
@@ -73,7 +73,7 @@ fn test_bucket_delete_nonempty() {
 
         // Delete bucket should fail (not empty)
         let result = client.delete_bucket().bucket(&bucket).send().await;
-        assert!(result.is_err());
+        assert_eq!(err_status(&result), 409);
 
         // Clean up
         client
@@ -312,6 +312,12 @@ fn test_buckets_list_ctime() {
 
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
+}
+
+#[test]
+#[ignore = "not implemented: HEAD bucket usage statistics"]
+fn test_head_bucket_usage() {
+    s3_tests::run(async {});
 }
 
 #[test]

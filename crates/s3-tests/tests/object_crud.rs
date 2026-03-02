@@ -1,5 +1,5 @@
 use aws_sdk_s3::primitives::ByteStream;
-use s3_tests::{unique_bucket, CTX};
+use s3_tests::{err_status, unique_bucket, CTX};
 
 /// Create a bucket, returning its name. Tests are responsible for cleanup.
 async fn setup_bucket() -> String {
@@ -174,7 +174,7 @@ fn test_object_read_not_exist() {
             .key("no-such-key")
             .send()
             .await;
-        assert!(result.is_err());
+        assert_eq!(err_status(&result), 404);
 
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
@@ -992,7 +992,7 @@ fn test_object_write_to_nonexist_bucket() {
             .body(ByteStream::from_static(b"data"))
             .send()
             .await;
-        assert!(result.is_err());
+        assert_eq!(err_status(&result), 404);
     });
 }
 
