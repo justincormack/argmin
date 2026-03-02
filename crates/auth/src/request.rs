@@ -125,7 +125,7 @@ fn authenticate_presigned(
     path: &str,
     query_string: &str,
     headers: &[(&str, &str)],
-    body: &[u8],
+    _body: &[u8],
     store: &CredentialStore,
     expected_region: &str,
     expected_service: &str,
@@ -216,16 +216,13 @@ fn authenticate_presigned(
     let canonical_hdrs = canonical_headers(&signed_header_pairs);
     let signed_headers_joined = signed_headers.join(";");
     let canonical_qs = canonical_query_string(&query_without_signature(query_string));
+    // If the request includes x-amz-content-sha256 as a signed header, use
+    // its value (allows presigned PUTs with a known body hash). Otherwise
+    // default to UNSIGNED-PAYLOAD (the common case for presigned URLs where
+    // the body is unknown at signing time).
     let body_hash = match header_value(headers, "x-amz-content-sha256") {
-        Some("UNSIGNED-PAYLOAD") => "UNSIGNED-PAYLOAD".to_string(),
         Some(hash) => hash.to_string(),
-        None => {
-            if body.is_empty() {
-                "UNSIGNED-PAYLOAD".to_string()
-            } else {
-                sha256_hex(body)
-            }
-        }
+        None => "UNSIGNED-PAYLOAD".to_string(),
     };
     let canonical_req = canonical_request(
         method,
