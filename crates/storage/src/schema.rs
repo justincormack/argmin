@@ -46,7 +46,8 @@ CREATE TABLE IF NOT EXISTS buckets (
     created_at       INTEGER NOT NULL,
     region           INTEGER NOT NULL DEFAULT 0,
     versioning       INTEGER NOT NULL DEFAULT 0,
-    public_read      INTEGER NOT NULL DEFAULT 0
+    public_read      INTEGER NOT NULL DEFAULT 0,
+    cors_config      TEXT
 )";
 
 /// SQLite pragmas for per-PG databases: WAL mode, NORMAL synchronous.

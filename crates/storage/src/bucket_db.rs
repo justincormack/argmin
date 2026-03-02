@@ -122,7 +122,7 @@ impl GlobalService for SqliteBucketDb {
     fn head_bucket(&self, name: &str) -> Result<BucketInfo, MetadataError> {
         self.conn
             .query_row(
-                "SELECT name, owner_principal, created_at, region, versioning, public_read \
+                "SELECT name, owner_principal, created_at, region, versioning, public_read, cors_config \
                  FROM buckets WHERE name = ?1",
                 params![name],
                 |row| {
@@ -133,6 +133,7 @@ impl GlobalService for SqliteBucketDb {
                         region: row.get::<_, i64>(3)? as u16,
                         versioning: row.get::<_, i64>(4)? as u8,
                         public_read: row.get::<_, i64>(5)? != 0,
+                        cors_config: row.get(6)?,
                     })
                 },
             )
@@ -189,7 +190,7 @@ impl GlobalService for SqliteBucketDb {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT name, owner_principal, created_at, region, versioning, public_read \
+                "SELECT name, owner_principal, created_at, region, versioning, public_read, cors_config \
                  FROM buckets WHERE owner_principal = ?1 ORDER BY name ASC",
             )
             .map_err(|e| MetadataError::Db {
@@ -206,6 +207,7 @@ impl GlobalService for SqliteBucketDb {
                     region: row.get::<_, i64>(3)? as u16,
                     versioning: row.get::<_, i64>(4)? as u8,
                     public_read: row.get::<_, i64>(5)? != 0,
+                    cors_config: row.get(6)?,
                 })
             })
             .map_err(|e| MetadataError::Db {
@@ -222,6 +224,61 @@ impl GlobalService for SqliteBucketDb {
         }
 
         Ok(buckets)
+    }
+
+    fn put_bucket_cors(&self, name: &str, config: &str) -> Result<(), MetadataError> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE buckets SET cors_config = ?1 WHERE name = ?2",
+                params![config, name],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "put bucket cors",
+                source: e,
+            })?;
+        if updated == 0 {
+            return Err(MetadataError::BucketNotFound {
+                name: name.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn get_bucket_cors(&self, name: &str) -> Result<Option<String>, MetadataError> {
+        self.conn
+            .query_row(
+                "SELECT cors_config FROM buckets WHERE name = ?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| MetadataError::Db {
+                context: "get bucket cors",
+                source: e,
+            })?
+            .ok_or(MetadataError::BucketNotFound {
+                name: name.to_string(),
+            })
+    }
+
+    fn delete_bucket_cors(&self, name: &str) -> Result<(), MetadataError> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE buckets SET cors_config = NULL WHERE name = ?1",
+                params![name],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "delete bucket cors",
+                source: e,
+            })?;
+        if updated == 0 {
+            return Err(MetadataError::BucketNotFound {
+                name: name.to_string(),
+            });
+        }
+        Ok(())
     }
 }
 

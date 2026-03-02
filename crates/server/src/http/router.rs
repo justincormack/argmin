@@ -19,6 +19,10 @@ pub enum S3Operation {
     ListObjectVersions { bucket: String },
     PutBucketVersioning { bucket: String },
     GetBucketVersioning { bucket: String },
+    PutBucketCors { bucket: String },
+    GetBucketCors { bucket: String },
+    DeleteBucketCors { bucket: String },
+    OptionsRequest { bucket: String, key: Option<String> },
 }
 
 /// Validate an S3 bucket name per AWS rules.
@@ -152,13 +156,25 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
     }
 
     match (method, decoded_key) {
+        // OPTIONS requests (preflight CORS)
+        ("OPTIONS", key) => Ok(S3Operation::OptionsRequest {
+            bucket: bucket.to_string(),
+            key,
+        }),
+
         // Bucket-level operations (no key)
         ("PUT", None) if has_query_key(query, "versioning") => {
             Ok(S3Operation::PutBucketVersioning {
                 bucket: bucket.to_string(),
             })
         }
+        ("PUT", None) if has_query_key(query, "cors") => Ok(S3Operation::PutBucketCors {
+            bucket: bucket.to_string(),
+        }),
         ("PUT", None) => Ok(S3Operation::CreateBucket {
+            bucket: bucket.to_string(),
+        }),
+        ("DELETE", None) if has_query_key(query, "cors") => Ok(S3Operation::DeleteBucketCors {
             bucket: bucket.to_string(),
         }),
         ("DELETE", None) => Ok(S3Operation::DeleteBucket {
@@ -168,6 +184,12 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
             bucket: bucket.to_string(),
         }),
         ("GET", None) => {
+            // Check for ?cors → GetBucketCors
+            if has_query_key(query, "cors") {
+                return Ok(S3Operation::GetBucketCors {
+                    bucket: bucket.to_string(),
+                });
+            }
             // Check for ?versioning → GetBucketVersioning
             if has_query_key(query, "versioning") {
                 return Ok(S3Operation::GetBucketVersioning {
@@ -552,6 +574,58 @@ mod tests {
             route("GET", "/mybucket", "versioning").unwrap(),
             S3Operation::GetBucketVersioning {
                 bucket: "mybucket".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn put_bucket_cors() {
+        assert_eq!(
+            route("PUT", "/mybucket", "cors").unwrap(),
+            S3Operation::PutBucketCors {
+                bucket: "mybucket".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn get_bucket_cors() {
+        assert_eq!(
+            route("GET", "/mybucket", "cors").unwrap(),
+            S3Operation::GetBucketCors {
+                bucket: "mybucket".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn delete_bucket_cors() {
+        assert_eq!(
+            route("DELETE", "/mybucket", "cors").unwrap(),
+            S3Operation::DeleteBucketCors {
+                bucket: "mybucket".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn options_bucket() {
+        assert_eq!(
+            route("OPTIONS", "/mybucket", "").unwrap(),
+            S3Operation::OptionsRequest {
+                bucket: "mybucket".to_string(),
+                key: None,
+            }
+        );
+    }
+
+    #[test]
+    fn options_bucket_with_key() {
+        assert_eq!(
+            route("OPTIONS", "/mybucket/path/to/key", "").unwrap(),
+            S3Operation::OptionsRequest {
+                bucket: "mybucket".to_string(),
+                key: Some("path/to/key".to_string()),
             }
         );
     }

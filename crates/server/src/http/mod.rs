@@ -47,13 +47,24 @@ impl HttpFrontend {
     /// The caller (serve layer) is responsible for parsing the HTTP request into
     /// an S3Request and converting the S3Response back to an HTTP response.
     pub fn handle_s3_request(&self, s3req: &S3Request) -> S3Response {
+        // Route first to detect OPTIONS requests (which bypass auth).
+        let operation = match route(&s3req.method, &s3req.path, &s3req.query_string) {
+            Ok(op) => op,
+            Err(err) => return S3Response::error(&err, &s3req.path),
+        };
+
+        // OPTIONS (preflight CORS) bypasses authentication.
+        if let S3Operation::OptionsRequest { ref bucket, .. } = operation {
+            return self.handle_options_request(s3req, bucket);
+        }
+
         let auth = self.authenticate(s3req);
         let result = match auth {
-            Ok(auth) => self.dispatch(s3req, &auth),
+            Ok(auth) => self.dispatch_routed(s3req, &auth, operation),
             Err(err) => Err(err),
         };
 
-        match result {
+        let mut resp = match result {
             Ok(resp) => resp,
             Err(ServerError::NotModified {
                 ref etag,
@@ -67,13 +78,124 @@ impl HttpFrontend {
                 resp
             }
             Err(err) => S3Response::error(&err, &s3req.path),
+        };
+
+        // CORS response headers on actual (non-preflight) requests.
+        if let Some(origin) = s3req.header("origin") {
+            let bucket = self.extract_bucket_from_path(&s3req.path);
+            if let Some(bucket) = bucket {
+                self.apply_cors_headers(&mut resp, &bucket, origin, &s3req.method);
+            }
+        }
+
+        resp
+    }
+
+    /// Handle an OPTIONS (CORS preflight) request. No auth required.
+    fn handle_options_request(&self, req: &S3Request, bucket: &str) -> S3Response {
+        let origin = match req.header("origin") {
+            Some(o) => o,
+            None => {
+                return S3Response::error(
+                    &ServerError::InvalidRequest {
+                        reason: "Insufficient information. Origin request header needed."
+                            .to_string(),
+                    },
+                    &req.path,
+                )
+            }
+        };
+
+        let request_method = match req.header("access-control-request-method") {
+            Some(m) => m,
+            None => {
+                return S3Response::error(
+                    &ServerError::InvalidRequest {
+                        reason:
+                            "Insufficient information. Access-Control-Request-Method request header needed."
+                                .to_string(),
+                    },
+                    &req.path,
+                )
+            }
+        };
+
+        let request_headers_str = req.header("access-control-request-headers");
+        let request_headers: Vec<&str> = request_headers_str
+            .map(|h| h.split(',').map(|s| s.trim()).collect())
+            .unwrap_or_default();
+
+        // Load CORS config
+        let cors_config_xml = match self.coordinator.get_bucket_cors(bucket) {
+            Ok(Some(xml)) => xml,
+            _ => return S3Response::forbidden(),
+        };
+        let config = match crate::http::xml::parse_cors_config_xml(cors_config_xml.as_bytes()) {
+            Ok(c) => c,
+            Err(_) => return S3Response::forbidden(),
+        };
+
+        match crate::cors::find_matching_rule(&config, origin, request_method, &request_headers) {
+            Some(m) => {
+                let headers = crate::cors::preflight_response_headers(
+                    m.rule,
+                    origin,
+                    m.matched_origin,
+                    request_headers_str,
+                );
+                let mut resp = S3Response::cors_preflight();
+                for (k, v) in headers {
+                    resp.headers.push((k, v));
+                }
+                resp
+            }
+            None => S3Response::forbidden(),
         }
     }
 
-    fn dispatch(&self, req: &S3Request, auth: &AuthContext) -> Result<S3Response, ServerError> {
-        // Route
-        let operation = route(&req.method, &req.path, &req.query_string)?;
+    /// Apply CORS headers to an actual (non-preflight) response if the request
+    /// has an Origin header and a matching CORS rule exists.
+    fn apply_cors_headers(&self, resp: &mut S3Response, bucket: &str, origin: &str, method: &str) {
+        let cors_config_xml = match self.coordinator.get_bucket_cors(bucket) {
+            Ok(Some(xml)) => xml,
+            _ => return,
+        };
+        let config = match crate::http::xml::parse_cors_config_xml(cors_config_xml.as_bytes()) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
 
+        if let Some(m) = crate::cors::find_matching_rule(&config, origin, method, &[]) {
+            let headers = crate::cors::actual_response_headers(m.rule, origin, m.matched_origin);
+            for (k, v) in headers {
+                resp.headers.push((k, v));
+            }
+        }
+    }
+
+    /// Extract bucket name from the request path (first path segment).
+    fn extract_bucket_from_path(&self, path: &str) -> Option<String> {
+        let trimmed = path.strip_prefix('/').unwrap_or(path);
+        if trimmed.is_empty() {
+            return None;
+        }
+        let bucket = match trimmed.find('/') {
+            Some(pos) => &trimmed[..pos],
+            None => trimmed,
+        };
+        if bucket.is_empty() {
+            None
+        } else {
+            Some(bucket.to_string())
+        }
+    }
+
+    fn dispatch_routed(
+        &self,
+        req: &S3Request,
+        auth: &AuthContext,
+        operation: S3Operation,
+    ) -> Result<S3Response, ServerError> {
         // Dispatch to coordinator
         match operation {
             S3Operation::ListBuckets => {
@@ -299,6 +421,31 @@ impl HttpFrontend {
                 Ok(S3Response::get_bucket_versioning(state))
             }
             S3Operation::PostObject { bucket } => self.handle_post_object(req, auth, &bucket),
+            S3Operation::PutBucketCors { bucket } => {
+                self.authorize_bucket_write(auth, &bucket)?;
+                let config = xml::parse_cors_config_xml(&req.body)?;
+                let config_xml = xml::get_cors_config_xml(&config);
+                self.coordinator.put_bucket_cors(&bucket, &config_xml)?;
+                Ok(S3Response::put_bucket_cors())
+            }
+            S3Operation::GetBucketCors { bucket } => {
+                self.authorize_bucket_read(auth, &bucket)?;
+                match self.coordinator.get_bucket_cors(&bucket)? {
+                    Some(config_xml) => Ok(S3Response::get_bucket_cors(&config_xml)),
+                    None => Err(ServerError::NoSuchCorsConfiguration {
+                        bucket: bucket.clone(),
+                    }),
+                }
+            }
+            S3Operation::DeleteBucketCors { bucket } => {
+                self.authorize_bucket_write(auth, &bucket)?;
+                self.coordinator.delete_bucket_cors(&bucket)?;
+                Ok(S3Response::delete_bucket_cors())
+            }
+            // OptionsRequest is handled before auth in handle_s3_request
+            S3Operation::OptionsRequest { .. } => {
+                unreachable!("OPTIONS handled before dispatch")
+            }
             S3Operation::ListObjectVersions { bucket } => {
                 self.authorize_bucket_read(auth, &bucket)?;
                 let prefix = req.query_param("prefix");

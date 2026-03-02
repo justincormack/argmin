@@ -583,6 +583,173 @@ fn xml_unescape(s: &str) -> String {
     out
 }
 
+/// Parse a CORS configuration XML body.
+///
+/// Expected format:
+/// ```xml
+/// <CORSConfiguration>
+///   <CORSRule>
+///     <AllowedOrigin>...</AllowedOrigin>
+///     <AllowedMethod>GET</AllowedMethod>
+///     <AllowedHeader>...</AllowedHeader>
+///     <ExposeHeader>...</ExposeHeader>
+///     <MaxAgeSeconds>3600</MaxAgeSeconds>
+///   </CORSRule>
+/// </CORSConfiguration>
+/// ```
+pub fn parse_cors_config_xml(data: &[u8]) -> Result<crate::cors::CorsConfiguration, ServerError> {
+    let text = std::str::from_utf8(data).map_err(|_| ServerError::InvalidRequest {
+        reason: "invalid UTF-8 in CORS XML body".to_string(),
+    })?;
+
+    if !text.contains("<CORSConfiguration") {
+        return Err(ServerError::InvalidRequest {
+            reason: "missing <CORSConfiguration> element".to_string(),
+        });
+    }
+
+    let valid_methods = ["GET", "PUT", "POST", "DELETE", "HEAD"];
+
+    let mut rules = Vec::new();
+    let mut search_from = 0;
+    while let Some(start) = text[search_from..].find("<CORSRule>") {
+        let abs_start = search_from + start + "<CORSRule>".len();
+        let end =
+            text[abs_start..]
+                .find("</CORSRule>")
+                .ok_or_else(|| ServerError::InvalidRequest {
+                    reason: "unclosed <CORSRule> element".to_string(),
+                })?;
+        let block = &text[abs_start..abs_start + end];
+
+        // Parse AllowedOrigin (1+ required)
+        let allowed_origins = extract_all_tag_contents(block, "AllowedOrigin");
+        if allowed_origins.is_empty() {
+            return Err(ServerError::InvalidRequest {
+                reason: "CORSRule missing <AllowedOrigin> element".to_string(),
+            });
+        }
+
+        // Parse AllowedMethod (1+ required)
+        let allowed_methods = extract_all_tag_contents(block, "AllowedMethod");
+        if allowed_methods.is_empty() {
+            return Err(ServerError::InvalidRequest {
+                reason: "CORSRule missing <AllowedMethod> element".to_string(),
+            });
+        }
+        for m in &allowed_methods {
+            if !valid_methods.contains(&m.as_str()) {
+                return Err(ServerError::InvalidRequest {
+                    reason: format!("invalid CORS method: {}", m),
+                });
+            }
+        }
+
+        // Parse AllowedHeader (0+)
+        let allowed_headers = extract_all_tag_contents(block, "AllowedHeader");
+
+        // Parse ExposeHeader (0+)
+        let expose_headers = extract_all_tag_contents(block, "ExposeHeader");
+
+        // Parse MaxAgeSeconds (0 or 1)
+        let max_age_seconds = extract_tag_content(block, "MaxAgeSeconds")
+            .map(|s| {
+                s.parse::<u32>().map_err(|_| ServerError::InvalidRequest {
+                    reason: format!("invalid MaxAgeSeconds: {}", s),
+                })
+            })
+            .transpose()?;
+
+        rules.push(crate::cors::CorsRule {
+            allowed_origins,
+            allowed_methods,
+            allowed_headers,
+            expose_headers,
+            max_age_seconds,
+        });
+
+        search_from = abs_start + end + "</CORSRule>".len();
+    }
+
+    if rules.is_empty() {
+        return Err(ServerError::InvalidRequest {
+            reason: "CORS configuration must contain at least one rule".to_string(),
+        });
+    }
+    if rules.len() > 100 {
+        return Err(ServerError::InvalidRequest {
+            reason: "CORS configuration must contain at most 100 rules".to_string(),
+        });
+    }
+
+    Ok(crate::cors::CorsConfiguration { rules })
+}
+
+/// Serialize a CORS configuration to XML.
+pub fn get_cors_config_xml(config: &crate::cors::CorsConfiguration) -> String {
+    let mut xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <CORSConfiguration>",
+    );
+
+    for rule in &config.rules {
+        xml.push_str("<CORSRule>");
+
+        for origin in &rule.allowed_origins {
+            xml.push_str("<AllowedOrigin>");
+            xml.push_str(&xml_escape(origin));
+            xml.push_str("</AllowedOrigin>");
+        }
+
+        for method in &rule.allowed_methods {
+            xml.push_str("<AllowedMethod>");
+            xml.push_str(&xml_escape(method));
+            xml.push_str("</AllowedMethod>");
+        }
+
+        for header in &rule.allowed_headers {
+            xml.push_str("<AllowedHeader>");
+            xml.push_str(&xml_escape(header));
+            xml.push_str("</AllowedHeader>");
+        }
+
+        for header in &rule.expose_headers {
+            xml.push_str("<ExposeHeader>");
+            xml.push_str(&xml_escape(header));
+            xml.push_str("</ExposeHeader>");
+        }
+
+        if let Some(max_age) = rule.max_age_seconds {
+            xml.push_str("<MaxAgeSeconds>");
+            xml.push_str(&max_age.to_string());
+            xml.push_str("</MaxAgeSeconds>");
+        }
+
+        xml.push_str("</CORSRule>");
+    }
+
+    xml.push_str("</CORSConfiguration>");
+    xml
+}
+
+/// Extract all occurrences of a simple XML tag's text content.
+fn extract_all_tag_contents(xml: &str, tag: &str) -> Vec<String> {
+    let open = format!("<{}>", tag);
+    let close = format!("</{}>", tag);
+    let mut results = Vec::new();
+    let mut search_from = 0;
+    while let Some(start_pos) = xml[search_from..].find(&open) {
+        let abs_start = search_from + start_pos + open.len();
+        if let Some(end_pos) = xml[abs_start..].find(&close) {
+            results.push(xml_unescape(&xml[abs_start..abs_start + end_pos]));
+            search_from = abs_start + end_pos + close.len();
+        } else {
+            break;
+        }
+    }
+    results
+}
+
 /// Format a CopyObjectResult XML response.
 pub fn copy_object_result_xml(etag: &str, last_modified: u64) -> String {
     format!(
@@ -658,6 +825,7 @@ mod tests {
             region: 0,
             versioning: 0,
             public_read: false,
+            cors_config: None,
         }];
         let xml = list_buckets_xml(&buckets, "owner");
         assert!(xml.contains("<Name>test-bucket</Name>"));
@@ -1094,5 +1262,149 @@ mod tests {
     fn get_bucket_versioning_suspended() {
         let xml = get_bucket_versioning_xml(2);
         assert!(xml.contains("<Status>Suspended</Status>"));
+    }
+
+    // ── CORS XML ─────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_cors_config_basic() {
+        let xml = b"\
+            <CORSConfiguration>\
+                <CORSRule>\
+                    <AllowedOrigin>http://example.com</AllowedOrigin>\
+                    <AllowedMethod>GET</AllowedMethod>\
+                    <AllowedMethod>PUT</AllowedMethod>\
+                    <AllowedHeader>*</AllowedHeader>\
+                    <ExposeHeader>x-amz-request-id</ExposeHeader>\
+                    <MaxAgeSeconds>3600</MaxAgeSeconds>\
+                </CORSRule>\
+            </CORSConfiguration>";
+        let config = parse_cors_config_xml(xml).unwrap();
+        assert_eq!(config.rules.len(), 1);
+        let rule = &config.rules[0];
+        assert_eq!(rule.allowed_origins, vec!["http://example.com"]);
+        assert_eq!(rule.allowed_methods, vec!["GET", "PUT"]);
+        assert_eq!(rule.allowed_headers, vec!["*"]);
+        assert_eq!(rule.expose_headers, vec!["x-amz-request-id"]);
+        assert_eq!(rule.max_age_seconds, Some(3600));
+    }
+
+    #[test]
+    fn parse_cors_config_multiple_rules() {
+        let xml = b"\
+            <CORSConfiguration>\
+                <CORSRule>\
+                    <AllowedOrigin>http://a.com</AllowedOrigin>\
+                    <AllowedMethod>GET</AllowedMethod>\
+                </CORSRule>\
+                <CORSRule>\
+                    <AllowedOrigin>http://b.com</AllowedOrigin>\
+                    <AllowedMethod>POST</AllowedMethod>\
+                </CORSRule>\
+            </CORSConfiguration>";
+        let config = parse_cors_config_xml(xml).unwrap();
+        assert_eq!(config.rules.len(), 2);
+        assert_eq!(config.rules[0].allowed_origins, vec!["http://a.com"]);
+        assert_eq!(config.rules[1].allowed_origins, vec!["http://b.com"]);
+    }
+
+    #[test]
+    fn parse_cors_config_missing_origin() {
+        let xml = b"\
+            <CORSConfiguration>\
+                <CORSRule>\
+                    <AllowedMethod>GET</AllowedMethod>\
+                </CORSRule>\
+            </CORSConfiguration>";
+        assert!(parse_cors_config_xml(xml).is_err());
+    }
+
+    #[test]
+    fn parse_cors_config_missing_method() {
+        let xml = b"\
+            <CORSConfiguration>\
+                <CORSRule>\
+                    <AllowedOrigin>http://example.com</AllowedOrigin>\
+                </CORSRule>\
+            </CORSConfiguration>";
+        assert!(parse_cors_config_xml(xml).is_err());
+    }
+
+    #[test]
+    fn parse_cors_config_invalid_method() {
+        let xml = b"\
+            <CORSConfiguration>\
+                <CORSRule>\
+                    <AllowedOrigin>http://example.com</AllowedOrigin>\
+                    <AllowedMethod>PATCH</AllowedMethod>\
+                </CORSRule>\
+            </CORSConfiguration>";
+        assert!(parse_cors_config_xml(xml).is_err());
+    }
+
+    #[test]
+    fn parse_cors_config_no_rules() {
+        let xml = b"<CORSConfiguration></CORSConfiguration>";
+        assert!(parse_cors_config_xml(xml).is_err());
+    }
+
+    #[test]
+    fn parse_cors_config_missing_wrapper() {
+        let xml = b"<CORSRule><AllowedOrigin>*</AllowedOrigin><AllowedMethod>GET</AllowedMethod></CORSRule>";
+        assert!(parse_cors_config_xml(xml).is_err());
+    }
+
+    #[test]
+    fn get_cors_config_xml_round_trip() {
+        let config = crate::cors::CorsConfiguration {
+            rules: vec![crate::cors::CorsRule {
+                allowed_origins: vec!["http://example.com".into()],
+                allowed_methods: vec!["GET".into(), "PUT".into()],
+                allowed_headers: vec!["*".into()],
+                expose_headers: vec!["x-amz-request-id".into()],
+                max_age_seconds: Some(3600),
+            }],
+        };
+        let xml = get_cors_config_xml(&config);
+        assert!(xml.contains("<CORSConfiguration>"));
+        assert!(xml.contains("<AllowedOrigin>http://example.com</AllowedOrigin>"));
+        assert!(xml.contains("<AllowedMethod>GET</AllowedMethod>"));
+        assert!(xml.contains("<AllowedMethod>PUT</AllowedMethod>"));
+        assert!(xml.contains("<AllowedHeader>*</AllowedHeader>"));
+        assert!(xml.contains("<ExposeHeader>x-amz-request-id</ExposeHeader>"));
+        assert!(xml.contains("<MaxAgeSeconds>3600</MaxAgeSeconds>"));
+
+        // Parse it back
+        let parsed = parse_cors_config_xml(xml.as_bytes()).unwrap();
+        assert_eq!(parsed.rules.len(), 1);
+        assert_eq!(parsed.rules[0].allowed_origins, vec!["http://example.com"]);
+    }
+
+    #[test]
+    fn cors_xml_round_trip_multiple_origins() {
+        let config = crate::cors::CorsConfiguration {
+            rules: vec![crate::cors::CorsRule {
+                allowed_origins: vec![
+                    "http://first.com".into(),
+                    "http://second.com".into(),
+                    "http://*.example.com".into(),
+                ],
+                allowed_methods: vec!["GET".into()],
+                allowed_headers: vec![],
+                expose_headers: vec![],
+                max_age_seconds: None,
+            }],
+        };
+        let xml = get_cors_config_xml(&config);
+        assert!(xml.contains("<AllowedOrigin>http://first.com</AllowedOrigin>"));
+        assert!(xml.contains("<AllowedOrigin>http://second.com</AllowedOrigin>"));
+        assert!(xml.contains("<AllowedOrigin>http://*.example.com</AllowedOrigin>"));
+
+        let parsed = parse_cors_config_xml(xml.as_bytes()).unwrap();
+        assert_eq!(parsed.rules.len(), 1);
+        assert_eq!(
+            parsed.rules[0].allowed_origins,
+            vec!["http://first.com", "http://second.com", "http://*.example.com"]
+        );
     }
 }

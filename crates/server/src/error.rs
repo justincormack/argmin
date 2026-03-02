@@ -61,6 +61,9 @@ pub enum ServerError {
 
     #[error("bad digest")]
     BadDigest,
+
+    #[error("no CORS configuration")]
+    NoSuchCorsConfiguration { bucket: String },
 }
 
 impl ServerError {
@@ -88,6 +91,7 @@ impl ServerError {
             Self::InvalidRange { .. } => "InvalidRange",
             Self::SlowDown => "SlowDown",
             Self::BadDigest => "BadDigest",
+            Self::NoSuchCorsConfiguration { .. } => "NoSuchCORSConfiguration",
             Self::Store(_) => "InternalError",
             Self::Metadata(_) => "InternalError",
             Self::Ec(_) => "InternalError",
@@ -107,6 +111,7 @@ impl ServerError {
             | Self::InvalidArgument { .. }
             | Self::InvalidBucketName { .. }
             | Self::BadDigest => 400,
+            Self::NoSuchCorsConfiguration { .. } => 404,
             Self::ObjectTooLarge { .. } => 400,
             Self::MethodNotAllowed => 405,
             Self::InvalidRange { .. } => 416,

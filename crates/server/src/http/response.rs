@@ -401,6 +401,32 @@ impl S3Response {
         Self::new(412).xml_body(body)
     }
 
+    /// Build a response for PutBucketCors (200 OK, no body).
+    pub fn put_bucket_cors() -> Self {
+        Self::new(200)
+    }
+
+    /// Build a response for GetBucketCors (200 OK, XML body).
+    pub fn get_bucket_cors(config_xml: &str) -> Self {
+        Self::new(200).xml_body(config_xml.to_string())
+    }
+
+    /// Build a response for DeleteBucketCors (204 No Content).
+    pub fn delete_bucket_cors() -> Self {
+        Self::new(204)
+    }
+
+    /// Build a 200 response for a CORS preflight (headers added by caller).
+    pub fn cors_preflight() -> Self {
+        Self::new(200)
+    }
+
+    /// Build a 403 Forbidden response.
+    pub fn forbidden() -> Self {
+        let body = xml::error_xml("AccessDenied", "Access Denied", "", "request-id");
+        Self::new(403).xml_body(body)
+    }
+
     /// Build an error response.
     pub fn error(err: &ServerError, resource: &str) -> Self {
         let fallback;
@@ -848,6 +874,7 @@ mod tests {
             region: 0,
             versioning: 0,
             public_read: false,
+            cors_config: None,
         };
         let resp = S3Response::head_bucket(&info);
         assert_eq!(resp.status_code, 200);
@@ -864,6 +891,7 @@ mod tests {
             region: 0,
             versioning: 0,
             public_read: false,
+            cors_config: None,
         }];
         let resp = S3Response::list_buckets(&buckets, "owner");
         assert_eq!(resp.status_code, 200);

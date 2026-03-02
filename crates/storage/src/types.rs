@@ -144,6 +144,8 @@ pub struct BucketInfo {
     /// 0 = Disabled, 1 = Enabled, 2 = Suspended.
     pub versioning: u8,
     pub public_read: bool,
+    /// Serialized CORS configuration XML (None = no CORS config).
+    pub cors_config: Option<String>,
 }
 
 /// Request to store object metadata.

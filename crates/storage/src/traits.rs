@@ -112,6 +112,15 @@ pub trait GlobalService {
     /// Validates transitions: Disabled→Enabled and Enabled↔Suspended are allowed.
     /// Enabled→Disabled is rejected.
     fn put_bucket_versioning(&self, name: &str, state: u8) -> Result<(), MetadataError>;
+
+    /// Store a CORS configuration for a bucket (serialized XML string).
+    fn put_bucket_cors(&self, name: &str, config: &str) -> Result<(), MetadataError>;
+
+    /// Retrieve a bucket's CORS configuration. Returns None if not set.
+    fn get_bucket_cors(&self, name: &str) -> Result<Option<String>, MetadataError>;
+
+    /// Delete a bucket's CORS configuration. Idempotent.
+    fn delete_bucket_cors(&self, name: &str) -> Result<(), MetadataError>;
 }
 
 /// Multiplexes across PG stores on a single node.
