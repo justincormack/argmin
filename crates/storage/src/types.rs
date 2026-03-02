@@ -131,6 +131,8 @@ pub struct ObjectRecord {
     pub ec_m: u8,
     /// 0 = Live, 1 = DeleteMarker, 2 = PendingDelete.
     pub status: u8,
+    /// Serialized tagging XML (None = no tags).
+    pub tags: Option<String>,
 }
 
 /// Bucket metadata.
@@ -146,6 +148,8 @@ pub struct BucketInfo {
     pub public_read: bool,
     /// Serialized CORS configuration XML (None = no CORS config).
     pub cors_config: Option<String>,
+    /// Serialized tagging XML (None = no tags).
+    pub tags: Option<String>,
 }
 
 /// Request to store object metadata.

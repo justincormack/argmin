@@ -158,6 +158,7 @@ impl PgMetadataStore for MemoryPgStore {
             ec_k: req.ec_k,
             ec_m: req.ec_m,
             status: req.status,
+            tags: None,
         };
         self.objects.borrow_mut().insert(
             (req.bucket.clone(), req.key.clone(), req.version_id),
@@ -337,5 +338,54 @@ impl PgMetadataStore for MemoryPgStore {
             .map(|r| r.version_id)
             .max();
         Ok(max.map(|v| v + 1).unwrap_or(1))
+    }
+
+    fn put_object_tags(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: u64,
+        tags: &str,
+    ) -> Result<(), MetadataError> {
+        let mut objects = self.objects.borrow_mut();
+        let k = (bucket.to_string(), key.to_string(), version_id);
+        match objects.get_mut(&k) {
+            Some(record) => {
+                record.tags = Some(tags.to_string());
+                Ok(())
+            }
+            None => Err(MetadataError::ObjectNotFound),
+        }
+    }
+
+    fn get_object_tags(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: u64,
+    ) -> Result<Option<String>, MetadataError> {
+        let objects = self.objects.borrow();
+        let k = (bucket.to_string(), key.to_string(), version_id);
+        match objects.get(&k) {
+            Some(record) => Ok(record.tags.clone()),
+            None => Err(MetadataError::ObjectNotFound),
+        }
+    }
+
+    fn delete_object_tags(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: u64,
+    ) -> Result<(), MetadataError> {
+        let mut objects = self.objects.borrow_mut();
+        let k = (bucket.to_string(), key.to_string(), version_id);
+        match objects.get_mut(&k) {
+            Some(record) => {
+                record.tags = None;
+                Ok(())
+            }
+            None => Err(MetadataError::ObjectNotFound),
+        }
     }
 }

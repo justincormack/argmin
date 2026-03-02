@@ -268,6 +268,34 @@ impl PgMetadataStore for FaultyPgStore {
     fn next_version_id(&self, bucket: &str, key: &str) -> Result<u64, MetadataError> {
         self.inner.next_version_id(bucket, key)
     }
+
+    fn put_object_tags(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: u64,
+        tags: &str,
+    ) -> Result<(), MetadataError> {
+        self.inner.put_object_tags(bucket, key, version_id, tags)
+    }
+
+    fn get_object_tags(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: u64,
+    ) -> Result<Option<String>, MetadataError> {
+        self.inner.get_object_tags(bucket, key, version_id)
+    }
+
+    fn delete_object_tags(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: u64,
+    ) -> Result<(), MetadataError> {
+        self.inner.delete_object_tags(bucket, key, version_id)
+    }
 }
 
 #[cfg(test)]

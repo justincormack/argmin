@@ -122,7 +122,7 @@ impl GlobalService for SqliteBucketDb {
     fn head_bucket(&self, name: &str) -> Result<BucketInfo, MetadataError> {
         self.conn
             .query_row(
-                "SELECT name, owner_principal, created_at, region, versioning, public_read, cors_config \
+                "SELECT name, owner_principal, created_at, region, versioning, public_read, cors_config, tags \
                  FROM buckets WHERE name = ?1",
                 params![name],
                 |row| {
@@ -134,6 +134,7 @@ impl GlobalService for SqliteBucketDb {
                         versioning: row.get::<_, i64>(4)? as u8,
                         public_read: row.get::<_, i64>(5)? != 0,
                         cors_config: row.get(6)?,
+                        tags: row.get(7)?,
                     })
                 },
             )
@@ -190,7 +191,7 @@ impl GlobalService for SqliteBucketDb {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT name, owner_principal, created_at, region, versioning, public_read, cors_config \
+                "SELECT name, owner_principal, created_at, region, versioning, public_read, cors_config, tags \
                  FROM buckets WHERE owner_principal = ?1 ORDER BY name ASC",
             )
             .map_err(|e| MetadataError::Db {
@@ -208,6 +209,7 @@ impl GlobalService for SqliteBucketDb {
                     versioning: row.get::<_, i64>(4)? as u8,
                     public_read: row.get::<_, i64>(5)? != 0,
                     cors_config: row.get(6)?,
+                    tags: row.get(7)?,
                 })
             })
             .map_err(|e| MetadataError::Db {
@@ -271,6 +273,61 @@ impl GlobalService for SqliteBucketDb {
             )
             .map_err(|e| MetadataError::Db {
                 context: "delete bucket cors",
+                source: e,
+            })?;
+        if updated == 0 {
+            return Err(MetadataError::BucketNotFound {
+                name: name.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn put_bucket_tags(&self, name: &str, tags: &str) -> Result<(), MetadataError> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE buckets SET tags = ?1 WHERE name = ?2",
+                params![tags, name],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "put bucket tags",
+                source: e,
+            })?;
+        if updated == 0 {
+            return Err(MetadataError::BucketNotFound {
+                name: name.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn get_bucket_tags(&self, name: &str) -> Result<Option<String>, MetadataError> {
+        self.conn
+            .query_row(
+                "SELECT tags FROM buckets WHERE name = ?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| MetadataError::Db {
+                context: "get bucket tags",
+                source: e,
+            })?
+            .ok_or(MetadataError::BucketNotFound {
+                name: name.to_string(),
+            })
+    }
+
+    fn delete_bucket_tags(&self, name: &str) -> Result<(), MetadataError> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE buckets SET tags = NULL WHERE name = ?1",
+                params![name],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "delete bucket tags",
                 source: e,
             })?;
         if updated == 0 {

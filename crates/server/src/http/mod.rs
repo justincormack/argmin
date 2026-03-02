@@ -25,14 +25,16 @@ use response::S3Response;
 use router::{route, S3Operation};
 
 /// Parse versionId query parameter from an S3 request.
-fn parse_version_id(req: &S3Request) -> Option<u64> {
-    req.query_param("versionId").and_then(|v| {
-        if v == "null" {
-            Some(0)
-        } else {
-            v.parse::<u64>().ok()
-        }
-    })
+/// Returns `Ok(None)` if the parameter is absent, `Ok(Some(id))` if valid,
+/// or `Err` if the value is present but not a valid version ID.
+fn parse_version_id(req: &S3Request) -> Result<Option<u64>, ServerError> {
+    match req.query_param("versionId") {
+        None => Ok(None),
+        Some(v) if v == "null" => Ok(Some(0)),
+        Some(v) => v.parse::<u64>().map(Some).map_err(|_| ServerError::InvalidArgument {
+            reason: format!("invalid versionId: {v}"),
+        }),
+    }
 }
 
 /// The HTTP frontend that handles incoming requests.
@@ -299,13 +301,15 @@ impl HttpFrontend {
                     // CopyObject path
                     let (src_bucket, src_key, src_version_id_str) =
                         request::parse_copy_source(copy_source)?;
-                    let src_version_id = src_version_id_str.and_then(|v| {
-                        if v == "null" {
-                            Some(0)
-                        } else {
-                            v.parse::<u64>().ok()
-                        }
-                    });
+                    let src_version_id = match src_version_id_str {
+                        None => None,
+                        Some(v) if v == "null" => Some(0),
+                        Some(v) => Some(v.parse::<u64>().map_err(|_| {
+                            ServerError::InvalidArgument {
+                                reason: format!("invalid versionId in copy source: {v}"),
+                            }
+                        })?),
+                    };
                     self.authorize_bucket_write(auth, &bucket)?;
                     self.authorize_bucket_read(auth, &src_bucket)?;
                     let src_cond = copy_source_condition_from_headers(req);
@@ -323,6 +327,25 @@ impl HttpFrontend {
                             reason: "This copy request is illegal because it is trying to copy an object to itself without changing the object's metadata, storage class, website redirect location or encryption attributes.".to_string(),
                         });
                     }
+                    // Parse inline tags before writing so invalid tags don't leave orphan objects
+                    let tagging_directive = match req.header("x-amz-tagging-directive") {
+                        Some(d) if d.eq_ignore_ascii_case("REPLACE") => "REPLACE",
+                        _ => "COPY",
+                    };
+                    let inline_tags_xml = if tagging_directive == "REPLACE" {
+                        if let Some(tagging_header) = req.header("x-amz-tagging") {
+                            let tags = xml::parse_url_encoded_tags(tagging_header)?;
+                            if tags.is_empty() {
+                                None
+                            } else {
+                                Some(xml::get_tagging_xml(&tags))
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
                     let header_pairs: Vec<(&str, &str)> = req
                         .headers
                         .iter()
@@ -339,11 +362,39 @@ impl HttpFrontend {
                         directive,
                         &header_pairs,
                     )?;
+                    // Apply tagging based on directive
+                    let dst_vid = Some(result.version_id);
+                    if tagging_directive == "COPY" {
+                        // Copy source object's tags to destination
+                        if let Some(src_tags) = self.coordinator.get_object_tags(
+                            &src_bucket,
+                            &src_key,
+                            src_version_id,
+                        )? {
+                            self.coordinator
+                                .put_object_tags(&bucket, &key, dst_vid, &src_tags)?;
+                        }
+                    } else if let Some(tags_xml) = inline_tags_xml {
+                        self.coordinator
+                            .put_object_tags(&bucket, &key, dst_vid, &tags_xml)?;
+                    }
                     Ok(S3Response::copy_object(&result))
                 } else {
                     // Normal PutObject path
                     self.authorize_bucket_write(auth, &bucket)?;
                     validate_checksum_headers(req)?;
+                    // Parse inline tags before writing so invalid tags don't leave orphan objects
+                    let inline_tags_xml = if let Some(tagging_header) = req.header("x-amz-tagging")
+                    {
+                        let tags = xml::parse_url_encoded_tags(tagging_header)?;
+                        if tags.is_empty() {
+                            None
+                        } else {
+                            Some(xml::get_tagging_xml(&tags))
+                        }
+                    } else {
+                        None
+                    };
                     let header_pairs: Vec<(&str, &str)> = req
                         .headers
                         .iter()
@@ -357,6 +408,14 @@ impl HttpFrontend {
                         &header_pairs,
                         &cond,
                     )?;
+                    if let Some(tags_xml) = inline_tags_xml {
+                        self.coordinator.put_object_tags(
+                            &bucket,
+                            &key,
+                            Some(result.version_id),
+                            &tags_xml,
+                        )?;
+                    }
                     let mut resp = S3Response::put_object(&result);
                     append_checksum_response_headers(&mut resp, req);
                     Ok(resp)
@@ -365,14 +424,27 @@ impl HttpFrontend {
             S3Operation::GetObject { bucket, key } => {
                 self.authorize_bucket_read(auth, &bucket)?;
                 let cond = read_condition_from_headers(req);
-                let vid = parse_version_id(req);
+                let vid = parse_version_id(req)?;
                 if let Some(range_header) = req.header("range") {
                     let byte_range = crate::range::ByteRange::parse(range_header)?;
                     match self
                         .coordinator
                         .get_object_range(&bucket, &key, vid, byte_range, &cond)
                     {
-                        Ok(result) => Ok(S3Response::get_object_range(result)),
+                        Ok(result) => {
+                            let tags = result.tags.clone();
+                            let mut resp = S3Response::get_object_range(result);
+                            if let Some(tags_xml) = tags {
+                                let count = xml::count_tags_in_xml(&tags_xml);
+                                if count > 0 {
+                                    resp.headers.push((
+                                        "x-amz-tagging-count".to_string(),
+                                        count.to_string(),
+                                    ));
+                                }
+                            }
+                            Ok(resp)
+                        }
                         Err(ServerError::InvalidRange { total_size }) => {
                             Ok(S3Response::range_not_satisfiable(total_size))
                         }
@@ -381,25 +453,43 @@ impl HttpFrontend {
                 } else {
                     let result = self.coordinator.get_object(&bucket, &key, vid, &cond)?;
                     let checksum_mode = req.header("x-amz-checksum-mode");
+                    let tags = result.tags.clone();
                     let mut resp = S3Response::get_object(result, checksum_mode);
                     apply_response_overrides(&mut resp, req);
+                    // Add x-amz-tagging-count if the object has tags
+                    if let Some(tags_xml) = tags {
+                        let count = xml::count_tags_in_xml(&tags_xml);
+                        if count > 0 {
+                            resp.headers
+                                .push(("x-amz-tagging-count".to_string(), count.to_string()));
+                        }
+                    }
                     Ok(resp)
                 }
             }
             S3Operation::DeleteObject { bucket, key } => {
                 self.authorize_bucket_write(auth, &bucket)?;
                 let cond = delete_condition_from_headers(req);
-                let vid = parse_version_id(req);
+                let vid = parse_version_id(req)?;
                 let result = self.coordinator.delete_object(&bucket, &key, vid, &cond)?;
                 Ok(S3Response::delete_object(&result))
             }
             S3Operation::HeadObject { bucket, key } => {
                 self.authorize_bucket_read(auth, &bucket)?;
                 let cond = read_condition_from_headers(req);
-                let vid = parse_version_id(req);
+                let vid = parse_version_id(req)?;
                 let result = self.coordinator.head_object(&bucket, &key, vid, &cond)?;
                 let checksum_mode = req.header("x-amz-checksum-mode");
-                Ok(S3Response::head_object(&result, checksum_mode))
+                let mut resp = S3Response::head_object(&result, checksum_mode);
+                // Add x-amz-tagging-count if the object has tags
+                if let Some(tags_xml) = &result.tags {
+                    let count = xml::count_tags_in_xml(tags_xml);
+                    if count > 0 {
+                        resp.headers
+                            .push(("x-amz-tagging-count".to_string(), count.to_string()));
+                    }
+                }
+                Ok(resp)
             }
             S3Operation::DeleteObjects { bucket } => {
                 self.authorize_bucket_write(auth, &bucket)?;
@@ -441,6 +531,54 @@ impl HttpFrontend {
                 self.authorize_bucket_write(auth, &bucket)?;
                 self.coordinator.delete_bucket_cors(&bucket)?;
                 Ok(S3Response::delete_bucket_cors())
+            }
+            S3Operation::PutBucketTagging { bucket } => {
+                self.authorize_bucket_write(auth, &bucket)?;
+                let tags = xml::parse_tagging_xml(&req.body, 50)?;
+                let tags_xml = xml::get_tagging_xml(&tags);
+                self.coordinator.put_bucket_tags(&bucket, &tags_xml)?;
+                Ok(S3Response::put_bucket_tagging())
+            }
+            S3Operation::GetBucketTagging { bucket } => {
+                self.authorize_bucket_read(auth, &bucket)?;
+                match self.coordinator.get_bucket_tags(&bucket)? {
+                    Some(tags_xml) => Ok(S3Response::get_bucket_tagging(&tags_xml)),
+                    None => Err(ServerError::NoSuchTagSet {
+                        resource: bucket.clone(),
+                    }),
+                }
+            }
+            S3Operation::DeleteBucketTagging { bucket } => {
+                self.authorize_bucket_write(auth, &bucket)?;
+                self.coordinator.delete_bucket_tags(&bucket)?;
+                Ok(S3Response::delete_bucket_tagging())
+            }
+            S3Operation::PutObjectTagging { bucket, key } => {
+                self.authorize_bucket_write(auth, &bucket)?;
+                let vid = parse_version_id(req)?;
+                let tags = xml::parse_tagging_xml(&req.body, 10)?;
+                let tags_xml = xml::get_tagging_xml(&tags);
+                self.coordinator
+                    .put_object_tags(&bucket, &key, vid, &tags_xml)?;
+                Ok(S3Response::put_object_tagging())
+            }
+            S3Operation::GetObjectTagging { bucket, key } => {
+                self.authorize_bucket_read(auth, &bucket)?;
+                let vid = parse_version_id(req)?;
+                match self.coordinator.get_object_tags(&bucket, &key, vid)? {
+                    Some(tags_xml) => Ok(S3Response::get_object_tagging(&tags_xml)),
+                    None => {
+                        // S3 returns empty TagSet (not 404) for objects with no tags
+                        let empty = xml::get_tagging_xml(&[]);
+                        Ok(S3Response::get_object_tagging(&empty))
+                    }
+                }
+            }
+            S3Operation::DeleteObjectTagging { bucket, key } => {
+                self.authorize_bucket_write(auth, &bucket)?;
+                let vid = parse_version_id(req)?;
+                self.coordinator.delete_object_tags(&bucket, &key, vid)?;
+                Ok(S3Response::delete_object_tagging())
             }
             // OptionsRequest is handled before auth in handle_s3_request
             S3Operation::OptionsRequest { .. } => {

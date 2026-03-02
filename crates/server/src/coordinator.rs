@@ -39,6 +39,7 @@ pub struct GetObjectResult {
     pub size: u64,
     pub last_modified: u64,
     pub version_id: u64,
+    pub tags: Option<String>,
 }
 
 /// Result of a HeadObject operation.
@@ -49,6 +50,7 @@ pub struct HeadObjectResult {
     pub size: u64,
     pub last_modified: u64,
     pub version_id: u64,
+    pub tags: Option<String>,
 }
 
 /// Result of a range GetObject operation (206 Partial Content).
@@ -62,6 +64,7 @@ pub struct GetObjectRangeResult {
     pub range_start: u64,
     pub range_end: u64,
     pub version_id: u64,
+    pub tags: Option<String>,
 }
 
 /// Metadata handling directive for `CopyObject`.
@@ -78,6 +81,7 @@ pub enum MetadataDirective {
 pub struct CopyObjectResult {
     pub etag: String,
     pub last_modified: u64,
+    pub version_id: u64,
 }
 
 /// Object entry for listing.
@@ -304,6 +308,115 @@ impl Coordinator {
                 }
                 other => ServerError::Metadata(other),
             })
+    }
+
+    // ── Bucket tagging ────────────────────────────────────────────────
+
+    pub fn put_bucket_tags(&self, name: &str, tags: &str) -> Result<(), ServerError> {
+        self.head_bucket(name)?;
+        self.bucket_db
+            .put_bucket_tags(name, tags)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => {
+                    ServerError::BucketNotFound { name }
+                }
+                other => ServerError::Metadata(other),
+            })
+    }
+
+    pub fn get_bucket_tags(&self, name: &str) -> Result<Option<String>, ServerError> {
+        self.head_bucket(name)?;
+        self.bucket_db.get_bucket_tags(name).map_err(|e| match e {
+            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound { name },
+            other => ServerError::Metadata(other),
+        })
+    }
+
+    pub fn delete_bucket_tags(&self, name: &str) -> Result<(), ServerError> {
+        self.head_bucket(name)?;
+        self.bucket_db
+            .delete_bucket_tags(name)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => {
+                    ServerError::BucketNotFound { name }
+                }
+                other => ServerError::Metadata(other),
+            })
+    }
+
+    // ── Object tagging ──────────────────────────────────────────────
+
+    pub fn put_object_tags(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<u64>,
+        tags: &str,
+    ) -> Result<(), ServerError> {
+        self.head_bucket(bucket)?;
+        let pg_id = derive_pg(bucket, key, self.pg_count);
+        let pg = self.storage_node.get_pg(pg_id)?;
+        let record = match version_id {
+            Some(vid) => pg.get_object_version(bucket, key, vid),
+            None => pg.get_object_meta(bucket, key),
+        }
+        .map_err(|e| match e {
+            storage::MetadataError::ObjectNotFound => ServerError::ObjectNotFound {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+            },
+            other => ServerError::Metadata(other),
+        })?;
+        pg.put_object_tags(bucket, key, record.version_id, tags)
+            .map_err(ServerError::Metadata)
+    }
+
+    pub fn get_object_tags(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<u64>,
+    ) -> Result<Option<String>, ServerError> {
+        self.head_bucket(bucket)?;
+        let pg_id = derive_pg(bucket, key, self.pg_count);
+        let pg = self.storage_node.get_pg(pg_id)?;
+        let record = match version_id {
+            Some(vid) => pg.get_object_version(bucket, key, vid),
+            None => pg.get_object_meta(bucket, key),
+        }
+        .map_err(|e| match e {
+            storage::MetadataError::ObjectNotFound => ServerError::ObjectNotFound {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+            },
+            other => ServerError::Metadata(other),
+        })?;
+        pg.get_object_tags(bucket, key, record.version_id)
+            .map_err(ServerError::Metadata)
+    }
+
+    pub fn delete_object_tags(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<u64>,
+    ) -> Result<(), ServerError> {
+        self.head_bucket(bucket)?;
+        let pg_id = derive_pg(bucket, key, self.pg_count);
+        let pg = self.storage_node.get_pg(pg_id)?;
+        let record = match version_id {
+            Some(vid) => pg.get_object_version(bucket, key, vid),
+            None => pg.get_object_meta(bucket, key),
+        }
+        .map_err(|e| match e {
+            storage::MetadataError::ObjectNotFound => ServerError::ObjectNotFound {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+            },
+            other => ServerError::Metadata(other),
+        })?;
+        pg.delete_object_tags(bucket, key, record.version_id)
+            .map_err(ServerError::Metadata)
     }
 
     // ── Object operations ─────────────────────────────────────────────
@@ -586,6 +699,7 @@ impl Coordinator {
         Ok(CopyObjectResult {
             etag: put_result.etag,
             last_modified: dst_record.last_modified,
+            version_id: put_result.version_id,
         })
     }
 
@@ -841,6 +955,7 @@ impl Coordinator {
             size: record.size,
             last_modified: record.last_modified,
             version_id: record.version_id,
+            tags: record.tags,
         })
     }
 
@@ -906,6 +1021,7 @@ impl Coordinator {
             size: record.size,
             last_modified: record.last_modified,
             version_id: record.version_id,
+            tags: record.tags,
         })
     }
 
@@ -998,6 +1114,7 @@ impl Coordinator {
             range_start: user_start,
             range_end: user_end,
             version_id: record.version_id,
+            tags: record.tags,
         })
     }
 

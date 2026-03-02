@@ -64,6 +64,12 @@ pub enum ServerError {
 
     #[error("no CORS configuration")]
     NoSuchCorsConfiguration { bucket: String },
+
+    #[error("no such tag set")]
+    NoSuchTagSet { resource: String },
+
+    #[error("invalid tag: {reason}")]
+    InvalidTag { reason: String },
 }
 
 impl ServerError {
@@ -92,6 +98,8 @@ impl ServerError {
             Self::SlowDown => "SlowDown",
             Self::BadDigest => "BadDigest",
             Self::NoSuchCorsConfiguration { .. } => "NoSuchCORSConfiguration",
+            Self::NoSuchTagSet { .. } => "NoSuchTagSet",
+            Self::InvalidTag { .. } => "InvalidTag",
             Self::Store(_) => "InternalError",
             Self::Metadata(_) => "InternalError",
             Self::Ec(_) => "InternalError",
@@ -112,6 +120,8 @@ impl ServerError {
             | Self::InvalidBucketName { .. }
             | Self::BadDigest => 400,
             Self::NoSuchCorsConfiguration { .. } => 404,
+            Self::NoSuchTagSet { .. } => 404,
+            Self::InvalidTag { .. } => 400,
             Self::ObjectTooLarge { .. } => 400,
             Self::MethodNotAllowed => 405,
             Self::InvalidRange { .. } => 416,

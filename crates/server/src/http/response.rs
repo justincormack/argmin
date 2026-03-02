@@ -98,7 +98,12 @@ impl S3Response {
     /// Build a response for a successful CopyObject.
     pub fn copy_object(result: &CopyObjectResult) -> Self {
         let body = xml::copy_object_result_xml(&result.etag, result.last_modified);
-        Self::new(200).xml_body(body)
+        let mut resp = Self::new(200).xml_body(body);
+        if result.version_id != 0 {
+            let vid = format_version_id(result.version_id);
+            resp.headers.push(("x-amz-version-id".to_string(), vid));
+        }
+        resp
     }
 
     /// Build a response for a successful GetObject.
@@ -416,6 +421,36 @@ impl S3Response {
         Self::new(204)
     }
 
+    /// Build a response for PutBucketTagging (200 OK, no body).
+    pub fn put_bucket_tagging() -> Self {
+        Self::new(200)
+    }
+
+    /// Build a response for GetBucketTagging (200 OK, XML body).
+    pub fn get_bucket_tagging(xml: &str) -> Self {
+        Self::new(200).xml_body(xml.to_string())
+    }
+
+    /// Build a response for DeleteBucketTagging (204 No Content).
+    pub fn delete_bucket_tagging() -> Self {
+        Self::new(204)
+    }
+
+    /// Build a response for PutObjectTagging (200 OK, no body).
+    pub fn put_object_tagging() -> Self {
+        Self::new(200)
+    }
+
+    /// Build a response for GetObjectTagging (200 OK, XML body).
+    pub fn get_object_tagging(xml: &str) -> Self {
+        Self::new(200).xml_body(xml.to_string())
+    }
+
+    /// Build a response for DeleteObjectTagging (204 No Content).
+    pub fn delete_object_tagging() -> Self {
+        Self::new(204)
+    }
+
     /// Build a 200 response for a CORS preflight (headers added by caller).
     pub fn cors_preflight() -> Self {
         Self::new(200)
@@ -639,6 +674,7 @@ mod tests {
             size: 5,
             last_modified: 0,
             version_id: 0,
+            tags: None,
         };
         let resp = S3Response::get_object(result, None);
         assert_eq!(resp.status_code, 200);
@@ -655,6 +691,7 @@ mod tests {
             size: 4,
             last_modified: 0,
             version_id: 0,
+            tags: None,
         };
         let resp = S3Response::get_object(result, None);
         assert_eq!(
@@ -677,6 +714,7 @@ mod tests {
             size: 0,
             last_modified: 0,
             version_id: 0,
+            tags: None,
         };
         let resp = S3Response::get_object(result, None);
         assert_eq!(find_header(&resp, "x-amz-meta-author"), Some("alice"));
@@ -718,6 +756,7 @@ mod tests {
             size: 0,
             last_modified: 0,
             version_id: 0,
+            tags: None,
         };
         let resp = S3Response::get_object(result, None);
         assert_eq!(find_header(&resp, "Content-Type"), Some("text/html"));
@@ -749,6 +788,7 @@ mod tests {
             size: 1024,
             last_modified: 0,
             version_id: 0,
+            tags: None,
         };
         let resp = S3Response::head_object(&result, None);
         assert_eq!(resp.status_code, 200);
@@ -766,6 +806,7 @@ mod tests {
             size: 0,
             last_modified: 0,
             version_id: 0,
+            tags: None,
         };
         let resp = S3Response::head_object(&result, None);
         assert_eq!(
@@ -793,6 +834,7 @@ mod tests {
             size: 10,
             last_modified: 0,
             version_id: 0,
+            tags: None,
         };
         let resp = S3Response::head_object(&result, None);
         assert_eq!(find_header(&resp, "Content-Encoding"), Some("br"));
@@ -812,6 +854,7 @@ mod tests {
             size: 0,
             last_modified: 0,
             version_id: 0,
+            tags: None,
         };
         let resp = S3Response::head_object(&result, None);
         assert_eq!(find_header(&resp, "x-amz-meta-tag"), Some("value"));
@@ -875,6 +918,7 @@ mod tests {
             versioning: 0,
             public_read: false,
             cors_config: None,
+            tags: None,
         };
         let resp = S3Response::head_bucket(&info);
         assert_eq!(resp.status_code, 200);
@@ -892,6 +936,7 @@ mod tests {
             versioning: 0,
             public_read: false,
             cors_config: None,
+            tags: None,
         }];
         let resp = S3Response::list_buckets(&buckets, "owner");
         assert_eq!(resp.status_code, 200);

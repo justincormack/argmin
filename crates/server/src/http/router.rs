@@ -22,6 +22,12 @@ pub enum S3Operation {
     PutBucketCors { bucket: String },
     GetBucketCors { bucket: String },
     DeleteBucketCors { bucket: String },
+    PutBucketTagging { bucket: String },
+    GetBucketTagging { bucket: String },
+    DeleteBucketTagging { bucket: String },
+    PutObjectTagging { bucket: String, key: String },
+    GetObjectTagging { bucket: String, key: String },
+    DeleteObjectTagging { bucket: String, key: String },
     OptionsRequest { bucket: String, key: Option<String> },
 }
 
@@ -171,12 +177,20 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
         ("PUT", None) if has_query_key(query, "cors") => Ok(S3Operation::PutBucketCors {
             bucket: bucket.to_string(),
         }),
+        ("PUT", None) if has_query_key(query, "tagging") => Ok(S3Operation::PutBucketTagging {
+            bucket: bucket.to_string(),
+        }),
         ("PUT", None) => Ok(S3Operation::CreateBucket {
             bucket: bucket.to_string(),
         }),
         ("DELETE", None) if has_query_key(query, "cors") => Ok(S3Operation::DeleteBucketCors {
             bucket: bucket.to_string(),
         }),
+        ("DELETE", None) if has_query_key(query, "tagging") => {
+            Ok(S3Operation::DeleteBucketTagging {
+                bucket: bucket.to_string(),
+            })
+        }
         ("DELETE", None) => Ok(S3Operation::DeleteBucket {
             bucket: bucket.to_string(),
         }),
@@ -187,6 +201,12 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
             // Check for ?cors → GetBucketCors
             if has_query_key(query, "cors") {
                 return Ok(S3Operation::GetBucketCors {
+                    bucket: bucket.to_string(),
+                });
+            }
+            // Check for ?tagging → GetBucketTagging
+            if has_query_key(query, "tagging") {
+                return Ok(S3Operation::GetBucketTagging {
                     bucket: bucket.to_string(),
                 });
             }
@@ -229,6 +249,26 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
                     bucket: bucket.to_string(),
                 })
             }
+        }
+
+        // Object-level tagging (must appear before catch-all)
+        ("PUT", Some(key)) if has_query_key(query, "tagging") => {
+            Ok(S3Operation::PutObjectTagging {
+                bucket: bucket.to_string(),
+                key,
+            })
+        }
+        ("GET", Some(key)) if has_query_key(query, "tagging") => {
+            Ok(S3Operation::GetObjectTagging {
+                bucket: bucket.to_string(),
+                key,
+            })
+        }
+        ("DELETE", Some(key)) if has_query_key(query, "tagging") => {
+            Ok(S3Operation::DeleteObjectTagging {
+                bucket: bucket.to_string(),
+                key,
+            })
         }
 
         // Object-level operations

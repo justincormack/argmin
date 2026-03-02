@@ -83,6 +83,31 @@ pub trait PgMetadataStore {
     ///
     /// Returns 1 if no versions exist.
     fn next_version_id(&self, bucket: &str, key: &str) -> Result<u64, MetadataError>;
+
+    /// Store tags for an object version (serialized XML string).
+    fn put_object_tags(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: u64,
+        tags: &str,
+    ) -> Result<(), MetadataError>;
+
+    /// Retrieve tags for an object version. Returns None if not set.
+    fn get_object_tags(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: u64,
+    ) -> Result<Option<String>, MetadataError>;
+
+    /// Delete tags for an object version. Idempotent.
+    fn delete_object_tags(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: u64,
+    ) -> Result<(), MetadataError>;
 }
 
 /// Global metadata service (bucket table).
@@ -121,6 +146,15 @@ pub trait GlobalService {
 
     /// Delete a bucket's CORS configuration. Idempotent.
     fn delete_bucket_cors(&self, name: &str) -> Result<(), MetadataError>;
+
+    /// Store tags for a bucket (serialized XML string).
+    fn put_bucket_tags(&self, name: &str, tags: &str) -> Result<(), MetadataError>;
+
+    /// Retrieve a bucket's tags. Returns None if not set.
+    fn get_bucket_tags(&self, name: &str) -> Result<Option<String>, MetadataError>;
+
+    /// Delete a bucket's tags. Idempotent.
+    fn delete_bucket_tags(&self, name: &str) -> Result<(), MetadataError>;
 }
 
 /// Multiplexes across PG stores on a single node.

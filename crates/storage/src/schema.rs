@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS objects (
     ec_k          INTEGER NOT NULL,
     ec_m          INTEGER NOT NULL,
     status        INTEGER NOT NULL DEFAULT 0,
+    tags          TEXT,
     PRIMARY KEY (bucket, key, version_id)
 )";
 
@@ -47,7 +48,8 @@ CREATE TABLE IF NOT EXISTS buckets (
     region           INTEGER NOT NULL DEFAULT 0,
     versioning       INTEGER NOT NULL DEFAULT 0,
     public_read      INTEGER NOT NULL DEFAULT 0,
-    cors_config      TEXT
+    cors_config      TEXT,
+    tags             TEXT
 )";
 
 /// SQLite pragmas for per-PG databases: WAL mode, NORMAL synchronous.

@@ -334,9 +334,19 @@ pub fn parse_delete_objects_xml(
 
 /// Extract the text content of a simple XML tag (no attributes, no nesting).
 fn extract_tag_content<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
-    let open = format!("<{}>", tag);
     let close = format!("</{}>", tag);
-    let start = xml.find(&open)? + open.len();
+    // Try exact match first: <Tag>
+    let open_exact = format!("<{}>", tag);
+    if let Some(pos) = xml.find(&open_exact) {
+        let start = pos + open_exact.len();
+        let end = xml[start..].find(&close)? + start;
+        return Some(&xml[start..end]);
+    }
+    // Try match with attributes: <Tag ...>
+    let open_prefix = format!("<{} ", tag);
+    let pos = xml.find(&open_prefix)?;
+    let gt = xml[pos..].find('>')? + pos;
+    let start = gt + 1;
     let end = xml[start..].find(&close)? + start;
     Some(&xml[start..end])
 }
@@ -623,7 +633,10 @@ pub fn parse_cors_config_xml(data: &[u8]) -> Result<crate::cors::CorsConfigurati
         let block = &text[abs_start..abs_start + end];
 
         // Parse AllowedOrigin (1+ required)
-        let allowed_origins = extract_all_tag_contents(block, "AllowedOrigin");
+        let allowed_origins: Vec<String> = extract_all_tag_contents(block, "AllowedOrigin")
+            .into_iter()
+            .map(|s| xml_unescape(&s))
+            .collect();
         if allowed_origins.is_empty() {
             return Err(ServerError::InvalidRequest {
                 reason: "CORSRule missing <AllowedOrigin> element".to_string(),
@@ -631,7 +644,10 @@ pub fn parse_cors_config_xml(data: &[u8]) -> Result<crate::cors::CorsConfigurati
         }
 
         // Parse AllowedMethod (1+ required)
-        let allowed_methods = extract_all_tag_contents(block, "AllowedMethod");
+        let allowed_methods: Vec<String> = extract_all_tag_contents(block, "AllowedMethod")
+            .into_iter()
+            .map(|s| xml_unescape(&s))
+            .collect();
         if allowed_methods.is_empty() {
             return Err(ServerError::InvalidRequest {
                 reason: "CORSRule missing <AllowedMethod> element".to_string(),
@@ -646,10 +662,16 @@ pub fn parse_cors_config_xml(data: &[u8]) -> Result<crate::cors::CorsConfigurati
         }
 
         // Parse AllowedHeader (0+)
-        let allowed_headers = extract_all_tag_contents(block, "AllowedHeader");
+        let allowed_headers: Vec<String> = extract_all_tag_contents(block, "AllowedHeader")
+            .into_iter()
+            .map(|s| xml_unescape(&s))
+            .collect();
 
         // Parse ExposeHeader (0+)
-        let expose_headers = extract_all_tag_contents(block, "ExposeHeader");
+        let expose_headers: Vec<String> = extract_all_tag_contents(block, "ExposeHeader")
+            .into_iter()
+            .map(|s| xml_unescape(&s))
+            .collect();
 
         // Parse MaxAgeSeconds (0 or 1)
         let max_age_seconds = extract_tag_content(block, "MaxAgeSeconds")
@@ -741,7 +763,7 @@ fn extract_all_tag_contents(xml: &str, tag: &str) -> Vec<String> {
     while let Some(start_pos) = xml[search_from..].find(&open) {
         let abs_start = search_from + start_pos + open.len();
         if let Some(end_pos) = xml[abs_start..].find(&close) {
-            results.push(xml_unescape(&xml[abs_start..abs_start + end_pos]));
+            results.push(xml[abs_start..abs_start + end_pos].to_string());
             search_from = abs_start + end_pos + close.len();
         } else {
             break;
@@ -798,6 +820,216 @@ fn days_to_date(days: i64) -> (i64, u32, u32) {
     (y, m, d)
 }
 
+/// Parse a `<Tagging>` XML request body into a list of (key, value) pairs.
+///
+/// Validates S3 constraints: key 1–128 chars, value 0–256 chars,
+/// unique keys, no `aws:` key prefix.
+///
+/// `max_tags` sets the limit: 10 for object tags, 50 for bucket tags.
+pub fn parse_tagging_xml(
+    data: &[u8],
+    max_tags: usize,
+) -> Result<Vec<(String, String)>, ServerError> {
+    let text = std::str::from_utf8(data).map_err(|_| ServerError::InvalidRequest {
+        reason: "invalid UTF-8 in tagging XML body".to_string(),
+    })?;
+
+    // Require both wrapper elements
+    let tagging_block =
+        extract_tag_content(text, "Tagging").ok_or(ServerError::InvalidRequest {
+            reason: "missing <Tagging> element in tagging XML".to_string(),
+        })?;
+    let tag_set =
+        extract_tag_content(tagging_block, "TagSet").ok_or(ServerError::InvalidRequest {
+            reason: "missing <TagSet> element in tagging XML".to_string(),
+        })?;
+
+    // Extract all <Tag> blocks
+    let tag_blocks = extract_all_tag_contents(tag_set, "Tag");
+
+    if tag_blocks.len() > max_tags {
+        return Err(ServerError::InvalidTag {
+            reason: format!(
+                "tags cannot be greater than {}, got {}",
+                max_tags,
+                tag_blocks.len()
+            ),
+        });
+    }
+
+    let mut tags = Vec::with_capacity(tag_blocks.len());
+    let mut seen_keys = std::collections::HashSet::new();
+
+    for block in &tag_blocks {
+        let key = extract_tag_content(block, "Key").ok_or(ServerError::InvalidTag {
+            reason: "missing <Key> element in <Tag>".to_string(),
+        })?;
+        let key = xml_unescape(key);
+
+        let key_chars = key.chars().count();
+        if key_chars == 0 || key_chars > 128 {
+            return Err(ServerError::InvalidTag {
+                reason: format!("tag key must be 1-128 characters, got {}", key_chars),
+            });
+        }
+        if key.starts_with("aws:") {
+            return Err(ServerError::InvalidTag {
+                reason: "tag key must not start with 'aws:'".to_string(),
+            });
+        }
+
+        let value = extract_tag_content(block, "Value").unwrap_or("");
+        let value = xml_unescape(value);
+
+        let value_chars = value.chars().count();
+        if value_chars > 256 {
+            return Err(ServerError::InvalidTag {
+                reason: format!("tag value must be 0-256 characters, got {}", value_chars),
+            });
+        }
+
+        if !seen_keys.insert(key.clone()) {
+            return Err(ServerError::InvalidTag {
+                reason: format!("duplicate tag key: {}", key),
+            });
+        }
+
+        tags.push((key, value));
+    }
+
+    Ok(tags)
+}
+
+/// Serialize a list of (key, value) tag pairs into S3 tagging XML.
+pub fn get_tagging_xml(tags: &[(String, String)]) -> String {
+    let mut xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <Tagging xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><TagSet>",
+    );
+    for (k, v) in tags {
+        xml.push_str("<Tag><Key>");
+        xml.push_str(&xml_escape(k));
+        xml.push_str("</Key><Value>");
+        xml.push_str(&xml_escape(v));
+        xml.push_str("</Value></Tag>");
+    }
+    xml.push_str("</TagSet></Tagging>");
+    xml
+}
+
+/// Parse URL-encoded tags from the `x-amz-tagging` header.
+///
+/// Format: `key1=value1&key2=value2`
+/// Applies the same S3 validation constraints as `parse_tagging_xml`.
+pub fn parse_url_encoded_tags(input: &str) -> Result<Vec<(String, String)>, ServerError> {
+    if input.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut tags = Vec::new();
+    let mut seen_keys = std::collections::HashSet::new();
+
+    for pair in input.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (raw_key, raw_value) = match pair.find('=') {
+            Some(pos) => (&pair[..pos], &pair[pos + 1..]),
+            None => (pair, ""),
+        };
+
+        let key = percent_decode_tag(raw_key)?;
+        let value = percent_decode_tag(raw_value)?;
+
+        let key_chars = key.chars().count();
+        if key_chars == 0 || key_chars > 128 {
+            return Err(ServerError::InvalidTag {
+                reason: format!("tag key must be 1-128 characters, got {}", key_chars),
+            });
+        }
+        if key.starts_with("aws:") {
+            return Err(ServerError::InvalidTag {
+                reason: "tag key must not start with 'aws:'".to_string(),
+            });
+        }
+        let value_chars = value.chars().count();
+        if value_chars > 256 {
+            return Err(ServerError::InvalidTag {
+                reason: format!("tag value must be 0-256 characters, got {}", value_chars),
+            });
+        }
+
+        if !seen_keys.insert(key.clone()) {
+            return Err(ServerError::InvalidTag {
+                reason: format!("duplicate tag key: {}", key),
+            });
+        }
+
+        tags.push((key, value));
+    }
+
+    if tags.len() > 10 {
+        return Err(ServerError::InvalidTag {
+            reason: format!("Object tags cannot be greater than 10, got {}", tags.len()),
+        });
+    }
+
+    Ok(tags)
+}
+
+/// Count the number of tags in a stored tagging XML string.
+pub fn count_tags_in_xml(xml: &str) -> usize {
+    let tag_set = extract_tag_content(xml, "TagSet").unwrap_or("");
+    extract_all_tag_contents(tag_set, "Tag").len()
+}
+
+/// Percent-decode a tag key or value from URL-encoded form.
+///
+/// Collects decoded bytes first, then converts to UTF-8, so multibyte
+/// percent-encoded sequences (e.g. `%C3%A9` for `é`) decode correctly.
+fn percent_decode_tag(input: &str) -> Result<String, ServerError> {
+    let mut bytes = Vec::with_capacity(input.len());
+    let mut iter = input.bytes();
+    while let Some(b) = iter.next() {
+        if b == b'+' {
+            bytes.push(b' ');
+        } else if b == b'%' {
+            let hi = iter.next().ok_or(ServerError::InvalidTag {
+                reason: "incomplete percent-encoding in tag".to_string(),
+            })?;
+            let lo = iter.next().ok_or(ServerError::InvalidTag {
+                reason: "incomplete percent-encoding in tag".to_string(),
+            })?;
+            let byte = decode_hex_pair(hi, lo).ok_or(ServerError::InvalidTag {
+                reason: "invalid percent-encoding in tag".to_string(),
+            })?;
+            bytes.push(byte);
+        } else {
+            bytes.push(b);
+        }
+    }
+    String::from_utf8(bytes).map_err(|_| ServerError::InvalidTag {
+        reason: "invalid UTF-8 in percent-decoded tag".to_string(),
+    })
+}
+
+/// Decode a pair of hex characters into a byte.
+fn decode_hex_pair(hi: u8, lo: u8) -> Option<u8> {
+    let h = match hi {
+        b'0'..=b'9' => hi - b'0',
+        b'a'..=b'f' => hi - b'a' + 10,
+        b'A'..=b'F' => hi - b'A' + 10,
+        _ => return None,
+    };
+    let l = match lo {
+        b'0'..=b'9' => lo - b'0',
+        b'a'..=b'f' => lo - b'a' + 10,
+        b'A'..=b'F' => lo - b'A' + 10,
+        _ => return None,
+    };
+    Some(h << 4 | l)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -826,6 +1058,7 @@ mod tests {
             versioning: 0,
             public_read: false,
             cors_config: None,
+            tags: None,
         }];
         let xml = list_buckets_xml(&buckets, "owner");
         assert!(xml.contains("<Name>test-bucket</Name>"));
@@ -1410,5 +1643,206 @@ mod tests {
                 "http://*.example.com"
             ]
         );
+    }
+
+    // ── Tagging XML ─────────────────────────────────────────────────
+
+    #[test]
+    fn parse_tagging_xml_basic() {
+        let xml =
+            b"<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag></TagSet></Tagging>";
+        let tags = parse_tagging_xml(xml, 10).unwrap();
+        assert_eq!(tags, vec![("env".to_string(), "prod".to_string())]);
+    }
+
+    #[test]
+    fn parse_tagging_xml_multiple() {
+        let xml = b"<Tagging><TagSet>\
+            <Tag><Key>k1</Key><Value>v1</Value></Tag>\
+            <Tag><Key>k2</Key><Value>v2</Value></Tag>\
+            </TagSet></Tagging>";
+        let tags = parse_tagging_xml(xml, 10).unwrap();
+        assert_eq!(tags.len(), 2);
+        assert_eq!(tags[0], ("k1".to_string(), "v1".to_string()));
+        assert_eq!(tags[1], ("k2".to_string(), "v2".to_string()));
+    }
+
+    #[test]
+    fn parse_tagging_xml_empty_value() {
+        let xml = b"<Tagging><TagSet><Tag><Key>k</Key><Value></Value></Tag></TagSet></Tagging>";
+        let tags = parse_tagging_xml(xml, 10).unwrap();
+        assert_eq!(tags, vec![("k".to_string(), String::new())]);
+    }
+
+    #[test]
+    fn parse_tagging_xml_empty_tagset() {
+        let xml = b"<Tagging><TagSet></TagSet></Tagging>";
+        let tags = parse_tagging_xml(xml, 10).unwrap();
+        assert!(tags.is_empty());
+    }
+
+    #[test]
+    fn parse_tagging_xml_too_many() {
+        let mut xml = String::from("<Tagging><TagSet>");
+        for i in 0..11 {
+            xml.push_str(&format!("<Tag><Key>k{i}</Key><Value>v</Value></Tag>"));
+        }
+        xml.push_str("</TagSet></Tagging>");
+        let err = parse_tagging_xml(xml.as_bytes(), 10).unwrap_err();
+        assert!(matches!(err, ServerError::InvalidTag { .. }));
+    }
+
+    #[test]
+    fn parse_tagging_xml_key_too_long() {
+        let long_key = "k".repeat(129);
+        let xml = format!(
+            "<Tagging><TagSet><Tag><Key>{long_key}</Key><Value>v</Value></Tag></TagSet></Tagging>"
+        );
+        let err = parse_tagging_xml(xml.as_bytes(), 10).unwrap_err();
+        assert!(matches!(err, ServerError::InvalidTag { .. }));
+    }
+
+    #[test]
+    fn parse_tagging_xml_value_too_long() {
+        let long_val = "v".repeat(257);
+        let xml = format!(
+            "<Tagging><TagSet><Tag><Key>k</Key><Value>{long_val}</Value></Tag></TagSet></Tagging>"
+        );
+        let err = parse_tagging_xml(xml.as_bytes(), 10).unwrap_err();
+        assert!(matches!(err, ServerError::InvalidTag { .. }));
+    }
+
+    #[test]
+    fn parse_tagging_xml_duplicate_keys() {
+        let xml = b"<Tagging><TagSet>\
+            <Tag><Key>k</Key><Value>v1</Value></Tag>\
+            <Tag><Key>k</Key><Value>v2</Value></Tag>\
+            </TagSet></Tagging>";
+        let err = parse_tagging_xml(xml, 10).unwrap_err();
+        assert!(matches!(err, ServerError::InvalidTag { .. }));
+    }
+
+    #[test]
+    fn parse_tagging_xml_aws_prefix() {
+        let xml = b"<Tagging><TagSet><Tag><Key>aws:internal</Key><Value>v</Value></Tag></TagSet></Tagging>";
+        let err = parse_tagging_xml(xml, 10).unwrap_err();
+        assert!(matches!(err, ServerError::InvalidTag { .. }));
+    }
+
+    #[test]
+    fn parse_tagging_xml_missing_tagging_element() {
+        let xml = b"<TagSet><Tag><Key>k</Key><Value>v</Value></Tag></TagSet>";
+        let err = parse_tagging_xml(xml, 10).unwrap_err();
+        assert!(matches!(err, ServerError::InvalidRequest { .. }));
+    }
+
+    #[test]
+    fn parse_tagging_xml_missing_tagset_element() {
+        let xml = b"<Tagging><Tag><Key>k</Key><Value>v</Value></Tag></Tagging>";
+        let err = parse_tagging_xml(xml, 10).unwrap_err();
+        assert!(matches!(err, ServerError::InvalidRequest { .. }));
+    }
+
+    #[test]
+    fn get_tagging_xml_round_trip() {
+        let tags = vec![
+            ("env".to_string(), "prod".to_string()),
+            ("team".to_string(), "platform".to_string()),
+        ];
+        let xml = get_tagging_xml(&tags);
+        let parsed = parse_tagging_xml(xml.as_bytes(), 10).unwrap();
+        assert_eq!(parsed, tags);
+    }
+
+    #[test]
+    fn get_tagging_xml_empty() {
+        let xml = get_tagging_xml(&[]);
+        assert!(xml.contains("<TagSet></TagSet>"));
+        let parsed = parse_tagging_xml(xml.as_bytes(), 10).unwrap();
+        assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn get_tagging_xml_escapes_special_chars() {
+        let tags = vec![("k&1".to_string(), "v<2>".to_string())];
+        let xml = get_tagging_xml(&tags);
+        assert!(xml.contains("k&amp;1"));
+        assert!(xml.contains("v&lt;2&gt;"));
+        let parsed = parse_tagging_xml(xml.as_bytes(), 10).unwrap();
+        assert_eq!(parsed, tags);
+    }
+
+    // ── URL-encoded tags ────────────────────────────────────────────
+
+    #[test]
+    fn parse_url_encoded_tags_basic() {
+        let tags = parse_url_encoded_tags("key1=value1&key2=value2").unwrap();
+        assert_eq!(tags.len(), 2);
+        assert_eq!(tags[0], ("key1".to_string(), "value1".to_string()));
+        assert_eq!(tags[1], ("key2".to_string(), "value2".to_string()));
+    }
+
+    #[test]
+    fn parse_url_encoded_tags_empty() {
+        let tags = parse_url_encoded_tags("").unwrap();
+        assert!(tags.is_empty());
+    }
+
+    #[test]
+    fn parse_url_encoded_tags_percent_encoded() {
+        let tags = parse_url_encoded_tags("k%201=v%201").unwrap();
+        assert_eq!(tags[0], ("k 1".to_string(), "v 1".to_string()));
+    }
+
+    #[test]
+    fn parse_url_encoded_tags_plus_as_space() {
+        let tags = parse_url_encoded_tags("k+1=v+1").unwrap();
+        assert_eq!(tags[0], ("k 1".to_string(), "v 1".to_string()));
+    }
+
+    #[test]
+    fn parse_url_encoded_tags_too_many() {
+        let input: String = (0..11)
+            .map(|i| format!("k{i}=v{i}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        let err = parse_url_encoded_tags(&input).unwrap_err();
+        assert!(matches!(err, ServerError::InvalidTag { .. }));
+    }
+
+    #[test]
+    fn parse_url_encoded_tags_empty_value() {
+        let tags = parse_url_encoded_tags("k=").unwrap();
+        assert_eq!(tags[0], ("k".to_string(), String::new()));
+    }
+
+    #[test]
+    fn parse_url_encoded_tags_multibyte_utf8() {
+        // é = U+00E9 = 0xC3 0xA9 in UTF-8
+        let tags = parse_url_encoded_tags("caf%C3%A9=cr%C3%A8me").unwrap();
+        assert_eq!(tags[0].0, "café");
+        assert_eq!(tags[0].1, "crème");
+    }
+
+    #[test]
+    fn parse_url_encoded_tags_invalid_utf8() {
+        // 0xFF is not valid in any UTF-8 sequence
+        let err = parse_url_encoded_tags("k=%FF").unwrap_err();
+        assert!(matches!(err, ServerError::InvalidTag { .. }));
+    }
+
+    #[test]
+    fn count_tags_basic() {
+        let xml = get_tagging_xml(&[
+            ("a".to_string(), "1".to_string()),
+            ("b".to_string(), "2".to_string()),
+        ]);
+        assert_eq!(count_tags_in_xml(&xml), 2);
+    }
+
+    #[test]
+    fn count_tags_empty() {
+        let xml = get_tagging_xml(&[]);
+        assert_eq!(count_tags_in_xml(&xml), 0);
     }
 }

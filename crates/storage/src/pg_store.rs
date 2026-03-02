@@ -391,7 +391,7 @@ impl PgMetadataStore for PgStore {
         self.conn
             .query_row(
                 "SELECT bucket, key, version_id, size, total_size, etag, etag_kind, \
-                 last_modified, storage_class, ec_k, ec_m, status \
+                 last_modified, storage_class, ec_k, ec_m, status, tags \
                  FROM objects WHERE bucket = ?1 AND key = ?2 \
                  ORDER BY last_modified DESC, version_id DESC LIMIT 1",
                 params![bucket, key],
@@ -409,6 +409,7 @@ impl PgMetadataStore for PgStore {
                         ec_k: row.get::<_, u8>(9)?,
                         ec_m: row.get::<_, u8>(10)?,
                         status: row.get::<_, u8>(11)?,
+                        tags: row.get(12)?,
                     })
                 },
             )
@@ -429,7 +430,7 @@ impl PgMetadataStore for PgStore {
         self.conn
             .query_row(
                 "SELECT bucket, key, version_id, size, total_size, etag, etag_kind, \
-                 last_modified, storage_class, ec_k, ec_m, status \
+                 last_modified, storage_class, ec_k, ec_m, status, tags \
                  FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
                 params![bucket, key, version_id as i64],
                 |row| {
@@ -446,6 +447,7 @@ impl PgMetadataStore for PgStore {
                         ec_k: row.get::<_, u8>(9)?,
                         ec_m: row.get::<_, u8>(10)?,
                         status: row.get::<_, u8>(11)?,
+                        tags: row.get(12)?,
                     })
                 },
             )
@@ -527,7 +529,7 @@ impl PgMetadataStore for PgStore {
                 GROUP BY bucket, key \
             ) \
             SELECT o.bucket, o.key, o.version_id, o.size, o.total_size, o.etag, o.etag_kind, \
-                   o.last_modified, o.storage_class, o.ec_k, o.ec_m, o.status \
+                   o.last_modified, o.storage_class, o.ec_k, o.ec_m, o.status, o.tags \
             FROM objects o \
             INNER JOIN latest l ON o.bucket = l.bucket AND o.key = l.key AND o.version_id = l.max_vid \
             WHERE {where_str} AND o.status = 0 \
@@ -557,6 +559,7 @@ impl PgMetadataStore for PgStore {
                     ec_k: row.get::<_, u8>(9)?,
                     ec_m: row.get::<_, u8>(10)?,
                     status: row.get::<_, u8>(11)?,
+                    tags: row.get(12)?,
                 })
             })
             .map_err(|e| MetadataError::Db {
@@ -636,7 +639,7 @@ impl PgMetadataStore for PgStore {
 
         let sql = format!(
             "SELECT bucket, key, version_id, size, total_size, etag, etag_kind, \
-             last_modified, storage_class, ec_k, ec_m, status \
+             last_modified, storage_class, ec_k, ec_m, status, tags \
              FROM objects \
              WHERE {where_str} \
              ORDER BY key ASC, version_id DESC LIMIT ?{param_idx}"
@@ -665,6 +668,7 @@ impl PgMetadataStore for PgStore {
                     ec_k: row.get::<_, u8>(9)?,
                     ec_m: row.get::<_, u8>(10)?,
                     status: row.get::<_, u8>(11)?,
+                    tags: row.get(12)?,
                 })
             })
             .map_err(|e| MetadataError::Db {
@@ -718,6 +722,71 @@ impl PgMetadataStore for PgStore {
             .flatten();
 
         Ok(max.map(|v| v as u64 + 1).unwrap_or(1))
+    }
+
+    fn put_object_tags(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: u64,
+        tags: &str,
+    ) -> Result<(), MetadataError> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE objects SET tags = ?1 WHERE bucket = ?2 AND key = ?3 AND version_id = ?4",
+                params![tags, bucket, key, version_id as i64],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "put object tags",
+                source: e,
+            })?;
+        if updated == 0 {
+            return Err(MetadataError::ObjectNotFound);
+        }
+        Ok(())
+    }
+
+    fn get_object_tags(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: u64,
+    ) -> Result<Option<String>, MetadataError> {
+        self.conn
+            .query_row(
+                "SELECT tags FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
+                params![bucket, key, version_id as i64],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| MetadataError::Db {
+                context: "get object tags",
+                source: e,
+            })?
+            .ok_or(MetadataError::ObjectNotFound)
+    }
+
+    fn delete_object_tags(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: u64,
+    ) -> Result<(), MetadataError> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE objects SET tags = NULL WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
+                params![bucket, key, version_id as i64],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "delete object tags",
+                source: e,
+            })?;
+        if updated == 0 {
+            return Err(MetadataError::ObjectNotFound);
+        }
+        Ok(())
     }
 }
 
