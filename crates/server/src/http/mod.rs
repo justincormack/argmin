@@ -221,6 +221,7 @@ impl HttpFrontend {
                 } else {
                     // Normal PutObject path
                     self.authorize_bucket_write(auth, &bucket)?;
+                    validate_checksum_headers(req)?;
                     let header_pairs: Vec<(&str, &str)> = req
                         .headers
                         .iter()
@@ -234,7 +235,9 @@ impl HttpFrontend {
                         &header_pairs,
                         &cond,
                     )?;
-                    Ok(S3Response::put_object(&result))
+                    let mut resp = S3Response::put_object(&result);
+                    append_checksum_response_headers(&mut resp, req);
+                    Ok(resp)
                 }
             }
             S3Operation::GetObject { bucket, key } => {
@@ -255,7 +258,8 @@ impl HttpFrontend {
                     }
                 } else {
                     let result = self.coordinator.get_object(&bucket, &key, vid, &cond)?;
-                    let mut resp = S3Response::get_object(result);
+                    let checksum_mode = req.header("x-amz-checksum-mode");
+                    let mut resp = S3Response::get_object(result, checksum_mode);
                     apply_response_overrides(&mut resp, req);
                     Ok(resp)
                 }
@@ -272,7 +276,8 @@ impl HttpFrontend {
                 let cond = read_condition_from_headers(req);
                 let vid = parse_version_id(req);
                 let result = self.coordinator.head_object(&bucket, &key, vid, &cond)?;
-                Ok(S3Response::head_object(&result))
+                let checksum_mode = req.header("x-amz-checksum-mode");
+                Ok(S3Response::head_object(&result, checksum_mode))
             }
             S3Operation::DeleteObjects { bucket } => {
                 self.authorize_bucket_write(auth, &bucket)?;
@@ -605,6 +610,71 @@ fn parse_max_keys(raw: Option<String>) -> Result<u32, ServerError> {
 }
 
 /// Apply response-* query parameter overrides to a GET response.
+/// Checksum algorithm names and the corresponding header names.
+const CHECKSUM_HEADERS: &[(&str, &str)] = &[
+    ("SHA256", "x-amz-checksum-sha256"),
+    ("CRC64NVME", "x-amz-checksum-crc64nvme"),
+    ("CRC32", "x-amz-checksum-crc32"),
+    ("CRC32C", "x-amz-checksum-crc32c"),
+    ("SHA1", "x-amz-checksum-sha1"),
+];
+
+/// Validate checksum headers on PutObject. If a checksum header is present,
+/// compute the actual checksum and compare. Returns `BadDigest` on mismatch.
+fn validate_checksum_headers(req: &S3Request) -> Result<(), ServerError> {
+    use base64::Engine;
+
+    for &(algo, header) in CHECKSUM_HEADERS {
+        if let Some(claimed) = req.header(header) {
+            let actual_b64 = match algo {
+                "SHA256" => {
+                    let digest = ring::digest::digest(&ring::digest::SHA256, &req.body);
+                    base64::engine::general_purpose::STANDARD.encode(digest.as_ref())
+                }
+                "SHA1" => {
+                    let digest =
+                        ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, &req.body);
+                    base64::engine::general_purpose::STANDARD.encode(digest.as_ref())
+                }
+                "CRC32" => {
+                    let crc = unsafe {
+                        ec_sys::crc32_gzip_refl(0, req.body.as_ptr(), req.body.len() as u64)
+                    };
+                    base64::engine::general_purpose::STANDARD.encode(crc.to_be_bytes())
+                }
+                "CRC32C" => {
+                    let crc = unsafe {
+                        ec_sys::crc32_iscsi(
+                            req.body.as_ptr() as *mut _,
+                            req.body.len() as i32,
+                            0,
+                        )
+                    };
+                    base64::engine::general_purpose::STANDARD.encode(crc.to_be_bytes())
+                }
+                "CRC64NVME" => {
+                    let crc = crc64::checksum(&req.body);
+                    base64::engine::general_purpose::STANDARD.encode(crc.to_be_bytes())
+                }
+                _ => continue,
+            };
+            if claimed != actual_b64 {
+                return Err(ServerError::BadDigest);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Append any checksum headers that were sent on PutObject to the response.
+fn append_checksum_response_headers(resp: &mut S3Response, req: &S3Request) {
+    for &(_, header) in CHECKSUM_HEADERS {
+        if let Some(value) = req.header(header) {
+            resp.headers.push((header.to_string(), value.to_string()));
+        }
+    }
+}
+
 fn apply_response_overrides(resp: &mut S3Response, req: &S3Request) {
     let overrides: &[(&str, &str)] = &[
         ("response-content-type", "Content-Type"),

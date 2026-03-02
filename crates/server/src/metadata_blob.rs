@@ -38,6 +38,13 @@ const STORED_HEADERS: &[&str] = &[
     "content-disposition",
     "content-language",
     "expires",
+    // Checksum headers (stored so they can be returned with ChecksumMode=ENABLED)
+    "x-amz-checksum-sha256",
+    "x-amz-checksum-crc64nvme",
+    "x-amz-checksum-crc32",
+    "x-amz-checksum-crc32c",
+    "x-amz-checksum-sha1",
+    "x-amz-checksum-algorithm",
 ];
 
 /// Check if a string contains bytes invalid in HTTP headers:
@@ -241,6 +248,13 @@ impl MetadataBlob {
             .iter()
             .find(|e| e.key == key)
             .map(|e| e.value.as_str())
+    }
+
+    /// Return checksum header entries (x-amz-checksum-*) stored in the blob.
+    pub fn checksum_entries(&self) -> impl Iterator<Item = &MetadataEntry> {
+        self.entries.iter().filter(|e| {
+            e.key.starts_with("x-amz-checksum-") && e.key != "x-amz-checksum-algorithm"
+        })
     }
 }
 

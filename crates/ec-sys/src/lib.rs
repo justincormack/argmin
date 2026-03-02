@@ -62,6 +62,30 @@ extern "C" {
         coding: *mut *mut c_uchar,
     );
 
+    // ── CRC32 ────────────────────────────────────────────────────────────
+
+    /// Compute CRC-32/IEEE (used by gzip, Ethernet).
+    ///
+    /// Multi-binary dispatcher: selects the fastest implementation at runtime.
+    /// Polynomial: 0x04C11DB7 (normal), 0xEDB88320 (reflected).
+    ///
+    /// **Note**: ISA-L uses the non-reflected convention. For compatibility with
+    /// the standard reflected CRC-32 (gzip, etc.), use `crc32_gzip_refl` instead.
+    pub fn crc32_ieee(init_crc: u32, buf: *const c_uchar, len: u64) -> u32;
+
+    /// Compute reflected CRC-32/IEEE (gzip compatible).
+    ///
+    /// This is the standard CRC-32 used in gzip, zlib, PNG, etc.
+    pub fn crc32_gzip_refl(init_crc: u32, buf: *const c_uchar, len: u64) -> u32;
+
+    /// Compute CRC-32C (iSCSI / Castagnoli).
+    ///
+    /// Multi-binary dispatcher: selects the fastest implementation at runtime.
+    /// Polynomial: 0x1EDC6F41. This is the CRC used by iSCSI, SCTP, Btrfs, ext4.
+    ///
+    /// `buffer` must point to `len` bytes. Returns the CRC-32C value.
+    pub fn crc32_iscsi(buffer: *mut c_uchar, len: c_int, init_crc: u32) -> u32;
+
     // ── CRC64 ────────────────────────────────────────────────────────────
 
     /// Compute CRC-64/Rocksoft (= CRC-64/NVME) in reflected form.

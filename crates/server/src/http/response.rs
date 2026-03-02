@@ -102,7 +102,8 @@ impl S3Response {
     }
 
     /// Build a response for a successful GetObject.
-    pub fn get_object(result: GetObjectResult) -> Self {
+    /// If `checksum_mode` is `Some("ENABLED")`, include stored checksum headers.
+    pub fn get_object(result: GetObjectResult, checksum_mode: Option<&str>) -> Self {
         let mut resp = Self::new(200)
             .header("ETag", &result.etag)
             .header("Last-Modified", &format_http_date(result.last_modified))
@@ -141,11 +142,19 @@ impl S3Response {
             }
         }
 
+        // Checksum headers (only when ChecksumMode=ENABLED)
+        if checksum_mode.map(|m| m.eq_ignore_ascii_case("ENABLED")).unwrap_or(false) {
+            for entry in result.metadata.checksum_entries() {
+                resp = resp.header(&entry.key, &entry.value);
+            }
+        }
+
         resp.data_body(result.data)
     }
 
     /// Build a response for a successful HeadObject.
-    pub fn head_object(result: &HeadObjectResult) -> Self {
+    /// If `checksum_mode` is `Some("ENABLED")`, include stored checksum headers.
+    pub fn head_object(result: &HeadObjectResult, checksum_mode: Option<&str>) -> Self {
         let mut resp = Self::new(200)
             .header("ETag", &result.etag)
             .header("Content-Length", &result.size.to_string())
@@ -179,6 +188,13 @@ impl S3Response {
 
         for entry in &result.metadata.entries {
             if entry.key.starts_with("x-amz-meta-") {
+                resp = resp.header(&entry.key, &entry.value);
+            }
+        }
+
+        // Checksum headers (only when ChecksumMode=ENABLED)
+        if checksum_mode.map(|m| m.eq_ignore_ascii_case("ENABLED")).unwrap_or(false) {
+            for entry in result.metadata.checksum_entries() {
                 resp = resp.header(&entry.key, &entry.value);
             }
         }
@@ -592,7 +608,7 @@ mod tests {
             last_modified: 0,
             version_id: 0,
         };
-        let resp = S3Response::get_object(result);
+        let resp = S3Response::get_object(result, None);
         assert_eq!(resp.status_code, 200);
         assert_eq!(find_header(&resp, "Content-Type"), Some("text/plain"));
         assert_eq!(resp.body, b"hello");
@@ -608,7 +624,7 @@ mod tests {
             last_modified: 0,
             version_id: 0,
         };
-        let resp = S3Response::get_object(result);
+        let resp = S3Response::get_object(result, None);
         assert_eq!(
             find_header(&resp, "Content-Type"),
             Some("application/octet-stream")
@@ -630,7 +646,7 @@ mod tests {
             last_modified: 0,
             version_id: 0,
         };
-        let resp = S3Response::get_object(result);
+        let resp = S3Response::get_object(result, None);
         assert_eq!(find_header(&resp, "x-amz-meta-author"), Some("alice"));
     }
 
@@ -671,7 +687,7 @@ mod tests {
             last_modified: 0,
             version_id: 0,
         };
-        let resp = S3Response::get_object(result);
+        let resp = S3Response::get_object(result, None);
         assert_eq!(find_header(&resp, "Content-Type"), Some("text/html"));
         assert_eq!(find_header(&resp, "Content-Encoding"), Some("gzip"));
         assert_eq!(find_header(&resp, "Cache-Control"), Some("max-age=3600"));
@@ -702,7 +718,7 @@ mod tests {
             last_modified: 0,
             version_id: 0,
         };
-        let resp = S3Response::head_object(&result);
+        let resp = S3Response::head_object(&result, None);
         assert_eq!(resp.status_code, 200);
         assert_eq!(find_header(&resp, "ETag"), Some("\"etag\""));
         assert_eq!(find_header(&resp, "Content-Length"), Some("1024"));
@@ -719,7 +735,7 @@ mod tests {
             last_modified: 0,
             version_id: 0,
         };
-        let resp = S3Response::head_object(&result);
+        let resp = S3Response::head_object(&result, None);
         assert_eq!(
             find_header(&resp, "Content-Type"),
             Some("application/octet-stream")
@@ -746,7 +762,7 @@ mod tests {
             last_modified: 0,
             version_id: 0,
         };
-        let resp = S3Response::head_object(&result);
+        let resp = S3Response::head_object(&result, None);
         assert_eq!(find_header(&resp, "Content-Encoding"), Some("br"));
         assert_eq!(find_header(&resp, "Cache-Control"), Some("no-cache"));
     }
@@ -765,7 +781,7 @@ mod tests {
             last_modified: 0,
             version_id: 0,
         };
-        let resp = S3Response::head_object(&result);
+        let resp = S3Response::head_object(&result, None);
         assert_eq!(find_header(&resp, "x-amz-meta-tag"), Some("value"));
     }
 

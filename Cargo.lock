@@ -2041,6 +2041,7 @@ dependencies = [
  "bytes",
  "crc64",
  "ec",
+ "ec-sys",
  "http 1.4.0",
  "http-body-util",
  "hyper 1.8.1",

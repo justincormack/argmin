@@ -58,6 +58,9 @@ pub enum ServerError {
 
     #[error("please reduce your request rate")]
     SlowDown,
+
+    #[error("bad digest")]
+    BadDigest,
 }
 
 impl ServerError {
@@ -84,6 +87,7 @@ impl ServerError {
             Self::MethodNotAllowed => "MethodNotAllowed",
             Self::InvalidRange { .. } => "InvalidRange",
             Self::SlowDown => "SlowDown",
+            Self::BadDigest => "BadDigest",
             Self::Store(_) => "InternalError",
             Self::Metadata(_) => "InternalError",
             Self::Ec(_) => "InternalError",
@@ -101,7 +105,8 @@ impl ServerError {
             Self::Auth(_) => 403,
             Self::InvalidRequest { .. }
             | Self::InvalidArgument { .. }
-            | Self::InvalidBucketName { .. } => 400,
+            | Self::InvalidBucketName { .. }
+            | Self::BadDigest => 400,
             Self::ObjectTooLarge { .. } => 400,
             Self::MethodNotAllowed => 405,
             Self::InvalidRange { .. } => 416,
