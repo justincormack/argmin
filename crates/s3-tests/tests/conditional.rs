@@ -866,7 +866,6 @@ fn test_put_object_ifnonmatch_good() {
 }
 
 #[test]
-#[ignore = "not implemented: If-None-Match with specific etag on PUT"]
 fn test_put_object_ifnonmatch_failed() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;
@@ -980,7 +979,6 @@ fn test_copy_object_ifnonematch_good() {
 }
 
 #[test]
-#[ignore = "not implemented: If-None-Match with specific etag on COPY"]
 fn test_copy_object_ifnonematch_failed() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;
@@ -1039,13 +1037,100 @@ fn test_delete_object_if_match() {
 }
 
 #[test]
-#[ignore = "not implemented: delete If-Match with last-modified-time"]
 fn test_delete_object_if_match_last_modified_time() {
-    s3_tests::run(async {});
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        put_object(&bucket, "obj", b"hello").await;
+
+        // Get the object's last-modified time
+        let head = client
+            .head_object()
+            .bucket(&bucket)
+            .key("obj")
+            .send()
+            .await
+            .unwrap();
+        let last_modified = head.last_modified().unwrap().clone();
+
+        // Delete with wrong last-modified → 412
+        let wrong_time = DateTime::from_secs(0);
+        let result = client
+            .delete_object()
+            .bucket(&bucket)
+            .key("obj")
+            .if_match_last_modified_time(wrong_time)
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 412);
+
+        // Verify object still exists
+        client
+            .head_object()
+            .bucket(&bucket)
+            .key("obj")
+            .send()
+            .await
+            .unwrap();
+
+        // Delete with correct last-modified → succeeds
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key("obj")
+            .if_match_last_modified_time(last_modified)
+            .send()
+            .await
+            .unwrap();
+
+        // Verify object is gone
+        let result = client.head_object().bucket(&bucket).key("obj").send().await;
+        assert!(result.is_err());
+
+        cleanup(&bucket, &[]).await;
+    });
 }
 
 #[test]
-#[ignore = "not implemented: delete If-Match with size"]
 fn test_delete_object_if_match_size() {
-    s3_tests::run(async {});
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        put_object(&bucket, "obj", b"hello").await;
+
+        // Delete with wrong size → 412
+        let result = client
+            .delete_object()
+            .bucket(&bucket)
+            .key("obj")
+            .if_match_size(999)
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 412);
+
+        // Verify object still exists
+        client
+            .head_object()
+            .bucket(&bucket)
+            .key("obj")
+            .send()
+            .await
+            .unwrap();
+
+        // Delete with correct size (5 bytes for "hello") → succeeds
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key("obj")
+            .if_match_size(5)
+            .send()
+            .await
+            .unwrap();
+
+        // Verify object is gone
+        let result = client.head_object().bucket(&bucket).key("obj").send().await;
+        assert!(result.is_err());
+
+        cleanup(&bucket, &[]).await;
+    });
 }

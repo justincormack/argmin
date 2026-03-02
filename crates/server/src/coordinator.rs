@@ -1035,7 +1035,7 @@ impl Coordinator {
                 if !cond.is_empty() {
                     let etag_crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
                     let etag_str = format_etag(etag_crc);
-                    check_delete_conditions(cond, &etag_str)?;
+                    check_delete_conditions(cond, &etag_str, record.last_modified, record.size)?;
                 }
 
                 let okh = object_key_hash(bucket, key);
@@ -1405,9 +1405,13 @@ mod tests {
     };
     const NO_WRITE: &WriteCondition = &WriteCondition {
         if_match: None,
-        if_none_match_any: false,
+        if_none_match: None,
     };
-    const NO_DELETE: &DeleteCondition = &DeleteCondition { if_match: None };
+    const NO_DELETE: &DeleteCondition = &DeleteCondition {
+        if_match: None,
+        if_match_last_modified_time: None,
+        if_match_size: None,
+    };
 
     fn setup_coordinator(dir: &Path) -> Coordinator {
         let pg_ids: Vec<u32> = (0..4).collect();
@@ -2662,7 +2666,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let cond = WriteCondition {
-            if_none_match_any: true,
+            if_none_match: Some("*".to_string()),
             ..Default::default()
         };
         let result = coord
@@ -2681,7 +2685,7 @@ mod tests {
             .unwrap();
 
         let cond = WriteCondition {
-            if_none_match_any: true,
+            if_none_match: Some("*".to_string()),
             ..Default::default()
         };
         let err = coord
@@ -2815,6 +2819,7 @@ mod tests {
             .unwrap();
         let cond = DeleteCondition {
             if_match: Some(put.etag),
+            ..Default::default()
         };
         coord.delete_object("bucket", "key", None, &cond).unwrap();
         assert!(coord.get_object("bucket", "key", None, NO_READ).is_err());
@@ -2831,6 +2836,7 @@ mod tests {
 
         let cond = DeleteCondition {
             if_match: Some("\"0000000000000000\"".to_string()),
+            ..Default::default()
         };
         let err = coord
             .delete_object("bucket", "key", None, &cond)
@@ -2854,6 +2860,7 @@ mod tests {
         // Use key1's etag for both entries; key2 will fail the condition
         let cond = DeleteCondition {
             if_match: Some(p1.etag),
+            ..Default::default()
         };
         let entries = vec![
             crate::http::xml::DeleteObjectEntry {
@@ -3120,7 +3127,7 @@ mod tests {
             .unwrap();
 
         let dst_cond = WriteCondition {
-            if_none_match_any: true,
+            if_none_match: Some("*".to_string()),
             ..Default::default()
         };
         let err = coord

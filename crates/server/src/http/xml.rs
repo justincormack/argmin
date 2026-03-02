@@ -1404,7 +1404,11 @@ mod tests {
         assert_eq!(parsed.rules.len(), 1);
         assert_eq!(
             parsed.rules[0].allowed_origins,
-            vec!["http://first.com", "http://second.com", "http://*.example.com"]
+            vec![
+                "http://first.com",
+                "http://second.com",
+                "http://*.example.com"
+            ]
         );
     }
 }

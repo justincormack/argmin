@@ -20,13 +20,15 @@ pub struct ReadCondition {
 #[derive(Debug, Default)]
 pub struct WriteCondition {
     pub if_match: Option<String>,
-    pub if_none_match_any: bool,
+    pub if_none_match: Option<String>,
 }
 
 /// Conditions for delete operations (DELETE, `DeleteObjects`).
 #[derive(Debug, Default)]
 pub struct DeleteCondition {
     pub if_match: Option<String>,
+    pub if_match_last_modified_time: Option<u64>,
+    pub if_match_size: Option<u64>,
 }
 
 /// Extract read conditions from an S3 request's headers.
@@ -41,10 +43,9 @@ pub fn read_condition_from_headers(req: &S3Request) -> ReadCondition {
 
 /// Extract write conditions from an S3 request's headers.
 pub fn write_condition_from_headers(req: &S3Request) -> WriteCondition {
-    let if_none_match_any = req.header("if-none-match").is_some_and(|s| s.trim() == "*");
     WriteCondition {
         if_match: req.header("if-match").map(str::to_string),
-        if_none_match_any,
+        if_none_match: req.header("if-none-match").map(str::to_string),
     }
 }
 
@@ -52,6 +53,12 @@ pub fn write_condition_from_headers(req: &S3Request) -> WriteCondition {
 pub fn delete_condition_from_headers(req: &S3Request) -> DeleteCondition {
     DeleteCondition {
         if_match: req.header("if-match").map(str::to_string),
+        if_match_last_modified_time: req
+            .header("x-amz-if-match-last-modified-time")
+            .and_then(parse_http_date),
+        if_match_size: req
+            .header("x-amz-if-match-size")
+            .and_then(|s| s.trim().parse::<u64>().ok()),
     }
 }
 
@@ -152,8 +159,18 @@ pub fn check_write_conditions(
     cond: &WriteCondition,
     existing_etag: Option<&str>,
 ) -> Result<(), ServerError> {
-    if cond.if_none_match_any && existing_etag.is_some() {
-        return Err(ServerError::PreconditionFailed);
+    // If-None-Match: * → 412 if object exists (create-only)
+    // If-None-Match: <etag> → 412 if any etag in list matches existing object
+    if let Some(ref unwanted) = cond.if_none_match {
+        if unwanted.trim() == "*" {
+            if existing_etag.is_some() {
+                return Err(ServerError::PreconditionFailed);
+            }
+        } else if let Some(obj_etag) = existing_etag {
+            if etags_match(unwanted, obj_etag) {
+                return Err(ServerError::PreconditionFailed);
+            }
+        }
     }
 
     if let Some(ref required_etag) = cond.if_match {
@@ -177,16 +194,32 @@ pub fn check_write_conditions(
 ///
 /// - If-Match: * → pass (object existence already checked by caller)
 /// - If-Match: <etag> → 412 if mismatch
+/// - x-amz-if-match-last-modified-time → 412 if last_modified doesn't match
+/// - x-amz-if-match-size → 412 if size doesn't match
 ///
 /// # Errors
 ///
-/// Returns `PreconditionFailed` (412) if the etag does not match.
-pub fn check_delete_conditions(cond: &DeleteCondition, etag: &str) -> Result<(), ServerError> {
+/// Returns `PreconditionFailed` (412) if any condition fails.
+pub fn check_delete_conditions(
+    cond: &DeleteCondition,
+    etag: &str,
+    last_modified: u64,
+    size: u64,
+) -> Result<(), ServerError> {
     if let Some(ref required_etag) = cond.if_match {
         if required_etag.trim() == "*" {
-            return Ok(());
+            // Wildcard matches any existing object — continue to check other conditions
+        } else if !etags_match(required_etag, etag) {
+            return Err(ServerError::PreconditionFailed);
         }
-        if !etags_match(required_etag, etag) {
+    }
+    if let Some(required_last_modified) = cond.if_match_last_modified_time {
+        if last_modified != required_last_modified {
+            return Err(ServerError::PreconditionFailed);
+        }
+    }
+    if let Some(required_size) = cond.if_match_size {
+        if size != required_size {
             return Err(ServerError::PreconditionFailed);
         }
     }
@@ -266,7 +299,7 @@ impl ReadCondition {
 impl WriteCondition {
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.if_match.is_none() && !self.if_none_match_any
+        self.if_match.is_none() && self.if_none_match.is_none()
     }
 }
 
@@ -274,6 +307,8 @@ impl DeleteCondition {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.if_match.is_none()
+            && self.if_match_last_modified_time.is_none()
+            && self.if_match_size.is_none()
     }
 }
 
@@ -389,7 +424,7 @@ mod tests {
     #[test]
     fn write_if_none_match_star_prevents_overwrite() {
         let cond = WriteCondition {
-            if_none_match_any: true,
+            if_none_match: Some("*".to_string()),
             ..Default::default()
         };
         let err = check_write_conditions(&cond, Some(&test_etag())).unwrap_err();
@@ -399,7 +434,35 @@ mod tests {
     #[test]
     fn write_if_none_match_star_allows_create() {
         let cond = WriteCondition {
-            if_none_match_any: true,
+            if_none_match: Some("*".to_string()),
+            ..Default::default()
+        };
+        assert!(check_write_conditions(&cond, None).is_ok());
+    }
+
+    #[test]
+    fn write_if_none_match_specific_etag_prevents_overwrite() {
+        let cond = WriteCondition {
+            if_none_match: Some(test_etag()),
+            ..Default::default()
+        };
+        let err = check_write_conditions(&cond, Some(&test_etag())).unwrap_err();
+        assert!(matches!(err, ServerError::PreconditionFailed));
+    }
+
+    #[test]
+    fn write_if_none_match_specific_etag_allows_different() {
+        let cond = WriteCondition {
+            if_none_match: Some(other_etag()),
+            ..Default::default()
+        };
+        assert!(check_write_conditions(&cond, Some(&test_etag())).is_ok());
+    }
+
+    #[test]
+    fn write_if_none_match_specific_etag_allows_create() {
+        let cond = WriteCondition {
+            if_none_match: Some(test_etag()),
             ..Default::default()
         };
         assert!(check_write_conditions(&cond, None).is_ok());
@@ -440,16 +503,18 @@ mod tests {
     fn delete_if_match_passes() {
         let cond = DeleteCondition {
             if_match: Some(test_etag()),
+            ..Default::default()
         };
-        assert!(check_delete_conditions(&cond, &test_etag()).is_ok());
+        assert!(check_delete_conditions(&cond, &test_etag(), 1000, 100).is_ok());
     }
 
     #[test]
     fn delete_if_match_fails() {
         let cond = DeleteCondition {
             if_match: Some(other_etag()),
+            ..Default::default()
         };
-        let err = check_delete_conditions(&cond, &test_etag()).unwrap_err();
+        let err = check_delete_conditions(&cond, &test_etag(), 1000, 100).unwrap_err();
         assert!(matches!(err, ServerError::PreconditionFailed));
     }
 
@@ -457,8 +522,47 @@ mod tests {
     fn delete_if_match_wildcard_passes() {
         let cond = DeleteCondition {
             if_match: Some("*".to_string()),
+            ..Default::default()
         };
-        assert!(check_delete_conditions(&cond, &test_etag()).is_ok());
+        assert!(check_delete_conditions(&cond, &test_etag(), 1000, 100).is_ok());
+    }
+
+    #[test]
+    fn delete_if_match_last_modified_time_passes() {
+        let cond = DeleteCondition {
+            if_match_last_modified_time: Some(1000),
+            ..Default::default()
+        };
+        assert!(check_delete_conditions(&cond, &test_etag(), 1000, 100).is_ok());
+    }
+
+    #[test]
+    fn delete_if_match_last_modified_time_fails() {
+        let cond = DeleteCondition {
+            if_match_last_modified_time: Some(2000),
+            ..Default::default()
+        };
+        let err = check_delete_conditions(&cond, &test_etag(), 1000, 100).unwrap_err();
+        assert!(matches!(err, ServerError::PreconditionFailed));
+    }
+
+    #[test]
+    fn delete_if_match_size_passes() {
+        let cond = DeleteCondition {
+            if_match_size: Some(100),
+            ..Default::default()
+        };
+        assert!(check_delete_conditions(&cond, &test_etag(), 1000, 100).is_ok());
+    }
+
+    #[test]
+    fn delete_if_match_size_fails() {
+        let cond = DeleteCondition {
+            if_match_size: Some(999),
+            ..Default::default()
+        };
+        let err = check_delete_conditions(&cond, &test_etag(), 1000, 100).unwrap_err();
+        assert!(matches!(err, ServerError::PreconditionFailed));
     }
 
     #[test]
@@ -471,7 +575,7 @@ mod tests {
         assert!(check_write_conditions(&write, None).is_ok());
 
         let delete = DeleteCondition::default();
-        assert!(check_delete_conditions(&delete, &test_etag()).is_ok());
+        assert!(check_delete_conditions(&delete, &test_etag(), 1000, 100).is_ok());
     }
 
     // ── is_empty ──────────────────────────────────────────────────────
@@ -490,7 +594,7 @@ mod tests {
     fn write_condition_is_empty() {
         assert!(WriteCondition::default().is_empty());
         assert!(!WriteCondition {
-            if_none_match_any: true,
+            if_none_match: Some("*".to_string()),
             ..Default::default()
         }
         .is_empty());
@@ -501,6 +605,17 @@ mod tests {
         assert!(DeleteCondition::default().is_empty());
         assert!(!DeleteCondition {
             if_match: Some("x".into()),
+            ..Default::default()
+        }
+        .is_empty());
+        assert!(!DeleteCondition {
+            if_match_last_modified_time: Some(1000),
+            ..Default::default()
+        }
+        .is_empty());
+        assert!(!DeleteCondition {
+            if_match_size: Some(100),
+            ..Default::default()
         }
         .is_empty());
     }
