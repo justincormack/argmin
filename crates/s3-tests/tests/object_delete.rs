@@ -1,4 +1,7 @@
-use aws_sdk_s3::types::{Delete, ObjectIdentifier};
+use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::{
+    BucketVersioningStatus, Delete, ObjectIdentifier, VersioningConfiguration,
+};
 use s3_tests::{
     create_objects, create_objects_with_keys, delete_all_and_bucket, err_status, unique_bucket, CTX,
 };
@@ -403,5 +406,363 @@ fn test_object_delete_key_bucket_gone() {
             .send()
             .await;
         assert_eq!(err_status(&result), 404);
+    });
+}
+
+// ── Versioning helpers ──────────────────────────────────────────────
+
+async fn setup_versioned_bucket() -> String {
+    let client = CTX.client();
+    let bucket = unique_bucket();
+    client.create_bucket().bucket(&bucket).send().await.unwrap();
+    client
+        .put_bucket_versioning()
+        .bucket(&bucket)
+        .versioning_configuration(
+            VersioningConfiguration::builder()
+                .status(BucketVersioningStatus::Enabled)
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    bucket
+}
+
+async fn create_multiple_versions(
+    bucket: &str,
+    key: &str,
+    num: usize,
+) -> (Vec<String>, Vec<String>) {
+    let client = CTX.client();
+    let mut version_ids = Vec::new();
+    let mut contents = Vec::new();
+    for i in 0..num {
+        let body = format!("content-{}", i);
+        let resp = client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from(body.clone().into_bytes()))
+            .send()
+            .await
+            .unwrap();
+        version_ids.push(resp.version_id().unwrap().to_string());
+        contents.push(body);
+    }
+    (version_ids, contents)
+}
+
+/// Clean up a versioned bucket by deleting all versions and delete markers.
+async fn cleanup_versioned_bucket(bucket: &str) {
+    let client = CTX.client();
+    // List all versions and delete markers, delete them all
+    let resp = client
+        .list_object_versions()
+        .bucket(bucket)
+        .send()
+        .await
+        .unwrap();
+    for v in resp.versions() {
+        client
+            .delete_object()
+            .bucket(bucket)
+            .key(v.key().unwrap())
+            .version_id(v.version_id().unwrap())
+            .send()
+            .await
+            .unwrap();
+    }
+    for dm in resp.delete_markers() {
+        client
+            .delete_object()
+            .bucket(bucket)
+            .key(dm.key().unwrap())
+            .version_id(dm.version_id().unwrap())
+            .send()
+            .await
+            .unwrap();
+    }
+    client.delete_bucket().bucket(bucket).send().await.unwrap();
+}
+
+// ── Versioning + multi-object delete ────────────────────────────────
+
+/// Batch-delete specific version IDs and verify they are removed.
+#[test]
+fn test_versioning_multi_object_delete() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_versioned_bucket().await;
+        let key = "testobj";
+        let num_versions = 5;
+
+        let (version_ids, _contents) = create_multiple_versions(&bucket, key, num_versions).await;
+
+        // Batch delete all versions by specifying their version IDs
+        let objects: Vec<ObjectIdentifier> = version_ids
+            .iter()
+            .map(|vid| {
+                ObjectIdentifier::builder()
+                    .key(key)
+                    .version_id(vid)
+                    .build()
+                    .unwrap()
+            })
+            .collect();
+        let delete = Delete::builder()
+            .set_objects(Some(objects))
+            .quiet(false)
+            .build()
+            .unwrap();
+        let resp = client
+            .delete_objects()
+            .bucket(&bucket)
+            .delete(delete)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.deleted().len(), num_versions);
+        assert!(resp.errors().is_empty());
+
+        // Verify: no versions remain
+        let list = client
+            .list_object_versions()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            list.versions().is_empty(),
+            "expected no versions after batch delete"
+        );
+        assert!(
+            list.delete_markers().is_empty(),
+            "expected no delete markers after batch delete"
+        );
+
+        // Idempotent: deleting the same version IDs again should succeed
+        let objects2: Vec<ObjectIdentifier> = version_ids
+            .iter()
+            .map(|vid| {
+                ObjectIdentifier::builder()
+                    .key(key)
+                    .version_id(vid)
+                    .build()
+                    .unwrap()
+            })
+            .collect();
+        let delete2 = Delete::builder()
+            .set_objects(Some(objects2))
+            .quiet(false)
+            .build()
+            .unwrap();
+        let resp2 = client
+            .delete_objects()
+            .bucket(&bucket)
+            .delete(delete2)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp2.deleted().len(), num_versions);
+        assert!(resp2.errors().is_empty());
+
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+/// Batch-delete versions plus a delete marker.
+#[test]
+fn test_versioning_multi_object_delete_with_marker() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_versioned_bucket().await;
+        let key = "testobj";
+
+        // Create 3 versions
+        let (version_ids, _contents) = create_multiple_versions(&bucket, key, 3).await;
+
+        // Create a delete marker by deleting without specifying versionId
+        let del_resp = client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert!(del_resp.delete_marker().unwrap_or(false));
+        let marker_vid = del_resp.version_id().unwrap().to_string();
+
+        // Now batch-delete all versions + the delete marker
+        let mut all_vids = version_ids.clone();
+        all_vids.push(marker_vid);
+
+        let objects: Vec<ObjectIdentifier> = all_vids
+            .iter()
+            .map(|vid| {
+                ObjectIdentifier::builder()
+                    .key(key)
+                    .version_id(vid)
+                    .build()
+                    .unwrap()
+            })
+            .collect();
+        let delete = Delete::builder()
+            .set_objects(Some(objects))
+            .quiet(false)
+            .build()
+            .unwrap();
+        let resp = client
+            .delete_objects()
+            .bucket(&bucket)
+            .delete(delete)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.deleted().len(), 4);
+        assert!(resp.errors().is_empty());
+
+        // The entry for the delete marker should have delete_marker=true
+        let marker_entry = resp
+            .deleted()
+            .iter()
+            .find(|d| d.delete_marker().unwrap_or(false));
+        assert!(
+            marker_entry.is_some(),
+            "expected a delete marker entry in response"
+        );
+
+        // Verify: bucket should be completely clean
+        let list = client
+            .list_object_versions()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        assert!(list.versions().is_empty());
+        assert!(list.delete_markers().is_empty());
+
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+/// Use delete_objects (without versionId) on a versioned bucket to create a delete marker.
+#[test]
+fn test_versioning_multi_object_delete_marker_create() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_versioned_bucket().await;
+        let key = "testobj";
+
+        // Put one version
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from(b"data".to_vec()))
+            .send()
+            .await
+            .unwrap();
+
+        // Batch-delete WITHOUT specifying versionId → should create a delete marker
+        let objects = vec![ObjectIdentifier::builder().key(key).build().unwrap()];
+        let delete = Delete::builder()
+            .set_objects(Some(objects))
+            .quiet(false)
+            .build()
+            .unwrap();
+        let resp = client
+            .delete_objects()
+            .bucket(&bucket)
+            .delete(delete)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.deleted().len(), 1);
+        assert!(resp.errors().is_empty());
+        let d = &resp.deleted()[0];
+        assert!(
+            d.delete_marker().unwrap_or(false),
+            "expected delete_marker=true when deleting without versionId in versioned bucket"
+        );
+        assert!(
+            d.delete_marker_version_id().is_some(),
+            "expected delete_marker_version_id in response"
+        );
+
+        // The object should now be inaccessible (404) via normal GET
+        let get_result = client.get_object().bucket(&bucket).key(key).send().await;
+        assert!(get_result.is_err());
+
+        // But list_object_versions should show both the version and the delete marker
+        let list = client
+            .list_object_versions()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            list.versions().len(),
+            1,
+            "original version should still exist"
+        );
+        assert_eq!(list.delete_markers().len(), 1, "delete marker should exist");
+
+        cleanup_versioned_bucket(&bucket).await;
+    });
+}
+
+/// Batch-delete on a non-existent key in a versioned bucket creates a delete marker.
+#[test]
+fn test_versioning_multi_object_delete_nonexistent_creates_marker() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_versioned_bucket().await;
+
+        // Batch-delete a key that was never created
+        let objects = vec![ObjectIdentifier::builder()
+            .key("never-existed")
+            .build()
+            .unwrap()];
+        let delete = Delete::builder()
+            .set_objects(Some(objects))
+            .quiet(false)
+            .build()
+            .unwrap();
+        let resp = client
+            .delete_objects()
+            .bucket(&bucket)
+            .delete(delete)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.deleted().len(), 1);
+        assert!(resp.errors().is_empty());
+        let d = &resp.deleted()[0];
+        assert!(
+            d.delete_marker().unwrap_or(false),
+            "expected delete_marker=true for nonexistent key in versioned bucket"
+        );
+        assert!(
+            d.delete_marker_version_id().is_some(),
+            "expected delete_marker_version_id for nonexistent key"
+        );
+
+        // Verify delete marker was actually created
+        let list = client
+            .list_object_versions()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        assert!(list.versions().is_empty());
+        assert_eq!(list.delete_markers().len(), 1);
+        assert_eq!(list.delete_markers()[0].key().unwrap(), "never-existed");
+
+        cleanup_versioned_bucket(&bucket).await;
     });
 }
