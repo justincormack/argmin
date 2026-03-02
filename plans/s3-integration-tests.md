@@ -268,3 +268,183 @@ tempfile = "3"
 3. `cargo test --workspace` — no regressions in other crates
 4. `S3_TEST_ENDPOINT=... cargo test -p s3-tests` — validates tests match real AWS behavior
 5. `cargo clippy --workspace`
+
+---
+
+## Status as of 2 March 2026
+
+### Current test files
+
+| File | Tests | Ignored | Covers |
+|------|------:|--------:|--------|
+| bucket_list.rs | 85 | 1 | ListObjects V1/V2, delimiters, prefixes, pagination |
+| post_object.rs | 46 | 8 | Form-based POST upload (SigV4) |
+| headers.rs | 42 | 3 | Header validation: checksum, auth, date, SigV4 |
+| conditional.rs | 40 | 4 | If-Match/If-None-Match on GET/PUT/DELETE/COPY |
+| bucket_naming.rs | 32 | 0 | DNS compliance, length limits, special chars |
+| object_crud.rs | 29 | 2 | PUT/GET/HEAD/DELETE, metadata, range requests |
+| versioning.rs | 24 | 4 | Versioning enable/suspend, version CRUD, copy |
+| presigned.rs | 22 | 4 | Presigned GET/PUT/DELETE/HEAD, expiry, tampering |
+| bucket_crud.rs | 20 | 4 | Bucket create/delete/head/list-buckets |
+| copy_object.rs | 17 | 4 | Same-bucket, cross-bucket, metadata copy |
+| bucket_anon.rs | 14 | 2 | Anonymous GET/HEAD/PUT/DELETE, public vs private |
+| object_delete.rs | 14 | 0 | Single delete, versioned delete markers |
+| checksums.rs | 10 | 8 | SHA256, CRC32, CRC32C, CRC64NVME, SHA1 |
+| atomic.rs | 7 | 1 | Concurrent read/write, overwrite, bucket-gone |
+| **Total** | **402** | **45** | |
+
+### Ceph test groups — coverage analysis
+
+#### Fully covered
+
+These groups from test_s3.py are well covered by existing tests:
+
+- **Bucket listing** (~88 tests) → bucket_list.rs (85)
+- **POST object** (~36) → post_object.rs (46)
+- **Bucket create/naming** (~23) → bucket_crud.rs + bucket_naming.rs (52)
+- **Object CRUD** (~23) → object_crud.rs (29)
+- **Versioning** (~24) → versioning.rs (24)
+- **Object copy** (~17) → copy_object.rs (17)
+- **Presigned/raw** (~17) → presigned.rs (22)
+- **Conditional ops** (~24 get/put/copy) → conditional.rs (40)
+- **Anonymous/access** (~12) → bucket_anon.rs (14)
+- **Headers** (~48 from test_headers.py) → headers.rs (42)
+- **Checksums** (~2) → checksums.rs (10)
+- **Object delete** (~22 incl conditional) → object_delete.rs + conditional.rs (54)
+- **Range requests** (~6) → object_crud.rs (partial)
+- **Atomic** (~13) → atomic.rs (7, partial)
+- **Expect 100** (~2) → headers.rs
+- **Bucket head** (~5) → bucket_crud.rs (partial)
+- **List buckets** (~6) → bucket_crud.rs (partial)
+
+#### Not yet covered — by implementation dependency
+
+##### Tier 1: No or minimal server changes
+
+**Multi-object delete (~5 tests)**
+- `DeleteObjects` batch API (`POST /?delete`). XML request with list of keys, XML response
+  with per-key results.
+- Server work: new endpoint handler, iterate existing single-delete logic. Small.
+
+**Object user metadata (~5 tests)**
+- `x-amz-meta-*` headers stored and returned on GET/HEAD. Also `Cache-Control`, `Expires`,
+  `Content-Encoding` response headers.
+- Server work: persist arbitrary metadata headers in object metadata blob. Small — extend
+  existing PutObject/GetObject.
+
+**Content-Encoding: aws-chunked (1 test)**
+- SigV4 chunked transfer encoding payload parsing.
+- Server work: parse `aws-chunked` body format (chunk-size + signature per chunk). Moderate.
+
+##### Tier 2: Moderate new features
+
+**CORS (~13 tests)**
+- CORS configuration storage (`PUT/GET/DELETE /?cors`) and preflight OPTIONS responses
+  with `Access-Control-*` headers.
+- Server work: config storage per bucket, OPTIONS handler, response header injection.
+
+**Tagging (~15 tests)**
+- Object and bucket tag storage (`PUT/GET/DELETE /?tagging`). Up to 10 key-value pairs.
+- Server work: new endpoints, tag metadata storage.
+
+**Public access block (~6 tests)**
+- `PUT/GET/DELETE /?publicAccessBlock` configuration. Enforces restrictions on ACLs
+  and bucket policies.
+- Server work: config storage + enforcement checks in ACL path.
+
+**Bucket ownership controls (~4 tests)**
+- `BucketOwnerEnforced`, `BucketOwnerPreferred`, `ObjectWriter` modes.
+- Server work: config storage + mode enforcement on object writes. Small.
+
+**GetObjectAttributes (~16 tests)**
+- `GetObjectAttributes` API returning structured metadata (checksum, size, parts info).
+- Server work: new endpoint, assemble response from stored metadata.
+
+##### Tier 3: Large core features
+
+**Multipart upload (~36 tests)**
+- Full lifecycle: CreateMultipartUpload, UploadPart, CompleteMultipartUpload,
+  AbortMultipartUpload, ListParts, ListMultipartUploads.
+- Server work: large feature touching storage, metadata, and HTTP layers. Tracks in-progress
+  uploads, assembles parts into final object. Many other features (encryption, versioning,
+  checksums) have multipart variants that depend on this.
+
+**Full ACL system (~41 tests)**
+- Per-object and per-bucket ACL grants (read, write, read-acp, write-acp) to specific
+  users/groups. Currently only bucket-level public-read vs private.
+- Server work: ACL storage, grant evaluation, canned ACL expansion. Large — touches
+  authorization on every request.
+
+**Bucket policy (~25 tests)**
+- JSON-based policy documents with Statement/Effect/Principal/Action/Resource/Condition.
+- Server work: policy storage, evaluation engine, condition operators. Large.
+
+**Object lock / WORM (~39 tests)**
+- Retention periods (governance/compliance modes), legal holds, delete protection.
+- Server work: lock metadata per object version, enforcement on delete/overwrite.
+  Requires versioning (done).
+
+##### Tier 4: Encryption
+
+**SSE-C — customer-provided keys (~15 tests)**
+- Client sends AES-256 key in headers, server encrypts/decrypts transparently.
+- Server work: AES-256 encrypt on write, decrypt on read, key validation.
+
+**SSE-S3 — server-managed keys (~10 tests)**
+- Server generates and manages encryption keys per object.
+- Server work: key generation/storage + encrypt/decrypt.
+
+**SSE-KMS (~15 tests)**
+- KMS-managed keys. Would need a KMS mock or integration.
+- Server work: KMS interface + encrypt/decrypt. Heaviest encryption variant.
+
+##### Tier 5: Background processing / large infrastructure
+
+**Lifecycle (~44 tests)**
+- Lifecycle rule configuration, expiration worker, transition between storage classes.
+- Server work: rule storage, background expiration scanner, transition logic. Very large.
+
+**Bucket logging (~100 tests)**
+- Access log generation and delivery to a target bucket.
+- Server work: log record generation, buffering, periodic delivery. Very large.
+
+**Restore / cloud transition (~4 tests)**
+- Glacier-style storage classes, RestoreObject workflow.
+- Server work: storage class infrastructure, restore state machine. Very large.
+
+### Prioritized implementation order
+
+Based on test coverage unlocked vs implementation effort:
+
+| # | Feature | Tests | Effort | Notes |
+|---|---------|------:|--------|-------|
+| 1 | Multi-object delete | ~5 | Small | New endpoint, simple iteration |
+| 2 | Object user metadata | ~5 | Small | Extend existing put/get |
+| 3 | CORS | ~13 | Moderate | Config + OPTIONS handler |
+| 4 | Tagging | ~15 | Moderate | New endpoints + metadata |
+| 5 | Bucket ownership controls | ~4 | Small | Config + enforcement |
+| 6 | Public access block | ~6 | Moderate | Config + ACL enforcement |
+| 7 | GetObjectAttributes | ~16 | Moderate | New endpoint |
+| 8 | **Multipart upload** | ~36 | **Large** | Core feature, many dependents |
+| 9 | Full ACL system | ~41 | Large | Per-object grants |
+| 10 | Bucket policy | ~25 | Large | Policy evaluation engine |
+| 11 | Object lock | ~39 | Large | Lock metadata + enforcement |
+| 12 | SSE-C encryption | ~15 | Large | Crypto layer |
+| 13 | SSE-S3 / SSE-KMS | ~25 | Large | Key management |
+| 14 | Lifecycle | ~44 | Very large | Background worker |
+| 15 | Bucket logging | ~100 | Very large | Background log delivery |
+| 16 | Restore / transition | ~4 | Very large | Storage class infrastructure |
+
+### Ignored tests in current files
+
+Tests for unimplemented features are marked `#[ignore = "reason"]` so they show up in
+`cargo test -- --ignored` runs. Current ignore reasons across all files:
+
+- `not implemented: ACL on presigned PUT` (presigned.rs)
+- `not implemented: multi-tenant` (presigned.rs)
+- `not implemented: X-Amz-Expires max range enforcement` (presigned.rs)
+- `not implemented: public-read-write ACL` (bucket_anon.rs)
+- `not implemented: header auth region/service scope validation` (headers.rs)
+- `not implemented: duplicate Authorization header rejection` (headers.rs)
+- `not implemented: multipart upload checksums` (checksums.rs)
+- Various conditional/versioning edge cases
