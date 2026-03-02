@@ -22,17 +22,32 @@ pub enum S3Operation {
 }
 
 /// Validate an S3 bucket name per AWS rules.
-/// 3-63 characters, lowercase letters/digits/hyphens, no leading/trailing hyphen,
-/// no consecutive periods, not formatted as an IP address.
+///
+/// Rules enforced:
+/// - 3-63 characters long
+/// - Only lowercase letters, digits, hyphens, and periods
+/// - Must start and end with a letter or digit
+/// - No consecutive periods (`..`)
+/// - No dot-dash (`.-`) or dash-dot (`-.`)
+/// - Not formatted as an IP address
+/// - Must not start with `xn--` (reserved for IDN/Punycode)
 fn validate_bucket_name(name: &str) -> Result<(), ServerError> {
     if name.len() < 3 || name.len() > 63 {
         return Err(ServerError::InvalidBucketName {
             reason: format!("bucket name must be 3-63 characters, got {}", name.len()),
         });
     }
-    if name.starts_with('-') || name.ends_with('-') {
+    // Must start and end with a lowercase letter or digit
+    let first = name.as_bytes()[0];
+    let last = name.as_bytes()[name.len() - 1];
+    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
         return Err(ServerError::InvalidBucketName {
-            reason: "bucket name must not start or end with a hyphen".to_string(),
+            reason: "bucket name must start with a lowercase letter or digit".to_string(),
+        });
+    }
+    if !(last.is_ascii_lowercase() || last.is_ascii_digit()) {
+        return Err(ServerError::InvalidBucketName {
+            reason: "bucket name must end with a lowercase letter or digit".to_string(),
         });
     }
     if !name
@@ -52,6 +67,12 @@ fn validate_bucket_name(name: &str) -> Result<(), ServerError> {
     if name.contains(".-") || name.contains("-.") {
         return Err(ServerError::InvalidBucketName {
             reason: "bucket name must not contain dot-dash or dash-dot".to_string(),
+        });
+    }
+    // Reject xn-- prefix (reserved for Internationalized Domain Names)
+    if name.starts_with("xn--") {
+        return Err(ServerError::InvalidBucketName {
+            reason: "bucket name must not start with xn-- (reserved for IDN)".to_string(),
         });
     }
     // Reject IP-address-formatted names (4 groups of digits separated by periods)
@@ -388,12 +409,18 @@ mod tests {
         assert!(route("HEAD", "/-bucket", "").is_err());
         // Trailing hyphen
         assert!(route("HEAD", "/bucket-", "").is_err());
+        // Leading dot
+        assert!(route("HEAD", "/.bucket", "").is_err());
+        // Trailing dot
+        assert!(route("HEAD", "/bucket.", "").is_err());
         // Uppercase
         assert!(route("HEAD", "/MyBucket", "").is_err());
         // Consecutive periods
         assert!(route("HEAD", "/my..bucket", "").is_err());
         // IP address format
         assert!(route("HEAD", "/192.168.1.1", "").is_err());
+        // xn-- prefix (IDN reserved)
+        assert!(route("HEAD", "/xn--bucket", "").is_err());
     }
 
     #[test]
