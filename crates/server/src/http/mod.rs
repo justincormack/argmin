@@ -184,6 +184,15 @@ impl HttpFrontend {
                         Some(d) if d.eq_ignore_ascii_case("REPLACE") => MetadataDirective::Replace,
                         _ => MetadataDirective::Copy,
                     };
+                    // Copy-to-self without REPLACE is invalid (AWS returns 400)
+                    if matches!(directive, MetadataDirective::Copy)
+                        && src_bucket == bucket
+                        && src_key == key
+                    {
+                        return Err(ServerError::InvalidRequest {
+                            reason: "This copy request is illegal because it is trying to copy an object to itself without changing the object's metadata, storage class, website redirect location or encryption attributes.".to_string(),
+                        });
+                    }
                     let header_pairs: Vec<(&str, &str)> = req
                         .headers
                         .iter()
