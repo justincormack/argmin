@@ -345,6 +345,25 @@ fn test_post_object_empty_body() {
 // ── success_action_status ───────────────────────────────────────────────
 
 #[test]
+fn test_post_object_set_success_code() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "post-default-success";
+
+        // Default success code (no success_action_status) should return 204
+        let fields = sigv4_fields(&bucket, key, &[]);
+        let field_refs: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
+        let (status, _) = post_object(&bucket, &field_refs, b"data", "test.txt");
+        assert_eq!(status, 204, "expected 204, got {}", status);
+
+        client.delete_object().bucket(&bucket).key(key).send().await.unwrap();
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
 fn test_post_object_set_success_code_200() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -559,7 +578,7 @@ fn test_post_object_missing_file() {
 // ── Auth errors ─────────────────────────────────────────────────────────
 
 #[test]
-fn test_post_object_bad_access_key() {
+fn test_post_object_authenticated_request_bad_access_key() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;
         let key = "post-bad-key";
@@ -587,7 +606,7 @@ fn test_post_object_bad_access_key() {
 }
 
 #[test]
-fn test_post_object_bad_signature() {
+fn test_post_object_invalid_signature() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;
         let key = "post-bad-sig";
@@ -1322,7 +1341,7 @@ fn test_post_object_metadata() {
 }
 
 #[test]
-fn test_post_object_ignored_header() {
+fn test_post_object_user_specified_header() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = setup_bucket().await;
@@ -1388,7 +1407,7 @@ fn test_post_object_wrong_bucket() {
 // ── Checksum ────────────────────────────────────────────────────────────
 
 #[test]
-fn test_post_object_checksum_sha256() {
+fn test_post_object_upload_checksum() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = setup_bucket().await;
@@ -1418,7 +1437,7 @@ fn test_post_object_checksum_sha256() {
 // ── Large file ──────────────────────────────────────────────────────────
 
 #[test]
-fn test_post_object_large_file() {
+fn test_post_object_upload_larger_than_chunk() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = setup_bucket().await;
@@ -1448,4 +1467,114 @@ fn test_post_object_large_file() {
         client.delete_object().bucket(&bucket).key(key).send().await.unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
+}
+
+// ── Additional Ceph tests ──────────────────────────────────────────────
+
+#[test]
+fn test_post_object_invalid_access_key() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "post-invalid-key";
+
+        let (short_date, full_date) = current_dates();
+        let region = CTX.region();
+        // Use a completely malformed access key (not just wrong, but invalid format)
+        let credential = format!("/{}/{}/s3/aws4_request", short_date, region);
+        let policy_b64 = make_policy(&bucket, key, 3600, &[]);
+        let signature = sign_policy_v4(&policy_b64, "fake-secret", &short_date, region);
+
+        let fields: Vec<(&str, &str)> = vec![
+            ("key", key),
+            ("x-amz-algorithm", "AWS4-HMAC-SHA256"),
+            ("x-amz-credential", &credential),
+            ("x-amz-date", &full_date),
+            ("policy", &policy_b64),
+            ("x-amz-signature", &signature),
+        ];
+
+        let (status, _) = post_object(&bucket, &fields, b"data", "test.txt");
+        assert!(status == 400 || status == 403, "expected 400 or 403, got {}", status);
+
+        CTX.client().delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_post_object_invalid_content_length_argument() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "post-bad-clr";
+
+        // Use an invalid content-length-range (min > max)
+        let fields = sigv4_fields(
+            &bucket,
+            key,
+            &[serde_json::json!(["content-length-range", 100, 10])],
+        );
+        let field_refs: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
+        let (status, _) = post_object(&bucket, &field_refs, b"data", "test.txt");
+        assert!(status == 400 || status == 403, "expected 400 or 403, got {}", status);
+
+        CTX.client().delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_post_object_missing_expires_condition() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "post-no-expiry";
+
+        let (short_date, full_date) = current_dates();
+        let access_key = CTX.access_key();
+        let secret_key = CTX.secret_key();
+        let region = CTX.region();
+        let credential = format!("{}/{}/{}/s3/aws4_request", access_key, short_date, region);
+
+        // Policy without expiration field
+        use base64::Engine;
+        let policy_json = serde_json::json!({
+            "conditions": [
+                {"bucket": bucket},
+                ["eq", "$key", key],
+            ]
+        });
+        let policy_b64 = base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_string(&policy_json).unwrap());
+        let signature = sign_policy_v4(&policy_b64, secret_key, &short_date, region);
+
+        let fields: Vec<(&str, &str)> = vec![
+            ("key", key),
+            ("x-amz-algorithm", "AWS4-HMAC-SHA256"),
+            ("x-amz-credential", &credential),
+            ("x-amz-date", &full_date),
+            ("policy", &policy_b64),
+            ("x-amz-signature", &signature),
+        ];
+
+        let (status, _) = post_object(&bucket, &fields, b"data", "test.txt");
+        assert!(status == 400 || status == 403, "expected 400 or 403, got {}", status);
+
+        CTX.client().delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+#[ignore = "not implemented: tagging"]
+fn test_post_object_tags_anonymous_request() {
+    s3_tests::run(async {});
+}
+
+#[test]
+#[ignore = "not implemented: tagging"]
+fn test_post_object_tags_authenticated_request() {
+    s3_tests::run(async {});
+}
+
+#[test]
+#[ignore = "not implemented: RGW-specific bug"]
+fn test_post_object_upload_size_rgw_chunk_size_bug() {
+    s3_tests::run(async {});
 }

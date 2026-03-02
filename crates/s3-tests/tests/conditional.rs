@@ -335,7 +335,7 @@ fn test_head_object_ifnonematch_failed() {
 // ── PUT If-None-Match: * (create-only) ──────────────────────────────────
 
 #[test]
-fn test_put_object_ifnonematch_star_create() {
+fn test_put_object_ifnonmatch_nonexisted_good() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;
 
@@ -365,7 +365,7 @@ fn test_put_object_ifnonematch_star_create() {
 }
 
 #[test]
-fn test_put_object_ifnonematch_star_overwrite_fails() {
+fn test_put_object_ifnonmatch_overwrite_existed_failed() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;
         put_object(&bucket, "existing", b"original").await;
@@ -462,7 +462,7 @@ fn test_put_object_ifmatch_failed() {
 }
 
 #[test]
-fn test_put_object_ifmatch_nonexistent() {
+fn test_put_object_ifmatch_nonexisted_failed() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;
 
@@ -733,4 +733,277 @@ fn test_copy_object_source_ifunmodifiedsince_failed() {
 
         cleanup(&bucket, &["src"]).await;
     });
+}
+
+// ── PUT If-Match (additional Ceph tests) ────────────────────────────────
+
+#[test]
+fn test_put_object_if_match() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let etag = put_object(&bucket, "obj", b"data").await;
+
+        // Basic If-Match PUT
+        CTX.client()
+            .put_object()
+            .bucket(&bucket)
+            .key("obj")
+            .if_match(&etag)
+            .body(ByteStream::from_static(b"updated"))
+            .send()
+            .await
+            .unwrap();
+
+        let resp = CTX.client()
+            .get_object()
+            .bucket(&bucket)
+            .key("obj")
+            .send()
+            .await
+            .unwrap();
+        let data = resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], b"updated");
+
+        cleanup(&bucket, &["obj"]).await;
+    });
+}
+
+#[test]
+fn test_put_object_ifmatch_overwrite_existed_good() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let etag = put_object(&bucket, "obj", b"original").await;
+
+        // Overwrite existing object with matching etag
+        CTX.client()
+            .put_object()
+            .bucket(&bucket)
+            .key("obj")
+            .if_match(&etag)
+            .body(ByteStream::from_static(b"overwritten"))
+            .send()
+            .await
+            .unwrap();
+
+        let resp = CTX.client()
+            .get_object()
+            .bucket(&bucket)
+            .key("obj")
+            .send()
+            .await
+            .unwrap();
+        let data = resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], b"overwritten");
+
+        cleanup(&bucket, &["obj"]).await;
+    });
+}
+
+// ── PUT If-None-Match (non-star) ────────────────────────────────────────
+
+#[test]
+fn test_put_object_ifnonmatch_good() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        put_object(&bucket, "obj", b"data").await;
+
+        // Non-matching etag → should succeed
+        CTX.client()
+            .put_object()
+            .bucket(&bucket)
+            .key("obj")
+            .if_none_match("\"0000000000000000\"")
+            .body(ByteStream::from_static(b"updated"))
+            .send()
+            .await
+            .unwrap();
+
+        let resp = CTX.client()
+            .get_object()
+            .bucket(&bucket)
+            .key("obj")
+            .send()
+            .await
+            .unwrap();
+        let data = resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], b"updated");
+
+        cleanup(&bucket, &["obj"]).await;
+    });
+}
+
+#[test]
+#[ignore = "not implemented: If-None-Match with specific etag on PUT"]
+fn test_put_object_ifnonmatch_failed() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let etag = put_object(&bucket, "obj", b"data").await;
+
+        // Matching etag → should fail with 412
+        let result = CTX.client()
+            .put_object()
+            .bucket(&bucket)
+            .key("obj")
+            .if_none_match(&etag)
+            .body(ByteStream::from_static(b"updated"))
+            .send()
+            .await;
+        assert!(result.is_err(), "expected 412 PreconditionFailed");
+
+        cleanup(&bucket, &["obj"]).await;
+    });
+}
+
+// ── Copy destination conditions ─────────────────────────────────────────
+
+#[test]
+fn test_copy_object_ifmatch_good() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        put_object(&bucket, "src", b"source data").await;
+        let dst_etag = put_object(&bucket, "dst", b"old dst").await;
+
+        // If-Match on destination with correct etag → should succeed
+        CTX.client()
+            .copy_object()
+            .bucket(&bucket)
+            .key("dst")
+            .copy_source(format!("{}/src", bucket))
+            .if_match(&dst_etag)
+            .send()
+            .await
+            .unwrap();
+
+        let resp = CTX.client()
+            .get_object()
+            .bucket(&bucket)
+            .key("dst")
+            .send()
+            .await
+            .unwrap();
+        let data = resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], b"source data");
+
+        cleanup(&bucket, &["src", "dst"]).await;
+    });
+}
+
+#[test]
+fn test_copy_object_ifmatch_failed() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        put_object(&bucket, "src", b"source data").await;
+        put_object(&bucket, "dst", b"old dst").await;
+
+        // If-Match on destination with wrong etag → should fail
+        let result = CTX.client()
+            .copy_object()
+            .bucket(&bucket)
+            .key("dst")
+            .copy_source(format!("{}/src", bucket))
+            .if_match("\"0000000000000000\"")
+            .send()
+            .await;
+        assert!(result.is_err(), "expected 412 PreconditionFailed");
+
+        cleanup(&bucket, &["src", "dst"]).await;
+    });
+}
+
+#[test]
+fn test_copy_object_ifnonematch_good() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        put_object(&bucket, "src", b"source data").await;
+        put_object(&bucket, "dst", b"old dst").await;
+
+        // If-None-Match on destination with non-matching etag → should succeed
+        CTX.client()
+            .copy_object()
+            .bucket(&bucket)
+            .key("dst")
+            .copy_source(format!("{}/src", bucket))
+            .if_none_match("\"0000000000000000\"")
+            .send()
+            .await
+            .unwrap();
+
+        let resp = CTX.client()
+            .get_object()
+            .bucket(&bucket)
+            .key("dst")
+            .send()
+            .await
+            .unwrap();
+        let data = resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], b"source data");
+
+        cleanup(&bucket, &["src", "dst"]).await;
+    });
+}
+
+#[test]
+#[ignore = "not implemented: If-None-Match with specific etag on COPY"]
+fn test_copy_object_ifnonematch_failed() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        put_object(&bucket, "src", b"source data").await;
+        let dst_etag = put_object(&bucket, "dst", b"old dst").await;
+
+        // If-None-Match on destination with matching etag → should fail
+        let result = CTX.client()
+            .copy_object()
+            .bucket(&bucket)
+            .key("dst")
+            .copy_source(format!("{}/src", bucket))
+            .if_none_match(&dst_etag)
+            .send()
+            .await;
+        assert!(result.is_err(), "expected 412 PreconditionFailed");
+
+        cleanup(&bucket, &["src", "dst"]).await;
+    });
+}
+
+// ── DELETE If-Match (additional Ceph tests) ─────────────────────────────
+
+#[test]
+fn test_delete_object_if_match() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let etag = put_object(&bucket, "obj", b"hello").await;
+
+        // Basic delete with If-Match
+        CTX.client()
+            .delete_object()
+            .bucket(&bucket)
+            .key("obj")
+            .if_match(&etag)
+            .send()
+            .await
+            .unwrap();
+
+        // Verify deleted
+        let result = CTX.client()
+            .get_object()
+            .bucket(&bucket)
+            .key("obj")
+            .send()
+            .await;
+        assert!(result.is_err());
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+#[ignore = "not implemented: delete If-Match with last-modified-time"]
+fn test_delete_object_if_match_last_modified_time() {
+    s3_tests::run(async {});
+}
+
+#[test]
+#[ignore = "not implemented: delete If-Match with size"]
+fn test_delete_object_if_match_size() {
+    s3_tests::run(async {});
 }

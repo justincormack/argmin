@@ -734,3 +734,221 @@ fn test_presigned_get_response_content_type() {
         cleanup(&bucket, &["obj"]).await;
     });
 }
+
+// ── X-Amz-Expires range tests ──────────────────────────────────────────
+
+#[test]
+fn test_object_raw_get_x_amz_expires_not_expired() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("obj")
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+
+        // Generate a presigned URL with a valid, non-expired duration
+        let presign_config = PresigningConfig::expires_in(Duration::from_secs(600)).unwrap();
+        let presigned = client
+            .get_object()
+            .bucket(&bucket)
+            .key("obj")
+            .presigned(presign_config)
+            .await
+            .unwrap();
+
+        let mut resp = agent().get(presigned.uri()).call().expect("transport error");
+        assert_eq!(resp.status().as_u16(), 200);
+        let data = resp.body_mut().read_to_vec().unwrap();
+        assert_eq!(&data[..], b"data");
+
+        cleanup(&bucket, &["obj"]).await;
+    });
+}
+
+#[test]
+#[ignore = "not implemented: X-Amz-Expires max range enforcement"]
+fn test_object_raw_get_x_amz_expires_out_max_range() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("obj")
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+
+        // 604801 seconds = 7 days + 1 second, exceeds the max allowed
+        let presign_config = PresigningConfig::expires_in(Duration::from_secs(604801)).unwrap();
+        let presigned = client
+            .get_object()
+            .bucket(&bucket)
+            .key("obj")
+            .presigned(presign_config)
+            .await
+            .unwrap();
+
+        let mut resp = agent().get(presigned.uri()).call().expect("transport error");
+        let status = resp.status().as_u16();
+        let _ = resp.body_mut().read_to_string();
+        // Should be rejected as expires exceeds max range
+        assert!(
+            status == 400 || status == 403,
+            "expected 400 or 403 for out-of-range expires, got {}",
+            status
+        );
+
+        cleanup(&bucket, &["obj"]).await;
+    });
+}
+
+#[test]
+fn test_object_raw_get_x_amz_expires_out_positive_range() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("obj")
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+
+        // Manually construct a URL with a negative X-Amz-Expires
+        let presign_config = PresigningConfig::expires_in(Duration::from_secs(600)).unwrap();
+        let presigned = client
+            .get_object()
+            .bucket(&bucket)
+            .key("obj")
+            .presigned(presign_config)
+            .await
+            .unwrap();
+
+        // Replace the X-Amz-Expires value with a negative number
+        let tampered_url = presigned.uri().replace(
+            "X-Amz-Expires=600",
+            "X-Amz-Expires=-1",
+        );
+
+        let mut resp = agent().get(&tampered_url).call().expect("transport error");
+        let status = resp.status().as_u16();
+        let _ = resp.body_mut().read_to_string();
+        assert!(
+            status == 400 || status == 403,
+            "expected 400 or 403 for negative expires, got {}",
+            status
+        );
+
+        cleanup(&bucket, &["obj"]).await;
+    });
+}
+
+#[test]
+fn test_object_raw_get_x_amz_expires_out_range_zero() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("obj")
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+
+        // Construct a URL with X-Amz-Expires=0
+        let presign_config = PresigningConfig::expires_in(Duration::from_secs(600)).unwrap();
+        let presigned = client
+            .get_object()
+            .bucket(&bucket)
+            .key("obj")
+            .presigned(presign_config)
+            .await
+            .unwrap();
+
+        let tampered_url = presigned.uri().replace(
+            "X-Amz-Expires=600",
+            "X-Amz-Expires=0",
+        );
+
+        let mut resp = agent().get(&tampered_url).call().expect("transport error");
+        let status = resp.status().as_u16();
+        let _ = resp.body_mut().read_to_string();
+        assert!(
+            status == 400 || status == 403,
+            "expected 400 or 403 for zero expires, got {}",
+            status
+        );
+
+        cleanup(&bucket, &["obj"]).await;
+    });
+}
+
+#[test]
+fn test_object_raw_put_authenticated_expired() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+
+        // Generate a presigned PUT URL that's already expired
+        let presign_config = PresigningConfig::expires_in(Duration::from_secs(1)).unwrap();
+        let presigned = client
+            .put_object()
+            .bucket(&bucket)
+            .key("obj")
+            .presigned(presign_config)
+            .await
+            .unwrap();
+
+        // Wait for expiry
+        std::thread::sleep(Duration::from_secs(2));
+
+        let mut resp = agent()
+            .put(presigned.uri())
+            .send(b"data" as &[u8])
+            .expect("transport error");
+        let status = resp.status().as_u16();
+        let _ = resp.body_mut().read_to_string();
+        assert!(
+            status == 400 || status == 403,
+            "expected 400 or 403 for expired PUT, got {}",
+            status
+        );
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+// ── ACL / Tenant presigned (not implemented) ───────────────────────────
+
+#[test]
+#[ignore = "not implemented: ACL on presigned PUT"]
+fn test_object_presigned_put_object_with_acl() {
+    s3_tests::run(async {});
+}
+
+#[test]
+#[ignore = "not implemented: multi-tenant"]
+fn test_object_presigned_put_object_with_acl_tenant() {
+    s3_tests::run(async {});
+}
+
+#[test]
+#[ignore = "not implemented: multi-tenant"]
+fn test_object_raw_get_x_amz_expires_not_expired_tenant() {
+    s3_tests::run(async {});
+}

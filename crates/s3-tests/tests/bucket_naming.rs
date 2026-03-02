@@ -44,7 +44,7 @@ fn test_bucket_create_naming_good_contains_hyphen() {
 }
 
 #[test]
-fn test_bucket_create_naming_good_long() {
+fn test_bucket_create_naming_good_long_63() {
     s3_tests::run(async {
         let client = CTX.client();
         // 63 chars is the max allowed
@@ -178,7 +178,7 @@ fn test_bucket_create_naming_bad_short_two() {
 }
 
 #[test]
-fn test_bucket_create_naming_bad_long() {
+fn test_bucket_create_naming_dns_long() {
     s3_tests::run(async {
         let client = CTX.client();
         // 64 chars exceeds the limit
@@ -328,6 +328,49 @@ fn test_bucket_create_naming_bad_xn_prefix() {
     s3_tests::run(async {
         let client = CTX.client();
         let result = client.create_bucket().bucket("xn--bucket").send().await;
+        assert!(result.is_err());
+    });
+}
+
+// ── Good: specific lengths ─────────────────────────────────────────────
+
+#[test]
+fn test_bucket_create_naming_good_long_60() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = "a".repeat(60);
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_bucket_create_naming_good_long_61() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = "a".repeat(61);
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_bucket_create_naming_good_long_62() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = "a".repeat(62);
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+// ── Bad: non-alphanumeric start ────────────────────────────────────────
+
+#[test]
+fn test_bucket_create_naming_bad_starts_nonalpha() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let result = client.create_bucket().bucket("!bucket").send().await;
         assert!(result.is_err());
     });
 }

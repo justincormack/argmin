@@ -562,7 +562,7 @@ fn test_bucket_list_delimiter_prefix_underscore() {
 }
 
 #[test]
-fn test_bucket_list_delimiter_prefix() {
+fn test_bucket_list_prefix_delimiter_basic() {
     s3_tests::run(async {
         let client = CTX.client();
         let (bucket, keys) = create_objects_with_keys(client, SET_A).await;
@@ -1788,4 +1788,134 @@ fn test_bucket_listv2_objects_anonymous_fail() {
 
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
+}
+
+// ── Additional Ceph tests ──────────────────────────────────────────────
+
+#[test]
+fn test_bucket_list_long_name() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        // Use a 63-char bucket name (max allowed)
+        let bucket = "a".repeat(63);
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let resp = client.list_objects().bucket(&bucket).send().await.unwrap();
+        assert!(resp.contents().is_empty());
+
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_bucket_list_maxkeys_invalid() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let (bucket, keys) = create_objects(client, "", 3).await;
+
+        // max-keys = -1 should be treated as error or ignored
+        let result = client
+            .list_objects()
+            .bucket(&bucket)
+            .max_keys(-1)
+            .send()
+            .await;
+        // AWS returns 400 for invalid max-keys
+        assert!(result.is_err(), "expected error for negative max-keys");
+
+        delete_all_and_bucket(client, &bucket, &keys).await;
+    });
+}
+
+#[test]
+fn test_bucket_list_special_prefix() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let (bucket, keys) = create_objects_with_keys(
+            client,
+            &["_bla/1", "_bla/2", "_bla/3", "_bla/foo"],
+        )
+        .await;
+
+        let resp = client
+            .list_objects()
+            .bucket(&bucket)
+            .prefix("_bla/")
+            .send()
+            .await
+            .unwrap();
+        let result_keys = get_keys(resp.contents());
+        assert_eq!(result_keys.len(), 4);
+
+        delete_all_and_bucket(client, &bucket, &keys).await;
+    });
+}
+
+#[test]
+fn test_bucket_listv2_delimiter_prefix() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let (bucket, keys) = create_objects_with_keys(client, SET_A).await;
+
+        // Paginate V2 with max_keys=1 through delimiter="/" results
+        let mut all_keys = Vec::new();
+        let mut all_prefixes = Vec::new();
+        let mut continuation_token: Option<String> = None;
+        loop {
+            let mut req = client
+                .list_objects_v2()
+                .bucket(&bucket)
+                .delimiter("/")
+                .max_keys(1);
+            if let Some(ref token) = continuation_token {
+                req = req.continuation_token(token);
+            }
+            let resp = req.send().await.unwrap();
+
+            let page_keys = get_keys(resp.contents());
+            let page_prefixes = get_prefixes(resp.common_prefixes());
+            all_keys.extend(page_keys);
+            all_prefixes.extend(page_prefixes);
+
+            if resp.is_truncated() != Some(true) {
+                break;
+            }
+            continuation_token = resp.next_continuation_token().map(String::from);
+        }
+
+        assert_eq!(all_keys, vec!["asdf", "cquux", "thud", "zoo"]);
+        assert_eq!(all_prefixes, vec!["boo/"]);
+
+        delete_all_and_bucket(client, &bucket, &keys).await;
+    });
+}
+
+#[test]
+fn test_bucket_listv2_prefix_delimiter_basic() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let (bucket, keys) = create_objects_with_keys(client, SET_A).await;
+
+        let resp = client
+            .list_objects_v2()
+            .bucket(&bucket)
+            .delimiter("/")
+            .prefix("boo/")
+            .send()
+            .await
+            .unwrap();
+
+        let result_keys = get_keys(resp.contents());
+        let result_prefixes = get_prefixes(resp.common_prefixes());
+        assert_eq!(result_keys, vec!["boo/bar"]);
+        assert_eq!(result_prefixes, vec!["boo/baz/"]);
+
+        delete_all_and_bucket(client, &bucket, &keys).await;
+    });
+}
+
+#[test]
+#[ignore = "not implemented: versioning"]
+fn test_bucket_list_return_data_versioning() {
+    s3_tests::run(async {});
 }

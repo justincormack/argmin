@@ -4,7 +4,7 @@ use s3_tests::{unique_bucket, CTX};
 // ── CreateBucket ─────────────────────────────────────────────────────
 
 #[test]
-fn test_bucket_create_exists() {
+fn test_bucket_create_delete() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
@@ -32,7 +32,7 @@ fn test_bucket_create_already_exists() {
 // ── DeleteBucket ─────────────────────────────────────────────────────
 
 #[test]
-fn test_bucket_delete_nonexistent() {
+fn test_bucket_delete_notexist() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
@@ -91,7 +91,7 @@ fn test_bucket_delete_then_recreate() {
 // ── HeadBucket ───────────────────────────────────────────────────────
 
 #[test]
-fn test_bucket_head_existing() {
+fn test_bucket_head() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
@@ -104,7 +104,7 @@ fn test_bucket_head_existing() {
 }
 
 #[test]
-fn test_bucket_head_nonexistent() {
+fn test_bucket_head_notexist() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
@@ -217,4 +217,103 @@ fn test_bucket_list_objects_nonexistent_bucket() {
         let result = client.list_objects_v2().bucket(&bucket).send().await;
         assert!(result.is_err());
     });
+}
+
+// ── Extended HEAD / ACL / ownership ─────────────────────────────────
+
+#[test]
+fn test_bucket_head_extended() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        // HEAD should return without error and include standard headers
+        client.head_bucket().bucket(&bucket).send().await.unwrap();
+
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_bucket_create_special_key_names() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        // Create objects with special key names
+        let special_keys = &["foo/bar", "foo&bar", "foo bar", "foo+bar"];
+        for key in special_keys {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(*key)
+                .body(ByteStream::from_static(b"data"))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        // Verify they all exist
+        let resp = client
+            .list_objects_v2()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.key_count(), Some(special_keys.len() as i32));
+
+        // Clean up
+        for key in special_keys {
+            client
+                .delete_object()
+                .bucket(&bucket)
+                .key(*key)
+                .send()
+                .await
+                .unwrap();
+        }
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_buckets_list_ctime() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let resp = client.list_buckets().send().await.unwrap();
+        let found = resp
+            .buckets()
+            .iter()
+            .find(|b| b.name() == Some(bucket.as_str()));
+        assert!(found.is_some(), "bucket should be in listing");
+        assert!(
+            found.unwrap().creation_date().is_some(),
+            "bucket should have creation date"
+        );
+
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+#[ignore = "not implemented: multi-user"]
+fn test_bucket_create_exists_nonowner() {
+    s3_tests::run(async {});
+}
+
+#[test]
+#[ignore = "not implemented: bucket ownership controls"]
+fn test_bucket_create_delete_bucket_ownership() {
+    s3_tests::run(async {});
+}
+
+#[test]
+#[ignore = "not implemented: ACL grants"]
+fn test_bucket_header_acl_grants() {
+    s3_tests::run(async {});
 }

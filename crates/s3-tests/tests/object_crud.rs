@@ -12,7 +12,7 @@ async fn setup_bucket() -> String {
 // ── PutObject / GetObject basic ──────────────────────────────────────
 
 #[test]
-fn test_object_write_read() {
+fn test_object_write_file() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = setup_bucket().await;
@@ -132,7 +132,7 @@ fn test_object_write_overwrite() {
 // ── PutObject returns ETag ───────────────────────────────────────────
 
 #[test]
-fn test_object_write_returns_etag() {
+fn test_object_write_check_etag() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = setup_bucket().await;
@@ -163,7 +163,7 @@ fn test_object_write_returns_etag() {
 // ── GetObject nonexistent ────────────────────────────────────────────
 
 #[test]
-fn test_object_read_nonexistent() {
+fn test_object_read_not_exist() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = setup_bucket().await;
@@ -637,7 +637,7 @@ fn test_object_key_with_spaces() {
 // ── Cache-Control ────────────────────────────────────────────────────
 
 #[test]
-fn test_object_cache_control() {
+fn test_object_write_cache_control() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = setup_bucket().await;
@@ -787,4 +787,225 @@ fn test_object_content_language() {
             .unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
+}
+
+// ── HEAD zero-byte object ───────────────────────────────────────────
+
+#[test]
+fn test_object_head_zero_bytes() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("empty")
+            .body(ByteStream::from_static(b""))
+            .send()
+            .await
+            .unwrap();
+
+        let resp = client
+            .head_object()
+            .bucket(&bucket)
+            .key("empty")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.content_length(), Some(0));
+        assert!(resp.e_tag().is_some());
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key("empty")
+            .send()
+            .await
+            .unwrap();
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+// ── Read with unreadable key ────────────────────────────────────────
+
+#[test]
+fn test_object_read_unreadable() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "\u{2680}";
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+
+        let resp = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let data = resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], b"data");
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+// ── Expires header ──────────────────────────────────────────────────
+
+#[test]
+fn test_object_write_expires() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+
+        let expires = aws_sdk_s3::primitives::DateTime::from_secs(4_102_444_800); // 2100-01-01
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("obj")
+            .expires(expires)
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+
+        let resp = client
+            .head_object()
+            .bucket(&bucket)
+            .key("obj")
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.expires_string().is_some());
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key("obj")
+            .send()
+            .await
+            .unwrap();
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+// ── Full lifecycle: write → read → update → read → delete ──────────
+
+#[test]
+fn test_object_write_read_update_read_delete() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+
+        // Write
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("obj")
+            .body(ByteStream::from_static(b"v1"))
+            .send()
+            .await
+            .unwrap();
+
+        // Read
+        let resp = client
+            .get_object()
+            .bucket(&bucket)
+            .key("obj")
+            .send()
+            .await
+            .unwrap();
+        let data = resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], b"v1");
+
+        // Update
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("obj")
+            .body(ByteStream::from_static(b"v2"))
+            .send()
+            .await
+            .unwrap();
+
+        // Read again
+        let resp = client
+            .get_object()
+            .bucket(&bucket)
+            .key("obj")
+            .send()
+            .await
+            .unwrap();
+        let data = resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], b"v2");
+
+        // Delete
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key("obj")
+            .send()
+            .await
+            .unwrap();
+
+        // Verify gone
+        let result = client
+            .get_object()
+            .bucket(&bucket)
+            .key("obj")
+            .send()
+            .await;
+        assert!(result.is_err());
+
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+// ── Write to nonexistent bucket ─────────────────────────────────────
+
+#[test]
+fn test_object_write_to_nonexist_bucket() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+
+        let result = client
+            .put_object()
+            .bucket(&bucket)
+            .key("key")
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await;
+        assert!(result.is_err());
+    });
+}
+
+// ── Not implemented ─────────────────────────────────────────────────
+
+#[test]
+#[ignore = "not implemented: ACL grants"]
+fn test_object_header_acl_grants() {
+    s3_tests::run(async {});
+}
+
+#[test]
+#[ignore = "not implemented: chunked transfer encoding"]
+fn test_object_write_with_chunked_transfer_encoding() {
+    s3_tests::run(async {});
 }

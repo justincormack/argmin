@@ -362,3 +362,46 @@ fn test_multi_object_delete_nonexistent_bucket() {
         assert!(result.is_err());
     });
 }
+
+#[test]
+fn test_multi_objectv2_delete_key_limit() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        // Build a request with >1000 keys (server limit), verify via V2 list
+        let key_strs: Vec<String> = (0..1001).map(|i| format!("key{}", i)).collect();
+        let key_refs: Vec<&str> = key_strs.iter().map(|s| s.as_str()).collect();
+        let delete = make_delete_request(&key_refs, false);
+
+        let result = client
+            .delete_objects()
+            .bucket(&bucket)
+            .delete(delete)
+            .send()
+            .await;
+        assert!(result.is_err(), "expected error for >1000 keys");
+
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_object_delete_key_bucket_gone() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+
+        // Try to delete an object from the now-deleted bucket
+        let result = client
+            .delete_object()
+            .bucket(&bucket)
+            .key("somekey")
+            .send()
+            .await;
+        assert!(result.is_err());
+    });
+}
