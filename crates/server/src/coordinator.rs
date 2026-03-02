@@ -445,6 +445,7 @@ impl Coordinator {
         &self,
         src_bucket: &str,
         src_key: &str,
+        src_version_id: Option<u64>,
         dst_bucket: &str,
         dst_key: &str,
         src_cond: &ReadCondition,
@@ -455,15 +456,17 @@ impl Coordinator {
         // 1. Read source metadata from metadata PG
         let src_meta_pg_id = derive_pg(src_bucket, src_key, self.pg_count);
         let src_meta_pg = self.storage_node.get_pg(src_meta_pg_id)?;
-        let src_record = src_meta_pg
-            .get_object_meta(src_bucket, src_key)
-            .map_err(|e| match e {
-                storage::MetadataError::ObjectNotFound => ServerError::ObjectNotFound {
-                    bucket: src_bucket.to_string(),
-                    key: src_key.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })?;
+        let src_record = match src_version_id {
+            Some(vid) => src_meta_pg.get_object_version(src_bucket, src_key, vid),
+            None => src_meta_pg.get_object_meta(src_bucket, src_key),
+        }
+        .map_err(|e| match e {
+            storage::MetadataError::ObjectNotFound => ServerError::ObjectNotFound {
+                bucket: src_bucket.to_string(),
+                key: src_key.to_string(),
+            },
+            other => ServerError::Metadata(other),
+        })?;
 
         let src_etag_crc = etag_bytes_to_crc64(&src_record.etag).unwrap_or(0);
         let src_etag = format_etag(src_etag_crc);
@@ -2879,6 +2882,7 @@ mod tests {
             .copy_object(
                 "bucket",
                 "src",
+                None,
                 "bucket",
                 "dst",
                 NO_READ,
@@ -2911,6 +2915,7 @@ mod tests {
             .copy_object(
                 "bucket",
                 "src",
+                None,
                 "bucket",
                 "dst",
                 NO_READ,
@@ -2944,6 +2949,7 @@ mod tests {
             .copy_object(
                 "bucket",
                 "src",
+                None,
                 "bucket",
                 "dst",
                 NO_READ,
@@ -2977,6 +2983,7 @@ mod tests {
             .copy_object(
                 "bucket",
                 "key",
+                None,
                 "bucket",
                 "key",
                 NO_READ,
@@ -3001,6 +3008,7 @@ mod tests {
             .copy_object(
                 "bucket",
                 "no-such-key",
+                None,
                 "bucket",
                 "dst",
                 NO_READ,
@@ -3025,6 +3033,7 @@ mod tests {
             .copy_object(
                 "bucket",
                 "src",
+                None,
                 "no-bucket",
                 "dst",
                 NO_READ,
@@ -3053,6 +3062,7 @@ mod tests {
             .copy_object(
                 "bucket",
                 "src",
+                None,
                 "bucket",
                 "dst",
                 &src_cond,
@@ -3085,6 +3095,7 @@ mod tests {
             .copy_object(
                 "bucket",
                 "src",
+                None,
                 "bucket",
                 "dst",
                 NO_READ,
@@ -3117,6 +3128,7 @@ mod tests {
             .copy_object(
                 "bucket",
                 "src",
+                None,
                 "bucket",
                 "dst",
                 NO_READ,
@@ -3153,6 +3165,7 @@ mod tests {
             .copy_object(
                 "src-bucket",
                 "key",
+                None,
                 "dst-bucket",
                 "key",
                 NO_READ,

@@ -139,19 +139,28 @@ pub(crate) fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&percent_decode_bytes(s)).to_string()
 }
 
-/// Parse the `x-amz-copy-source` header value into `(bucket, key)`.
+/// Parse the `x-amz-copy-source` header value into `(bucket, key, version_id)`.
 ///
-/// Accepts `[/]bucket/key[?versionId=...]`. Strips optional leading `/`
-/// and ignores `?versionId=...` (we don't support versioning).
-/// Both bucket and key are percent-decoded.
-pub(crate) fn parse_copy_source(header: &str) -> Result<(String, String), ServerError> {
+/// Accepts `[/]bucket/key[?versionId=...]`. Strips optional leading `/`.
+/// Both bucket and key are percent-decoded. Returns the raw `versionId`
+/// query-parameter value (if present) as-is.
+pub(crate) fn parse_copy_source(
+    header: &str,
+) -> Result<(String, String, Option<String>), ServerError> {
     // Strip optional leading slash
     let s = header.strip_prefix('/').unwrap_or(header);
 
-    // Strip ?versionId=... query string
-    let s = match s.find('?') {
-        Some(pos) => &s[..pos],
-        None => s,
+    // Extract ?versionId=... query string
+    let (s, version_id) = match s.find('?') {
+        Some(pos) => {
+            let query = &s[pos + 1..];
+            let vid = query
+                .split('&')
+                .find_map(|param| param.strip_prefix("versionId="))
+                .map(|v| v.to_string());
+            (&s[..pos], vid)
+        }
+        None => (s, None),
     };
 
     // Split into bucket/key at first '/'
@@ -168,7 +177,7 @@ pub(crate) fn parse_copy_source(header: &str) -> Result<(String, String), Server
         });
     }
 
-    Ok((bucket, key))
+    Ok((bucket, key, version_id))
 }
 
 fn hex_val(b: u8) -> Option<u8> {
@@ -399,37 +408,42 @@ mod tests {
 
     #[test]
     fn parse_copy_source_basic() {
-        let (bucket, key) = parse_copy_source("/bucket/key").unwrap();
+        let (bucket, key, vid) = parse_copy_source("/bucket/key").unwrap();
         assert_eq!(bucket, "bucket");
         assert_eq!(key, "key");
+        assert_eq!(vid, None);
     }
 
     #[test]
     fn parse_copy_source_no_leading_slash() {
-        let (bucket, key) = parse_copy_source("bucket/key").unwrap();
+        let (bucket, key, vid) = parse_copy_source("bucket/key").unwrap();
         assert_eq!(bucket, "bucket");
         assert_eq!(key, "key");
+        assert_eq!(vid, None);
     }
 
     #[test]
     fn parse_copy_source_encoded() {
-        let (bucket, key) = parse_copy_source("/bucket/key%20name").unwrap();
+        let (bucket, key, vid) = parse_copy_source("/bucket/key%20name").unwrap();
         assert_eq!(bucket, "bucket");
         assert_eq!(key, "key name");
+        assert_eq!(vid, None);
     }
 
     #[test]
     fn parse_copy_source_nested_key() {
-        let (bucket, key) = parse_copy_source("/bucket/a/b/c").unwrap();
+        let (bucket, key, vid) = parse_copy_source("/bucket/a/b/c").unwrap();
         assert_eq!(bucket, "bucket");
         assert_eq!(key, "a/b/c");
+        assert_eq!(vid, None);
     }
 
     #[test]
-    fn parse_copy_source_version_id_stripped() {
-        let (bucket, key) = parse_copy_source("/bucket/key?versionId=xyz").unwrap();
+    fn parse_copy_source_version_id() {
+        let (bucket, key, vid) = parse_copy_source("/bucket/key?versionId=xyz").unwrap();
         assert_eq!(bucket, "bucket");
         assert_eq!(key, "key");
+        assert_eq!(vid.as_deref(), Some("xyz"));
     }
 
     #[test]

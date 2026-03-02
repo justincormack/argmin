@@ -175,7 +175,15 @@ impl HttpFrontend {
             S3Operation::PutObject { bucket, key } => {
                 if let Some(copy_source) = req.header("x-amz-copy-source") {
                     // CopyObject path
-                    let (src_bucket, src_key) = request::parse_copy_source(copy_source)?;
+                    let (src_bucket, src_key, src_version_id_str) =
+                        request::parse_copy_source(copy_source)?;
+                    let src_version_id = src_version_id_str.and_then(|v| {
+                        if v == "null" {
+                            Some(0)
+                        } else {
+                            v.parse::<u64>().ok()
+                        }
+                    });
                     self.authorize_bucket_write(auth, &bucket)?;
                     self.authorize_bucket_read(auth, &src_bucket)?;
                     let src_cond = copy_source_condition_from_headers(req);
@@ -201,6 +209,7 @@ impl HttpFrontend {
                     let result = self.coordinator.copy_object(
                         &src_bucket,
                         &src_key,
+                        src_version_id,
                         &bucket,
                         &key,
                         &src_cond,

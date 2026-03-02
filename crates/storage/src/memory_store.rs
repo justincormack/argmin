@@ -172,7 +172,7 @@ impl PgMetadataStore for MemoryPgStore {
         objects
             .values()
             .filter(|r| r.bucket == bucket && r.key == key)
-            .max_by_key(|r| r.version_id)
+            .max_by_key(|r| (r.last_modified, r.version_id))
             .cloned()
             .ok_or(MetadataError::ObjectNotFound)
     }

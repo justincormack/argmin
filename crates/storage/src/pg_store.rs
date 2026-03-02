@@ -393,7 +393,7 @@ impl PgMetadataStore for PgStore {
                 "SELECT bucket, key, version_id, size, total_size, etag, etag_kind, \
                  last_modified, storage_class, ec_k, ec_m, status \
                  FROM objects WHERE bucket = ?1 AND key = ?2 \
-                 ORDER BY version_id DESC LIMIT 1",
+                 ORDER BY last_modified DESC, version_id DESC LIMIT 1",
                 params![bucket, key],
                 |row| {
                     Ok(ObjectRecord {
