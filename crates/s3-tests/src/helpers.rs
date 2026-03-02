@@ -50,6 +50,52 @@ pub async fn create_objects(client: &Client, prefix: &str, n: usize) -> (String,
     (bucket, keys)
 }
 
+/// Create a bucket and populate it with objects whose keys are the given strings.
+///
+/// Each object body is `b"content"`. Returns `(bucket_name, keys_as_owned_strings)`.
+pub async fn create_objects_with_keys(client: &Client, keys: &[&str]) -> (String, Vec<String>) {
+    let bucket = unique_bucket();
+    client
+        .create_bucket()
+        .bucket(&bucket)
+        .send()
+        .await
+        .expect("create bucket");
+
+    let mut owned_keys = Vec::with_capacity(keys.len());
+    for key in keys {
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(*key)
+            .body(ByteStream::from_static(b"content"))
+            .send()
+            .await
+            .expect("put object");
+        owned_keys.push((*key).to_string());
+    }
+    (bucket, owned_keys)
+}
+
+/// Delete all listed keys from the bucket, then delete the bucket itself.
+pub async fn delete_all_and_bucket(client: &Client, bucket: &str, keys: &[String]) {
+    for key in keys {
+        client
+            .delete_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .expect("delete object");
+    }
+    client
+        .delete_bucket()
+        .bucket(bucket)
+        .send()
+        .await
+        .expect("delete bucket");
+}
+
 /// Assert that an S3 SDK error contains the expected error code string.
 pub fn assert_s3_err_code<T, E: std::fmt::Debug>(
     result: &Result<T, aws_sdk_s3::error::SdkError<E>>,

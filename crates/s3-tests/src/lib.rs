@@ -1,7 +1,10 @@
 pub mod helpers;
 pub mod server;
 
-pub use helpers::{assert_s3_err_code, create_objects, unique_bucket};
+pub use helpers::{
+    assert_s3_err_code, create_objects, create_objects_with_keys, delete_all_and_bucket,
+    unique_bucket,
+};
 pub use server::TestServer;
 
 use std::sync::LazyLock;
