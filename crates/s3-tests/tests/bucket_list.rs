@@ -611,6 +611,30 @@ fn test_bucket_list_prefix_delimiter_basic() {
 }
 
 #[test]
+fn test_bucket_list_delimiter_prefix() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let (bucket, keys) = create_objects_with_keys(client, SET_A).await;
+
+        let resp = client
+            .list_objects()
+            .bucket(&bucket)
+            .delimiter("/")
+            .prefix("boo/")
+            .send()
+            .await
+            .unwrap();
+
+        let result_keys = get_keys(resp.contents());
+        let result_prefixes = get_prefixes(resp.common_prefixes());
+        assert_eq!(result_keys, vec!["boo/bar"]);
+        assert_eq!(result_prefixes, vec!["boo/baz/"]);
+
+        delete_all_and_bucket(client, &bucket, &keys).await;
+    });
+}
+
+#[test]
 fn test_bucket_list_prefix_delimiter_alt() {
     s3_tests::run(async {
         let client = CTX.client();

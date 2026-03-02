@@ -1361,6 +1361,37 @@ fn test_post_object_user_specified_header() {
 }
 
 #[test]
+fn test_post_object_ignored_header() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "post-ignored-hdr";
+
+        // Include a form field that the server should silently ignore
+        let mut fields = sigv4_fields(&bucket, key, &[]);
+        fields.push(("x-ignore-me".to_string(), "value".to_string()));
+        let field_refs: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
+        let (status, _) = post_object(&bucket, &field_refs, b"data", "test.txt");
+        assert!(status == 200 || status == 204, "expected 200/204, got {}", status);
+
+        // Verify object was created
+        let resp = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let data = resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], b"data");
+
+        client.delete_object().bucket(&bucket).key(key).send().await.unwrap();
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
 fn test_post_object_wrong_bucket() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;

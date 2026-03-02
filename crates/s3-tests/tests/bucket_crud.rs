@@ -15,6 +15,20 @@ fn test_bucket_create_delete() {
 }
 
 #[test]
+fn test_bucket_create_exists() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        // Verify bucket exists via HEAD
+        client.head_bucket().bucket(&bucket).send().await.unwrap();
+
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
 fn test_bucket_create_already_exists() {
     s3_tests::run(async {
         let client = CTX.client();
