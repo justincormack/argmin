@@ -214,7 +214,9 @@ pub fn check_delete_conditions(
         }
     }
     if let Some(required_last_modified) = cond.if_match_last_modified_time {
-        if last_modified != required_last_modified {
+        // Compare at second precision: HTTP dates are second-granularity,
+        // but last_modified is stored in milliseconds.
+        if last_modified / 1000 != required_last_modified / 1000 {
             return Err(ServerError::PreconditionFailed);
         }
     }
