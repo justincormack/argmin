@@ -1,6 +1,6 @@
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::ChecksumAlgorithm;
-use s3_tests::{err_status, unique_bucket, CTX};
+use s3_tests::{assert_s3_err_code, err_status, unique_bucket, CTX};
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
@@ -88,6 +88,7 @@ fn test_object_checksum_sha256() {
             .send()
             .await;
         assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "BadDigest");
 
         cleanup(&bucket, &[key]).await;
     });
@@ -150,6 +151,7 @@ fn test_object_checksum_crc64nvme() {
             .send()
             .await;
         assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "BadDigest");
 
         cleanup(&bucket, &[key]).await;
     });

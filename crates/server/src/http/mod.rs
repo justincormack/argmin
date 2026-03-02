@@ -621,11 +621,37 @@ const CHECKSUM_HEADERS: &[(&str, &str)] = &[
 
 /// Validate checksum headers on PutObject. If a checksum header is present,
 /// compute the actual checksum and compare. Returns `BadDigest` on mismatch.
+///
+/// Enforces that at most one checksum header is present, and if
+/// `x-amz-checksum-algorithm` is set it must match the provided checksum header.
 fn validate_checksum_headers(req: &S3Request) -> Result<(), ServerError> {
     use base64::Engine;
 
+    let algo_header = req.header("x-amz-checksum-algorithm");
+    let mut found_algo: Option<&str> = None;
+
     for &(algo, header) in CHECKSUM_HEADERS {
         if let Some(claimed) = req.header(header) {
+            // Reject multiple checksum headers
+            if found_algo.is_some() {
+                return Err(ServerError::InvalidRequest {
+                    reason: "only one checksum header may be specified".into(),
+                });
+            }
+            found_algo = Some(algo);
+
+            // If x-amz-checksum-algorithm is set, it must match this header
+            if let Some(declared) = algo_header {
+                if !declared.eq_ignore_ascii_case(algo) {
+                    return Err(ServerError::InvalidRequest {
+                        reason: format!(
+                            "checksum algorithm mismatch: header says {} but got {}",
+                            declared, algo
+                        ),
+                    });
+                }
+            }
+
             let actual_b64 = match algo {
                 "SHA256" => {
                     let digest = ring::digest::digest(&ring::digest::SHA256, &req.body);
