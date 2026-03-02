@@ -463,6 +463,190 @@ fn test_object_metadata_in_get() {
     });
 }
 
+/// Empty metadata value should be stored and retrieved as empty string.
+#[test]
+fn test_object_metadata_empty_value() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("meta-empty")
+            .metadata("meta1", "")
+            .body(ByteStream::from_static(b"bar"))
+            .send()
+            .await
+            .unwrap();
+
+        let resp = client
+            .get_object()
+            .bucket(&bucket)
+            .key("meta-empty")
+            .send()
+            .await
+            .unwrap();
+
+        let metadata = resp.metadata().unwrap();
+        assert_eq!(metadata.get("meta1").map(|s| s.as_str()), Some(""));
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key("meta-empty")
+            .send()
+            .await
+            .unwrap();
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+/// Overwriting metadata with empty value replaces the old value.
+#[test]
+fn test_object_metadata_overwrite_to_empty() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+
+        // First put with a non-empty metadata value
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("foo")
+            .metadata("meta1", "oldmeta")
+            .body(ByteStream::from_static(b"bar"))
+            .send()
+            .await
+            .unwrap();
+
+        let resp = client
+            .get_object()
+            .bucket(&bucket)
+            .key("foo")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.metadata().unwrap().get("meta1").map(|s| s.as_str()),
+            Some("oldmeta")
+        );
+
+        // Overwrite with empty metadata value
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("foo")
+            .metadata("meta1", "")
+            .body(ByteStream::from_static(b"bar"))
+            .send()
+            .await
+            .unwrap();
+
+        let resp = client
+            .get_object()
+            .bucket(&bucket)
+            .key("foo")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.metadata().unwrap().get("meta1").map(|s| s.as_str()),
+            Some("")
+        );
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key("foo")
+            .send()
+            .await
+            .unwrap();
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+/// Re-putting an object without metadata clears all previous metadata.
+#[test]
+fn test_object_metadata_replaced_on_put() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+
+        // Put with metadata
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("foo")
+            .metadata("meta1", "bar")
+            .body(ByteStream::from_static(b"bar"))
+            .send()
+            .await
+            .unwrap();
+
+        // Re-put same key without any metadata
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("foo")
+            .body(ByteStream::from_static(b"bar"))
+            .send()
+            .await
+            .unwrap();
+
+        let resp = client
+            .get_object()
+            .bucket(&bucket)
+            .key("foo")
+            .send()
+            .await
+            .unwrap();
+
+        // Metadata should be empty (or None)
+        let metadata = resp.metadata();
+        let is_empty = metadata.is_none() || metadata.unwrap().is_empty();
+        assert!(
+            is_empty,
+            "metadata should be cleared on re-put without metadata"
+        );
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key("foo")
+            .send()
+            .await
+            .unwrap();
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+/// Non-ASCII (unicode) metadata values are rejected with 400.
+///
+/// The S3 spec only allows visible ASCII (0x20-0x7E) in HTTP header values.
+/// The Ceph test `test_object_set_get_unicode_metadata` is marked
+/// `fails_on_rgw` for the same reason — non-ASCII metadata is not portable.
+#[test]
+fn test_object_metadata_unicode_rejected() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+
+        let unicode_value = "Hello World\u{e9}"; // "Hello Worldé"
+        let result = client
+            .put_object()
+            .bucket(&bucket)
+            .key("unicode-meta")
+            .metadata("meta1", unicode_value)
+            .body(ByteStream::from_static(b"bar"))
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
 // ── ETag consistency ─────────────────────────────────────────────────
 
 #[test]
