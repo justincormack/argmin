@@ -41,6 +41,10 @@ pub fn run<F: std::future::Future>(f: F) -> F::Output {
 /// `TestServer` on a random port with well-known test credentials.
 pub struct TestContext {
     client: Client,
+    endpoint: String,
+    access_key: String,
+    secret_key: String,
+    region: String,
     _server: Option<TestServer>,
 }
 
@@ -69,13 +73,18 @@ impl TestContext {
             let client = build_client(&endpoint, &access_key, &secret_key, &region).await;
             TestContext {
                 client,
+                endpoint,
+                access_key,
+                secret_key,
+                region,
                 _server: None,
             }
         } else {
             // Local server mode
             let server = TestServer::start().await;
+            let endpoint = server.endpoint().to_string();
             let client = build_client(
-                server.endpoint(),
+                &endpoint,
                 server::TEST_ACCESS_KEY,
                 server::TEST_SECRET_KEY,
                 server::TEST_REGION,
@@ -83,6 +92,10 @@ impl TestContext {
             .await;
             TestContext {
                 client,
+                endpoint,
+                access_key: server::TEST_ACCESS_KEY.to_string(),
+                secret_key: server::TEST_SECRET_KEY.to_string(),
+                region: server::TEST_REGION.to_string(),
                 _server: Some(server),
             }
         }
@@ -91,6 +104,26 @@ impl TestContext {
     /// The S3 client.
     pub fn client(&self) -> &Client {
         &self.client
+    }
+
+    /// The HTTP endpoint URL (e.g. "http://127.0.0.1:12345").
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    /// The access key ID.
+    pub fn access_key(&self) -> &str {
+        &self.access_key
+    }
+
+    /// The secret access key.
+    pub fn secret_key(&self) -> &str {
+        &self.secret_key
+    }
+
+    /// The region.
+    pub fn region(&self) -> &str {
+        &self.region
     }
 }
 

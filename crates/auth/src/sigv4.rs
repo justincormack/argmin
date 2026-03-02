@@ -204,12 +204,12 @@ pub fn verify_request(
     Ok(auth.credential.access_key_id.clone())
 }
 
-fn hmac_sha256(key: &[u8], data: &[u8]) -> hmac::Tag {
+pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> hmac::Tag {
     let k = hmac::Key::new(hmac::HMAC_SHA256, key);
     hmac::sign(&k, data)
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for &b in bytes {
         s.push(HEX_LOWER[(b >> 4) as usize] as char);

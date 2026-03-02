@@ -21,3 +21,9 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 # Test infrastructure
 tempfile = "3"
+
+# POST Object tests (raw HTTP, SigV4 signing)
+ureq = "3"
+base64 = "0.22"
+serde_json = "1"
+ring = "0.17"

@@ -1,14 +1,14 @@
-/// S3 POST Object authentication (SigV2 form-based).
+/// S3 POST Object authentication (SigV2 and SigV4 form-based).
 ///
-/// POST Object uses `multipart/form-data` with authentication via form fields:
-/// - `AWSAccessKeyId`: the access key
-/// - `policy`: base64-encoded JSON policy document
-/// - `signature`: base64(HMAC-SHA1(secret_key, base64_policy))
+/// SigV2 uses form fields: `AWSAccessKeyId`, `policy`, `signature`
+/// SigV4 uses form fields: `x-amz-algorithm`, `x-amz-credential`, `x-amz-date`,
+///   `policy`, `x-amz-signature`
 use ring::hmac;
 
 use crate::credential::CredentialStore;
 use crate::error::AuthError;
 use crate::request::{AuthContext, AuthMode};
+use crate::sigv4;
 
 /// Authenticate a POST Object request using form fields.
 ///
@@ -63,6 +63,64 @@ pub fn authenticate_post(
     Ok(AuthContext {
         mode: AuthMode::HeaderSigV4, // Reuse existing mode; could add PostSigV2 later
         access_key_id: Some(akid.to_string()),
+        principal: Some(record.principal.clone()),
+        request_epoch_secs: None,
+    })
+}
+
+/// Authenticate a POST Object request using SigV4 form fields.
+///
+/// SigV4 POST signs the base64-encoded policy directly (no canonical request).
+/// Returns `Ok(AuthContext)` on success.
+pub fn authenticate_post_sigv4(
+    algorithm: &str,
+    credential: &str,
+    date: &str,
+    policy_b64: &str,
+    signature_hex: &str,
+    store: &CredentialStore,
+) -> Result<AuthContext, AuthError> {
+    // Validate algorithm
+    if algorithm != "AWS4-HMAC-SHA256" {
+        return Err(AuthError::MalformedAuth);
+    }
+
+    // Parse credential: AKID/YYYYMMDD/region/service/aws4_request
+    let parts: Vec<&str> = credential.splitn(5, '/').collect();
+    if parts.len() != 5 || parts[4] != "aws4_request" {
+        return Err(AuthError::MalformedAuth);
+    }
+    let access_key_id = parts[0];
+    let cred_date = parts[1];
+    let region = parts[2];
+    let service = parts[3];
+
+    // Validate date in credential matches the short date from x-amz-date
+    // x-amz-date is YYYYMMDDTHHMMSSZ, short date is first 8 chars
+    if date.len() < 8 || &date[..8] != cred_date {
+        return Err(AuthError::MalformedAuth);
+    }
+
+    // Look up the secret key
+    let record = store
+        .get_record(access_key_id)
+        .ok_or(AuthError::UnknownAccessKey)?;
+    if !record.enabled {
+        return Err(AuthError::UnknownAccessKey);
+    }
+
+    // Derive signing key and compute expected signature
+    let signing_key = sigv4::derive_signing_key(&record.secret_key, cred_date, region, service);
+    let expected_sig = sigv4::hmac_sha256(signing_key.as_ref(), policy_b64.as_bytes());
+    let expected_hex = sigv4::hex_encode(expected_sig.as_ref());
+
+    if expected_hex != signature_hex {
+        return Err(AuthError::SignatureMismatch);
+    }
+
+    Ok(AuthContext {
+        mode: AuthMode::HeaderSigV4,
+        access_key_id: Some(access_key_id.to_string()),
         principal: Some(record.principal.clone()),
         request_epoch_secs: None,
     })
@@ -368,5 +426,109 @@ mod tests {
             check_expiration("2020-01-01 00:00:00+00:00", 0),
             Err(PostPolicyError::Malformed(_))
         ));
+    }
+
+    #[test]
+    fn sigv4_post_valid() {
+        let store = test_store();
+        let policy_b64 = "eyJleHBpcmF0aW9uIjoiMjAzMC0wMS0wMVQwMDowMDowMFoiLCJjb25kaXRpb25zIjpbXX0=";
+        let date = "20250101T000000Z";
+        let credential = "testAccessKey123/20250101/us-east-1/s3/aws4_request";
+
+        // Compute expected signature
+        let signing_key = crate::sigv4::derive_signing_key(
+            &SecretKey("testSecretKey456".to_string()),
+            "20250101",
+            "us-east-1",
+            "s3",
+        );
+        let sig = crate::sigv4::hmac_sha256(signing_key.as_ref(), policy_b64.as_bytes());
+        let sig_hex = crate::sigv4::hex_encode(sig.as_ref());
+
+        let ctx = authenticate_post_sigv4(
+            "AWS4-HMAC-SHA256",
+            credential,
+            date,
+            policy_b64,
+            &sig_hex,
+            &store,
+        )
+        .unwrap();
+        assert_eq!(ctx.access_key_id.as_deref(), Some("testAccessKey123"));
+    }
+
+    #[test]
+    fn sigv4_post_bad_algorithm() {
+        let store = test_store();
+        let err = authenticate_post_sigv4(
+            "AWS4-HMAC-SHA1",
+            "testAccessKey123/20250101/us-east-1/s3/aws4_request",
+            "20250101T000000Z",
+            "policy",
+            "sig",
+            &store,
+        )
+        .unwrap_err();
+        assert!(matches!(err, AuthError::MalformedAuth));
+    }
+
+    #[test]
+    fn sigv4_post_bad_credential_format() {
+        let store = test_store();
+        let err = authenticate_post_sigv4(
+            "AWS4-HMAC-SHA256",
+            "testAccessKey123/bad",
+            "20250101T000000Z",
+            "policy",
+            "sig",
+            &store,
+        )
+        .unwrap_err();
+        assert!(matches!(err, AuthError::MalformedAuth));
+    }
+
+    #[test]
+    fn sigv4_post_date_mismatch() {
+        let store = test_store();
+        let err = authenticate_post_sigv4(
+            "AWS4-HMAC-SHA256",
+            "testAccessKey123/20250101/us-east-1/s3/aws4_request",
+            "20250102T000000Z",
+            "policy",
+            "sig",
+            &store,
+        )
+        .unwrap_err();
+        assert!(matches!(err, AuthError::MalformedAuth));
+    }
+
+    #[test]
+    fn sigv4_post_unknown_key() {
+        let store = test_store();
+        let err = authenticate_post_sigv4(
+            "AWS4-HMAC-SHA256",
+            "BADKEY/20250101/us-east-1/s3/aws4_request",
+            "20250101T000000Z",
+            "policy",
+            "sig",
+            &store,
+        )
+        .unwrap_err();
+        assert!(matches!(err, AuthError::UnknownAccessKey));
+    }
+
+    #[test]
+    fn sigv4_post_bad_signature() {
+        let store = test_store();
+        let err = authenticate_post_sigv4(
+            "AWS4-HMAC-SHA256",
+            "testAccessKey123/20250101/us-east-1/s3/aws4_request",
+            "20250101T000000Z",
+            "policy",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            &store,
+        )
+        .unwrap_err();
+        assert!(matches!(err, AuthError::SignatureMismatch));
     }
 }
