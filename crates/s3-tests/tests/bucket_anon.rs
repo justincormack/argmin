@@ -86,8 +86,9 @@ fn test_anon_get_object_private_bucket_fail() {
         let url = format!("{}/{}/obj", CTX.endpoint(), bucket);
         let mut resp = agent().get(&url).call().expect("transport error");
         let status = resp.status().as_u16();
-        let _ = resp.body_mut().read_to_string();
+        let body = resp.body_mut().read_to_string().unwrap();
         assert_eq!(status, 403, "expected 403 for anon GET on private bucket, got {}", status);
+        assert!(body.contains("<Code>AccessDenied</Code>"), "expected AccessDenied in body: {}", body);
 
         cleanup(&bucket, &["obj"]).await;
     });
@@ -161,8 +162,9 @@ fn test_anon_put_object_public_bucket_fail() {
             .send(b"should fail" as &[u8])
             .expect("transport error");
         let status = resp.status().as_u16();
-        let _ = resp.body_mut().read_to_string();
+        let body = resp.body_mut().read_to_string().unwrap();
         assert_eq!(status, 403, "expected 403 for anon PUT on public-read bucket, got {}", status);
+        assert!(body.contains("<Code>AccessDenied</Code>"), "expected AccessDenied in body: {}", body);
 
         cleanup(&bucket, &[]).await;
     });
@@ -188,8 +190,9 @@ fn test_anon_delete_object_public_bucket_fail() {
         let url = format!("{}/{}/obj", CTX.endpoint(), bucket);
         let mut resp = agent().delete(&url).call().expect("transport error");
         let status = resp.status().as_u16();
-        let _ = resp.body_mut().read_to_string();
+        let body = resp.body_mut().read_to_string().unwrap();
         assert_eq!(status, 403, "expected 403 for anon DELETE on public-read bucket, got {}", status);
+        assert!(body.contains("<Code>AccessDenied</Code>"), "expected AccessDenied in body: {}", body);
 
         // Verify object still exists
         client
@@ -239,8 +242,9 @@ fn test_anon_list_objects_v1_private_bucket_fail() {
         let url = format!("{}/{}", CTX.endpoint(), bucket);
         let mut resp = agent().get(&url).call().expect("transport error");
         let status = resp.status().as_u16();
-        let _ = resp.body_mut().read_to_string();
+        let body = resp.body_mut().read_to_string().unwrap();
         assert_eq!(status, 403, "expected 403 for anon list on private bucket, got {}", status);
+        assert!(body.contains("<Code>AccessDenied</Code>"), "expected AccessDenied in body: {}", body);
 
         cleanup(&bucket, &[]).await;
     });
@@ -281,9 +285,69 @@ fn test_anon_list_objects_v2_private_bucket_fail() {
         let url = format!("{}/{}?list-type=2", CTX.endpoint(), bucket);
         let mut resp = agent().get(&url).call().expect("transport error");
         let status = resp.status().as_u16();
-        let _ = resp.body_mut().read_to_string();
+        let body = resp.body_mut().read_to_string().unwrap();
         assert_eq!(status, 403, "expected 403 for anon listv2 on private bucket, got {}", status);
+        assert!(body.contains("<Code>AccessDenied</Code>"), "expected AccessDenied in body: {}", body);
 
         cleanup(&bucket, &[]).await;
+    });
+}
+
+// ── Anonymous PUT object (private bucket) ────────────────────────────
+
+#[test]
+fn test_object_anon_put() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_private_bucket().await;
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("foo")
+            .body(ByteStream::from_static(b""))
+            .send()
+            .await
+            .unwrap();
+
+        let url = format!("{}/{}/foo", CTX.endpoint(), bucket);
+        let mut resp = agent()
+            .put(&url)
+            .send(b"foo" as &[u8])
+            .expect("transport error");
+        let status = resp.status().as_u16();
+        let body = resp.body_mut().read_to_string().unwrap();
+        assert_eq!(status, 403, "expected 403 for anon PUT on private bucket, got {}", status);
+        assert!(body.contains("<Code>AccessDenied</Code>"), "expected AccessDenied in body: {}", body);
+
+        cleanup(&bucket, &["foo"]).await;
+    });
+}
+
+// ── Anonymous PUT object with write access ───────────────────────────
+
+#[test]
+#[ignore = "not implemented: public-read-write ACL"]
+fn test_object_anon_put_write_access() {
+    s3_tests::run(async {});
+}
+
+// ── Anonymous ListBuckets ────────────────────────────────────────────
+
+#[test]
+#[ignore = "server returns 403 for anonymous ListBuckets (Ceph marks this fails_on_aws)"]
+fn test_list_buckets_anonymous() {
+    s3_tests::run(async {
+        let url = format!("{}/", CTX.endpoint());
+        let mut resp = agent().get(&url).call().expect("transport error");
+        let status = resp.status().as_u16();
+        let body = resp.body_mut().read_to_string().unwrap();
+        // Anonymous ListBuckets should return 200 with empty bucket list
+        assert_eq!(status, 200, "expected 200 for anon ListBuckets, got {}", status);
+        assert!(
+            body.contains("<Buckets"),
+            "expected Buckets element in response: {}",
+            body
+        );
     });
 }
