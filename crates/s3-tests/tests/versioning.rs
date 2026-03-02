@@ -1,5 +1,7 @@
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{BucketVersioningStatus, Delete, ObjectIdentifier, VersioningConfiguration};
+use aws_sdk_s3::types::{
+    BucketVersioningStatus, Delete, ObjectIdentifier, VersioningConfiguration,
+};
 use s3_tests::{err_status, unique_bucket, CTX};
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -396,7 +398,13 @@ fn test_versioning_obj_plain_null_version_overwrite() {
         let version_id = resp.version_id().unwrap().to_string();
 
         // GET returns new version
-        let resp = client.get_object().bucket(&bucket).key(key).send().await.unwrap();
+        let resp = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
         let body = resp.body.collect().await.unwrap().into_bytes();
         assert_eq!(&body[..], b"zzz");
 
@@ -410,7 +418,13 @@ fn test_versioning_obj_plain_null_version_overwrite() {
             .await
             .unwrap();
 
-        let resp = client.get_object().bucket(&bucket).key(key).send().await.unwrap();
+        let resp = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
         let body = resp.body.collect().await.unwrap().into_bytes();
         assert_eq!(&body[..], b"fooz");
 
@@ -565,7 +579,13 @@ fn test_versioning_obj_plain_null_version_overwrite_suspended() {
             .await
             .unwrap();
 
-        let resp = client.get_object().bucket(&bucket).key(key).send().await.unwrap();
+        let resp = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
         let body = resp.body.collect().await.unwrap().into_bytes();
         assert_eq!(&body[..], b"zzz");
 
@@ -688,14 +708,48 @@ fn test_versioning_obj_suspended_copy() {
         assert_eq!(&body[..], b"null content");
 
         // Cleanup
-        client.delete_object().bucket(&bucket2).key(key1).send().await.unwrap();
-        client.delete_bucket().bucket(&bucket2).send().await.unwrap();
-        let _ = client.delete_object().bucket(&bucket).key(key2).version_id("null").send().await;
-        let _ = client.delete_object().bucket(&bucket).key(key2).send().await;
+        client
+            .delete_object()
+            .bucket(&bucket2)
+            .key(key1)
+            .send()
+            .await
+            .unwrap();
+        client
+            .delete_bucket()
+            .bucket(&bucket2)
+            .send()
+            .await
+            .unwrap();
+        let _ = client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key2)
+            .version_id("null")
+            .send()
+            .await;
+        let _ = client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key2)
+            .send()
+            .await;
         for vid in &version_ids {
-            let _ = client.delete_object().bucket(&bucket).key(key1).version_id(vid).send().await;
+            let _ = client
+                .delete_object()
+                .bucket(&bucket)
+                .key(key1)
+                .version_id(vid)
+                .send()
+                .await;
         }
-        let _ = client.delete_object().bucket(&bucket).key(key1).version_id("null").send().await;
+        let _ = client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key1)
+            .version_id("null")
+            .send()
+            .await;
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
 }
@@ -731,8 +785,13 @@ fn test_versioning_obj_list_marker() {
             let v = &versions[i];
             assert_eq!(v.key().unwrap(), key);
             assert_eq!(v.version_id().unwrap(), version_ids[num - 1 - i]);
-            check_obj_content(&bucket, key, v.version_id().unwrap(), &contents[num - 1 - i])
-                .await;
+            check_obj_content(
+                &bucket,
+                key,
+                v.version_id().unwrap(),
+                &contents[num - 1 - i],
+            )
+            .await;
         }
 
         // Next `num` entries for `key2`, newest first
@@ -740,8 +799,13 @@ fn test_versioning_obj_list_marker() {
             let v = &versions[num + i];
             assert_eq!(v.key().unwrap(), key2);
             assert_eq!(v.version_id().unwrap(), version_ids2[num - 1 - i]);
-            check_obj_content(&bucket, key2, v.version_id().unwrap(), &contents2[num - 1 - i])
-                .await;
+            check_obj_content(
+                &bucket,
+                key2,
+                v.version_id().unwrap(),
+                &contents2[num - 1 - i],
+            )
+            .await;
         }
 
         // Clean up both keys' versions, then delete bucket
@@ -875,7 +939,12 @@ fn test_versioning_copy_obj_version() {
             .send()
             .await
             .unwrap();
-        client.delete_bucket().bucket(&bucket2).send().await.unwrap();
+        client
+            .delete_bucket()
+            .bucket(&bucket2)
+            .send()
+            .await
+            .unwrap();
 
         // Cleanup bucket1
         for k in &copy_keys {
@@ -917,7 +986,12 @@ fn test_versioning_multi_object_delete() {
         client
             .delete_objects()
             .bucket(&bucket)
-            .delete(Delete::builder().set_objects(Some(objects.clone())).build().unwrap())
+            .delete(
+                Delete::builder()
+                    .set_objects(Some(objects.clone()))
+                    .build()
+                    .unwrap(),
+            )
             .send()
             .await
             .unwrap();
@@ -934,7 +1008,12 @@ fn test_versioning_multi_object_delete() {
         client
             .delete_objects()
             .bucket(&bucket)
-            .delete(Delete::builder().set_objects(Some(objects)).build().unwrap())
+            .delete(
+                Delete::builder()
+                    .set_objects(Some(objects))
+                    .build()
+                    .unwrap(),
+            )
             .send()
             .await
             .unwrap();
@@ -980,7 +1059,12 @@ fn test_versioning_multi_object_delete_with_marker() {
         client
             .delete_objects()
             .bucket(&bucket)
-            .delete(Delete::builder().set_objects(Some(objects.clone())).build().unwrap())
+            .delete(
+                Delete::builder()
+                    .set_objects(Some(objects.clone()))
+                    .build()
+                    .unwrap(),
+            )
             .send()
             .await
             .unwrap();
@@ -998,7 +1082,12 @@ fn test_versioning_multi_object_delete_with_marker() {
         client
             .delete_objects()
             .bucket(&bucket)
-            .delete(Delete::builder().set_objects(Some(objects)).build().unwrap())
+            .delete(
+                Delete::builder()
+                    .set_objects(Some(objects))
+                    .build()
+                    .unwrap(),
+            )
             .send()
             .await
             .unwrap();
@@ -1015,14 +1104,16 @@ fn test_versioning_multi_object_delete_with_marker_create() {
         let key = "key";
 
         // Use delete_objects to create a delete marker on a nonexistent key
-        let objects = vec![ObjectIdentifier::builder()
-            .key(key)
-            .build()
-            .unwrap()];
+        let objects = vec![ObjectIdentifier::builder().key(key).build().unwrap()];
         let resp = client
             .delete_objects()
             .bucket(&bucket)
-            .delete(Delete::builder().set_objects(Some(objects)).build().unwrap())
+            .delete(
+                Delete::builder()
+                    .set_objects(Some(objects))
+                    .build()
+                    .unwrap(),
+            )
             .send()
             .await
             .unwrap();
@@ -1041,7 +1132,10 @@ fn test_versioning_multi_object_delete_with_marker_create() {
             .await
             .unwrap();
         assert_eq!(resp.delete_markers().len(), 1);
-        assert_eq!(resp.delete_markers()[0].version_id().unwrap(), dm_vid.as_str());
+        assert_eq!(
+            resp.delete_markers()[0].version_id().unwrap(),
+            dm_vid.as_str()
+        );
         assert_eq!(resp.delete_markers()[0].key().unwrap(), key);
 
         // Cleanup
@@ -1083,7 +1177,10 @@ fn test_versioning_bucket_atomic_upload_return_version_id() {
             .await
             .unwrap();
         assert_eq!(resp.versions().len(), 1);
-        assert_eq!(resp.versions()[0].version_id().unwrap(), version_id.as_str());
+        assert_eq!(
+            resp.versions()[0].version_id().unwrap(),
+            version_id.as_str()
+        );
 
         client
             .delete_object()
@@ -1122,7 +1219,12 @@ fn test_versioning_bucket_atomic_upload_return_version_id() {
             .send()
             .await
             .unwrap();
-        client.delete_bucket().bucket(&bucket2).send().await.unwrap();
+        client
+            .delete_bucket()
+            .bucket(&bucket2)
+            .send()
+            .await
+            .unwrap();
 
         // Suspended: should not return a version ID
         let bucket3 = unique_bucket();
@@ -1162,7 +1264,12 @@ fn test_versioning_bucket_atomic_upload_return_version_id() {
             .send()
             .await
             .unwrap();
-        client.delete_bucket().bucket(&bucket3).send().await.unwrap();
+        client
+            .delete_bucket()
+            .bucket(&bucket3)
+            .send()
+            .await
+            .unwrap();
     });
 }
 
@@ -1216,7 +1323,12 @@ fn test_versioning_concurrent_multi_object_delete() {
         let resp = client
             .delete_objects()
             .bucket(&bucket)
-            .delete(Delete::builder().set_objects(Some(objects)).build().unwrap())
+            .delete(
+                Delete::builder()
+                    .set_objects(Some(objects))
+                    .build()
+                    .unwrap(),
+            )
             .send()
             .await
             .unwrap();

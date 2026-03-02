@@ -546,7 +546,11 @@ fn test_object_copy_versioned_bucket() {
 
         cleanup(&bucket3, &["bar321foo4"]).await;
         cleanup(&bucket2, &["bar321foo3"]).await;
-        cleanup(&bucket1, &["foo123bar", "bar321foo", "bar321foo2", "foo123bar2"]).await;
+        cleanup(
+            &bucket1,
+            &["foo123bar", "bar321foo", "bar321foo2", "foo123bar2"],
+        )
+        .await;
     });
 }
 

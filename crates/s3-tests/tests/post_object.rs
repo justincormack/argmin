@@ -187,7 +187,11 @@ fn build_multipart(
 
 /// Helper: build SigV4 POST form fields for a given bucket/key/file.
 /// Returns fields vec including all auth fields plus key.
-fn sigv4_fields(bucket: &str, key: &str, extra_conditions: &[serde_json::Value]) -> Vec<(String, String)> {
+fn sigv4_fields(
+    bucket: &str,
+    key: &str,
+    extra_conditions: &[serde_json::Value],
+) -> Vec<(String, String)> {
     let (short_date, full_date) = current_dates();
     let secret = CTX.secret_key();
     let access_key = CTX.access_key();
@@ -199,7 +203,10 @@ fn sigv4_fields(bucket: &str, key: &str, extra_conditions: &[serde_json::Value])
 
     vec![
         ("key".to_string(), key.to_string()),
-        ("x-amz-algorithm".to_string(), "AWS4-HMAC-SHA256".to_string()),
+        (
+            "x-amz-algorithm".to_string(),
+            "AWS4-HMAC-SHA256".to_string(),
+        ),
         ("x-amz-credential".to_string(), credential),
         ("x-amz-date".to_string(), full_date),
         ("policy".to_string(), policy_b64),
@@ -208,7 +215,12 @@ fn sigv4_fields(bucket: &str, key: &str, extra_conditions: &[serde_json::Value])
 }
 
 /// Send a POST Object request. Returns (status_code, response_body).
-fn post_object(bucket: &str, fields: &[(&str, &str)], file_data: &[u8], file_name: &str) -> (u16, String) {
+fn post_object(
+    bucket: &str,
+    fields: &[(&str, &str)],
+    file_data: &[u8],
+    file_name: &str,
+) -> (u16, String) {
     let url = format!("{}/{}", CTX.endpoint(), bucket);
     let (content_type, body) = build_multipart(fields, file_data, file_name);
 
@@ -234,7 +246,10 @@ fn test_post_object_authenticated_request() {
         let file_data = b"hello from POST";
 
         let fields = sigv4_fields(&bucket, key, &[]);
-        let field_refs: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
 
         let (status, _) = post_object(&bucket, &field_refs, file_data, "test.txt");
         assert_eq!(status, 204, "expected 204, got {}", status);
@@ -250,7 +265,13 @@ fn test_post_object_authenticated_request() {
         let data = resp.body.collect().await.unwrap().into_bytes();
         assert_eq!(&data[..], file_data);
 
-        client.delete_object().bucket(&bucket).key(key).send().await.unwrap();
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
 }
@@ -264,12 +285,21 @@ fn test_post_object_authenticated_no_content_type() {
         let file_data = b"data without content type";
 
         let fields = sigv4_fields(&bucket, key, &[]);
-        let field_refs: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
 
         let (status, _) = post_object(&bucket, &field_refs, file_data, "test.bin");
         assert_eq!(status, 204, "expected 204, got {}", status);
 
-        client.delete_object().bucket(&bucket).key(key).send().await.unwrap();
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
 }
@@ -288,7 +318,10 @@ fn test_post_object_set_content_type() {
             &[serde_json::json!(["starts-with", "$Content-Type", "text/"])],
         );
         fields.push(("Content-Type".to_string(), "text/plain".to_string()));
-        let field_refs: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
 
         let (status, _) = post_object(&bucket, &field_refs, file_data, "test.txt");
         assert_eq!(status, 204, "expected 204, got {}", status);
@@ -302,7 +335,13 @@ fn test_post_object_set_content_type() {
             .unwrap();
         assert_eq!(resp.content_type(), Some("text/plain"));
 
-        client.delete_object().bucket(&bucket).key(key).send().await.unwrap();
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
 }
@@ -322,7 +361,10 @@ fn test_post_object_empty_body() {
         let key = "post-empty";
 
         let fields = sigv4_fields(&bucket, key, &[]);
-        let field_refs: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
 
         let (status, _) = post_object(&bucket, &field_refs, b"", "empty.txt");
         assert_eq!(status, 204, "expected 204, got {}", status);
@@ -337,7 +379,13 @@ fn test_post_object_empty_body() {
         let data = resp.body.collect().await.unwrap().into_bytes();
         assert_eq!(data.len(), 0);
 
-        client.delete_object().bucket(&bucket).key(key).send().await.unwrap();
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
 }
@@ -354,18 +402,35 @@ fn test_post_object_set_success_code() {
         let mut fields = sigv4_fields(
             &bucket,
             key,
-            &[serde_json::json!(["starts-with", "$success_action_status", ""])],
+            &[serde_json::json!([
+                "starts-with",
+                "$success_action_status",
+                ""
+            ])],
         );
         fields.push(("success_action_status".to_string(), "201".to_string()));
-        let field_refs: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
 
         let (status, body) = post_object(&bucket, &field_refs, b"data", "test.txt");
         assert_eq!(status, 201, "expected 201, got {}", status);
-        assert!(body.contains("<Bucket>"), "expected Bucket in XML: {}", body);
+        assert!(
+            body.contains("<Bucket>"),
+            "expected Bucket in XML: {}",
+            body
+        );
         assert!(body.contains("<Key>"), "expected Key in XML: {}", body);
         assert!(body.contains("<ETag>"), "expected ETag in XML: {}", body);
 
-        client.delete_object().bucket(&bucket).key(key).send().await.unwrap();
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
 }
@@ -380,15 +445,28 @@ fn test_post_object_set_success_code_200() {
         let mut fields = sigv4_fields(
             &bucket,
             key,
-            &[serde_json::json!(["starts-with", "$success_action_status", ""])],
+            &[serde_json::json!([
+                "starts-with",
+                "$success_action_status",
+                ""
+            ])],
         );
         fields.push(("success_action_status".to_string(), "200".to_string()));
-        let field_refs: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
 
         let (status, _) = post_object(&bucket, &field_refs, b"data", "test.txt");
         assert_eq!(status, 200);
 
-        client.delete_object().bucket(&bucket).key(key).send().await.unwrap();
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
 }
@@ -403,19 +481,36 @@ fn test_post_object_set_success_code_201() {
         let mut fields = sigv4_fields(
             &bucket,
             key,
-            &[serde_json::json!(["starts-with", "$success_action_status", ""])],
+            &[serde_json::json!([
+                "starts-with",
+                "$success_action_status",
+                ""
+            ])],
         );
         fields.push(("success_action_status".to_string(), "201".to_string()));
-        let field_refs: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
 
         let (status, body) = post_object(&bucket, &field_refs, b"data", "test.txt");
         assert_eq!(status, 201);
         // 201 response should contain XML with Location, Bucket, Key, ETag
-        assert!(body.contains("<Bucket>"), "expected Bucket in XML: {}", body);
+        assert!(
+            body.contains("<Bucket>"),
+            "expected Bucket in XML: {}",
+            body
+        );
         assert!(body.contains("<Key>"), "expected Key in XML: {}", body);
         assert!(body.contains("<ETag>"), "expected ETag in XML: {}", body);
 
-        client.delete_object().bucket(&bucket).key(key).send().await.unwrap();
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
 }
@@ -430,16 +525,29 @@ fn test_post_object_set_invalid_success_code() {
         let mut fields = sigv4_fields(
             &bucket,
             key,
-            &[serde_json::json!(["starts-with", "$success_action_status", ""])],
+            &[serde_json::json!([
+                "starts-with",
+                "$success_action_status",
+                ""
+            ])],
         );
         fields.push(("success_action_status".to_string(), "999".to_string()));
-        let field_refs: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
 
         let (status, _) = post_object(&bucket, &field_refs, b"data", "test.txt");
         // Invalid code defaults to 204
         assert_eq!(status, 204);
 
-        client.delete_object().bucket(&bucket).key(key).send().await.unwrap();
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
 }
@@ -500,7 +608,13 @@ fn test_post_object_set_key_from_filename() {
         let data = resp.body.collect().await.unwrap().into_bytes();
         assert_eq!(&data[..], b"file content");
 
-        client.delete_object().bucket(&bucket).key(expected_key).send().await.unwrap();
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(expected_key)
+            .send()
+            .await
+            .unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
 }
@@ -540,7 +654,12 @@ fn test_post_object_no_key_specified() {
         let (status, _) = post_object(&bucket, &fields, b"data", "test.txt");
         assert!(status >= 400, "expected error status, got {}", status);
 
-        CTX.client().delete_bucket().bucket(&bucket).send().await.unwrap();
+        CTX.client()
+            .delete_bucket()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
     });
 }
 
@@ -551,7 +670,10 @@ fn test_post_object_missing_file() {
         let key = "post-no-file";
 
         let fields = sigv4_fields(&bucket, key, &[]);
-        let field_refs: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
 
         // Send with no file field — build multipart manually without file part
         let boundary = "----TestBoundary7MA4YWxkTrZu0gW";
@@ -578,7 +700,12 @@ fn test_post_object_missing_file() {
 
         assert!(status >= 400, "expected error status, got {}", status);
 
-        CTX.client().delete_bucket().bucket(&bucket).send().await.unwrap();
+        CTX.client()
+            .delete_bucket()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
     });
 }
 
@@ -608,7 +735,12 @@ fn test_post_object_authenticated_request_bad_access_key() {
         let (status, _) = post_object(&bucket, &fields, b"data", "test.txt");
         assert_eq!(status, 403, "expected 403, got {}", status);
 
-        CTX.client().delete_bucket().bucket(&bucket).send().await.unwrap();
+        CTX.client()
+            .delete_bucket()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
     });
 }
 
@@ -630,13 +762,21 @@ fn test_post_object_invalid_signature() {
             ("x-amz-credential", &credential),
             ("x-amz-date", &full_date),
             ("policy", &policy_b64),
-            ("x-amz-signature", "0000000000000000000000000000000000000000000000000000000000000000"),
+            (
+                "x-amz-signature",
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            ),
         ];
 
         let (status, _) = post_object(&bucket, &fields, b"data", "test.txt");
         assert_eq!(status, 403, "expected 403, got {}", status);
 
-        CTX.client().delete_bucket().bucket(&bucket).send().await.unwrap();
+        CTX.client()
+            .delete_bucket()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
     });
 }
 
@@ -663,7 +803,12 @@ fn test_post_object_missing_policy() {
         let (status, _) = post_object(&bucket, &fields, b"data", "test.txt");
         assert!(status >= 400, "expected error status, got {}", status);
 
-        CTX.client().delete_bucket().bucket(&bucket).send().await.unwrap();
+        CTX.client()
+            .delete_bucket()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
     });
 }
 
@@ -691,7 +836,12 @@ fn test_post_object_missing_signature() {
         let (status, _) = post_object(&bucket, &fields, b"data", "test.txt");
         assert!(status >= 400, "expected error status, got {}", status);
 
-        CTX.client().delete_bucket().bucket(&bucket).send().await.unwrap();
+        CTX.client()
+            .delete_bucket()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
     });
 }
 
@@ -729,9 +879,18 @@ fn test_post_object_expired_policy() {
         ];
 
         let (status, _) = post_object(&bucket, &fields, b"data", "test.txt");
-        assert_eq!(status, 403, "expected 403 for expired policy, got {}", status);
+        assert_eq!(
+            status, 403,
+            "expected 403 for expired policy, got {}",
+            status
+        );
 
-        CTX.client().delete_bucket().bucket(&bucket).send().await.unwrap();
+        CTX.client()
+            .delete_bucket()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
     });
 }
 
@@ -767,9 +926,18 @@ fn test_post_object_invalid_date_format() {
         ];
 
         let (status, _) = post_object(&bucket, &fields, b"data", "test.txt");
-        assert_eq!(status, 400, "expected 400 for malformed date, got {}", status);
+        assert_eq!(
+            status, 400,
+            "expected 400 for malformed date, got {}",
+            status
+        );
 
-        CTX.client().delete_bucket().bucket(&bucket).send().await.unwrap();
+        CTX.client()
+            .delete_bucket()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
     });
 }
 
@@ -794,8 +962,8 @@ fn test_post_object_expires_is_case_sensitive() {
                 {"key": key},
             ],
         });
-        let policy_b64 = base64::engine::general_purpose::STANDARD
-            .encode(policy_json.to_string().as_bytes());
+        let policy_b64 =
+            base64::engine::general_purpose::STANDARD.encode(policy_json.to_string().as_bytes());
         let signature = sign_policy_v4(&policy_b64, secret, &short_date, region);
 
         let fields: Vec<(&str, &str)> = vec![
@@ -808,9 +976,18 @@ fn test_post_object_expires_is_case_sensitive() {
         ];
 
         let (status, _) = post_object(&bucket, &fields, b"data", "test.txt");
-        assert_eq!(status, 400, "expected 400 for wrong-case expiration, got {}", status);
+        assert_eq!(
+            status, 400,
+            "expected 400 for wrong-case expiration, got {}",
+            status
+        );
 
-        CTX.client().delete_bucket().bucket(&bucket).send().await.unwrap();
+        CTX.client()
+            .delete_bucket()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
     });
 }
 
@@ -854,8 +1031,19 @@ fn test_post_object_empty_conditions() {
         let (status, _) = post_object(&bucket, &fields, b"data", "test.txt");
         assert_eq!(status, 400, "expected 400, got {}", status);
 
-        let _ = CTX.client().delete_object().bucket(&bucket).key(key).send().await;
-        CTX.client().delete_bucket().bucket(&bucket).send().await.unwrap();
+        let _ = CTX
+            .client()
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await;
+        CTX.client()
+            .delete_bucket()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
     });
 }
 
@@ -876,8 +1064,8 @@ fn test_post_object_missing_conditions_list() {
         let policy_json = serde_json::json!({
             "expiration": "2099-01-01T00:00:00Z",
         });
-        let policy_b64 = base64::engine::general_purpose::STANDARD
-            .encode(policy_json.to_string().as_bytes());
+        let policy_b64 =
+            base64::engine::general_purpose::STANDARD.encode(policy_json.to_string().as_bytes());
         let signature = sign_policy_v4(&policy_b64, secret, &short_date, region);
 
         let fields: Vec<(&str, &str)> = vec![
@@ -890,9 +1078,18 @@ fn test_post_object_missing_conditions_list() {
         ];
 
         let (status, _) = post_object(&bucket, &fields, b"data", "test.txt");
-        assert_eq!(status, 400, "expected 400 for missing conditions, got {}", status);
+        assert_eq!(
+            status, 400,
+            "expected 400 for missing conditions, got {}",
+            status
+        );
 
-        CTX.client().delete_bucket().bucket(&bucket).send().await.unwrap();
+        CTX.client()
+            .delete_bucket()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
     });
 }
 
@@ -938,8 +1135,19 @@ fn test_post_object_condition_is_case_sensitive() {
         let (status, _) = post_object(&bucket, &fields, b"data", "test.txt");
         assert_eq!(status, 400, "expected 400, got {}", status);
 
-        let _ = CTX.client().delete_object().bucket(&bucket).key(key).send().await;
-        CTX.client().delete_bucket().bucket(&bucket).send().await.unwrap();
+        let _ = CTX
+            .client()
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await;
+        CTX.client()
+            .delete_bucket()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
     });
 }
 
@@ -984,7 +1192,13 @@ fn test_post_object_case_insensitive_condition_fields() {
         let (status, _) = post_object(&bucket, &fields, b"data", "test.txt");
         assert_eq!(status, 204, "expected 204, got {}", status);
 
-        client.delete_object().bucket(&bucket).key(key).send().await.unwrap();
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
 }
@@ -997,7 +1211,10 @@ fn test_post_object_escaped_field_values() {
         let key = "post/special chars & more";
 
         let fields = sigv4_fields(&bucket, key, &[]);
-        let field_refs: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
 
         let (status, _) = post_object(&bucket, &field_refs, b"data", "test.txt");
         assert_eq!(status, 204, "expected 204, got {}", status);
@@ -1012,7 +1229,13 @@ fn test_post_object_escaped_field_values() {
         let data = resp.body.collect().await.unwrap().into_bytes();
         assert_eq!(&data[..], b"data");
 
-        client.delete_object().bucket(&bucket).key(key).send().await.unwrap();
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
 }
@@ -1049,8 +1272,19 @@ fn test_post_object_missing_policy_condition() {
         assert_eq!(status, 403, "expected 403, got {}", status);
 
         // Cleanup
-        let _ = CTX.client().delete_object().bucket(&bucket).key(key).send().await;
-        CTX.client().delete_bucket().bucket(&bucket).send().await.unwrap();
+        let _ = CTX
+            .client()
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await;
+        CTX.client()
+            .delete_bucket()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
     });
 }
 
@@ -1093,9 +1327,18 @@ fn test_post_object_request_missing_policy_specified_field() {
         ];
 
         let (status, _) = post_object(&bucket, &fields, b"data", "test.txt");
-        assert_eq!(status, 403, "expected 403 for missing required field, got {}", status);
+        assert_eq!(
+            status, 403,
+            "expected 403 for missing required field, got {}",
+            status
+        );
 
-        CTX.client().delete_bucket().bucket(&bucket).send().await.unwrap();
+        CTX.client()
+            .delete_bucket()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
     });
 }
 
@@ -1139,9 +1382,18 @@ fn test_post_object_invalid_request_field_value() {
         ];
 
         let (status, _) = post_object(&bucket, &fields, b"data", "test.txt");
-        assert_eq!(status, 403, "expected 403 for value mismatch, got {}", status);
+        assert_eq!(
+            status, 403,
+            "expected 403 for value mismatch, got {}",
+            status
+        );
 
-        CTX.client().delete_bucket().bucket(&bucket).send().await.unwrap();
+        CTX.client()
+            .delete_bucket()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
     });
 }
 
@@ -1157,13 +1409,22 @@ fn test_post_object_starts_with() {
             key,
             &[serde_json::json!(["starts-with", "$Content-Type", "text/"])],
         );
-        let mut field_refs: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let mut field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
         field_refs.push(("Content-Type", "text/html"));
 
         let (status, _) = post_object(&bucket, &field_refs, b"<html>", "test.html");
         assert_eq!(status, 204, "expected 204, got {}", status);
 
-        client.delete_object().bucket(&bucket).key(key).send().await.unwrap();
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
 }
@@ -1178,15 +1439,28 @@ fn test_post_object_eq_condition() {
         let fields = sigv4_fields(
             &bucket,
             key,
-            &[serde_json::json!(["eq", "$Content-Type", "application/json"])],
+            &[serde_json::json!([
+                "eq",
+                "$Content-Type",
+                "application/json"
+            ])],
         );
-        let mut field_refs: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let mut field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
         field_refs.push(("Content-Type", "application/json"));
 
         let (status, _) = post_object(&bucket, &field_refs, b"{}", "data.json");
         assert_eq!(status, 204, "expected 204, got {}", status);
 
-        client.delete_object().bucket(&bucket).key(key).send().await.unwrap();
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
 }
@@ -1205,12 +1479,21 @@ fn test_post_object_content_length_range() {
             key,
             &[serde_json::json!(["content-length-range", 1, 1024])],
         );
-        let field_refs: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
 
         let (status, _) = post_object(&bucket, &field_refs, b"hello", "test.txt");
         assert_eq!(status, 204, "expected 204, got {}", status);
 
-        client.delete_object().bucket(&bucket).key(key).send().await.unwrap();
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
 }
@@ -1226,12 +1509,24 @@ fn test_post_object_upload_size_limit_exceeded() {
             key,
             &[serde_json::json!(["content-length-range", 0, 5])],
         );
-        let field_refs: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
 
         let (status, _) = post_object(&bucket, &field_refs, b"this is way too long", "test.txt");
-        assert!(status >= 400, "expected error for too large, got {}", status);
+        assert!(
+            status >= 400,
+            "expected error for too large, got {}",
+            status
+        );
 
-        CTX.client().delete_bucket().bucket(&bucket).send().await.unwrap();
+        CTX.client()
+            .delete_bucket()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
     });
 }
 
@@ -1246,12 +1541,24 @@ fn test_post_object_upload_size_below_minimum() {
             key,
             &[serde_json::json!(["content-length-range", 100, 1024])],
         );
-        let field_refs: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
 
         let (status, _) = post_object(&bucket, &field_refs, b"tiny", "test.txt");
-        assert!(status >= 400, "expected error for too small, got {}", status);
+        assert!(
+            status >= 400,
+            "expected error for too small, got {}",
+            status
+        );
 
-        CTX.client().delete_bucket().bucket(&bucket).send().await.unwrap();
+        CTX.client()
+            .delete_bucket()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
     });
 }
 
@@ -1294,9 +1601,18 @@ fn test_post_object_missing_content_length_argument() {
         ];
 
         let (status, _) = post_object(&bucket, &fields, b"data", "test.txt");
-        assert_eq!(status, 400, "expected 400 for malformed content-length-range, got {}", status);
+        assert_eq!(
+            status, 400,
+            "expected 400 for malformed content-length-range, got {}",
+            status
+        );
 
-        CTX.client().delete_bucket().bucket(&bucket).send().await.unwrap();
+        CTX.client()
+            .delete_bucket()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
     });
 }
 
@@ -1324,7 +1640,10 @@ fn test_post_object_metadata() {
             &[serde_json::json!(["starts-with", "$x-amz-meta-custom", ""])],
         );
         fields.push(("x-amz-meta-custom".to_string(), "my-value".to_string()));
-        let field_refs: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
 
         let (status, _) = post_object(&bucket, &field_refs, b"data", "test.txt");
         assert_eq!(status, 204, "expected 204, got {}", status);
@@ -1340,7 +1659,13 @@ fn test_post_object_metadata() {
         let meta = resp.metadata().unwrap();
         assert_eq!(meta.get("custom").map(|s| s.as_str()), Some("my-value"));
 
-        client.delete_object().bucket(&bucket).key(key).send().await.unwrap();
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
 }
@@ -1355,12 +1680,21 @@ fn test_post_object_user_specified_header() {
         // Include an unknown form field — should be ignored
         let mut fields = sigv4_fields(&bucket, key, &[]);
         fields.push(("x-unknown-field".to_string(), "whatever".to_string()));
-        let field_refs: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
 
         let (status, _) = post_object(&bucket, &field_refs, b"data", "test.txt");
         assert_eq!(status, 204, "expected 204, got {}", status);
 
-        client.delete_object().bucket(&bucket).key(key).send().await.unwrap();
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
 }
@@ -1375,7 +1709,10 @@ fn test_post_object_ignored_header() {
         // Include a form field that the server should silently ignore
         let mut fields = sigv4_fields(&bucket, key, &[]);
         fields.push(("x-ignore-me".to_string(), "value".to_string()));
-        let field_refs: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
 
         let (status, _) = post_object(&bucket, &field_refs, b"data", "test.txt");
         assert_eq!(status, 204, "expected 204, got {}", status);
@@ -1391,7 +1728,13 @@ fn test_post_object_ignored_header() {
         let data = resp.body.collect().await.unwrap().into_bytes();
         assert_eq!(&data[..], b"data");
 
-        client.delete_object().bucket(&bucket).key(key).send().await.unwrap();
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
 }
@@ -1436,7 +1779,12 @@ fn test_post_object_wrong_bucket() {
         let (status, _) = post_object(&bucket, &fields, b"data", "test.txt");
         assert_eq!(status, 403, "expected 403 for wrong bucket, got {}", status);
 
-        CTX.client().delete_bucket().bucket(&bucket).send().await.unwrap();
+        CTX.client()
+            .delete_bucket()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
     });
 }
 
@@ -1458,29 +1806,54 @@ fn test_post_object_upload_checksum() {
         let mut fields = sigv4_fields(
             &bucket,
             key,
-            &[serde_json::json!(["starts-with", "$x-amz-checksum-sha256", ""])],
+            &[serde_json::json!([
+                "starts-with",
+                "$x-amz-checksum-sha256",
+                ""
+            ])],
         );
         fields.push(("x-amz-checksum-sha256".to_string(), checksum_b64));
-        let field_refs: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
 
         let (status, _) = post_object(&bucket, &field_refs, file_data, "test.txt");
         assert_eq!(status, 204, "expected 204, got {}", status);
 
         // Bad checksum → 400
         let bad_key = "post-checksum-bad";
-        let bad_checksum = base64::engine::general_purpose::STANDARD.encode(b"wrong-digest-value-here!!!!!!!!");
+        let bad_checksum =
+            base64::engine::general_purpose::STANDARD.encode(b"wrong-digest-value-here!!!!!!!!");
         let mut bad_fields = sigv4_fields(
             &bucket,
             bad_key,
-            &[serde_json::json!(["starts-with", "$x-amz-checksum-sha256", ""])],
+            &[serde_json::json!([
+                "starts-with",
+                "$x-amz-checksum-sha256",
+                ""
+            ])],
         );
         bad_fields.push(("x-amz-checksum-sha256".to_string(), bad_checksum));
-        let bad_field_refs: Vec<(&str, &str)> = bad_fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let bad_field_refs: Vec<(&str, &str)> = bad_fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
 
         let (bad_status, _) = post_object(&bucket, &bad_field_refs, file_data, "test.txt");
-        assert_eq!(bad_status, 400, "expected 400 for bad checksum, got {}", bad_status);
+        assert_eq!(
+            bad_status, 400,
+            "expected 400 for bad checksum, got {}",
+            bad_status
+        );
 
-        client.delete_object().bucket(&bucket).key(key).send().await.unwrap();
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
 }
@@ -1500,7 +1873,10 @@ fn test_post_object_upload_larger_than_chunk() {
             key,
             &[serde_json::json!(["content-length-range", 0, 2_000_000])],
         );
-        let field_refs: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
 
         let (status, _) = post_object(&bucket, &field_refs, &file_data, "large.bin");
         assert_eq!(status, 204, "expected 204, got {}", status);
@@ -1515,7 +1891,13 @@ fn test_post_object_upload_larger_than_chunk() {
         let data = resp.body.collect().await.unwrap().into_bytes();
         assert_eq!(data.len(), 1024 * 1024);
 
-        client.delete_object().bucket(&bucket).key(key).send().await.unwrap();
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
 }
@@ -1547,7 +1929,12 @@ fn test_post_object_invalid_access_key() {
         let (status, _) = post_object(&bucket, &fields, b"data", "test.txt");
         assert_eq!(status, 403, "expected 403, got {}", status);
 
-        CTX.client().delete_bucket().bucket(&bucket).send().await.unwrap();
+        CTX.client()
+            .delete_bucket()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
     });
 }
 
@@ -1563,12 +1950,20 @@ fn test_post_object_invalid_content_length_argument() {
             key,
             &[serde_json::json!(["content-length-range", 100, 10])],
         );
-        let field_refs: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
 
         let (status, _) = post_object(&bucket, &field_refs, b"data", "test.txt");
         assert_eq!(status, 400, "expected 400, got {}", status);
 
-        CTX.client().delete_bucket().bucket(&bucket).send().await.unwrap();
+        CTX.client()
+            .delete_bucket()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
     });
 }
 
@@ -1608,7 +2003,12 @@ fn test_post_object_missing_expires_condition() {
         let (status, _) = post_object(&bucket, &fields, b"data", "test.txt");
         assert_eq!(status, 400, "expected 400, got {}", status);
 
-        CTX.client().delete_bucket().bucket(&bucket).send().await.unwrap();
+        CTX.client()
+            .delete_bucket()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
     });
 }
 

@@ -12,12 +12,7 @@ const SIZE: usize = 1024 * 1024; // 1 MB
 async fn setup_bucket() -> String {
     let client = CTX.client();
     let bucket = unique_bucket();
-    client
-        .create_bucket()
-        .bucket(&bucket)
-        .send()
-        .await
-        .unwrap();
+    client.create_bucket().bucket(&bucket).send().await.unwrap();
     bucket
 }
 
@@ -91,9 +86,7 @@ fn test_atomic_read() {
         });
 
         let bucket3 = bucket.clone();
-        let read_task = tokio::spawn(async move {
-            get_body(&bucket3, "atomic-read").await
-        });
+        let read_task = tokio::spawn(async move { get_body(&bucket3, "atomic-read").await });
 
         let (write_result, read_result) = tokio::join!(write_task, read_task);
         write_result.unwrap();
@@ -313,18 +306,8 @@ fn test_atomic_write_bucket_gone() {
         let bucket = unique_bucket();
 
         // Create then immediately delete the bucket
-        client
-            .create_bucket()
-            .bucket(&bucket)
-            .send()
-            .await
-            .unwrap();
-        client
-            .delete_bucket()
-            .bucket(&bucket)
-            .send()
-            .await
-            .unwrap();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
 
         // PUT to the gone bucket → 404
         let result = client

@@ -1771,7 +1771,10 @@ fn test_bucket_listv2_objects_anonymous() {
         let mut resp = anon_agent().get(&url).call().expect("transport error");
         assert_eq!(resp.status().as_u16(), 200);
         let body = resp.body_mut().read_to_string().unwrap();
-        assert!(body.contains("<Key>bar</Key>"), "expected 'bar' in v2 listing");
+        assert!(
+            body.contains("<Key>bar</Key>"),
+            "expected 'bar' in v2 listing"
+        );
 
         let keys: Vec<String> = SET_B.iter().map(|s| s.to_string()).collect();
         delete_all_and_bucket(client, &bucket, &keys).await;
@@ -1790,7 +1793,11 @@ fn test_bucket_list_objects_anonymous_fail() {
         let mut resp = anon_agent().get(&url).call().expect("transport error");
         let status = resp.status().as_u16();
         let _ = resp.body_mut().read_to_string();
-        assert_eq!(status, 403, "expected 403 for anon list on private bucket, got {}", status);
+        assert_eq!(
+            status, 403,
+            "expected 403 for anon list on private bucket, got {}",
+            status
+        );
 
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
@@ -1808,7 +1815,11 @@ fn test_bucket_listv2_objects_anonymous_fail() {
         let mut resp = anon_agent().get(&url).call().expect("transport error");
         let status = resp.status().as_u16();
         let _ = resp.body_mut().read_to_string();
-        assert_eq!(status, 403, "expected 403 for anon listv2 on private bucket, got {}", status);
+        assert_eq!(
+            status, 403,
+            "expected 403 for anon listv2 on private bucket, got {}",
+            status
+        );
 
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
@@ -1855,11 +1866,8 @@ fn test_bucket_list_maxkeys_invalid() {
 fn test_bucket_list_special_prefix() {
     s3_tests::run(async {
         let client = CTX.client();
-        let (bucket, keys) = create_objects_with_keys(
-            client,
-            &["_bla/1", "_bla/2", "_bla/3", "_bla/foo"],
-        )
-        .await;
+        let (bucket, keys) =
+            create_objects_with_keys(client, &["_bla/1", "_bla/2", "_bla/3", "_bla/foo"]).await;
 
         let resp = client
             .list_objects()

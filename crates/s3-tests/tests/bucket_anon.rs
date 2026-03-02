@@ -87,8 +87,16 @@ fn test_anon_get_object_private_bucket_fail() {
         let mut resp = agent().get(&url).call().expect("transport error");
         let status = resp.status().as_u16();
         let body = resp.body_mut().read_to_string().unwrap();
-        assert_eq!(status, 403, "expected 403 for anon GET on private bucket, got {}", status);
-        assert!(body.contains("<Code>AccessDenied</Code>"), "expected AccessDenied in body: {}", body);
+        assert_eq!(
+            status, 403,
+            "expected 403 for anon GET on private bucket, got {}",
+            status
+        );
+        assert!(
+            body.contains("<Code>AccessDenied</Code>"),
+            "expected AccessDenied in body: {}",
+            body
+        );
 
         cleanup(&bucket, &["obj"]).await;
     });
@@ -143,7 +151,11 @@ fn test_anon_head_bucket_private_fail() {
         let mut resp = agent().head(&url).call().expect("transport error");
         let status = resp.status().as_u16();
         let _ = resp.body_mut().read_to_string();
-        assert_eq!(status, 403, "expected 403 for anon HEAD on private bucket, got {}", status);
+        assert_eq!(
+            status, 403,
+            "expected 403 for anon HEAD on private bucket, got {}",
+            status
+        );
 
         cleanup(&bucket, &[]).await;
     });
@@ -163,8 +175,16 @@ fn test_anon_put_object_public_bucket_fail() {
             .expect("transport error");
         let status = resp.status().as_u16();
         let body = resp.body_mut().read_to_string().unwrap();
-        assert_eq!(status, 403, "expected 403 for anon PUT on public-read bucket, got {}", status);
-        assert!(body.contains("<Code>AccessDenied</Code>"), "expected AccessDenied in body: {}", body);
+        assert_eq!(
+            status, 403,
+            "expected 403 for anon PUT on public-read bucket, got {}",
+            status
+        );
+        assert!(
+            body.contains("<Code>AccessDenied</Code>"),
+            "expected AccessDenied in body: {}",
+            body
+        );
 
         cleanup(&bucket, &[]).await;
     });
@@ -191,8 +211,16 @@ fn test_anon_delete_object_public_bucket_fail() {
         let mut resp = agent().delete(&url).call().expect("transport error");
         let status = resp.status().as_u16();
         let body = resp.body_mut().read_to_string().unwrap();
-        assert_eq!(status, 403, "expected 403 for anon DELETE on public-read bucket, got {}", status);
-        assert!(body.contains("<Code>AccessDenied</Code>"), "expected AccessDenied in body: {}", body);
+        assert_eq!(
+            status, 403,
+            "expected 403 for anon DELETE on public-read bucket, got {}",
+            status
+        );
+        assert!(
+            body.contains("<Code>AccessDenied</Code>"),
+            "expected AccessDenied in body: {}",
+            body
+        );
 
         // Verify object still exists
         client
@@ -228,7 +256,11 @@ fn test_anon_list_objects_v1_public_bucket() {
         let mut resp = agent().get(&url).call().expect("transport error");
         assert_eq!(resp.status().as_u16(), 200);
         let body = resp.body_mut().read_to_string().unwrap();
-        assert!(body.contains("<Key>obj1</Key>"), "expected obj1 in listing: {}", body);
+        assert!(
+            body.contains("<Key>obj1</Key>"),
+            "expected obj1 in listing: {}",
+            body
+        );
 
         cleanup(&bucket, &["obj1"]).await;
     });
@@ -243,8 +275,16 @@ fn test_anon_list_objects_v1_private_bucket_fail() {
         let mut resp = agent().get(&url).call().expect("transport error");
         let status = resp.status().as_u16();
         let body = resp.body_mut().read_to_string().unwrap();
-        assert_eq!(status, 403, "expected 403 for anon list on private bucket, got {}", status);
-        assert!(body.contains("<Code>AccessDenied</Code>"), "expected AccessDenied in body: {}", body);
+        assert_eq!(
+            status, 403,
+            "expected 403 for anon list on private bucket, got {}",
+            status
+        );
+        assert!(
+            body.contains("<Code>AccessDenied</Code>"),
+            "expected AccessDenied in body: {}",
+            body
+        );
 
         cleanup(&bucket, &[]).await;
     });
@@ -271,7 +311,11 @@ fn test_anon_list_objects_v2_public_bucket() {
         let mut resp = agent().get(&url).call().expect("transport error");
         assert_eq!(resp.status().as_u16(), 200);
         let body = resp.body_mut().read_to_string().unwrap();
-        assert!(body.contains("<Key>obj1</Key>"), "expected obj1 in v2 listing: {}", body);
+        assert!(
+            body.contains("<Key>obj1</Key>"),
+            "expected obj1 in v2 listing: {}",
+            body
+        );
 
         cleanup(&bucket, &["obj1"]).await;
     });
@@ -286,8 +330,16 @@ fn test_anon_list_objects_v2_private_bucket_fail() {
         let mut resp = agent().get(&url).call().expect("transport error");
         let status = resp.status().as_u16();
         let body = resp.body_mut().read_to_string().unwrap();
-        assert_eq!(status, 403, "expected 403 for anon listv2 on private bucket, got {}", status);
-        assert!(body.contains("<Code>AccessDenied</Code>"), "expected AccessDenied in body: {}", body);
+        assert_eq!(
+            status, 403,
+            "expected 403 for anon listv2 on private bucket, got {}",
+            status
+        );
+        assert!(
+            body.contains("<Code>AccessDenied</Code>"),
+            "expected AccessDenied in body: {}",
+            body
+        );
 
         cleanup(&bucket, &[]).await;
     });
@@ -317,8 +369,16 @@ fn test_object_anon_put() {
             .expect("transport error");
         let status = resp.status().as_u16();
         let body = resp.body_mut().read_to_string().unwrap();
-        assert_eq!(status, 403, "expected 403 for anon PUT on private bucket, got {}", status);
-        assert!(body.contains("<Code>AccessDenied</Code>"), "expected AccessDenied in body: {}", body);
+        assert_eq!(
+            status, 403,
+            "expected 403 for anon PUT on private bucket, got {}",
+            status
+        );
+        assert!(
+            body.contains("<Code>AccessDenied</Code>"),
+            "expected AccessDenied in body: {}",
+            body
+        );
 
         cleanup(&bucket, &["foo"]).await;
     });
@@ -343,7 +403,11 @@ fn test_list_buckets_anonymous() {
         let status = resp.status().as_u16();
         let body = resp.body_mut().read_to_string().unwrap();
         // Anonymous ListBuckets should return 200 with empty bucket list
-        assert_eq!(status, 200, "expected 200 for anon ListBuckets, got {}", status);
+        assert_eq!(
+            status, 200,
+            "expected 200 for anon ListBuckets, got {}",
+            status
+        );
         assert!(
             body.contains("<Buckets"),
             "expected Buckets element in response: {}",

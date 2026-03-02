@@ -965,12 +965,7 @@ fn test_object_write_read_update_read_delete() {
             .unwrap();
 
         // Verify gone
-        let result = client
-            .get_object()
-            .bucket(&bucket)
-            .key("obj")
-            .send()
-            .await;
+        let result = client.get_object().bucket(&bucket).key("obj").send().await;
         assert!(result.is_err());
 
         client.delete_bucket().bucket(&bucket).send().await.unwrap();

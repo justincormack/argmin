@@ -70,7 +70,10 @@ fn presigned_put_url(
     secret_key: &str,
     region: &str,
 ) -> String {
-    let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     let days = secs / 86400;
     let (year, month, day) = days_to_ymd(days);
     let time_of_day = secs % 86400;
@@ -92,10 +95,7 @@ fn presigned_put_url(
         .trim_start_matches("http://")
         .trim_start_matches("https://");
     let (signed_headers, canonical_headers_str) = if body_hash == "UNSIGNED-PAYLOAD" {
-        (
-            "host".to_string(),
-            format!("host:{}\n", host),
-        )
+        ("host".to_string(), format!("host:{}\n", host))
     } else {
         (
             "host;x-amz-content-sha256".to_string(),
@@ -293,7 +293,11 @@ fn test_presigned_put_object_signed_payload() {
             .expect("transport error");
         let status = resp.status().as_u16();
         let _ = resp.body_mut().read_to_string();
-        assert_eq!(status, 200, "expected 200 for signed-payload presigned PUT, got {}", status);
+        assert_eq!(
+            status, 200,
+            "expected 200 for signed-payload presigned PUT, got {}",
+            status
+        );
 
         // Verify via normal GET
         let get_resp = client
@@ -337,7 +341,11 @@ fn test_presigned_put_object_signed_payload_mismatch() {
             .expect("transport error");
         let status = resp.status().as_u16();
         let _ = resp.body_mut().read_to_string();
-        assert_eq!(status, 403, "expected 403 for mismatched body hash, got {}", status);
+        assert_eq!(
+            status, 403,
+            "expected 403 for mismatched body hash, got {}",
+            status
+        );
 
         cleanup(&bucket, &[]).await;
     });
@@ -375,10 +383,19 @@ fn test_presigned_delete_object() {
             .expect("transport error");
         let status = resp.status().as_u16();
         let _ = resp.body_mut().read_to_string();
-        assert!(status == 200 || status == 204, "expected 200/204, got {}", status);
+        assert!(
+            status == 200 || status == 204,
+            "expected 200/204, got {}",
+            status
+        );
 
         // Verify deleted
-        let result = client.get_object().bucket(&bucket).key("todelete").send().await;
+        let result = client
+            .get_object()
+            .bucket(&bucket)
+            .key("todelete")
+            .send()
+            .await;
         assert!(result.is_err());
 
         cleanup(&bucket, &[]).await;
@@ -495,13 +512,14 @@ fn test_presigned_get_bad_signature() {
         let url = presigned.uri().to_string();
         let tampered = url.replace("X-Amz-Signature=", "X-Amz-Signature=0000000000000000");
 
-        let mut resp = agent()
-            .get(&tampered)
-            .call()
-            .expect("transport error");
+        let mut resp = agent().get(&tampered).call().expect("transport error");
         let status = resp.status().as_u16();
         let _ = resp.body_mut().read_to_string();
-        assert_eq!(status, 403, "expected 403 for bad signature, got {}", status);
+        assert_eq!(
+            status, 403,
+            "expected 403 for bad signature, got {}",
+            status
+        );
 
         cleanup(&bucket, &["obj"]).await;
     });
@@ -537,14 +555,15 @@ fn test_presigned_get_tampered_key() {
         let url = presigned.uri().to_string();
         let tampered = url.replace("/original?", "/different?");
 
-        let mut resp = agent()
-            .get(&tampered)
-            .call()
-            .expect("transport error");
+        let mut resp = agent().get(&tampered).call().expect("transport error");
         let status = resp.status().as_u16();
         let _ = resp.body_mut().read_to_string();
         // Should fail: either 403 (signature mismatch) or 404 (not found)
-        assert!(status == 403 || status == 404, "expected 403/404, got {}", status);
+        assert!(
+            status == 403 || status == 404,
+            "expected 403/404, got {}",
+            status
+        );
 
         cleanup(&bucket, &["original"]).await;
     });
@@ -635,13 +654,14 @@ fn test_presigned_missing_signature() {
             .collect::<Vec<_>>()
             .join("&");
 
-        let mut resp = agent()
-            .get(&stripped)
-            .call()
-            .expect("transport error");
+        let mut resp = agent().get(&stripped).call().expect("transport error");
         let status = resp.status().as_u16();
         let _ = resp.body_mut().read_to_string();
-        assert!(status >= 400, "expected error for missing signature, got {}", status);
+        assert!(
+            status >= 400,
+            "expected error for missing signature, got {}",
+            status
+        );
 
         cleanup(&bucket, &["obj"]).await;
     });
@@ -727,7 +747,10 @@ fn test_presigned_get_response_content_type() {
             .call()
             .expect("transport error");
         assert_eq!(resp.status().as_u16(), 200);
-        let ct = resp.headers().get("Content-Type").map(|v| v.to_str().unwrap().to_string());
+        let ct = resp
+            .headers()
+            .get("Content-Type")
+            .map(|v| v.to_str().unwrap().to_string());
         let _ = resp.body_mut().read_to_string();
         assert_eq!(ct.as_deref(), Some("application/pdf"));
 
@@ -762,7 +785,10 @@ fn test_object_raw_get_x_amz_expires_not_expired() {
             .await
             .unwrap();
 
-        let mut resp = agent().get(presigned.uri()).call().expect("transport error");
+        let mut resp = agent()
+            .get(presigned.uri())
+            .call()
+            .expect("transport error");
         assert_eq!(resp.status().as_u16(), 200);
         let data = resp.body_mut().read_to_vec().unwrap();
         assert_eq!(&data[..], b"data");
@@ -797,7 +823,10 @@ fn test_object_raw_get_x_amz_expires_out_max_range() {
             .await
             .unwrap();
 
-        let mut resp = agent().get(presigned.uri()).call().expect("transport error");
+        let mut resp = agent()
+            .get(presigned.uri())
+            .call()
+            .expect("transport error");
         let status = resp.status().as_u16();
         let _ = resp.body_mut().read_to_string();
         // Should be rejected as expires exceeds max range
@@ -837,10 +866,9 @@ fn test_object_raw_get_x_amz_expires_out_positive_range() {
             .unwrap();
 
         // Replace the X-Amz-Expires value with a negative number
-        let tampered_url = presigned.uri().replace(
-            "X-Amz-Expires=600",
-            "X-Amz-Expires=-1",
-        );
+        let tampered_url = presigned
+            .uri()
+            .replace("X-Amz-Expires=600", "X-Amz-Expires=-1");
 
         let mut resp = agent().get(&tampered_url).call().expect("transport error");
         let status = resp.status().as_u16();
@@ -880,10 +908,9 @@ fn test_object_raw_get_x_amz_expires_out_range_zero() {
             .await
             .unwrap();
 
-        let tampered_url = presigned.uri().replace(
-            "X-Amz-Expires=600",
-            "X-Amz-Expires=0",
-        );
+        let tampered_url = presigned
+            .uri()
+            .replace("X-Amz-Expires=600", "X-Amz-Expires=0");
 
         let mut resp = agent().get(&tampered_url).call().expect("transport error");
         let status = resp.status().as_u16();

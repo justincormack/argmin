@@ -143,7 +143,10 @@ impl S3Response {
         }
 
         // Checksum headers (only when ChecksumMode=ENABLED)
-        if checksum_mode.map(|m| m.eq_ignore_ascii_case("ENABLED")).unwrap_or(false) {
+        if checksum_mode
+            .map(|m| m.eq_ignore_ascii_case("ENABLED"))
+            .unwrap_or(false)
+        {
             for entry in result.metadata.checksum_entries() {
                 resp = resp.header(&entry.key, &entry.value);
             }
@@ -193,7 +196,10 @@ impl S3Response {
         }
 
         // Checksum headers (only when ChecksumMode=ENABLED)
-        if checksum_mode.map(|m| m.eq_ignore_ascii_case("ENABLED")).unwrap_or(false) {
+        if checksum_mode
+            .map(|m| m.eq_ignore_ascii_case("ENABLED"))
+            .unwrap_or(false)
+        {
             for entry in result.metadata.checksum_entries() {
                 resp = resp.header(&entry.key, &entry.value);
             }

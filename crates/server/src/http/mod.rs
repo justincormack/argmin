@@ -442,26 +442,22 @@ impl HttpFrontend {
             // SigV4 POST
             auth::authenticate_post_sigv4(
                 algo,
-                form.field("x-amz-credential").ok_or_else(|| {
-                    ServerError::InvalidRequest {
+                form.field("x-amz-credential")
+                    .ok_or_else(|| ServerError::InvalidRequest {
                         reason: "missing x-amz-credential".to_string(),
-                    }
-                })?,
-                form.field("x-amz-date").ok_or_else(|| {
-                    ServerError::InvalidRequest {
+                    })?,
+                form.field("x-amz-date")
+                    .ok_or_else(|| ServerError::InvalidRequest {
                         reason: "missing x-amz-date".to_string(),
-                    }
-                })?,
-                form.field("policy").ok_or_else(|| {
-                    ServerError::InvalidRequest {
+                    })?,
+                form.field("policy")
+                    .ok_or_else(|| ServerError::InvalidRequest {
                         reason: "missing policy".to_string(),
-                    }
-                })?,
-                form.field("x-amz-signature").ok_or_else(|| {
-                    ServerError::InvalidRequest {
+                    })?,
+                form.field("x-amz-signature")
+                    .ok_or_else(|| ServerError::InvalidRequest {
                         reason: "missing x-amz-signature".to_string(),
-                    }
-                })?,
+                    })?,
                 &self.credentials,
             )
         } else {
@@ -670,11 +666,7 @@ fn validate_checksum_headers(req: &S3Request) -> Result<(), ServerError> {
                 }
                 "CRC32C" => {
                     let crc = unsafe {
-                        ec_sys::crc32_iscsi(
-                            req.body.as_ptr() as *mut _,
-                            req.body.len() as i32,
-                            0,
-                        )
+                        ec_sys::crc32_iscsi(req.body.as_ptr() as *mut _, req.body.len() as i32, 0)
                     };
                     base64::engine::general_purpose::STANDARD.encode(crc.to_be_bytes())
                 }

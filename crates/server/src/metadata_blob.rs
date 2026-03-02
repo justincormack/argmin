@@ -252,9 +252,9 @@ impl MetadataBlob {
 
     /// Return checksum header entries (x-amz-checksum-*) stored in the blob.
     pub fn checksum_entries(&self) -> impl Iterator<Item = &MetadataEntry> {
-        self.entries.iter().filter(|e| {
-            e.key.starts_with("x-amz-checksum-") && e.key != "x-amz-checksum-algorithm"
-        })
+        self.entries
+            .iter()
+            .filter(|e| e.key.starts_with("x-amz-checksum-") && e.key != "x-amz-checksum-algorithm")
     }
 }
 

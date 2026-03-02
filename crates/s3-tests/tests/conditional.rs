@@ -41,7 +41,8 @@ fn test_get_object_ifmatch_good() {
         let bucket = setup_bucket().await;
         let etag = put_object(&bucket, "obj", b"hello").await;
 
-        let resp = CTX.client()
+        let resp = CTX
+            .client()
             .get_object()
             .bucket(&bucket)
             .key("obj")
@@ -62,7 +63,8 @@ fn test_get_object_ifmatch_failed() {
         let bucket = setup_bucket().await;
         put_object(&bucket, "obj", b"hello").await;
 
-        let result = CTX.client()
+        let result = CTX
+            .client()
             .get_object()
             .bucket(&bucket)
             .key("obj")
@@ -81,7 +83,8 @@ fn test_get_object_ifmatch_wildcard() {
         let bucket = setup_bucket().await;
         put_object(&bucket, "obj", b"hello").await;
 
-        let resp = CTX.client()
+        let resp = CTX
+            .client()
             .get_object()
             .bucket(&bucket)
             .key("obj")
@@ -105,7 +108,8 @@ fn test_get_object_ifnonematch_good() {
         put_object(&bucket, "obj", b"hello").await;
 
         // Different etag → should succeed
-        let resp = CTX.client()
+        let resp = CTX
+            .client()
             .get_object()
             .bucket(&bucket)
             .key("obj")
@@ -127,7 +131,8 @@ fn test_get_object_ifnonematch_failed() {
         let etag = put_object(&bucket, "obj", b"hello").await;
 
         // Same etag → should return 304 Not Modified
-        let result = CTX.client()
+        let result = CTX
+            .client()
             .get_object()
             .bucket(&bucket)
             .key("obj")
@@ -147,7 +152,8 @@ fn test_get_object_ifnonematch_wildcard() {
         put_object(&bucket, "obj", b"hello").await;
 
         // * matches any etag → should return 304
-        let result = CTX.client()
+        let result = CTX
+            .client()
             .get_object()
             .bucket(&bucket)
             .key("obj")
@@ -170,7 +176,8 @@ fn test_get_object_ifmodifiedsince_good() {
 
         // Use a date in the past → object was modified after → should succeed
         let past = DateTime::from_secs(0);
-        let resp = CTX.client()
+        let resp = CTX
+            .client()
             .get_object()
             .bucket(&bucket)
             .key("obj")
@@ -193,7 +200,8 @@ fn test_get_object_ifmodifiedsince_failed() {
 
         // Use a date far in the future → object not modified since → 304
         let future = DateTime::from_secs(4_102_444_800); // 2100-01-01
-        let result = CTX.client()
+        let result = CTX
+            .client()
             .get_object()
             .bucket(&bucket)
             .key("obj")
@@ -216,7 +224,8 @@ fn test_get_object_ifunmodifiedsince_good() {
 
         // Use a date far in the future → object was last modified before → should succeed
         let future = DateTime::from_secs(4_102_444_800);
-        let resp = CTX.client()
+        let resp = CTX
+            .client()
             .get_object()
             .bucket(&bucket)
             .key("obj")
@@ -239,7 +248,8 @@ fn test_get_object_ifunmodifiedsince_failed() {
 
         // Use epoch → object modified after → 412
         let past = DateTime::from_secs(0);
-        let result = CTX.client()
+        let result = CTX
+            .client()
             .get_object()
             .bucket(&bucket)
             .key("obj")
@@ -260,7 +270,8 @@ fn test_head_object_ifmatch_good() {
         let bucket = setup_bucket().await;
         let etag = put_object(&bucket, "obj", b"hello").await;
 
-        let resp = CTX.client()
+        let resp = CTX
+            .client()
             .head_object()
             .bucket(&bucket)
             .key("obj")
@@ -280,7 +291,8 @@ fn test_head_object_ifmatch_failed() {
         let bucket = setup_bucket().await;
         put_object(&bucket, "obj", b"hello").await;
 
-        let result = CTX.client()
+        let result = CTX
+            .client()
             .head_object()
             .bucket(&bucket)
             .key("obj")
@@ -299,7 +311,8 @@ fn test_head_object_ifnonematch_good() {
         let bucket = setup_bucket().await;
         put_object(&bucket, "obj", b"hello").await;
 
-        let resp = CTX.client()
+        let resp = CTX
+            .client()
             .head_object()
             .bucket(&bucket)
             .key("obj")
@@ -319,7 +332,8 @@ fn test_head_object_ifnonematch_failed() {
         let bucket = setup_bucket().await;
         let etag = put_object(&bucket, "obj", b"hello").await;
 
-        let result = CTX.client()
+        let result = CTX
+            .client()
             .head_object()
             .bucket(&bucket)
             .key("obj")
@@ -350,7 +364,8 @@ fn test_put_object_ifnonmatch_nonexisted_good() {
             .await
             .unwrap();
 
-        let resp = CTX.client()
+        let resp = CTX
+            .client()
             .get_object()
             .bucket(&bucket)
             .key("new")
@@ -371,7 +386,8 @@ fn test_put_object_ifnonmatch_overwrite_existed_failed() {
         put_object(&bucket, "existing", b"original").await;
 
         // Object already exists → should fail with 412
-        let result = CTX.client()
+        let result = CTX
+            .client()
             .put_object()
             .bucket(&bucket)
             .key("existing")
@@ -382,7 +398,8 @@ fn test_put_object_ifnonmatch_overwrite_existed_failed() {
         assert_eq!(err_status(&result), 412);
 
         // Verify original content unchanged
-        let resp = CTX.client()
+        let resp = CTX
+            .client()
             .get_object()
             .bucket(&bucket)
             .key("existing")
@@ -415,7 +432,8 @@ fn test_put_object_ifmatch_good() {
             .await
             .unwrap();
 
-        let resp = CTX.client()
+        let resp = CTX
+            .client()
             .get_object()
             .bucket(&bucket)
             .key("obj")
@@ -436,7 +454,8 @@ fn test_put_object_ifmatch_failed() {
         put_object(&bucket, "obj", b"v1").await;
 
         // Wrong etag → should fail with 412
-        let result = CTX.client()
+        let result = CTX
+            .client()
             .put_object()
             .bucket(&bucket)
             .key("obj")
@@ -447,7 +466,8 @@ fn test_put_object_ifmatch_failed() {
         assert_eq!(err_status(&result), 412);
 
         // Verify original content unchanged
-        let resp = CTX.client()
+        let resp = CTX
+            .client()
             .get_object()
             .bucket(&bucket)
             .key("obj")
@@ -467,7 +487,8 @@ fn test_put_object_ifmatch_nonexisted_failed() {
         let bucket = setup_bucket().await;
 
         // Object doesn't exist → If-Match fails with 404 NoSuchKey
-        let result = CTX.client()
+        let result = CTX
+            .client()
             .put_object()
             .bucket(&bucket)
             .key("nonexistent")
@@ -500,7 +521,8 @@ fn test_delete_object_ifmatch_good() {
             .unwrap();
 
         // Verify deleted
-        let result = CTX.client()
+        let result = CTX
+            .client()
             .get_object()
             .bucket(&bucket)
             .key("obj")
@@ -519,7 +541,8 @@ fn test_delete_object_ifmatch_failed() {
         put_object(&bucket, "obj", b"hello").await;
 
         // Wrong etag → delete should fail with 412
-        let result = CTX.client()
+        let result = CTX
+            .client()
             .delete_object()
             .bucket(&bucket)
             .key("obj")
@@ -529,7 +552,8 @@ fn test_delete_object_ifmatch_failed() {
         assert!(result.is_err(), "expected 412 PreconditionFailed");
 
         // Verify still exists
-        let resp = CTX.client()
+        let resp = CTX
+            .client()
             .get_object()
             .bucket(&bucket)
             .key("obj")
@@ -561,7 +585,8 @@ fn test_copy_object_source_ifmatch_good() {
             .await
             .unwrap();
 
-        let resp = CTX.client()
+        let resp = CTX
+            .client()
             .get_object()
             .bucket(&bucket)
             .key("dst")
@@ -581,7 +606,8 @@ fn test_copy_object_source_ifmatch_failed() {
         let bucket = setup_bucket().await;
         put_object(&bucket, "src", b"source data").await;
 
-        let result = CTX.client()
+        let result = CTX
+            .client()
             .copy_object()
             .bucket(&bucket)
             .key("dst")
@@ -612,7 +638,8 @@ fn test_copy_object_source_ifnonematch_good() {
             .await
             .unwrap();
 
-        let resp = CTX.client()
+        let resp = CTX
+            .client()
             .get_object()
             .bucket(&bucket)
             .key("dst")
@@ -633,7 +660,8 @@ fn test_copy_object_source_ifnonematch_failed() {
         let etag = put_object(&bucket, "src", b"source data").await;
 
         // Same etag → copy should fail with 412
-        let result = CTX.client()
+        let result = CTX
+            .client()
             .copy_object()
             .bucket(&bucket)
             .key("dst")
@@ -677,7 +705,8 @@ fn test_copy_object_source_ifmodifiedsince_failed() {
 
         // Date far in future → not modified since → 412
         let future = DateTime::from_secs(4_102_444_800);
-        let result = CTX.client()
+        let result = CTX
+            .client()
             .copy_object()
             .bucket(&bucket)
             .key("dst")
@@ -721,7 +750,8 @@ fn test_copy_object_source_ifunmodifiedsince_failed() {
 
         // Date at epoch → object was modified after → 412
         let past = DateTime::from_secs(0);
-        let result = CTX.client()
+        let result = CTX
+            .client()
             .copy_object()
             .bucket(&bucket)
             .key("dst")
@@ -754,7 +784,8 @@ fn test_put_object_if_match() {
             .await
             .unwrap();
 
-        let resp = CTX.client()
+        let resp = CTX
+            .client()
             .get_object()
             .bucket(&bucket)
             .key("obj")
@@ -785,7 +816,8 @@ fn test_put_object_ifmatch_overwrite_existed_good() {
             .await
             .unwrap();
 
-        let resp = CTX.client()
+        let resp = CTX
+            .client()
             .get_object()
             .bucket(&bucket)
             .key("obj")
@@ -818,7 +850,8 @@ fn test_put_object_ifnonmatch_good() {
             .await
             .unwrap();
 
-        let resp = CTX.client()
+        let resp = CTX
+            .client()
             .get_object()
             .bucket(&bucket)
             .key("obj")
@@ -840,7 +873,8 @@ fn test_put_object_ifnonmatch_failed() {
         let etag = put_object(&bucket, "obj", b"data").await;
 
         // Matching etag → should fail with 412
-        let result = CTX.client()
+        let result = CTX
+            .client()
             .put_object()
             .bucket(&bucket)
             .key("obj")
@@ -874,7 +908,8 @@ fn test_copy_object_ifmatch_good() {
             .await
             .unwrap();
 
-        let resp = CTX.client()
+        let resp = CTX
+            .client()
             .get_object()
             .bucket(&bucket)
             .key("dst")
@@ -896,7 +931,8 @@ fn test_copy_object_ifmatch_failed() {
         put_object(&bucket, "dst", b"old dst").await;
 
         // If-Match on destination with wrong etag → should fail
-        let result = CTX.client()
+        let result = CTX
+            .client()
             .copy_object()
             .bucket(&bucket)
             .key("dst")
@@ -928,7 +964,8 @@ fn test_copy_object_ifnonematch_good() {
             .await
             .unwrap();
 
-        let resp = CTX.client()
+        let resp = CTX
+            .client()
             .get_object()
             .bucket(&bucket)
             .key("dst")
@@ -951,7 +988,8 @@ fn test_copy_object_ifnonematch_failed() {
         let dst_etag = put_object(&bucket, "dst", b"old dst").await;
 
         // If-None-Match on destination with matching etag → should fail
-        let result = CTX.client()
+        let result = CTX
+            .client()
             .copy_object()
             .bucket(&bucket)
             .key("dst")
@@ -974,7 +1012,8 @@ fn test_delete_object_if_match() {
         put_object(&bucket, "obj", b"hello").await;
 
         // Delete with wrong If-Match → 412
-        let result = CTX.client()
+        let result = CTX
+            .client()
             .delete_object()
             .bucket(&bucket)
             .key("obj")
@@ -984,7 +1023,8 @@ fn test_delete_object_if_match() {
         assert_eq!(err_status(&result), 412);
 
         // Verify object still exists
-        let resp = CTX.client()
+        let resp = CTX
+            .client()
             .get_object()
             .bucket(&bucket)
             .key("obj")
