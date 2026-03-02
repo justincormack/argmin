@@ -1675,36 +1675,117 @@ fn test_bucket_list_return_data() {
     });
 }
 
-// ── Anonymous access (not implemented) ──────────────────────────────
+// ── Anonymous access ────────────────────────────────────────────────
+
+fn anon_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .new_agent()
+}
 
 #[test]
-#[ignore = "not implemented: anonymous access"]
 fn test_bucket_list_objects_anonymous() {
     s3_tests::run(async {
-        unimplemented!();
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client
+            .create_bucket()
+            .bucket(&bucket)
+            .acl(aws_sdk_s3::types::BucketCannedAcl::PublicRead)
+            .send()
+            .await
+            .unwrap();
+        for key in SET_B {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(*key)
+                .body(aws_sdk_s3::primitives::ByteStream::from_static(b"content"))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        // Anonymous ListObjects V1
+        let url = format!("{}/{}", CTX.endpoint(), bucket);
+        let mut resp = anon_agent().get(&url).call().expect("transport error");
+        assert_eq!(resp.status().as_u16(), 200);
+        let body = resp.body_mut().read_to_string().unwrap();
+        assert!(body.contains("<Key>bar</Key>"), "expected 'bar' in listing");
+
+        let keys: Vec<String> = SET_B.iter().map(|s| s.to_string()).collect();
+        delete_all_and_bucket(client, &bucket, &keys).await;
     });
 }
 
 #[test]
-#[ignore = "not implemented: anonymous access"]
 fn test_bucket_listv2_objects_anonymous() {
     s3_tests::run(async {
-        unimplemented!();
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client
+            .create_bucket()
+            .bucket(&bucket)
+            .acl(aws_sdk_s3::types::BucketCannedAcl::PublicRead)
+            .send()
+            .await
+            .unwrap();
+        for key in SET_B {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(*key)
+                .body(aws_sdk_s3::primitives::ByteStream::from_static(b"content"))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        // Anonymous ListObjects V2
+        let url = format!("{}/{}?list-type=2", CTX.endpoint(), bucket);
+        let mut resp = anon_agent().get(&url).call().expect("transport error");
+        assert_eq!(resp.status().as_u16(), 200);
+        let body = resp.body_mut().read_to_string().unwrap();
+        assert!(body.contains("<Key>bar</Key>"), "expected 'bar' in v2 listing");
+
+        let keys: Vec<String> = SET_B.iter().map(|s| s.to_string()).collect();
+        delete_all_and_bucket(client, &bucket, &keys).await;
     });
 }
 
 #[test]
-#[ignore = "not implemented: anonymous access"]
 fn test_bucket_list_objects_anonymous_fail() {
     s3_tests::run(async {
-        unimplemented!();
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        // Private bucket (default ACL)
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let url = format!("{}/{}", CTX.endpoint(), bucket);
+        let mut resp = anon_agent().get(&url).call().expect("transport error");
+        let status = resp.status().as_u16();
+        let _ = resp.body_mut().read_to_string();
+        assert_eq!(status, 403, "expected 403 for anon list on private bucket, got {}", status);
+
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
 }
 
 #[test]
-#[ignore = "not implemented: anonymous access"]
 fn test_bucket_listv2_objects_anonymous_fail() {
     s3_tests::run(async {
-        unimplemented!();
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        // Private bucket (default ACL)
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let url = format!("{}/{}?list-type=2", CTX.endpoint(), bucket);
+        let mut resp = anon_agent().get(&url).call().expect("transport error");
+        let status = resp.status().as_u16();
+        let _ = resp.body_mut().read_to_string();
+        assert_eq!(status, 403, "expected 403 for anon listv2 on private bucket, got {}", status);
+
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
 }
