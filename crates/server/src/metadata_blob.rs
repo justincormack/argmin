@@ -53,6 +53,21 @@ fn has_invalid_header_bytes(s: &str) -> bool {
     s.bytes().any(|b| !(0x20..0x7f).contains(&b))
 }
 
+/// Strip `aws-chunked` from a comma-separated Content-Encoding value.
+/// Returns `None` if nothing remains after stripping.
+fn strip_aws_chunked(value: &str) -> Option<String> {
+    let filtered: Vec<&str> = value
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.eq_ignore_ascii_case("aws-chunked"))
+        .collect();
+    if filtered.is_empty() {
+        None
+    } else {
+        Some(filtered.join(", "))
+    }
+}
+
 impl MetadataBlob {
     /// Create an empty metadata blob.
     pub fn new() -> Self {
@@ -78,10 +93,19 @@ impl MetadataBlob {
                         ),
                     });
                 }
-                entries.push(MetadataEntry {
-                    key: lower,
-                    value: value.to_string(),
-                });
+                if lower == "content-encoding" {
+                    if let Some(filtered) = strip_aws_chunked(value) {
+                        entries.push(MetadataEntry {
+                            key: lower,
+                            value: filtered,
+                        });
+                    }
+                } else {
+                    entries.push(MetadataEntry {
+                        key: lower,
+                        value: value.to_string(),
+                    });
+                }
             }
         }
         Ok(Self { entries })
@@ -451,5 +475,59 @@ mod tests {
             ("X-Amz-Meta-Tag", "hello world 123 !@#$%"),
         ];
         assert!(MetadataBlob::from_headers(&headers).is_ok());
+    }
+
+    #[test]
+    fn strip_aws_chunked_removes_trailing() {
+        assert_eq!(
+            strip_aws_chunked("gzip, aws-chunked"),
+            Some("gzip".to_string())
+        );
+    }
+
+    #[test]
+    fn strip_aws_chunked_removes_leading() {
+        assert_eq!(
+            strip_aws_chunked("aws-chunked, gzip"),
+            Some("gzip".to_string())
+        );
+    }
+
+    #[test]
+    fn strip_aws_chunked_only() {
+        assert_eq!(strip_aws_chunked("aws-chunked"), None);
+    }
+
+    #[test]
+    fn strip_aws_chunked_duplicates() {
+        assert_eq!(strip_aws_chunked("aws-chunked, aws-chunked"), None);
+    }
+
+    #[test]
+    fn strip_aws_chunked_no_match() {
+        assert_eq!(
+            strip_aws_chunked("deflate, gzip"),
+            Some("deflate, gzip".to_string())
+        );
+    }
+
+    #[test]
+    fn strip_aws_chunked_single_no_match() {
+        assert_eq!(strip_aws_chunked("gzip"), Some("gzip".to_string()));
+    }
+
+    #[test]
+    fn from_headers_strips_aws_chunked_from_content_encoding() {
+        let headers = [("Content-Encoding", "gzip, aws-chunked")];
+        let blob = MetadataBlob::from_headers(&headers).unwrap();
+        assert_eq!(blob.get("content-encoding"), Some("gzip"));
+    }
+
+    #[test]
+    fn from_headers_drops_content_encoding_when_only_aws_chunked() {
+        let headers = [("Content-Encoding", "aws-chunked")];
+        let blob = MetadataBlob::from_headers(&headers).unwrap();
+        assert_eq!(blob.get("content-encoding"), None);
+        assert!(blob.entries.is_empty());
     }
 }

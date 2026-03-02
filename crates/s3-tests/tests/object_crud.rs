@@ -1175,16 +1175,148 @@ fn test_object_write_to_nonexist_bucket() {
     });
 }
 
+// ── Content-Encoding aws-chunked stripping ──────────────────────────
+
+/// Port of Ceph test_object_content_encoding_aws_chunked.
+/// When Content-Encoding contains "aws-chunked", the server must strip it
+/// from the stored value, only persisting real content encodings.
+#[test]
+fn test_object_content_encoding_aws_chunked() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "ce-test";
+
+        // 1. gzip only — returned as-is
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .content_encoding("gzip")
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+        let resp = client
+            .head_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.content_encoding(), Some("gzip"));
+
+        // 2. deflate, gzip — returned as-is
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .content_encoding("deflate, gzip")
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+        let resp = client
+            .head_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.content_encoding(), Some("deflate, gzip"));
+
+        // 3. gzip, aws-chunked — aws-chunked stripped, returns gzip
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .content_encoding("gzip, aws-chunked")
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+        let resp = client
+            .head_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.content_encoding(), Some("gzip"));
+
+        // 4. aws-chunked, gzip — aws-chunked stripped, returns gzip
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .content_encoding("aws-chunked, gzip")
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+        let resp = client
+            .head_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.content_encoding(), Some("gzip"));
+
+        // 5. aws-chunked only — no Content-Encoding stored
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .content_encoding("aws-chunked")
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+        let resp = client
+            .head_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.content_encoding(), None);
+
+        // 6. aws-chunked, aws-chunked — no Content-Encoding stored
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .content_encoding("aws-chunked, aws-chunked")
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+        let resp = client
+            .head_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.content_encoding(), None);
+
+        // Cleanup
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
 // ── Not implemented ─────────────────────────────────────────────────
 
 #[test]
 #[ignore = "not implemented: ACL grants"]
 fn test_object_header_acl_grants() {
-    s3_tests::run(async {});
-}
-
-#[test]
-#[ignore = "not implemented: chunked transfer encoding"]
-fn test_object_write_with_chunked_transfer_encoding() {
     s3_tests::run(async {});
 }
