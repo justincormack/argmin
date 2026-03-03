@@ -334,6 +334,7 @@ pub struct ListPartsReq {
 }
 
 /// Response from listing parts of a multipart upload.
+#[derive(Debug)]
 pub struct ListPartsResp {
     pub parts: Vec<MultipartPartRecord>,
     pub is_truncated: bool,

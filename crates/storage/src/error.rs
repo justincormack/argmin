@@ -53,6 +53,9 @@ pub enum MetadataError {
     #[error("upload not in InProgress state (current: {state})")]
     UploadNotInProgress { state: u8 },
 
+    #[error("multipart part not found: upload={upload_id} part={part_number}")]
+    PartNotFound { upload_id: String, part_number: u32 },
+
     #[error("not implemented: {context}")]
     NotImplemented { context: &'static str },
 

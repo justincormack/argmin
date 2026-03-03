@@ -103,6 +103,40 @@ impl PgStore {
             .as_millis() as u64
     }
 
+    /// Convert a BLOB to a 16-byte object key hash, failing on wrong length.
+    fn blob_to_okh(blob: Vec<u8>, col: usize) -> Result<[u8; 16], rusqlite::Error> {
+        let len = blob.len();
+        blob.try_into().map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                col,
+                rusqlite::types::Type::Blob,
+                Box::from(format!("invalid part_okh length: {len} (expected 16)")),
+            )
+        })
+    }
+
+    /// Map a row with columns (upload_id, part_number, generation, size, etag,
+    /// etag_kind, part_okh, part_vid, ec_k, ec_m, last_modified) to a
+    /// MultipartPartRecord.
+    fn row_to_multipart_part(
+        row: &rusqlite::Row<'_>,
+    ) -> Result<MultipartPartRecord, rusqlite::Error> {
+        let part_okh = Self::blob_to_okh(row.get(6)?, 6)?;
+        Ok(MultipartPartRecord {
+            upload_id: row.get(0)?,
+            part_number: row.get::<_, i64>(1)? as u32,
+            generation: row.get::<_, i64>(2)? as u32,
+            size: row.get::<_, i64>(3)? as u64,
+            etag: row.get(4)?,
+            etag_kind: row.get::<_, u8>(5)?,
+            part_okh,
+            part_vid: row.get::<_, i64>(7)? as u64,
+            ec_k: row.get::<_, u8>(8)?,
+            ec_m: row.get::<_, u8>(9)?,
+            last_modified: row.get::<_, i64>(10)? as u64,
+        })
+    }
+
     /// Map a row with columns (bucket, key, version_id, size, total_size, etag,
     /// etag_kind, last_modified, storage_class, ec_k, ec_m, status, tags,
     /// data_layout, parts_count, metadata_blob) to an ObjectRecord.
@@ -762,102 +796,556 @@ impl PgMetadataStore for PgStore {
         Ok(())
     }
 
-    // ── Multipart upload methods (stubs — implemented in Step 3) ──
+    // ── Multipart upload methods ──────────────────────────────────
 
-    fn create_multipart_upload(
-        &self,
-        _req: &CreateMultipartUploadReq,
-    ) -> Result<(), MetadataError> {
-        Err(MetadataError::NotImplemented {
-            context: "multipart metadata (pending Step 3)",
-        })
+    fn create_multipart_upload(&self, req: &CreateMultipartUploadReq) -> Result<(), MetadataError> {
+        let now = PgStore::now_millis();
+        self.conn
+            .execute(
+                "INSERT INTO multipart_uploads \
+                 (upload_id, bucket, key, initiated_at, state, metadata_blob, owner_principal) \
+                 VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)",
+                params![
+                    req.upload_id,
+                    req.bucket,
+                    req.key,
+                    now as i64,
+                    req.metadata_blob,
+                    req.owner_principal,
+                ],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "create multipart upload",
+                source: e,
+            })?;
+        Ok(())
     }
 
     fn get_multipart_upload(
         &self,
-        _upload_id: &str,
+        upload_id: &str,
     ) -> Result<MultipartUploadRecord, MetadataError> {
-        Err(MetadataError::NotImplemented {
-            context: "multipart metadata (pending Step 3)",
-        })
+        self.conn
+            .query_row(
+                "SELECT upload_id, bucket, key, initiated_at, state, metadata_blob, \
+                 owner_principal \
+                 FROM multipart_uploads WHERE upload_id = ?1",
+                params![upload_id],
+                |row| {
+                    let state_raw = row.get::<_, u8>(4)?;
+                    Ok(MultipartUploadRecord {
+                        upload_id: row.get(0)?,
+                        bucket: row.get(1)?,
+                        key: row.get(2)?,
+                        initiated_at: row.get::<_, i64>(3)? as u64,
+                        state: UploadState::from_u8(state_raw).ok_or_else(|| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                4,
+                                rusqlite::types::Type::Integer,
+                                Box::from(format!("invalid upload state: {state_raw}")),
+                            )
+                        })?,
+                        metadata_blob: row.get(5)?,
+                        owner_principal: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| MetadataError::Db {
+                context: "get multipart upload",
+                source: e,
+            })?
+            .ok_or(MetadataError::NoSuchUpload)
     }
 
     fn set_upload_state(
         &self,
-        _upload_id: &str,
-        _new_state: UploadState,
+        upload_id: &str,
+        new_state: UploadState,
     ) -> Result<(), MetadataError> {
-        Err(MetadataError::NotImplemented {
-            context: "multipart metadata (pending Step 3)",
-        })
+        // Only Completing and Aborting are valid transition targets.
+        // Check existence first so we return NoSuchUpload accurately.
+        if new_state == UploadState::InProgress {
+            let current = self
+                .conn
+                .query_row(
+                    "SELECT state FROM multipart_uploads WHERE upload_id = ?1",
+                    params![upload_id],
+                    |row| row.get::<_, u8>(0),
+                )
+                .optional()
+                .map_err(|e| MetadataError::Db {
+                    context: "set upload state (exists check)",
+                    source: e,
+                })?;
+            return match current {
+                Some(state) => Err(MetadataError::UploadNotInProgress { state }),
+                None => Err(MetadataError::NoSuchUpload)
+            };
+        }
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE multipart_uploads SET state = ?1 \
+                 WHERE upload_id = ?2 AND state = 0",
+                params![new_state as u8, upload_id],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "set upload state",
+                source: e,
+            })?;
+        if updated == 0 {
+            // Either the upload doesn't exist or it's not InProgress.
+            let current = self
+                .conn
+                .query_row(
+                    "SELECT state FROM multipart_uploads WHERE upload_id = ?1",
+                    params![upload_id],
+                    |row| row.get::<_, u8>(0),
+                )
+                .optional()
+                .map_err(|e| MetadataError::Db {
+                    context: "set upload state (check)",
+                    source: e,
+                })?;
+            return match current {
+                None => Err(MetadataError::NoSuchUpload),
+                Some(s) => Err(MetadataError::UploadNotInProgress { state: s }),
+            };
+        }
+        Ok(())
     }
 
-    fn delete_multipart_upload(&self, _upload_id: &str) -> Result<(), MetadataError> {
-        Err(MetadataError::NotImplemented {
-            context: "multipart metadata (pending Step 3)",
-        })
+    fn delete_multipart_upload(&self, upload_id: &str) -> Result<(), MetadataError> {
+        let deleted = self
+            .conn
+            .execute(
+                "DELETE FROM multipart_uploads WHERE upload_id = ?1",
+                params![upload_id],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "delete multipart upload",
+                source: e,
+            })?;
+        if deleted == 0 {
+            return Err(MetadataError::NoSuchUpload);
+        }
+        Ok(())
     }
 
     fn list_multipart_uploads(
         &self,
-        _req: &ListMultipartUploadsReq,
+        req: &ListMultipartUploadsReq,
     ) -> Result<ListMultipartUploadsResp, MetadataError> {
-        Err(MetadataError::NotImplemented {
-            context: "multipart metadata (pending Step 3)",
+        let limit = req.max_uploads as i64 + 1;
+        let mut where_clauses = vec!["bucket = ?1".to_string()];
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> =
+            vec![Box::new(req.bucket.clone())];
+        let mut param_idx = 2;
+
+        if let Some(ref prefix) = req.prefix {
+            where_clauses.push(format!("key >= ?{param_idx}"));
+            params_vec.push(Box::new(prefix.clone()));
+            param_idx += 1;
+
+            if let Some(end) = prefix_end(prefix) {
+                where_clauses.push(format!("key < ?{param_idx}"));
+                params_vec.push(Box::new(end));
+                param_idx += 1;
+            }
+        }
+
+        if let Some(ref key_marker) = req.key_marker {
+            if let Some(ref uid_marker) = req.upload_id_marker {
+                // Resume after (key_marker, uid_marker)
+                where_clauses.push(format!(
+                    "(key > ?{km} OR (key = ?{km} AND upload_id > ?{um}))",
+                    km = param_idx,
+                    um = param_idx + 1
+                ));
+                params_vec.push(Box::new(key_marker.clone()));
+                params_vec.push(Box::new(uid_marker.clone()));
+                param_idx += 2;
+            } else {
+                where_clauses.push(format!("key > ?{param_idx}"));
+                params_vec.push(Box::new(key_marker.clone()));
+                param_idx += 1;
+            }
+        }
+
+        let where_str = where_clauses.join(" AND ");
+        let sql = format!(
+            "SELECT upload_id, bucket, key, initiated_at, state, metadata_blob, \
+             owner_principal \
+             FROM multipart_uploads \
+             WHERE {where_str} \
+             ORDER BY key ASC, upload_id ASC LIMIT ?{param_idx}"
+        );
+        params_vec.push(Box::new(limit));
+
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = self.conn.prepare(&sql).map_err(|e| MetadataError::Db {
+            context: "prepare list multipart uploads",
+            source: e,
+        })?;
+
+        let rows = stmt
+            .query_map(params_refs.as_slice(), |row| {
+                let state_raw = row.get::<_, u8>(4)?;
+                Ok(MultipartUploadRecord {
+                    upload_id: row.get(0)?,
+                    bucket: row.get(1)?,
+                    key: row.get(2)?,
+                    initiated_at: row.get::<_, i64>(3)? as u64,
+                    state: UploadState::from_u8(state_raw).ok_or_else(|| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            4,
+                            rusqlite::types::Type::Integer,
+                            Box::from(format!("invalid upload state: {state_raw}")),
+                        )
+                    })?,
+                    metadata_blob: row.get(5)?,
+                    owner_principal: row.get(6)?,
+                })
+            })
+            .map_err(|e| MetadataError::Db {
+                context: "list multipart uploads query",
+                source: e,
+            })?;
+
+        let mut uploads: Vec<MultipartUploadRecord> = Vec::new();
+        for row in rows {
+            uploads.push(row.map_err(|e| MetadataError::Db {
+                context: "list multipart uploads row",
+                source: e,
+            })?);
+        }
+
+        let is_truncated = uploads.len() as i64 > req.max_uploads as i64;
+        if is_truncated {
+            uploads.truncate(req.max_uploads as usize);
+        }
+
+        let (next_key_marker, next_upload_id_marker) = if is_truncated {
+            uploads
+                .last()
+                .map(|u| (Some(u.key.clone()), Some(u.upload_id.clone())))
+                .unwrap_or((None, None))
+        } else {
+            (None, None)
+        };
+
+        Ok(ListMultipartUploadsResp {
+            uploads,
+            is_truncated,
+            next_key_marker,
+            next_upload_id_marker,
         })
     }
 
     fn upsert_multipart_part(
         &self,
-        _part: &MultipartPartRecord,
+        part: &MultipartPartRecord,
     ) -> Result<Option<u32>, MetadataError> {
-        Err(MetadataError::NotImplemented {
-            context: "multipart metadata (pending Step 3)",
-        })
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| MetadataError::Db {
+                context: "upsert part (begin txn)",
+                source: e,
+            })?;
+
+        let result = (|| -> Result<Option<u32>, rusqlite::Error> {
+            // Read previous generation before overwrite.
+            let prev_gen: Option<u32> = self
+                .conn
+                .query_row(
+                    "SELECT generation FROM multipart_parts \
+                     WHERE upload_id = ?1 AND part_number = ?2",
+                    params![part.upload_id, part.part_number],
+                    |row| row.get::<_, i64>(0).map(|v| v as u32),
+                )
+                .optional()?;
+
+            self.conn.execute(
+                "INSERT OR REPLACE INTO multipart_parts \
+                 (upload_id, part_number, generation, size, etag, etag_kind, \
+                  part_okh, part_vid, ec_k, ec_m, last_modified) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    part.upload_id,
+                    part.part_number,
+                    part.generation,
+                    part.size as i64,
+                    part.etag,
+                    part.etag_kind,
+                    part.part_okh.as_slice(),
+                    part.part_vid as i64,
+                    part.ec_k,
+                    part.ec_m,
+                    part.last_modified as i64,
+                ],
+            )?;
+
+            Ok(prev_gen)
+        })();
+
+        match result {
+            Ok(prev_gen) => {
+                if let Err(e) = self.conn.execute_batch("COMMIT") {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    return Err(MetadataError::Db {
+                        context: "upsert part (commit txn)",
+                        source: e,
+                    });
+                }
+                Ok(prev_gen)
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                // FK violation means the upload_id doesn't exist.
+                if let rusqlite::Error::SqliteFailure(ref err, _) = e {
+                    if err.code == rusqlite::ffi::ErrorCode::ConstraintViolation {
+                        return Err(MetadataError::NoSuchUpload);
+                    }
+                }
+                Err(MetadataError::Db {
+                    context: "upsert multipart part",
+                    source: e,
+                })
+            }
+        }
     }
 
     fn get_multipart_part(
         &self,
-        _upload_id: &str,
-        _part_number: u32,
+        upload_id: &str,
+        part_number: u32,
     ) -> Result<MultipartPartRecord, MetadataError> {
-        Err(MetadataError::NotImplemented {
-            context: "multipart metadata (pending Step 3)",
+        self.conn
+            .query_row(
+                "SELECT upload_id, part_number, generation, size, etag, etag_kind, \
+                 part_okh, part_vid, ec_k, ec_m, last_modified \
+                 FROM multipart_parts WHERE upload_id = ?1 AND part_number = ?2",
+                params![upload_id, part_number],
+                Self::row_to_multipart_part,
+            )
+            .optional()
+            .map_err(|e| MetadataError::Db {
+                context: "get multipart part",
+                source: e,
+            })?
+            .ok_or(MetadataError::PartNotFound {
+                upload_id: upload_id.to_string(),
+                part_number,
+            })
+    }
+
+    fn list_multipart_parts(&self, req: &ListPartsReq) -> Result<ListPartsResp, MetadataError> {
+        // Verify the upload exists so we return NoSuchUpload, not an empty list.
+        let exists = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM multipart_uploads WHERE upload_id = ?1",
+                params![req.upload_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|e| MetadataError::Db {
+                context: "list parts (upload exists check)",
+                source: e,
+            })?;
+        if exists.is_none() {
+            return Err(MetadataError::NoSuchUpload);
+        }
+
+        let limit = req.max_parts as i64 + 1;
+
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> =
+            vec![Box::new(req.upload_id.clone())];
+        let sql = if let Some(marker) = req.part_number_marker {
+            params_vec.push(Box::new(marker));
+            params_vec.push(Box::new(limit));
+            "SELECT upload_id, part_number, generation, size, etag, etag_kind, \
+             part_okh, part_vid, ec_k, ec_m, last_modified \
+             FROM multipart_parts \
+             WHERE upload_id = ?1 AND part_number > ?2 \
+             ORDER BY part_number ASC LIMIT ?3"
+                .to_string()
+        } else {
+            params_vec.push(Box::new(limit));
+            "SELECT upload_id, part_number, generation, size, etag, etag_kind, \
+             part_okh, part_vid, ec_k, ec_m, last_modified \
+             FROM multipart_parts \
+             WHERE upload_id = ?1 \
+             ORDER BY part_number ASC LIMIT ?2"
+                .to_string()
+        };
+
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = self.conn.prepare(&sql).map_err(|e| MetadataError::Db {
+            context: "prepare list multipart parts",
+            source: e,
+        })?;
+
+        let rows = stmt
+            .query_map(params_refs.as_slice(), Self::row_to_multipart_part)
+            .map_err(|e| MetadataError::Db {
+                context: "list multipart parts query",
+                source: e,
+            })?;
+
+        let mut parts: Vec<MultipartPartRecord> = Vec::new();
+        for row in rows {
+            parts.push(row.map_err(|e| MetadataError::Db {
+                context: "list multipart parts row",
+                source: e,
+            })?);
+        }
+
+        let is_truncated = parts.len() as i64 > req.max_parts as i64;
+        if is_truncated {
+            parts.truncate(req.max_parts as usize);
+        }
+
+        let next_part_number_marker = if is_truncated {
+            parts.last().map(|p| p.part_number)
+        } else {
+            None
+        };
+
+        Ok(ListPartsResp {
+            parts,
+            is_truncated,
+            next_part_number_marker,
         })
     }
 
-    fn list_multipart_parts(&self, _req: &ListPartsReq) -> Result<ListPartsResp, MetadataError> {
-        Err(MetadataError::NotImplemented {
-            context: "multipart metadata (pending Step 3)",
-        })
-    }
+    fn commit_object_parts(&self, parts: &[ObjectPartRecord]) -> Result<(), MetadataError> {
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| MetadataError::Db {
+                context: "commit object parts (begin txn)",
+                source: e,
+            })?;
 
-    fn commit_object_parts(&self, _parts: &[ObjectPartRecord]) -> Result<(), MetadataError> {
-        Err(MetadataError::NotImplemented {
-            context: "multipart metadata (pending Step 3)",
-        })
+        let result = (|| {
+            let mut stmt = self.conn.prepare(
+                "INSERT INTO object_parts \
+                 (bucket, key, version_id, part_number, size, etag, etag_kind, \
+                  part_okh, part_vid, ec_k, ec_m) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            )?;
+
+            for part in parts {
+                stmt.execute(params![
+                    part.bucket,
+                    part.key,
+                    part.version_id as i64,
+                    part.part_number,
+                    part.size as i64,
+                    part.etag,
+                    part.etag_kind,
+                    part.part_okh.as_slice(),
+                    part.part_vid as i64,
+                    part.ec_k,
+                    part.ec_m,
+                ])?;
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                if let Err(e) = self.conn.execute_batch("COMMIT") {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    return Err(MetadataError::Db {
+                        context: "commit object parts (commit txn)",
+                        source: e,
+                    });
+                }
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(MetadataError::Db {
+                    context: "commit object parts",
+                    source: e,
+                })
+            }
+        }
     }
 
     fn get_object_parts(
         &self,
-        _bucket: &str,
-        _key: &str,
-        _version_id: u64,
+        bucket: &str,
+        key: &str,
+        version_id: u64,
     ) -> Result<Vec<ObjectPartRecord>, MetadataError> {
-        Err(MetadataError::NotImplemented {
-            context: "multipart metadata (pending Step 3)",
-        })
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT bucket, key, version_id, part_number, size, etag, etag_kind, \
+                 part_okh, part_vid, ec_k, ec_m \
+                 FROM object_parts \
+                 WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 \
+                 ORDER BY part_number ASC",
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "prepare get object parts",
+                source: e,
+            })?;
+
+        let rows = stmt
+            .query_map(params![bucket, key, version_id as i64], |row| {
+                let part_okh = Self::blob_to_okh(row.get(7)?, 7)?;
+                Ok(ObjectPartRecord {
+                    bucket: row.get(0)?,
+                    key: row.get(1)?,
+                    version_id: row.get::<_, i64>(2)? as u64,
+                    part_number: row.get::<_, i64>(3)? as u32,
+                    size: row.get::<_, i64>(4)? as u64,
+                    etag: row.get(5)?,
+                    etag_kind: row.get::<_, u8>(6)?,
+                    part_okh,
+                    part_vid: row.get::<_, i64>(8)? as u64,
+                    ec_k: row.get::<_, u8>(9)?,
+                    ec_m: row.get::<_, u8>(10)?,
+                })
+            })
+            .map_err(|e| MetadataError::Db {
+                context: "get object parts query",
+                source: e,
+            })?;
+
+        let mut parts = Vec::new();
+        for row in rows {
+            parts.push(row.map_err(|e| MetadataError::Db {
+                context: "get object parts row",
+                source: e,
+            })?);
+        }
+        Ok(parts)
     }
 
     fn delete_object_parts(
         &self,
-        _bucket: &str,
-        _key: &str,
-        _version_id: u64,
+        bucket: &str,
+        key: &str,
+        version_id: u64,
     ) -> Result<(), MetadataError> {
-        Err(MetadataError::NotImplemented {
-            context: "multipart metadata (pending Step 3)",
-        })
+        self.conn
+            .execute(
+                "DELETE FROM object_parts \
+                 WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
+                params![bucket, key, version_id as i64],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "delete object parts",
+                source: e,
+            })?;
+        Ok(())
     }
 }
 
