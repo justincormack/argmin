@@ -368,6 +368,7 @@ These groups from test_s3.py are well covered by existing tests:
 - Server work: large feature touching storage, metadata, and HTTP layers. Tracks in-progress
   uploads, assembles parts into final object. Many other features (encryption, versioning,
   checksums) have multipart variants that depend on this.
+- Detailed implementation plan: `plans/multipart-upload-core-design.md`.
 
 **Full ACL system (~41 tests)**
 - Per-object and per-bucket ACL grants (read, write, read-acp, write-acp) to specific
