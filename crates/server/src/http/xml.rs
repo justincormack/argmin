@@ -1030,6 +1030,76 @@ fn decode_hex_pair(hi: u8, lo: u8) -> Option<u8> {
     Some(h << 4 | l)
 }
 
+/// Public access block configuration for a bucket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicAccessBlockConfig {
+    pub block_public_acls: bool,
+    pub ignore_public_acls: bool,
+    pub block_public_policy: bool,
+    pub restrict_public_buckets: bool,
+}
+
+/// Parse a `<PublicAccessBlockConfiguration>` XML request body.
+///
+/// Missing boolean elements default to `false`.
+pub fn parse_public_access_block_xml(data: &[u8]) -> Result<PublicAccessBlockConfig, ServerError> {
+    let text = std::str::from_utf8(data).map_err(|_| ServerError::InvalidRequest {
+        reason: "invalid UTF-8 in public access block XML body".to_string(),
+    })?;
+    let inner =
+        extract_tag_content(text, "PublicAccessBlockConfiguration").ok_or_else(|| {
+            ServerError::InvalidRequest {
+                reason: "missing PublicAccessBlockConfiguration element".to_string(),
+            }
+        })?;
+
+    fn parse_bool_element(xml: &str, tag: &str) -> bool {
+        extract_tag_content(xml, tag)
+            .map(|v| v.trim().eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+
+    Ok(PublicAccessBlockConfig {
+        block_public_acls: parse_bool_element(inner, "BlockPublicAcls"),
+        ignore_public_acls: parse_bool_element(inner, "IgnorePublicAcls"),
+        block_public_policy: parse_bool_element(inner, "BlockPublicPolicy"),
+        restrict_public_buckets: parse_bool_element(inner, "RestrictPublicBuckets"),
+    })
+}
+
+/// Serialize a `PublicAccessBlockConfig` into S3 response XML.
+pub fn get_public_access_block_xml(config: &PublicAccessBlockConfig) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <PublicAccessBlockConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <BlockPublicAcls>{}</BlockPublicAcls>\
+         <IgnorePublicAcls>{}</IgnorePublicAcls>\
+         <BlockPublicPolicy>{}</BlockPublicPolicy>\
+         <RestrictPublicBuckets>{}</RestrictPublicBuckets>\
+         </PublicAccessBlockConfiguration>",
+        if config.block_public_acls {
+            "true"
+        } else {
+            "false"
+        },
+        if config.ignore_public_acls {
+            "true"
+        } else {
+            "false"
+        },
+        if config.block_public_policy {
+            "true"
+        } else {
+            "false"
+        },
+        if config.restrict_public_buckets {
+            "true"
+        } else {
+            "false"
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1059,6 +1129,7 @@ mod tests {
             public_read: false,
             cors_config: None,
             tags: None,
+            public_access_block: None,
         }];
         let xml = list_buckets_xml(&buckets, "owner");
         assert!(xml.contains("<Name>test-bucket</Name>"));
@@ -1844,5 +1915,78 @@ mod tests {
     fn count_tags_empty() {
         let xml = get_tagging_xml(&[]);
         assert_eq!(count_tags_in_xml(&xml), 0);
+    }
+
+    // ── PublicAccessBlock XML ──────────────────────────────────────────
+
+    #[test]
+    fn parse_public_access_block_all_true() {
+        let xml = b"<PublicAccessBlockConfiguration>\
+            <BlockPublicAcls>true</BlockPublicAcls>\
+            <IgnorePublicAcls>true</IgnorePublicAcls>\
+            <BlockPublicPolicy>true</BlockPublicPolicy>\
+            <RestrictPublicBuckets>true</RestrictPublicBuckets>\
+            </PublicAccessBlockConfiguration>";
+        let config = parse_public_access_block_xml(xml).unwrap();
+        assert!(config.block_public_acls);
+        assert!(config.ignore_public_acls);
+        assert!(config.block_public_policy);
+        assert!(config.restrict_public_buckets);
+    }
+
+    #[test]
+    fn parse_public_access_block_all_false() {
+        let xml = b"<PublicAccessBlockConfiguration>\
+            <BlockPublicAcls>false</BlockPublicAcls>\
+            <IgnorePublicAcls>false</IgnorePublicAcls>\
+            <BlockPublicPolicy>false</BlockPublicPolicy>\
+            <RestrictPublicBuckets>false</RestrictPublicBuckets>\
+            </PublicAccessBlockConfiguration>";
+        let config = parse_public_access_block_xml(xml).unwrap();
+        assert!(!config.block_public_acls);
+        assert!(!config.ignore_public_acls);
+        assert!(!config.block_public_policy);
+        assert!(!config.restrict_public_buckets);
+    }
+
+    #[test]
+    fn parse_public_access_block_missing_elements_default_false() {
+        let xml = b"<PublicAccessBlockConfiguration>\
+            <BlockPublicAcls>true</BlockPublicAcls>\
+            </PublicAccessBlockConfiguration>";
+        let config = parse_public_access_block_xml(xml).unwrap();
+        assert!(config.block_public_acls);
+        assert!(!config.ignore_public_acls);
+        assert!(!config.block_public_policy);
+        assert!(!config.restrict_public_buckets);
+    }
+
+    #[test]
+    fn parse_public_access_block_empty() {
+        let xml = b"<PublicAccessBlockConfiguration></PublicAccessBlockConfiguration>";
+        let config = parse_public_access_block_xml(xml).unwrap();
+        assert!(!config.block_public_acls);
+        assert!(!config.ignore_public_acls);
+        assert!(!config.block_public_policy);
+        assert!(!config.restrict_public_buckets);
+    }
+
+    #[test]
+    fn parse_public_access_block_missing_wrapper() {
+        let xml = b"<BlockPublicAcls>true</BlockPublicAcls>";
+        assert!(parse_public_access_block_xml(xml).is_err());
+    }
+
+    #[test]
+    fn public_access_block_xml_round_trip() {
+        let config = PublicAccessBlockConfig {
+            block_public_acls: true,
+            ignore_public_acls: false,
+            block_public_policy: true,
+            restrict_public_buckets: false,
+        };
+        let xml = get_public_access_block_xml(&config);
+        let parsed = parse_public_access_block_xml(xml.as_bytes()).unwrap();
+        assert_eq!(parsed, config);
     }
 }

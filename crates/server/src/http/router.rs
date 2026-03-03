@@ -28,6 +28,10 @@ pub enum S3Operation {
     PutObjectTagging { bucket: String, key: String },
     GetObjectTagging { bucket: String, key: String },
     DeleteObjectTagging { bucket: String, key: String },
+    PutBucketPublicAccessBlock { bucket: String },
+    GetBucketPublicAccessBlock { bucket: String },
+    DeleteBucketPublicAccessBlock { bucket: String },
+    PutBucketAcl { bucket: String },
     OptionsRequest { bucket: String, key: Option<String> },
 }
 
@@ -180,12 +184,25 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
         ("PUT", None) if has_query_key(query, "tagging") => Ok(S3Operation::PutBucketTagging {
             bucket: bucket.to_string(),
         }),
+        ("PUT", None) if has_query_key(query, "publicAccessBlock") => {
+            Ok(S3Operation::PutBucketPublicAccessBlock {
+                bucket: bucket.to_string(),
+            })
+        }
+        ("PUT", None) if has_query_key(query, "acl") => Ok(S3Operation::PutBucketAcl {
+            bucket: bucket.to_string(),
+        }),
         ("PUT", None) => Ok(S3Operation::CreateBucket {
             bucket: bucket.to_string(),
         }),
         ("DELETE", None) if has_query_key(query, "cors") => Ok(S3Operation::DeleteBucketCors {
             bucket: bucket.to_string(),
         }),
+        ("DELETE", None) if has_query_key(query, "publicAccessBlock") => {
+            Ok(S3Operation::DeleteBucketPublicAccessBlock {
+                bucket: bucket.to_string(),
+            })
+        }
         ("DELETE", None) if has_query_key(query, "tagging") => {
             Ok(S3Operation::DeleteBucketTagging {
                 bucket: bucket.to_string(),
@@ -198,6 +215,12 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
             bucket: bucket.to_string(),
         }),
         ("GET", None) => {
+            // Check for ?publicAccessBlock → GetBucketPublicAccessBlock
+            if has_query_key(query, "publicAccessBlock") {
+                return Ok(S3Operation::GetBucketPublicAccessBlock {
+                    bucket: bucket.to_string(),
+                });
+            }
             // Check for ?cors → GetBucketCors
             if has_query_key(query, "cors") {
                 return Ok(S3Operation::GetBucketCors {
@@ -676,6 +699,46 @@ mod tests {
         assert_eq!(
             route("PUT", "/mybucket", "versioning").unwrap(),
             S3Operation::PutBucketVersioning {
+                bucket: "mybucket".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn put_bucket_public_access_block() {
+        assert_eq!(
+            route("PUT", "/mybucket", "publicAccessBlock").unwrap(),
+            S3Operation::PutBucketPublicAccessBlock {
+                bucket: "mybucket".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn get_bucket_public_access_block() {
+        assert_eq!(
+            route("GET", "/mybucket", "publicAccessBlock").unwrap(),
+            S3Operation::GetBucketPublicAccessBlock {
+                bucket: "mybucket".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn delete_bucket_public_access_block() {
+        assert_eq!(
+            route("DELETE", "/mybucket", "publicAccessBlock").unwrap(),
+            S3Operation::DeleteBucketPublicAccessBlock {
+                bucket: "mybucket".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn put_bucket_acl() {
+        assert_eq!(
+            route("PUT", "/mybucket", "acl").unwrap(),
+            S3Operation::PutBucketAcl {
                 bucket: "mybucket".to_string()
             }
         );

@@ -155,6 +155,20 @@ pub trait GlobalService {
 
     /// Delete a bucket's tags. Idempotent.
     fn delete_bucket_tags(&self, name: &str) -> Result<(), MetadataError>;
+
+    /// Store a public access block configuration for a bucket (serialized XML string).
+    fn put_bucket_public_access_block(&self, name: &str, config: &str)
+        -> Result<(), MetadataError>;
+
+    /// Retrieve a bucket's public access block configuration. Returns None if not set.
+    fn get_bucket_public_access_block(&self, name: &str)
+        -> Result<Option<String>, MetadataError>;
+
+    /// Delete a bucket's public access block configuration. Idempotent.
+    fn delete_bucket_public_access_block(&self, name: &str) -> Result<(), MetadataError>;
+
+    /// Update a bucket's public_read ACL flag.
+    fn put_bucket_acl(&self, name: &str, public_read: bool) -> Result<(), MetadataError>;
 }
 
 /// Multiplexes across PG stores on a single node.

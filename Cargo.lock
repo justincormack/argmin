@@ -1925,6 +1925,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "ureq",
+ "url",
 ]
 
 [[package]]

@@ -207,7 +207,17 @@ impl HttpFrontend {
             }
             S3Operation::CreateBucket { bucket } => {
                 let owner_principal = self.require_principal(auth)?;
-                let public_read = parse_bucket_acl(req)?;
+                let acl = parse_bucket_acl(req)?;
+                let public_read = match acl {
+                    BucketAcl::Private => false,
+                    BucketAcl::PublicRead => true,
+                    BucketAcl::UnsupportedPublic => {
+                        return Err(ServerError::NotImplemented {
+                            feature: "public-read-write and authenticated-read ACLs"
+                                .to_string(),
+                        });
+                    }
+                };
                 self.coordinator
                     .create_bucket_for_owner(owner_principal, &bucket, public_read)?;
                 Ok(S3Response::create_bucket(&bucket))
@@ -580,6 +590,71 @@ impl HttpFrontend {
                 self.coordinator.delete_object_tags(&bucket, &key, vid)?;
                 Ok(S3Response::delete_object_tagging())
             }
+            S3Operation::PutBucketPublicAccessBlock { bucket } => {
+                self.authorize_bucket_write(auth, &bucket)?;
+                let config = xml::parse_public_access_block_xml(&req.body)?;
+                let config_xml = xml::get_public_access_block_xml(&config);
+                self.coordinator
+                    .put_bucket_public_access_block(&bucket, &config_xml)?;
+                Ok(S3Response::put_bucket_public_access_block())
+            }
+            S3Operation::GetBucketPublicAccessBlock { bucket } => {
+                self.authorize_bucket_write(auth, &bucket)?;
+                match self.coordinator.get_bucket_public_access_block(&bucket)? {
+                    Some(config_xml) => {
+                        Ok(S3Response::get_bucket_public_access_block(&config_xml))
+                    }
+                    None => Err(ServerError::NoSuchPublicAccessBlockConfiguration {
+                        bucket: bucket.clone(),
+                    }),
+                }
+            }
+            S3Operation::DeleteBucketPublicAccessBlock { bucket } => {
+                self.authorize_bucket_write(auth, &bucket)?;
+                self.coordinator
+                    .delete_bucket_public_access_block(&bucket)?;
+                Ok(S3Response::delete_bucket_public_access_block())
+            }
+            S3Operation::PutBucketAcl { bucket } => {
+                self.authorize_bucket_write(auth, &bucket)?;
+                let acl = parse_bucket_acl(req)?;
+                match acl {
+                    BucketAcl::Private => {
+                        self.coordinator.put_bucket_acl(&bucket, false)?;
+                    }
+                    BucketAcl::PublicRead => {
+                        // Enforce BlockPublicAcls
+                        if let Some(pab_xml) =
+                            self.coordinator.get_bucket_public_access_block(&bucket)?
+                        {
+                            let pab =
+                                xml::parse_public_access_block_xml(pab_xml.as_bytes())?;
+                            if pab.block_public_acls {
+                                return Err(ServerError::AccessDenied);
+                            }
+                        }
+                        self.coordinator.put_bucket_acl(&bucket, true)?;
+                    }
+                    BucketAcl::UnsupportedPublic => {
+                        // Check BlockPublicAcls first — return 403 if set
+                        if let Some(pab_xml) =
+                            self.coordinator.get_bucket_public_access_block(&bucket)?
+                        {
+                            let pab =
+                                xml::parse_public_access_block_xml(pab_xml.as_bytes())?;
+                            if pab.block_public_acls {
+                                return Err(ServerError::AccessDenied);
+                            }
+                        }
+                        // Not blocked, but we don't support these ACL semantics
+                        return Err(ServerError::NotImplemented {
+                            feature: "public-read-write and authenticated-read ACLs"
+                                .to_string(),
+                        });
+                    }
+                }
+                Ok(S3Response::put_bucket_acl())
+            }
             // OptionsRequest is handled before auth in handle_s3_request
             S3Operation::OptionsRequest { .. } => {
                 unreachable!("OPTIONS handled before dispatch")
@@ -680,7 +755,18 @@ impl HttpFrontend {
 
     fn authorize_bucket_read(&self, auth: &AuthContext, bucket: &str) -> Result<(), ServerError> {
         let info = self.coordinator.head_bucket(bucket)?;
-        let visibility = if info.public_read {
+        let mut effective_public_read = info.public_read;
+        // IgnorePublicAcls: treat public-read as private if set
+        if effective_public_read {
+            if let Some(ref pab_xml) = info.public_access_block {
+                if let Ok(pab) = xml::parse_public_access_block_xml(pab_xml.as_bytes()) {
+                    if pab.ignore_public_acls {
+                        effective_public_read = false;
+                    }
+                }
+            }
+        }
+        let visibility = if effective_public_read {
             ResourceVisibility::PublicRead
         } else {
             ResourceVisibility::Private
@@ -996,10 +1082,20 @@ fn apply_response_overrides(resp: &mut S3Response, req: &S3Request) {
     }
 }
 
-fn parse_bucket_acl(req: &S3Request) -> Result<bool, ServerError> {
+enum BucketAcl {
+    Private,
+    PublicRead,
+    /// ACL values that grant public access but whose specific semantics we don't implement
+    /// (public-read-write, authenticated-read). Kept separate so BlockPublicAcls can reject
+    /// them with 403 while normal requests get NotImplemented.
+    UnsupportedPublic,
+}
+
+fn parse_bucket_acl(req: &S3Request) -> Result<BucketAcl, ServerError> {
     match req.header("x-amz-acl") {
-        None | Some("private") => Ok(false),
-        Some("public-read") => Ok(true),
+        None | Some("private") => Ok(BucketAcl::Private),
+        Some("public-read") => Ok(BucketAcl::PublicRead),
+        Some("public-read-write") | Some("authenticated-read") => Ok(BucketAcl::UnsupportedPublic),
         Some(other) => Err(ServerError::InvalidArgument {
             reason: format!("unsupported x-amz-acl value: {other}"),
         }),

@@ -70,6 +70,15 @@ pub enum ServerError {
 
     #[error("invalid tag: {reason}")]
     InvalidTag { reason: String },
+
+    #[error("no public access block configuration: {bucket}")]
+    NoSuchPublicAccessBlockConfiguration { bucket: String },
+
+    #[error("access denied")]
+    AccessDenied,
+
+    #[error("not implemented: {feature}")]
+    NotImplemented { feature: String },
 }
 
 impl ServerError {
@@ -100,6 +109,11 @@ impl ServerError {
             Self::NoSuchCorsConfiguration { .. } => "NoSuchCORSConfiguration",
             Self::NoSuchTagSet { .. } => "NoSuchTagSet",
             Self::InvalidTag { .. } => "InvalidTag",
+            Self::NoSuchPublicAccessBlockConfiguration { .. } => {
+                "NoSuchPublicAccessBlockConfiguration"
+            }
+            Self::AccessDenied => "AccessDenied",
+            Self::NotImplemented { .. } => "NotImplemented",
             Self::Store(_) => "InternalError",
             Self::Metadata(_) => "InternalError",
             Self::Ec(_) => "InternalError",
@@ -121,7 +135,10 @@ impl ServerError {
             | Self::BadDigest => 400,
             Self::NoSuchCorsConfiguration { .. } => 404,
             Self::NoSuchTagSet { .. } => 404,
+            Self::NoSuchPublicAccessBlockConfiguration { .. } => 404,
             Self::InvalidTag { .. } => 400,
+            Self::AccessDenied => 403,
+            Self::NotImplemented { .. } => 501,
             Self::ObjectTooLarge { .. } => 400,
             Self::MethodNotAllowed => 405,
             Self::InvalidRange { .. } => 416,

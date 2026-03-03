@@ -5,6 +5,10 @@ pub const TEST_ACCESS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
 pub const TEST_SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
 pub const TEST_REGION: &str = "us-east-1";
 
+/// Alternate test credentials (non-owner user).
+pub const ALT_ACCESS_KEY: &str = "AKIAI44QH8DHBEXAMPLE";
+pub const ALT_SECRET_KEY: &str = "je7MtGbClwBF/2Zp9Utk/h3yCo8nvbEXAMPLEKEY";
+
 /// Number of frontend instances in the pool.
 ///
 /// Each frontend opens its own SQLite connections (SQLite WAL mode + busy_timeout
@@ -68,6 +72,10 @@ impl TestServer {
                 credentials.add(
                     TEST_ACCESS_KEY.to_string(),
                     auth::SecretKey(TEST_SECRET_KEY.to_string()),
+                );
+                credentials.add(
+                    ALT_ACCESS_KEY.to_string(),
+                    auth::SecretKey(ALT_SECRET_KEY.to_string()),
                 );
 
                 server::http::HttpFrontend {

@@ -150,6 +150,8 @@ pub struct BucketInfo {
     pub cors_config: Option<String>,
     /// Serialized tagging XML (None = no tags).
     pub tags: Option<String>,
+    /// Serialized public access block configuration XML (None = no config).
+    pub public_access_block: Option<String>,
 }
 
 /// Request to store object metadata.

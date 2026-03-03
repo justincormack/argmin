@@ -41,6 +41,7 @@ pub fn run<F: std::future::Future>(f: F) -> F::Output {
 /// `TestServer` on a random port with well-known test credentials.
 pub struct TestContext {
     client: Client,
+    alt_client: Client,
     endpoint: String,
     access_key: String,
     secret_key: String,
@@ -67,12 +68,19 @@ impl TestContext {
                 .expect("S3_TEST_ACCESS_KEY required with S3_TEST_ENDPOINT");
             let secret_key = std::env::var("S3_TEST_SECRET_KEY")
                 .expect("S3_TEST_SECRET_KEY required with S3_TEST_ENDPOINT");
+            let alt_access_key = std::env::var("S3_TEST_ALT_ACCESS_KEY")
+                .unwrap_or_else(|_| server::ALT_ACCESS_KEY.to_string());
+            let alt_secret_key = std::env::var("S3_TEST_ALT_SECRET_KEY")
+                .unwrap_or_else(|_| server::ALT_SECRET_KEY.to_string());
             let region =
                 std::env::var("S3_TEST_REGION").unwrap_or_else(|_| "us-east-1".to_string());
 
             let client = build_client(&endpoint, &access_key, &secret_key, &region).await;
+            let alt_client =
+                build_client(&endpoint, &alt_access_key, &alt_secret_key, &region).await;
             TestContext {
                 client,
+                alt_client,
                 endpoint,
                 access_key,
                 secret_key,
@@ -90,8 +98,16 @@ impl TestContext {
                 server::TEST_REGION,
             )
             .await;
+            let alt_client = build_client(
+                &endpoint,
+                server::ALT_ACCESS_KEY,
+                server::ALT_SECRET_KEY,
+                server::TEST_REGION,
+            )
+            .await;
             TestContext {
                 client,
+                alt_client,
                 endpoint,
                 access_key: server::TEST_ACCESS_KEY.to_string(),
                 secret_key: server::TEST_SECRET_KEY.to_string(),
@@ -101,9 +117,14 @@ impl TestContext {
         }
     }
 
-    /// The S3 client.
+    /// The S3 client (bucket owner).
     pub fn client(&self) -> &Client {
         &self.client
+    }
+
+    /// An alternate S3 client (different user, not the bucket owner).
+    pub fn alt_client(&self) -> &Client {
+        &self.alt_client
     }
 
     /// The HTTP endpoint URL (e.g. "http://127.0.0.1:12345").

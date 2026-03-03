@@ -122,7 +122,7 @@ impl GlobalService for SqliteBucketDb {
     fn head_bucket(&self, name: &str) -> Result<BucketInfo, MetadataError> {
         self.conn
             .query_row(
-                "SELECT name, owner_principal, created_at, region, versioning, public_read, cors_config, tags \
+                "SELECT name, owner_principal, created_at, region, versioning, public_read, cors_config, tags, public_access_block \
                  FROM buckets WHERE name = ?1",
                 params![name],
                 |row| {
@@ -135,6 +135,7 @@ impl GlobalService for SqliteBucketDb {
                         public_read: row.get::<_, i64>(5)? != 0,
                         cors_config: row.get(6)?,
                         tags: row.get(7)?,
+                        public_access_block: row.get(8)?,
                     })
                 },
             )
@@ -191,7 +192,7 @@ impl GlobalService for SqliteBucketDb {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT name, owner_principal, created_at, region, versioning, public_read, cors_config, tags \
+                "SELECT name, owner_principal, created_at, region, versioning, public_read, cors_config, tags, public_access_block \
                  FROM buckets WHERE owner_principal = ?1 ORDER BY name ASC",
             )
             .map_err(|e| MetadataError::Db {
@@ -210,6 +211,7 @@ impl GlobalService for SqliteBucketDb {
                     public_read: row.get::<_, i64>(5)? != 0,
                     cors_config: row.get(6)?,
                     tags: row.get(7)?,
+                    public_access_block: row.get(8)?,
                 })
             })
             .map_err(|e| MetadataError::Db {
@@ -328,6 +330,84 @@ impl GlobalService for SqliteBucketDb {
             )
             .map_err(|e| MetadataError::Db {
                 context: "delete bucket tags",
+                source: e,
+            })?;
+        if updated == 0 {
+            return Err(MetadataError::BucketNotFound {
+                name: name.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn put_bucket_public_access_block(
+        &self,
+        name: &str,
+        config: &str,
+    ) -> Result<(), MetadataError> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE buckets SET public_access_block = ?1 WHERE name = ?2",
+                params![config, name],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "put bucket public access block",
+                source: e,
+            })?;
+        if updated == 0 {
+            return Err(MetadataError::BucketNotFound {
+                name: name.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn get_bucket_public_access_block(&self, name: &str) -> Result<Option<String>, MetadataError> {
+        self.conn
+            .query_row(
+                "SELECT public_access_block FROM buckets WHERE name = ?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| MetadataError::Db {
+                context: "get bucket public access block",
+                source: e,
+            })?
+            .ok_or(MetadataError::BucketNotFound {
+                name: name.to_string(),
+            })
+    }
+
+    fn delete_bucket_public_access_block(&self, name: &str) -> Result<(), MetadataError> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE buckets SET public_access_block = NULL WHERE name = ?1",
+                params![name],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "delete bucket public access block",
+                source: e,
+            })?;
+        if updated == 0 {
+            return Err(MetadataError::BucketNotFound {
+                name: name.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn put_bucket_acl(&self, name: &str, public_read: bool) -> Result<(), MetadataError> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE buckets SET public_read = ?1 WHERE name = ?2",
+                params![if public_read { 1 } else { 0 }, name],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "put bucket acl",
                 source: e,
             })?;
         if updated == 0 {
