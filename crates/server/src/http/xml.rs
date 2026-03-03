@@ -1046,12 +1046,11 @@ pub fn parse_public_access_block_xml(data: &[u8]) -> Result<PublicAccessBlockCon
     let text = std::str::from_utf8(data).map_err(|_| ServerError::InvalidRequest {
         reason: "invalid UTF-8 in public access block XML body".to_string(),
     })?;
-    let inner =
-        extract_tag_content(text, "PublicAccessBlockConfiguration").ok_or_else(|| {
-            ServerError::InvalidRequest {
-                reason: "missing PublicAccessBlockConfiguration element".to_string(),
-            }
-        })?;
+    let inner = extract_tag_content(text, "PublicAccessBlockConfiguration").ok_or_else(|| {
+        ServerError::InvalidRequest {
+            reason: "missing PublicAccessBlockConfiguration element".to_string(),
+        }
+    })?;
 
     fn parse_bool_element(xml: &str, tag: &str) -> bool {
         extract_tag_content(xml, tag)

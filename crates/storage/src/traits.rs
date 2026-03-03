@@ -161,8 +161,7 @@ pub trait GlobalService {
         -> Result<(), MetadataError>;
 
     /// Retrieve a bucket's public access block configuration. Returns None if not set.
-    fn get_bucket_public_access_block(&self, name: &str)
-        -> Result<Option<String>, MetadataError>;
+    fn get_bucket_public_access_block(&self, name: &str) -> Result<Option<String>, MetadataError>;
 
     /// Delete a bucket's public access block configuration. Idempotent.
     fn delete_bucket_public_access_block(&self, name: &str) -> Result<(), MetadataError>;

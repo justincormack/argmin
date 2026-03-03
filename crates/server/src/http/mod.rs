@@ -31,9 +31,12 @@ fn parse_version_id(req: &S3Request) -> Result<Option<u64>, ServerError> {
     match req.query_param("versionId") {
         None => Ok(None),
         Some(v) if v == "null" => Ok(Some(0)),
-        Some(v) => v.parse::<u64>().map(Some).map_err(|_| ServerError::InvalidArgument {
-            reason: format!("invalid versionId: {v}"),
-        }),
+        Some(v) => v
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|_| ServerError::InvalidArgument {
+                reason: format!("invalid versionId: {v}"),
+            }),
     }
 }
 
@@ -213,8 +216,7 @@ impl HttpFrontend {
                     BucketAcl::PublicRead => true,
                     BucketAcl::UnsupportedPublic => {
                         return Err(ServerError::NotImplemented {
-                            feature: "public-read-write and authenticated-read ACLs"
-                                .to_string(),
+                            feature: "public-read-write and authenticated-read ACLs".to_string(),
                         });
                     }
                 };
@@ -314,11 +316,11 @@ impl HttpFrontend {
                     let src_version_id = match src_version_id_str {
                         None => None,
                         Some(v) if v == "null" => Some(0),
-                        Some(v) => Some(v.parse::<u64>().map_err(|_| {
-                            ServerError::InvalidArgument {
+                        Some(v) => {
+                            Some(v.parse::<u64>().map_err(|_| ServerError::InvalidArgument {
                                 reason: format!("invalid versionId in copy source: {v}"),
-                            }
-                        })?),
+                            })?)
+                        }
                     };
                     self.authorize_bucket_write(auth, &bucket)?;
                     self.authorize_bucket_read(auth, &src_bucket)?;
@@ -601,9 +603,7 @@ impl HttpFrontend {
             S3Operation::GetBucketPublicAccessBlock { bucket } => {
                 self.authorize_bucket_write(auth, &bucket)?;
                 match self.coordinator.get_bucket_public_access_block(&bucket)? {
-                    Some(config_xml) => {
-                        Ok(S3Response::get_bucket_public_access_block(&config_xml))
-                    }
+                    Some(config_xml) => Ok(S3Response::get_bucket_public_access_block(&config_xml)),
                     None => Err(ServerError::NoSuchPublicAccessBlockConfiguration {
                         bucket: bucket.clone(),
                     }),
@@ -627,8 +627,7 @@ impl HttpFrontend {
                         if let Some(pab_xml) =
                             self.coordinator.get_bucket_public_access_block(&bucket)?
                         {
-                            let pab =
-                                xml::parse_public_access_block_xml(pab_xml.as_bytes())?;
+                            let pab = xml::parse_public_access_block_xml(pab_xml.as_bytes())?;
                             if pab.block_public_acls {
                                 return Err(ServerError::AccessDenied);
                             }
@@ -640,16 +639,14 @@ impl HttpFrontend {
                         if let Some(pab_xml) =
                             self.coordinator.get_bucket_public_access_block(&bucket)?
                         {
-                            let pab =
-                                xml::parse_public_access_block_xml(pab_xml.as_bytes())?;
+                            let pab = xml::parse_public_access_block_xml(pab_xml.as_bytes())?;
                             if pab.block_public_acls {
                                 return Err(ServerError::AccessDenied);
                             }
                         }
                         // Not blocked, but we don't support these ACL semantics
                         return Err(ServerError::NotImplemented {
-                            feature: "public-read-write and authenticated-read ACLs"
-                                .to_string(),
+                            feature: "public-read-write and authenticated-read ACLs".to_string(),
                         });
                     }
                 }

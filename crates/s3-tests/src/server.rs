@@ -1,4 +1,5 @@
 use std::net::TcpListener;
+use std::sync::Arc;
 
 /// Well-known test credentials.
 pub const TEST_ACCESS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
@@ -11,9 +12,9 @@ pub const ALT_SECRET_KEY: &str = "je7MtGbClwBF/2Zp9Utk/h3yCo8nvbEXAMPLEKEY";
 
 /// Number of frontend instances in the pool.
 ///
-/// Each frontend opens its own SQLite connections (SQLite WAL mode + busy_timeout
-/// handles concurrent access). This controls the parallelism level for request
-/// processing.
+/// Each frontend opens its own bucket DB connection. All frontends share one
+/// `SharedStorageNode` (PG access serialized by mutex). This controls the
+/// parallelism level for request processing.
 const POOL_SIZE: usize = 4;
 
 /// A local S3 server running as a tokio task for integration testing.
@@ -50,17 +51,19 @@ impl TestServer {
         let pg_count: u32 = 4;
         let pg_ids: Vec<u32> = (0..pg_count).collect();
 
-        // Build a pool of frontends, each with its own SQLite connections.
+        // Create one shared storage node for all frontends.
+        let storage_node = Arc::new(
+            storage::SharedStorageNode::open(&data_path, &pg_ids).expect("open storage node"),
+        );
+
         let bucket_db_path = data_path.join("buckets.db");
         let frontends: Vec<server::http::HttpFrontend> = (0..POOL_SIZE)
             .map(|_| {
-                let storage_node = storage::LocalStorageNode::open(&data_path, &pg_ids)
-                    .expect("open storage node");
                 let bucket_db =
                     storage::SqliteBucketDb::open(&bucket_db_path).expect("open bucket db");
                 let ec_config = ec::EcConfig::new(4, 2).expect("EC config");
                 let coordinator = server::coordinator::Coordinator::new(
-                    storage_node,
+                    Arc::clone(&storage_node),
                     bucket_db,
                     ec_config,
                     pg_count,

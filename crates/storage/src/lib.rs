@@ -16,7 +16,7 @@ pub mod types;
 pub use bucket_db::SqliteBucketDb;
 pub use error::{MetadataError, StoreError};
 pub use memory_store::MemoryPgStore;
-pub use node::LocalStorageNode;
+pub use node::{LocalStorageNode, SharedStorageNode};
 pub use pg_store::PgStore;
 pub use traits::{GlobalService, PgMetadataStore, ShardStore, StorageNode};
 pub use types::*;

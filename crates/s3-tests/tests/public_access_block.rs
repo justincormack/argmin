@@ -237,11 +237,7 @@ fn test_ignore_public_acls() {
             .unwrap();
 
         // Verify alt_client (non-owner) can list objects on public-read bucket
-        let list_resp = alt_client
-            .list_objects_v2()
-            .bucket(&bucket)
-            .send()
-            .await;
+        let list_resp = alt_client.list_objects_v2().bucket(&bucket).send().await;
         assert!(
             list_resp.is_ok(),
             "public-read bucket should allow alt_client list_objects"
@@ -279,14 +275,13 @@ fn test_ignore_public_acls() {
         // Re-apply public-read ACL (matching Ceph test: ACL still set, but ignored)
         let acl_url = format!("{}/{}?acl", CTX.endpoint(), bucket);
         let resp = send_signed_put(&acl_url, b"", &[("x-amz-acl", "public-read")]);
-        assert_eq!(resp, 200, "PutBucketAcl should succeed (IgnorePublicAcls doesn't block setting)");
+        assert_eq!(
+            resp, 200,
+            "PutBucketAcl should succeed (IgnorePublicAcls doesn't block setting)"
+        );
 
         // alt_client list_objects should now fail (public ACL is ignored)
-        let list_err = alt_client
-            .list_objects_v2()
-            .bucket(&bucket)
-            .send()
-            .await;
+        let list_err = alt_client.list_objects_v2().bucket(&bucket).send().await;
         assert!(
             list_err.is_err(),
             "expected alt_client list_objects to fail when IgnorePublicAcls is set"
@@ -315,13 +310,12 @@ fn test_ignore_public_acls() {
             .send()
             .await
             .unwrap();
-        let body = get_resp
-            .body
-            .collect()
-            .await
-            .unwrap()
-            .into_bytes();
-        assert_eq!(&body[..], b"abcde", "authenticated owner should still read object");
+        let body = get_resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(
+            &body[..],
+            b"abcde",
+            "authenticated owner should still read object"
+        );
 
         // Cleanup
         client

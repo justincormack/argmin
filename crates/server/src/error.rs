@@ -79,6 +79,14 @@ pub enum ServerError {
 
     #[error("not implemented: {feature}")]
     NotImplemented { feature: String },
+
+    #[error("data integrity error for {bucket}/{key}")]
+    IntegrityError {
+        bucket: String,
+        key: String,
+        expected: u64,
+        actual: u64,
+    },
 }
 
 impl ServerError {
@@ -114,6 +122,7 @@ impl ServerError {
             }
             Self::AccessDenied => "AccessDenied",
             Self::NotImplemented { .. } => "NotImplemented",
+            Self::IntegrityError { .. } => "InternalError",
             Self::Store(_) => "InternalError",
             Self::Metadata(_) => "InternalError",
             Self::Ec(_) => "InternalError",
