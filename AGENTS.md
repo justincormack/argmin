@@ -22,6 +22,8 @@ new dependencies.
 We are designing a highly reliable system so we need to have full trust in it. We need a very comprehensive
 set of tests, and will look at different test methodologies, formal methods, fuzz testing and so on as needed.
 
+We are using the Ceph test suite and porting these to native tests 1:1, these tests are in ./tmp/s3/tests
+
 ## Cleanliness
 
 Make sure `cargo clippy` is clean, even if it is pedantic. Always run tests after making changes and make sure
