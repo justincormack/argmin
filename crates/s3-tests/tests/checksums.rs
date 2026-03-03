@@ -197,16 +197,4 @@ fn test_multipart_use_cksum_helper_sha1() {
     s3_tests::run(async {});
 }
 
-// ── GetObjectAttributes checksum tests (not implemented) ────────────
-
-#[test]
-#[ignore = "not implemented: GetObjectAttributes"]
-fn test_get_checksum_object_attributes() {
-    s3_tests::run(async {});
-}
-
-#[test]
-#[ignore = "not implemented: GetObjectAttributes + multipart"]
-fn test_get_multipart_checksum_object_attributes() {
-    s3_tests::run(async {});
-}
+// GetObjectAttributes checksum tests moved to object_attributes.rs

@@ -556,6 +556,60 @@ impl HttpFrontend {
                 }
                 Ok(resp)
             }
+            S3Operation::GetObjectAttributes { bucket, key } => {
+                self.authorize_bucket_read(auth, &bucket)?;
+                // Parse x-amz-object-attributes header (required, comma-separated).
+                // The AWS Rust SDK may send one header per list element; accept both
+                // repeated headers and comma-delimited header values.
+                let attr_values: Vec<&str> = req
+                    .headers
+                    .iter()
+                    .filter(|(k, _)| k == "x-amz-object-attributes")
+                    .map(|(_, v)| v.as_str())
+                    .collect();
+                if attr_values.is_empty() {
+                    return Err(ServerError::InvalidArgument {
+                        reason: "missing required header: x-amz-object-attributes".to_string(),
+                    });
+                }
+                let requested: Vec<&str> = attr_values
+                    .into_iter()
+                    .flat_map(|value| value.split(','))
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if requested.is_empty() {
+                    return Err(ServerError::InvalidArgument {
+                        reason: "missing required header: x-amz-object-attributes".to_string(),
+                    });
+                }
+                for &attr in &requested {
+                    if !xml::is_valid_object_attribute(attr) {
+                        return Err(ServerError::InvalidArgument {
+                            reason: format!("invalid object attribute: {attr}"),
+                        });
+                    }
+                }
+                let cond = read_condition_from_headers(req);
+                let vid = parse_version_id(req)?;
+                let result = self.coordinator.head_object(&bucket, &key, vid, &cond)?;
+                let checksum_entries: Vec<(&str, &str)> = result
+                    .metadata
+                    .checksum_entries()
+                    .map(|e| (e.key.as_str(), e.value.as_str()))
+                    .collect();
+                let body_xml = xml::get_object_attributes_xml(
+                    &requested,
+                    &result.etag,
+                    result.size,
+                    &checksum_entries,
+                );
+                Ok(S3Response::get_object_attributes(
+                    &body_xml,
+                    result.last_modified,
+                    result.version_id,
+                ))
+            }
             S3Operation::DeleteObjects { bucket } => {
                 self.authorize_bucket_write(auth, &bucket)?;
                 let (entries, quiet) = xml::parse_delete_objects_xml(&req.body)?;

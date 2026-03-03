@@ -1141,6 +1141,96 @@ pub fn get_ownership_controls_xml(object_ownership: &str) -> String {
     )
 }
 
+/// Recognized object attribute names for GetObjectAttributes.
+const VALID_OBJECT_ATTRIBUTES: &[&str] = &[
+    "ETag",
+    "Checksum",
+    "ObjectParts",
+    "StorageClass",
+    "ObjectSize",
+];
+
+/// Check whether an attribute name is valid for GetObjectAttributes.
+pub fn is_valid_object_attribute(name: &str) -> bool {
+    VALID_OBJECT_ATTRIBUTES.contains(&name)
+}
+
+/// Build a `<GetObjectAttributesResponse>` XML body.
+///
+/// `requested` is the set of attribute names from the `x-amz-object-attributes`
+/// header. Only requested attributes appear in the response.
+///
+/// `etag` should be the quoted ETag string (quotes will be stripped).
+/// `checksum_entries` are the `x-amz-checksum-*` metadata entries.
+pub fn get_object_attributes_xml(
+    requested: &[&str],
+    etag: &str,
+    size: u64,
+    checksum_entries: &[(&str, &str)],
+) -> String {
+    let mut xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <GetObjectAttributesResponse>",
+    );
+
+    for &attr in requested {
+        match attr {
+            "ETag" => {
+                // Strip surrounding quotes from etag
+                let unquoted = etag.trim_matches('"');
+                xml.push_str("<ETag>");
+                xml.push_str(&xml_escape(unquoted));
+                xml.push_str("</ETag>");
+            }
+            "Checksum" => {
+                if !checksum_entries.is_empty() {
+                    xml.push_str("<Checksum>");
+                    for &(header_key, value) in checksum_entries {
+                        if let Some(xml_tag) = checksum_header_to_xml_tag(header_key) {
+                            xml.push('<');
+                            xml.push_str(xml_tag);
+                            xml.push('>');
+                            xml.push_str(&xml_escape(value));
+                            xml.push_str("</");
+                            xml.push_str(xml_tag);
+                            xml.push('>');
+                        }
+                    }
+                    xml.push_str("</Checksum>");
+                }
+            }
+            "StorageClass" => {
+                xml.push_str("<StorageClass>STANDARD</StorageClass>");
+            }
+            "ObjectSize" => {
+                xml.push_str("<ObjectSize>");
+                xml.push_str(&size.to_string());
+                xml.push_str("</ObjectSize>");
+            }
+            "ObjectParts" => {
+                // Multipart not yet supported — omit for non-multipart objects
+            }
+            _ => {}
+        }
+    }
+
+    xml.push_str("</GetObjectAttributesResponse>");
+    xml
+}
+
+/// Map a metadata header key like `x-amz-checksum-sha256` to an XML element
+/// name like `ChecksumSHA256`.
+fn checksum_header_to_xml_tag(header: &str) -> Option<&'static str> {
+    match header {
+        "x-amz-checksum-sha256" => Some("ChecksumSHA256"),
+        "x-amz-checksum-sha1" => Some("ChecksumSHA1"),
+        "x-amz-checksum-crc32" => Some("ChecksumCRC32"),
+        "x-amz-checksum-crc32c" => Some("ChecksumCRC32C"),
+        "x-amz-checksum-crc64nvme" => Some("ChecksumCRC64NVME"),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2077,5 +2167,80 @@ mod tests {
     fn parse_ownership_controls_xml_invalid_utf8() {
         let xml: &[u8] = &[0xFF, 0xFE];
         assert!(parse_ownership_controls_xml(xml).is_err());
+    }
+
+    // ── GetObjectAttributes XML tests ───────────────────────────────
+
+    #[test]
+    fn get_object_attributes_all() {
+        let xml = get_object_attributes_xml(
+            &["ETag", "Checksum", "StorageClass", "ObjectSize"],
+            "\"abc123\"",
+            1024,
+            &[("x-amz-checksum-sha256", "base64hash==")],
+        );
+        assert!(xml.contains("<GetObjectAttributesResponse>"));
+        assert!(xml.contains("<ETag>abc123</ETag>"));
+        assert!(xml.contains("<StorageClass>STANDARD</StorageClass>"));
+        assert!(xml.contains("<ObjectSize>1024</ObjectSize>"));
+        assert!(xml.contains("<Checksum><ChecksumSHA256>base64hash==</ChecksumSHA256></Checksum>"));
+        assert!(xml.contains("</GetObjectAttributesResponse>"));
+    }
+
+    #[test]
+    fn get_object_attributes_etag_only() {
+        let xml = get_object_attributes_xml(&["ETag"], "\"abcdef\"", 0, &[]);
+        assert!(xml.contains("<ETag>abcdef</ETag>"));
+        assert!(!xml.contains("<StorageClass>"));
+        assert!(!xml.contains("<ObjectSize>"));
+        assert!(!xml.contains("<Checksum>"));
+    }
+
+    #[test]
+    fn get_object_attributes_size_only() {
+        let xml = get_object_attributes_xml(&["ObjectSize"], "\"x\"", 42, &[]);
+        assert!(xml.contains("<ObjectSize>42</ObjectSize>"));
+        assert!(!xml.contains("<ETag>"));
+    }
+
+    #[test]
+    fn get_object_attributes_no_checksum_entries() {
+        let xml = get_object_attributes_xml(&["Checksum"], "\"x\"", 0, &[]);
+        // Checksum element should be omitted when there are no checksum entries
+        assert!(!xml.contains("<Checksum>"));
+    }
+
+    #[test]
+    fn get_object_attributes_multiple_checksums() {
+        let xml = get_object_attributes_xml(
+            &["Checksum"],
+            "\"x\"",
+            0,
+            &[
+                ("x-amz-checksum-crc32", "AAAAAA=="),
+                ("x-amz-checksum-sha256", "BBBBBB=="),
+            ],
+        );
+        assert!(xml.contains("<ChecksumCRC32>AAAAAA==</ChecksumCRC32>"));
+        assert!(xml.contains("<ChecksumSHA256>BBBBBB==</ChecksumSHA256>"));
+    }
+
+    #[test]
+    fn get_object_attributes_object_parts_omitted() {
+        let xml = get_object_attributes_xml(&["ObjectParts"], "\"x\"", 0, &[]);
+        // ObjectParts should be omitted for non-multipart objects
+        assert!(!xml.contains("<ObjectParts>"));
+    }
+
+    #[test]
+    fn valid_object_attributes() {
+        assert!(is_valid_object_attribute("ETag"));
+        assert!(is_valid_object_attribute("Checksum"));
+        assert!(is_valid_object_attribute("ObjectParts"));
+        assert!(is_valid_object_attribute("StorageClass"));
+        assert!(is_valid_object_attribute("ObjectSize"));
+        assert!(!is_valid_object_attribute("etag"));
+        assert!(!is_valid_object_attribute("Size"));
+        assert!(!is_valid_object_attribute(""));
     }
 }

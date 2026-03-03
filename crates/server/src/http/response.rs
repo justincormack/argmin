@@ -481,6 +481,17 @@ impl S3Response {
         Self::new(204)
     }
 
+    /// Build a response for GetObjectAttributes (200 OK, XML body).
+    pub fn get_object_attributes(body_xml: &str, last_modified: u64, version_id: u64) -> Self {
+        let mut resp = Self::new(200)
+            .xml_body(body_xml.to_string())
+            .header("Last-Modified", &format_http_date(last_modified));
+        if version_id != 0 {
+            resp = resp.header("x-amz-version-id", &format_version_id(version_id));
+        }
+        resp
+    }
+
     /// Build a response for PutBucketAcl (200 OK, no body).
     pub fn put_bucket_acl() -> Self {
         Self::new(200)

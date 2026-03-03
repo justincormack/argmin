@@ -35,6 +35,7 @@ pub enum S3Operation {
     PutBucketOwnershipControls { bucket: String },
     GetBucketOwnershipControls { bucket: String },
     DeleteBucketOwnershipControls { bucket: String },
+    GetObjectAttributes { bucket: String, key: String },
     OptionsRequest { bucket: String, key: Option<String> },
 }
 
@@ -308,6 +309,14 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
         }
         ("DELETE", Some(key)) if has_query_key(query, "tagging") => {
             Ok(S3Operation::DeleteObjectTagging {
+                bucket: bucket.to_string(),
+                key,
+            })
+        }
+
+        // GetObjectAttributes (must appear before catch-all GET)
+        ("GET", Some(key)) if has_query_key(query, "attributes") => {
+            Ok(S3Operation::GetObjectAttributes {
                 bucket: bucket.to_string(),
                 key,
             })
@@ -789,6 +798,39 @@ mod tests {
             route("DELETE", "/mybucket", "ownershipControls").unwrap(),
             S3Operation::DeleteBucketOwnershipControls {
                 bucket: "mybucket".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn get_object_attributes() {
+        assert_eq!(
+            route("GET", "/mybucket/mykey", "attributes").unwrap(),
+            S3Operation::GetObjectAttributes {
+                bucket: "mybucket".to_string(),
+                key: "mykey".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn get_object_attributes_with_version() {
+        assert_eq!(
+            route("GET", "/mybucket/mykey", "attributes&versionId=123").unwrap(),
+            S3Operation::GetObjectAttributes {
+                bucket: "mybucket".to_string(),
+                key: "mykey".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn get_object_without_attributes_is_get_object() {
+        assert_eq!(
+            route("GET", "/mybucket/mykey", "").unwrap(),
+            S3Operation::GetObject {
+                bucket: "mybucket".to_string(),
+                key: "mykey".to_string()
             }
         );
     }
