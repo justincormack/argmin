@@ -409,6 +409,23 @@ Acceptance:
    - list uploads pagination
    - manifest insert/read/delete
 
+### Step 3b: PgStore multipart metadata hardening
+
+Files:
+
+- `crates/storage/src/pg_store.rs`
+- `crates/storage/src/tests/metadata_tests.rs`
+
+Tasks:
+
+1. Add deterministic rollback handling tests around transaction failures (including commit failure paths).
+2. Add concurrency stress tests for multipart metadata operations.
+
+Acceptance:
+
+1. Deterministic commit-failure rollback leaves connection usable and state consistent.
+2. Concurrent upserts/state transitions preserve invariants and explicit error mapping.
+
 ### Step 4: Coordinator data-layout plumbing
 
 Files:
