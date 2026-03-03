@@ -152,6 +152,8 @@ pub struct BucketInfo {
     pub tags: Option<String>,
     /// Serialized public access block configuration XML (None = no config).
     pub public_access_block: Option<String>,
+    /// Ownership controls value (None = not set).
+    pub ownership_controls: Option<String>,
 }
 
 /// Request to store object metadata.

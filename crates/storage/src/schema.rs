@@ -50,7 +50,8 @@ CREATE TABLE IF NOT EXISTS buckets (
     public_read      INTEGER NOT NULL DEFAULT 0,
     cors_config      TEXT,
     tags             TEXT,
-    public_access_block TEXT
+    public_access_block TEXT,
+    ownership_controls TEXT
 )";
 
 /// SQLite pragmas for per-PG databases: WAL mode, NORMAL synchronous.

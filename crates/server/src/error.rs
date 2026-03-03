@@ -74,6 +74,15 @@ pub enum ServerError {
     #[error("no public access block configuration: {bucket}")]
     NoSuchPublicAccessBlockConfiguration { bucket: String },
 
+    #[error("ownership controls not found: {bucket}")]
+    OwnershipControlsNotFound { bucket: String },
+
+    #[error("ACL not supported with BucketOwnerEnforced")]
+    AccessControlListNotSupported,
+
+    #[error("invalid bucket ACL with object ownership")]
+    InvalidBucketAclWithObjectOwnership,
+
     #[error("access denied")]
     AccessDenied,
 
@@ -120,6 +129,9 @@ impl ServerError {
             Self::NoSuchPublicAccessBlockConfiguration { .. } => {
                 "NoSuchPublicAccessBlockConfiguration"
             }
+            Self::OwnershipControlsNotFound { .. } => "OwnershipControlsNotFoundError",
+            Self::AccessControlListNotSupported => "AccessControlListNotSupported",
+            Self::InvalidBucketAclWithObjectOwnership => "InvalidBucketAclWithObjectOwnership",
             Self::AccessDenied => "AccessDenied",
             Self::NotImplemented { .. } => "NotImplemented",
             Self::IntegrityError { .. } => "InternalError",
@@ -145,7 +157,9 @@ impl ServerError {
             Self::NoSuchCorsConfiguration { .. } => 404,
             Self::NoSuchTagSet { .. } => 404,
             Self::NoSuchPublicAccessBlockConfiguration { .. } => 404,
+            Self::OwnershipControlsNotFound { .. } => 404,
             Self::InvalidTag { .. } => 400,
+            Self::AccessControlListNotSupported | Self::InvalidBucketAclWithObjectOwnership => 400,
             Self::AccessDenied => 403,
             Self::NotImplemented { .. } => 501,
             Self::ObjectTooLarge { .. } => 400,

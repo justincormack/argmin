@@ -327,12 +327,6 @@ fn test_bucket_create_exists_nonowner() {
 }
 
 #[test]
-#[ignore = "not implemented: bucket ownership controls"]
-fn test_bucket_create_delete_bucket_ownership() {
-    s3_tests::run(async {});
-}
-
-#[test]
 #[ignore = "not implemented: ACL grants"]
 fn test_bucket_header_acl_grants() {
     s3_tests::run(async {});

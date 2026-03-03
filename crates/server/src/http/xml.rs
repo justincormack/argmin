@@ -1099,6 +1099,48 @@ pub fn get_public_access_block_xml(config: &PublicAccessBlockConfig) -> String {
     )
 }
 
+/// Parse an `<OwnershipControls>` XML request body.
+///
+/// Extracts the `ObjectOwnership` value from
+/// `<OwnershipControls><Rule><ObjectOwnership>VALUE</ObjectOwnership></Rule></OwnershipControls>`.
+/// Validates VALUE is one of `BucketOwnerEnforced`, `BucketOwnerPreferred`, or `ObjectWriter`.
+pub fn parse_ownership_controls_xml(data: &[u8]) -> Result<String, ServerError> {
+    let text = std::str::from_utf8(data).map_err(|_| ServerError::InvalidRequest {
+        reason: "invalid UTF-8 in ownership controls XML body".to_string(),
+    })?;
+    let inner = extract_tag_content(text, "OwnershipControls").ok_or_else(|| {
+        ServerError::InvalidRequest {
+            reason: "missing OwnershipControls element".to_string(),
+        }
+    })?;
+    let rule = extract_tag_content(inner, "Rule").ok_or_else(|| ServerError::InvalidRequest {
+        reason: "missing Rule element in OwnershipControls".to_string(),
+    })?;
+    let value = extract_tag_content(rule, "ObjectOwnership")
+        .ok_or_else(|| ServerError::InvalidRequest {
+            reason: "missing ObjectOwnership element in Rule".to_string(),
+        })?
+        .trim();
+
+    match value {
+        "BucketOwnerEnforced" | "BucketOwnerPreferred" | "ObjectWriter" => Ok(value.to_string()),
+        _ => Err(ServerError::InvalidArgument {
+            reason: format!("invalid ObjectOwnership value: {value}"),
+        }),
+    }
+}
+
+/// Serialize an `ObjectOwnership` value into S3 response XML.
+pub fn get_ownership_controls_xml(object_ownership: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <OwnershipControls xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <Rule><ObjectOwnership>{}</ObjectOwnership></Rule>\
+         </OwnershipControls>",
+        xml_escape(object_ownership),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1129,6 +1171,7 @@ mod tests {
             cors_config: None,
             tags: None,
             public_access_block: None,
+            ownership_controls: None,
         }];
         let xml = list_buckets_xml(&buckets, "owner");
         assert!(xml.contains("<Name>test-bucket</Name>"));
@@ -1987,5 +2030,52 @@ mod tests {
         let xml = get_public_access_block_xml(&config);
         let parsed = parse_public_access_block_xml(xml.as_bytes()).unwrap();
         assert_eq!(parsed, config);
+    }
+
+    // ── Ownership controls XML tests ────────────────────────────────
+
+    #[test]
+    fn ownership_controls_xml_round_trip_enforced() {
+        let xml = get_ownership_controls_xml("BucketOwnerEnforced");
+        let parsed = parse_ownership_controls_xml(xml.as_bytes()).unwrap();
+        assert_eq!(parsed, "BucketOwnerEnforced");
+    }
+
+    #[test]
+    fn ownership_controls_xml_round_trip_preferred() {
+        let xml = get_ownership_controls_xml("BucketOwnerPreferred");
+        let parsed = parse_ownership_controls_xml(xml.as_bytes()).unwrap();
+        assert_eq!(parsed, "BucketOwnerPreferred");
+    }
+
+    #[test]
+    fn ownership_controls_xml_round_trip_object_writer() {
+        let xml = get_ownership_controls_xml("ObjectWriter");
+        let parsed = parse_ownership_controls_xml(xml.as_bytes()).unwrap();
+        assert_eq!(parsed, "ObjectWriter");
+    }
+
+    #[test]
+    fn parse_ownership_controls_xml_invalid_value() {
+        let xml = b"<OwnershipControls><Rule><ObjectOwnership>Invalid</ObjectOwnership></Rule></OwnershipControls>";
+        assert!(parse_ownership_controls_xml(xml).is_err());
+    }
+
+    #[test]
+    fn parse_ownership_controls_xml_missing_rule() {
+        let xml = b"<OwnershipControls></OwnershipControls>";
+        assert!(parse_ownership_controls_xml(xml).is_err());
+    }
+
+    #[test]
+    fn parse_ownership_controls_xml_missing_root() {
+        let xml = b"<Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule>";
+        assert!(parse_ownership_controls_xml(xml).is_err());
+    }
+
+    #[test]
+    fn parse_ownership_controls_xml_invalid_utf8() {
+        let xml: &[u8] = &[0xFF, 0xFE];
+        assert!(parse_ownership_controls_xml(xml).is_err());
     }
 }

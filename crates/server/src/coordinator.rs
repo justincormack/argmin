@@ -441,6 +441,48 @@ impl Coordinator {
             })
     }
 
+    // ── Ownership controls ────────────────────────────────────────────
+
+    pub fn put_bucket_ownership_controls(
+        &self,
+        name: &str,
+        config: &str,
+    ) -> Result<(), ServerError> {
+        self.head_bucket(name)?;
+        self.bucket_db
+            .put_bucket_ownership_controls(name, config)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => {
+                    ServerError::BucketNotFound { name }
+                }
+                other => ServerError::Metadata(other),
+            })
+    }
+
+    pub fn get_bucket_ownership_controls(&self, name: &str) -> Result<Option<String>, ServerError> {
+        self.head_bucket(name)?;
+        self.bucket_db
+            .get_bucket_ownership_controls(name)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => {
+                    ServerError::BucketNotFound { name }
+                }
+                other => ServerError::Metadata(other),
+            })
+    }
+
+    pub fn delete_bucket_ownership_controls(&self, name: &str) -> Result<(), ServerError> {
+        self.head_bucket(name)?;
+        self.bucket_db
+            .delete_bucket_ownership_controls(name)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => {
+                    ServerError::BucketNotFound { name }
+                }
+                other => ServerError::Metadata(other),
+            })
+    }
+
     // ── Object tagging ──────────────────────────────────────────────
 
     pub fn put_object_tags(

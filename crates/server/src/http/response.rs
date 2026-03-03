@@ -466,6 +466,21 @@ impl S3Response {
         Self::new(204)
     }
 
+    /// Build a response for PutBucketOwnershipControls (200 OK, no body).
+    pub fn put_bucket_ownership_controls() -> Self {
+        Self::new(200)
+    }
+
+    /// Build a response for GetBucketOwnershipControls (200 OK, XML body).
+    pub fn get_bucket_ownership_controls(config_xml: &str) -> Self {
+        Self::new(200).xml_body(config_xml.to_string())
+    }
+
+    /// Build a response for DeleteBucketOwnershipControls (204 No Content).
+    pub fn delete_bucket_ownership_controls() -> Self {
+        Self::new(204)
+    }
+
     /// Build a response for PutBucketAcl (200 OK, no body).
     pub fn put_bucket_acl() -> Self {
         Self::new(200)
@@ -940,6 +955,7 @@ mod tests {
             cors_config: None,
             tags: None,
             public_access_block: None,
+            ownership_controls: None,
         };
         let resp = S3Response::head_bucket(&info);
         assert_eq!(resp.status_code, 200);
@@ -959,6 +975,7 @@ mod tests {
             cors_config: None,
             tags: None,
             public_access_block: None,
+            ownership_controls: None,
         }];
         let resp = S3Response::list_buckets(&buckets, "owner");
         assert_eq!(resp.status_code, 200);

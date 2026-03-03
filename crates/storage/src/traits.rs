@@ -168,6 +168,15 @@ pub trait GlobalService {
 
     /// Update a bucket's public_read ACL flag.
     fn put_bucket_acl(&self, name: &str, public_read: bool) -> Result<(), MetadataError>;
+
+    /// Store ownership controls for a bucket.
+    fn put_bucket_ownership_controls(&self, name: &str, config: &str) -> Result<(), MetadataError>;
+
+    /// Retrieve a bucket's ownership controls. Returns None if not set.
+    fn get_bucket_ownership_controls(&self, name: &str) -> Result<Option<String>, MetadataError>;
+
+    /// Delete a bucket's ownership controls. Idempotent.
+    fn delete_bucket_ownership_controls(&self, name: &str) -> Result<(), MetadataError>;
 }
 
 /// Multiplexes across PG stores on a single node.

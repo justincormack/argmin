@@ -122,7 +122,7 @@ impl GlobalService for SqliteBucketDb {
     fn head_bucket(&self, name: &str) -> Result<BucketInfo, MetadataError> {
         self.conn
             .query_row(
-                "SELECT name, owner_principal, created_at, region, versioning, public_read, cors_config, tags, public_access_block \
+                "SELECT name, owner_principal, created_at, region, versioning, public_read, cors_config, tags, public_access_block, ownership_controls \
                  FROM buckets WHERE name = ?1",
                 params![name],
                 |row| {
@@ -136,6 +136,7 @@ impl GlobalService for SqliteBucketDb {
                         cors_config: row.get(6)?,
                         tags: row.get(7)?,
                         public_access_block: row.get(8)?,
+                        ownership_controls: row.get(9)?,
                     })
                 },
             )
@@ -192,7 +193,7 @@ impl GlobalService for SqliteBucketDb {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT name, owner_principal, created_at, region, versioning, public_read, cors_config, tags, public_access_block \
+                "SELECT name, owner_principal, created_at, region, versioning, public_read, cors_config, tags, public_access_block, ownership_controls \
                  FROM buckets WHERE owner_principal = ?1 ORDER BY name ASC",
             )
             .map_err(|e| MetadataError::Db {
@@ -212,6 +213,7 @@ impl GlobalService for SqliteBucketDb {
                     cors_config: row.get(6)?,
                     tags: row.get(7)?,
                     public_access_block: row.get(8)?,
+                    ownership_controls: row.get(9)?,
                 })
             })
             .map_err(|e| MetadataError::Db {
@@ -408,6 +410,61 @@ impl GlobalService for SqliteBucketDb {
             )
             .map_err(|e| MetadataError::Db {
                 context: "put bucket acl",
+                source: e,
+            })?;
+        if updated == 0 {
+            return Err(MetadataError::BucketNotFound {
+                name: name.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn put_bucket_ownership_controls(&self, name: &str, config: &str) -> Result<(), MetadataError> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE buckets SET ownership_controls = ?1 WHERE name = ?2",
+                params![config, name],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "put bucket ownership controls",
+                source: e,
+            })?;
+        if updated == 0 {
+            return Err(MetadataError::BucketNotFound {
+                name: name.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn get_bucket_ownership_controls(&self, name: &str) -> Result<Option<String>, MetadataError> {
+        self.conn
+            .query_row(
+                "SELECT ownership_controls FROM buckets WHERE name = ?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| MetadataError::Db {
+                context: "get bucket ownership controls",
+                source: e,
+            })?
+            .ok_or(MetadataError::BucketNotFound {
+                name: name.to_string(),
+            })
+    }
+
+    fn delete_bucket_ownership_controls(&self, name: &str) -> Result<(), MetadataError> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE buckets SET ownership_controls = NULL WHERE name = ?1",
+                params![name],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "delete bucket ownership controls",
                 source: e,
             })?;
         if updated == 0 {

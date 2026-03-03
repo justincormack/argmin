@@ -220,8 +220,33 @@ impl HttpFrontend {
                         });
                     }
                 };
+                // Validate x-amz-object-ownership header before creating bucket
+                let ownership_xml = if let Some(ownership) = req.header("x-amz-object-ownership") {
+                    match ownership {
+                        "BucketOwnerEnforced" | "BucketOwnerPreferred" | "ObjectWriter" => {
+                            // BucketOwnerEnforced conflicts with public ACLs
+                            if ownership == "BucketOwnerEnforced" && public_read {
+                                return Err(ServerError::InvalidBucketAclWithObjectOwnership);
+                            }
+                            Some(xml::get_ownership_controls_xml(ownership))
+                        }
+                        _ => {
+                            return Err(ServerError::InvalidArgument {
+                                reason: format!(
+                                    "invalid x-amz-object-ownership value: {ownership}"
+                                ),
+                            });
+                        }
+                    }
+                } else {
+                    None
+                };
                 self.coordinator
                     .create_bucket_for_owner(owner_principal, &bucket, public_read)?;
+                if let Some(config_xml) = ownership_xml {
+                    self.coordinator
+                        .put_bucket_ownership_controls(&bucket, &config_xml)?;
+                }
                 Ok(S3Response::create_bucket(&bucket))
             }
             S3Operation::DeleteBucket { bucket } => {
@@ -324,6 +349,20 @@ impl HttpFrontend {
                     };
                     self.authorize_bucket_write(auth, &bucket)?;
                     self.authorize_bucket_read(auth, &src_bucket)?;
+                    // Enforce BucketOwnerEnforced on CopyObject with x-amz-acl
+                    if let Some(acl_value) = req.header("x-amz-acl") {
+                        if let Some(ref oc_xml) =
+                            self.coordinator.get_bucket_ownership_controls(&bucket)?
+                        {
+                            if let Ok(val) = xml::parse_ownership_controls_xml(oc_xml.as_bytes()) {
+                                if val == "BucketOwnerEnforced"
+                                    && acl_value != "bucket-owner-full-control"
+                                {
+                                    return Err(ServerError::AccessControlListNotSupported);
+                                }
+                            }
+                        }
+                    }
                     let src_cond = copy_source_condition_from_headers(req);
                     let dst_cond = write_condition_from_headers(req);
                     let directive = match req.header("x-amz-metadata-directive") {
@@ -394,6 +433,20 @@ impl HttpFrontend {
                 } else {
                     // Normal PutObject path
                     self.authorize_bucket_write(auth, &bucket)?;
+                    // Enforce BucketOwnerEnforced: reject x-amz-acl unless bucket-owner-full-control
+                    if let Some(acl_value) = req.header("x-amz-acl") {
+                        if let Some(ref oc_xml) =
+                            self.coordinator.get_bucket_ownership_controls(&bucket)?
+                        {
+                            if let Ok(val) = xml::parse_ownership_controls_xml(oc_xml.as_bytes()) {
+                                if val == "BucketOwnerEnforced"
+                                    && acl_value != "bucket-owner-full-control"
+                                {
+                                    return Err(ServerError::AccessControlListNotSupported);
+                                }
+                            }
+                        }
+                    }
                     validate_checksum_headers(req)?;
                     // Parse inline tags before writing so invalid tags don't leave orphan objects
                     let inline_tags_xml = if let Some(tagging_header) = req.header("x-amz-tagging")
@@ -615,14 +668,62 @@ impl HttpFrontend {
                     .delete_bucket_public_access_block(&bucket)?;
                 Ok(S3Response::delete_bucket_public_access_block())
             }
+            S3Operation::PutBucketOwnershipControls { bucket } => {
+                self.authorize_bucket_write(auth, &bucket)?;
+                let value = xml::parse_ownership_controls_xml(&req.body)?;
+                if value == "BucketOwnerEnforced" {
+                    let info = self.coordinator.head_bucket(&bucket)?;
+                    if info.public_read {
+                        return Err(ServerError::InvalidBucketAclWithObjectOwnership);
+                    }
+                }
+                let config_xml = xml::get_ownership_controls_xml(&value);
+                self.coordinator
+                    .put_bucket_ownership_controls(&bucket, &config_xml)?;
+                Ok(S3Response::put_bucket_ownership_controls())
+            }
+            S3Operation::GetBucketOwnershipControls { bucket } => {
+                self.authorize_bucket_write(auth, &bucket)?;
+                match self.coordinator.get_bucket_ownership_controls(&bucket)? {
+                    Some(config_xml) => Ok(S3Response::get_bucket_ownership_controls(&config_xml)),
+                    None => Err(ServerError::OwnershipControlsNotFound {
+                        bucket: bucket.clone(),
+                    }),
+                }
+            }
+            S3Operation::DeleteBucketOwnershipControls { bucket } => {
+                self.authorize_bucket_write(auth, &bucket)?;
+                self.coordinator.delete_bucket_ownership_controls(&bucket)?;
+                Ok(S3Response::delete_bucket_ownership_controls())
+            }
             S3Operation::PutBucketAcl { bucket } => {
                 self.authorize_bucket_write(auth, &bucket)?;
                 let acl = parse_bucket_acl(req)?;
                 match acl {
                     BucketAcl::Private => {
+                        // Enforce BucketOwnerEnforced — no ACL ops allowed
+                        if let Some(ref oc_xml) =
+                            self.coordinator.get_bucket_ownership_controls(&bucket)?
+                        {
+                            if let Ok(val) = xml::parse_ownership_controls_xml(oc_xml.as_bytes()) {
+                                if val == "BucketOwnerEnforced" {
+                                    return Err(ServerError::AccessControlListNotSupported);
+                                }
+                            }
+                        }
                         self.coordinator.put_bucket_acl(&bucket, false)?;
                     }
                     BucketAcl::PublicRead => {
+                        // Enforce BucketOwnerEnforced
+                        if let Some(ref oc_xml) =
+                            self.coordinator.get_bucket_ownership_controls(&bucket)?
+                        {
+                            if let Ok(val) = xml::parse_ownership_controls_xml(oc_xml.as_bytes()) {
+                                if val == "BucketOwnerEnforced" {
+                                    return Err(ServerError::AccessControlListNotSupported);
+                                }
+                            }
+                        }
                         // Enforce BlockPublicAcls
                         if let Some(pab_xml) =
                             self.coordinator.get_bucket_public_access_block(&bucket)?
@@ -635,6 +736,16 @@ impl HttpFrontend {
                         self.coordinator.put_bucket_acl(&bucket, true)?;
                     }
                     BucketAcl::UnsupportedPublic => {
+                        // Enforce BucketOwnerEnforced
+                        if let Some(ref oc_xml) =
+                            self.coordinator.get_bucket_ownership_controls(&bucket)?
+                        {
+                            if let Ok(val) = xml::parse_ownership_controls_xml(oc_xml.as_bytes()) {
+                                if val == "BucketOwnerEnforced" {
+                                    return Err(ServerError::AccessControlListNotSupported);
+                                }
+                            }
+                        }
                         // Check BlockPublicAcls first — return 403 if set
                         if let Some(pab_xml) =
                             self.coordinator.get_bucket_public_access_block(&bucket)?

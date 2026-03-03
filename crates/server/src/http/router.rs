@@ -32,6 +32,9 @@ pub enum S3Operation {
     GetBucketPublicAccessBlock { bucket: String },
     DeleteBucketPublicAccessBlock { bucket: String },
     PutBucketAcl { bucket: String },
+    PutBucketOwnershipControls { bucket: String },
+    GetBucketOwnershipControls { bucket: String },
+    DeleteBucketOwnershipControls { bucket: String },
     OptionsRequest { bucket: String, key: Option<String> },
 }
 
@@ -192,6 +195,11 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
         ("PUT", None) if has_query_key(query, "acl") => Ok(S3Operation::PutBucketAcl {
             bucket: bucket.to_string(),
         }),
+        ("PUT", None) if has_query_key(query, "ownershipControls") => {
+            Ok(S3Operation::PutBucketOwnershipControls {
+                bucket: bucket.to_string(),
+            })
+        }
         ("PUT", None) => Ok(S3Operation::CreateBucket {
             bucket: bucket.to_string(),
         }),
@@ -200,6 +208,11 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
         }),
         ("DELETE", None) if has_query_key(query, "publicAccessBlock") => {
             Ok(S3Operation::DeleteBucketPublicAccessBlock {
+                bucket: bucket.to_string(),
+            })
+        }
+        ("DELETE", None) if has_query_key(query, "ownershipControls") => {
+            Ok(S3Operation::DeleteBucketOwnershipControls {
                 bucket: bucket.to_string(),
             })
         }
@@ -215,6 +228,12 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
             bucket: bucket.to_string(),
         }),
         ("GET", None) => {
+            // Check for ?ownershipControls → GetBucketOwnershipControls
+            if has_query_key(query, "ownershipControls") {
+                return Ok(S3Operation::GetBucketOwnershipControls {
+                    bucket: bucket.to_string(),
+                });
+            }
             // Check for ?publicAccessBlock → GetBucketPublicAccessBlock
             if has_query_key(query, "publicAccessBlock") {
                 return Ok(S3Operation::GetBucketPublicAccessBlock {
@@ -739,6 +758,36 @@ mod tests {
         assert_eq!(
             route("PUT", "/mybucket", "acl").unwrap(),
             S3Operation::PutBucketAcl {
+                bucket: "mybucket".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn put_bucket_ownership_controls() {
+        assert_eq!(
+            route("PUT", "/mybucket", "ownershipControls").unwrap(),
+            S3Operation::PutBucketOwnershipControls {
+                bucket: "mybucket".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn get_bucket_ownership_controls() {
+        assert_eq!(
+            route("GET", "/mybucket", "ownershipControls").unwrap(),
+            S3Operation::GetBucketOwnershipControls {
+                bucket: "mybucket".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn delete_bucket_ownership_controls() {
+        assert_eq!(
+            route("DELETE", "/mybucket", "ownershipControls").unwrap(),
+            S3Operation::DeleteBucketOwnershipControls {
                 bucket: "mybucket".to_string()
             }
         );
