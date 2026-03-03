@@ -102,6 +102,39 @@ impl PgStore {
             .unwrap_or_default()
             .as_millis() as u64
     }
+
+    /// Map a row with columns (bucket, key, version_id, size, total_size, etag,
+    /// etag_kind, last_modified, storage_class, ec_k, ec_m, status, tags,
+    /// data_layout, parts_count, metadata_blob) to an ObjectRecord.
+    fn row_to_object_record(row: &rusqlite::Row<'_>) -> Result<ObjectRecord, rusqlite::Error> {
+        Ok(ObjectRecord {
+            bucket: row.get(0)?,
+            key: row.get(1)?,
+            version_id: row.get::<_, i64>(2)? as u64,
+            size: row.get::<_, i64>(3)? as u64,
+            total_size: row.get::<_, i64>(4)? as u64,
+            etag: row.get(5)?,
+            etag_kind: row.get::<_, u8>(6)?,
+            last_modified: row.get::<_, i64>(7)? as u64,
+            storage_class: row.get::<_, u8>(8)?,
+            ec_k: row.get::<_, u8>(9)?,
+            ec_m: row.get::<_, u8>(10)?,
+            status: row.get::<_, u8>(11)?,
+            tags: row.get(12)?,
+            data_layout: {
+                let raw = row.get::<_, u8>(13)?;
+                DataLayout::from_u8(raw).ok_or_else(|| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        13,
+                        rusqlite::types::Type::Integer,
+                        Box::from(format!("invalid data_layout: {raw}")),
+                    )
+                })?
+            },
+            parts_count: row.get::<_, Option<i64>>(14)?.map(|v| v as u32),
+            metadata_blob: row.get(15)?,
+        })
+    }
 }
 
 impl ShardStore for PgStore {
@@ -391,27 +424,12 @@ impl PgMetadataStore for PgStore {
         self.conn
             .query_row(
                 "SELECT bucket, key, version_id, size, total_size, etag, etag_kind, \
-                 last_modified, storage_class, ec_k, ec_m, status, tags \
+                 last_modified, storage_class, ec_k, ec_m, status, tags, \
+                 data_layout, parts_count, metadata_blob \
                  FROM objects WHERE bucket = ?1 AND key = ?2 \
                  ORDER BY last_modified DESC, version_id DESC LIMIT 1",
                 params![bucket, key],
-                |row| {
-                    Ok(ObjectRecord {
-                        bucket: row.get(0)?,
-                        key: row.get(1)?,
-                        version_id: row.get::<_, i64>(2)? as u64,
-                        size: row.get::<_, i64>(3)? as u64,
-                        total_size: row.get::<_, i64>(4)? as u64,
-                        etag: row.get(5)?,
-                        etag_kind: row.get::<_, u8>(6)?,
-                        last_modified: row.get::<_, i64>(7)? as u64,
-                        storage_class: row.get::<_, u8>(8)?,
-                        ec_k: row.get::<_, u8>(9)?,
-                        ec_m: row.get::<_, u8>(10)?,
-                        status: row.get::<_, u8>(11)?,
-                        tags: row.get(12)?,
-                    })
-                },
+                Self::row_to_object_record,
             )
             .optional()
             .map_err(|e| MetadataError::Db {
@@ -430,26 +448,11 @@ impl PgMetadataStore for PgStore {
         self.conn
             .query_row(
                 "SELECT bucket, key, version_id, size, total_size, etag, etag_kind, \
-                 last_modified, storage_class, ec_k, ec_m, status, tags \
+                 last_modified, storage_class, ec_k, ec_m, status, tags, \
+                 data_layout, parts_count, metadata_blob \
                  FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
                 params![bucket, key, version_id as i64],
-                |row| {
-                    Ok(ObjectRecord {
-                        bucket: row.get(0)?,
-                        key: row.get(1)?,
-                        version_id: row.get::<_, i64>(2)? as u64,
-                        size: row.get::<_, i64>(3)? as u64,
-                        total_size: row.get::<_, i64>(4)? as u64,
-                        etag: row.get(5)?,
-                        etag_kind: row.get::<_, u8>(6)?,
-                        last_modified: row.get::<_, i64>(7)? as u64,
-                        storage_class: row.get::<_, u8>(8)?,
-                        ec_k: row.get::<_, u8>(9)?,
-                        ec_m: row.get::<_, u8>(10)?,
-                        status: row.get::<_, u8>(11)?,
-                        tags: row.get(12)?,
-                    })
-                },
+                Self::row_to_object_record,
             )
             .optional()
             .map_err(|e| MetadataError::Db {
@@ -529,7 +532,8 @@ impl PgMetadataStore for PgStore {
                 GROUP BY bucket, key \
             ) \
             SELECT o.bucket, o.key, o.version_id, o.size, o.total_size, o.etag, o.etag_kind, \
-                   o.last_modified, o.storage_class, o.ec_k, o.ec_m, o.status, o.tags \
+                   o.last_modified, o.storage_class, o.ec_k, o.ec_m, o.status, o.tags, \
+                   o.data_layout, o.parts_count, o.metadata_blob \
             FROM objects o \
             INNER JOIN latest l ON o.bucket = l.bucket AND o.key = l.key AND o.version_id = l.max_vid \
             WHERE {where_str} AND o.status = 0 \
@@ -545,23 +549,7 @@ impl PgMetadataStore for PgStore {
         })?;
 
         let rows = stmt
-            .query_map(params_refs.as_slice(), |row| {
-                Ok(ObjectRecord {
-                    bucket: row.get(0)?,
-                    key: row.get(1)?,
-                    version_id: row.get::<_, i64>(2)? as u64,
-                    size: row.get::<_, i64>(3)? as u64,
-                    total_size: row.get::<_, i64>(4)? as u64,
-                    etag: row.get(5)?,
-                    etag_kind: row.get::<_, u8>(6)?,
-                    last_modified: row.get::<_, i64>(7)? as u64,
-                    storage_class: row.get::<_, u8>(8)?,
-                    ec_k: row.get::<_, u8>(9)?,
-                    ec_m: row.get::<_, u8>(10)?,
-                    status: row.get::<_, u8>(11)?,
-                    tags: row.get(12)?,
-                })
-            })
+            .query_map(params_refs.as_slice(), Self::row_to_object_record)
             .map_err(|e| MetadataError::Db {
                 context: "list objects query",
                 source: e,
@@ -639,7 +627,8 @@ impl PgMetadataStore for PgStore {
 
         let sql = format!(
             "SELECT bucket, key, version_id, size, total_size, etag, etag_kind, \
-             last_modified, storage_class, ec_k, ec_m, status, tags \
+             last_modified, storage_class, ec_k, ec_m, status, tags, \
+             data_layout, parts_count, metadata_blob \
              FROM objects \
              WHERE {where_str} \
              ORDER BY key ASC, version_id DESC LIMIT ?{param_idx}"
@@ -654,23 +643,7 @@ impl PgMetadataStore for PgStore {
         })?;
 
         let rows = stmt
-            .query_map(params_refs.as_slice(), |row| {
-                Ok(ObjectRecord {
-                    bucket: row.get(0)?,
-                    key: row.get(1)?,
-                    version_id: row.get::<_, i64>(2)? as u64,
-                    size: row.get::<_, i64>(3)? as u64,
-                    total_size: row.get::<_, i64>(4)? as u64,
-                    etag: row.get(5)?,
-                    etag_kind: row.get::<_, u8>(6)?,
-                    last_modified: row.get::<_, i64>(7)? as u64,
-                    storage_class: row.get::<_, u8>(8)?,
-                    ec_k: row.get::<_, u8>(9)?,
-                    ec_m: row.get::<_, u8>(10)?,
-                    status: row.get::<_, u8>(11)?,
-                    tags: row.get(12)?,
-                })
-            })
+            .query_map(params_refs.as_slice(), Self::row_to_object_record)
             .map_err(|e| MetadataError::Db {
                 context: "list object versions query",
                 source: e,
@@ -787,6 +760,104 @@ impl PgMetadataStore for PgStore {
             return Err(MetadataError::ObjectNotFound);
         }
         Ok(())
+    }
+
+    // ── Multipart upload methods (stubs — implemented in Step 3) ──
+
+    fn create_multipart_upload(
+        &self,
+        _req: &CreateMultipartUploadReq,
+    ) -> Result<(), MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "multipart metadata (pending Step 3)",
+        })
+    }
+
+    fn get_multipart_upload(
+        &self,
+        _upload_id: &str,
+    ) -> Result<MultipartUploadRecord, MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "multipart metadata (pending Step 3)",
+        })
+    }
+
+    fn set_upload_state(
+        &self,
+        _upload_id: &str,
+        _new_state: UploadState,
+    ) -> Result<(), MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "multipart metadata (pending Step 3)",
+        })
+    }
+
+    fn delete_multipart_upload(&self, _upload_id: &str) -> Result<(), MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "multipart metadata (pending Step 3)",
+        })
+    }
+
+    fn list_multipart_uploads(
+        &self,
+        _req: &ListMultipartUploadsReq,
+    ) -> Result<ListMultipartUploadsResp, MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "multipart metadata (pending Step 3)",
+        })
+    }
+
+    fn upsert_multipart_part(
+        &self,
+        _part: &MultipartPartRecord,
+    ) -> Result<Option<u32>, MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "multipart metadata (pending Step 3)",
+        })
+    }
+
+    fn get_multipart_part(
+        &self,
+        _upload_id: &str,
+        _part_number: u32,
+    ) -> Result<MultipartPartRecord, MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "multipart metadata (pending Step 3)",
+        })
+    }
+
+    fn list_multipart_parts(&self, _req: &ListPartsReq) -> Result<ListPartsResp, MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "multipart metadata (pending Step 3)",
+        })
+    }
+
+    fn commit_object_parts(&self, _parts: &[ObjectPartRecord]) -> Result<(), MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "multipart metadata (pending Step 3)",
+        })
+    }
+
+    fn get_object_parts(
+        &self,
+        _bucket: &str,
+        _key: &str,
+        _version_id: u64,
+    ) -> Result<Vec<ObjectPartRecord>, MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "multipart metadata (pending Step 3)",
+        })
+    }
+
+    fn delete_object_parts(
+        &self,
+        _bucket: &str,
+        _key: &str,
+        _version_id: u64,
+    ) -> Result<(), MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "multipart metadata (pending Step 3)",
+        })
     }
 }
 

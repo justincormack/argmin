@@ -159,6 +159,9 @@ impl PgMetadataStore for MemoryPgStore {
             ec_m: req.ec_m,
             status: req.status,
             tags: None,
+            data_layout: DataLayout::InlineLegacy,
+            parts_count: None,
+            metadata_blob: None,
         };
         self.objects.borrow_mut().insert(
             (req.bucket.clone(), req.key.clone(), req.version_id),
@@ -387,5 +390,103 @@ impl PgMetadataStore for MemoryPgStore {
             }
             None => Err(MetadataError::ObjectNotFound),
         }
+    }
+
+    // ── Multipart upload methods (stubs — implemented in Step 3) ──
+
+    fn create_multipart_upload(
+        &self,
+        _req: &CreateMultipartUploadReq,
+    ) -> Result<(), MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "multipart metadata (pending Step 3)",
+        })
+    }
+
+    fn get_multipart_upload(
+        &self,
+        _upload_id: &str,
+    ) -> Result<MultipartUploadRecord, MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "multipart metadata (pending Step 3)",
+        })
+    }
+
+    fn set_upload_state(
+        &self,
+        _upload_id: &str,
+        _new_state: UploadState,
+    ) -> Result<(), MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "multipart metadata (pending Step 3)",
+        })
+    }
+
+    fn delete_multipart_upload(&self, _upload_id: &str) -> Result<(), MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "multipart metadata (pending Step 3)",
+        })
+    }
+
+    fn list_multipart_uploads(
+        &self,
+        _req: &ListMultipartUploadsReq,
+    ) -> Result<ListMultipartUploadsResp, MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "multipart metadata (pending Step 3)",
+        })
+    }
+
+    fn upsert_multipart_part(
+        &self,
+        _part: &MultipartPartRecord,
+    ) -> Result<Option<u32>, MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "multipart metadata (pending Step 3)",
+        })
+    }
+
+    fn get_multipart_part(
+        &self,
+        _upload_id: &str,
+        _part_number: u32,
+    ) -> Result<MultipartPartRecord, MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "multipart metadata (pending Step 3)",
+        })
+    }
+
+    fn list_multipart_parts(&self, _req: &ListPartsReq) -> Result<ListPartsResp, MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "multipart metadata (pending Step 3)",
+        })
+    }
+
+    fn commit_object_parts(&self, _parts: &[ObjectPartRecord]) -> Result<(), MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "multipart metadata (pending Step 3)",
+        })
+    }
+
+    fn get_object_parts(
+        &self,
+        _bucket: &str,
+        _key: &str,
+        _version_id: u64,
+    ) -> Result<Vec<ObjectPartRecord>, MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "multipart metadata (pending Step 3)",
+        })
+    }
+
+    fn delete_object_parts(
+        &self,
+        _bucket: &str,
+        _key: &str,
+        _version_id: u64,
+    ) -> Result<(), MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "multipart metadata (pending Step 3)",
+        })
     }
 }

@@ -108,6 +108,68 @@ pub trait PgMetadataStore {
         key: &str,
         version_id: u64,
     ) -> Result<(), MetadataError>;
+
+    // ── Multipart upload methods ───────────────────────────────────
+
+    /// Create a new multipart upload record.
+    fn create_multipart_upload(&self, req: &CreateMultipartUploadReq) -> Result<(), MetadataError>;
+
+    /// Get an in-progress multipart upload record.
+    fn get_multipart_upload(&self, upload_id: &str)
+        -> Result<MultipartUploadRecord, MetadataError>;
+
+    /// Transition an upload's state. Only valid transitions from InProgress
+    /// are accepted; returns `UploadNotInProgress` otherwise.
+    fn set_upload_state(
+        &self,
+        upload_id: &str,
+        new_state: UploadState,
+    ) -> Result<(), MetadataError>;
+
+    /// Delete a multipart upload and its parts (CASCADE).
+    fn delete_multipart_upload(&self, upload_id: &str) -> Result<(), MetadataError>;
+
+    /// List multipart uploads for a bucket with pagination.
+    fn list_multipart_uploads(
+        &self,
+        req: &ListMultipartUploadsReq,
+    ) -> Result<ListMultipartUploadsResp, MetadataError>;
+
+    /// Upsert a part row for an in-progress upload. Returns the previous
+    /// generation if the part was overwritten.
+    fn upsert_multipart_part(
+        &self,
+        part: &MultipartPartRecord,
+    ) -> Result<Option<u32>, MetadataError>;
+
+    /// Get a specific part of an in-progress upload.
+    fn get_multipart_part(
+        &self,
+        upload_id: &str,
+        part_number: u32,
+    ) -> Result<MultipartPartRecord, MetadataError>;
+
+    /// List parts of an in-progress upload with pagination.
+    fn list_multipart_parts(&self, req: &ListPartsReq) -> Result<ListPartsResp, MetadataError>;
+
+    /// Commit manifest rows into `object_parts` for a completed multipart object.
+    fn commit_object_parts(&self, parts: &[ObjectPartRecord]) -> Result<(), MetadataError>;
+
+    /// Read committed manifest parts for a multipart object.
+    fn get_object_parts(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: u64,
+    ) -> Result<Vec<ObjectPartRecord>, MetadataError>;
+
+    /// Delete committed manifest parts for an object version.
+    fn delete_object_parts(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: u64,
+    ) -> Result<(), MetadataError>;
 }
 
 /// Global metadata service (bucket table).

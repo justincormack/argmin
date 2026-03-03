@@ -296,6 +296,77 @@ impl PgMetadataStore for FaultyPgStore {
     ) -> Result<(), MetadataError> {
         self.inner.delete_object_tags(bucket, key, version_id)
     }
+
+    fn create_multipart_upload(&self, req: &CreateMultipartUploadReq) -> Result<(), MetadataError> {
+        self.inner.create_multipart_upload(req)
+    }
+
+    fn get_multipart_upload(
+        &self,
+        upload_id: &str,
+    ) -> Result<MultipartUploadRecord, MetadataError> {
+        self.inner.get_multipart_upload(upload_id)
+    }
+
+    fn set_upload_state(
+        &self,
+        upload_id: &str,
+        new_state: UploadState,
+    ) -> Result<(), MetadataError> {
+        self.inner.set_upload_state(upload_id, new_state)
+    }
+
+    fn delete_multipart_upload(&self, upload_id: &str) -> Result<(), MetadataError> {
+        self.inner.delete_multipart_upload(upload_id)
+    }
+
+    fn list_multipart_uploads(
+        &self,
+        req: &ListMultipartUploadsReq,
+    ) -> Result<ListMultipartUploadsResp, MetadataError> {
+        self.inner.list_multipart_uploads(req)
+    }
+
+    fn upsert_multipart_part(
+        &self,
+        part: &MultipartPartRecord,
+    ) -> Result<Option<u32>, MetadataError> {
+        self.inner.upsert_multipart_part(part)
+    }
+
+    fn get_multipart_part(
+        &self,
+        upload_id: &str,
+        part_number: u32,
+    ) -> Result<MultipartPartRecord, MetadataError> {
+        self.inner.get_multipart_part(upload_id, part_number)
+    }
+
+    fn list_multipart_parts(&self, req: &ListPartsReq) -> Result<ListPartsResp, MetadataError> {
+        self.inner.list_multipart_parts(req)
+    }
+
+    fn commit_object_parts(&self, parts: &[ObjectPartRecord]) -> Result<(), MetadataError> {
+        self.inner.commit_object_parts(parts)
+    }
+
+    fn get_object_parts(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: u64,
+    ) -> Result<Vec<ObjectPartRecord>, MetadataError> {
+        self.inner.get_object_parts(bucket, key, version_id)
+    }
+
+    fn delete_object_parts(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: u64,
+    ) -> Result<(), MetadataError> {
+        self.inner.delete_object_parts(bucket, key, version_id)
+    }
 }
 
 #[cfg(test)]

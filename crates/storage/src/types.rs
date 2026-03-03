@@ -111,6 +111,26 @@ impl ShardStatus {
     }
 }
 
+/// Object data layout discriminator.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataLayout {
+    /// Single contiguous payload (current model).
+    InlineLegacy = 0,
+    /// Composite manifest of independent parts.
+    MultipartManifest = 1,
+}
+
+impl DataLayout {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::InlineLegacy),
+            1 => Some(Self::MultipartManifest),
+            _ => None,
+        }
+    }
+}
+
 /// Object record stored in per-PG metadata.
 #[derive(Debug, Clone)]
 pub struct ObjectRecord {
@@ -133,6 +153,12 @@ pub struct ObjectRecord {
     pub status: u8,
     /// Serialized tagging XML (None = no tags).
     pub tags: Option<String>,
+    /// Object data layout (InlineLegacy or MultipartManifest).
+    pub data_layout: DataLayout,
+    /// Number of parts (set for MultipartManifest objects).
+    pub parts_count: Option<u32>,
+    /// Serialized user metadata headers (set for MultipartManifest objects).
+    pub metadata_blob: Option<Vec<u8>>,
 }
 
 /// Bucket metadata.
@@ -203,6 +229,117 @@ pub struct ListObjectVersionsResp {
     pub next_version_id_marker: Option<u64>,
 }
 
+// ── Multipart upload types ─────────────────────────────────────────
+
+/// Multipart upload state machine.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadState {
+    InProgress = 0,
+    Completing = 1,
+    Aborting = 2,
+}
+
+impl UploadState {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::InProgress),
+            1 => Some(Self::Completing),
+            2 => Some(Self::Aborting),
+            _ => None,
+        }
+    }
+}
+
+/// In-progress multipart upload record.
+#[derive(Debug, Clone)]
+pub struct MultipartUploadRecord {
+    pub upload_id: String,
+    pub bucket: String,
+    pub key: String,
+    /// Initiation timestamp (unix milliseconds).
+    pub initiated_at: u64,
+    pub state: UploadState,
+    /// Serialized user metadata headers.
+    pub metadata_blob: Vec<u8>,
+    pub owner_principal: Option<String>,
+}
+
+/// In-progress multipart part record.
+#[derive(Debug, Clone)]
+pub struct MultipartPartRecord {
+    pub upload_id: String,
+    pub part_number: u32,
+    pub generation: u32,
+    pub size: u64,
+    pub etag: Vec<u8>,
+    pub etag_kind: u8,
+    /// 16-byte object key hash for shard keys.
+    pub part_okh: [u8; 16],
+    /// Per-part shard key version field.
+    pub part_vid: u64,
+    pub ec_k: u8,
+    pub ec_m: u8,
+    /// Last modified timestamp (unix milliseconds).
+    pub last_modified: u64,
+}
+
+/// Committed part record in the object manifest.
+#[derive(Debug, Clone)]
+pub struct ObjectPartRecord {
+    pub bucket: String,
+    pub key: String,
+    pub version_id: u64,
+    pub part_number: u32,
+    pub size: u64,
+    pub etag: Vec<u8>,
+    pub etag_kind: u8,
+    pub part_okh: [u8; 16],
+    pub part_vid: u64,
+    pub ec_k: u8,
+    pub ec_m: u8,
+}
+
+/// Request to create a multipart upload.
+pub struct CreateMultipartUploadReq {
+    pub upload_id: String,
+    pub bucket: String,
+    pub key: String,
+    pub metadata_blob: Vec<u8>,
+    pub owner_principal: Option<String>,
+}
+
+/// Request to list multipart uploads.
+pub struct ListMultipartUploadsReq {
+    pub bucket: String,
+    pub prefix: Option<String>,
+    pub key_marker: Option<String>,
+    pub upload_id_marker: Option<String>,
+    pub max_uploads: u32,
+}
+
+/// Response from listing multipart uploads.
+pub struct ListMultipartUploadsResp {
+    pub uploads: Vec<MultipartUploadRecord>,
+    pub is_truncated: bool,
+    pub next_key_marker: Option<String>,
+    pub next_upload_id_marker: Option<String>,
+}
+
+/// Request to list parts of a multipart upload.
+pub struct ListPartsReq {
+    pub upload_id: String,
+    pub part_number_marker: Option<u32>,
+    pub max_parts: u32,
+}
+
+/// Response from listing parts of a multipart upload.
+pub struct ListPartsResp {
+    pub parts: Vec<MultipartPartRecord>,
+    pub is_truncated: bool,
+    pub next_part_number_marker: Option<u32>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,6 +364,39 @@ mod tests {
     fn shard_status_from_u8_invalid() {
         assert_eq!(ShardStatus::from_u8(3), None);
         assert_eq!(ShardStatus::from_u8(255), None);
+    }
+
+    // ── DataLayout enum tests ──────────────────────────────────────
+
+    #[test]
+    fn data_layout_from_u8_inline_legacy() {
+        assert_eq!(DataLayout::from_u8(0), Some(DataLayout::InlineLegacy));
+    }
+
+    #[test]
+    fn data_layout_from_u8_multipart_manifest() {
+        assert_eq!(DataLayout::from_u8(1), Some(DataLayout::MultipartManifest));
+    }
+
+    #[test]
+    fn data_layout_from_u8_invalid() {
+        assert_eq!(DataLayout::from_u8(2), None);
+        assert_eq!(DataLayout::from_u8(255), None);
+    }
+
+    // ── UploadState enum tests ─────────────────────────────────────
+
+    #[test]
+    fn upload_state_from_u8_valid() {
+        assert_eq!(UploadState::from_u8(0), Some(UploadState::InProgress));
+        assert_eq!(UploadState::from_u8(1), Some(UploadState::Completing));
+        assert_eq!(UploadState::from_u8(2), Some(UploadState::Aborting));
+    }
+
+    #[test]
+    fn upload_state_from_u8_invalid() {
+        assert_eq!(UploadState::from_u8(3), None);
+        assert_eq!(UploadState::from_u8(255), None);
     }
 
     #[test]

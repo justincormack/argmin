@@ -426,6 +426,69 @@ fn file_metadata_zero_size() {
     metadata_zero_size_object(&store);
 }
 
+// --- DataLayout decode tests ---
+
+#[test]
+fn file_metadata_object_has_inline_legacy_layout() {
+    let (_dir, store) = make_pg_store();
+    store
+        .put_object_meta(&PutObjectMetaReq {
+            bucket: "b".to_string(),
+            key: "k".to_string(),
+            version_id: 0,
+            status: 0,
+            size: 100,
+            total_size: 100,
+            etag: vec![1, 2, 3],
+            etag_kind: 0,
+            ec_k: 4,
+            ec_m: 2,
+        })
+        .unwrap();
+
+    let obj = store.get_object_meta("b", "k").unwrap();
+    assert_eq!(obj.data_layout, DataLayout::InlineLegacy);
+    assert_eq!(obj.parts_count, None);
+    assert_eq!(obj.metadata_blob, None);
+}
+
+#[test]
+fn file_metadata_invalid_data_layout_returns_error() {
+    let (_dir, store) = make_pg_store();
+
+    // Insert a valid object first
+    store
+        .put_object_meta(&PutObjectMetaReq {
+            bucket: "b".to_string(),
+            key: "k".to_string(),
+            version_id: 0,
+            status: 0,
+            size: 100,
+            total_size: 100,
+            etag: vec![1, 2, 3],
+            etag_kind: 0,
+            ec_k: 4,
+            ec_m: 2,
+        })
+        .unwrap();
+
+    // Corrupt the data_layout via raw SQL
+    store
+        .connection()
+        .execute(
+            "UPDATE objects SET data_layout = 99 WHERE bucket = 'b' AND key = 'k'",
+            [],
+        )
+        .unwrap();
+
+    // Reading should fail, not silently default to InlineLegacy
+    let err = store.get_object_meta("b", "k").unwrap_err();
+    assert!(
+        matches!(err, crate::error::MetadataError::Db { .. }),
+        "expected Db error for invalid data_layout, got: {err:?}"
+    );
+}
+
 // --- Property-based tests ---
 
 #[cfg(test)]

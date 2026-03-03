@@ -47,6 +47,15 @@ pub enum MetadataError {
     #[error("invalid versioning transition from {from} to {to}")]
     InvalidVersioningTransition { from: u8, to: u8 },
 
+    #[error("multipart upload not found")]
+    NoSuchUpload,
+
+    #[error("upload not in InProgress state (current: {state})")]
+    UploadNotInProgress { state: u8 },
+
+    #[error("not implemented: {context}")]
+    NotImplemented { context: &'static str },
+
     #[error("database error: {context}: {source}")]
     Db {
         context: &'static str,
