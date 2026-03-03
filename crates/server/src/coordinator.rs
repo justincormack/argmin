@@ -4,8 +4,8 @@ use std::sync::{Arc, MutexGuard};
 use ec::{EcConfig, ErasureCodec};
 use storage::traits::{GlobalService, PgMetadataStore, ShardStore};
 use storage::{
-    BucketInfo, ListObjectVersionsReq, ListObjectsReq, ObjectRecord, PutObjectMetaReq, ShardKey,
-    SharedStorageNode, SqliteBucketDb,
+    BucketInfo, DataLayout, ListObjectVersionsReq, ListObjectsReq, ObjectRecord, PutObjectMetaReq,
+    ShardKey, SharedStorageNode, SqliteBucketDb,
 };
 
 use crate::conditional::{
@@ -745,6 +745,8 @@ impl Coordinator {
             } = self.lock_object_pgs_for_read(src_bucket, src_key, src_version_id)?;
             let src_shard_pg = pgs.shard();
 
+            Self::require_inline_layout(&src_record)?;
+
             let src_etag_crc = etag_bytes_to_crc64(&src_record.etag).unwrap_or(0);
             let src_etag = format_etag(src_etag_crc);
             check_copy_source_conditions(src_cond, &src_etag, src_record.last_modified)?;
@@ -854,6 +856,19 @@ impl Coordinator {
             },
             other => ServerError::Metadata(other),
         })
+    }
+
+    /// Verify that the object uses InlineLegacy layout.
+    ///
+    /// Returns `NotImplemented` for MultipartManifest objects, which require
+    /// the multipart-aware read path (Step 9).
+    fn require_inline_layout(record: &ObjectRecord) -> Result<(), ServerError> {
+        if record.data_layout != DataLayout::InlineLegacy {
+            return Err(ServerError::NotImplemented {
+                feature: "multipart object reads".to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// Lock metadata and shard PGs for a consistent object read view.
@@ -1180,6 +1195,8 @@ impl Coordinator {
             });
         }
 
+        Self::require_inline_layout(&record)?;
+
         let okh = object_key_hash(bucket, key);
         let object_version_id = record.version_id;
         let etag_crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
@@ -1247,6 +1264,8 @@ impl Coordinator {
             });
         }
 
+        Self::require_inline_layout(&record)?;
+
         let okh = object_key_hash(bucket, key);
         let object_version_id = record.version_id;
         let etag_crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
@@ -1306,6 +1325,8 @@ impl Coordinator {
                 key: key.to_string(),
             });
         }
+
+        Self::require_inline_layout(&record)?;
 
         let okh = object_key_hash(bucket, key);
         let object_version_id = record.version_id;
@@ -1409,6 +1430,8 @@ impl Coordinator {
                 let meta_pg = pgs.meta();
                 let shard_pg = pgs.shard();
 
+                Self::require_inline_layout(&record)?;
+
                 // Check delete conditions
                 if !cond.is_empty() {
                     let etag_crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
@@ -1454,6 +1477,8 @@ impl Coordinator {
 
                 // Delete shards if it's a live object (not a delete marker)
                 if record.status == 0 {
+                    Self::require_inline_layout(&record)?;
+
                     let okh = object_key_hash(bucket, key);
                     let total = record.ec_k as usize + record.ec_m as usize;
 
