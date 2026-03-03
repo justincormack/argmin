@@ -156,11 +156,41 @@ pub struct DeleteObjectsResult {
     pub errors: Vec<DeleteError>,
 }
 
-type LockedReadPgs<'a> = (
-    ObjectRecord,
-    MutexGuard<'a, storage::PgStore>,
-    Option<MutexGuard<'a, storage::PgStore>>,
-);
+/// Ordered PG guard pair for object operations.
+///
+/// Constructed only by `lock_object_pgs_for_read` / `lock_object_pgs_for_write`.
+/// Object paths should not hand-roll multi-PG locking.
+struct TwoPgGuards<'a> {
+    meta: MutexGuard<'a, storage::PgStore>,
+    shard: Option<MutexGuard<'a, storage::PgStore>>,
+}
+
+impl<'a> TwoPgGuards<'a> {
+    fn new(
+        meta: MutexGuard<'a, storage::PgStore>,
+        shard: Option<MutexGuard<'a, storage::PgStore>>,
+    ) -> Self {
+        Self { meta, shard }
+    }
+
+    fn meta(&self) -> &storage::PgStore {
+        &self.meta
+    }
+
+    fn shard(&self) -> &storage::PgStore {
+        self.shard.as_deref().unwrap_or(&self.meta)
+    }
+}
+
+struct LockedReadObject<'a> {
+    record: ObjectRecord,
+    pgs: TwoPgGuards<'a>,
+}
+
+struct LockedWriteObject<'a> {
+    version_id: u64,
+    pgs: TwoPgGuards<'a>,
+}
 
 /// The coordinator ties together EC, storage, and metadata.
 pub struct Coordinator {
@@ -610,68 +640,41 @@ impl Coordinator {
         // 1. Verify bucket exists and get versioning state
         let bucket_info = self.head_bucket(bucket)?;
 
-        let meta_pg_id = derive_pg(bucket, key, self.pg_count);
         let metadata_blob = MetadataBlob::from_headers(headers)?;
+        let LockedWriteObject { version_id, pgs } =
+            self.lock_object_pgs_for_write(bucket, key, bucket_info.versioning)?;
+        let meta_pg = pgs.meta();
+        let shard_pg = pgs.shard();
 
-        // 2. Choose an initial version_id (revalidated under lock below).
-        let mut version_id = if bucket_info.versioning == 1 {
-            let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
-            meta_pg.next_version_id(bucket, key)?
-        } else {
-            0
-        };
-
-        loop {
-            // 3. Lock both PGs for this candidate version.
-            let shard_pg_id = derive_pg_shards(bucket, key, version_id, self.pg_count);
-            let (meta_guard, shard_guard) =
-                self.storage_node.lock_two_pgs(meta_pg_id, shard_pg_id)?;
-            let meta_pg: &storage::PgStore = &meta_guard;
-            let shard_pg: &storage::PgStore = match &shard_guard {
-                Some(g) => g,
-                None => meta_pg,
+        // 2. Check write conditions if any are set
+        if !cond.is_empty() {
+            let existing_etag = match meta_pg.get_object_meta(bucket, key) {
+                Ok(record) => {
+                    let crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
+                    Some(format_etag(crc))
+                }
+                Err(storage::MetadataError::ObjectNotFound) => None,
+                Err(e) => return Err(ServerError::Metadata(e)),
             };
-
-            // If versioning is enabled, ensure the chosen version is still current
-            // while holding the metadata PG lock. Retry if it changed.
-            if bucket_info.versioning == 1 {
-                let current = meta_pg.next_version_id(bucket, key)?;
-                if current != version_id {
-                    version_id = current;
-                    continue;
-                }
+            if cond.if_match.is_some() && existing_etag.is_none() {
+                return Err(ServerError::ObjectNotFound {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                });
             }
-
-            // 4. Check write conditions if any are set
-            if !cond.is_empty() {
-                let existing_etag = match meta_pg.get_object_meta(bucket, key) {
-                    Ok(record) => {
-                        let crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
-                        Some(format_etag(crc))
-                    }
-                    Err(storage::MetadataError::ObjectNotFound) => None,
-                    Err(e) => return Err(ServerError::Metadata(e)),
-                };
-                if cond.if_match.is_some() && existing_etag.is_none() {
-                    return Err(ServerError::ObjectNotFound {
-                        bucket: bucket.to_string(),
-                        key: key.to_string(),
-                    });
-                }
-                check_write_conditions(cond, existing_etag.as_deref())?;
-            }
-
-            // 5. Write object while holding both PG locks.
-            return self.write_object_inner(
-                bucket,
-                key,
-                &metadata_blob,
-                data,
-                version_id,
-                meta_pg,
-                shard_pg,
-            );
+            check_write_conditions(cond, existing_etag.as_deref())?;
         }
+
+        // 3. Write object while holding both PG locks.
+        self.write_object_inner(
+            bucket,
+            key,
+            &metadata_blob,
+            data,
+            version_id,
+            meta_pg,
+            shard_pg,
+        )
     }
 
     /// Copy an object from one location to another.
@@ -694,12 +697,11 @@ impl Coordinator {
     ) -> Result<CopyObjectResult, ServerError> {
         // Phase 1: Read source object
         let (src_metadata, user_data) = {
-            let (src_record, src_meta_guard, src_shard_guard) =
-                self.lock_object_pgs_for_read(src_bucket, src_key, src_version_id)?;
-            let src_shard_pg: &storage::PgStore = match &src_shard_guard {
-                Some(g) => g,
-                None => &src_meta_guard,
-            };
+            let LockedReadObject {
+                record: src_record,
+                pgs,
+            } = self.lock_object_pgs_for_read(src_bucket, src_key, src_version_id)?;
+            let src_shard_pg = pgs.shard();
 
             let src_etag_crc = etag_bytes_to_crc64(&src_record.etag).unwrap_or(0);
             let src_etag = format_etag(src_etag_crc);
@@ -750,71 +752,47 @@ impl Coordinator {
             MetadataDirective::Replace => MetadataBlob::from_headers(new_headers)?,
         };
 
-        let dst_meta_pg_id = derive_pg(dst_bucket, dst_key, self.pg_count);
-
         let dst_bucket_info = self.head_bucket(dst_bucket)?;
-        let mut dst_version_id = if dst_bucket_info.versioning == 1 {
-            let dst_meta_pg = self.storage_node.get_pg(dst_meta_pg_id)?;
-            dst_meta_pg.next_version_id(dst_bucket, dst_key)?
-        } else {
-            0
-        };
+        let LockedWriteObject {
+            version_id: dst_version_id,
+            pgs,
+        } = self.lock_object_pgs_for_write(dst_bucket, dst_key, dst_bucket_info.versioning)?;
+        let dst_meta_pg = pgs.meta();
+        let dst_shard_pg = pgs.shard();
 
-        loop {
-            let dst_shard_pg_id =
-                derive_pg_shards(dst_bucket, dst_key, dst_version_id, self.pg_count);
-            let (dst_meta_guard, dst_shard_guard) = self
-                .storage_node
-                .lock_two_pgs(dst_meta_pg_id, dst_shard_pg_id)?;
-            let dst_meta_pg: &storage::PgStore = &dst_meta_guard;
-            let dst_shard_pg: &storage::PgStore = match &dst_shard_guard {
-                Some(g) => g,
-                None => dst_meta_pg,
-            };
-
-            // For versioned buckets, ensure version_id is still current while locked.
-            if dst_bucket_info.versioning == 1 {
-                let current = dst_meta_pg.next_version_id(dst_bucket, dst_key)?;
-                if current != dst_version_id {
-                    dst_version_id = current;
-                    continue;
+        // Check dest write conditions
+        if !dst_cond.is_empty() {
+            let existing_etag = match dst_meta_pg.get_object_meta(dst_bucket, dst_key) {
+                Ok(record) => {
+                    let crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
+                    Some(format_etag(crc))
                 }
-            }
-
-            // Check dest write conditions
-            if !dst_cond.is_empty() {
-                let existing_etag = match dst_meta_pg.get_object_meta(dst_bucket, dst_key) {
-                    Ok(record) => {
-                        let crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
-                        Some(format_etag(crc))
-                    }
-                    Err(storage::MetadataError::ObjectNotFound) => None,
-                    Err(e) => return Err(ServerError::Metadata(e)),
-                };
-                check_write_conditions(dst_cond, existing_etag.as_deref())?;
-            }
-
-            let put_result = self.write_object_inner(
-                dst_bucket,
-                dst_key,
-                &metadata_blob,
-                &user_data,
-                dst_version_id,
-                dst_meta_pg,
-                dst_shard_pg,
-            )?;
-
-            // Read back dest metadata to get the authoritative last_modified
-            let dst_record = dst_meta_pg
-                .get_object_meta(dst_bucket, dst_key)
-                .map_err(ServerError::Metadata)?;
-
-            return Ok(CopyObjectResult {
-                etag: put_result.etag,
-                last_modified: dst_record.last_modified,
-                version_id: put_result.version_id,
-            });
+                Err(storage::MetadataError::ObjectNotFound) => None,
+                Err(e) => return Err(ServerError::Metadata(e)),
+            };
+            check_write_conditions(dst_cond, existing_etag.as_deref())?;
         }
+
+        let put_result = self.write_object_inner(
+            dst_bucket,
+            dst_key,
+            &metadata_blob,
+            &user_data,
+            dst_version_id,
+            dst_meta_pg,
+            dst_shard_pg,
+        )?;
+
+        // Read back dest metadata to get the authoritative last_modified
+        let dst_record = dst_meta_pg
+            .get_object_meta(dst_bucket, dst_key)
+            .map_err(ServerError::Metadata)?;
+
+        Ok(CopyObjectResult {
+            etag: put_result.etag,
+            last_modified: dst_record.last_modified,
+            version_id: put_result.version_id,
+        })
     }
 
     fn lookup_object_record(
@@ -847,7 +825,7 @@ impl Coordinator {
         bucket: &str,
         key: &str,
         version_id: Option<u64>,
-    ) -> Result<LockedReadPgs<'a>, ServerError> {
+    ) -> Result<LockedReadObject<'a>, ServerError> {
         let meta_pg_id = derive_pg(bucket, key, self.pg_count);
 
         loop {
@@ -856,12 +834,18 @@ impl Coordinator {
             let shard_pg_id = derive_pg_shards(bucket, key, record.version_id, self.pg_count);
 
             if shard_pg_id == meta_pg_id {
-                return Ok((record, meta_guard, None));
+                return Ok(LockedReadObject {
+                    record,
+                    pgs: TwoPgGuards::new(meta_guard, None),
+                });
             }
 
             if meta_pg_id < shard_pg_id {
                 let shard_guard = self.storage_node.get_pg(shard_pg_id)?;
-                return Ok((record, meta_guard, Some(shard_guard)));
+                return Ok(LockedReadObject {
+                    record,
+                    pgs: TwoPgGuards::new(meta_guard, Some(shard_guard)),
+                });
             }
 
             // Need lower-id shard PG first to avoid deadlocks with writers.
@@ -878,7 +862,74 @@ impl Coordinator {
                 continue;
             }
 
-            return Ok((record, meta_guard, shard_guard));
+            return Ok(LockedReadObject {
+                record,
+                pgs: TwoPgGuards::new(meta_guard, shard_guard),
+            });
+        }
+    }
+
+    /// Lock metadata and shard PGs for an object write.
+    ///
+    /// Computes a candidate version ID from metadata while holding the metadata PG
+    /// lock, then locks shard PG in global order and revalidates when needed.
+    fn lock_object_pgs_for_write<'a>(
+        &'a self,
+        bucket: &str,
+        key: &str,
+        versioning_state: u8,
+    ) -> Result<LockedWriteObject<'a>, ServerError> {
+        let meta_pg_id = derive_pg(bucket, key, self.pg_count);
+
+        loop {
+            let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
+            let version_id = if versioning_state == 1 {
+                meta_guard.next_version_id(bucket, key)?
+            } else {
+                0
+            };
+            let shard_pg_id = derive_pg_shards(bucket, key, version_id, self.pg_count);
+
+            if shard_pg_id == meta_pg_id {
+                return Ok(LockedWriteObject {
+                    version_id,
+                    pgs: TwoPgGuards::new(meta_guard, None),
+                });
+            }
+
+            if meta_pg_id < shard_pg_id {
+                let shard_guard = self.storage_node.get_pg(shard_pg_id)?;
+                if versioning_state == 1 {
+                    let current = meta_guard.next_version_id(bucket, key)?;
+                    if current != version_id {
+                        continue;
+                    }
+                }
+                return Ok(LockedWriteObject {
+                    version_id,
+                    pgs: TwoPgGuards::new(meta_guard, Some(shard_guard)),
+                });
+            }
+
+            // Need lower-id shard PG first to avoid deadlocks with readers/writers.
+            drop(meta_guard);
+
+            let (meta_guard, shard_guard) =
+                self.storage_node.lock_two_pgs(meta_pg_id, shard_pg_id)?;
+            let version_id = if versioning_state == 1 {
+                meta_guard.next_version_id(bucket, key)?
+            } else {
+                0
+            };
+            let verify_shard_pg_id = derive_pg_shards(bucket, key, version_id, self.pg_count);
+            if verify_shard_pg_id != shard_pg_id {
+                continue;
+            }
+
+            return Ok(LockedWriteObject {
+                version_id,
+                pgs: TwoPgGuards::new(meta_guard, shard_guard),
+            });
         }
     }
 
@@ -1076,7 +1127,7 @@ impl Coordinator {
         version_id: Option<u64>,
         cond: &ReadCondition,
     ) -> Result<GetObjectResult, ServerError> {
-        let (record, meta_guard, shard_guard) =
+        let LockedReadObject { record, pgs } =
             self.lock_object_pgs_for_read(bucket, key, version_id)?;
 
         // If latest version is a delete marker, return 404 with x-amz-delete-marker
@@ -1090,10 +1141,7 @@ impl Coordinator {
         let okh = object_key_hash(bucket, key);
         let object_version_id = record.version_id;
         let etag_crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
-        let shard_pg: &storage::PgStore = match &shard_guard {
-            Some(g) => g,
-            None => &meta_guard,
-        };
+        let shard_pg = pgs.shard();
 
         // Check conditions before reading shard data
         let etag_str = format_etag(etag_crc);
@@ -1146,7 +1194,7 @@ impl Coordinator {
         version_id: Option<u64>,
         cond: &ReadCondition,
     ) -> Result<HeadObjectResult, ServerError> {
-        let (record, meta_guard, shard_guard) =
+        let LockedReadObject { record, pgs } =
             self.lock_object_pgs_for_read(bucket, key, version_id)?;
 
         // If latest version is a delete marker, return 404 with x-amz-delete-marker
@@ -1160,10 +1208,7 @@ impl Coordinator {
         let okh = object_key_hash(bucket, key);
         let object_version_id = record.version_id;
         let etag_crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
-        let shard_pg: &storage::PgStore = match &shard_guard {
-            Some(g) => g,
-            None => &meta_guard,
-        };
+        let shard_pg = pgs.shard();
 
         // Check conditions before reading shard data
         let etag_str = format_etag(etag_crc);
@@ -1209,7 +1254,7 @@ impl Coordinator {
         range: ByteRange,
         cond: &ReadCondition,
     ) -> Result<GetObjectRangeResult, ServerError> {
-        let (record, meta_guard, shard_guard) =
+        let LockedReadObject { record, pgs } =
             self.lock_object_pgs_for_read(bucket, key, version_id)?;
 
         // If latest version is a delete marker, return 404 with x-amz-delete-marker
@@ -1223,10 +1268,7 @@ impl Coordinator {
         let okh = object_key_hash(bucket, key);
         let object_version_id = record.version_id;
         let etag_crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
-        let shard_pg: &storage::PgStore = match &shard_guard {
-            Some(g) => g,
-            None => &meta_guard,
-        };
+        let shard_pg = pgs.shard();
 
         // Check conditions before reading shard data
         let etag_str = format_etag(etag_crc);
@@ -1303,17 +1345,14 @@ impl Coordinator {
         cond: &DeleteCondition,
     ) -> Result<DeleteObjectResult, ServerError> {
         let bucket_info = self.head_bucket(bucket)?;
-        let meta_pg_id = derive_pg(bucket, key, self.pg_count);
 
         match (bucket_info.versioning, request_version_id) {
             // Unversioned bucket: physical delete (current behavior)
             (0, _) => {
-                // First, read metadata under meta_pg lock to get record info
-                let record = {
-                    let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
-                    match meta_pg.get_object_meta(bucket, key) {
-                        Ok(r) => r,
-                        Err(storage::MetadataError::ObjectNotFound) => {
+                let LockedReadObject { record, pgs } =
+                    match self.lock_object_pgs_for_read(bucket, key, None) {
+                        Ok(locked) => locked,
+                        Err(ServerError::ObjectNotFound { .. }) => {
                             if !cond.is_empty() {
                                 return Err(ServerError::PreconditionFailed);
                             }
@@ -1322,9 +1361,11 @@ impl Coordinator {
                                 delete_marker: false,
                             });
                         }
-                        Err(e) => return Err(ServerError::Metadata(e)),
-                    }
-                };
+                        Err(other) => return Err(other),
+                    };
+
+                let meta_pg = pgs.meta();
+                let shard_pg = pgs.shard();
 
                 // Check delete conditions
                 if !cond.is_empty() {
@@ -1335,17 +1376,7 @@ impl Coordinator {
 
                 let okh = object_key_hash(bucket, key);
                 let vid = record.version_id;
-                let shard_pg_id = derive_pg_shards(bucket, key, vid, self.pg_count);
                 let total = record.ec_k as usize + record.ec_m as usize;
-
-                // Lock both PGs for delete
-                let (meta_guard, shard_guard) =
-                    self.storage_node.lock_two_pgs(meta_pg_id, shard_pg_id)?;
-                let meta_pg: &storage::PgStore = &meta_guard;
-                let shard_pg: &storage::PgStore = match &shard_guard {
-                    Some(g) => g,
-                    None => meta_pg,
-                };
 
                 // Delete all shards (idempotent)
                 for i in 0..total {
@@ -1364,45 +1395,33 @@ impl Coordinator {
 
             // Versioned/Suspended + specific versionId: permanent delete that version
             (_, Some(vid)) => {
-                // Read record under meta lock, then drop
-                let record = {
-                    let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
-                    match meta_pg.get_object_version(bucket, key, vid) {
-                        Ok(r) => r,
-                        Err(storage::MetadataError::ObjectNotFound) => {
+                let LockedReadObject { record, pgs } =
+                    match self.lock_object_pgs_for_read(bucket, key, Some(vid)) {
+                        Ok(locked) => locked,
+                        Err(ServerError::ObjectNotFound { .. }) => {
                             return Ok(DeleteObjectResult {
                                 version_id: vid,
                                 delete_marker: false,
                             });
                         }
-                        Err(e) => return Err(ServerError::Metadata(e)),
-                    }
-                };
+                        Err(other) => return Err(other),
+                    };
+
+                let meta_pg = pgs.meta();
+                let shard_pg = pgs.shard();
 
                 // Delete shards if it's a live object (not a delete marker)
                 if record.status == 0 {
                     let okh = object_key_hash(bucket, key);
-                    let shard_pg_id = derive_pg_shards(bucket, key, vid, self.pg_count);
                     let total = record.ec_k as usize + record.ec_m as usize;
-
-                    let (meta_guard, shard_guard) =
-                        self.storage_node.lock_two_pgs(meta_pg_id, shard_pg_id)?;
-                    let meta_pg: &storage::PgStore = &meta_guard;
-                    let shard_pg: &storage::PgStore = match &shard_guard {
-                        Some(g) => g,
-                        None => meta_pg,
-                    };
 
                     for i in 0..total {
                         let shard_key = ShardKey::new(&okh, vid, i as u8);
                         shard_pg.delete_shard(&shard_key)?;
                     }
-
-                    meta_pg.delete_object_version(bucket, key, vid)?;
-                } else {
-                    let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
-                    meta_pg.delete_object_version(bucket, key, vid)?;
                 }
+
+                meta_pg.delete_object_version(bucket, key, vid)?;
 
                 let is_delete_marker = record.status == 1;
 
@@ -1414,6 +1433,7 @@ impl Coordinator {
 
             // Versioned/Suspended + no versionId: insert delete marker
             (_, None) => {
+                let meta_pg_id = derive_pg(bucket, key, self.pg_count);
                 let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
                 let marker_vid = meta_pg.next_version_id(bucket, key)?;
                 meta_pg.put_object_meta(&PutObjectMetaReq {
@@ -3778,6 +3798,82 @@ mod tests {
             );
 
             current = next;
+        }
+    }
+
+    #[test]
+    fn delete_object_is_consistent_during_concurrent_overwrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pg_ids: Vec<u32> = (0..4).collect();
+        let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
+        let bucket_db_path = tmp.path().join("buckets.db");
+        let ec_config = EcConfig::new(4, 2).unwrap();
+
+        let make_coord = || {
+            let bucket_db = SqliteBucketDb::open(&bucket_db_path).unwrap();
+            Coordinator::new(
+                Arc::clone(&storage_node),
+                bucket_db,
+                ec_config,
+                4,
+                "us-east-1".to_string(),
+            )
+            .unwrap()
+        };
+
+        let admin = make_coord();
+        admin.create_bucket("bucket").unwrap();
+
+        let object_size = 256 * 1024;
+        admin
+            .put_object("bucket", "key", &vec![b'A'; object_size], &[], NO_WRITE)
+            .unwrap();
+
+        for i in 0..50 {
+            let expected_byte = if i % 2 == 0 { b'B' } else { b'C' };
+            let payload = vec![expected_byte; object_size];
+
+            let writer = make_coord();
+            let deleter = make_coord();
+            let barrier = Arc::new(Barrier::new(3));
+            let b1 = Arc::clone(&barrier);
+            let b2 = Arc::clone(&barrier);
+
+            let t_write = thread::spawn(move || {
+                b1.wait();
+                writer.put_object("bucket", "key", &payload, &[], NO_WRITE)
+            });
+            let t_delete = thread::spawn(move || {
+                b2.wait();
+                deleter.delete_object("bucket", "key", None, NO_DELETE)
+            });
+
+            barrier.wait();
+
+            let write_res = t_write.join().unwrap();
+            assert!(
+                write_res.is_ok(),
+                "concurrent overwrite failed: {write_res:?}"
+            );
+
+            let delete_res = t_delete.join().unwrap();
+            assert!(
+                delete_res.is_ok(),
+                "concurrent delete failed: {delete_res:?}"
+            );
+
+            let check = make_coord().get_object("bucket", "key", None, NO_READ);
+            match check {
+                Ok(obj) => {
+                    assert_eq!(obj.data.len(), object_size);
+                    assert!(
+                        obj.data.iter().all(|&b| b == expected_byte),
+                        "if object exists after put/delete race, it must be a full new image"
+                    );
+                }
+                Err(ServerError::ObjectNotFound { .. }) => {}
+                Err(other) => panic!("unexpected read result after put/delete race: {other:?}"),
+            }
         }
     }
 
