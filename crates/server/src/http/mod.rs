@@ -21,6 +21,7 @@ use crate::coordinator::Coordinator;
 use crate::coordinator::MetadataDirective;
 use crate::error::ServerError;
 use crate::metadata_blob::MetadataBlob;
+use storage::{ChecksumAlgorithm, ChecksumType};
 use request::S3Request;
 use response::S3Response;
 use router::{route, S3Operation};
@@ -854,13 +855,60 @@ impl HttpFrontend {
                     .map(|(k, v)| (k.as_str(), v.as_str()))
                     .collect();
                 let metadata = MetadataBlob::from_headers(&header_pairs)?;
-                let result = self
-                    .coordinator
-                    .create_multipart_upload(&bucket, &key, &metadata)?;
+
+                // Parse optional checksum algorithm/type headers.
+                let checksum_algorithm = match req.header("x-amz-checksum-algorithm") {
+                    None => None,
+                    Some(v) => Some(ChecksumAlgorithm::from_str(v).ok_or_else(|| {
+                        ServerError::InvalidArgument {
+                            reason: format!("unsupported checksum algorithm: {v}"),
+                        }
+                    })?),
+                };
+                let checksum_type = match req.header("x-amz-checksum-type") {
+                    None => None,
+                    Some(v) => Some(ChecksumType::from_str(v).ok_or_else(|| {
+                        ServerError::InvalidArgument {
+                            reason: format!("unsupported checksum type: {v}"),
+                        }
+                    })?),
+                };
+
+                // Validate: checksum-type without checksum-algorithm is invalid.
+                if checksum_type.is_some() && checksum_algorithm.is_none() {
+                    return Err(ServerError::InvalidArgument {
+                        reason: "x-amz-checksum-type requires x-amz-checksum-algorithm"
+                            .to_string(),
+                    });
+                }
+
+                // SHA algorithms only support COMPOSITE; reject FULL_OBJECT.
+                if let (Some(algo), Some(ChecksumType::FullObject)) =
+                    (checksum_algorithm, checksum_type)
+                {
+                    if matches!(algo, ChecksumAlgorithm::Sha1 | ChecksumAlgorithm::Sha256) {
+                        return Err(ServerError::InvalidArgument {
+                            reason: format!(
+                                "FULL_OBJECT checksum type is not supported for {}",
+                                algo.as_str()
+                            ),
+                        });
+                    }
+                }
+
+                let result = self.coordinator.create_multipart_upload(
+                    &bucket,
+                    &key,
+                    &metadata,
+                    checksum_algorithm,
+                    checksum_type,
+                )?;
                 Ok(S3Response::create_multipart_upload(
                     &bucket,
                     &key,
                     &result.upload_id,
+                    checksum_algorithm,
+                    checksum_type,
                 ))
             }
             S3Operation::UploadPart { bucket, key } => {
@@ -1788,5 +1836,238 @@ mod tests {
             Err(e) => panic!("expected InvalidArgument, got {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
+    }
+
+    // ── CreateMultipartUpload checksum validation ───────────────────
+
+    #[test]
+    fn create_multipart_invalid_checksum_algorithm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+
+        let req = S3Request {
+            method: String::new(),
+            path: String::new(),
+            query_string: "uploads".to_string(),
+            headers: vec![(
+                "x-amz-checksum-algorithm".to_string(),
+                "BOGUS".to_string(),
+            )],
+            body: vec![],
+        };
+        let op = S3Operation::CreateMultipartUpload {
+            bucket: "mybucket".to_string(),
+            key: "k".to_string(),
+        };
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::InvalidArgument { .. }) => {}
+            Err(e) => panic!("expected InvalidArgument, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn create_multipart_invalid_checksum_type() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+
+        let req = S3Request {
+            method: String::new(),
+            path: String::new(),
+            query_string: "uploads".to_string(),
+            headers: vec![
+                ("x-amz-checksum-algorithm".to_string(), "CRC32".to_string()),
+                ("x-amz-checksum-type".to_string(), "INVALID".to_string()),
+            ],
+            body: vec![],
+        };
+        let op = S3Operation::CreateMultipartUpload {
+            bucket: "mybucket".to_string(),
+            key: "k".to_string(),
+        };
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::InvalidArgument { .. }) => {}
+            Err(e) => panic!("expected InvalidArgument, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn create_multipart_checksum_type_without_algorithm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+
+        let req = S3Request {
+            method: String::new(),
+            path: String::new(),
+            query_string: "uploads".to_string(),
+            headers: vec![(
+                "x-amz-checksum-type".to_string(),
+                "COMPOSITE".to_string(),
+            )],
+            body: vec![],
+        };
+        let op = S3Operation::CreateMultipartUpload {
+            bucket: "mybucket".to_string(),
+            key: "k".to_string(),
+        };
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::InvalidArgument { .. }) => {}
+            Err(e) => panic!("expected InvalidArgument, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn create_multipart_sha_full_object_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+
+        let req = S3Request {
+            method: String::new(),
+            path: String::new(),
+            query_string: "uploads".to_string(),
+            headers: vec![
+                (
+                    "x-amz-checksum-algorithm".to_string(),
+                    "SHA256".to_string(),
+                ),
+                (
+                    "x-amz-checksum-type".to_string(),
+                    "FULL_OBJECT".to_string(),
+                ),
+            ],
+            body: vec![],
+        };
+        let op = S3Operation::CreateMultipartUpload {
+            bucket: "mybucket".to_string(),
+            key: "k".to_string(),
+        };
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::InvalidArgument { .. }) => {}
+            Err(e) => panic!("expected InvalidArgument, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn create_multipart_with_checksum_returns_fields_in_xml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+
+        let req = S3Request {
+            method: String::new(),
+            path: String::new(),
+            query_string: "uploads".to_string(),
+            headers: vec![
+                ("x-amz-checksum-algorithm".to_string(), "CRC32".to_string()),
+                (
+                    "x-amz-checksum-type".to_string(),
+                    "FULL_OBJECT".to_string(),
+                ),
+            ],
+            body: vec![],
+        };
+        let op = S3Operation::CreateMultipartUpload {
+            bucket: "mybucket".to_string(),
+            key: "mykey".to_string(),
+        };
+        let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
+        assert_eq!(resp.status_code, 200);
+        let body = std::str::from_utf8(&resp.body).unwrap();
+        assert!(
+            body.contains("<ChecksumAlgorithm>CRC32</ChecksumAlgorithm>"),
+            "missing ChecksumAlgorithm: {body}"
+        );
+        assert!(
+            body.contains("<ChecksumType>FULL_OBJECT</ChecksumType>"),
+            "missing ChecksumType: {body}"
+        );
+    }
+
+    #[test]
+    fn create_multipart_crc32_composite_accepted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+
+        let req = S3Request {
+            method: String::new(),
+            path: String::new(),
+            query_string: "uploads".to_string(),
+            headers: vec![
+                ("x-amz-checksum-algorithm".to_string(), "CRC32".to_string()),
+                ("x-amz-checksum-type".to_string(), "COMPOSITE".to_string()),
+            ],
+            body: vec![],
+        };
+        let op = S3Operation::CreateMultipartUpload {
+            bucket: "mybucket".to_string(),
+            key: "mykey".to_string(),
+        };
+        let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
+        assert_eq!(resp.status_code, 200);
+        let body = std::str::from_utf8(&resp.body).unwrap();
+        assert!(
+            body.contains("<ChecksumAlgorithm>CRC32</ChecksumAlgorithm>"),
+            "missing ChecksumAlgorithm: {body}"
+        );
+        assert!(
+            body.contains("<ChecksumType>COMPOSITE</ChecksumType>"),
+            "missing ChecksumType: {body}"
+        );
+    }
+
+    #[test]
+    fn create_multipart_algorithm_only_defaults_type() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+
+        let req = S3Request {
+            method: String::new(),
+            path: String::new(),
+            query_string: "uploads".to_string(),
+            headers: vec![(
+                "x-amz-checksum-algorithm".to_string(),
+                "SHA256".to_string(),
+            )],
+            body: vec![],
+        };
+        let op = S3Operation::CreateMultipartUpload {
+            bucket: "mybucket".to_string(),
+            key: "mykey".to_string(),
+        };
+        let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
+        assert_eq!(resp.status_code, 200);
+        let body = std::str::from_utf8(&resp.body).unwrap();
+        assert!(
+            body.contains("<ChecksumAlgorithm>SHA256</ChecksumAlgorithm>"),
+            "missing ChecksumAlgorithm: {body}"
+        );
+        // When no type specified, no ChecksumType element emitted.
+        assert!(
+            !body.contains("ChecksumType"),
+            "unexpected ChecksumType: {body}"
+        );
     }
 }

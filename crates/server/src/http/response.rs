@@ -498,8 +498,20 @@ impl S3Response {
     }
 
     /// Build a response for CreateMultipartUpload (200 OK, XML body).
-    pub fn create_multipart_upload(bucket: &str, key: &str, upload_id: &str) -> Self {
-        let body = xml::initiate_multipart_upload_xml(bucket, key, upload_id);
+    pub fn create_multipart_upload(
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        checksum_algorithm: Option<storage::ChecksumAlgorithm>,
+        checksum_type: Option<storage::ChecksumType>,
+    ) -> Self {
+        let body = xml::initiate_multipart_upload_xml(
+            bucket,
+            key,
+            upload_id,
+            checksum_algorithm.map(|a| a.as_str()),
+            checksum_type.map(|t| t.as_str()),
+        );
         Self::new(200).xml_body(body)
     }
 

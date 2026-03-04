@@ -134,8 +134,8 @@ impl ChecksumAlgorithm {
         }
     }
 
-    /// Parse from an S3 API header value. Accepts the canonical uppercase
-    /// form used by S3 (`SHA256`, `CRC32`, etc.).
+    /// Parse from an S3 API header value. Only accepts the canonical
+    /// uppercase form (`SHA256`, `CRC32`, `CRC32C`, `SHA1`, `CRC64NVME`).
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "CRC32" => Some(Self::Crc32),

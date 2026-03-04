@@ -1272,18 +1272,35 @@ fn checksum_header_to_xml_tag(header: &str) -> Option<&'static str> {
 // ── Multipart upload XML ─────────────────────────────────────────
 
 /// Format an InitiateMultipartUploadResult XML response.
-pub fn initiate_multipart_upload_xml(bucket: &str, key: &str, upload_id: &str) -> String {
-    format!(
+pub fn initiate_multipart_upload_xml(
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    checksum_algorithm: Option<&str>,
+    checksum_type: Option<&str>,
+) -> String {
+    let mut xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <InitiateMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
          <Bucket>{}</Bucket>\
          <Key>{}</Key>\
-         <UploadId>{}</UploadId>\
-         </InitiateMultipartUploadResult>",
+         <UploadId>{}</UploadId>",
         xml_escape(bucket),
         xml_escape(key),
         xml_escape(upload_id),
-    )
+    );
+    if let Some(algo) = checksum_algorithm {
+        xml.push_str("<ChecksumAlgorithm>");
+        xml.push_str(algo);
+        xml.push_str("</ChecksumAlgorithm>");
+    }
+    if let Some(ctype) = checksum_type {
+        xml.push_str("<ChecksumType>");
+        xml.push_str(ctype);
+        xml.push_str("</ChecksumType>");
+    }
+    xml.push_str("</InitiateMultipartUploadResult>");
+    xml
 }
 
 /// Percent-encode a logical key for use in URLs, preserving '/'.
@@ -2641,11 +2658,14 @@ mod tests {
 
     #[test]
     fn initiate_multipart_upload_xml_format() {
-        let xml = initiate_multipart_upload_xml("mybucket", "mykey", "upload123");
+        let xml = initiate_multipart_upload_xml("mybucket", "mykey", "upload123", None, None);
         assert!(xml.contains("<Bucket>mybucket</Bucket>"));
         assert!(xml.contains("<Key>mykey</Key>"));
         assert!(xml.contains("<UploadId>upload123</UploadId>"));
         assert!(xml.contains("InitiateMultipartUploadResult"));
+        // No checksum elements when not set.
+        assert!(!xml.contains("ChecksumAlgorithm"));
+        assert!(!xml.contains("ChecksumType"));
     }
 
     #[test]
@@ -2681,10 +2701,30 @@ mod tests {
 
     #[test]
     fn initiate_xml_escapes_special_chars() {
-        let xml = initiate_multipart_upload_xml("my&bucket", "key<>", "id\"1");
+        let xml = initiate_multipart_upload_xml("my&bucket", "key<>", "id\"1", None, None);
         assert!(xml.contains("my&amp;bucket"));
         assert!(xml.contains("key&lt;&gt;"));
         assert!(xml.contains("id&quot;1"));
+    }
+
+    #[test]
+    fn initiate_xml_includes_checksum_fields() {
+        let xml = initiate_multipart_upload_xml(
+            "b",
+            "k",
+            "u",
+            Some("CRC32"),
+            Some("FULL_OBJECT"),
+        );
+        assert!(xml.contains("<ChecksumAlgorithm>CRC32</ChecksumAlgorithm>"));
+        assert!(xml.contains("<ChecksumType>FULL_OBJECT</ChecksumType>"));
+    }
+
+    #[test]
+    fn initiate_xml_checksum_algorithm_only() {
+        let xml = initiate_multipart_upload_xml("b", "k", "u", Some("SHA256"), None);
+        assert!(xml.contains("<ChecksumAlgorithm>SHA256</ChecksumAlgorithm>"));
+        assert!(!xml.contains("ChecksumType"));
     }
 
     // ── ListMultipartUploads XML tests ───────────────────────────────
