@@ -529,13 +529,18 @@ Tasks:
    - no leaked visible metadata state
    - no leaked current-generation part shards on failed upsert
    - retry behavior converges to a valid completed or aborted state
-4. Document expected recovery semantics for each injected failure point.
+4. Add storage-level rollback tests for `complete_multipart_commit` so failures
+   during finalize (object row write, manifest insert, upload-row delete, and
+   commit-time failures) prove transaction atomicity.
+5. Document expected recovery semantics for each injected failure point.
 
 Acceptance:
 
 1. Deterministic tests reproduce and validate cleanup/retry behavior for the
    two known risk areas above.
-2. Test docs clearly map each fault point to expected system state.
+2. `complete_multipart_commit` failure-path tests prove no partial finalize
+   state is committed.
+3. Test docs clearly map each fault point to expected system state.
 
 ### Step 8: AbortMultipartUpload and ListParts
 
