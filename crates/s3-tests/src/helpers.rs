@@ -1,18 +1,31 @@
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::LazyLock;
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 
 static BUCKET_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Bucket name prefix, configurable via `S3_TEST_BUCKET_PREFIX`.
+/// Defaults to `"test"`.
+static BUCKET_PREFIX: LazyLock<String> = LazyLock::new(|| {
+    std::env::var("S3_TEST_BUCKET_PREFIX").unwrap_or_else(|_| "test".to_string())
+});
+
+/// Return the bucket prefix (from `S3_TEST_BUCKET_PREFIX` or `"test"`).
+pub fn bucket_prefix() -> &'static str {
+    &BUCKET_PREFIX
+}
+
 /// Generate a unique bucket name for a test.
 ///
 /// Uses a monotonic counter + process ID to avoid collisions between
 /// parallel test runs and between tests within the same run.
+/// The prefix is configurable via `S3_TEST_BUCKET_PREFIX` (default `"test"`).
 pub fn unique_bucket() -> String {
     let n = BUCKET_COUNTER.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
-    format!("test-{}-{}-{}", pid, n, timestamp_millis())
+    format!("{}-{}-{}-{}", bucket_prefix(), pid, n, timestamp_millis())
 }
 
 fn timestamp_millis() -> u64 {

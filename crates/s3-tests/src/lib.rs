@@ -2,8 +2,8 @@ pub mod helpers;
 pub mod server;
 
 pub use helpers::{
-    assert_s3_err_code, create_objects, create_objects_with_keys, delete_all_and_bucket,
-    err_status, unique_bucket,
+    assert_s3_err_code, bucket_prefix, create_objects, create_objects_with_keys,
+    delete_all_and_bucket, err_status, unique_bucket,
 };
 pub use server::TestServer;
 
