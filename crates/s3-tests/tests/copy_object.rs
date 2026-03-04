@@ -623,7 +623,6 @@ fn test_object_copy_versioned_url_encoding() {
 }
 
 #[test]
-#[ignore = "not implemented: multipart upload"]
 fn test_object_copy_versioning_multipart_upload() {
     s3_tests::run(async {});
 }

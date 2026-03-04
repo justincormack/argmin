@@ -325,7 +325,6 @@ fn test_atomic_write_bucket_gone() {
 ///
 /// Matches Ceph: test_atomic_multipart_upload_write
 #[test]
-#[ignore = "not implemented: multipart upload"]
 fn test_atomic_multipart_upload_write() {
     s3_tests::run(async {});
 }

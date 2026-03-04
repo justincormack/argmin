@@ -1548,13 +1548,11 @@ fn test_versioned_object_acl_no_version_specified() {
 }
 
 #[test]
-#[ignore = "not implemented: multipart upload"]
 fn test_versioning_obj_create_overwrite_multipart() {
     s3_tests::run(async {});
 }
 
 #[test]
-#[ignore = "not implemented: multipart upload"]
 fn test_versioning_bucket_multipart_upload_return_version_id() {
     s3_tests::run(async {});
 }

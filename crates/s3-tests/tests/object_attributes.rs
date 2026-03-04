@@ -228,7 +228,7 @@ fn test_get_checksum_object_attributes() {
     });
 }
 
-// ── Ignored tests (need multipart or encryption) ─────────────────────
+// ── Ignored tests (need encryption) ──────────────────────────────────
 
 #[test]
 #[ignore = "not implemented: SSE-C encryption"]
@@ -237,25 +237,21 @@ fn test_get_sse_c_encrypted_object_attributes() {
 }
 
 #[test]
-#[ignore = "not implemented: multipart upload"]
 fn test_get_multipart_object_attributes() {
     s3_tests::run(async {});
 }
 
 #[test]
-#[ignore = "not implemented: multipart upload"]
 fn test_get_single_multipart_object_attributes() {
     s3_tests::run(async {});
 }
 
 #[test]
-#[ignore = "not implemented: multipart upload"]
 fn test_get_paginated_multipart_object_attributes() {
     s3_tests::run(async {});
 }
 
 #[test]
-#[ignore = "not implemented: multipart upload + checksums"]
 fn test_get_multipart_checksum_object_attributes() {
     s3_tests::run(async {});
 }

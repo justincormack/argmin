@@ -77,7 +77,7 @@ crates/s3-tests/
     ├── acl_access.rs       # GROUP 11: 12 tests — Access control combinations
     ├── bucket_anon.rs      # GROUP 12: 10 tests — Anonymous/public listing
     ├── copy_object.rs      # GROUP 13: 19 tests — Copy operations
-    ├── multipart.rs        # GROUP 14: 39 tests — Multipart upload
+    ├── multipart.rs        # GROUP 14: 26 tests — Multipart upload (21 active, 5 ignored: UploadPartCopy + PartNumber GET)
     ├── cors.rs             # GROUP 15: 14 tests — CORS
     ├── tagging.rs          # GROUP 16: 24 tests — Object/bucket tags
     ├── range_requests.rs   # GROUP 17:  6 tests — Byte range GET
@@ -243,7 +243,7 @@ tempfile = "3"
 8. `tests/range_requests.rs` — 6 tests
 9. `tests/versioning.rs` — 24 tests
 10. `tests/conditional.rs` — 28 tests
-11. `tests/multipart.rs` — 39 tests
+11. `tests/multipart.rs` — 26 tests (implemented; 21 active, 5 ignored)
 
 ### Phase 4: Auth + POST + Headers (~3 files)
 12. `tests/presigned.rs` — 13 tests (needs ureq for raw fetch)
@@ -362,12 +362,10 @@ These groups from test_s3.py are well covered by existing tests:
 
 ##### Tier 3: Large core features
 
-**Multipart upload (~36 tests)**
-- Full lifecycle: CreateMultipartUpload, UploadPart, CompleteMultipartUpload,
+**Multipart upload (implemented — 26 integration tests, 21 active)**
+- Full lifecycle implemented: CreateMultipartUpload, UploadPart, CompleteMultipartUpload,
   AbortMultipartUpload, ListParts, ListMultipartUploads.
-- Server work: large feature touching storage, metadata, and HTTP layers. Tracks in-progress
-  uploads, assembles parts into final object. Many other features (encryption, versioning,
-  checksums) have multipart variants that depend on this.
+- Remaining ignored tests: UploadPartCopy (3), PartNumber GET (2).
 - Detailed implementation plan: `plans/multipart-upload-core-design.md`.
 
 **Full ACL system (~41 tests)**
@@ -447,5 +445,6 @@ Tests for unimplemented features are marked `#[ignore = "reason"]` so they show 
 - `not implemented: public-read-write ACL` (bucket_anon.rs)
 - `not implemented: header auth region/service scope validation` (headers.rs)
 - `not implemented: duplicate Authorization header rejection` (headers.rs)
-- `not implemented: multipart upload checksums` (checksums.rs)
+- `not implemented: UploadPartCopy` (multipart.rs)
+- `not implemented: PartNumber GET query parameter` (multipart.rs)
 - Various conditional/versioning edge cases

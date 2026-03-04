@@ -7,7 +7,7 @@
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::CompletedMultipartUpload;
 use aws_sdk_s3::types::CompletedPart;
-use s3_tests::{unique_bucket, CTX};
+use s3_tests::{assert_s3_err_code, unique_bucket, CTX};
 
 const PART_SIZE: usize = 5 * 1024 * 1024; // 5 MB minimum part size
 
@@ -800,4 +800,357 @@ fn test_multipart_part_overwrite() {
 
         cleanup(&bucket, &[key]).await;
     });
+}
+
+// ── Completion validation (Ceph parity) ─────────────────────────────
+
+/// Ceph: test_multipart_upload_empty — completing with no parts should fail.
+#[test]
+fn test_multipart_complete_empty_parts() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "empty-complete";
+
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap();
+
+        let result = client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(CompletedMultipartUpload::builder().build())
+            .send()
+            .await;
+        assert!(result.is_err());
+
+        // Abort to clean up
+        let _ = client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .send()
+            .await;
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+/// Ceph: test_multipart_upload_incorrect_etag — wrong ETag should fail with InvalidPart.
+#[test]
+fn test_multipart_complete_incorrect_etag() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "wrong-etag";
+
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap();
+
+        client
+            .upload_part()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(1)
+            .body(ByteStream::from(vec![0u8; 256]))
+            .send()
+            .await
+            .unwrap();
+
+        // Complete with a fabricated ETag
+        let result = client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag("\"ffffffffffffffff\"")
+                            .part_number(1)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send()
+            .await;
+        assert_s3_err_code(&result, "InvalidPart");
+
+        let _ = client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .send()
+            .await;
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+/// Ceph: test_multipart_upload_missing_part — referencing an unuploaded part number.
+#[test]
+fn test_multipart_complete_missing_part() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "missing-part";
+
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap();
+
+        // Upload part 1
+        let resp = client
+            .upload_part()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(1)
+            .body(ByteStream::from(vec![0u8; 256]))
+            .send()
+            .await
+            .unwrap();
+
+        // Complete referencing part 9999 (never uploaded)
+        let result = client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(resp.e_tag().unwrap())
+                            .part_number(9999)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send()
+            .await;
+        assert_s3_err_code(&result, "InvalidPart");
+
+        let _ = client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .send()
+            .await;
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+/// Ceph: test_multipart_upload — metadata and content-type survive multipart.
+#[test]
+fn test_multipart_metadata_preserved() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "meta-preserved";
+
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .content_type("application/octet-stream")
+            .metadata("testkey", "testvalue")
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap();
+
+        let resp = client
+            .upload_part()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(1)
+            .body(ByteStream::from(vec![b'm'; 128]))
+            .send()
+            .await
+            .unwrap();
+
+        client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(resp.e_tag().unwrap())
+                            .part_number(1)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let head = client
+            .head_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(head.content_type().unwrap(), "application/octet-stream");
+        assert_eq!(
+            head.metadata().unwrap().get("testkey").unwrap(),
+            "testvalue"
+        );
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+/// Parts must be in strictly ascending order.
+#[test]
+fn test_multipart_complete_invalid_order() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "invalid-order";
+
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap();
+
+        let r1 = client
+            .upload_part()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(1)
+            .body(ByteStream::from(vec![b'a'; PART_SIZE]))
+            .send()
+            .await
+            .unwrap();
+
+        let r2 = client
+            .upload_part()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(2)
+            .body(ByteStream::from(vec![b'b'; 256]))
+            .send()
+            .await
+            .unwrap();
+
+        // Complete with parts in reverse order (2, 1)
+        let result = client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(r2.e_tag().unwrap())
+                            .part_number(2)
+                            .build(),
+                    )
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(r1.e_tag().unwrap())
+                            .part_number(1)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send()
+            .await;
+        assert_s3_err_code(&result, "InvalidPartOrder");
+
+        let _ = client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .send()
+            .await;
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+/// Multipart ETag is a composite format: "hex-N".
+#[test]
+fn test_multipart_composite_etag() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "composite-etag";
+
+        let part_data = vec![b'e'; 256];
+        let etag = do_multipart_upload(&bucket, key, &[part_data]).await;
+        // Multipart ETags have the format "hex-N" where N is part count
+        assert!(etag.contains("-1"), "expected composite ETag with -1 suffix, got: {etag}");
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+// ── PartNumber GET semantics ────────────────────────────────────────
+
+#[test]
+#[ignore = "not implemented: PartNumber GET query parameter"]
+fn test_multipart_get_part() {
+    s3_tests::run(async {});
+}
+
+#[test]
+#[ignore = "not implemented: PartNumber GET query parameter"]
+fn test_non_multipart_get_part() {
+    s3_tests::run(async {});
+}
+
+// ── UploadPartCopy (not implemented) ────────────────────────────────
+
+#[test]
+#[ignore = "not implemented: UploadPartCopy"]
+fn test_multipart_copy_small() {
+    s3_tests::run(async {});
+}
+
+#[test]
+#[ignore = "not implemented: UploadPartCopy"]
+fn test_multipart_copy_without_range() {
+    s3_tests::run(async {});
+}
+
+#[test]
+#[ignore = "not implemented: UploadPartCopy"]
+fn test_multipart_copy_invalid_range() {
+    s3_tests::run(async {});
 }
