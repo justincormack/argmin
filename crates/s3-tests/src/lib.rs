@@ -157,9 +157,13 @@ async fn build_client(endpoint: &str, access_key: &str, secret_key: &str, region
         "s3-tests",
     );
 
+    let timeout_secs: u64 = std::env::var("S3_TEST_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
     let timeout_config = aws_sdk_s3::config::timeout::TimeoutConfig::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .operation_attempt_timeout(Duration::from_secs(5))
+        .connect_timeout(Duration::from_secs(timeout_secs))
+        .operation_attempt_timeout(Duration::from_secs(timeout_secs))
         .build();
 
     let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
