@@ -591,9 +591,39 @@ impl HttpFrontend {
                         });
                     }
                 }
+                let want_parts = requested.iter().any(|&a| a == "ObjectParts");
+                let max_parts: u32 = match req
+                    .headers
+                    .iter()
+                    .find(|(k, _)| k == "x-amz-max-parts")
+                {
+                    None => 1000,
+                    Some((_, v)) => v.parse().map_err(|_| ServerError::InvalidArgument {
+                        reason: "invalid x-amz-max-parts".to_string(),
+                    })?,
+                };
+                let part_number_marker: Option<u32> = req
+                    .headers
+                    .iter()
+                    .find(|(k, _)| k == "x-amz-part-number-marker")
+                    .map(|(_, v)| {
+                        v.parse().map_err(|_| ServerError::InvalidArgument {
+                            reason: "x-amz-part-number-marker must be an integer".to_string(),
+                        })
+                    })
+                    .transpose()?;
+
                 let cond = read_condition_from_headers(req);
                 let vid = parse_version_id(req)?;
-                let result = self.coordinator.head_object(&bucket, &key, vid, &cond)?;
+                let result = self.coordinator.get_object_attributes(
+                    &bucket,
+                    &key,
+                    vid,
+                    &cond,
+                    want_parts,
+                    part_number_marker,
+                    max_parts,
+                )?;
                 let checksum_entries: Vec<(&str, &str)> = result
                     .metadata
                     .checksum_entries()
@@ -604,6 +634,7 @@ impl HttpFrontend {
                     &result.etag,
                     result.size,
                     &checksum_entries,
+                    result.object_parts.as_ref(),
                 );
                 Ok(S3Response::get_object_attributes(
                     &body_xml,
@@ -1557,6 +1588,75 @@ mod tests {
 
         let req = make_req("uploadId=abc&max-parts=notanumber");
         let op = S3Operation::ListParts {
+            bucket: "mybucket".to_string(),
+            key: "mykey".to_string(),
+        };
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::InvalidArgument { .. }) => {}
+            Err(e) => panic!("expected InvalidArgument, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    // ── GetObjectAttributes header validation ──────────────────────
+
+    #[test]
+    fn get_object_attributes_invalid_max_parts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+
+        let req = S3Request {
+            method: String::new(),
+            path: String::new(),
+            query_string: String::new(),
+            headers: vec![
+                (
+                    "x-amz-object-attributes".to_string(),
+                    "ObjectParts".to_string(),
+                ),
+                ("x-amz-max-parts".to_string(), "notanumber".to_string()),
+            ],
+            body: vec![],
+        };
+        let op = S3Operation::GetObjectAttributes {
+            bucket: "mybucket".to_string(),
+            key: "mykey".to_string(),
+        };
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::InvalidArgument { .. }) => {}
+            Err(e) => panic!("expected InvalidArgument, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn get_object_attributes_invalid_part_number_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+
+        let req = S3Request {
+            method: String::new(),
+            path: String::new(),
+            query_string: String::new(),
+            headers: vec![
+                (
+                    "x-amz-object-attributes".to_string(),
+                    "ObjectParts".to_string(),
+                ),
+                (
+                    "x-amz-part-number-marker".to_string(),
+                    "xyz".to_string(),
+                ),
+            ],
+            body: vec![],
+        };
+        let op = S3Operation::GetObjectAttributes {
             bucket: "mybucket".to_string(),
             key: "mykey".to_string(),
         };

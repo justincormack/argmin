@@ -60,6 +60,35 @@ pub struct HeadObjectResult {
     pub tags: Option<String>,
 }
 
+/// A single part entry for GetObjectAttributes ObjectParts response.
+#[derive(Debug)]
+pub struct ObjectPartEntry {
+    pub part_number: u32,
+    pub size: u64,
+}
+
+/// Pagination info for ObjectParts in GetObjectAttributes.
+#[derive(Debug)]
+pub struct ObjectPartsInfo {
+    pub total_parts_count: u32,
+    pub parts: Vec<ObjectPartEntry>,
+    pub is_truncated: bool,
+    pub next_part_number_marker: Option<u32>,
+    pub max_parts: u32,
+    pub part_number_marker: u32,
+}
+
+/// Result of a GetObjectAttributes operation.
+#[derive(Debug)]
+pub struct GetObjectAttributesResult {
+    pub metadata: MetadataBlob,
+    pub etag: String,
+    pub size: u64,
+    pub last_modified: u64,
+    pub version_id: u64,
+    pub object_parts: Option<ObjectPartsInfo>,
+}
+
 /// Result of a range GetObject operation (206 Partial Content).
 #[derive(Debug)]
 pub struct GetObjectRangeResult {
@@ -1617,6 +1646,119 @@ impl Coordinator {
             last_modified: record.last_modified,
             version_id: record.version_id,
             tags: record.tags,
+        })
+    }
+
+    /// Retrieve object attributes, optionally including multipart ObjectParts
+    /// with pagination support.
+    pub fn get_object_attributes(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<u64>,
+        cond: &ReadCondition,
+        want_parts: bool,
+        part_number_marker: Option<u32>,
+        max_parts: u32,
+    ) -> Result<GetObjectAttributesResult, ServerError> {
+        let LockedReadObject { record, pgs } =
+            self.lock_object_pgs_for_read(bucket, key, version_id)?;
+
+        if record.status == 1 {
+            return Err(ServerError::DeleteMarkerHit {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+            });
+        }
+
+        let etag_str = format_object_etag(&record.etag, record.etag_kind, record.parts_count);
+        check_read_conditions(cond, &etag_str, record.last_modified)?;
+
+        let metadata = if record.data_layout == DataLayout::MultipartManifest {
+            record
+                .metadata_blob
+                .as_ref()
+                .map(|b| MetadataBlob::deserialize(b).map(|(m, _)| m))
+                .transpose()?
+                .unwrap_or_default()
+        } else {
+            let okh = object_key_hash(bucket, key);
+            let object_version_id = record.version_id;
+            let shard_pg = pgs.shard();
+
+            let metadata_size = (record.total_size - record.size) as usize;
+            let data = self
+                .read_range(
+                    shard_pg,
+                    &okh,
+                    object_version_id,
+                    &record,
+                    0,
+                    metadata_size - 1,
+                )
+                .map_err(|e| match e {
+                    ServerError::Store(storage::StoreError::NotFound) => {
+                        ServerError::ObjectNotFound {
+                            bucket: bucket.to_string(),
+                            key: key.to_string(),
+                        }
+                    }
+                    other => other,
+                })?;
+
+            let (m, _) = MetadataBlob::deserialize(&data)?;
+            m
+        };
+
+        let object_parts =
+            if want_parts && record.data_layout == DataLayout::MultipartManifest {
+                let meta_pg = pgs.meta();
+                let all_parts =
+                    meta_pg.get_object_parts(bucket, key, record.version_id)?;
+                let total_parts_count = all_parts.len() as u32;
+                let marker = part_number_marker.unwrap_or(0);
+
+                let filtered: Vec<_> = all_parts
+                    .into_iter()
+                    .filter(|p| p.part_number > marker)
+                    .collect();
+
+                let is_truncated = filtered.len() > max_parts as usize;
+                let take_count = (max_parts as usize).min(filtered.len());
+                let page: Vec<ObjectPartEntry> = filtered
+                    .into_iter()
+                    .take(take_count)
+                    .map(|p| ObjectPartEntry {
+                        part_number: p.part_number,
+                        size: p.size,
+                    })
+                    .collect();
+
+                let next_part_number_marker = if is_truncated {
+                    Some(page.last().map_or(marker, |p| p.part_number))
+                } else {
+                    None
+                };
+
+                Some(ObjectPartsInfo {
+                    total_parts_count,
+                    parts: page,
+                    is_truncated,
+                    next_part_number_marker,
+                    max_parts,
+                    part_number_marker: marker,
+                })
+            } else {
+                None
+            };
+
+        Ok(GetObjectAttributesResult {
+            metadata,
+            etag: etag_str,
+            size: record.size,
+            last_modified: record.last_modified,
+            version_id: record.version_id,
+            object_parts,
         })
     }
 

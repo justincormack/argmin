@@ -366,8 +366,8 @@ These groups from test_s3.py are well covered by existing tests:
 - Full lifecycle implemented: CreateMultipartUpload, UploadPart, CompleteMultipartUpload,
   AbortMultipartUpload, ListParts, ListMultipartUploads.
 - Remaining ignored tests: UploadPartCopy (8), PartNumber GET (2), multi-user (1),
-  multipart per-part checksums in checksums.rs (6), GetObjectAttributes ObjectParts in
-  object_attributes.rs (4), multipart tagging in tagging.rs (1).
+  multipart per-part checksums in checksums.rs (6), per-part checksums in
+  object_attributes.rs (1), multipart tagging in tagging.rs (1).
 - Detailed implementation plan: `plans/multipart-upload-core-design.md`.
 
 **Full ACL system (~41 tests)**
@@ -451,7 +451,7 @@ Tests for unimplemented features are marked `#[ignore = "reason"]` so they show 
 - `not implemented: PartNumber GET query parameter` (multipart.rs — 2 tests)
 - `not implemented: multi-user` (multipart.rs — 1 test)
 - `not implemented: multipart per-part checksums` (checksums.rs — 6 tests)
-- `not implemented: GetObjectAttributes ObjectParts` (object_attributes.rs — 4 tests)
+- `not implemented: per-part checksums in GetObjectAttributes` (object_attributes.rs — 1 test)
 - `not implemented: SSE-C encryption` (object_attributes.rs — 1 test)
 - `not implemented: multipart upload` (tagging.rs — 1 test, blocked on tagging todo)
 - Various conditional/versioning edge cases

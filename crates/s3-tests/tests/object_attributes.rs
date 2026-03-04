@@ -1,8 +1,11 @@
+use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
-    BucketVersioningStatus, ChecksumAlgorithm, ObjectAttributes, StorageClass,
-    VersioningConfiguration,
+    BucketVersioningStatus, ChecksumAlgorithm, CompletedMultipartUpload, CompletedPart,
+    ObjectAttributes, StorageClass, VersioningConfiguration,
 };
 use s3_tests::{unique_bucket, CTX};
+
+const PART_SIZE: usize = 5 * 1024 * 1024; // 5 MB minimum part size
 
 /// Cleanup helper: delete all given keys then the bucket.
 async fn cleanup(bucket: &str, keys: &[&str]) {
@@ -236,26 +239,240 @@ fn test_get_sse_c_encrypted_object_attributes() {
     s3_tests::run(async {});
 }
 
+/// Helper: create multipart upload, upload parts, complete, return etag.
+async fn do_multipart_upload(bucket: &str, key: &str, parts_data: &[Vec<u8>]) -> String {
+    let client = CTX.client();
+    let create = client
+        .create_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .unwrap();
+    let upload_id = create.upload_id().unwrap();
+
+    let mut completed_parts = Vec::new();
+    for (i, data) in parts_data.iter().enumerate() {
+        let part_number = (i + 1) as i32;
+        let resp = client
+            .upload_part()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(part_number)
+            .body(ByteStream::from(data.clone()))
+            .send()
+            .await
+            .unwrap();
+        completed_parts.push(
+            CompletedPart::builder()
+                .e_tag(resp.e_tag().unwrap())
+                .part_number(part_number)
+                .build(),
+        );
+    }
+
+    let complete = client
+        .complete_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .set_parts(Some(completed_parts))
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    complete.e_tag().unwrap().to_string()
+}
+
+/// Two-part multipart upload, verify ObjectParts TotalPartsCount, part sizes,
+/// and part numbers.
 #[test]
-#[ignore = "not implemented: GetObjectAttributes ObjectParts"]
 fn test_get_multipart_object_attributes() {
-    s3_tests::run(async {});
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let part1 = vec![b'a'; PART_SIZE];
+        let part2 = vec![b'b'; 1024];
+        do_multipart_upload(&bucket, "mpu", &[part1, part2]).await;
+
+        let resp = client
+            .get_object_attributes()
+            .bucket(&bucket)
+            .key("mpu")
+            .object_attributes(ObjectAttributes::ObjectParts)
+            .object_attributes(ObjectAttributes::ObjectSize)
+            .send()
+            .await
+            .unwrap();
+
+        let parts_info = resp.object_parts().expect("expected ObjectParts");
+        assert_eq!(parts_info.total_parts_count(), Some(2));
+        let parts = parts_info.parts();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].part_number(), Some(1));
+        assert_eq!(parts[0].size(), Some(PART_SIZE as i64));
+        assert_eq!(parts[1].part_number(), Some(2));
+        assert_eq!(parts[1].size(), Some(1024));
+        assert_eq!(parts_info.is_truncated(), Some(false));
+
+        assert_eq!(resp.object_size(), Some((PART_SIZE + 1024) as i64));
+
+        cleanup(&bucket, &["mpu"]).await;
+    });
 }
 
+/// Single-part multipart upload, verify TotalPartsCount=1.
 #[test]
-#[ignore = "not implemented: GetObjectAttributes ObjectParts"]
 fn test_get_single_multipart_object_attributes() {
-    s3_tests::run(async {});
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let part1 = vec![b'x'; PART_SIZE];
+        do_multipart_upload(&bucket, "mpu-single", &[part1]).await;
+
+        let resp = client
+            .get_object_attributes()
+            .bucket(&bucket)
+            .key("mpu-single")
+            .object_attributes(ObjectAttributes::ObjectParts)
+            .send()
+            .await
+            .unwrap();
+
+        let parts_info = resp.object_parts().expect("expected ObjectParts");
+        assert_eq!(parts_info.total_parts_count(), Some(1));
+        assert_eq!(parts_info.parts().len(), 1);
+        assert_eq!(parts_info.parts()[0].part_number(), Some(1));
+        assert_eq!(parts_info.parts()[0].size(), Some(PART_SIZE as i64));
+
+        cleanup(&bucket, &["mpu-single"]).await;
+    });
 }
 
+/// Three-part multipart upload with pagination: max_parts(1), verify truncation
+/// and NextPartNumberMarker, then fetch next page.
 #[test]
-#[ignore = "not implemented: GetObjectAttributes ObjectParts"]
 fn test_get_paginated_multipart_object_attributes() {
-    s3_tests::run(async {});
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let parts: Vec<Vec<u8>> = vec![
+            vec![b'a'; PART_SIZE],
+            vec![b'b'; PART_SIZE],
+            vec![b'c'; 1024],
+        ];
+        do_multipart_upload(&bucket, "mpu-page", &parts).await;
+
+        // Page 1: max_parts=1
+        let resp = client
+            .get_object_attributes()
+            .bucket(&bucket)
+            .key("mpu-page")
+            .object_attributes(ObjectAttributes::ObjectParts)
+            .max_parts(1)
+            .send()
+            .await
+            .unwrap();
+
+        let p1 = resp.object_parts().expect("expected ObjectParts page 1");
+        assert_eq!(p1.total_parts_count(), Some(3));
+        assert_eq!(p1.is_truncated(), Some(true));
+        assert_eq!(p1.parts().len(), 1);
+        assert_eq!(p1.parts()[0].part_number(), Some(1));
+        let next_marker = p1
+            .next_part_number_marker()
+            .expect("expected NextPartNumberMarker");
+
+        // Page 2: use marker from page 1, max_parts=1
+        let resp2 = client
+            .get_object_attributes()
+            .bucket(&bucket)
+            .key("mpu-page")
+            .object_attributes(ObjectAttributes::ObjectParts)
+            .max_parts(1)
+            .part_number_marker(next_marker)
+            .send()
+            .await
+            .unwrap();
+
+        let p2 = resp2.object_parts().expect("expected ObjectParts page 2");
+        assert_eq!(p2.total_parts_count(), Some(3));
+        assert_eq!(p2.is_truncated(), Some(true));
+        assert_eq!(p2.parts().len(), 1);
+        assert_eq!(p2.parts()[0].part_number(), Some(2));
+
+        // Page 3: last page
+        let next_marker2 = p2
+            .next_part_number_marker()
+            .expect("expected NextPartNumberMarker page 2");
+        let resp3 = client
+            .get_object_attributes()
+            .bucket(&bucket)
+            .key("mpu-page")
+            .object_attributes(ObjectAttributes::ObjectParts)
+            .max_parts(1)
+            .part_number_marker(next_marker2)
+            .send()
+            .await
+            .unwrap();
+
+        let p3 = resp3.object_parts().expect("expected ObjectParts page 3");
+        assert_eq!(p3.is_truncated(), Some(false));
+        assert_eq!(p3.parts().len(), 1);
+        assert_eq!(p3.parts()[0].part_number(), Some(3));
+        assert!(p3.next_part_number_marker().is_none());
+
+        cleanup(&bucket, &["mpu-page"]).await;
+    });
+}
+
+/// max_parts=0 should return IsTruncated=true, empty parts list,
+/// TotalPartsCount with the real count, and a NextPartNumberMarker so
+/// the caller knows where pagination would start.
+#[test]
+fn test_get_zero_max_parts_object_attributes() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let part1 = vec![b'a'; PART_SIZE];
+        let part2 = vec![b'b'; 1024];
+        do_multipart_upload(&bucket, "mpu-zero", &[part1, part2]).await;
+
+        let resp = client
+            .get_object_attributes()
+            .bucket(&bucket)
+            .key("mpu-zero")
+            .object_attributes(ObjectAttributes::ObjectParts)
+            .max_parts(0)
+            .send()
+            .await
+            .unwrap();
+
+        let parts_info = resp.object_parts().expect("expected ObjectParts");
+        assert_eq!(parts_info.total_parts_count(), Some(2));
+        assert_eq!(parts_info.is_truncated(), Some(true));
+        assert!(parts_info.parts().is_empty());
+        // NextPartNumberMarker must be present so callers can advance
+        assert!(parts_info.next_part_number_marker().is_some());
+
+        cleanup(&bucket, &["mpu-zero"]).await;
+    });
 }
 
 #[test]
-#[ignore = "not implemented: GetObjectAttributes ObjectParts"]
+#[ignore = "not implemented: per-part checksums in GetObjectAttributes"]
 fn test_get_multipart_checksum_object_attributes() {
     s3_tests::run(async {});
 }

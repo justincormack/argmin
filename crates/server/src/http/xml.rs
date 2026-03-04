@@ -1,7 +1,7 @@
 /// Hand-formatted XML for S3 responses. No XML library dependency.
 use crate::coordinator::{
     CompletePart, DeleteError, DeletedObject, ListMultipartUploadsResult, ListObjectVersionsResult,
-    ListObjectsResult, ListPartsResult,
+    ListObjectsResult, ListPartsResult, ObjectPartsInfo,
 };
 use crate::error::ServerError;
 use auth::canonical::uri_encode_path;
@@ -1170,6 +1170,7 @@ pub fn get_object_attributes_xml(
     etag: &str,
     size: u64,
     checksum_entries: &[(&str, &str)],
+    object_parts: Option<&ObjectPartsInfo>,
 ) -> String {
     let mut xml = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -1211,7 +1212,41 @@ pub fn get_object_attributes_xml(
                 xml.push_str("</ObjectSize>");
             }
             "ObjectParts" => {
-                // Multipart not yet supported — omit for non-multipart objects
+                if let Some(parts_info) = object_parts {
+                    xml.push_str("<ObjectParts>");
+                    xml.push_str("<PartsCount>");
+                    xml.push_str(&parts_info.total_parts_count.to_string());
+                    xml.push_str("</PartsCount>");
+                    xml.push_str("<PartNumberMarker>");
+                    xml.push_str(&parts_info.part_number_marker.to_string());
+                    xml.push_str("</PartNumberMarker>");
+                    xml.push_str("<MaxParts>");
+                    xml.push_str(&parts_info.max_parts.to_string());
+                    xml.push_str("</MaxParts>");
+                    xml.push_str("<IsTruncated>");
+                    xml.push_str(if parts_info.is_truncated {
+                        "true"
+                    } else {
+                        "false"
+                    });
+                    xml.push_str("</IsTruncated>");
+                    if let Some(next) = parts_info.next_part_number_marker {
+                        xml.push_str("<NextPartNumberMarker>");
+                        xml.push_str(&next.to_string());
+                        xml.push_str("</NextPartNumberMarker>");
+                    }
+                    for part in &parts_info.parts {
+                        xml.push_str("<Part>");
+                        xml.push_str("<PartNumber>");
+                        xml.push_str(&part.part_number.to_string());
+                        xml.push_str("</PartNumber>");
+                        xml.push_str("<Size>");
+                        xml.push_str(&part.size.to_string());
+                        xml.push_str("</Size>");
+                        xml.push_str("</Part>");
+                    }
+                    xml.push_str("</ObjectParts>");
+                }
             }
             _ => {}
         }
@@ -2419,6 +2454,7 @@ mod tests {
             "\"abc123\"",
             1024,
             &[("x-amz-checksum-sha256", "base64hash==")],
+            None,
         );
         assert!(xml.contains("<GetObjectAttributesResponse>"));
         assert!(xml.contains("<ETag>abc123</ETag>"));
@@ -2430,7 +2466,7 @@ mod tests {
 
     #[test]
     fn get_object_attributes_etag_only() {
-        let xml = get_object_attributes_xml(&["ETag"], "\"abcdef\"", 0, &[]);
+        let xml = get_object_attributes_xml(&["ETag"], "\"abcdef\"", 0, &[], None);
         assert!(xml.contains("<ETag>abcdef</ETag>"));
         assert!(!xml.contains("<StorageClass>"));
         assert!(!xml.contains("<ObjectSize>"));
@@ -2439,14 +2475,14 @@ mod tests {
 
     #[test]
     fn get_object_attributes_size_only() {
-        let xml = get_object_attributes_xml(&["ObjectSize"], "\"x\"", 42, &[]);
+        let xml = get_object_attributes_xml(&["ObjectSize"], "\"x\"", 42, &[], None);
         assert!(xml.contains("<ObjectSize>42</ObjectSize>"));
         assert!(!xml.contains("<ETag>"));
     }
 
     #[test]
     fn get_object_attributes_no_checksum_entries() {
-        let xml = get_object_attributes_xml(&["Checksum"], "\"x\"", 0, &[]);
+        let xml = get_object_attributes_xml(&["Checksum"], "\"x\"", 0, &[], None);
         // Checksum element should be omitted when there are no checksum entries
         assert!(!xml.contains("<Checksum>"));
     }
@@ -2461,6 +2497,7 @@ mod tests {
                 ("x-amz-checksum-crc32", "AAAAAA=="),
                 ("x-amz-checksum-sha256", "BBBBBB=="),
             ],
+            None,
         );
         assert!(xml.contains("<ChecksumCRC32>AAAAAA==</ChecksumCRC32>"));
         assert!(xml.contains("<ChecksumSHA256>BBBBBB==</ChecksumSHA256>"));
@@ -2468,9 +2505,73 @@ mod tests {
 
     #[test]
     fn get_object_attributes_object_parts_omitted() {
-        let xml = get_object_attributes_xml(&["ObjectParts"], "\"x\"", 0, &[]);
+        let xml = get_object_attributes_xml(&["ObjectParts"], "\"x\"", 0, &[], None);
         // ObjectParts should be omitted for non-multipart objects
         assert!(!xml.contains("<ObjectParts>"));
+    }
+
+    #[test]
+    fn get_object_attributes_object_parts_rendered() {
+        use crate::coordinator::{ObjectPartEntry, ObjectPartsInfo};
+        let parts_info = ObjectPartsInfo {
+            total_parts_count: 3,
+            parts: vec![
+                ObjectPartEntry {
+                    part_number: 1,
+                    size: 5242880,
+                },
+                ObjectPartEntry {
+                    part_number: 2,
+                    size: 1024,
+                },
+            ],
+            is_truncated: true,
+            next_part_number_marker: Some(2),
+            max_parts: 2,
+            part_number_marker: 0,
+        };
+        let xml = get_object_attributes_xml(
+            &["ObjectParts"],
+            "\"x\"",
+            0,
+            &[],
+            Some(&parts_info),
+        );
+        assert!(xml.contains("<ObjectParts>"));
+        assert!(xml.contains("<PartsCount>3</PartsCount>"));
+        assert!(xml.contains("<PartNumberMarker>0</PartNumberMarker>"));
+        assert!(xml.contains("<MaxParts>2</MaxParts>"));
+        assert!(xml.contains("<IsTruncated>true</IsTruncated>"));
+        assert!(xml.contains("<NextPartNumberMarker>2</NextPartNumberMarker>"));
+        assert!(xml.contains("<Part><PartNumber>1</PartNumber><Size>5242880</Size></Part>"));
+        assert!(xml.contains("<Part><PartNumber>2</PartNumber><Size>1024</Size></Part>"));
+        assert!(xml.contains("</ObjectParts>"));
+    }
+
+    #[test]
+    fn get_object_attributes_object_parts_not_truncated() {
+        use crate::coordinator::{ObjectPartEntry, ObjectPartsInfo};
+        let parts_info = ObjectPartsInfo {
+            total_parts_count: 1,
+            parts: vec![ObjectPartEntry {
+                part_number: 1,
+                size: 100,
+            }],
+            is_truncated: false,
+            next_part_number_marker: None,
+            max_parts: 1000,
+            part_number_marker: 0,
+        };
+        let xml = get_object_attributes_xml(
+            &["ObjectParts"],
+            "\"x\"",
+            0,
+            &[],
+            Some(&parts_info),
+        );
+        assert!(xml.contains("<IsTruncated>false</IsTruncated>"));
+        assert!(!xml.contains("<NextPartNumberMarker>"));
+        assert!(xml.contains("<PartsCount>1</PartsCount>"));
     }
 
     #[test]
