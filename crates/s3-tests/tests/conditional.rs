@@ -1051,7 +1051,7 @@ fn test_delete_object_if_match_last_modified_time() {
             .send()
             .await
             .unwrap();
-        let last_modified = head.last_modified().unwrap().clone();
+        let last_modified = *head.last_modified().unwrap();
 
         // Delete with wrong last-modified → 412
         let wrong_time = DateTime::from_secs(0);

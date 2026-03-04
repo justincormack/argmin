@@ -104,11 +104,11 @@ fn presigned_put_url(
     };
 
     // Build canonical query string (sorted)
-    let mut qs_parts = vec![
+    let mut qs_parts = [
         format!("X-Amz-Algorithm={}", uri_encode("AWS4-HMAC-SHA256")),
         format!("X-Amz-Credential={}", uri_encode(&credential)),
         format!("X-Amz-Date={}", uri_encode(&date_long)),
-        format!("X-Amz-Expires=900"),
+        "X-Amz-Expires=900".to_string(),
         format!("X-Amz-SignedHeaders={}", uri_encode(&signed_headers)),
     ];
     qs_parts.sort();
