@@ -471,8 +471,132 @@ fn test_get_zero_max_parts_object_attributes() {
     });
 }
 
+/// Multipart upload with CRC32 checksums, verify per-part checksums and
+/// object-level checksum in GetObjectAttributes response.
 #[test]
-#[ignore = "not implemented: per-part checksums in GetObjectAttributes"]
 fn test_get_multipart_checksum_object_attributes() {
-    s3_tests::run(async {});
+    use aws_sdk_s3::types::ChecksumMode;
+
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let key = "mpu-cksum";
+        let part1_data = vec![b'X'; PART_SIZE];
+        let part2_data = vec![b'Y'; 1024];
+
+        // CreateMultipartUpload with CRC32
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .checksum_algorithm(ChecksumAlgorithm::Crc32)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap();
+
+        // Upload parts with CRC32 checksums (server computes them)
+        let resp1 = client
+            .upload_part()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(1)
+            .body(ByteStream::from(part1_data))
+            .checksum_algorithm(ChecksumAlgorithm::Crc32)
+            .send()
+            .await
+            .unwrap();
+        let cksum1 = resp1.checksum_crc32().unwrap().to_string();
+
+        let resp2 = client
+            .upload_part()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(2)
+            .body(ByteStream::from(part2_data))
+            .checksum_algorithm(ChecksumAlgorithm::Crc32)
+            .send()
+            .await
+            .unwrap();
+        let cksum2 = resp2.checksum_crc32().unwrap().to_string();
+
+        // Complete
+        let _complete = client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(resp1.e_tag().unwrap())
+                            .checksum_crc32(&cksum1)
+                            .part_number(1)
+                            .build(),
+                    )
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(resp2.e_tag().unwrap())
+                            .checksum_crc32(&cksum2)
+                            .part_number(2)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        // GetObjectAttributes: Checksum should show object-level checksum + type
+        let resp = client
+            .get_object_attributes()
+            .bucket(&bucket)
+            .key(key)
+            .object_attributes(ObjectAttributes::Checksum)
+            .object_attributes(ObjectAttributes::ObjectParts)
+            .send()
+            .await
+            .unwrap();
+
+        let checksum = resp.checksum().expect("expected Checksum");
+        assert!(
+            checksum.checksum_crc32().is_some(),
+            "expected CRC32 in Checksum"
+        );
+        assert_eq!(
+            checksum.checksum_type(),
+            Some(&aws_sdk_s3::types::ChecksumType::FullObject),
+            "expected FULL_OBJECT type"
+        );
+
+        // ObjectParts should include per-part checksums
+        let parts_info = resp.object_parts().expect("expected ObjectParts");
+        assert_eq!(parts_info.total_parts_count(), Some(2));
+        let parts = parts_info.parts();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].checksum_crc32(), Some(cksum1.as_str()));
+        assert_eq!(parts[1].checksum_crc32(), Some(cksum2.as_str()));
+
+        // HeadObject with ChecksumMode=ENABLED should also return checksum + type
+        let head = client
+            .head_object()
+            .bucket(&bucket)
+            .key(key)
+            .checksum_mode(ChecksumMode::Enabled)
+            .send()
+            .await
+            .unwrap();
+        assert!(head.checksum_crc32().is_some());
+        assert_eq!(
+            head.checksum_type(),
+            Some(&aws_sdk_s3::types::ChecksumType::FullObject)
+        );
+
+        cleanup(&bucket, &[key]).await;
+    });
 }

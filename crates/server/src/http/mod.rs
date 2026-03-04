@@ -934,7 +934,7 @@ impl HttpFrontend {
                     })?;
 
                 // Extract claimed checksum from request headers (at most one).
-                let claimed_checksum = extract_part_checksum(req)?;
+                let claimed_checksum = extract_checksum_header(req)?;
                 let claimed_ref = claimed_checksum
                     .as_ref()
                     .map(|(algo, val)| (*algo, val.as_str()));
@@ -961,9 +961,19 @@ impl HttpFrontend {
                             reason: "missing uploadId query parameter".to_string(),
                         })?;
                 let parts = xml::parse_complete_multipart_upload_xml(&req.body)?;
-                let result = self
-                    .coordinator
-                    .complete_multipart_upload(&bucket, &key, &upload_id, &parts)?;
+                // Extract object-level checksum claim from request headers.
+                // Reject multiple checksum headers, same as UploadPart.
+                let claimed_checksum = extract_checksum_header(req)?;
+                let claimed_ref = claimed_checksum
+                    .as_ref()
+                    .map(|(algo, val)| (*algo, val.as_str()));
+                let result = self.coordinator.complete_multipart_upload(
+                    &bucket,
+                    &key,
+                    &upload_id,
+                    &parts,
+                    claimed_ref,
+                )?;
                 Ok(S3Response::complete_multipart_upload(
                     &bucket,
                     &key,
@@ -1449,14 +1459,27 @@ fn validate_checksum_headers(req: &S3Request) -> Result<(), ServerError> {
     Ok(())
 }
 
-/// Extract a claimed checksum from request headers for UploadPart.
+/// Count how many times a header name appears in the request.
+fn header_count(req: &S3Request, name: &str) -> usize {
+    req.headers.iter().filter(|(k, _)| k == name).count()
+}
+
+/// Extract a claimed checksum from request headers (shared by UploadPart and
+/// CompleteMultipartUpload).
 ///
-/// Returns `(ChecksumAlgorithm, base64_value)` if exactly one checksum header
-/// is present. Returns an error if multiple checksum headers are present or
-/// if `x-amz-checksum-algorithm` contradicts the value header.
-fn extract_part_checksum(
+/// Returns `(ChecksumAlgorithm, base64_value)` if exactly one checksum value
+/// header is present. Rejects if:
+/// - multiple distinct checksum value headers are present (e.g. crc32 + sha256)
+/// - the same checksum header appears more than once
+/// - `x-amz-checksum-algorithm` contradicts the value header's algorithm
+fn extract_checksum_header(
     req: &S3Request,
 ) -> Result<Option<(ChecksumAlgorithm, String)>, ServerError> {
+    if header_count(req, "x-amz-checksum-algorithm") > 1 {
+        return Err(ServerError::InvalidRequest {
+            reason: "duplicate header: x-amz-checksum-algorithm".into(),
+        });
+    }
     let algo_header = req.header("x-amz-checksum-algorithm");
     let mut found: Option<(ChecksumAlgorithm, String)> = None;
     for &(algo_name, header) in CHECKSUM_HEADERS {
@@ -1464,6 +1487,13 @@ fn extract_part_checksum(
             if found.is_some() {
                 return Err(ServerError::InvalidRequest {
                     reason: "only one checksum header may be specified".into(),
+                });
+            }
+            // Reject duplicate same-name headers (req.header returns only
+            // the first, so a second with a different value would be silent).
+            if header_count(req, header) > 1 {
+                return Err(ServerError::InvalidRequest {
+                    reason: format!("duplicate header: {header}"),
                 });
             }
             // Cross-check x-amz-checksum-algorithm if present.
@@ -1635,6 +1665,207 @@ mod tests {
         let op = S3Operation::CompleteMultipartUpload {
             bucket: "mybucket".to_string(),
             key: "mykey".to_string(),
+        };
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::InvalidRequest { .. }) => {}
+            Err(e) => panic!("expected InvalidRequest, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn complete_multipart_multiple_checksum_headers_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+
+        let upload_id = create_upload_with_checksum(&fe, "mybucket", "k", Some("CRC32"));
+        let xml = format!(
+            "<CompleteMultipartUpload>\
+               <Part><PartNumber>1</PartNumber><ETag>\"x\"</ETag></Part>\
+             </CompleteMultipartUpload>"
+        );
+        let req = S3Request {
+            method: String::new(),
+            path: String::new(),
+            query_string: format!("uploadId={upload_id}"),
+            headers: vec![
+                ("x-amz-checksum-crc32".to_string(), "AAAAAA==".to_string()),
+                ("x-amz-checksum-sha256".to_string(), "BBBBBB==".to_string()),
+            ],
+            body: xml.into_bytes(),
+        };
+        let op = S3Operation::CompleteMultipartUpload {
+            bucket: "mybucket".to_string(),
+            key: "k".to_string(),
+        };
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::InvalidRequest { .. }) => {}
+            Err(e) => panic!("expected InvalidRequest, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn complete_multipart_algorithm_header_contradicts_value_header() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+
+        let upload_id = create_upload_with_checksum(&fe, "mybucket", "k", Some("CRC32"));
+        let xml = format!(
+            "<CompleteMultipartUpload>\
+               <Part><PartNumber>1</PartNumber><ETag>\"x\"</ETag></Part>\
+             </CompleteMultipartUpload>"
+        );
+        let req = S3Request {
+            method: String::new(),
+            path: String::new(),
+            query_string: format!("uploadId={upload_id}"),
+            headers: vec![
+                // Algorithm header says SHA256 but value header is CRC32.
+                ("x-amz-checksum-algorithm".to_string(), "SHA256".to_string()),
+                ("x-amz-checksum-crc32".to_string(), "AAAAAA==".to_string()),
+            ],
+            body: xml.into_bytes(),
+        };
+        let op = S3Operation::CompleteMultipartUpload {
+            bucket: "mybucket".to_string(),
+            key: "k".to_string(),
+        };
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::InvalidRequest { .. }) => {}
+            Err(e) => panic!("expected InvalidRequest, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn complete_multipart_duplicate_same_checksum_header_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+
+        let upload_id = create_upload_with_checksum(&fe, "mybucket", "k", Some("CRC32"));
+        let xml = format!(
+            "<CompleteMultipartUpload>\
+               <Part><PartNumber>1</PartNumber><ETag>\"x\"</ETag></Part>\
+             </CompleteMultipartUpload>"
+        );
+        let req = S3Request {
+            method: String::new(),
+            path: String::new(),
+            query_string: format!("uploadId={upload_id}"),
+            headers: vec![
+                ("x-amz-checksum-crc32".to_string(), "AAAAAA==".to_string()),
+                ("x-amz-checksum-crc32".to_string(), "BBBBBB==".to_string()),
+            ],
+            body: xml.into_bytes(),
+        };
+        let op = S3Operation::CompleteMultipartUpload {
+            bucket: "mybucket".to_string(),
+            key: "k".to_string(),
+        };
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::InvalidRequest { .. }) => {}
+            Err(e) => panic!("expected InvalidRequest, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn complete_multipart_duplicate_checksum_algorithm_header_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+
+        let upload_id = create_upload_with_checksum(&fe, "mybucket", "k", Some("CRC32"));
+        let xml = format!(
+            "<CompleteMultipartUpload>\
+               <Part><PartNumber>1</PartNumber><ETag>\"x\"</ETag></Part>\
+             </CompleteMultipartUpload>"
+        );
+        let req = S3Request {
+            method: String::new(),
+            path: String::new(),
+            query_string: format!("uploadId={upload_id}"),
+            headers: vec![
+                (
+                    "x-amz-checksum-algorithm".to_string(),
+                    "CRC32".to_string(),
+                ),
+                (
+                    "x-amz-checksum-algorithm".to_string(),
+                    "SHA256".to_string(),
+                ),
+                ("x-amz-checksum-crc32".to_string(), "AAAAAA==".to_string()),
+            ],
+            body: xml.into_bytes(),
+        };
+        let op = S3Operation::CompleteMultipartUpload {
+            bucket: "mybucket".to_string(),
+            key: "k".to_string(),
+        };
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::InvalidRequest { .. }) => {}
+            Err(e) => panic!("expected InvalidRequest, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn complete_multipart_checksum_algo_mismatch_upload_rejected() {
+        // Upload created with CRC32 but complete sends SHA256 checksum header.
+        let tmp = tempfile::tempdir().unwrap();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+
+        let upload_id = create_upload_with_checksum(&fe, "mybucket", "k", Some("CRC32"));
+        // Upload a part so complete has something to work with.
+        let req = S3Request {
+            method: String::new(),
+            path: String::new(),
+            query_string: format!("partNumber=1&uploadId={upload_id}"),
+            headers: vec![],
+            body: vec![0u8; 1024],
+        };
+        let op = S3Operation::UploadPart {
+            bucket: "mybucket".to_string(),
+            key: "k".to_string(),
+        };
+        let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
+        let etag = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k == "ETag")
+            .map(|(_, v)| v.clone())
+            .unwrap();
+
+        let xml = format!(
+            "<CompleteMultipartUpload>\
+               <Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part>\
+             </CompleteMultipartUpload>"
+        );
+        let req = S3Request {
+            method: String::new(),
+            path: String::new(),
+            query_string: format!("uploadId={upload_id}"),
+            headers: vec![("x-amz-checksum-sha256".to_string(), "AAAAAA==".to_string())],
+            body: xml.into_bytes(),
+        };
+        let op = S3Operation::CompleteMultipartUpload {
+            bucket: "mybucket".to_string(),
+            key: "k".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
             Err(ServerError::InvalidRequest { .. }) => {}
@@ -2450,5 +2681,42 @@ mod tests {
             .iter()
             .any(|(k, _)| k == "x-amz-checksum-crc32");
         assert!(has_crc, "expected checksum header in response");
+    }
+
+    #[test]
+    fn upload_part_duplicate_checksum_algorithm_header_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+
+        let upload_id = create_upload_with_checksum(&fe, "mybucket", "k", Some("CRC32"));
+        let req = S3Request {
+            method: String::new(),
+            path: String::new(),
+            query_string: format!("partNumber=1&uploadId={upload_id}"),
+            headers: vec![
+                (
+                    "x-amz-checksum-algorithm".to_string(),
+                    "CRC32".to_string(),
+                ),
+                (
+                    "x-amz-checksum-algorithm".to_string(),
+                    "SHA256".to_string(),
+                ),
+                ("x-amz-checksum-crc32".to_string(), "AAAAAA==".to_string()),
+            ],
+            body: vec![1, 2, 3, 4],
+        };
+        let op = S3Operation::UploadPart {
+            bucket: "mybucket".to_string(),
+            key: "k".to_string(),
+        };
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::InvalidRequest { .. }) => {}
+            Err(e) => panic!("expected InvalidRequest, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
     }
 }

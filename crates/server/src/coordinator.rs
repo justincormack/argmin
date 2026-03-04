@@ -2649,6 +2649,7 @@ impl Coordinator {
         key: &str,
         upload_id: &str,
         parts: &[CompletePart],
+        claimed_checksum: Option<(ChecksumAlgorithm, &str)>,
     ) -> Result<CompleteMultipartUploadResult, ServerError> {
         // 1. Validate bucket exists and get versioning state.
         let bucket_info = self.head_bucket(bucket)?;
@@ -2707,6 +2708,14 @@ impl Coordinator {
             if stored_etag != cp.etag {
                 return Err(ServerError::InvalidPart {
                     part_number: cp.part_number,
+                });
+            }
+
+            // When the upload has a checksum algorithm, every part must include
+            // its checksum in the complete request.
+            if checksum_algo.is_some() && cp.checksum.is_none() {
+                return Err(ServerError::InvalidRequest {
+                    reason: format!("part {} missing required checksum", cp.part_number),
                 });
             }
 
@@ -2861,6 +2870,36 @@ impl Coordinator {
         } else {
             None
         };
+
+        // 8b'. Validate claimed object-level checksum if provided.
+        if let Some((claimed_algo, claimed_value)) = claimed_checksum {
+            // Algorithm of the header must match the upload's algorithm.
+            match checksum_algo {
+                Some(upload_algo) if claimed_algo != upload_algo => {
+                    return Err(ServerError::InvalidRequest {
+                        reason: format!(
+                            "checksum header algorithm {} does not match upload algorithm {}",
+                            claimed_algo.as_str(),
+                            upload_algo.as_str()
+                        ),
+                    });
+                }
+                None => {
+                    // Client sent a checksum header but upload has no checksum algorithm.
+                    return Err(ServerError::InvalidRequest {
+                        reason: "checksum header sent but upload has no checksum algorithm"
+                            .to_string(),
+                    });
+                }
+                _ => {}
+            }
+            // Value must match computed checksum.
+            if let Some(ref computed) = checksum_value {
+                if computed != claimed_value {
+                    return Err(ServerError::BadDigest);
+                }
+            }
+        }
 
         // 8c. Persist checksum in metadata blob.
         let mut metadata_blob_bytes = upload.metadata_blob.clone();
@@ -5973,7 +6012,7 @@ mod tests {
             create_upload_with_parts(&coord, "bucket", "key", &[(1, &big_part), (2, small_last)]);
 
         let result = coord
-            .complete_multipart_upload("bucket", "key", &upload_id, &parts)
+            .complete_multipart_upload("bucket", "key", &upload_id, &parts, None)
             .unwrap();
 
         // ETag should be composite format: "hex-2"
@@ -6020,7 +6059,7 @@ mod tests {
         );
 
         let err = coord
-            .complete_multipart_upload("bucket", "key", &upload_id, &parts)
+            .complete_multipart_upload("bucket", "key", &upload_id, &parts, None)
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidPart { part_number: 2 }));
     }
@@ -6038,7 +6077,7 @@ mod tests {
         parts[0].etag = "\"ffffffffffffffff\"".to_string();
 
         let err = coord
-            .complete_multipart_upload("bucket", "key", &upload_id, &parts)
+            .complete_multipart_upload("bucket", "key", &upload_id, &parts, None)
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidPart { part_number: 1 }));
     }
@@ -6055,7 +6094,7 @@ mod tests {
         // Reverse the order.
         let reversed = vec![parts[1].clone(), parts[0].clone()];
         let err = coord
-            .complete_multipart_upload("bucket", "key", &upload_id, &reversed)
+            .complete_multipart_upload("bucket", "key", &upload_id, &reversed, None)
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidPartOrder));
     }
@@ -6075,7 +6114,7 @@ mod tests {
         );
 
         let err = coord
-            .complete_multipart_upload("bucket", "key", &upload_id, &parts)
+            .complete_multipart_upload("bucket", "key", &upload_id, &parts, None)
             .unwrap_err();
         assert!(matches!(
             err,
@@ -6093,7 +6132,7 @@ mod tests {
         let (upload_id, parts) = create_upload_with_parts(&coord, "bucket", "key", &[(1, b"tiny")]);
 
         let result = coord
-            .complete_multipart_upload("bucket", "key", &upload_id, &parts)
+            .complete_multipart_upload("bucket", "key", &upload_id, &parts, None)
             .unwrap();
         assert!(result.etag.ends_with("-1\""));
     }
@@ -6110,7 +6149,7 @@ mod tests {
             .unwrap();
 
         let err = coord
-            .complete_multipart_upload("bucket", "key", &create.upload_id, &[])
+            .complete_multipart_upload("bucket", "key", &create.upload_id, &[], None)
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidRequest { .. }));
     }
@@ -6127,7 +6166,7 @@ mod tests {
 
         // First attempt fails because part 1 is too small.
         let err = coord
-            .complete_multipart_upload("bucket", "key", &upload_id, &parts)
+            .complete_multipart_upload("bucket", "key", &upload_id, &parts, None)
             .unwrap_err();
         assert!(matches!(err, ServerError::EntityTooSmall { .. }));
 
@@ -6146,7 +6185,7 @@ mod tests {
             parts[1].clone(),
         ];
         let result = coord
-            .complete_multipart_upload("bucket", "key", &upload_id, &retry_parts)
+            .complete_multipart_upload("bucket", "key", &upload_id, &retry_parts, None)
             .unwrap();
         assert!(result.etag.ends_with("-2\""));
     }
@@ -6163,7 +6202,7 @@ mod tests {
         // Duplicate part number 1.
         let duped = vec![parts[0].clone(), parts[0].clone()];
         let err = coord
-            .complete_multipart_upload("bucket", "key", &upload_id, &duped)
+            .complete_multipart_upload("bucket", "key", &upload_id, &duped, None)
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidPartOrder));
     }
@@ -6178,7 +6217,7 @@ mod tests {
         let (upload_id1, parts1) =
             create_upload_with_parts(&coord, "bucket", "key", &[(1, b"first-upload")]);
         let result1 = coord
-            .complete_multipart_upload("bucket", "key", &upload_id1, &parts1)
+            .complete_multipart_upload("bucket", "key", &upload_id1, &parts1, None)
             .unwrap();
         assert!(result1.etag.ends_with("-1\""));
 
@@ -6191,7 +6230,7 @@ mod tests {
             &[(1, &big_part), (2, b"second-data-b")],
         );
         let result2 = coord
-            .complete_multipart_upload("bucket", "key", &upload_id2, &parts2)
+            .complete_multipart_upload("bucket", "key", &upload_id2, &parts2, None)
             .unwrap();
         assert!(result2.etag.ends_with("-2\""));
         assert_ne!(result1.etag, result2.etag);
@@ -6216,7 +6255,7 @@ mod tests {
         let (upload_id, parts) =
             create_upload_with_parts(&coord, "bucket", "key", &[(1, b"data1")]);
         let result = coord
-            .complete_multipart_upload("bucket", "key", &upload_id, &parts)
+            .complete_multipart_upload("bucket", "key", &upload_id, &parts, None)
             .unwrap();
 
         // list_objects_v2 should return the composite ETag with -N suffix.
@@ -6242,7 +6281,7 @@ mod tests {
         let (upload_id, parts) =
             create_upload_with_parts(&coord, "bucket", "key", &[(1, b"data1")]);
         let result = coord
-            .complete_multipart_upload("bucket", "key", &upload_id, &parts)
+            .complete_multipart_upload("bucket", "key", &upload_id, &parts, None)
             .unwrap();
 
         let versions = coord
@@ -6360,7 +6399,7 @@ mod tests {
         let (upload_id, parts) =
             create_upload_with_parts(&coord, "bucket", "key", &[(1, b"data1")]);
         coord
-            .complete_multipart_upload("bucket", "key", &upload_id, &parts)
+            .complete_multipart_upload("bucket", "key", &upload_id, &parts, None)
             .unwrap();
 
         // Abort the same upload_id should fail (already deleted by complete).
@@ -6643,7 +6682,7 @@ mod tests {
             });
         }
         coord
-            .complete_multipart_upload(bucket, key, &create.upload_id, &complete_parts)
+            .complete_multipart_upload(bucket, key, &create.upload_id, &complete_parts, None)
             .unwrap()
     }
 
@@ -6998,7 +7037,7 @@ mod tests {
         );
 
         let result = coord
-            .complete_multipart_upload("bucket", "key", &upload_id, &parts)
+            .complete_multipart_upload("bucket", "key", &upload_id, &parts, None)
             .unwrap();
 
         assert_eq!(result.checksum_algorithm, Some(ChecksumAlgorithm::Sha256));
@@ -7038,7 +7077,7 @@ mod tests {
         );
 
         let result = coord
-            .complete_multipart_upload("bucket", "key", &upload_id, &parts)
+            .complete_multipart_upload("bucket", "key", &upload_id, &parts, None)
             .unwrap();
 
         assert_eq!(result.checksum_algorithm, Some(ChecksumAlgorithm::Crc32));
@@ -7072,7 +7111,7 @@ mod tests {
         );
 
         let result = coord
-            .complete_multipart_upload("bucket", "key", &upload_id, &parts)
+            .complete_multipart_upload("bucket", "key", &upload_id, &parts, None)
             .unwrap();
 
         assert_eq!(result.checksum_algorithm, Some(ChecksumAlgorithm::Crc32c));
@@ -7105,7 +7144,7 @@ mod tests {
         );
 
         let result = coord
-            .complete_multipart_upload("bucket", "key", &upload_id, &parts)
+            .complete_multipart_upload("bucket", "key", &upload_id, &parts, None)
             .unwrap();
 
         assert_eq!(
@@ -7142,7 +7181,7 @@ mod tests {
         );
 
         let result = coord
-            .complete_multipart_upload("bucket", "key", &upload_id, &parts)
+            .complete_multipart_upload("bucket", "key", &upload_id, &parts, None)
             .unwrap();
 
         assert_eq!(result.checksum_algorithm, Some(ChecksumAlgorithm::Crc32));
@@ -7182,7 +7221,7 @@ mod tests {
         parts[0].checksum = Some((ChecksumAlgorithm::Crc32, "AAAAAAAA".to_string()));
 
         let err = coord
-            .complete_multipart_upload("bucket", "key", &upload_id, &parts)
+            .complete_multipart_upload("bucket", "key", &upload_id, &parts, None)
             .unwrap_err();
         assert!(
             matches!(err, ServerError::BadDigest),
@@ -7202,7 +7241,7 @@ mod tests {
             create_upload_with_parts(&coord, "bucket", "key", &[(1, &big), (2, small)]);
 
         let result = coord
-            .complete_multipart_upload("bucket", "key", &upload_id, &parts)
+            .complete_multipart_upload("bucket", "key", &upload_id, &parts, None)
             .unwrap();
 
         assert_eq!(result.checksum_algorithm, None);
@@ -7233,7 +7272,7 @@ mod tests {
         parts[0].checksum = Some((ChecksumAlgorithm::Sha256, correct_value));
 
         let err = coord
-            .complete_multipart_upload("bucket", "key", &upload_id, &parts)
+            .complete_multipart_upload("bucket", "key", &upload_id, &parts, None)
             .unwrap_err();
         assert!(
             matches!(err, ServerError::InvalidRequest { .. }),
