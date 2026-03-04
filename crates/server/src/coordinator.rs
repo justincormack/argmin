@@ -194,6 +194,10 @@ pub struct DeleteObjectsResult {
 #[derive(Debug)]
 pub struct UploadPartResult {
     pub etag: String,
+    /// Checksum algorithm used for this part (if any).
+    pub checksum_algorithm: Option<ChecksumAlgorithm>,
+    /// Raw checksum bytes for this part (if any).
+    pub checksum_bytes: Option<Vec<u8>>,
 }
 
 /// Result of a CreateMultipartUpload operation.
@@ -2366,6 +2370,7 @@ impl Coordinator {
         upload_id: &str,
         part_number: u32,
         data: &[u8],
+        claimed_checksum: Option<(ChecksumAlgorithm, &str)>,
     ) -> Result<UploadPartResult, ServerError> {
         // 1. Validate part number range [1, 10000].
         if part_number == 0 || part_number > 10_000 {
@@ -2381,7 +2386,7 @@ impl Coordinator {
         //    if meta_pg_id > shard_pg_id, drop, relock in order, and re-read.
         let meta_pg_id = derive_pg(bucket, key, self.pg_count);
 
-        let (meta_pg, shard_guard, generation, _shard_pg_id) = loop {
+        let (meta_pg, shard_guard, generation, _shard_pg_id, upload_checksum_algo) = loop {
             let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
 
             // Validate upload exists, belongs to this bucket/key, and is InProgress.
@@ -2396,6 +2401,7 @@ impl Coordinator {
                     upload_id: upload_id.to_string(),
                 });
             }
+            let upload_algo = upload.checksum_algorithm;
 
             // Determine next generation for this part number.
             let generation = match meta_pg.get_multipart_part(upload_id, part_number) {
@@ -2412,13 +2418,13 @@ impl Coordinator {
             );
 
             if shard_pg_id == meta_pg_id {
-                break (meta_pg, None, generation, shard_pg_id);
+                break (meta_pg, None, generation, shard_pg_id, upload_algo);
             }
 
             if meta_pg_id < shard_pg_id {
                 // Already in ascending order.
                 let shard_guard = self.storage_node.get_pg(shard_pg_id)?;
-                break (meta_pg, Some(shard_guard), generation, shard_pg_id);
+                break (meta_pg, Some(shard_guard), generation, shard_pg_id, upload_algo);
             }
 
             // Out of order: drop meta_pg, relock both in ascending order, revalidate.
@@ -2436,6 +2442,7 @@ impl Coordinator {
                     upload_id: upload_id.to_string(),
                 });
             }
+            let upload_algo = upload.checksum_algorithm;
 
             let generation = match meta_pg.get_multipart_part(upload_id, part_number) {
                 Ok(existing) => existing.generation + 1,
@@ -2455,14 +2462,52 @@ impl Coordinator {
                 continue;
             }
 
-            break (meta_pg, shard_guard, generation, shard_pg_id);
+            break (meta_pg, shard_guard, generation, shard_pg_id, upload_algo);
         };
 
-        // 3. Compute part identity.
+        // 3. Validate and compute part checksum.
+        //    The upload's checksum_algorithm is the single source of truth.
+        //    Parts may only carry a checksum if the upload was configured with one,
+        //    and it must match. This prevents untagged raw bytes from being stored.
+        let claimed_algo = claimed_checksum.as_ref().map(|(a, _)| *a);
+        let effective_algo = match (upload_checksum_algo, claimed_algo) {
+            (Some(upload_algo), Some(part_algo)) if upload_algo != part_algo => {
+                return Err(ServerError::InvalidRequest {
+                    reason: format!(
+                        "checksum algorithm mismatch: upload configured with {} but part sent {}",
+                        upload_algo.as_str(),
+                        part_algo.as_str()
+                    ),
+                });
+            }
+            (Some(algo), _) => Some(algo),
+            (None, Some(part_algo)) => {
+                return Err(ServerError::InvalidRequest {
+                    reason: format!(
+                        "checksum header {} not allowed: upload was not configured with a checksum algorithm",
+                        part_algo.as_str()
+                    ),
+                });
+            }
+            (None, None) => None,
+        };
+
+        let checksum_bytes = effective_algo.map(|algo| compute_checksum(algo, data));
+
+        // Verify claimed checksum value if present.
+        if let (Some((_, claimed_b64)), Some(ref actual)) = (&claimed_checksum, &checksum_bytes) {
+            use base64::Engine;
+            let actual_b64 = base64::engine::general_purpose::STANDARD.encode(actual);
+            if *claimed_b64 != actual_b64 {
+                return Err(ServerError::BadDigest);
+            }
+        }
+
+        // 4. Compute part identity.
         let part_okh = part_key_hash(upload_id, part_number, generation);
         let part_vid = generation as u64;
 
-        // 4. EC-encode part data (no metadata blob for parts — raw data only).
+        // 5. EC-encode part data (no metadata blob for parts — raw data only).
         let etag_crc = crc64::checksum(data);
 
         let k = self.ec_config.data_shards as usize;
@@ -2524,7 +2569,7 @@ impl Coordinator {
             ec_k: self.ec_config.data_shards,
             ec_m: self.ec_config.parity_shards,
             last_modified: now,
-            checksum: None,
+            checksum: checksum_bytes.clone(),
         });
 
         let prev_gen = match upsert_result {
@@ -2562,6 +2607,8 @@ impl Coordinator {
 
         Ok(UploadPartResult {
             etag: format_etag(etag_crc),
+            checksum_algorithm: effective_algo,
+            checksum_bytes,
         })
     }
 
@@ -2931,6 +2978,25 @@ impl Coordinator {
             next_key_marker,
             next_upload_id_marker,
         })
+    }
+}
+
+/// Compute raw checksum bytes for the given algorithm and data.
+fn compute_checksum(algo: ChecksumAlgorithm, data: &[u8]) -> Vec<u8> {
+    match algo {
+        ChecksumAlgorithm::Crc32 => checksum::crc32::checksum(data).to_be_bytes().to_vec(),
+        ChecksumAlgorithm::Crc32c => checksum::crc32c::checksum(data).to_be_bytes().to_vec(),
+        ChecksumAlgorithm::Crc64nvme => crc64::checksum(data).to_be_bytes().to_vec(),
+        ChecksumAlgorithm::Sha256 => {
+            ring::digest::digest(&ring::digest::SHA256, data)
+                .as_ref()
+                .to_vec()
+        }
+        ChecksumAlgorithm::Sha1 => {
+            ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, data)
+                .as_ref()
+                .to_vec()
+        }
     }
 }
 
@@ -5439,7 +5505,7 @@ mod tests {
             .unwrap();
 
         let result = coord
-            .upload_part("bucket", "key", &create.upload_id, 1, b"hello world")
+            .upload_part("bucket", "key", &create.upload_id, 1, b"hello world", None)
             .unwrap();
 
         // ETag should be a quoted hex CRC64.
@@ -5468,12 +5534,12 @@ mod tests {
 
         // First upload → generation 0.
         coord
-            .upload_part("bucket", "key", &create.upload_id, 1, b"first")
+            .upload_part("bucket", "key", &create.upload_id, 1, b"first", None)
             .unwrap();
 
         // Re-upload same part number → generation 1.
         let result = coord
-            .upload_part("bucket", "key", &create.upload_id, 1, b"second")
+            .upload_part("bucket", "key", &create.upload_id, 1, b"second", None)
             .unwrap();
 
         let meta_pg_id = derive_pg("bucket", "key", coord.pg_count);
@@ -5499,7 +5565,7 @@ mod tests {
             .unwrap();
 
         let err = coord
-            .upload_part("bucket", "key", &create.upload_id, 0, b"data")
+            .upload_part("bucket", "key", &create.upload_id, 0, b"data", None)
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidArgument { .. }));
     }
@@ -5516,7 +5582,7 @@ mod tests {
             .unwrap();
 
         let err = coord
-            .upload_part("bucket", "key", &create.upload_id, 10_001, b"data")
+            .upload_part("bucket", "key", &create.upload_id, 10_001, b"data", None)
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidArgument { .. }));
     }
@@ -5528,7 +5594,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let err = coord
-            .upload_part("bucket", "key", "bogus-upload-id", 1, b"data")
+            .upload_part("bucket", "key", "bogus-upload-id", 1, b"data", None)
             .unwrap_err();
         assert!(matches!(err, ServerError::NoSuchUpload { .. }));
     }
@@ -5545,13 +5611,13 @@ mod tests {
             .unwrap();
 
         coord
-            .upload_part("bucket", "key", &create.upload_id, 1, b"part-one")
+            .upload_part("bucket", "key", &create.upload_id, 1, b"part-one", None)
             .unwrap();
         coord
-            .upload_part("bucket", "key", &create.upload_id, 2, b"part-two")
+            .upload_part("bucket", "key", &create.upload_id, 2, b"part-two", None)
             .unwrap();
         coord
-            .upload_part("bucket", "key", &create.upload_id, 3, b"part-three")
+            .upload_part("bucket", "key", &create.upload_id, 3, b"part-three", None)
             .unwrap();
 
         // Verify all three parts exist.
@@ -5586,7 +5652,7 @@ mod tests {
         for i in 0..4u32 {
             let data = format!("version-{i}");
             coord
-                .upload_part("bucket", "key", &create.upload_id, 1, data.as_bytes())
+                .upload_part("bucket", "key", &create.upload_id, 1, data.as_bytes(), None)
                 .unwrap();
         }
 
@@ -5610,11 +5676,11 @@ mod tests {
 
         // Part 1 (min valid).
         coord
-            .upload_part("bucket", "key", &create.upload_id, 1, b"a")
+            .upload_part("bucket", "key", &create.upload_id, 1, b"a", None)
             .unwrap();
         // Part 10000 (max valid).
         coord
-            .upload_part("bucket", "key", &create.upload_id, 10_000, b"z")
+            .upload_part("bucket", "key", &create.upload_id, 10_000, b"z", None)
             .unwrap();
 
         let meta_pg_id = derive_pg("bucket", "key", coord.pg_count);
@@ -5636,14 +5702,14 @@ mod tests {
 
         // Try uploading with wrong key — should be rejected even if upload_id is valid.
         let err = coord
-            .upload_part("bucket", "wrong-key", &create.upload_id, 1, b"data")
+            .upload_part("bucket", "wrong-key", &create.upload_id, 1, b"data", None)
             .unwrap_err();
         assert!(matches!(err, ServerError::NoSuchUpload { .. }));
 
         // Try uploading with wrong bucket.
         coord.create_bucket("other-bucket").unwrap();
         let err = coord
-            .upload_part("other-bucket", "key", &create.upload_id, 1, b"data")
+            .upload_part("other-bucket", "key", &create.upload_id, 1, b"data", None)
             .unwrap_err();
         assert!(matches!(err, ServerError::NoSuchUpload { .. }));
     }
@@ -5662,15 +5728,15 @@ mod tests {
         // Simulate concurrent same-part uploads sequentially.
         // Each successive upload should overwrite, with generation incrementing.
         let etag1 = coord
-            .upload_part("bucket", "key", &create.upload_id, 1, b"writer-A")
+            .upload_part("bucket", "key", &create.upload_id, 1, b"writer-A", None)
             .unwrap()
             .etag;
         let etag2 = coord
-            .upload_part("bucket", "key", &create.upload_id, 1, b"writer-B")
+            .upload_part("bucket", "key", &create.upload_id, 1, b"writer-B", None)
             .unwrap()
             .etag;
         let etag3 = coord
-            .upload_part("bucket", "key", &create.upload_id, 1, b"writer-C")
+            .upload_part("bucket", "key", &create.upload_id, 1, b"writer-C", None)
             .unwrap()
             .etag;
 
@@ -5703,7 +5769,7 @@ mod tests {
         let mut complete_parts = Vec::new();
         for &(part_number, data) in part_data {
             let result = coord
-                .upload_part(bucket, key, &create.upload_id, part_number, data)
+                .upload_part(bucket, key, &create.upload_id, part_number, data, None)
                 .unwrap();
             complete_parts.push(CompletePart {
                 part_number,
@@ -5887,7 +5953,7 @@ mod tests {
         // Upload remains usable — re-upload part 1 with large data and retry.
         let big_data = vec![0u8; 5 * 1024 * 1024];
         let new_part1 = coord
-            .upload_part("bucket", "key", &upload_id, 1, &big_data)
+            .upload_part("bucket", "key", &upload_id, 1, &big_data, None)
             .unwrap();
 
         let retry_parts = vec![
@@ -6026,7 +6092,7 @@ mod tests {
 
         // Upload should no longer exist.
         let err = coord
-            .upload_part("bucket", "key", &upload_id, 1, b"nope")
+            .upload_part("bucket", "key", &upload_id, 1, b"nope", None)
             .unwrap_err();
         assert!(
             matches!(err, ServerError::NoSuchUpload { .. }),
@@ -6143,7 +6209,7 @@ mod tests {
             .create_multipart_upload("bucket", "key", &metadata, None, None)
             .unwrap();
         coord
-            .upload_part("bucket", "key", &create.upload_id, 1, b"data")
+            .upload_part("bucket", "key", &create.upload_id, 1, b"data", None)
             .unwrap();
 
         coord
@@ -6151,7 +6217,7 @@ mod tests {
             .unwrap();
 
         let err = coord
-            .upload_part("bucket", "key", &create.upload_id, 2, b"more")
+            .upload_part("bucket", "key", &create.upload_id, 2, b"more", None)
             .unwrap_err();
         assert!(
             matches!(err, ServerError::NoSuchUpload { .. }),
@@ -6291,10 +6357,10 @@ mod tests {
 
         // Upload part 1, then overwrite it.
         coord
-            .upload_part("bucket", "key", &create.upload_id, 1, b"original")
+            .upload_part("bucket", "key", &create.upload_id, 1, b"original", None)
             .unwrap();
         let reupload = coord
-            .upload_part("bucket", "key", &create.upload_id, 1, b"replaced")
+            .upload_part("bucket", "key", &create.upload_id, 1, b"replaced", None)
             .unwrap();
 
         let result = coord
@@ -6316,7 +6382,7 @@ mod tests {
             .create_multipart_upload("bucket", "key", &metadata, None, None)
             .unwrap();
         coord
-            .upload_part("bucket", "key", &create.upload_id, 1, b"data")
+            .upload_part("bucket", "key", &create.upload_id, 1, b"data", None)
             .unwrap();
 
         // Manually transition to Aborting (simulates the window during abort).
@@ -6386,7 +6452,7 @@ mod tests {
         let mut complete_parts = Vec::new();
         for (part_number, data) in part_data {
             let result = coord
-                .upload_part(bucket, key, &create.upload_id, *part_number, data)
+                .upload_part(bucket, key, &create.upload_id, *part_number, data, None)
                 .unwrap();
             complete_parts.push(CompletePart {
                 part_number: *part_number,

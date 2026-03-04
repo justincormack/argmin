@@ -515,9 +515,19 @@ impl S3Response {
         Self::new(200).xml_body(body)
     }
 
-    /// Build a response for UploadPart (200 OK, ETag header).
-    pub fn upload_part(etag: &str) -> Self {
-        Self::new(200).header("ETag", etag)
+    /// Build a response for UploadPart (200 OK, ETag header, optional checksum).
+    pub fn upload_part(
+        etag: &str,
+        checksum_algorithm: Option<storage::ChecksumAlgorithm>,
+        checksum_bytes: Option<&[u8]>,
+    ) -> Self {
+        let mut resp = Self::new(200).header("ETag", etag);
+        if let (Some(algo), Some(bytes)) = (checksum_algorithm, checksum_bytes) {
+            use base64::Engine;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+            resp = resp.header(algo.header_name(), &b64);
+        }
+        resp
     }
 
     /// Build a response for CompleteMultipartUpload (200 OK, XML body).
