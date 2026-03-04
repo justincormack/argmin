@@ -1458,9 +1458,9 @@ pub fn parse_complete_multipart_upload_xml(body: &[u8]) -> Result<Vec<CompletePa
         let etag_end = part_content[etag_start..]
             .find("</ETag>")
             .ok_or_else(malformed)?;
-        let etag = part_content[etag_start..etag_start + etag_end]
-            .trim()
-            .to_string();
+        let etag = xml_unescape(
+            part_content[etag_start..etag_start + etag_end].trim(),
+        );
 
         parts.push(CompletePart { part_number, etag });
     }

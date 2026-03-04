@@ -969,19 +969,6 @@ impl Coordinator {
         })
     }
 
-    /// Verify that the object uses InlineLegacy layout.
-    ///
-    /// Returns `NotImplemented` for MultipartManifest objects, which require
-    /// the multipart-aware read path (Step 9).
-    fn require_inline_layout(record: &ObjectRecord) -> Result<(), ServerError> {
-        if record.data_layout != DataLayout::InlineLegacy {
-            return Err(ServerError::NotImplemented {
-                feature: "multipart object reads".to_string(),
-            });
-        }
-        Ok(())
-    }
-
     /// Lock metadata and shard PGs for a consistent object read view.
     ///
     /// For latest-version reads (`version_id = None`), shard placement depends on
@@ -1285,6 +1272,19 @@ impl Coordinator {
         let local_start = start - buf_start;
         let local_end = (end - buf_start).min(buf.len() - 1);
         Ok(buf[local_start..=local_end].to_vec())
+    }
+
+    /// Delete all shards for a list of object parts.
+    fn delete_part_shards(&self, parts: &[ObjectPartRecord]) -> Result<(), ServerError> {
+        for part in parts {
+            let pg = self.storage_node.get_pg(part.shard_pg_id)?;
+            let total = part.ec_k as usize + part.ec_m as usize;
+            for i in 0..total {
+                let shard_key = ShardKey::new(&part.part_okh, part.part_vid, i as u8);
+                pg.delete_shard(&shard_key)?;
+            }
+        }
+        Ok(())
     }
 
     /// Read a full part's data from its shard PG.
@@ -1767,27 +1767,38 @@ impl Coordinator {
                 let meta_pg = pgs.meta();
                 let shard_pg = pgs.shard();
 
-                Self::require_inline_layout(&record)?;
-
                 // Check delete conditions
                 if !cond.is_empty() {
-                    let etag_crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
-                    let etag_str = format_etag(etag_crc);
+                    let etag_str = format_object_etag(
+                        &record.etag, record.etag_kind, record.parts_count,
+                    );
                     check_delete_conditions(cond, &etag_str, record.last_modified, record.size)?;
                 }
 
-                let okh = object_key_hash(bucket, key);
-                let vid = record.version_id;
-                let total = record.ec_k as usize + record.ec_m as usize;
+                if record.data_layout == DataLayout::MultipartManifest {
+                    // Multipart: collect parts, delete metadata under lock,
+                    // then delete part shards after releasing the lock.
+                    let obj_parts = meta_pg
+                        .get_object_parts(bucket, key, record.version_id)
+                        .map_err(ServerError::Metadata)?;
+                    meta_pg.delete_object_parts(bucket, key, record.version_id)?;
+                    meta_pg.delete_object_meta(bucket, key)?;
+                    drop(pgs);
+                    self.delete_part_shards(&obj_parts)?;
+                } else {
+                    let okh = object_key_hash(bucket, key);
+                    let vid = record.version_id;
+                    let total = record.ec_k as usize + record.ec_m as usize;
 
-                // Delete all shards (idempotent)
-                for i in 0..total {
-                    let shard_key = ShardKey::new(&okh, vid, i as u8);
-                    shard_pg.delete_shard(&shard_key)?;
+                    // Delete all shards (idempotent)
+                    for i in 0..total {
+                        let shard_key = ShardKey::new(&okh, vid, i as u8);
+                        shard_pg.delete_shard(&shard_key)?;
+                    }
+
+                    // Delete metadata record
+                    meta_pg.delete_object_meta(bucket, key)?;
                 }
-
-                // Delete metadata record
-                meta_pg.delete_object_meta(bucket, key)?;
 
                 Ok(DeleteObjectResult {
                     version_id: 0,
@@ -1814,7 +1825,20 @@ impl Coordinator {
 
                 // Delete shards if it's a live object (not a delete marker)
                 if record.status == 0 {
-                    Self::require_inline_layout(&record)?;
+                    if record.data_layout == DataLayout::MultipartManifest {
+                        let obj_parts = meta_pg
+                            .get_object_parts(bucket, key, vid)
+                            .map_err(ServerError::Metadata)?;
+                        meta_pg.delete_object_parts(bucket, key, vid)?;
+                        meta_pg.delete_object_version(bucket, key, vid)?;
+                        drop(pgs);
+                        self.delete_part_shards(&obj_parts)?;
+
+                        return Ok(DeleteObjectResult {
+                            version_id: vid,
+                            delete_marker: false,
+                        });
+                    }
 
                     let okh = object_key_hash(bucket, key);
                     let total = record.ec_k as usize + record.ec_m as usize;
