@@ -22,7 +22,7 @@ pub enum ServerError {
     Store(#[from] StoreError),
 
     #[error("metadata error: {0}")]
-    Metadata(#[from] MetadataError),
+    Metadata(MetadataError),
 
     #[error("EC error: {0}")]
     Ec(#[from] ec::EcError),
@@ -86,8 +86,14 @@ pub enum ServerError {
     #[error("access denied")]
     AccessDenied,
 
+    #[error("no such upload: {upload_id}")]
+    NoSuchUpload { upload_id: String },
+
     #[error("not implemented: {feature}")]
     NotImplemented { feature: String },
+
+    #[error("internal error: {reason}")]
+    InternalError { reason: String },
 
     #[error("data integrity error for {bucket}/{key}")]
     IntegrityError {
@@ -133,7 +139,9 @@ impl ServerError {
             Self::AccessControlListNotSupported => "AccessControlListNotSupported",
             Self::InvalidBucketAclWithObjectOwnership => "InvalidBucketAclWithObjectOwnership",
             Self::AccessDenied => "AccessDenied",
+            Self::NoSuchUpload { .. } => "NoSuchUpload",
             Self::NotImplemented { .. } => "NotImplemented",
+            Self::InternalError { .. } => "InternalError",
             Self::IntegrityError { .. } => "InternalError",
             Self::Store(_) => "InternalError",
             Self::Metadata(_) => "InternalError",
@@ -161,7 +169,9 @@ impl ServerError {
             Self::InvalidTag { .. } => 400,
             Self::AccessControlListNotSupported | Self::InvalidBucketAclWithObjectOwnership => 400,
             Self::AccessDenied => 403,
+            Self::NoSuchUpload { .. } => 404,
             Self::NotImplemented { .. } => 501,
+            Self::InternalError { .. } => 500,
             Self::ObjectTooLarge { .. } => 400,
             Self::MethodNotAllowed => 405,
             Self::InvalidRange { .. } => 416,
@@ -169,6 +179,15 @@ impl ServerError {
             Self::NotModified { .. } => 304,
             Self::SlowDown => 503,
             _ => 500,
+        }
+    }
+}
+
+impl From<MetadataError> for ServerError {
+    fn from(e: MetadataError) -> Self {
+        match e {
+            MetadataError::NoSuchUpload { upload_id } => ServerError::NoSuchUpload { upload_id },
+            other => ServerError::Metadata(other),
         }
     }
 }
@@ -426,6 +445,15 @@ mod tests {
     fn from_ec_error() {
         let err: ServerError = ec::EcError::InvalidConfig { reason: "x" }.into();
         assert!(matches!(err, ServerError::Ec(_)));
+    }
+
+    #[test]
+    fn s3_error_code_no_such_upload() {
+        let err = ServerError::NoSuchUpload {
+            upload_id: "abc".into(),
+        };
+        assert_eq!(err.s3_error_code(), "NoSuchUpload");
+        assert_eq!(err.http_status(), 404);
     }
 
     #[test]

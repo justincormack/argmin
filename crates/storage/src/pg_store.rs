@@ -855,7 +855,9 @@ impl PgMetadataStore for PgStore {
                 context: "get multipart upload",
                 source: e,
             })?
-            .ok_or(MetadataError::NoSuchUpload)
+            .ok_or_else(|| MetadataError::NoSuchUpload {
+                upload_id: upload_id.to_string(),
+            })
     }
 
     fn set_upload_state(
@@ -880,7 +882,9 @@ impl PgMetadataStore for PgStore {
                 })?;
             return match current {
                 Some(state) => Err(MetadataError::UploadNotInProgress { state }),
-                None => Err(MetadataError::NoSuchUpload)
+                None => Err(MetadataError::NoSuchUpload {
+                    upload_id: upload_id.to_string(),
+                }),
             };
         }
         let updated = self
@@ -909,7 +913,9 @@ impl PgMetadataStore for PgStore {
                     source: e,
                 })?;
             return match current {
-                None => Err(MetadataError::NoSuchUpload),
+                None => Err(MetadataError::NoSuchUpload {
+                    upload_id: upload_id.to_string(),
+                }),
                 Some(s) => Err(MetadataError::UploadNotInProgress { state: s }),
             };
         }
@@ -928,7 +934,9 @@ impl PgMetadataStore for PgStore {
                 source: e,
             })?;
         if deleted == 0 {
-            return Err(MetadataError::NoSuchUpload);
+            return Err(MetadataError::NoSuchUpload {
+                upload_id: upload_id.to_string(),
+            });
         }
         Ok(())
     }
@@ -957,15 +965,27 @@ impl PgMetadataStore for PgStore {
 
         if let Some(ref key_marker) = req.key_marker {
             if let Some(ref uid_marker) = req.upload_id_marker {
-                // Resume after (key_marker, uid_marker)
+                // Resume after (key_marker, initiated_at of marker, uid_marker).
+                // Use a subquery to resolve the marker's initiated_at so the
+                // cursor is consistent with the (key, initiated_at, upload_id)
+                // sort order. COALESCE to 0 so a deleted marker row safely
+                // returns all remaining uploads for that key (duplicates are
+                // preferable to silently dropped entries).
                 where_clauses.push(format!(
-                    "(key > ?{km} OR (key = ?{km} AND upload_id > ?{um}))",
+                    "(key > ?{km} OR (key = ?{km} AND (\
+                     initiated_at > COALESCE((SELECT initiated_at FROM multipart_uploads \
+                     WHERE upload_id = ?{um} AND bucket = ?{bkt} AND key = ?{km}), 0) \
+                     OR (initiated_at = COALESCE((SELECT initiated_at FROM multipart_uploads \
+                     WHERE upload_id = ?{um} AND bucket = ?{bkt} AND key = ?{km}), 0) \
+                     AND upload_id > ?{um}))))",
                     km = param_idx,
-                    um = param_idx + 1
+                    um = param_idx + 1,
+                    bkt = param_idx + 2
                 ));
                 params_vec.push(Box::new(key_marker.clone()));
                 params_vec.push(Box::new(uid_marker.clone()));
-                param_idx += 2;
+                params_vec.push(Box::new(req.bucket.clone()));
+                param_idx += 3;
             } else {
                 where_clauses.push(format!("key > ?{param_idx}"));
                 params_vec.push(Box::new(key_marker.clone()));
@@ -979,7 +999,8 @@ impl PgMetadataStore for PgStore {
              owner_principal \
              FROM multipart_uploads \
              WHERE {where_str} \
-             ORDER BY key ASC, upload_id ASC LIMIT ?{param_idx}"
+             ORDER BY key ASC, initiated_at ASC, upload_id ASC \
+             LIMIT ?{param_idx}"
         );
         params_vec.push(Box::new(limit));
 
@@ -1106,7 +1127,9 @@ impl PgMetadataStore for PgStore {
                 // FK violation means the upload_id doesn't exist.
                 if let rusqlite::Error::SqliteFailure(ref err, _) = e {
                     if err.code == rusqlite::ffi::ErrorCode::ConstraintViolation {
-                        return Err(MetadataError::NoSuchUpload);
+                        return Err(MetadataError::NoSuchUpload {
+                            upload_id: part.upload_id.clone(),
+                        });
                     }
                 }
                 Err(MetadataError::Db {
@@ -1156,7 +1179,9 @@ impl PgMetadataStore for PgStore {
                 source: e,
             })?;
         if exists.is_none() {
-            return Err(MetadataError::NoSuchUpload);
+            return Err(MetadataError::NoSuchUpload {
+                upload_id: req.upload_id.clone(),
+            });
         }
 
         let limit = req.max_parts as i64 + 1;

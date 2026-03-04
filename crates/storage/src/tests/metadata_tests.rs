@@ -518,7 +518,10 @@ fn mpu_create_and_get_upload() {
 fn mpu_get_missing_upload_returns_no_such_upload() {
     let (_dir, store) = make_pg_store();
     let err = store.get_multipart_upload("nonexistent").unwrap_err();
-    assert!(matches!(err, crate::error::MetadataError::NoSuchUpload));
+    assert!(matches!(
+        err,
+        crate::error::MetadataError::NoSuchUpload { .. }
+    ));
 }
 
 #[test]
@@ -557,7 +560,10 @@ fn mpu_set_upload_state_missing_returns_no_such_upload() {
     let err = store
         .set_upload_state("nonexistent", UploadState::Completing)
         .unwrap_err();
-    assert!(matches!(err, crate::error::MetadataError::NoSuchUpload));
+    assert!(matches!(
+        err,
+        crate::error::MetadataError::NoSuchUpload { .. }
+    ));
 }
 
 #[test]
@@ -595,7 +601,7 @@ fn mpu_delete_upload_cascades_parts() {
 
     assert!(matches!(
         store.get_multipart_upload("uid-3").unwrap_err(),
-        crate::error::MetadataError::NoSuchUpload
+        crate::error::MetadataError::NoSuchUpload { .. }
     ));
 }
 
@@ -603,7 +609,10 @@ fn mpu_delete_upload_cascades_parts() {
 fn mpu_delete_missing_upload_returns_no_such_upload() {
     let (_dir, store) = make_pg_store();
     let err = store.delete_multipart_upload("nonexistent").unwrap_err();
-    assert!(matches!(err, crate::error::MetadataError::NoSuchUpload));
+    assert!(matches!(
+        err,
+        crate::error::MetadataError::NoSuchUpload { .. }
+    ));
 }
 
 #[test]
@@ -869,6 +878,47 @@ fn mpu_list_uploads_same_key_multiple_upload_ids() {
 }
 
 #[test]
+fn mpu_list_uploads_stale_marker_returns_remaining() {
+    let (_dir, store) = make_pg_store();
+
+    // Create 3 uploads for the same key.
+    for uid in ["u-x", "u-y", "u-z"] {
+        store
+            .create_multipart_upload(&CreateMultipartUploadReq {
+                upload_id: uid.to_string(),
+                bucket: "bkt".to_string(),
+                key: "key".to_string(),
+                metadata_blob: vec![],
+                owner_principal: None,
+            })
+            .unwrap();
+    }
+
+    // Delete the middle upload (simulating it being aborted between pages).
+    store.delete_multipart_upload("u-y").unwrap();
+
+    // Paginate using u-y as the marker — it no longer exists.
+    // COALESCE to 0 means all remaining uploads for "key" are returned.
+    let resp = store
+        .list_multipart_uploads(&ListMultipartUploadsReq {
+            bucket: "bkt".to_string(),
+            prefix: None,
+            key_marker: Some("key".to_string()),
+            upload_id_marker: Some("u-y".to_string()),
+            max_uploads: 10,
+        })
+        .unwrap();
+
+    // u-x and u-z should both appear (safe re-return of u-x, plus u-z).
+    // The stale marker must not cause u-z to be silently dropped.
+    let ids: Vec<&str> = resp.uploads.iter().map(|u| u.upload_id.as_str()).collect();
+    assert!(
+        ids.contains(&"u-z"),
+        "u-z must not be dropped; got: {ids:?}"
+    );
+}
+
+#[test]
 fn mpu_corrupted_part_okh_returns_error() {
     let (_dir, store) = make_pg_store();
     store
@@ -997,7 +1047,10 @@ fn mpu_set_upload_state_rejects_in_progress_target() {
         .set_upload_state("uid-ip", UploadState::InProgress)
         .unwrap_err();
     assert!(
-        matches!(err, crate::error::MetadataError::UploadNotInProgress { state: 0 }),
+        matches!(
+            err,
+            crate::error::MetadataError::UploadNotInProgress { state: 0 }
+        ),
         "expected UploadNotInProgress {{ state: 0 }}, got: {err:?}"
     );
 
@@ -1009,7 +1062,10 @@ fn mpu_set_upload_state_rejects_in_progress_target() {
         .set_upload_state("uid-ip", UploadState::InProgress)
         .unwrap_err();
     assert!(
-        matches!(err, crate::error::MetadataError::UploadNotInProgress { state: 1 }),
+        matches!(
+            err,
+            crate::error::MetadataError::UploadNotInProgress { state: 1 }
+        ),
         "expected UploadNotInProgress {{ state: 1 }}, got: {err:?}"
     );
 
@@ -1025,7 +1081,7 @@ fn mpu_set_upload_state_in_progress_target_nonexistent_returns_no_such_upload() 
         .set_upload_state("nonexistent", UploadState::InProgress)
         .unwrap_err();
     assert!(
-        matches!(err, crate::error::MetadataError::NoSuchUpload),
+        matches!(err, crate::error::MetadataError::NoSuchUpload { .. }),
         "expected NoSuchUpload for nonexistent upload with InProgress target, got: {err:?}"
     );
 }
@@ -1049,7 +1105,7 @@ fn mpu_upsert_part_nonexistent_upload_returns_no_such_upload() {
         })
         .unwrap_err();
     assert!(
-        matches!(err, crate::error::MetadataError::NoSuchUpload),
+        matches!(err, crate::error::MetadataError::NoSuchUpload { .. }),
         "expected NoSuchUpload for FK violation, got: {err:?}"
     );
 }
@@ -1065,7 +1121,7 @@ fn mpu_list_parts_nonexistent_upload_returns_no_such_upload() {
         })
         .unwrap_err();
     assert!(
-        matches!(err, crate::error::MetadataError::NoSuchUpload),
+        matches!(err, crate::error::MetadataError::NoSuchUpload { .. }),
         "expected NoSuchUpload for nonexistent upload, got: {err:?}"
     );
 }
@@ -1089,7 +1145,9 @@ fn mpu_commit_object_parts_rollback_on_duplicate() {
     };
 
     // First commit succeeds
-    store.commit_object_parts(std::slice::from_ref(&part)).unwrap();
+    store
+        .commit_object_parts(std::slice::from_ref(&part))
+        .unwrap();
 
     // Second commit with same PK should fail (duplicate)
     let err = store.commit_object_parts(&[part]).unwrap_err();
@@ -1220,7 +1278,7 @@ fn mpu_upsert_fk_rollback_leaves_connection_usable() {
         .upsert_multipart_part(&make_part("nonexistent", 1, 0))
         .unwrap_err();
     assert!(
-        matches!(err, crate::error::MetadataError::NoSuchUpload),
+        matches!(err, crate::error::MetadataError::NoSuchUpload { .. }),
         "expected NoSuchUpload, got: {err:?}"
     );
 
@@ -1246,7 +1304,7 @@ fn mpu_upsert_fk_rollback_preserves_existing_parts() {
         .upsert_multipart_part(&make_part("nonexistent", 1, 0))
         .unwrap_err();
     assert!(
-        matches!(err, crate::error::MetadataError::NoSuchUpload),
+        matches!(err, crate::error::MetadataError::NoSuchUpload { .. }),
         "expected NoSuchUpload for FK violation, got: {err:?}"
     );
 
@@ -1497,7 +1555,7 @@ fn mpu_delete_upload_during_upsert_returns_no_such_upload() {
         .upsert_multipart_part(&make_part("uid-del", 2, 0))
         .unwrap_err();
     assert!(
-        matches!(err, crate::error::MetadataError::NoSuchUpload),
+        matches!(err, crate::error::MetadataError::NoSuchUpload { .. }),
         "expected NoSuchUpload after delete, got: {err:?}"
     );
 
@@ -1797,7 +1855,11 @@ fn mpu_threaded_upsert_same_part_stress() {
             max_parts: 100,
         })
         .unwrap();
-    assert_eq!(resp.parts.len(), 1, "INSERT OR REPLACE should leave exactly one row");
+    assert_eq!(
+        resp.parts.len(),
+        1,
+        "INSERT OR REPLACE should leave exactly one row"
+    );
 }
 
 // --- Property-based tests ---

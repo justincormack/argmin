@@ -4,7 +4,8 @@ use std::sync::{Arc, MutexGuard};
 use ec::{EcConfig, ErasureCodec};
 use storage::traits::{GlobalService, PgMetadataStore, ShardStore};
 use storage::{
-    BucketInfo, DataLayout, ListObjectVersionsReq, ListObjectsReq, ObjectRecord, PutObjectMetaReq,
+    BucketInfo, CreateMultipartUploadReq, DataLayout, ListMultipartUploadsReq,
+    ListObjectVersionsReq, ListObjectsReq, MultipartUploadRecord, ObjectRecord, PutObjectMetaReq,
     ShardKey, SharedStorageNode, SqliteBucketDb,
 };
 
@@ -156,6 +157,29 @@ pub struct DeleteObjectsResult {
     pub errors: Vec<DeleteError>,
 }
 
+/// Result of a CreateMultipartUpload operation.
+#[derive(Debug)]
+pub struct CreateMultipartUploadResult {
+    pub upload_id: String,
+}
+
+/// Entry in a ListMultipartUploads result.
+#[derive(Debug, Clone)]
+pub struct MultipartUploadEntry {
+    pub key: String,
+    pub upload_id: String,
+    pub initiated: u64,
+}
+
+/// Result of a ListMultipartUploads operation.
+#[derive(Debug)]
+pub struct ListMultipartUploadsResult {
+    pub uploads: Vec<MultipartUploadEntry>,
+    pub is_truncated: bool,
+    pub next_key_marker: Option<String>,
+    pub next_upload_id_marker: Option<String>,
+}
+
 /// Ordered PG guard pair for object operations.
 ///
 /// Constructed only by `lock_object_pgs_for_read` / `lock_object_pgs_for_write`.
@@ -254,7 +278,7 @@ impl Coordinator {
     }
 
     pub fn delete_bucket(&self, name: &str) -> Result<(), ServerError> {
-        // Check emptiness: list objects across all PGs
+        // Check emptiness: list objects and multipart uploads across all PGs.
         for &pg_id in self.storage_node.pg_ids() {
             let pg = self.storage_node.get_pg(pg_id)?;
             let resp = pg.list_objects(&ListObjectsReq {
@@ -264,6 +288,16 @@ impl Coordinator {
                 max_keys: 1,
             })?;
             if !resp.objects.is_empty() {
+                return Err(ServerError::BucketNotEmpty);
+            }
+            let mpu_resp = pg.list_multipart_uploads(&ListMultipartUploadsReq {
+                bucket: name.to_string(),
+                prefix: None,
+                key_marker: None,
+                upload_id_marker: None,
+                max_uploads: 1,
+            })?;
+            if !mpu_resp.uploads.is_empty() {
                 return Err(ServerError::BucketNotEmpty);
             }
         }
@@ -1795,6 +1829,134 @@ impl Coordinator {
         }
 
         Ok(DeleteObjectsResult { deleted, errors })
+    }
+
+    // ── Multipart upload operations ───────────────────────────────────
+
+    /// Initiate a multipart upload.
+    ///
+    /// Generates a random upload ID, serializes the metadata blob, and
+    /// inserts a new multipart upload record in the metadata PG for (bucket, key).
+    pub fn create_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        metadata: &MetadataBlob,
+    ) -> Result<CreateMultipartUploadResult, ServerError> {
+        let bucket_info = self.head_bucket(bucket)?;
+
+        // Generate 16 random bytes → 32-char hex upload ID.
+        let rng = ring::rand::SystemRandom::new();
+        let mut id_bytes = [0u8; 16];
+        ring::rand::SecureRandom::fill(&rng, &mut id_bytes).map_err(|_| {
+            ServerError::InternalError {
+                reason: "failed to generate upload ID".to_string(),
+            }
+        })?;
+        let upload_id = id_bytes.iter().fold(String::with_capacity(32), |mut s, b| {
+            use std::fmt::Write;
+            write!(s, "{b:02x}").unwrap();
+            s
+        });
+
+        let metadata_blob = metadata.serialize()?;
+
+        // Lock metadata PG and insert upload record.
+        let meta_pg_id = derive_pg(bucket, key, self.pg_count);
+        let pg = self.storage_node.get_pg(meta_pg_id)?;
+        pg.create_multipart_upload(&CreateMultipartUploadReq {
+            upload_id: upload_id.clone(),
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            metadata_blob,
+            owner_principal: Some(bucket_info.owner_principal),
+        })?;
+
+        Ok(CreateMultipartUploadResult { upload_id })
+    }
+
+    /// List in-progress multipart uploads for a bucket.
+    ///
+    /// Fans out across all PGs, merges results sorted by (key, upload_id),
+    /// and applies pagination.
+    pub fn list_multipart_uploads(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+        key_marker: Option<&str>,
+        upload_id_marker: Option<&str>,
+        max_uploads: u32,
+    ) -> Result<ListMultipartUploadsResult, ServerError> {
+        self.head_bucket(bucket)?;
+
+        if max_uploads == 0 {
+            return Ok(ListMultipartUploadsResult {
+                uploads: Vec::new(),
+                is_truncated: false,
+                next_key_marker: None,
+                next_upload_id_marker: None,
+            });
+        }
+
+        // Fan out to all PGs and collect results, with a hard memory cap.
+        let mut all_uploads: Vec<MultipartUploadRecord> = Vec::new();
+        let mut hit_record_cap = false;
+        for &pg_id in self.storage_node.pg_ids() {
+            let pg = self.storage_node.get_pg(pg_id)?;
+            let resp = pg.list_multipart_uploads(&ListMultipartUploadsReq {
+                bucket: bucket.to_string(),
+                prefix: prefix.map(|s| s.to_string()),
+                key_marker: key_marker.map(|s| s.to_string()),
+                upload_id_marker: upload_id_marker.map(|s| s.to_string()),
+                max_uploads: max_uploads.saturating_add(1),
+            })?;
+            all_uploads.extend(resp.uploads);
+            if all_uploads.len() >= MAX_LIST_RECORDS {
+                all_uploads.truncate(MAX_LIST_RECORDS);
+                hit_record_cap = true;
+                break;
+            }
+        }
+
+        // Sort by (key ASC, initiated_at ASC) per S3 spec, with upload_id
+        // as tiebreaker for identical timestamps.
+        all_uploads.sort_by(|a, b| {
+            a.key
+                .cmp(&b.key)
+                .then(a.initiated_at.cmp(&b.initiated_at))
+                .then(a.upload_id.cmp(&b.upload_id))
+        });
+
+        // Truncate to max_uploads + detect truncation.
+        let max = max_uploads as usize;
+        let is_truncated = hit_record_cap || all_uploads.len() > max;
+        all_uploads.truncate(max);
+
+        let (next_key_marker, next_upload_id_marker) = if is_truncated {
+            if let Some(last) = all_uploads.last() {
+                (Some(last.key.clone()), Some(last.upload_id.clone()))
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
+
+        let uploads = all_uploads
+            .into_iter()
+            .map(|u| MultipartUploadEntry {
+                key: u.key,
+                upload_id: u.upload_id,
+                initiated: u.initiated_at,
+            })
+            .collect();
+
+        Ok(ListMultipartUploadsResult {
+            uploads,
+            is_truncated,
+            next_key_marker,
+            next_upload_id_marker,
+        })
     }
 }
 
@@ -3958,5 +4120,334 @@ mod tests {
             .unwrap();
         assert_eq!(result.version_id, 0);
         assert!(!result.delete_marker);
+    }
+
+    // ── Multipart upload tests ────────────────────────────────────────
+
+    #[test]
+    fn create_multipart_upload_returns_upload_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let metadata = MetadataBlob::new();
+        let result = coord
+            .create_multipart_upload("bucket", "key", &metadata)
+            .unwrap();
+
+        // Upload ID should be 32 hex chars (16 random bytes).
+        assert_eq!(result.upload_id.len(), 32);
+        assert!(result.upload_id.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn create_multipart_upload_unique_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let metadata = MetadataBlob::new();
+        let r1 = coord
+            .create_multipart_upload("bucket", "key", &metadata)
+            .unwrap();
+        let r2 = coord
+            .create_multipart_upload("bucket", "key", &metadata)
+            .unwrap();
+        assert_ne!(r1.upload_id, r2.upload_id);
+    }
+
+    #[test]
+    fn create_multipart_upload_requires_bucket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+
+        let metadata = MetadataBlob::new();
+        let err = coord
+            .create_multipart_upload("no-such-bucket", "key", &metadata)
+            .unwrap_err();
+        assert!(matches!(err, ServerError::BucketNotFound { .. }));
+    }
+
+    #[test]
+    fn list_multipart_uploads_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let result = coord
+            .list_multipart_uploads("bucket", None, None, None, 1000)
+            .unwrap();
+        assert!(result.uploads.is_empty());
+        assert!(!result.is_truncated);
+    }
+
+    #[test]
+    fn list_multipart_uploads_returns_created() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let metadata = MetadataBlob::new();
+        let r1 = coord
+            .create_multipart_upload("bucket", "alpha", &metadata)
+            .unwrap();
+        let r2 = coord
+            .create_multipart_upload("bucket", "beta", &metadata)
+            .unwrap();
+
+        let result = coord
+            .list_multipart_uploads("bucket", None, None, None, 1000)
+            .unwrap();
+        assert_eq!(result.uploads.len(), 2);
+
+        // Should be sorted by key ascending.
+        assert_eq!(result.uploads[0].key, "alpha");
+        assert_eq!(result.uploads[0].upload_id, r1.upload_id);
+        assert_eq!(result.uploads[1].key, "beta");
+        assert_eq!(result.uploads[1].upload_id, r2.upload_id);
+        assert!(!result.is_truncated);
+    }
+
+    #[test]
+    fn list_multipart_uploads_sorted_by_key_then_initiated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let metadata = MetadataBlob::new();
+        // Create two uploads for the same key.
+        let r1 = coord
+            .create_multipart_upload("bucket", "key", &metadata)
+            .unwrap();
+        let r2 = coord
+            .create_multipart_upload("bucket", "key", &metadata)
+            .unwrap();
+
+        let result = coord
+            .list_multipart_uploads("bucket", None, None, None, 1000)
+            .unwrap();
+        assert_eq!(result.uploads.len(), 2);
+
+        // Both same key — sorted by initiation time (ascending).
+        assert!(result.uploads[0].initiated <= result.uploads[1].initiated);
+        // Both upload IDs present.
+        let ids: Vec<&str> = result
+            .uploads
+            .iter()
+            .map(|u| u.upload_id.as_str())
+            .collect();
+        assert!(ids.contains(&r1.upload_id.as_str()));
+        assert!(ids.contains(&r2.upload_id.as_str()));
+    }
+
+    #[test]
+    fn list_multipart_uploads_pagination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let metadata = MetadataBlob::new();
+        // Create 3 uploads for distinct keys so ordering is deterministic.
+        coord
+            .create_multipart_upload("bucket", "a", &metadata)
+            .unwrap();
+        coord
+            .create_multipart_upload("bucket", "b", &metadata)
+            .unwrap();
+        coord
+            .create_multipart_upload("bucket", "c", &metadata)
+            .unwrap();
+
+        // Page 1: max_uploads=2.
+        let page1 = coord
+            .list_multipart_uploads("bucket", None, None, None, 2)
+            .unwrap();
+        assert_eq!(page1.uploads.len(), 2);
+        assert!(page1.is_truncated);
+        assert_eq!(page1.uploads[0].key, "a");
+        assert_eq!(page1.uploads[1].key, "b");
+        assert!(page1.next_key_marker.is_some());
+        assert!(page1.next_upload_id_marker.is_some());
+
+        // Page 2: use markers from page 1.
+        let page2 = coord
+            .list_multipart_uploads(
+                "bucket",
+                None,
+                page1.next_key_marker.as_deref(),
+                page1.next_upload_id_marker.as_deref(),
+                2,
+            )
+            .unwrap();
+        assert_eq!(page2.uploads.len(), 1);
+        assert!(!page2.is_truncated);
+        assert_eq!(page2.uploads[0].key, "c");
+    }
+
+    #[test]
+    fn list_multipart_uploads_prefix_filter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let metadata = MetadataBlob::new();
+        coord
+            .create_multipart_upload("bucket", "photos/a.jpg", &metadata)
+            .unwrap();
+        coord
+            .create_multipart_upload("bucket", "photos/b.jpg", &metadata)
+            .unwrap();
+        coord
+            .create_multipart_upload("bucket", "docs/readme.md", &metadata)
+            .unwrap();
+
+        let result = coord
+            .list_multipart_uploads("bucket", Some("photos/"), None, None, 1000)
+            .unwrap();
+        assert_eq!(result.uploads.len(), 2);
+        assert!(result.uploads.iter().all(|u| u.key.starts_with("photos/")));
+    }
+
+    #[test]
+    fn list_multipart_uploads_max_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let metadata = MetadataBlob::new();
+        coord
+            .create_multipart_upload("bucket", "key", &metadata)
+            .unwrap();
+
+        let result = coord
+            .list_multipart_uploads("bucket", None, None, None, 0)
+            .unwrap();
+        assert!(result.uploads.is_empty());
+        assert!(!result.is_truncated);
+    }
+
+    #[test]
+    fn list_multipart_uploads_requires_bucket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+
+        let err = coord
+            .list_multipart_uploads("no-such-bucket", None, None, None, 1000)
+            .unwrap_err();
+        assert!(matches!(err, ServerError::BucketNotFound { .. }));
+    }
+
+    #[test]
+    fn create_multipart_upload_preserves_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let metadata = MetadataBlob::from_headers(&[
+            ("Content-Type", "image/png"),
+            ("X-Amz-Meta-Author", "test"),
+        ])
+        .unwrap();
+
+        let result = coord
+            .create_multipart_upload("bucket", "photo.png", &metadata)
+            .unwrap();
+
+        // Verify we can retrieve the upload and its metadata blob is stored.
+        let meta_pg_id = derive_pg("bucket", "photo.png", coord.pg_count);
+        let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
+        let record = pg.get_multipart_upload(&result.upload_id).unwrap();
+        assert_eq!(record.bucket, "bucket");
+        assert_eq!(record.key, "photo.png");
+
+        // Deserialize and verify the metadata blob.
+        let (blob, _) = MetadataBlob::deserialize(&record.metadata_blob).unwrap();
+        assert_eq!(blob.get("content-type"), Some("image/png"));
+        assert_eq!(blob.get("x-amz-meta-author"), Some("test"));
+    }
+
+    #[test]
+    fn delete_bucket_blocked_by_multipart_uploads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let metadata = MetadataBlob::new();
+        coord
+            .create_multipart_upload("bucket", "key", &metadata)
+            .unwrap();
+
+        // Bucket has no objects but has an in-progress MPU — should fail.
+        let err = coord.delete_bucket("bucket").unwrap_err();
+        assert!(matches!(err, ServerError::BucketNotEmpty));
+    }
+
+    #[test]
+    fn no_such_upload_from_storage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        // Directly call get_multipart_upload on a PG with a bogus upload ID.
+        let meta_pg_id = derive_pg("bucket", "key", coord.pg_count);
+        let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
+        let err: ServerError = pg.get_multipart_upload("nonexistent").unwrap_err().into();
+        assert!(matches!(err, ServerError::NoSuchUpload { .. }));
+        assert_eq!(err.s3_error_code(), "NoSuchUpload");
+        assert_eq!(err.http_status(), 404);
+    }
+
+    #[test]
+    fn list_multipart_uploads_same_key_pagination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let metadata = MetadataBlob::new();
+        // Create 3 uploads for the same key.
+        let mut upload_ids = Vec::new();
+        for _ in 0..3 {
+            let r = coord
+                .create_multipart_upload("bucket", "key", &metadata)
+                .unwrap();
+            upload_ids.push(r.upload_id);
+        }
+
+        // Page 1: max_uploads=2 — should get first 2 by initiation time.
+        let page1 = coord
+            .list_multipart_uploads("bucket", None, None, None, 2)
+            .unwrap();
+        assert_eq!(page1.uploads.len(), 2);
+        assert!(page1.is_truncated);
+        assert_eq!(page1.uploads[0].key, "key");
+        assert_eq!(page1.uploads[1].key, "key");
+        // Initiation time ordering.
+        assert!(page1.uploads[0].initiated <= page1.uploads[1].initiated);
+
+        // Page 2: use markers from page 1 — should get remaining upload.
+        let page2 = coord
+            .list_multipart_uploads(
+                "bucket",
+                None,
+                page1.next_key_marker.as_deref(),
+                page1.next_upload_id_marker.as_deref(),
+                2,
+            )
+            .unwrap();
+        assert_eq!(page2.uploads.len(), 1);
+        assert!(!page2.is_truncated);
+        assert_eq!(page2.uploads[0].key, "key");
+
+        // All 3 upload IDs should be covered across both pages.
+        let mut seen: Vec<String> = page1
+            .uploads
+            .iter()
+            .chain(page2.uploads.iter())
+            .map(|u| u.upload_id.clone())
+            .collect();
+        seen.sort();
+        let mut expected = upload_ids.clone();
+        expected.sort();
+        assert_eq!(seen, expected);
     }
 }
