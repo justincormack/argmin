@@ -1567,6 +1567,80 @@ mod tests {
         }
     }
 
+    // ── End-to-end multipart upload flow ────────────────────────────
+
+    #[test]
+    fn multipart_upload_e2e_quoted_etags() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+
+        // 1. CreateMultipartUpload
+        let req = make_req("uploads");
+        let op = S3Operation::CreateMultipartUpload {
+            bucket: "mybucket".to_string(),
+            key: "mykey".to_string(),
+        };
+        let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
+        assert_eq!(resp.status_code, 200);
+        let body = std::str::from_utf8(&resp.body).unwrap();
+        // Extract upload_id from <UploadId>...</UploadId>
+        let uid_start = body.find("<UploadId>").unwrap() + "<UploadId>".len();
+        let uid_end = uid_start + body[uid_start..].find("</UploadId>").unwrap();
+        let upload_id = &body[uid_start..uid_end];
+        assert!(!upload_id.is_empty());
+
+        // 2. UploadPart — single part (last part is exempt from min-size)
+        let part_body = vec![0u8; 1024];
+        let req = S3Request {
+            method: String::new(),
+            path: String::new(),
+            query_string: format!("partNumber=1&uploadId={upload_id}"),
+            headers: vec![],
+            body: part_body,
+        };
+        let op = S3Operation::UploadPart {
+            bucket: "mybucket".to_string(),
+            key: "mykey".to_string(),
+        };
+        let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
+        assert_eq!(resp.status_code, 200);
+        let etag = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k == "ETag")
+            .map(|(_, v)| v.clone())
+            .expect("UploadPart response must have ETag header");
+        // ETag must be quoted
+        assert!(etag.starts_with('"') && etag.ends_with('"'), "ETag not quoted: {etag}");
+
+        // 3. CompleteMultipartUpload with quoted ETag from UploadPart response
+        let complete_xml = format!(
+            "<CompleteMultipartUpload>\
+               <Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part>\
+             </CompleteMultipartUpload>"
+        );
+        let req = S3Request {
+            method: String::new(),
+            path: String::new(),
+            query_string: format!("uploadId={upload_id}"),
+            headers: vec![],
+            body: complete_xml.into_bytes(),
+        };
+        let op = S3Operation::CompleteMultipartUpload {
+            bucket: "mybucket".to_string(),
+            key: "mykey".to_string(),
+        };
+        let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
+        assert_eq!(resp.status_code, 200);
+        let body = std::str::from_utf8(&resp.body).unwrap();
+        assert!(body.contains("<CompleteMultipartUploadResult"), "missing result element: {body}");
+        assert!(body.contains("<Key>mykey</Key>"), "missing key: {body}");
+        assert!(body.contains("<ETag>"), "missing etag: {body}");
+    }
+
     // ── ListMultipartUploads validation ──────────────────────────────
 
     #[test]

@@ -480,6 +480,39 @@ mod tests {
     }
 
     #[test]
+    fn s3_error_code_invalid_part() {
+        let err = ServerError::InvalidPart { part_number: 3 };
+        assert_eq!(err.s3_error_code(), "InvalidPart");
+        assert_eq!(err.http_status(), 400);
+    }
+
+    #[test]
+    fn s3_error_code_invalid_part_order() {
+        assert_eq!(ServerError::InvalidPartOrder.s3_error_code(), "InvalidPartOrder");
+        assert_eq!(ServerError::InvalidPartOrder.http_status(), 400);
+    }
+
+    #[test]
+    fn s3_error_code_entity_too_small() {
+        let err = ServerError::EntityTooSmall {
+            part_number: 1,
+            size: 100,
+            min: 5242880,
+        };
+        assert_eq!(err.s3_error_code(), "EntityTooSmall");
+        assert_eq!(err.http_status(), 400);
+    }
+
+    #[test]
+    fn from_metadata_no_such_upload() {
+        let err: ServerError = MetadataError::NoSuchUpload {
+            upload_id: "abc".to_string(),
+        }
+        .into();
+        assert!(matches!(err, ServerError::NoSuchUpload { .. }));
+    }
+
+    #[test]
     fn display_messages() {
         let err = ServerError::BucketNotFound {
             name: "test".into(),

@@ -1251,15 +1251,47 @@ pub fn initiate_multipart_upload_xml(bucket: &str, key: &str, upload_id: &str) -
     )
 }
 
+/// Percent-encode a logical key for use in URLs, preserving '/'.
+///
+/// Unlike `uri_encode_path` (which preserves existing %XX sequences for
+/// canonical request paths), this encodes every byte that needs encoding,
+/// including literal '%' characters. Use this for Location URLs where the
+/// input is a logical object key, not a raw request path.
+fn uri_encode_key(s: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(b as char);
+            }
+            _ => {
+                out.push('%');
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0x0F) as usize] as char);
+            }
+        }
+    }
+    out
+}
+
 /// Format a CompleteMultipartUploadResult XML response.
 pub fn complete_multipart_upload_xml(bucket: &str, key: &str, etag: &str) -> String {
+    // Location uses path-style: http://s3.amazonaws.com/<bucket>/<key>
+    let location = format!(
+        "http://s3.amazonaws.com/{}/{}",
+        uri_encode_key(bucket),
+        uri_encode_key(key)
+    );
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <CompleteMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <Location>{}</Location>\
          <Bucket>{}</Bucket>\
          <Key>{}</Key>\
          <ETag>{}</ETag>\
          </CompleteMultipartUploadResult>",
+        xml_escape(&location),
         xml_escape(bucket),
         xml_escape(key),
         xml_escape(etag),
@@ -1428,7 +1460,6 @@ pub fn parse_complete_multipart_upload_xml(body: &[u8]) -> Result<Vec<CompletePa
             .ok_or_else(malformed)?;
         let etag = part_content[etag_start..etag_start + etag_end]
             .trim()
-            .trim_matches('"')
             .to_string();
 
         parts.push(CompletePart { part_number, etag });
@@ -2465,9 +2496,9 @@ mod tests {
         let parts = parse_complete_multipart_upload_xml(xml).unwrap();
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0].part_number, 1);
-        assert_eq!(parts[0].etag, "abc");
+        assert_eq!(parts[0].etag, "\"abc\"");
         assert_eq!(parts[1].part_number, 2);
-        assert_eq!(parts[1].etag, "def");
+        assert_eq!(parts[1].etag, "\"def\"");
     }
 
     #[test]
@@ -2482,11 +2513,12 @@ mod tests {
         let parts = parse_complete_multipart_upload_xml(xml).unwrap();
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].part_number, 1);
-        assert_eq!(parts[0].etag, "etag1");
+        assert_eq!(parts[0].etag, "\"etag1\"");
     }
 
     #[test]
     fn parse_complete_multipart_etag_without_quotes() {
+        // Unquoted ETags are preserved as-is (unusual but valid)
         let xml = b"<CompleteMultipartUpload>\
             <Part><PartNumber>1</PartNumber><ETag>abc123</ETag></Part>\
             </CompleteMultipartUpload>";
@@ -2534,10 +2566,32 @@ mod tests {
     #[test]
     fn complete_multipart_upload_xml_format() {
         let xml = complete_multipart_upload_xml("mybucket", "mykey", "\"etag123\"");
+        assert!(xml.contains("<Location>http://s3.amazonaws.com/mybucket/mykey</Location>"));
         assert!(xml.contains("<Bucket>mybucket</Bucket>"));
         assert!(xml.contains("<Key>mykey</Key>"));
         assert!(xml.contains("<ETag>&quot;etag123&quot;</ETag>"));
         assert!(xml.contains("CompleteMultipartUploadResult"));
+    }
+
+    #[test]
+    fn complete_multipart_upload_xml_location_encodes_key() {
+        let xml = complete_multipart_upload_xml("mybucket", "path/to/my key", "\"e\"");
+        assert!(xml.contains("mybucket/path/to/my%20key"));
+    }
+
+    #[test]
+    fn complete_multipart_upload_xml_location_encodes_literal_percent() {
+        // A key containing literal %20 should encode the % as %25
+        let xml = complete_multipart_upload_xml("mybucket", "key%20name", "\"e\"");
+        assert!(xml.contains("mybucket/key%2520name"));
+    }
+
+    #[test]
+    fn uri_encode_key_encodes_all_special_chars() {
+        assert_eq!(uri_encode_key("a/b"), "a/b");
+        assert_eq!(uri_encode_key("hello world"), "hello%20world");
+        assert_eq!(uri_encode_key("100%"), "100%25");
+        assert_eq!(uri_encode_key("a-b_c.d~e"), "a-b_c.d~e");
     }
 
     #[test]
@@ -2546,5 +2600,259 @@ mod tests {
         assert!(xml.contains("my&amp;bucket"));
         assert!(xml.contains("key&lt;&gt;"));
         assert!(xml.contains("id&quot;1"));
+    }
+
+    // ── ListMultipartUploads XML tests ───────────────────────────────
+
+    #[test]
+    fn list_multipart_uploads_xml_empty() {
+        let result = ListMultipartUploadsResult {
+            uploads: vec![],
+            is_truncated: false,
+            next_key_marker: None,
+            next_upload_id_marker: None,
+        };
+        let xml = list_multipart_uploads_xml("mybucket", None, None, None, 1000, &result);
+        assert!(xml.contains("<Bucket>mybucket</Bucket>"));
+        assert!(xml.contains("<Prefix/>"));
+        assert!(xml.contains("<KeyMarker/>"));
+        assert!(xml.contains("<UploadIdMarker/>"));
+        assert!(xml.contains("<MaxUploads>1000</MaxUploads>"));
+        assert!(xml.contains("<IsTruncated>false</IsTruncated>"));
+        assert!(!xml.contains("<Upload>"));
+        assert!(!xml.contains("<NextKeyMarker>"));
+        assert!(!xml.contains("<NextUploadIdMarker>"));
+    }
+
+    #[test]
+    fn list_multipart_uploads_xml_with_entries() {
+        use crate::coordinator::MultipartUploadEntry;
+        let result = ListMultipartUploadsResult {
+            uploads: vec![
+                MultipartUploadEntry {
+                    key: "file1.txt".to_string(),
+                    upload_id: "id1".to_string(),
+                    initiated: 1700000000000,
+                },
+                MultipartUploadEntry {
+                    key: "file2.txt".to_string(),
+                    upload_id: "id2".to_string(),
+                    initiated: 1700000001000,
+                },
+            ],
+            is_truncated: false,
+            next_key_marker: None,
+            next_upload_id_marker: None,
+        };
+        let xml =
+            list_multipart_uploads_xml("mybucket", Some("file"), None, None, 1000, &result);
+        assert!(xml.contains("<Prefix>file</Prefix>"));
+        assert!(xml.contains("<Key>file1.txt</Key>"));
+        assert!(xml.contains("<UploadId>id1</UploadId>"));
+        assert!(xml.contains("<Key>file2.txt</Key>"));
+        assert!(xml.contains("<UploadId>id2</UploadId>"));
+        assert!(xml.contains("<Initiated>"));
+    }
+
+    #[test]
+    fn list_multipart_uploads_xml_truncated() {
+        use crate::coordinator::MultipartUploadEntry;
+        let result = ListMultipartUploadsResult {
+            uploads: vec![MultipartUploadEntry {
+                key: "key1".to_string(),
+                upload_id: "uid1".to_string(),
+                initiated: 0,
+            }],
+            is_truncated: true,
+            next_key_marker: Some("key1".to_string()),
+            next_upload_id_marker: Some("uid1".to_string()),
+        };
+        let xml = list_multipart_uploads_xml(
+            "mybucket",
+            None,
+            Some("marker"),
+            Some("uid-marker"),
+            1,
+            &result,
+        );
+        assert!(xml.contains("<IsTruncated>true</IsTruncated>"));
+        assert!(xml.contains("<KeyMarker>marker</KeyMarker>"));
+        assert!(xml.contains("<UploadIdMarker>uid-marker</UploadIdMarker>"));
+        assert!(xml.contains("<NextKeyMarker>key1</NextKeyMarker>"));
+        assert!(xml.contains("<NextUploadIdMarker>uid1</NextUploadIdMarker>"));
+        assert!(xml.contains("<MaxUploads>1</MaxUploads>"));
+    }
+
+    #[test]
+    fn list_multipart_uploads_xml_escapes_keys() {
+        use crate::coordinator::MultipartUploadEntry;
+        let result = ListMultipartUploadsResult {
+            uploads: vec![MultipartUploadEntry {
+                key: "key&<>".to_string(),
+                upload_id: "id\"'".to_string(),
+                initiated: 0,
+            }],
+            is_truncated: false,
+            next_key_marker: None,
+            next_upload_id_marker: None,
+        };
+        let xml = list_multipart_uploads_xml("mybucket", None, None, None, 1000, &result);
+        assert!(xml.contains("<Key>key&amp;&lt;&gt;</Key>"));
+        assert!(xml.contains("<UploadId>id&quot;&apos;</UploadId>"));
+    }
+
+    // ── ListParts XML tests ──────────────────────────────────────────
+
+    #[test]
+    fn list_parts_xml_empty() {
+        let result = ListPartsResult {
+            parts: vec![],
+            is_truncated: false,
+            next_part_number_marker: None,
+        };
+        let xml = list_parts_xml("mybucket", "mykey", "uid1", None, 1000, &result);
+        assert!(xml.contains("<Bucket>mybucket</Bucket>"));
+        assert!(xml.contains("<Key>mykey</Key>"));
+        assert!(xml.contains("<UploadId>uid1</UploadId>"));
+        assert!(xml.contains("<PartNumberMarker>0</PartNumberMarker>"));
+        assert!(xml.contains("<MaxParts>1000</MaxParts>"));
+        assert!(xml.contains("<IsTruncated>false</IsTruncated>"));
+        assert!(!xml.contains("<Part>"));
+    }
+
+    #[test]
+    fn list_parts_xml_with_entries() {
+        use crate::coordinator::PartEntry;
+        let result = ListPartsResult {
+            parts: vec![
+                PartEntry {
+                    part_number: 1,
+                    size: 5242880,
+                    etag: "\"abc\"".to_string(),
+                    last_modified: 1700000000000,
+                },
+                PartEntry {
+                    part_number: 2,
+                    size: 1024,
+                    etag: "\"def\"".to_string(),
+                    last_modified: 1700000001000,
+                },
+            ],
+            is_truncated: false,
+            next_part_number_marker: None,
+        };
+        let xml = list_parts_xml("mybucket", "mykey", "uid1", None, 1000, &result);
+        assert!(xml.contains("<PartNumber>1</PartNumber>"));
+        assert!(xml.contains("<Size>5242880</Size>"));
+        assert!(xml.contains("<ETag>&quot;abc&quot;</ETag>"));
+        assert!(xml.contains("<PartNumber>2</PartNumber>"));
+        assert!(xml.contains("<Size>1024</Size>"));
+        assert!(xml.contains("<LastModified>"));
+    }
+
+    #[test]
+    fn list_parts_xml_truncated_with_marker() {
+        use crate::coordinator::PartEntry;
+        let result = ListPartsResult {
+            parts: vec![PartEntry {
+                part_number: 3,
+                size: 100,
+                etag: "\"e\"".to_string(),
+                last_modified: 0,
+            }],
+            is_truncated: true,
+            next_part_number_marker: Some(3),
+        };
+        let xml = list_parts_xml("mybucket", "mykey", "uid1", Some(2), 1, &result);
+        assert!(xml.contains("<PartNumberMarker>2</PartNumberMarker>"));
+        assert!(xml.contains("<MaxParts>1</MaxParts>"));
+        assert!(xml.contains("<IsTruncated>true</IsTruncated>"));
+        assert!(xml.contains("<NextPartNumberMarker>3</NextPartNumberMarker>"));
+    }
+
+    // ── Multipart error XML coverage ─────────────────────────────────
+
+    #[test]
+    fn error_xml_no_such_upload() {
+        let xml = error_xml("NoSuchUpload", "no such upload: abc", "/bucket/key", "req-1");
+        assert!(xml.contains("<Code>NoSuchUpload</Code>"));
+        assert!(xml.contains("<Message>no such upload: abc</Message>"));
+    }
+
+    #[test]
+    fn error_xml_invalid_part() {
+        let xml = error_xml("InvalidPart", "invalid part: part 3", "/bucket/key", "req-1");
+        assert!(xml.contains("<Code>InvalidPart</Code>"));
+    }
+
+    #[test]
+    fn error_xml_invalid_part_order() {
+        let xml = error_xml(
+            "InvalidPartOrder",
+            "invalid part order",
+            "/bucket/key",
+            "req-1",
+        );
+        assert!(xml.contains("<Code>InvalidPartOrder</Code>"));
+    }
+
+    #[test]
+    fn error_xml_entity_too_small() {
+        let xml = error_xml(
+            "EntityTooSmall",
+            "entity too small: part 1 is 100 bytes (min 5242880)",
+            "/bucket/key",
+            "req-1",
+        );
+        assert!(xml.contains("<Code>EntityTooSmall</Code>"));
+        assert!(xml.contains("5242880"));
+    }
+
+    // ── Parse CompleteMultipartUpload edge cases ─────────────────────
+
+    #[test]
+    fn parse_complete_multipart_many_parts() {
+        let mut xml = String::from("<CompleteMultipartUpload>");
+        for i in 1..=100 {
+            xml.push_str(&format!(
+                "<Part><PartNumber>{i}</PartNumber><ETag>\"etag{i}\"</ETag></Part>"
+            ));
+        }
+        xml.push_str("</CompleteMultipartUpload>");
+        let parts = parse_complete_multipart_upload_xml(xml.as_bytes()).unwrap();
+        assert_eq!(parts.len(), 100);
+        assert_eq!(parts[0].part_number, 1);
+        assert_eq!(parts[99].part_number, 100);
+        assert_eq!(parts[49].etag, "\"etag50\"");
+    }
+
+    #[test]
+    fn parse_complete_multipart_with_xml_declaration_and_namespace() {
+        let xml = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+            <CompleteMultipartUpload xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+            <Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part>\
+            </CompleteMultipartUpload>";
+        let parts = parse_complete_multipart_upload_xml(xml).unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].part_number, 1);
+        assert_eq!(parts[0].etag, "\"a\"");
+    }
+
+    #[test]
+    fn parse_complete_multipart_invalid_part_number_zero() {
+        // part_number=0 parses fine; validation is in coordinator
+        let xml = b"<CompleteMultipartUpload>\
+            <Part><PartNumber>0</PartNumber><ETag>\"a\"</ETag></Part>\
+            </CompleteMultipartUpload>";
+        let parts = parse_complete_multipart_upload_xml(xml).unwrap();
+        assert_eq!(parts[0].part_number, 0);
+    }
+
+    #[test]
+    fn parse_complete_multipart_negative_part_number() {
+        let xml = b"<CompleteMultipartUpload>\
+            <Part><PartNumber>-1</PartNumber><ETag>\"a\"</ETag></Part>\
+            </CompleteMultipartUpload>";
+        assert!(parse_complete_multipart_upload_xml(xml).is_err());
     }
 }
