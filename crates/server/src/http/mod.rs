@@ -929,10 +929,9 @@ impl HttpFrontend {
 
                 // Extract claimed checksum from request headers (at most one).
                 let claimed_checksum = extract_part_checksum(req)?;
-                let claimed_ref =
-                    claimed_checksum
-                        .as_ref()
-                        .map(|(algo, val)| (*algo, val.as_str()));
+                let claimed_ref = claimed_checksum
+                    .as_ref()
+                    .map(|(algo, val)| (*algo, val.as_str()));
 
                 let result = self.coordinator.upload_part(
                     &bucket,
@@ -2206,10 +2205,7 @@ mod tests {
             method: String::new(),
             path: String::new(),
             query_string: format!("partNumber=1&uploadId={upload_id}"),
-            headers: vec![(
-                "x-amz-checksum-sha256".to_string(),
-                "AAAA".to_string(),
-            )],
+            headers: vec![("x-amz-checksum-sha256".to_string(), "AAAA".to_string())],
             body: vec![1, 2, 3, 4],
         };
         let op = S3Operation::UploadPart {
@@ -2367,10 +2363,7 @@ mod tests {
             method: String::new(),
             path: String::new(),
             query_string: format!("partNumber=1&uploadId={upload_id}"),
-            headers: vec![(
-                "x-amz-checksum-crc32".to_string(),
-                "AAAAAA==".to_string(),
-            )],
+            headers: vec![("x-amz-checksum-crc32".to_string(), "AAAAAA==".to_string())],
             body: vec![1, 2, 3, 4],
         };
         let op = S3Operation::UploadPart {
@@ -2399,10 +2392,7 @@ mod tests {
             query_string: format!("partNumber=1&uploadId={upload_id}"),
             headers: vec![
                 // Algorithm header says SHA256 but value header is CRC32.
-                (
-                    "x-amz-checksum-algorithm".to_string(),
-                    "SHA256".to_string(),
-                ),
+                ("x-amz-checksum-algorithm".to_string(), "SHA256".to_string()),
                 ("x-amz-checksum-crc32".to_string(), "AAAAAA==".to_string()),
             ],
             body: vec![1, 2, 3, 4],
@@ -2433,10 +2423,7 @@ mod tests {
             method: String::new(),
             path: String::new(),
             query_string: format!("partNumber=1&uploadId={upload_id}"),
-            headers: vec![(
-                "x-amz-checksum-algorithm".to_string(),
-                "CRC32".to_string(),
-            )],
+            headers: vec![("x-amz-checksum-algorithm".to_string(), "CRC32".to_string())],
             body: vec![1, 2, 3, 4],
         };
         let op = S3Operation::UploadPart {
@@ -2447,7 +2434,10 @@ mod tests {
         assert_eq!(resp.status_code, 200);
 
         // Checksum should still be computed and returned from the upload config.
-        let has_crc = resp.headers.iter().any(|(k, _)| k == "x-amz-checksum-crc32");
+        let has_crc = resp
+            .headers
+            .iter()
+            .any(|(k, _)| k == "x-amz-checksum-crc32");
         assert!(has_crc, "expected checksum header in response");
     }
 }

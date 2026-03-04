@@ -2424,7 +2424,13 @@ impl Coordinator {
             if meta_pg_id < shard_pg_id {
                 // Already in ascending order.
                 let shard_guard = self.storage_node.get_pg(shard_pg_id)?;
-                break (meta_pg, Some(shard_guard), generation, shard_pg_id, upload_algo);
+                break (
+                    meta_pg,
+                    Some(shard_guard),
+                    generation,
+                    shard_pg_id,
+                    upload_algo,
+                );
             }
 
             // Out of order: drop meta_pg, relock both in ascending order, revalidate.
@@ -2987,11 +2993,9 @@ fn compute_checksum(algo: ChecksumAlgorithm, data: &[u8]) -> Vec<u8> {
         ChecksumAlgorithm::Crc32 => checksum::crc32::checksum(data).to_be_bytes().to_vec(),
         ChecksumAlgorithm::Crc32c => checksum::crc32c::checksum(data).to_be_bytes().to_vec(),
         ChecksumAlgorithm::Crc64nvme => crc64::checksum(data).to_be_bytes().to_vec(),
-        ChecksumAlgorithm::Sha256 => {
-            ring::digest::digest(&ring::digest::SHA256, data)
-                .as_ref()
-                .to_vec()
-        }
+        ChecksumAlgorithm::Sha256 => ring::digest::digest(&ring::digest::SHA256, data)
+            .as_ref()
+            .to_vec(),
         ChecksumAlgorithm::Sha1 => {
             ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, data)
                 .as_ref()
