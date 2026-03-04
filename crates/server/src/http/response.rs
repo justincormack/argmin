@@ -1,8 +1,8 @@
 /// Build HTTP responses for S3 operations.
 use crate::coordinator::{
     CopyObjectResult, DeleteObjectResult, DeleteObjectsResult, GetObjectRangeResult,
-    GetObjectResult, HeadObjectResult, ListObjectVersionsResult, ListObjectsResult,
-    PutObjectResult,
+    GetObjectResult, HeadObjectResult, ListMultipartUploadsResult, ListObjectVersionsResult,
+    ListObjectsResult, ListPartsResult, PutObjectResult,
 };
 use crate::error::ServerError;
 use storage::BucketInfo;
@@ -495,6 +495,71 @@ impl S3Response {
     /// Build a response for PutBucketAcl (200 OK, no body).
     pub fn put_bucket_acl() -> Self {
         Self::new(200)
+    }
+
+    /// Build a response for CreateMultipartUpload (200 OK, XML body).
+    pub fn create_multipart_upload(bucket: &str, key: &str, upload_id: &str) -> Self {
+        let body = xml::initiate_multipart_upload_xml(bucket, key, upload_id);
+        Self::new(200).xml_body(body)
+    }
+
+    /// Build a response for UploadPart (200 OK, ETag header).
+    pub fn upload_part(etag: &str) -> Self {
+        Self::new(200).header("ETag", etag)
+    }
+
+    /// Build a response for CompleteMultipartUpload (200 OK, XML body).
+    pub fn complete_multipart_upload(
+        bucket: &str,
+        key: &str,
+        etag: &str,
+        version_id: u64,
+    ) -> Self {
+        let body = xml::complete_multipart_upload_xml(bucket, key, etag);
+        let mut resp = Self::new(200).xml_body(body);
+        if version_id != 0 {
+            resp = resp.header("x-amz-version-id", &format_version_id(version_id));
+        }
+        resp
+    }
+
+    /// Build a response for AbortMultipartUpload (204 No Content).
+    pub fn abort_multipart_upload() -> Self {
+        Self::new(204)
+    }
+
+    /// Build a response for ListMultipartUploads (200 OK, XML body).
+    pub fn list_multipart_uploads(
+        bucket: &str,
+        prefix: Option<&str>,
+        key_marker: Option<&str>,
+        upload_id_marker: Option<&str>,
+        max_uploads: u32,
+        result: &ListMultipartUploadsResult,
+    ) -> Self {
+        let body = xml::list_multipart_uploads_xml(
+            bucket,
+            prefix,
+            key_marker,
+            upload_id_marker,
+            max_uploads,
+            result,
+        );
+        Self::new(200).xml_body(body)
+    }
+
+    /// Build a response for ListParts (200 OK, XML body).
+    pub fn list_parts(
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number_marker: Option<u32>,
+        max_parts: u32,
+        result: &ListPartsResult,
+    ) -> Self {
+        let body =
+            xml::list_parts_xml(bucket, key, upload_id, part_number_marker, max_parts, result);
+        Self::new(200).xml_body(body)
     }
 
     /// Build a 200 response for a CORS preflight (headers added by caller).

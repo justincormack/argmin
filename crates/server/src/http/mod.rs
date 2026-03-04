@@ -20,6 +20,7 @@ use crate::conditional::{
 use crate::coordinator::Coordinator;
 use crate::coordinator::MetadataDirective;
 use crate::error::ServerError;
+use crate::metadata_blob::MetadataBlob;
 use request::S3Request;
 use response::S3Response;
 use router::{route, S3Operation};
@@ -817,6 +818,118 @@ impl HttpFrontend {
                 }
                 Ok(S3Response::put_bucket_acl())
             }
+            S3Operation::CreateMultipartUpload { bucket, key } => {
+                self.authorize_bucket_write(auth, &bucket)?;
+                let header_pairs: Vec<(&str, &str)> = req
+                    .headers
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str()))
+                    .collect();
+                let metadata = MetadataBlob::from_headers(&header_pairs)?;
+                let result = self.coordinator.create_multipart_upload(&bucket, &key, &metadata)?;
+                Ok(S3Response::create_multipart_upload(&bucket, &key, &result.upload_id))
+            }
+            S3Operation::UploadPart { bucket, key } => {
+                self.authorize_bucket_write(auth, &bucket)?;
+                let upload_id = req.query_param("uploadId").ok_or_else(|| {
+                    ServerError::InvalidRequest {
+                        reason: "missing uploadId query parameter".to_string(),
+                    }
+                })?;
+                let part_number: u32 = req
+                    .query_param("partNumber")
+                    .ok_or_else(|| ServerError::InvalidRequest {
+                        reason: "missing partNumber query parameter".to_string(),
+                    })?
+                    .parse()
+                    .map_err(|_| ServerError::InvalidArgument {
+                        reason: "partNumber must be a positive integer".to_string(),
+                    })?;
+                let result = self.coordinator.upload_part(
+                    &bucket, &key, &upload_id, part_number, &req.body,
+                )?;
+                Ok(S3Response::upload_part(&result.etag))
+            }
+            S3Operation::CompleteMultipartUpload { bucket, key } => {
+                self.authorize_bucket_write(auth, &bucket)?;
+                let upload_id = req.query_param("uploadId").ok_or_else(|| {
+                    ServerError::InvalidRequest {
+                        reason: "missing uploadId query parameter".to_string(),
+                    }
+                })?;
+                let parts = xml::parse_complete_multipart_upload_xml(&req.body)?;
+                let result = self.coordinator.complete_multipart_upload(
+                    &bucket, &key, &upload_id, &parts,
+                )?;
+                Ok(S3Response::complete_multipart_upload(
+                    &bucket, &key, &result.etag, result.version_id,
+                ))
+            }
+            S3Operation::AbortMultipartUpload { bucket, key } => {
+                self.authorize_bucket_write(auth, &bucket)?;
+                let upload_id = req.query_param("uploadId").ok_or_else(|| {
+                    ServerError::InvalidRequest {
+                        reason: "missing uploadId query parameter".to_string(),
+                    }
+                })?;
+                self.coordinator.abort_multipart_upload(&bucket, &key, &upload_id)?;
+                Ok(S3Response::abort_multipart_upload())
+            }
+            S3Operation::ListMultipartUploads { bucket } => {
+                self.authorize_bucket_read(auth, &bucket)?;
+                let prefix = req.query_param("prefix");
+                let key_marker = req.query_param("key-marker");
+                let upload_id_marker = req.query_param("upload-id-marker");
+                let max_uploads: u32 = match req.query_param("max-uploads") {
+                    None => 1000,
+                    Some(s) => s.parse().map_err(|_| ServerError::InvalidArgument {
+                        reason: "invalid max-uploads".to_string(),
+                    })?,
+                };
+                let result = self.coordinator.list_multipart_uploads(
+                    &bucket,
+                    prefix.as_deref(),
+                    key_marker.as_deref(),
+                    upload_id_marker.as_deref(),
+                    max_uploads,
+                )?;
+                Ok(S3Response::list_multipart_uploads(
+                    &bucket,
+                    prefix.as_deref(),
+                    key_marker.as_deref(),
+                    upload_id_marker.as_deref(),
+                    max_uploads,
+                    &result,
+                ))
+            }
+            S3Operation::ListParts { bucket, key } => {
+                self.authorize_bucket_read(auth, &bucket)?;
+                let upload_id = req.query_param("uploadId").ok_or_else(|| {
+                    ServerError::InvalidRequest {
+                        reason: "missing uploadId query parameter".to_string(),
+                    }
+                })?;
+                let part_number_marker: Option<u32> = req
+                    .query_param("part-number-marker")
+                    .map(|s| {
+                        s.parse().map_err(|_| ServerError::InvalidArgument {
+                            reason: "part-number-marker must be an integer".to_string(),
+                        })
+                    })
+                    .transpose()?;
+                let max_parts: u32 = match req.query_param("max-parts") {
+                    None => 1000,
+                    Some(s) => s.parse().map_err(|_| ServerError::InvalidArgument {
+                        reason: "invalid max-parts".to_string(),
+                    })?,
+                };
+                let result = self.coordinator.list_parts(
+                    &bucket, &key, &upload_id, part_number_marker, max_parts,
+                )?;
+                Ok(S3Response::list_parts(
+                    &bucket, &key, &upload_id, part_number_marker, max_parts, &result,
+                ))
+            }
             // OptionsRequest is handled before auth in handle_s3_request
             S3Operation::OptionsRequest { .. } => {
                 unreachable!("OPTIONS handled before dispatch")
@@ -1261,5 +1374,217 @@ fn parse_bucket_acl(req: &S3Request) -> Result<BucketAcl, ServerError> {
         Some(other) => Err(ServerError::InvalidArgument {
             reason: format!("unsupported x-amz-acl value: {other}"),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::coordinator::Coordinator;
+    use ec::EcConfig;
+    use std::sync::Arc;
+    use storage::{SharedStorageNode, SqliteBucketDb};
+
+    fn setup_frontend(dir: &std::path::Path) -> HttpFrontend {
+        let pg_ids: Vec<u32> = (0..4).collect();
+        let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
+        let bucket_db = SqliteBucketDb::open_in_memory().unwrap();
+        let ec_config = EcConfig::new(4, 2).unwrap();
+        let coordinator =
+            Coordinator::new(storage_node, bucket_db, ec_config, 4, "us-east-1".to_string())
+                .unwrap();
+        let credentials = auth::CredentialStore::new();
+        HttpFrontend {
+            coordinator,
+            credentials,
+        }
+    }
+
+    fn test_auth() -> auth::AuthContext {
+        auth::AuthContext {
+            mode: auth::AuthMode::HeaderSigV4,
+            access_key_id: Some("AKID".to_string()),
+            principal: Some("testuser".to_string()),
+            request_epoch_secs: Some(0),
+        }
+    }
+
+    fn make_req(query: &str) -> S3Request {
+        S3Request {
+            method: String::new(),
+            path: String::new(),
+            query_string: query.to_string(),
+            headers: vec![],
+            body: vec![],
+        }
+    }
+
+    // ── UploadPart validation ────────────────────────────────────────
+
+    #[test]
+    fn upload_part_missing_upload_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+
+        let req = make_req("partNumber=1");
+        let op = S3Operation::UploadPart {
+            bucket: "mybucket".to_string(),
+            key: "mykey".to_string(),
+        };
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::InvalidRequest { .. }) => {}
+            Err(e) => panic!("expected InvalidRequest, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn upload_part_invalid_part_number() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+
+        let req = make_req("partNumber=abc&uploadId=xyz");
+        let op = S3Operation::UploadPart {
+            bucket: "mybucket".to_string(),
+            key: "mykey".to_string(),
+        };
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::InvalidArgument { .. }) => {}
+            Err(e) => panic!("expected InvalidArgument, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    // ── CompleteMultipartUpload validation ────────────────────────────
+
+    #[test]
+    fn complete_multipart_missing_upload_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+
+        let req = make_req("");
+        let op = S3Operation::CompleteMultipartUpload {
+            bucket: "mybucket".to_string(),
+            key: "mykey".to_string(),
+        };
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::InvalidRequest { .. }) => {}
+            Err(e) => panic!("expected InvalidRequest, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    // ── AbortMultipartUpload validation ──────────────────────────────
+
+    #[test]
+    fn abort_multipart_missing_upload_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+
+        let req = make_req("");
+        let op = S3Operation::AbortMultipartUpload {
+            bucket: "mybucket".to_string(),
+            key: "mykey".to_string(),
+        };
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::InvalidRequest { .. }) => {}
+            Err(e) => panic!("expected InvalidRequest, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    // ── ListParts validation ─────────────────────────────────────────
+
+    #[test]
+    fn list_parts_missing_upload_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+
+        let req = make_req("");
+        let op = S3Operation::ListParts {
+            bucket: "mybucket".to_string(),
+            key: "mykey".to_string(),
+        };
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::InvalidRequest { .. }) => {}
+            Err(e) => panic!("expected InvalidRequest, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn list_parts_invalid_part_number_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+
+        let req = make_req("uploadId=abc&part-number-marker=xyz");
+        let op = S3Operation::ListParts {
+            bucket: "mybucket".to_string(),
+            key: "mykey".to_string(),
+        };
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::InvalidArgument { .. }) => {}
+            Err(e) => panic!("expected InvalidArgument, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn list_parts_invalid_max_parts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+
+        let req = make_req("uploadId=abc&max-parts=notanumber");
+        let op = S3Operation::ListParts {
+            bucket: "mybucket".to_string(),
+            key: "mykey".to_string(),
+        };
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::InvalidArgument { .. }) => {}
+            Err(e) => panic!("expected InvalidArgument, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    // ── ListMultipartUploads validation ──────────────────────────────
+
+    #[test]
+    fn list_multipart_uploads_invalid_max_uploads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+
+        let req = make_req("uploads&max-uploads=abc");
+        let op = S3Operation::ListMultipartUploads {
+            bucket: "mybucket".to_string(),
+        };
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::InvalidArgument { .. }) => {}
+            Err(e) => panic!("expected InvalidArgument, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
     }
 }

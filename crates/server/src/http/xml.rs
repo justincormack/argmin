@@ -1,5 +1,8 @@
 /// Hand-formatted XML for S3 responses. No XML library dependency.
-use crate::coordinator::{DeleteError, DeletedObject, ListObjectVersionsResult, ListObjectsResult};
+use crate::coordinator::{
+    CompletePart, DeleteError, DeletedObject, ListMultipartUploadsResult, ListObjectVersionsResult,
+    ListObjectsResult, ListPartsResult,
+};
 use crate::error::ServerError;
 use auth::canonical::uri_encode_path;
 use storage::BucketInfo;
@@ -1231,6 +1234,213 @@ fn checksum_header_to_xml_tag(header: &str) -> Option<&'static str> {
     }
 }
 
+// ── Multipart upload XML ─────────────────────────────────────────
+
+/// Format an InitiateMultipartUploadResult XML response.
+pub fn initiate_multipart_upload_xml(bucket: &str, key: &str, upload_id: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <InitiateMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <Bucket>{}</Bucket>\
+         <Key>{}</Key>\
+         <UploadId>{}</UploadId>\
+         </InitiateMultipartUploadResult>",
+        xml_escape(bucket),
+        xml_escape(key),
+        xml_escape(upload_id),
+    )
+}
+
+/// Format a CompleteMultipartUploadResult XML response.
+pub fn complete_multipart_upload_xml(bucket: &str, key: &str, etag: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <CompleteMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <Bucket>{}</Bucket>\
+         <Key>{}</Key>\
+         <ETag>{}</ETag>\
+         </CompleteMultipartUploadResult>",
+        xml_escape(bucket),
+        xml_escape(key),
+        xml_escape(etag),
+    )
+}
+
+/// Format a ListMultipartUploadsResult XML response.
+pub fn list_multipart_uploads_xml(
+    bucket: &str,
+    prefix: Option<&str>,
+    key_marker: Option<&str>,
+    upload_id_marker: Option<&str>,
+    max_uploads: u32,
+    result: &ListMultipartUploadsResult,
+) -> String {
+    let mut xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <ListMultipartUploadsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <Bucket>{}</Bucket>",
+        xml_escape(bucket),
+    );
+    if let Some(p) = prefix {
+        xml.push_str(&format!("<Prefix>{}</Prefix>", xml_escape(p)));
+    } else {
+        xml.push_str("<Prefix/>");
+    }
+    if let Some(km) = key_marker {
+        xml.push_str(&format!("<KeyMarker>{}</KeyMarker>", xml_escape(km)));
+    } else {
+        xml.push_str("<KeyMarker/>");
+    }
+    if let Some(um) = upload_id_marker {
+        xml.push_str(&format!(
+            "<UploadIdMarker>{}</UploadIdMarker>",
+            xml_escape(um)
+        ));
+    } else {
+        xml.push_str("<UploadIdMarker/>");
+    }
+    xml.push_str(&format!("<MaxUploads>{max_uploads}</MaxUploads>"));
+    xml.push_str(&format!(
+        "<IsTruncated>{}</IsTruncated>",
+        result.is_truncated
+    ));
+    if let Some(ref nkm) = result.next_key_marker {
+        xml.push_str(&format!(
+            "<NextKeyMarker>{}</NextKeyMarker>",
+            xml_escape(nkm)
+        ));
+    }
+    if let Some(ref num) = result.next_upload_id_marker {
+        xml.push_str(&format!(
+            "<NextUploadIdMarker>{}</NextUploadIdMarker>",
+            xml_escape(num)
+        ));
+    }
+    for upload in &result.uploads {
+        xml.push_str(&format!(
+            "<Upload>\
+             <Key>{}</Key>\
+             <UploadId>{}</UploadId>\
+             <Initiated>{}</Initiated>\
+             </Upload>",
+            xml_escape(&upload.key),
+            xml_escape(&upload.upload_id),
+            format_timestamp(upload.initiated),
+        ));
+    }
+    xml.push_str("</ListMultipartUploadsResult>");
+    xml
+}
+
+/// Format a ListPartsResult XML response.
+pub fn list_parts_xml(
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    part_number_marker: Option<u32>,
+    max_parts: u32,
+    result: &ListPartsResult,
+) -> String {
+    let mut xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <ListPartsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <Bucket>{}</Bucket>\
+         <Key>{}</Key>\
+         <UploadId>{}</UploadId>",
+        xml_escape(bucket),
+        xml_escape(key),
+        xml_escape(upload_id),
+    );
+    if let Some(pm) = part_number_marker {
+        xml.push_str(&format!(
+            "<PartNumberMarker>{pm}</PartNumberMarker>"
+        ));
+    } else {
+        xml.push_str("<PartNumberMarker>0</PartNumberMarker>");
+    }
+    xml.push_str(&format!("<MaxParts>{max_parts}</MaxParts>"));
+    xml.push_str(&format!(
+        "<IsTruncated>{}</IsTruncated>",
+        result.is_truncated
+    ));
+    if let Some(npm) = result.next_part_number_marker {
+        xml.push_str(&format!(
+            "<NextPartNumberMarker>{npm}</NextPartNumberMarker>"
+        ));
+    }
+    for part in &result.parts {
+        xml.push_str(&format!(
+            "<Part>\
+             <PartNumber>{}</PartNumber>\
+             <LastModified>{}</LastModified>\
+             <ETag>{}</ETag>\
+             <Size>{}</Size>\
+             </Part>",
+            part.part_number,
+            format_timestamp(part.last_modified),
+            xml_escape(&part.etag),
+            part.size,
+        ));
+    }
+    xml.push_str("</ListPartsResult>");
+    xml
+}
+
+/// Parse a CompleteMultipartUpload request XML body into a list of parts.
+///
+/// Expected format:
+/// ```xml
+/// <CompleteMultipartUpload>
+///   <Part><PartNumber>1</PartNumber><ETag>"abc"</ETag></Part>
+///   ...
+/// </CompleteMultipartUpload>
+/// ```
+pub fn parse_complete_multipart_upload_xml(body: &[u8]) -> Result<Vec<CompletePart>, ServerError> {
+    let malformed = || ServerError::InvalidRequest {
+        reason: "malformed CompleteMultipartUpload XML".to_string(),
+    };
+
+    let s = std::str::from_utf8(body).map_err(|_| malformed())?;
+
+    let mut parts = Vec::new();
+    let mut pos = 0;
+
+    while let Some(i) = s[pos..].find("<Part>") {
+        let part_start = pos + i + 6;
+        let part_end = s[part_start..].find("</Part>").ok_or_else(malformed)?;
+        let part_content = &s[part_start..part_start + part_end];
+        pos = part_start + part_end + 7;
+
+        // Extract PartNumber
+        let pn_start = part_content.find("<PartNumber>").ok_or_else(malformed)? + 12;
+        let pn_end = part_content[pn_start..]
+            .find("</PartNumber>")
+            .ok_or_else(malformed)?;
+        let part_number: u32 = part_content[pn_start..pn_start + pn_end]
+            .trim()
+            .parse()
+            .map_err(|_| malformed())?;
+
+        // Extract ETag
+        let etag_start = part_content.find("<ETag>").ok_or_else(malformed)? + 6;
+        let etag_end = part_content[etag_start..]
+            .find("</ETag>")
+            .ok_or_else(malformed)?;
+        let etag = part_content[etag_start..etag_start + etag_end]
+            .trim()
+            .trim_matches('"')
+            .to_string();
+
+        parts.push(CompletePart { part_number, etag });
+    }
+
+    if parts.is_empty() {
+        return Err(malformed());
+    }
+
+    Ok(parts)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2242,5 +2452,99 @@ mod tests {
         assert!(!is_valid_object_attribute("etag"));
         assert!(!is_valid_object_attribute("Size"));
         assert!(!is_valid_object_attribute(""));
+    }
+
+    // ── Multipart XML tests ─────────────────────────────────────────
+
+    #[test]
+    fn parse_complete_multipart_basic() {
+        let xml = b"<CompleteMultipartUpload>\
+            <Part><PartNumber>1</PartNumber><ETag>\"abc\"</ETag></Part>\
+            <Part><PartNumber>2</PartNumber><ETag>\"def\"</ETag></Part>\
+            </CompleteMultipartUpload>";
+        let parts = parse_complete_multipart_upload_xml(xml).unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].part_number, 1);
+        assert_eq!(parts[0].etag, "abc");
+        assert_eq!(parts[1].part_number, 2);
+        assert_eq!(parts[1].etag, "def");
+    }
+
+    #[test]
+    fn parse_complete_multipart_with_whitespace() {
+        let xml = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+            <CompleteMultipartUpload>\n\
+            <Part>\n\
+              <PartNumber> 1 </PartNumber>\n\
+              <ETag> \"etag1\" </ETag>\n\
+            </Part>\n\
+            </CompleteMultipartUpload>";
+        let parts = parse_complete_multipart_upload_xml(xml).unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].part_number, 1);
+        assert_eq!(parts[0].etag, "etag1");
+    }
+
+    #[test]
+    fn parse_complete_multipart_etag_without_quotes() {
+        let xml = b"<CompleteMultipartUpload>\
+            <Part><PartNumber>1</PartNumber><ETag>abc123</ETag></Part>\
+            </CompleteMultipartUpload>";
+        let parts = parse_complete_multipart_upload_xml(xml).unwrap();
+        assert_eq!(parts[0].etag, "abc123");
+    }
+
+    #[test]
+    fn parse_complete_multipart_empty_body() {
+        let xml = b"<CompleteMultipartUpload></CompleteMultipartUpload>";
+        assert!(parse_complete_multipart_upload_xml(xml).is_err());
+    }
+
+    #[test]
+    fn parse_complete_multipart_invalid_utf8() {
+        let xml = &[0xFF, 0xFE, 0x00];
+        assert!(parse_complete_multipart_upload_xml(xml).is_err());
+    }
+
+    #[test]
+    fn parse_complete_multipart_missing_part_number() {
+        let xml = b"<CompleteMultipartUpload>\
+            <Part><ETag>\"abc\"</ETag></Part>\
+            </CompleteMultipartUpload>";
+        assert!(parse_complete_multipart_upload_xml(xml).is_err());
+    }
+
+    #[test]
+    fn parse_complete_multipart_missing_etag() {
+        let xml = b"<CompleteMultipartUpload>\
+            <Part><PartNumber>1</PartNumber></Part>\
+            </CompleteMultipartUpload>";
+        assert!(parse_complete_multipart_upload_xml(xml).is_err());
+    }
+
+    #[test]
+    fn initiate_multipart_upload_xml_format() {
+        let xml = initiate_multipart_upload_xml("mybucket", "mykey", "upload123");
+        assert!(xml.contains("<Bucket>mybucket</Bucket>"));
+        assert!(xml.contains("<Key>mykey</Key>"));
+        assert!(xml.contains("<UploadId>upload123</UploadId>"));
+        assert!(xml.contains("InitiateMultipartUploadResult"));
+    }
+
+    #[test]
+    fn complete_multipart_upload_xml_format() {
+        let xml = complete_multipart_upload_xml("mybucket", "mykey", "\"etag123\"");
+        assert!(xml.contains("<Bucket>mybucket</Bucket>"));
+        assert!(xml.contains("<Key>mykey</Key>"));
+        assert!(xml.contains("<ETag>&quot;etag123&quot;</ETag>"));
+        assert!(xml.contains("CompleteMultipartUploadResult"));
+    }
+
+    #[test]
+    fn initiate_xml_escapes_special_chars() {
+        let xml = initiate_multipart_upload_xml("my&bucket", "key<>", "id\"1");
+        assert!(xml.contains("my&amp;bucket"));
+        assert!(xml.contains("key&lt;&gt;"));
+        assert!(xml.contains("id&quot;1"));
     }
 }

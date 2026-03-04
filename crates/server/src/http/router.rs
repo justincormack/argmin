@@ -36,6 +36,12 @@ pub enum S3Operation {
     GetBucketOwnershipControls { bucket: String },
     DeleteBucketOwnershipControls { bucket: String },
     GetObjectAttributes { bucket: String, key: String },
+    CreateMultipartUpload { bucket: String, key: String },
+    UploadPart { bucket: String, key: String },
+    CompleteMultipartUpload { bucket: String, key: String },
+    AbortMultipartUpload { bucket: String, key: String },
+    ListMultipartUploads { bucket: String },
+    ListParts { bucket: String, key: String },
     OptionsRequest { bucket: String, key: Option<String> },
 }
 
@@ -229,6 +235,12 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
             bucket: bucket.to_string(),
         }),
         ("GET", None) => {
+            // Check for ?uploads → ListMultipartUploads
+            if has_query_key(query, "uploads") {
+                return Ok(S3Operation::ListMultipartUploads {
+                    bucket: bucket.to_string(),
+                });
+            }
             // Check for ?ownershipControls → GetBucketOwnershipControls
             if has_query_key(query, "ownershipControls") {
                 return Ok(S3Operation::GetBucketOwnershipControls {
@@ -317,6 +329,38 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
         // GetObjectAttributes (must appear before catch-all GET)
         ("GET", Some(key)) if has_query_key(query, "attributes") => {
             Ok(S3Operation::GetObjectAttributes {
+                bucket: bucket.to_string(),
+                key,
+            })
+        }
+
+        // Multipart upload operations (must appear before catch-all object operations)
+        ("POST", Some(key)) if has_query_key(query, "uploads") => {
+            Ok(S3Operation::CreateMultipartUpload {
+                bucket: bucket.to_string(),
+                key,
+            })
+        }
+        ("POST", Some(key)) if has_query_key(query, "uploadId") => {
+            Ok(S3Operation::CompleteMultipartUpload {
+                bucket: bucket.to_string(),
+                key,
+            })
+        }
+        ("PUT", Some(key)) if has_query_key(query, "partNumber") => {
+            Ok(S3Operation::UploadPart {
+                bucket: bucket.to_string(),
+                key,
+            })
+        }
+        ("DELETE", Some(key)) if has_query_key(query, "uploadId") => {
+            Ok(S3Operation::AbortMultipartUpload {
+                bucket: bucket.to_string(),
+                key,
+            })
+        }
+        ("GET", Some(key)) if has_query_key(query, "uploadId") => {
+            Ok(S3Operation::ListParts {
                 bucket: bucket.to_string(),
                 key,
             })
@@ -831,6 +875,183 @@ mod tests {
             S3Operation::GetObject {
                 bucket: "mybucket".to_string(),
                 key: "mykey".to_string()
+            }
+        );
+    }
+
+    // ── Multipart upload routing tests ───────────────────────────────
+
+    #[test]
+    fn create_multipart_upload() {
+        assert_eq!(
+            route("POST", "/mybucket/mykey", "uploads").unwrap(),
+            S3Operation::CreateMultipartUpload {
+                bucket: "mybucket".to_string(),
+                key: "mykey".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn create_multipart_upload_nested_key() {
+        assert_eq!(
+            route("POST", "/mybucket/a/b/c.txt", "uploads").unwrap(),
+            S3Operation::CreateMultipartUpload {
+                bucket: "mybucket".to_string(),
+                key: "a/b/c.txt".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn upload_part() {
+        assert_eq!(
+            route("PUT", "/mybucket/mykey", "partNumber=1&uploadId=abc").unwrap(),
+            S3Operation::UploadPart {
+                bucket: "mybucket".to_string(),
+                key: "mykey".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn upload_part_just_part_number() {
+        // partNumber alone routes to UploadPart (uploadId validation happens in dispatch)
+        assert_eq!(
+            route("PUT", "/mybucket/mykey", "partNumber=5").unwrap(),
+            S3Operation::UploadPart {
+                bucket: "mybucket".to_string(),
+                key: "mykey".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn complete_multipart_upload() {
+        assert_eq!(
+            route("POST", "/mybucket/mykey", "uploadId=abc123").unwrap(),
+            S3Operation::CompleteMultipartUpload {
+                bucket: "mybucket".to_string(),
+                key: "mykey".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn abort_multipart_upload() {
+        assert_eq!(
+            route("DELETE", "/mybucket/mykey", "uploadId=abc123").unwrap(),
+            S3Operation::AbortMultipartUpload {
+                bucket: "mybucket".to_string(),
+                key: "mykey".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn list_multipart_uploads() {
+        assert_eq!(
+            route("GET", "/mybucket", "uploads").unwrap(),
+            S3Operation::ListMultipartUploads {
+                bucket: "mybucket".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn list_multipart_uploads_with_params() {
+        assert_eq!(
+            route("GET", "/mybucket", "uploads&prefix=foo&max-uploads=10").unwrap(),
+            S3Operation::ListMultipartUploads {
+                bucket: "mybucket".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn list_parts() {
+        assert_eq!(
+            route("GET", "/mybucket/mykey", "uploadId=abc123").unwrap(),
+            S3Operation::ListParts {
+                bucket: "mybucket".to_string(),
+                key: "mykey".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn list_parts_with_params() {
+        assert_eq!(
+            route(
+                "GET",
+                "/mybucket/mykey",
+                "uploadId=abc&part-number-marker=5&max-parts=10"
+            )
+            .unwrap(),
+            S3Operation::ListParts {
+                bucket: "mybucket".to_string(),
+                key: "mykey".to_string()
+            }
+        );
+    }
+
+    // ── Multipart precedence tests ───────────────────────────────────
+
+    #[test]
+    fn post_uploads_takes_priority_over_catch_all() {
+        // POST /bucket/key?uploads → CreateMultipartUpload, not a generic POST
+        assert_eq!(
+            route("POST", "/mybucket/mykey", "uploads").unwrap(),
+            S3Operation::CreateMultipartUpload {
+                bucket: "mybucket".to_string(),
+                key: "mykey".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn put_part_number_takes_priority_over_put_object() {
+        // PUT /bucket/key?partNumber=1 → UploadPart, not PutObject
+        assert_eq!(
+            route("PUT", "/mybucket/mykey", "partNumber=1").unwrap(),
+            S3Operation::UploadPart {
+                bucket: "mybucket".to_string(),
+                key: "mykey".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn delete_upload_id_takes_priority_over_delete_object() {
+        // DELETE /bucket/key?uploadId=x → AbortMultipartUpload, not DeleteObject
+        assert_eq!(
+            route("DELETE", "/mybucket/mykey", "uploadId=x").unwrap(),
+            S3Operation::AbortMultipartUpload {
+                bucket: "mybucket".to_string(),
+                key: "mykey".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn get_upload_id_takes_priority_over_get_object() {
+        // GET /bucket/key?uploadId=x → ListParts, not GetObject
+        assert_eq!(
+            route("GET", "/mybucket/mykey", "uploadId=x").unwrap(),
+            S3Operation::ListParts {
+                bucket: "mybucket".to_string(),
+                key: "mykey".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn get_uploads_bucket_level_takes_priority_over_list_objects() {
+        // GET /bucket?uploads → ListMultipartUploads, not ListObjectsV1
+        assert_eq!(
+            route("GET", "/mybucket", "uploads").unwrap(),
+            S3Operation::ListMultipartUploads {
+                bucket: "mybucket".to_string()
             }
         );
     }
