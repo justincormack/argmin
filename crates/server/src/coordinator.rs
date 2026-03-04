@@ -5,9 +5,9 @@ use ec::{EcConfig, ErasureCodec};
 use storage::traits::{GlobalService, PgMetadataStore, ShardStore};
 use storage::{
     BucketInfo, CreateMultipartUploadReq, DataLayout, ListMultipartUploadsReq,
-    ListObjectVersionsReq, ListObjectsReq, MultipartPartRecord, MultipartUploadRecord,
-    ObjectPartRecord, ObjectRecord, PutObjectMetaReq, ShardKey, SharedStorageNode, SqliteBucketDb,
-    UploadState,
+    ListObjectVersionsReq, ListObjectsReq, ListPartsReq, MultipartPartRecord,
+    MultipartUploadRecord, ObjectPartRecord, ObjectRecord, PutObjectMetaReq, ShardKey,
+    SharedStorageNode, SqliteBucketDb, UploadState,
 };
 
 use crate::conditional::{
@@ -189,6 +189,23 @@ pub struct CompleteMultipartUploadResult {
 
 /// Minimum part size for non-final parts (5 MiB).
 const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
+
+/// Entry in a ListParts result.
+#[derive(Debug, Clone)]
+pub struct PartEntry {
+    pub part_number: u32,
+    pub size: u64,
+    pub etag: String,
+    pub last_modified: u64,
+}
+
+/// Result of a ListParts operation.
+#[derive(Debug)]
+pub struct ListPartsResult {
+    pub parts: Vec<PartEntry>,
+    pub is_truncated: bool,
+    pub next_part_number_marker: Option<u32>,
+}
 
 /// Entry in a ListMultipartUploads result.
 #[derive(Debug, Clone)]
@@ -2266,6 +2283,137 @@ impl Coordinator {
         Ok(CompleteMultipartUploadResult {
             etag: etag_str,
             version_id,
+        })
+    }
+
+    /// Abort an in-progress multipart upload.
+    ///
+    /// Transitions to Aborting, best-effort deletes all part shard sets,
+    /// then deletes the upload and part metadata rows.
+    pub fn abort_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<(), ServerError> {
+        // 1. Lock meta PG and validate upload.
+        let meta_pg_id = derive_pg(bucket, key, self.pg_count);
+        let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
+
+        let upload = meta_pg.get_multipart_upload(upload_id)?;
+        if upload.bucket != bucket || upload.key != key {
+            return Err(ServerError::NoSuchUpload {
+                upload_id: upload_id.to_string(),
+            });
+        }
+
+        // 2. Transition to Aborting. Allow already-Aborting for idempotence.
+        //    Completing → treat as NoSuchUpload (upload is being finalized).
+        match meta_pg.set_upload_state(upload_id, UploadState::Aborting) {
+            Ok(()) => {}
+            Err(storage::MetadataError::UploadNotInProgress { state }) if state == UploadState::Aborting as u8 => {
+                // Already aborting — continue cleanup idempotently.
+            }
+            Err(storage::MetadataError::UploadNotInProgress { .. }) => {
+                return Err(ServerError::NoSuchUpload {
+                    upload_id: upload_id.to_string(),
+                });
+            }
+            Err(e) => return Err(e.into()),
+        }
+
+        // 3. Collect all parts for shard cleanup.
+        let all_parts = meta_pg
+            .list_multipart_parts(&ListPartsReq {
+                upload_id: upload_id.to_string(),
+                part_number_marker: None,
+                max_parts: u32::MAX,
+            })
+            .map_err(ServerError::Metadata)?;
+
+        // 4. Drop meta PG lock before shard cleanup to avoid deadlocks.
+        drop(meta_pg);
+
+        // 5. Best-effort delete all shard sets for each part.
+        for part in &all_parts.parts {
+            let shard_pg_id = derive_pg_shards(
+                &format!("mpu/{upload_id}"),
+                &format!("{}/{}", part.part_number, part.generation),
+                part.part_vid,
+                self.pg_count,
+            );
+            if let Ok(shard_pg) = self.storage_node.get_pg(shard_pg_id) {
+                let k = part.ec_k as usize;
+                let m = part.ec_m as usize;
+                for i in 0..(k + m) {
+                    let shard_key = ShardKey::new(&part.part_okh, part.part_vid, i as u8);
+                    let _ = shard_pg.delete_shard(&shard_key);
+                }
+            }
+        }
+
+        // 6. Re-acquire meta PG and delete upload + parts (CASCADE).
+        let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
+        meta_pg
+            .delete_multipart_upload(upload_id)
+            .map_err(ServerError::Metadata)?;
+
+        Ok(())
+    }
+
+    /// List parts of an in-progress multipart upload.
+    pub fn list_parts(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number_marker: Option<u32>,
+        max_parts: u32,
+    ) -> Result<ListPartsResult, ServerError> {
+        // 1. Lock meta PG and validate upload.
+        let meta_pg_id = derive_pg(bucket, key, self.pg_count);
+        let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
+
+        let upload = meta_pg.get_multipart_upload(upload_id)?;
+        if upload.bucket != bucket || upload.key != key {
+            return Err(ServerError::NoSuchUpload {
+                upload_id: upload_id.to_string(),
+            });
+        }
+        if upload.state != UploadState::InProgress {
+            return Err(ServerError::NoSuchUpload {
+                upload_id: upload_id.to_string(),
+            });
+        }
+
+        // 2. Delegate to storage layer.
+        let resp = meta_pg
+            .list_multipart_parts(&ListPartsReq {
+                upload_id: upload_id.to_string(),
+                part_number_marker,
+                max_parts,
+            })
+            .map_err(ServerError::Metadata)?;
+
+        // 3. Convert to coordinator result types with formatted ETags.
+        let parts = resp
+            .parts
+            .iter()
+            .map(|p| {
+                let etag_crc = etag_bytes_to_crc64(&p.etag).unwrap_or(0);
+                PartEntry {
+                    part_number: p.part_number,
+                    size: p.size,
+                    etag: format_etag(etag_crc),
+                    last_modified: p.last_modified,
+                }
+            })
+            .collect();
+
+        Ok(ListPartsResult {
+            parts,
+            is_truncated: resp.is_truncated,
+            next_part_number_marker: resp.next_part_number_marker,
         })
     }
 
@@ -5468,6 +5616,367 @@ mod tests {
             versions.versions[0].etag.ends_with("-1\""),
             "etag = {}",
             versions.versions[0].etag
+        );
+    }
+
+    // --- AbortMultipartUpload tests ---
+
+    #[test]
+    fn abort_multipart_upload_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let (upload_id, _parts) = create_upload_with_parts(
+            &coord,
+            "bucket",
+            "key",
+            &[(1, b"part1"), (2, b"part2")],
+        );
+
+        coord
+            .abort_multipart_upload("bucket", "key", &upload_id)
+            .unwrap();
+
+        // Upload should no longer exist.
+        let err = coord
+            .upload_part("bucket", "key", &upload_id, 1, b"nope")
+            .unwrap_err();
+        assert!(
+            matches!(err, ServerError::NoSuchUpload { .. }),
+            "expected NoSuchUpload, got {err:?}"
+        );
+
+        // ListMultipartUploads should be empty.
+        let uploads = coord.list_multipart_uploads("bucket", None, None, None, 100).unwrap();
+        assert!(uploads.uploads.is_empty());
+    }
+
+    #[test]
+    fn abort_multipart_upload_nonexistent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let err = coord
+            .abort_multipart_upload("bucket", "key", "no-such-upload")
+            .unwrap_err();
+        assert!(
+            matches!(err, ServerError::NoSuchUpload { .. }),
+            "expected NoSuchUpload, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn abort_multipart_upload_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let metadata = MetadataBlob::new();
+        let create = coord
+            .create_multipart_upload("bucket", "key", &metadata)
+            .unwrap();
+
+        // First abort succeeds.
+        coord
+            .abort_multipart_upload("bucket", "key", &create.upload_id)
+            .unwrap();
+
+        // Second abort: upload is already deleted, returns UploadNotFound.
+        let err = coord
+            .abort_multipart_upload("bucket", "key", &create.upload_id)
+            .unwrap_err();
+        assert!(
+            matches!(err, ServerError::NoSuchUpload { .. }),
+            "expected UploadNotFound on second abort, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn abort_multipart_upload_wrong_bucket_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+        coord.create_bucket("other").unwrap();
+
+        let metadata = MetadataBlob::new();
+        let create = coord
+            .create_multipart_upload("bucket", "key", &metadata)
+            .unwrap();
+
+        let err = coord
+            .abort_multipart_upload("other", "key", &create.upload_id)
+            .unwrap_err();
+        assert!(
+            matches!(err, ServerError::NoSuchUpload { .. }),
+            "expected NoSuchUpload, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn abort_does_not_affect_completed_object() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        // Create and complete an upload.
+        let (upload_id, parts) = create_upload_with_parts(
+            &coord,
+            "bucket",
+            "key",
+            &[(1, b"data1")],
+        );
+        coord
+            .complete_multipart_upload("bucket", "key", &upload_id, &parts)
+            .unwrap();
+
+        // Abort the same upload_id should fail (already deleted by complete).
+        let err = coord
+            .abort_multipart_upload("bucket", "key", &upload_id)
+            .unwrap_err();
+        assert!(
+            matches!(err, ServerError::NoSuchUpload { .. }),
+            "expected NoSuchUpload, got {err:?}"
+        );
+
+        // Object should still exist (visible in listing).
+        let list = coord.list_objects_v2("bucket", None, None, None, 100).unwrap();
+        assert_eq!(list.objects.len(), 1);
+        assert_eq!(list.objects[0].key, "key");
+    }
+
+    #[test]
+    fn upload_part_after_abort_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let metadata = MetadataBlob::new();
+        let create = coord
+            .create_multipart_upload("bucket", "key", &metadata)
+            .unwrap();
+        coord
+            .upload_part("bucket", "key", &create.upload_id, 1, b"data")
+            .unwrap();
+
+        coord
+            .abort_multipart_upload("bucket", "key", &create.upload_id)
+            .unwrap();
+
+        let err = coord
+            .upload_part("bucket", "key", &create.upload_id, 2, b"more")
+            .unwrap_err();
+        assert!(
+            matches!(err, ServerError::NoSuchUpload { .. }),
+            "expected NoSuchUpload, got {err:?}"
+        );
+    }
+
+    // --- ListParts tests ---
+
+    #[test]
+    fn list_parts_basic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let (upload_id, _parts) = create_upload_with_parts(
+            &coord,
+            "bucket",
+            "key",
+            &[(1, b"data1"), (3, b"data3"), (5, b"data5")],
+        );
+
+        let result = coord
+            .list_parts("bucket", "key", &upload_id, None, 100)
+            .unwrap();
+        assert_eq!(result.parts.len(), 3);
+        assert_eq!(result.parts[0].part_number, 1);
+        assert_eq!(result.parts[1].part_number, 3);
+        assert_eq!(result.parts[2].part_number, 5);
+        assert_eq!(result.parts[0].size, 5); // "data1"
+        assert!(!result.is_truncated);
+        assert!(result.next_part_number_marker.is_none());
+    }
+
+    #[test]
+    fn list_parts_pagination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let (upload_id, _parts) = create_upload_with_parts(
+            &coord,
+            "bucket",
+            "key",
+            &[(1, b"a"), (2, b"b"), (3, b"c"), (4, b"d")],
+        );
+
+        // Page 1: max_parts=2
+        let page1 = coord
+            .list_parts("bucket", "key", &upload_id, None, 2)
+            .unwrap();
+        assert_eq!(page1.parts.len(), 2);
+        assert_eq!(page1.parts[0].part_number, 1);
+        assert_eq!(page1.parts[1].part_number, 2);
+        assert!(page1.is_truncated);
+        assert!(page1.next_part_number_marker.is_some());
+
+        // Page 2: continue from marker
+        let page2 = coord
+            .list_parts(
+                "bucket",
+                "key",
+                &upload_id,
+                page1.next_part_number_marker,
+                2,
+            )
+            .unwrap();
+        assert_eq!(page2.parts.len(), 2);
+        assert_eq!(page2.parts[0].part_number, 3);
+        assert_eq!(page2.parts[1].part_number, 4);
+        assert!(!page2.is_truncated);
+    }
+
+    #[test]
+    fn list_parts_etag_format() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let (upload_id, complete_parts) = create_upload_with_parts(
+            &coord,
+            "bucket",
+            "key",
+            &[(1, b"hello")],
+        );
+
+        let result = coord
+            .list_parts("bucket", "key", &upload_id, None, 100)
+            .unwrap();
+        assert_eq!(result.parts.len(), 1);
+        // ListParts ETag should match the ETag returned by UploadPart.
+        assert_eq!(result.parts[0].etag, complete_parts[0].etag);
+    }
+
+    #[test]
+    fn list_parts_wrong_bucket_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+        coord.create_bucket("other").unwrap();
+
+        let metadata = MetadataBlob::new();
+        let create = coord
+            .create_multipart_upload("bucket", "key", &metadata)
+            .unwrap();
+
+        let err = coord
+            .list_parts("other", "key", &create.upload_id, None, 100)
+            .unwrap_err();
+        assert!(
+            matches!(err, ServerError::NoSuchUpload { .. }),
+            "expected NoSuchUpload, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn list_parts_nonexistent_upload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let err = coord
+            .list_parts("bucket", "key", "no-such-upload", None, 100)
+            .unwrap_err();
+        assert!(
+            matches!(err, ServerError::NoSuchUpload { .. }),
+            "expected NoSuchUpload, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn list_parts_after_reupload_shows_latest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let metadata = MetadataBlob::new();
+        let create = coord
+            .create_multipart_upload("bucket", "key", &metadata)
+            .unwrap();
+
+        // Upload part 1, then overwrite it.
+        coord
+            .upload_part("bucket", "key", &create.upload_id, 1, b"original")
+            .unwrap();
+        let reupload = coord
+            .upload_part("bucket", "key", &create.upload_id, 1, b"replaced")
+            .unwrap();
+
+        let result = coord
+            .list_parts("bucket", "key", &create.upload_id, None, 100)
+            .unwrap();
+        assert_eq!(result.parts.len(), 1);
+        assert_eq!(result.parts[0].etag, reupload.etag);
+        assert_eq!(result.parts[0].size, "replaced".len() as u64);
+    }
+
+    #[test]
+    fn list_parts_rejected_when_aborting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let metadata = MetadataBlob::new();
+        let create = coord
+            .create_multipart_upload("bucket", "key", &metadata)
+            .unwrap();
+        coord
+            .upload_part("bucket", "key", &create.upload_id, 1, b"data")
+            .unwrap();
+
+        // Manually transition to Aborting (simulates the window during abort).
+        let meta_pg_id = derive_pg("bucket", "key", coord.pg_count);
+        let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
+        pg.set_upload_state(&create.upload_id, UploadState::Aborting)
+            .unwrap();
+        drop(pg);
+
+        let err = coord
+            .list_parts("bucket", "key", &create.upload_id, None, 100)
+            .unwrap_err();
+        assert!(
+            matches!(err, ServerError::NoSuchUpload { .. }),
+            "expected NoSuchUpload, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn abort_completing_upload_returns_no_such_upload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let metadata = MetadataBlob::new();
+        let create = coord
+            .create_multipart_upload("bucket", "key", &metadata)
+            .unwrap();
+
+        // Manually transition to Completing (simulates concurrent complete).
+        let meta_pg_id = derive_pg("bucket", "key", coord.pg_count);
+        let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
+        pg.set_upload_state(&create.upload_id, UploadState::Completing)
+            .unwrap();
+        drop(pg);
+
+        let err = coord
+            .abort_multipart_upload("bucket", "key", &create.upload_id)
+            .unwrap_err();
+        assert!(
+            matches!(err, ServerError::NoSuchUpload { .. }),
+            "expected NoSuchUpload, got {err:?}"
         );
     }
 }
