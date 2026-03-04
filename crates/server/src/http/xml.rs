@@ -1171,6 +1171,7 @@ pub fn get_object_attributes_xml(
     size: u64,
     checksum_entries: &[(&str, &str)],
     object_parts: Option<&ObjectPartsInfo>,
+    checksum_algorithm: Option<ChecksumAlgorithm>,
 ) -> String {
     let mut xml = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -1190,7 +1191,11 @@ pub fn get_object_attributes_xml(
                 if !checksum_entries.is_empty() {
                     xml.push_str("<Checksum>");
                     for &(header_key, value) in checksum_entries {
-                        if let Some(xml_tag) = checksum_header_to_xml_tag(header_key) {
+                        if header_key == "x-amz-checksum-type" {
+                            xml.push_str("<ChecksumType>");
+                            xml.push_str(&xml_escape(value));
+                            xml.push_str("</ChecksumType>");
+                        } else if let Some(xml_tag) = checksum_header_to_xml_tag(header_key) {
                             xml.push('<');
                             xml.push_str(xml_tag);
                             xml.push('>');
@@ -1243,6 +1248,10 @@ pub fn get_object_attributes_xml(
                         xml.push_str("<Size>");
                         xml.push_str(&part.size.to_string());
                         xml.push_str("</Size>");
+                        if let (Some(algo), Some(ref val)) = (checksum_algorithm, &part.checksum) {
+                            let elem = algo.xml_element_name();
+                            xml.push_str(&format!("<{elem}>{}</{elem}>", xml_escape(val)));
+                        }
                         xml.push_str("</Part>");
                     }
                     xml.push_str("</ObjectParts>");
@@ -1465,19 +1474,29 @@ pub fn list_parts_xml(
             "<NextPartNumberMarker>{npm}</NextPartNumberMarker>"
         ));
     }
+    if let Some(algo) = result.checksum_algorithm {
+        xml.push_str(&format!(
+            "<ChecksumAlgorithm>{}</ChecksumAlgorithm>",
+            algo.as_str()
+        ));
+    }
     for part in &result.parts {
         xml.push_str(&format!(
             "<Part>\
              <PartNumber>{}</PartNumber>\
              <LastModified>{}</LastModified>\
              <ETag>{}</ETag>\
-             <Size>{}</Size>\
-             </Part>",
+             <Size>{}</Size>",
             part.part_number,
             format_timestamp(part.last_modified),
             xml_escape(&part.etag),
             part.size,
         ));
+        if let (Some(algo), Some(ref val)) = (result.checksum_algorithm, &part.checksum) {
+            let elem = algo.xml_element_name();
+            xml.push_str(&format!("<{elem}>{}</{elem}>", xml_escape(val)));
+        }
+        xml.push_str("</Part>");
     }
     xml.push_str("</ListPartsResult>");
     xml
@@ -2535,6 +2554,7 @@ mod tests {
             1024,
             &[("x-amz-checksum-sha256", "base64hash==")],
             None,
+            None,
         );
         assert!(xml.contains("<GetObjectAttributesResponse>"));
         assert!(xml.contains("<ETag>abc123</ETag>"));
@@ -2546,7 +2566,7 @@ mod tests {
 
     #[test]
     fn get_object_attributes_etag_only() {
-        let xml = get_object_attributes_xml(&["ETag"], "\"abcdef\"", 0, &[], None);
+        let xml = get_object_attributes_xml(&["ETag"], "\"abcdef\"", 0, &[], None, None);
         assert!(xml.contains("<ETag>abcdef</ETag>"));
         assert!(!xml.contains("<StorageClass>"));
         assert!(!xml.contains("<ObjectSize>"));
@@ -2555,14 +2575,14 @@ mod tests {
 
     #[test]
     fn get_object_attributes_size_only() {
-        let xml = get_object_attributes_xml(&["ObjectSize"], "\"x\"", 42, &[], None);
+        let xml = get_object_attributes_xml(&["ObjectSize"], "\"x\"", 42, &[], None, None);
         assert!(xml.contains("<ObjectSize>42</ObjectSize>"));
         assert!(!xml.contains("<ETag>"));
     }
 
     #[test]
     fn get_object_attributes_no_checksum_entries() {
-        let xml = get_object_attributes_xml(&["Checksum"], "\"x\"", 0, &[], None);
+        let xml = get_object_attributes_xml(&["Checksum"], "\"x\"", 0, &[], None, None);
         // Checksum element should be omitted when there are no checksum entries
         assert!(!xml.contains("<Checksum>"));
     }
@@ -2578,6 +2598,7 @@ mod tests {
                 ("x-amz-checksum-sha256", "BBBBBB=="),
             ],
             None,
+            None,
         );
         assert!(xml.contains("<ChecksumCRC32>AAAAAA==</ChecksumCRC32>"));
         assert!(xml.contains("<ChecksumSHA256>BBBBBB==</ChecksumSHA256>"));
@@ -2585,7 +2606,7 @@ mod tests {
 
     #[test]
     fn get_object_attributes_object_parts_omitted() {
-        let xml = get_object_attributes_xml(&["ObjectParts"], "\"x\"", 0, &[], None);
+        let xml = get_object_attributes_xml(&["ObjectParts"], "\"x\"", 0, &[], None, None);
         // ObjectParts should be omitted for non-multipart objects
         assert!(!xml.contains("<ObjectParts>"));
     }
@@ -2599,10 +2620,12 @@ mod tests {
                 ObjectPartEntry {
                     part_number: 1,
                     size: 5242880,
+                    checksum: None,
                 },
                 ObjectPartEntry {
                     part_number: 2,
                     size: 1024,
+                    checksum: None,
                 },
             ],
             is_truncated: true,
@@ -2610,7 +2633,8 @@ mod tests {
             max_parts: 2,
             part_number_marker: 0,
         };
-        let xml = get_object_attributes_xml(&["ObjectParts"], "\"x\"", 0, &[], Some(&parts_info));
+        let xml =
+            get_object_attributes_xml(&["ObjectParts"], "\"x\"", 0, &[], Some(&parts_info), None);
         assert!(xml.contains("<ObjectParts>"));
         assert!(xml.contains("<PartsCount>3</PartsCount>"));
         assert!(xml.contains("<PartNumberMarker>0</PartNumberMarker>"));
@@ -2630,13 +2654,15 @@ mod tests {
             parts: vec![ObjectPartEntry {
                 part_number: 1,
                 size: 100,
+                checksum: None,
             }],
             is_truncated: false,
             next_part_number_marker: None,
             max_parts: 1000,
             part_number_marker: 0,
         };
-        let xml = get_object_attributes_xml(&["ObjectParts"], "\"x\"", 0, &[], Some(&parts_info));
+        let xml =
+            get_object_attributes_xml(&["ObjectParts"], "\"x\"", 0, &[], Some(&parts_info), None);
         assert!(xml.contains("<IsTruncated>false</IsTruncated>"));
         assert!(!xml.contains("<NextPartNumberMarker>"));
         assert!(xml.contains("<PartsCount>1</PartsCount>"));
@@ -2956,6 +2982,8 @@ mod tests {
             parts: vec![],
             is_truncated: false,
             next_part_number_marker: None,
+            checksum_algorithm: None,
+            checksum_type: None,
         };
         let xml = list_parts_xml("mybucket", "mykey", "uid1", None, 1000, &result);
         assert!(xml.contains("<Bucket>mybucket</Bucket>"));
@@ -2977,16 +3005,20 @@ mod tests {
                     size: 5242880,
                     etag: "\"abc\"".to_string(),
                     last_modified: 1700000000000,
+                    checksum: None,
                 },
                 PartEntry {
                     part_number: 2,
                     size: 1024,
                     etag: "\"def\"".to_string(),
                     last_modified: 1700000001000,
+                    checksum: None,
                 },
             ],
             is_truncated: false,
             next_part_number_marker: None,
+            checksum_algorithm: None,
+            checksum_type: None,
         };
         let xml = list_parts_xml("mybucket", "mykey", "uid1", None, 1000, &result);
         assert!(xml.contains("<PartNumber>1</PartNumber>"));
@@ -3006,15 +3038,130 @@ mod tests {
                 size: 100,
                 etag: "\"e\"".to_string(),
                 last_modified: 0,
+                checksum: None,
             }],
             is_truncated: true,
             next_part_number_marker: Some(3),
+            checksum_algorithm: None,
+            checksum_type: None,
         };
         let xml = list_parts_xml("mybucket", "mykey", "uid1", Some(2), 1, &result);
         assert!(xml.contains("<PartNumberMarker>2</PartNumberMarker>"));
         assert!(xml.contains("<MaxParts>1</MaxParts>"));
         assert!(xml.contains("<IsTruncated>true</IsTruncated>"));
         assert!(xml.contains("<NextPartNumberMarker>3</NextPartNumberMarker>"));
+    }
+
+    // ── Step 5: ListParts with checksums ───────────────────────────────
+
+    #[test]
+    fn list_parts_xml_with_checksum_algorithm_and_parts() {
+        use crate::coordinator::PartEntry;
+        use storage::ChecksumAlgorithm;
+        let result = ListPartsResult {
+            parts: vec![
+                PartEntry {
+                    part_number: 1,
+                    size: 5242880,
+                    etag: "\"abc\"".to_string(),
+                    last_modified: 1700000000000,
+                    checksum: Some("AAAAAA==".to_string()),
+                },
+                PartEntry {
+                    part_number: 2,
+                    size: 1024,
+                    etag: "\"def\"".to_string(),
+                    last_modified: 1700000001000,
+                    checksum: Some("BBBBBB==".to_string()),
+                },
+            ],
+            is_truncated: false,
+            next_part_number_marker: None,
+            checksum_algorithm: Some(ChecksumAlgorithm::Crc32),
+            checksum_type: None,
+        };
+        let xml = list_parts_xml("mybucket", "mykey", "uid1", None, 1000, &result);
+        assert!(xml.contains("<ChecksumAlgorithm>CRC32</ChecksumAlgorithm>"));
+        assert!(xml.contains("<ChecksumCRC32>AAAAAA==</ChecksumCRC32>"));
+        assert!(xml.contains("<ChecksumCRC32>BBBBBB==</ChecksumCRC32>"));
+    }
+
+    #[test]
+    fn list_parts_xml_checksum_omitted_when_no_algorithm() {
+        use crate::coordinator::PartEntry;
+        let result = ListPartsResult {
+            parts: vec![PartEntry {
+                part_number: 1,
+                size: 100,
+                etag: "\"e\"".to_string(),
+                last_modified: 0,
+                checksum: Some("AAAAAA==".to_string()),
+            }],
+            is_truncated: false,
+            next_part_number_marker: None,
+            checksum_algorithm: None,
+            checksum_type: None,
+        };
+        let xml = list_parts_xml("mybucket", "mykey", "uid1", None, 1000, &result);
+        // Without checksum_algorithm, per-part checksum elements should not be rendered
+        assert!(!xml.contains("<ChecksumCRC32>"));
+        assert!(!xml.contains("<ChecksumAlgorithm>"));
+    }
+
+    // ── Step 5: GetObjectAttributes with per-part checksums ──────────
+
+    #[test]
+    fn get_object_attributes_object_parts_with_checksums() {
+        use crate::coordinator::{ObjectPartEntry, ObjectPartsInfo};
+        use storage::ChecksumAlgorithm;
+        let parts_info = ObjectPartsInfo {
+            total_parts_count: 2,
+            parts: vec![
+                ObjectPartEntry {
+                    part_number: 1,
+                    size: 5242880,
+                    checksum: Some("AAAAAA==".to_string()),
+                },
+                ObjectPartEntry {
+                    part_number: 2,
+                    size: 1024,
+                    checksum: Some("BBBBBB==".to_string()),
+                },
+            ],
+            is_truncated: false,
+            next_part_number_marker: None,
+            max_parts: 1000,
+            part_number_marker: 0,
+        };
+        let xml = get_object_attributes_xml(
+            &["ObjectParts"],
+            "\"x\"",
+            0,
+            &[],
+            Some(&parts_info),
+            Some(ChecksumAlgorithm::Sha256),
+        );
+        assert!(xml.contains("<ChecksumSHA256>AAAAAA==</ChecksumSHA256>"));
+        assert!(xml.contains("<ChecksumSHA256>BBBBBB==</ChecksumSHA256>"));
+    }
+
+    #[test]
+    fn get_object_attributes_checksum_type_rendered() {
+        let xml = get_object_attributes_xml(
+            &["Checksum"],
+            "\"x\"",
+            0,
+            &[
+                ("x-amz-checksum-crc32", "AAAAAA=="),
+                ("x-amz-checksum-type", "FULL_OBJECT"),
+            ],
+            None,
+            None,
+        );
+        assert!(xml.contains("<Checksum>"));
+        assert!(xml.contains("<ChecksumCRC32>AAAAAA==</ChecksumCRC32>"));
+        assert!(xml.contains("<ChecksumType>FULL_OBJECT</ChecksumType>"));
+        assert!(xml.contains("</Checksum>"));
     }
 
     // ── Multipart error XML coverage ─────────────────────────────────

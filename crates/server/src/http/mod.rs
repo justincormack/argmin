@@ -624,15 +624,21 @@ impl HttpFrontend {
                 )?;
                 let checksum_entries: Vec<(&str, &str)> = result
                     .metadata
-                    .checksum_entries()
+                    .checksum_entries_with_type()
                     .map(|e| (e.key.as_str(), e.value.as_str()))
                     .collect();
+                // Extract checksum algorithm from metadata for per-part checksum XML elements.
+                let obj_checksum_algo = result
+                    .metadata
+                    .get("x-amz-checksum-algorithm")
+                    .and_then(ChecksumAlgorithm::from_str);
                 let body_xml = xml::get_object_attributes_xml(
                     &requested,
                     &result.etag,
                     result.size,
                     &checksum_entries,
                     result.object_parts.as_ref(),
+                    obj_checksum_algo,
                 );
                 Ok(S3Response::get_object_attributes(
                     &body_xml,

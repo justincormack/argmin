@@ -65,6 +65,8 @@ pub struct HeadObjectResult {
 pub struct ObjectPartEntry {
     pub part_number: u32,
     pub size: u64,
+    /// Base64-encoded checksum for this part (None if no checksum).
+    pub checksum: Option<String>,
 }
 
 /// Pagination info for ObjectParts in GetObjectAttributes.
@@ -238,6 +240,8 @@ pub struct PartEntry {
     pub size: u64,
     pub etag: String,
     pub last_modified: u64,
+    /// Base64-encoded checksum for this part (None if no checksum).
+    pub checksum: Option<String>,
 }
 
 /// Result of a ListParts operation.
@@ -246,6 +250,10 @@ pub struct ListPartsResult {
     pub parts: Vec<PartEntry>,
     pub is_truncated: bool,
     pub next_part_number_marker: Option<u32>,
+    /// Upload-level checksum algorithm.
+    pub checksum_algorithm: Option<ChecksumAlgorithm>,
+    /// Upload-level checksum type.
+    pub checksum_type: Option<ChecksumType>,
 }
 
 /// Entry in a ListMultipartUploads result.
@@ -1739,9 +1747,17 @@ impl Coordinator {
             let page: Vec<ObjectPartEntry> = filtered
                 .into_iter()
                 .take(take_count)
-                .map(|p| ObjectPartEntry {
-                    part_number: p.part_number,
-                    size: p.size,
+                .map(|p| {
+                    use base64::Engine;
+                    let checksum = p
+                        .checksum
+                        .as_ref()
+                        .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes));
+                    ObjectPartEntry {
+                        part_number: p.part_number,
+                        size: p.size,
+                        checksum,
+                    }
                 })
                 .collect();
 
@@ -2852,6 +2868,7 @@ impl Coordinator {
             let (mut blob, _) =
                 crate::metadata_blob::MetadataBlob::deserialize(&metadata_blob_bytes)?;
             blob.set(algo.header_name(), val);
+            blob.set("x-amz-checksum-algorithm", algo.as_str());
             if let Some(ctype) = checksum_type {
                 blob.set("x-amz-checksum-type", ctype.as_str());
             }
@@ -3035,12 +3052,18 @@ impl Coordinator {
             .parts
             .iter()
             .map(|p| {
+                use base64::Engine;
                 let etag_crc = etag_bytes_to_crc64(&p.etag).unwrap_or(0);
+                let checksum = p
+                    .checksum
+                    .as_ref()
+                    .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes));
                 PartEntry {
                     part_number: p.part_number,
                     size: p.size,
                     etag: format_etag(etag_crc),
                     last_modified: p.last_modified,
+                    checksum,
                 }
             })
             .collect();
@@ -3049,6 +3072,8 @@ impl Coordinator {
             parts,
             is_truncated: resp.is_truncated,
             next_part_number_marker: resp.next_part_number_marker,
+            checksum_algorithm: upload.checksum_algorithm,
+            checksum_type: upload.checksum_type,
         })
     }
 

@@ -286,8 +286,20 @@ impl MetadataBlob {
         }
     }
 
-    /// Return checksum header entries (x-amz-checksum-*) stored in the blob.
+    /// Return checksum value entries (x-amz-checksum-crc32, etc.) stored in the blob.
+    /// Excludes x-amz-checksum-algorithm and x-amz-checksum-type which are
+    /// surfaced as separate headers/elements.
     pub fn checksum_entries(&self) -> impl Iterator<Item = &MetadataEntry> {
+        self.entries.iter().filter(|e| {
+            e.key.starts_with("x-amz-checksum-")
+                && e.key != "x-amz-checksum-algorithm"
+                && e.key != "x-amz-checksum-type"
+        })
+    }
+
+    /// Return all checksum-related entries including x-amz-checksum-type.
+    /// Used for GetObjectAttributes where ChecksumType appears inside <Checksum>.
+    pub fn checksum_entries_with_type(&self) -> impl Iterator<Item = &MetadataEntry> {
         self.entries
             .iter()
             .filter(|e| e.key.starts_with("x-amz-checksum-") && e.key != "x-amz-checksum-algorithm")

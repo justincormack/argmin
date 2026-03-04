@@ -155,6 +155,9 @@ impl S3Response {
             for entry in result.metadata.checksum_entries() {
                 resp = resp.header(&entry.key, &entry.value);
             }
+            if let Some(ct) = result.metadata.get("x-amz-checksum-type") {
+                resp = resp.header("x-amz-checksum-type", ct);
+            }
         }
 
         resp.data_body(result.data)
@@ -207,6 +210,9 @@ impl S3Response {
         {
             for entry in result.metadata.checksum_entries() {
                 resp = resp.header(&entry.key, &entry.value);
+            }
+            if let Some(ct) = result.metadata.get("x-amz-checksum-type") {
+                resp = resp.header("x-amz-checksum-type", ct);
             }
         }
 
@@ -927,6 +933,63 @@ mod tests {
         );
     }
 
+    #[test]
+    fn get_object_checksum_type_with_checksum_mode_enabled() {
+        let result = GetObjectResult {
+            data: vec![],
+            metadata: MetadataBlob {
+                entries: vec![
+                    MetadataEntry {
+                        key: "x-amz-checksum-crc32".into(),
+                        value: "AAAAAA==".into(),
+                    },
+                    MetadataEntry {
+                        key: "x-amz-checksum-type".into(),
+                        value: "FULL_OBJECT".into(),
+                    },
+                ],
+            },
+            etag: "\"e\"".into(),
+            size: 0,
+            last_modified: 0,
+            version_id: 0,
+            tags: None,
+        };
+        let resp = S3Response::get_object(result, Some("ENABLED"));
+        assert_eq!(find_header(&resp, "x-amz-checksum-crc32"), Some("AAAAAA=="));
+        assert_eq!(
+            find_header(&resp, "x-amz-checksum-type"),
+            Some("FULL_OBJECT")
+        );
+    }
+
+    #[test]
+    fn get_object_checksum_type_omitted_without_checksum_mode() {
+        let result = GetObjectResult {
+            data: vec![],
+            metadata: MetadataBlob {
+                entries: vec![
+                    MetadataEntry {
+                        key: "x-amz-checksum-crc32".into(),
+                        value: "AAAAAA==".into(),
+                    },
+                    MetadataEntry {
+                        key: "x-amz-checksum-type".into(),
+                        value: "FULL_OBJECT".into(),
+                    },
+                ],
+            },
+            etag: "\"e\"".into(),
+            size: 0,
+            last_modified: 0,
+            version_id: 0,
+            tags: None,
+        };
+        let resp = S3Response::get_object(result, None);
+        assert_eq!(find_header(&resp, "x-amz-checksum-crc32"), None);
+        assert_eq!(find_header(&resp, "x-amz-checksum-type"), None);
+    }
+
     // ── head_object ───────────────────────────────────────────────────
 
     #[test]
@@ -1012,6 +1075,58 @@ mod tests {
         };
         let resp = S3Response::head_object(&result, None);
         assert_eq!(find_header(&resp, "x-amz-meta-tag"), Some("value"));
+    }
+
+    #[test]
+    fn head_object_checksum_type_with_checksum_mode_enabled() {
+        let result = HeadObjectResult {
+            metadata: MetadataBlob {
+                entries: vec![
+                    MetadataEntry {
+                        key: "x-amz-checksum-crc32".into(),
+                        value: "AAAAAA==".into(),
+                    },
+                    MetadataEntry {
+                        key: "x-amz-checksum-type".into(),
+                        value: "COMPOSITE".into(),
+                    },
+                ],
+            },
+            etag: "\"e\"".into(),
+            size: 0,
+            last_modified: 0,
+            version_id: 0,
+            tags: None,
+        };
+        let resp = S3Response::head_object(&result, Some("ENABLED"));
+        assert_eq!(find_header(&resp, "x-amz-checksum-crc32"), Some("AAAAAA=="));
+        assert_eq!(find_header(&resp, "x-amz-checksum-type"), Some("COMPOSITE"));
+    }
+
+    #[test]
+    fn head_object_checksum_type_omitted_without_checksum_mode() {
+        let result = HeadObjectResult {
+            metadata: MetadataBlob {
+                entries: vec![
+                    MetadataEntry {
+                        key: "x-amz-checksum-crc32".into(),
+                        value: "AAAAAA==".into(),
+                    },
+                    MetadataEntry {
+                        key: "x-amz-checksum-type".into(),
+                        value: "COMPOSITE".into(),
+                    },
+                ],
+            },
+            etag: "\"e\"".into(),
+            size: 0,
+            last_modified: 0,
+            version_id: 0,
+            tags: None,
+        };
+        let resp = S3Response::head_object(&result, None);
+        assert_eq!(find_header(&resp, "x-amz-checksum-crc32"), None);
+        assert_eq!(find_header(&resp, "x-amz-checksum-type"), None);
     }
 
     // ── delete_object ─────────────────────────────────────────────────
