@@ -195,6 +195,12 @@ pub struct PutObjectMetaReq {
     pub ec_m: u8,
     /// 0 = Live, 1 = DeleteMarker.
     pub status: u8,
+    /// Object data layout. None defaults to InlineLegacy (0).
+    pub data_layout: Option<DataLayout>,
+    /// Number of parts (set for MultipartManifest objects).
+    pub parts_count: Option<u32>,
+    /// Serialized user metadata headers (set for MultipartManifest objects).
+    pub metadata_blob: Option<Vec<u8>>,
 }
 
 /// Request to list objects in a PG.

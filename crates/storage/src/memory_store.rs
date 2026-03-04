@@ -159,9 +159,9 @@ impl PgMetadataStore for MemoryPgStore {
             ec_m: req.ec_m,
             status: req.status,
             tags: None,
-            data_layout: DataLayout::InlineLegacy,
-            parts_count: None,
-            metadata_blob: None,
+            data_layout: req.data_layout.unwrap_or(DataLayout::InlineLegacy),
+            parts_count: req.parts_count,
+            metadata_blob: req.metadata_blob.clone(),
         };
         self.objects.borrow_mut().insert(
             (req.bucket.clone(), req.key.clone(), req.version_id),
@@ -484,6 +484,17 @@ impl PgMetadataStore for MemoryPgStore {
         _bucket: &str,
         _key: &str,
         _version_id: u64,
+    ) -> Result<(), MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "multipart metadata (pending Step 3)",
+        })
+    }
+
+    fn complete_multipart_commit(
+        &self,
+        _upload_id: &str,
+        _obj: &PutObjectMetaReq,
+        _parts: &[ObjectPartRecord],
     ) -> Result<(), MetadataError> {
         Err(MetadataError::NotImplemented {
             context: "multipart metadata (pending Step 3)",

@@ -367,6 +367,16 @@ impl PgMetadataStore for FaultyPgStore {
     ) -> Result<(), MetadataError> {
         self.inner.delete_object_parts(bucket, key, version_id)
     }
+
+    fn complete_multipart_commit(
+        &self,
+        upload_id: &str,
+        obj: &PutObjectMetaReq,
+        parts: &[ObjectPartRecord],
+    ) -> Result<(), MetadataError> {
+        self.inner
+            .complete_multipart_commit(upload_id, obj, parts)
+    }
 }
 
 #[cfg(test)]
@@ -516,6 +526,9 @@ mod tests {
                 etag_kind: 0,
                 ec_k: 4,
                 ec_m: 2,
+                data_layout: None,
+                parts_count: None,
+                metadata_blob: None,
             })
             .unwrap();
 

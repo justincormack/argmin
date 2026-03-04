@@ -27,6 +27,9 @@ fn shard_and_metadata_roundtrip() {
         etag_kind: 0,
         ec_k: 4,
         ec_m: 2,
+        data_layout: None,
+        parts_count: None,
+        metadata_blob: None,
     };
     store.put_object_meta(&req).unwrap();
 
@@ -123,6 +126,9 @@ fn full_lifecycle() {
         etag_kind: 0,
         ec_k: 4,
         ec_m: 2,
+        data_layout: None,
+        parts_count: None,
+        metadata_blob: None,
     })
     .unwrap();
 
@@ -174,6 +180,9 @@ fn pg_store_persistence() {
                 etag_kind: 0,
                 ec_k: 4,
                 ec_m: 2,
+                data_layout: None,
+                parts_count: None,
+                metadata_blob: None,
             })
             .unwrap();
     }

@@ -89,6 +89,15 @@ pub enum ServerError {
     #[error("no such upload: {upload_id}")]
     NoSuchUpload { upload_id: String },
 
+    #[error("invalid part: part {part_number}")]
+    InvalidPart { part_number: u32 },
+
+    #[error("invalid part order")]
+    InvalidPartOrder,
+
+    #[error("entity too small: part {part_number} is {size} bytes (min {min})")]
+    EntityTooSmall { part_number: u32, size: u64, min: u64 },
+
     #[error("not implemented: {feature}")]
     NotImplemented { feature: String },
 
@@ -140,6 +149,9 @@ impl ServerError {
             Self::InvalidBucketAclWithObjectOwnership => "InvalidBucketAclWithObjectOwnership",
             Self::AccessDenied => "AccessDenied",
             Self::NoSuchUpload { .. } => "NoSuchUpload",
+            Self::InvalidPart { .. } => "InvalidPart",
+            Self::InvalidPartOrder => "InvalidPartOrder",
+            Self::EntityTooSmall { .. } => "EntityTooSmall",
             Self::NotImplemented { .. } => "NotImplemented",
             Self::InternalError { .. } => "InternalError",
             Self::IntegrityError { .. } => "InternalError",
@@ -170,6 +182,7 @@ impl ServerError {
             Self::AccessControlListNotSupported | Self::InvalidBucketAclWithObjectOwnership => 400,
             Self::AccessDenied => 403,
             Self::NoSuchUpload { .. } => 404,
+            Self::InvalidPart { .. } | Self::InvalidPartOrder | Self::EntityTooSmall { .. } => 400,
             Self::NotImplemented { .. } => 501,
             Self::InternalError { .. } => 500,
             Self::ObjectTooLarge { .. } => 400,

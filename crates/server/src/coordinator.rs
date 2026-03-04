@@ -6,7 +6,8 @@ use storage::traits::{GlobalService, PgMetadataStore, ShardStore};
 use storage::{
     BucketInfo, CreateMultipartUploadReq, DataLayout, ListMultipartUploadsReq,
     ListObjectVersionsReq, ListObjectsReq, MultipartPartRecord, MultipartUploadRecord,
-    ObjectRecord, PutObjectMetaReq, ShardKey, SharedStorageNode, SqliteBucketDb,
+    ObjectPartRecord, ObjectRecord, PutObjectMetaReq, ShardKey, SharedStorageNode, SqliteBucketDb,
+    UploadState,
 };
 
 use crate::conditional::{
@@ -14,7 +15,10 @@ use crate::conditional::{
     check_write_conditions, DeleteCondition, ReadCondition, WriteCondition,
 };
 use crate::error::ServerError;
-use crate::etag::{crc64_to_etag_bytes, etag_bytes_to_crc64, format_etag};
+use crate::etag::{
+    compute_multipart_etag, crc64_to_etag_bytes, etag_bytes_to_crc64, format_etag,
+    format_object_etag,
+};
 use crate::metadata_blob::MetadataBlob;
 use crate::pg::{derive_pg, derive_pg_shards, object_key_hash, part_key_hash};
 use crate::range::ByteRange;
@@ -168,6 +172,23 @@ pub struct UploadPartResult {
 pub struct CreateMultipartUploadResult {
     pub upload_id: String,
 }
+
+/// A single part entry in a CompleteMultipartUpload request.
+#[derive(Debug, Clone)]
+pub struct CompletePart {
+    pub part_number: u32,
+    pub etag: String,
+}
+
+/// Result of a CompleteMultipartUpload operation.
+#[derive(Debug)]
+pub struct CompleteMultipartUploadResult {
+    pub etag: String,
+    pub version_id: u64,
+}
+
+/// Minimum part size for non-final parts (5 MiB).
+const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
 
 /// Entry in a ListMultipartUploads result.
 #[derive(Debug, Clone)]
@@ -687,6 +708,9 @@ impl Coordinator {
             etag_kind: 0,
             ec_k: self.ec_config.data_shards,
             ec_m: self.ec_config.parity_shards,
+            data_layout: None,
+            parts_count: None,
+            metadata_blob: None,
         });
 
         if let Err(e) = meta_result {
@@ -1554,6 +1578,9 @@ impl Coordinator {
                     etag_kind: 0,
                     ec_k: 0,
                     ec_m: 0,
+                    data_layout: None,
+                    parts_count: None,
+                    metadata_blob: None,
                 })?;
 
                 Ok(DeleteObjectResult {
@@ -1660,11 +1687,14 @@ impl Coordinator {
                     }
                 } else {
                     if token.is_none_or(|t| record.key.as_str() > t) {
-                        let etag_crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
                         objects.push(ListEntry {
                             key: record.key.clone(),
                             size: record.size,
-                            etag: format_etag(etag_crc),
+                            etag: format_object_etag(
+                                &record.etag,
+                                record.etag_kind,
+                                record.parts_count,
+                            ),
                             last_modified: record.last_modified,
                         });
                         entry_count += 1;
@@ -1680,11 +1710,14 @@ impl Coordinator {
                     break;
                 }
                 if token.is_none_or(|t| record.key.as_str() > t) {
-                    let etag_crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
                     objects.push(ListEntry {
                         key: record.key.clone(),
                         size: record.size,
-                        etag: format_etag(etag_crc),
+                        etag: format_object_etag(
+                            &record.etag,
+                            record.etag_kind,
+                            record.parts_count,
+                        ),
                         last_modified: record.last_modified,
                     });
                     entry_count += 1;
@@ -1765,13 +1798,16 @@ impl Coordinator {
                 last_key = Some(&record.key);
             }
 
-            let etag_crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
             versions.push(VersionEntry {
                 key: record.key.clone(),
                 version_id: record.version_id,
                 is_latest,
                 size: record.size,
-                etag: format_etag(etag_crc),
+                etag: format_object_etag(
+                    &record.etag,
+                    record.etag_kind,
+                    record.parts_count,
+                ),
                 last_modified: record.last_modified,
                 is_delete_marker: record.status == 1,
             });
@@ -1918,7 +1954,7 @@ impl Coordinator {
                     upload_id: upload_id.to_string(),
                 });
             }
-            if upload.state != storage::UploadState::InProgress {
+            if upload.state != UploadState::InProgress {
                 return Err(ServerError::NoSuchUpload {
                     upload_id: upload_id.to_string(),
                 });
@@ -1959,7 +1995,7 @@ impl Coordinator {
                     upload_id: upload_id.to_string(),
                 });
             }
-            if upload.state != storage::UploadState::InProgress {
+            if upload.state != UploadState::InProgress {
                 return Err(ServerError::NoSuchUpload {
                     upload_id: upload_id.to_string(),
                 });
@@ -2089,6 +2125,147 @@ impl Coordinator {
 
         Ok(UploadPartResult {
             etag: format_etag(etag_crc),
+        })
+    }
+
+    /// Complete a multipart upload, committing a manifest object.
+    ///
+    /// Validates the part list, checks ETags and sizes, writes the final
+    /// object metadata row with `MultipartManifest` layout, commits
+    /// manifest rows into `object_parts`, and deletes in-progress state.
+    pub fn complete_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        parts: &[CompletePart],
+    ) -> Result<CompleteMultipartUploadResult, ServerError> {
+        // 1. Validate bucket exists and get versioning state.
+        let bucket_info = self.head_bucket(bucket)?;
+
+        // 2. Validate part list: non-empty and strictly increasing part numbers.
+        if parts.is_empty() {
+            return Err(ServerError::InvalidRequest {
+                reason: "part list must not be empty".to_string(),
+            });
+        }
+        for window in parts.windows(2) {
+            if window[0].part_number >= window[1].part_number {
+                return Err(ServerError::InvalidPartOrder);
+            }
+        }
+
+        // 3. Lock meta PG and validate upload.
+        let meta_pg_id = derive_pg(bucket, key, self.pg_count);
+        let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
+
+        let upload = meta_pg.get_multipart_upload(upload_id)?;
+        if upload.bucket != bucket || upload.key != key {
+            return Err(ServerError::NoSuchUpload {
+                upload_id: upload_id.to_string(),
+            });
+        }
+        if upload.state != UploadState::InProgress {
+            return Err(ServerError::NoSuchUpload {
+                upload_id: upload_id.to_string(),
+            });
+        }
+
+        // 4. Validate all parts exist and ETags match.
+        let mut part_records: Vec<MultipartPartRecord> = Vec::with_capacity(parts.len());
+        for cp in parts {
+            let part = match meta_pg.get_multipart_part(upload_id, cp.part_number) {
+                Ok(p) => p,
+                Err(storage::MetadataError::PartNotFound { .. }) => {
+                    return Err(ServerError::InvalidPart {
+                        part_number: cp.part_number,
+                    });
+                }
+                Err(e) => return Err(ServerError::Metadata(e)),
+            };
+
+            let stored_etag = etag_bytes_to_crc64(&part.etag)
+                .map(format_etag)
+                .unwrap_or_default();
+            if stored_etag != cp.etag {
+                return Err(ServerError::InvalidPart {
+                    part_number: cp.part_number,
+                });
+            }
+
+            part_records.push(part);
+        }
+
+        // 5. Enforce part-size constraints: all non-final parts >= 5 MiB.
+        if part_records.len() > 1 {
+            for part in &part_records[..part_records.len() - 1] {
+                if part.size < MIN_PART_SIZE {
+                    return Err(ServerError::EntityTooSmall {
+                        part_number: part.part_number,
+                        size: part.size,
+                        min: MIN_PART_SIZE,
+                    });
+                }
+            }
+        }
+
+        // 6. Allocate version_id using existing versioning rules.
+        let version_id = if bucket_info.versioning == 1 {
+            meta_pg.next_version_id(bucket, key)?
+        } else {
+            0
+        };
+
+        // 7. Compute composite multipart ETag.
+        let part_etags: Vec<&[u8]> = part_records.iter().map(|p| p.etag.as_slice()).collect();
+        let (etag_bytes, etag_str) = compute_multipart_etag(&part_etags);
+
+        // 8. Compute total object size.
+        let total_size: u64 = part_records.iter().map(|p| p.size).sum();
+
+        // 9. Build the object metadata and manifest parts.
+        let obj_req = PutObjectMetaReq {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            version_id,
+            status: 0,
+            size: total_size,
+            total_size,
+            etag: etag_bytes,
+            etag_kind: 1, // multipart-composite CRC64
+            ec_k: 0,      // per-part, not per-object
+            ec_m: 0,
+            data_layout: Some(DataLayout::MultipartManifest),
+            parts_count: Some(part_records.len() as u32),
+            metadata_blob: Some(upload.metadata_blob.clone()),
+        };
+
+        let object_parts: Vec<ObjectPartRecord> = part_records
+            .iter()
+            .map(|p| ObjectPartRecord {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                version_id,
+                part_number: p.part_number,
+                size: p.size,
+                etag: p.etag.clone(),
+                etag_kind: p.etag_kind,
+                part_okh: p.part_okh,
+                part_vid: p.part_vid,
+                ec_k: p.ec_k,
+                ec_m: p.ec_m,
+            })
+            .collect();
+
+        // 10. Atomically: transition to Completing, write object row,
+        //     replace object_parts, commit manifest, delete upload+parts.
+        meta_pg
+            .complete_multipart_commit(upload_id, &obj_req, &object_parts)
+            .map_err(ServerError::Metadata)?;
+
+        Ok(CompleteMultipartUploadResult {
+            etag: etag_str,
+            version_id,
         })
     }
 
@@ -4930,6 +5107,367 @@ mod tests {
         assert_eq!(
             format_etag(crc64::checksum(b"writer-C")),
             etag3
+        );
+    }
+
+    // --- CompleteMultipartUpload tests ---
+
+    /// Helper: create upload with given parts, returning (upload_id, vec of etags).
+    fn create_upload_with_parts(
+        coord: &Coordinator,
+        bucket: &str,
+        key: &str,
+        part_data: &[(u32, &[u8])],
+    ) -> (String, Vec<CompletePart>) {
+        let metadata = MetadataBlob::new();
+        let create = coord
+            .create_multipart_upload(bucket, key, &metadata)
+            .unwrap();
+        let mut complete_parts = Vec::new();
+        for &(part_number, data) in part_data {
+            let result = coord
+                .upload_part(bucket, key, &create.upload_id, part_number, data)
+                .unwrap();
+            complete_parts.push(CompletePart {
+                part_number,
+                etag: result.etag,
+            });
+        }
+        (create.upload_id, complete_parts)
+    }
+
+    #[test]
+    fn complete_multipart_upload_happy_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        // Use 5MiB+ parts for non-final parts.
+        let big_part = vec![0xABu8; 5 * 1024 * 1024];
+        let small_last = b"final-part";
+
+        let (upload_id, parts) = create_upload_with_parts(
+            &coord,
+            "bucket",
+            "key",
+            &[(1, &big_part), (2, small_last)],
+        );
+
+        let result = coord
+            .complete_multipart_upload("bucket", "key", &upload_id, &parts)
+            .unwrap();
+
+        // ETag should be composite format: "hex-2"
+        assert!(result.etag.ends_with("-2\""), "etag = {}", result.etag);
+
+        // Object should be visible via get_object metadata.
+        let meta_pg_id = derive_pg("bucket", "key", coord.pg_count);
+        let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
+        let obj = pg.get_object_meta("bucket", "key").unwrap();
+        assert_eq!(obj.data_layout, DataLayout::MultipartManifest);
+        assert_eq!(obj.parts_count, Some(2));
+        assert_eq!(obj.size, big_part.len() as u64 + small_last.len() as u64);
+
+        // object_parts should be committed.
+        let committed = pg.get_object_parts("bucket", "key", result.version_id).unwrap();
+        assert_eq!(committed.len(), 2);
+        assert_eq!(committed[0].part_number, 1);
+        assert_eq!(committed[1].part_number, 2);
+
+        // Upload should be deleted.
+        let err = pg.get_multipart_upload(&upload_id).unwrap_err();
+        assert!(matches!(err, storage::MetadataError::NoSuchUpload { .. }));
+    }
+
+    #[test]
+    fn complete_multipart_upload_missing_part() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let (upload_id, mut parts) = create_upload_with_parts(
+            &coord,
+            "bucket",
+            "key",
+            &[(1, b"data1"), (3, b"data3")],
+        );
+
+        // Request completion with part 2 which was never uploaded.
+        parts.insert(
+            1,
+            CompletePart {
+                part_number: 2,
+                etag: "\"0000000000000000\"".to_string(),
+            },
+        );
+
+        let err = coord
+            .complete_multipart_upload("bucket", "key", &upload_id, &parts)
+            .unwrap_err();
+        assert!(matches!(err, ServerError::InvalidPart { part_number: 2 }));
+    }
+
+    #[test]
+    fn complete_multipart_upload_wrong_etag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let (upload_id, mut parts) = create_upload_with_parts(
+            &coord,
+            "bucket",
+            "key",
+            &[(1, b"data1")],
+        );
+
+        // Tamper with the ETag.
+        parts[0].etag = "\"ffffffffffffffff\"".to_string();
+
+        let err = coord
+            .complete_multipart_upload("bucket", "key", &upload_id, &parts)
+            .unwrap_err();
+        assert!(matches!(err, ServerError::InvalidPart { part_number: 1 }));
+    }
+
+    #[test]
+    fn complete_multipart_upload_invalid_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let (upload_id, parts) = create_upload_with_parts(
+            &coord,
+            "bucket",
+            "key",
+            &[(1, b"data1"), (2, b"data2")],
+        );
+
+        // Reverse the order.
+        let reversed = vec![parts[1].clone(), parts[0].clone()];
+        let err = coord
+            .complete_multipart_upload("bucket", "key", &upload_id, &reversed)
+            .unwrap_err();
+        assert!(matches!(err, ServerError::InvalidPartOrder));
+    }
+
+    #[test]
+    fn complete_multipart_upload_too_small_non_final_part() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        // Part 1 is only 10 bytes (below 5 MiB minimum for non-final).
+        let (upload_id, parts) = create_upload_with_parts(
+            &coord,
+            "bucket",
+            "key",
+            &[(1, b"small-part"), (2, b"last-part")],
+        );
+
+        let err = coord
+            .complete_multipart_upload("bucket", "key", &upload_id, &parts)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ServerError::EntityTooSmall { part_number: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn complete_multipart_upload_single_part_any_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        // A single part can be any size (it's the "final" part).
+        let (upload_id, parts) = create_upload_with_parts(
+            &coord,
+            "bucket",
+            "key",
+            &[(1, b"tiny")],
+        );
+
+        let result = coord
+            .complete_multipart_upload("bucket", "key", &upload_id, &parts)
+            .unwrap();
+        assert!(result.etag.ends_with("-1\""));
+    }
+
+    #[test]
+    fn complete_multipart_upload_empty_part_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let metadata = MetadataBlob::new();
+        let create = coord
+            .create_multipart_upload("bucket", "key", &metadata)
+            .unwrap();
+
+        let err = coord
+            .complete_multipart_upload("bucket", "key", &create.upload_id, &[])
+            .unwrap_err();
+        assert!(matches!(err, ServerError::InvalidRequest { .. }));
+    }
+
+    #[test]
+    fn complete_multipart_upload_retry_after_validation_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        // Upload two small parts.
+        let (upload_id, parts) = create_upload_with_parts(
+            &coord,
+            "bucket",
+            "key",
+            &[(1, b"small"), (2, b"last")],
+        );
+
+        // First attempt fails because part 1 is too small.
+        let err = coord
+            .complete_multipart_upload("bucket", "key", &upload_id, &parts)
+            .unwrap_err();
+        assert!(matches!(err, ServerError::EntityTooSmall { .. }));
+
+        // Upload remains usable — re-upload part 1 with large data and retry.
+        let big_data = vec![0u8; 5 * 1024 * 1024];
+        let new_part1 = coord
+            .upload_part("bucket", "key", &upload_id, 1, &big_data)
+            .unwrap();
+
+        let retry_parts = vec![
+            CompletePart {
+                part_number: 1,
+                etag: new_part1.etag,
+            },
+            parts[1].clone(),
+        ];
+        let result = coord
+            .complete_multipart_upload("bucket", "key", &upload_id, &retry_parts)
+            .unwrap();
+        assert!(result.etag.ends_with("-2\""));
+    }
+
+    #[test]
+    fn complete_multipart_upload_duplicate_part_numbers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let (upload_id, parts) = create_upload_with_parts(
+            &coord,
+            "bucket",
+            "key",
+            &[(1, b"data1")],
+        );
+
+        // Duplicate part number 1.
+        let duped = vec![parts[0].clone(), parts[0].clone()];
+        let err = coord
+            .complete_multipart_upload("bucket", "key", &upload_id, &duped)
+            .unwrap_err();
+        assert!(matches!(err, ServerError::InvalidPartOrder));
+    }
+
+    #[test]
+    fn complete_multipart_upload_overwrite_unversioned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        // First multipart upload to key.
+        let (upload_id1, parts1) = create_upload_with_parts(
+            &coord,
+            "bucket",
+            "key",
+            &[(1, b"first-upload")],
+        );
+        let result1 = coord
+            .complete_multipart_upload("bucket", "key", &upload_id1, &parts1)
+            .unwrap();
+        assert!(result1.etag.ends_with("-1\""));
+
+        // Second multipart upload to the same key (unversioned, version_id=0).
+        let big_part = vec![0u8; 5 * 1024 * 1024];
+        let (upload_id2, parts2) = create_upload_with_parts(
+            &coord,
+            "bucket",
+            "key",
+            &[(1, &big_part), (2, b"second-data-b")],
+        );
+        let result2 = coord
+            .complete_multipart_upload("bucket", "key", &upload_id2, &parts2)
+            .unwrap();
+        assert!(result2.etag.ends_with("-2\""));
+        assert_ne!(result1.etag, result2.etag);
+
+        // Verify the object was overwritten — should have 2 parts now.
+        let meta_pg_id = derive_pg("bucket", "key", coord.pg_count);
+        let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
+        let obj = pg.get_object_meta("bucket", "key").unwrap();
+        assert_eq!(obj.parts_count, Some(2));
+
+        // Old manifest parts (from first upload) should be replaced.
+        let committed = pg.get_object_parts("bucket", "key", 0).unwrap();
+        assert_eq!(committed.len(), 2);
+    }
+
+    #[test]
+    fn complete_multipart_upload_list_shows_composite_etag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let (upload_id, parts) = create_upload_with_parts(
+            &coord,
+            "bucket",
+            "key",
+            &[(1, b"data1")],
+        );
+        let result = coord
+            .complete_multipart_upload("bucket", "key", &upload_id, &parts)
+            .unwrap();
+
+        // list_objects_v2 should return the composite ETag with -N suffix.
+        let list = coord
+            .list_objects_v2("bucket", None, None, None, 100)
+            .unwrap();
+        assert_eq!(list.objects.len(), 1);
+        assert_eq!(list.objects[0].etag, result.etag);
+        assert!(
+            list.objects[0].etag.ends_with("-1\""),
+            "etag = {}",
+            list.objects[0].etag
+        );
+    }
+
+    #[test]
+    fn complete_multipart_upload_list_versions_shows_composite_etag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+        coord.put_bucket_versioning("bucket", 1).unwrap();
+
+        let (upload_id, parts) = create_upload_with_parts(
+            &coord,
+            "bucket",
+            "key",
+            &[(1, b"data1")],
+        );
+        let result = coord
+            .complete_multipart_upload("bucket", "key", &upload_id, &parts)
+            .unwrap();
+
+        let versions = coord
+            .list_object_versions("bucket", None, None, None, 100)
+            .unwrap();
+        assert_eq!(versions.versions.len(), 1);
+        assert_eq!(versions.versions[0].etag, result.etag);
+        assert!(
+            versions.versions[0].etag.ends_with("-1\""),
+            "etag = {}",
+            versions.versions[0].etag
         );
     }
 }

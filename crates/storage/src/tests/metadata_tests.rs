@@ -14,6 +14,9 @@ fn metadata_put_get_delete(store: &dyn PgMetadataStore) {
         etag_kind: 0,
         ec_k: 4,
         ec_m: 2,
+        data_layout: None,
+        parts_count: None,
+        metadata_blob: None,
     };
 
     // Put
@@ -53,6 +56,9 @@ fn metadata_put_overwrites(store: &dyn PgMetadataStore) {
         etag_kind: 0,
         ec_k: 4,
         ec_m: 2,
+        data_layout: None,
+        parts_count: None,
+        metadata_blob: None,
     };
     store.put_object_meta(&req1).unwrap();
 
@@ -67,6 +73,9 @@ fn metadata_put_overwrites(store: &dyn PgMetadataStore) {
         etag_kind: 0,
         ec_k: 4,
         ec_m: 2,
+        data_layout: None,
+        parts_count: None,
+        metadata_blob: None,
     };
     store.put_object_meta(&req2).unwrap();
 
@@ -93,6 +102,9 @@ fn metadata_list_basic(store: &dyn PgMetadataStore) {
             etag_kind: 0,
             ec_k: 4,
             ec_m: 2,
+            data_layout: None,
+            parts_count: None,
+            metadata_blob: None,
         };
         store.put_object_meta(&req).unwrap();
     }
@@ -127,6 +139,9 @@ fn metadata_list_with_prefix(store: &dyn PgMetadataStore) {
             etag_kind: 0,
             ec_k: 4,
             ec_m: 2,
+            data_layout: None,
+            parts_count: None,
+            metadata_blob: None,
         };
         store.put_object_meta(&req).unwrap();
     }
@@ -157,6 +172,9 @@ fn metadata_list_pagination(store: &dyn PgMetadataStore) {
             etag_kind: 0,
             ec_k: 4,
             ec_m: 2,
+            data_layout: None,
+            parts_count: None,
+            metadata_blob: None,
         };
         store.put_object_meta(&req).unwrap();
     }
@@ -248,6 +266,9 @@ fn metadata_empty_key(store: &dyn PgMetadataStore) {
         etag_kind: 0,
         ec_k: 4,
         ec_m: 2,
+        data_layout: None,
+        parts_count: None,
+        metadata_blob: None,
     };
     store.put_object_meta(&req).unwrap();
 
@@ -269,6 +290,9 @@ fn metadata_long_key(store: &dyn PgMetadataStore) {
         etag_kind: 0,
         ec_k: 4,
         ec_m: 2,
+        data_layout: None,
+        parts_count: None,
+        metadata_blob: None,
     };
     store.put_object_meta(&req).unwrap();
 
@@ -288,6 +312,9 @@ fn metadata_zero_size_object(store: &dyn PgMetadataStore) {
         etag_kind: 0,
         ec_k: 4,
         ec_m: 2,
+        data_layout: None,
+        parts_count: None,
+        metadata_blob: None,
     };
     store.put_object_meta(&req).unwrap();
 
@@ -443,6 +470,9 @@ fn file_metadata_object_has_inline_legacy_layout() {
             etag_kind: 0,
             ec_k: 4,
             ec_m: 2,
+            data_layout: None,
+            parts_count: None,
+            metadata_blob: None,
         })
         .unwrap();
 
@@ -469,6 +499,9 @@ fn file_metadata_invalid_data_layout_returns_error() {
             etag_kind: 0,
             ec_k: 4,
             ec_m: 2,
+            data_layout: None,
+            parts_count: None,
+            metadata_blob: None,
         })
         .unwrap();
 
@@ -1882,6 +1915,9 @@ mod prop_tests {
                 etag_kind: 0,
                 ec_k: 4,
                 ec_m: 2,
+                data_layout: None,
+                parts_count: None,
+                metadata_blob: None,
             };
             store.put_object_meta(&req).unwrap();
         }

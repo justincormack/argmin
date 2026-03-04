@@ -398,14 +398,17 @@ impl ShardStore for PgStore {
 impl PgMetadataStore for PgStore {
     fn put_object_meta(&self, req: &PutObjectMetaReq) -> Result<(), MetadataError> {
         let now = PgStore::now_millis();
+        let data_layout = req.data_layout.map(|dl| dl as u8).unwrap_or(0);
+        let parts_count = req.parts_count.map(|n| n as i64);
+        let metadata_blob: Option<&[u8]> = req.metadata_blob.as_deref();
         if req.version_id == 0 {
             // Unversioned: INSERT OR REPLACE (overwrite null version)
             self.conn
                 .execute(
                     "INSERT OR REPLACE INTO objects \
                      (bucket, key, version_id, size, total_size, etag, etag_kind, last_modified, \
-                      storage_class, ec_k, ec_m, status) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11)",
+                      storage_class, ec_k, ec_m, status, data_layout, parts_count, metadata_blob) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14)",
                     params![
                         req.bucket,
                         req.key,
@@ -418,6 +421,9 @@ impl PgMetadataStore for PgStore {
                         req.ec_k,
                         req.ec_m,
                         req.status,
+                        data_layout,
+                        parts_count,
+                        metadata_blob,
                     ],
                 )
                 .map_err(|e| MetadataError::Db {
@@ -430,8 +436,8 @@ impl PgMetadataStore for PgStore {
                 .execute(
                     "INSERT INTO objects \
                      (bucket, key, version_id, size, total_size, etag, etag_kind, last_modified, \
-                      storage_class, ec_k, ec_m, status) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11)",
+                      storage_class, ec_k, ec_m, status, data_layout, parts_count, metadata_blob) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14)",
                     params![
                         req.bucket,
                         req.key,
@@ -444,6 +450,9 @@ impl PgMetadataStore for PgStore {
                         req.ec_k,
                         req.ec_m,
                         req.status,
+                        data_layout,
+                        parts_count,
+                        metadata_blob,
                     ],
                 )
                 .map_err(|e| MetadataError::Db {
@@ -1372,6 +1381,160 @@ impl PgMetadataStore for PgStore {
             })?;
         Ok(())
     }
+
+    fn complete_multipart_commit(
+        &self,
+        upload_id: &str,
+        obj: &PutObjectMetaReq,
+        parts: &[ObjectPartRecord],
+    ) -> Result<(), MetadataError> {
+        let now = PgStore::now_millis();
+        let data_layout = obj.data_layout.map(|dl| dl as u8).unwrap_or(0);
+        let parts_count = obj.parts_count.map(|n| n as i64);
+        let metadata_blob: Option<&[u8]> = obj.metadata_blob.as_deref();
+
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| MetadataError::Db {
+                context: "complete multipart commit (begin txn)",
+                source: e,
+            })?;
+
+        let result = (|| -> Result<(), rusqlite::Error> {
+            // 1. Transition upload to Completing.
+            let updated = self.conn.execute(
+                "UPDATE multipart_uploads SET state = ?1 \
+                 WHERE upload_id = ?2 AND state = 0",
+                params![UploadState::Completing as u8, upload_id],
+            )?;
+            if updated == 0 {
+                // Check if it's already Completing (idempotent retry).
+                let current: Option<u8> = self
+                    .conn
+                    .query_row(
+                        "SELECT state FROM multipart_uploads WHERE upload_id = ?1",
+                        params![upload_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                match current {
+                    Some(1) => { /* Already Completing — allow idempotent retry */ }
+                    _ => {
+                        return Err(rusqlite::Error::QueryReturnedNoRows);
+                    }
+                }
+            }
+
+            // 2. Write/overwrite object metadata row.
+            if obj.version_id == 0 {
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO objects \
+                     (bucket, key, version_id, size, total_size, etag, etag_kind, last_modified, \
+                      storage_class, ec_k, ec_m, status, data_layout, parts_count, metadata_blob) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14)",
+                    params![
+                        obj.bucket,
+                        obj.key,
+                        obj.version_id as i64,
+                        obj.size as i64,
+                        obj.total_size as i64,
+                        obj.etag,
+                        obj.etag_kind,
+                        now as i64,
+                        obj.ec_k,
+                        obj.ec_m,
+                        obj.status,
+                        data_layout,
+                        parts_count,
+                        metadata_blob,
+                    ],
+                )?;
+            } else {
+                self.conn.execute(
+                    "INSERT INTO objects \
+                     (bucket, key, version_id, size, total_size, etag, etag_kind, last_modified, \
+                      storage_class, ec_k, ec_m, status, data_layout, parts_count, metadata_blob) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14)",
+                    params![
+                        obj.bucket,
+                        obj.key,
+                        obj.version_id as i64,
+                        obj.size as i64,
+                        obj.total_size as i64,
+                        obj.etag,
+                        obj.etag_kind,
+                        now as i64,
+                        obj.ec_k,
+                        obj.ec_m,
+                        obj.status,
+                        data_layout,
+                        parts_count,
+                        metadata_blob,
+                    ],
+                )?;
+            }
+
+            // 3. Delete prior object_parts (null-version overwrite).
+            self.conn.execute(
+                "DELETE FROM object_parts \
+                 WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
+                params![obj.bucket, obj.key, obj.version_id as i64],
+            )?;
+
+            // 4. Insert new manifest rows.
+            {
+                let mut stmt = self.conn.prepare(
+                    "INSERT INTO object_parts \
+                     (bucket, key, version_id, part_number, size, etag, etag_kind, \
+                      part_okh, part_vid, ec_k, ec_m) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                )?;
+                for part in parts {
+                    stmt.execute(params![
+                        part.bucket,
+                        part.key,
+                        part.version_id as i64,
+                        part.part_number,
+                        part.size as i64,
+                        part.etag,
+                        part.etag_kind,
+                        part.part_okh.as_slice(),
+                        part.part_vid as i64,
+                        part.ec_k,
+                        part.ec_m,
+                    ])?;
+                }
+            }
+
+            // 5. Delete in-progress upload + parts (CASCADE).
+            self.conn.execute(
+                "DELETE FROM multipart_uploads WHERE upload_id = ?1",
+                params![upload_id],
+            )?;
+
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                if let Err(e) = self.conn.execute_batch("COMMIT") {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    return Err(MetadataError::Db {
+                        context: "complete multipart commit (commit txn)",
+                        source: e,
+                    });
+                }
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(MetadataError::Db {
+                    context: "complete multipart commit",
+                    source: e,
+                })
+            }
+        }
+    }
 }
 
 /// Compute the exclusive end of a prefix range for efficient SQL queries.
@@ -1467,6 +1630,9 @@ mod tests {
                     etag_kind: 0,
                     ec_k: 4,
                     ec_m: 2,
+                    data_layout: None,
+                    parts_count: None,
+                    metadata_blob: None,
                 })
                 .unwrap();
         }
@@ -1555,6 +1721,9 @@ mod tests {
                     etag_kind: 0,
                     ec_k: 4,
                     ec_m: 2,
+                    data_layout: None,
+                    parts_count: None,
+                    metadata_blob: None,
                 })
                 .unwrap();
         }

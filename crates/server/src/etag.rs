@@ -6,6 +6,20 @@ pub fn format_etag(crc64: u64) -> String {
     format!("\"{:016x}\"", crc64)
 }
 
+/// Format an ETag for an ObjectRecord, handling both regular and multipart objects.
+///
+/// Regular objects (etag_kind=0): `"abcdef1234567890"`
+/// Multipart objects (etag_kind=1): `"abcdef1234567890-3"` (with parts_count suffix)
+pub fn format_object_etag(etag: &[u8], etag_kind: u8, parts_count: Option<u32>) -> String {
+    let crc = etag_bytes_to_crc64(etag).unwrap_or(0);
+    if etag_kind == 1 {
+        if let Some(count) = parts_count {
+            return format!("\"{:016x}-{count}\"", crc);
+        }
+    }
+    format_etag(crc)
+}
+
 /// Parse a quoted hex ETag string back to a CRC64-NVME value.
 ///
 /// Accepts both quoted (`"abcdef..."`) and unquoted (`abcdef...`) forms.
@@ -21,6 +35,21 @@ pub fn parse_etag(etag: &str) -> Option<u64> {
 /// (for storage in the etag field of ObjectRecord).
 pub fn crc64_to_etag_bytes(crc64: u64) -> Vec<u8> {
     crc64.to_be_bytes().to_vec()
+}
+
+/// Compute a composite multipart ETag.
+///
+/// The composite ETag is CRC64 of the concatenated per-part CRC64 bytes,
+/// formatted as `"<hex>-<parts_count>"`.
+pub fn compute_multipart_etag(part_etag_bytes: &[&[u8]]) -> (Vec<u8>, String) {
+    let mut concat = Vec::with_capacity(part_etag_bytes.len() * 8);
+    for bytes in part_etag_bytes {
+        concat.extend_from_slice(bytes);
+    }
+    let composite_crc = crc64::checksum(&concat);
+    let etag_bytes = crc64_to_etag_bytes(composite_crc);
+    let etag_str = format!("\"{:016x}-{}\"", composite_crc, part_etag_bytes.len());
+    (etag_bytes, etag_str)
 }
 
 /// Convert etag bytes back to a CRC64-NVME value.
@@ -83,5 +112,25 @@ mod tests {
         let bytes = crc64_to_etag_bytes(crc);
         assert_eq!(bytes.len(), 8);
         assert_eq!(etag_bytes_to_crc64(&bytes), Some(crc));
+    }
+
+    #[test]
+    fn compute_multipart_etag_format() {
+        let part1 = crc64_to_etag_bytes(crc64::checksum(b"part1"));
+        let part2 = crc64_to_etag_bytes(crc64::checksum(b"part2"));
+        let (bytes, etag_str) = compute_multipart_etag(&[&part1, &part2]);
+        assert_eq!(bytes.len(), 8);
+        assert!(etag_str.starts_with('"'));
+        assert!(etag_str.ends_with("-2\""));
+    }
+
+    #[test]
+    fn compute_multipart_etag_deterministic() {
+        let part1 = crc64_to_etag_bytes(0x1234);
+        let (a_bytes, a_str) = compute_multipart_etag(&[&part1]);
+        let (b_bytes, b_str) = compute_multipart_etag(&[&part1]);
+        assert_eq!(a_bytes, b_bytes);
+        assert_eq!(a_str, b_str);
+        assert!(a_str.ends_with("-1\""));
     }
 }

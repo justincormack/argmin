@@ -170,6 +170,21 @@ pub trait PgMetadataStore {
         key: &str,
         version_id: u64,
     ) -> Result<(), MetadataError>;
+
+    /// Atomically finalize a multipart upload.
+    ///
+    /// In a single transaction:
+    /// 1. Transition upload to `Completing`
+    /// 2. Write/overwrite the object metadata row
+    /// 3. Delete any prior `object_parts` for this version_id (null-version overwrite)
+    /// 4. Insert new `object_parts` manifest rows
+    /// 5. Delete the `multipart_uploads` + `multipart_parts` rows
+    fn complete_multipart_commit(
+        &self,
+        upload_id: &str,
+        obj: &PutObjectMetaReq,
+        parts: &[ObjectPartRecord],
+    ) -> Result<(), MetadataError>;
 }
 
 /// Global metadata service (bucket table).
