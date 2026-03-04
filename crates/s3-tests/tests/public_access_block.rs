@@ -161,7 +161,13 @@ fn test_block_public_put_bucket_acls() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        client
+            .create_bucket()
+            .bucket(&bucket)
+            .object_ownership(ObjectOwnership::BucketOwnerPreferred)
+            .send()
+            .await
+            .unwrap();
 
         // Set BlockPublicAcls = true
         let pab = aws_sdk_s3::types::PublicAccessBlockConfiguration::builder()

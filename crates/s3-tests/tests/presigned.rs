@@ -862,8 +862,8 @@ fn test_object_raw_get_x_amz_expires_out_positive_range() {
         let mut resp = agent().get(&tampered_url).call().expect("transport error");
         let status = resp.status().as_u16();
         let _ = resp.body_mut().read_to_string();
-        // Negative X-Amz-Expires is a malformed parameter
-        assert_eq!(status, 400, "expected 400 for negative expires, got {}", status);
+        // Negative X-Amz-Expires is an auth parameter error
+        assert_eq!(status, 403, "expected 403 for negative expires, got {}", status);
 
         cleanup(&bucket, &["obj"]).await;
     });

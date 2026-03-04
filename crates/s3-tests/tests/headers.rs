@@ -991,11 +991,12 @@ fn test_put_body_sha256_mismatch() {
             .expect("transport error");
         let status = resp.status().as_u16();
         let rbody = resp.body_mut().read_to_string().unwrap();
-        // Body hash mismatch: signature covers x-amz-content-sha256 → SignatureDoesNotMatch
-        assert_eq!(status, 403, "expected 403, got {}", status);
+        // Body doesn't match x-amz-content-sha256 → 400 before signature check
+        assert_eq!(status, 400, "expected 400, got {}", status);
         assert!(
-            rbody.contains("<Code>SignatureDoesNotMatch</Code>"),
-            "expected SignatureDoesNotMatch in body: {}",
+            rbody.contains("<Code>XAmzContentSHA256Mismatch</Code>")
+                || rbody.contains("<Code>InvalidRequest</Code>"),
+            "expected XAmzContentSHA256Mismatch or InvalidRequest in body: {}",
             rbody
         );
         cleanup(&bucket, &[]).await;
