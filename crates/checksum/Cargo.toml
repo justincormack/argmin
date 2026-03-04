@@ -1,0 +1,10 @@
+[package]
+name = "checksum"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ec-sys = { path = "../ec-sys" }
+
+[dev-dependencies]
+proptest = "1"

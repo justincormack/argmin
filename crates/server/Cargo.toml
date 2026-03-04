@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 auth = { path = "../auth" }
+checksum = { path = "../checksum" }
 crc64 = { path = "../crc64" }
 ec = { path = "../ec" }
 storage = { path = "../storage" }
