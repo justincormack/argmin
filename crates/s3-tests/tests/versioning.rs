@@ -1549,10 +1549,144 @@ fn test_versioned_object_acl_no_version_specified() {
 
 #[test]
 fn test_versioning_obj_create_overwrite_multipart() {
-    s3_tests::run(async {});
+    s3_tests::run(async {
+        use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+
+        let client = CTX.client();
+        let bucket = setup_versioned_bucket().await;
+        let key = "mp-overwrite";
+
+        // Put a plain object first
+        let put = client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"original"))
+            .send()
+            .await
+            .unwrap();
+        let v1 = put.version_id().unwrap().to_string();
+
+        // Overwrite with a multipart upload
+        let part_data = vec![b'Z'; 5 * 1024 * 1024];
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap();
+        let part_resp = client
+            .upload_part()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(1)
+            .body(ByteStream::from(part_data))
+            .send()
+            .await
+            .unwrap();
+        let complete = client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(part_resp.e_tag().unwrap())
+                            .part_number(1)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+        let v2 = complete.version_id().unwrap().to_string();
+        assert_ne!(v1, v2, "multipart should create a new version");
+
+        // Current version is the multipart object
+        let get = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(get.content_length(), Some(5 * 1024 * 1024));
+
+        // Old version still has original content
+        let get_old = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&v1)
+            .send()
+            .await
+            .unwrap();
+        let body = get_old.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&body[..], b"original");
+
+        cleanup_versioned(&bucket, key, &[v1, v2]).await;
+    });
 }
 
 #[test]
 fn test_versioning_bucket_multipart_upload_return_version_id() {
-    s3_tests::run(async {});
+    s3_tests::run(async {
+        use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+
+        let client = CTX.client();
+        let bucket = setup_versioned_bucket().await;
+        let key = "mp-vid";
+
+        // Multipart upload on versioned bucket should return version_id
+        let part_data = vec![b'V'; 5 * 1024 * 1024];
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap();
+        let part_resp = client
+            .upload_part()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(1)
+            .body(ByteStream::from(part_data))
+            .send()
+            .await
+            .unwrap();
+        let complete = client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(part_resp.e_tag().unwrap())
+                            .part_number(1)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let version_id = complete
+            .version_id()
+            .expect("CompleteMultipartUpload should return version_id on versioned bucket");
+        assert!(!version_id.is_empty());
+
+        cleanup_versioned(&bucket, key, &[version_id.to_string()]).await;
+    });
 }

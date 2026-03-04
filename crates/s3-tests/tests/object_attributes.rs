@@ -237,21 +237,25 @@ fn test_get_sse_c_encrypted_object_attributes() {
 }
 
 #[test]
+#[ignore = "not implemented: GetObjectAttributes ObjectParts"]
 fn test_get_multipart_object_attributes() {
     s3_tests::run(async {});
 }
 
 #[test]
+#[ignore = "not implemented: GetObjectAttributes ObjectParts"]
 fn test_get_single_multipart_object_attributes() {
     s3_tests::run(async {});
 }
 
 #[test]
+#[ignore = "not implemented: GetObjectAttributes ObjectParts"]
 fn test_get_paginated_multipart_object_attributes() {
     s3_tests::run(async {});
 }
 
 #[test]
+#[ignore = "not implemented: GetObjectAttributes ObjectParts"]
 fn test_get_multipart_checksum_object_attributes() {
     s3_tests::run(async {});
 }

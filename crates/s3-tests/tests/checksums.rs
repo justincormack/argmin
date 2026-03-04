@@ -162,31 +162,37 @@ fn test_object_checksum_crc64nvme() {
 // ── Multipart checksum tests ─────────────────────────────────────────
 
 #[test]
+#[ignore = "not implemented: multipart per-part checksums"]
 fn test_multipart_checksum_sha256() {
     s3_tests::run(async {});
 }
 
 #[test]
+#[ignore = "not implemented: multipart per-part checksums"]
 fn test_multipart_use_cksum_helper_sha256() {
     s3_tests::run(async {});
 }
 
 #[test]
+#[ignore = "not implemented: multipart per-part checksums"]
 fn test_multipart_use_cksum_helper_crc64nvme() {
     s3_tests::run(async {});
 }
 
 #[test]
+#[ignore = "not implemented: multipart per-part checksums"]
 fn test_multipart_use_cksum_helper_crc32() {
     s3_tests::run(async {});
 }
 
 #[test]
+#[ignore = "not implemented: multipart per-part checksums"]
 fn test_multipart_use_cksum_helper_crc32c() {
     s3_tests::run(async {});
 }
 
 #[test]
+#[ignore = "not implemented: multipart per-part checksums"]
 fn test_multipart_use_cksum_helper_sha1() {
     s3_tests::run(async {});
 }

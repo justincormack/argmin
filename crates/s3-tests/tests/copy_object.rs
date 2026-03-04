@@ -624,7 +624,111 @@ fn test_object_copy_versioned_url_encoding() {
 
 #[test]
 fn test_object_copy_versioning_multipart_upload() {
-    s3_tests::run(async {});
+    s3_tests::run(async {
+        use aws_sdk_s3::types::{
+            BucketVersioningStatus, CompletedMultipartUpload, CompletedPart,
+            VersioningConfiguration,
+        };
+
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+
+        // Enable versioning
+        client
+            .put_bucket_versioning()
+            .bucket(&bucket)
+            .versioning_configuration(
+                VersioningConfiguration::builder()
+                    .status(BucketVersioningStatus::Enabled)
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        // Create a multipart object
+        let src_key = "mp-src";
+        let part_data = vec![b'M'; 5 * 1024 * 1024];
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(src_key)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap();
+        let part_resp = client
+            .upload_part()
+            .bucket(&bucket)
+            .key(src_key)
+            .upload_id(upload_id)
+            .part_number(1)
+            .body(ByteStream::from(part_data.clone()))
+            .send()
+            .await
+            .unwrap();
+        let complete = client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(src_key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(part_resp.e_tag().unwrap())
+                            .part_number(1)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+        let src_version = complete.version_id().unwrap().to_string();
+
+        // Copy the multipart object
+        let dst_key = "mp-dst";
+        let copy_resp = client
+            .copy_object()
+            .bucket(&bucket)
+            .key(dst_key)
+            .copy_source(format!("{}/{}", bucket, src_key))
+            .send()
+            .await
+            .unwrap();
+        assert!(copy_resp.version_id().is_some());
+
+        // Verify destination has same content
+        let get = client
+            .get_object()
+            .bucket(&bucket)
+            .key(dst_key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(get.content_length(), Some(5 * 1024 * 1024));
+        let body = get.body.collect().await.unwrap().into_bytes();
+        assert_eq!(body.len(), 5 * 1024 * 1024);
+        assert!(body.iter().all(|&b| b == b'M'));
+
+        // Clean up: delete both versions
+        let dst_version = copy_resp.version_id().unwrap().to_string();
+        for (key, vid) in [
+            (src_key, src_version),
+            (dst_key, dst_version),
+        ] {
+            client
+                .delete_object()
+                .bucket(&bucket)
+                .key(key)
+                .version_id(&vid)
+                .send()
+                .await
+                .unwrap();
+        }
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
 }
 
 // ── Multi-user / ACL (not implemented) ──────────────────────────────

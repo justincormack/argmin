@@ -77,7 +77,7 @@ crates/s3-tests/
     ├── acl_access.rs       # GROUP 11: 12 tests — Access control combinations
     ├── bucket_anon.rs      # GROUP 12: 10 tests — Anonymous/public listing
     ├── copy_object.rs      # GROUP 13: 19 tests — Copy operations
-    ├── multipart.rs        # GROUP 14: 26 tests — Multipart upload (21 active, 5 ignored: UploadPartCopy + PartNumber GET)
+    ├── multipart.rs        # GROUP 14: 34 tests — Multipart upload (23 active, 11 ignored)
     ├── cors.rs             # GROUP 15: 14 tests — CORS
     ├── tagging.rs          # GROUP 16: 24 tests — Object/bucket tags
     ├── range_requests.rs   # GROUP 17:  6 tests — Byte range GET
@@ -243,7 +243,7 @@ tempfile = "3"
 8. `tests/range_requests.rs` — 6 tests
 9. `tests/versioning.rs` — 24 tests
 10. `tests/conditional.rs` — 28 tests
-11. `tests/multipart.rs` — 26 tests (implemented; 21 active, 5 ignored)
+11. `tests/multipart.rs` — 34 tests (implemented; 23 active, 11 ignored)
 
 ### Phase 4: Auth + POST + Headers (~3 files)
 12. `tests/presigned.rs` — 13 tests (needs ureq for raw fetch)
@@ -362,10 +362,12 @@ These groups from test_s3.py are well covered by existing tests:
 
 ##### Tier 3: Large core features
 
-**Multipart upload (implemented — 26 integration tests, 21 active)**
+**Multipart upload (implemented — 34 integration tests, 23 active)**
 - Full lifecycle implemented: CreateMultipartUpload, UploadPart, CompleteMultipartUpload,
   AbortMultipartUpload, ListParts, ListMultipartUploads.
-- Remaining ignored tests: UploadPartCopy (3), PartNumber GET (2).
+- Remaining ignored tests: UploadPartCopy (8), PartNumber GET (2), multi-user (1),
+  multipart per-part checksums in checksums.rs (6), GetObjectAttributes ObjectParts in
+  object_attributes.rs (4), multipart tagging in tagging.rs (1).
 - Detailed implementation plan: `plans/multipart-upload-core-design.md`.
 
 **Full ACL system (~41 tests)**
@@ -445,6 +447,11 @@ Tests for unimplemented features are marked `#[ignore = "reason"]` so they show 
 - `not implemented: public-read-write ACL` (bucket_anon.rs)
 - `not implemented: header auth region/service scope validation` (headers.rs)
 - `not implemented: duplicate Authorization header rejection` (headers.rs)
-- `not implemented: UploadPartCopy` (multipart.rs)
-- `not implemented: PartNumber GET query parameter` (multipart.rs)
+- `not implemented: UploadPartCopy` (multipart.rs — 8 tests)
+- `not implemented: PartNumber GET query parameter` (multipart.rs — 2 tests)
+- `not implemented: multi-user` (multipart.rs — 1 test)
+- `not implemented: multipart per-part checksums` (checksums.rs — 6 tests)
+- `not implemented: GetObjectAttributes ObjectParts` (object_attributes.rs — 4 tests)
+- `not implemented: SSE-C encryption` (object_attributes.rs — 1 test)
+- `not implemented: multipart upload` (tagging.rs — 1 test, blocked on tagging todo)
 - Various conditional/versioning edge cases

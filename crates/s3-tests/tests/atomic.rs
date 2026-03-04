@@ -321,10 +321,69 @@ fn test_atomic_write_bucket_gone() {
     });
 }
 
-/// Multipart upload produces an atomic object.
+/// A pre-existing object remains readable while a multipart upload to
+/// the same key is in progress, and survives abort of that upload.
 ///
 /// Matches Ceph: test_atomic_multipart_upload_write
 #[test]
 fn test_atomic_multipart_upload_write() {
-    s3_tests::run(async {});
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "foo";
+
+        // Put a pre-existing object
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"bar"))
+            .send()
+            .await
+            .unwrap();
+
+        // Start a multipart upload to the same key
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap();
+
+        // Original object is still readable during in-progress MPU
+        let get = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let body = get.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&body[..], b"bar");
+
+        // Abort the multipart upload
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .send()
+            .await
+            .unwrap();
+
+        // Original object still intact after abort
+        let get = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let body = get.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&body[..], b"bar");
+
+        cleanup(&bucket, &[key]).await;
+    });
 }

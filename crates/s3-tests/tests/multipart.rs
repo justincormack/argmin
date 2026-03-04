@@ -1108,7 +1108,6 @@ fn test_multipart_complete_invalid_order() {
 #[test]
 fn test_multipart_composite_etag() {
     s3_tests::run(async {
-        let client = CTX.client();
         let bucket = setup_bucket().await;
         let key = "composite-etag";
 
@@ -1116,6 +1115,150 @@ fn test_multipart_composite_etag() {
         let etag = do_multipart_upload(&bucket, key, &[part_data]).await;
         // Multipart ETags have the format "hex-N" where N is part count
         assert!(etag.contains("-1"), "expected composite ETag with -1 suffix, got: {etag}");
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+// ── Ceph parity: resend part ────────────────────────────────────────
+
+/// Re-uploading a part before completion replaces the previous upload.
+///
+/// Matches Ceph: test_multipart_upload_resend_part
+#[test]
+fn test_multipart_upload_resend_part() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "resend-part";
+
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap();
+
+        // Upload part 1 with data 'A'
+        let data_a = vec![b'A'; PART_SIZE];
+        let _resp_a = client
+            .upload_part()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(1)
+            .body(ByteStream::from(data_a))
+            .send()
+            .await
+            .unwrap();
+
+        // Re-upload part 1 with data 'B' (replaces the first upload)
+        let data_b = vec![b'B'; PART_SIZE];
+        let resp_b = client
+            .upload_part()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(1)
+            .body(ByteStream::from(data_b.clone()))
+            .send()
+            .await
+            .unwrap();
+
+        // Complete with the second ETag
+        client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(resp_b.e_tag().unwrap())
+                            .part_number(1)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        // Verify the content is from the second upload
+        let get = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let body = get.body.collect().await.unwrap().into_bytes();
+        assert_eq!(body.len(), PART_SIZE);
+        assert!(body.iter().all(|&b| b == b'B'));
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+// ── Ceph parity: multiple sizes ─────────────────────────────────────
+
+/// Multipart upload with various total sizes, covering all boundary
+/// variants from the Ceph test.
+///
+/// Matches Ceph: test_multipart_upload_multiple_sizes
+#[test]
+fn test_multipart_upload_multiple_sizes() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "multi-sizes";
+        let mb = 1024 * 1024;
+        let kb = 1024;
+
+        // Helper: upload with given total size split into 5MB parts + remainder
+        async fn upload_and_check(
+            client: &aws_sdk_s3::Client,
+            bucket: &str,
+            key: &str,
+            total: usize,
+        ) {
+            let part_size = 5 * 1024 * 1024;
+            let mut parts = Vec::new();
+            let mut remaining = total;
+            while remaining > 0 {
+                let sz = remaining.min(part_size);
+                parts.push(vec![b'x'; sz]);
+                remaining -= sz;
+            }
+            do_multipart_upload(bucket, key, &parts).await;
+            let head = client
+                .head_object()
+                .bucket(bucket)
+                .key(key)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                head.content_length(),
+                Some(total as i64),
+                "size mismatch for {total} byte upload"
+            );
+        }
+
+        // Ceph sizes: 5MB, 5MB+100KB, 5MB+600KB, 10MB+100KB, 10MB+600KB, 10MB
+        for size in [
+            5 * mb,
+            5 * mb + 100 * kb,
+            5 * mb + 600 * kb,
+            10 * mb + 100 * kb,
+            10 * mb + 600 * kb,
+            10 * mb,
+        ] {
+            upload_and_check(client, &bucket, key, size).await;
+        }
 
         cleanup(&bucket, &[key]).await;
     });
@@ -1152,5 +1295,43 @@ fn test_multipart_copy_without_range() {
 #[test]
 #[ignore = "not implemented: UploadPartCopy"]
 fn test_multipart_copy_invalid_range() {
+    s3_tests::run(async {});
+}
+
+#[test]
+#[ignore = "not implemented: UploadPartCopy"]
+fn test_multipart_copy_improper_range() {
+    s3_tests::run(async {});
+}
+
+#[test]
+#[ignore = "not implemented: UploadPartCopy"]
+fn test_multipart_copy_special_names() {
+    s3_tests::run(async {});
+}
+
+#[test]
+#[ignore = "not implemented: UploadPartCopy"]
+fn test_multipart_copy_versioned() {
+    s3_tests::run(async {});
+}
+
+#[test]
+#[ignore = "not implemented: UploadPartCopy"]
+fn test_multipart_copy_multiple_sizes() {
+    s3_tests::run(async {});
+}
+
+#[test]
+#[ignore = "not implemented: UploadPartCopy"]
+fn test_upload_part_copy_percent_encoded_key() {
+    s3_tests::run(async {});
+}
+
+// ── Multi-user (not implemented) ────────────────────────────────────
+
+#[test]
+#[ignore = "not implemented: multi-user"]
+fn test_list_multipart_upload_owner() {
     s3_tests::run(async {});
 }
