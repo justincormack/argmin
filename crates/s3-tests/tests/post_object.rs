@@ -1927,7 +1927,7 @@ fn test_post_object_invalid_access_key() {
         ];
 
         let (status, _) = post_object(&bucket, &fields, b"data", "test.txt");
-        assert_eq!(status, 403, "expected 403, got {}", status);
+        assert_eq!(status, 400, "expected 400, got {}", status);
 
         CTX.client()
             .delete_bucket()

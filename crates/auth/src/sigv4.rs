@@ -156,6 +156,14 @@ pub fn verify_request(
         }
     }
 
+    // AWS requires all x-amz-* headers to be signed (security: prevents injection
+    // of unsigned x-amz-* headers).
+    for (name, _) in headers {
+        if name.starts_with("x-amz-") && !auth.signed_headers.iter().any(|sh| sh == name) {
+            return Err(AuthError::SignatureMismatch);
+        }
+    }
+
     let canonical_hdrs = canonical_headers(&signed_header_pairs);
     let signed_headers_str = auth.signed_headers.join(";");
     let canonical_qs = canonical_query_string(query_string);

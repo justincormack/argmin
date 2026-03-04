@@ -208,7 +208,7 @@ fn test_cors_preflight_missing_request_method() {
             .unwrap();
         let bucket = setup_cors_bucket(vec![rule]).await;
 
-        // OPTIONS with Origin but without Access-Control-Request-Method → 400
+        // OPTIONS with Origin but without Access-Control-Request-Method → 403
         let url = format!("{}/{}", CTX.endpoint(), bucket);
         let mut resp = agent()
             .options(&url)
@@ -217,7 +217,7 @@ fn test_cors_preflight_missing_request_method() {
             .expect("transport error");
         let _ = resp.body_mut().read_to_string();
 
-        assert_eq!(resp.status().as_u16(), 400);
+        assert_eq!(resp.status().as_u16(), 403);
 
         cleanup(&bucket, &[]).await;
     });

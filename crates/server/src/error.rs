@@ -127,6 +127,7 @@ impl ServerError {
             Self::ObjectNotFound { .. } => "NoSuchKey",
             Self::DeleteMarkerHit { .. } => "NoSuchKey",
             Self::Auth(auth::AuthError::MissingAuth) => "AccessDenied",
+            Self::Auth(auth::AuthError::MalformedAuth) => "InvalidArgument",
             Self::Auth(auth::AuthError::UnknownAccessKey) => "InvalidAccessKeyId",
             Self::Auth(auth::AuthError::SignatureMismatch) => "SignatureDoesNotMatch",
             Self::Auth(auth::AuthError::RequestExpired) => "RequestTimeTooSkewed",
@@ -173,6 +174,7 @@ impl ServerError {
             Self::BucketNotEmpty => 409,
             Self::ObjectNotFound { .. } => 404,
             Self::DeleteMarkerHit { .. } => 404,
+            Self::Auth(auth::AuthError::MalformedAuth) => 400,
             Self::Auth(_) => 403,
             Self::InvalidRequest { .. }
             | Self::InvalidArgument { .. }
@@ -277,7 +279,15 @@ mod tests {
     #[test]
     fn s3_error_code_auth_malformed() {
         let err = ServerError::Auth(auth::AuthError::MalformedAuth);
-        assert_eq!(err.s3_error_code(), "AccessDenied");
+        assert_eq!(err.s3_error_code(), "InvalidArgument");
+    }
+
+    #[test]
+    fn http_status_auth_malformed_400() {
+        assert_eq!(
+            ServerError::Auth(auth::AuthError::MalformedAuth).http_status(),
+            400
+        );
     }
 
     #[test]

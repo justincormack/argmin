@@ -2813,7 +2813,9 @@ impl Coordinator {
             use base64::Engine;
             let actual_b64 = base64::engine::general_purpose::STANDARD.encode(actual);
             if *claimed_b64 != actual_b64 {
-                return Err(ServerError::BadDigest);
+                return Err(ServerError::InvalidRequest {
+                    reason: "checksum mismatch".to_string(),
+                });
             }
         }
 
@@ -3027,12 +3029,16 @@ impl Coordinator {
                         let stored_b64 =
                             base64::engine::general_purpose::STANDARD.encode(stored_bytes);
                         if *claimed_b64 != stored_b64 {
-                            return Err(ServerError::BadDigest);
+                            return Err(ServerError::InvalidRequest {
+                                reason: "part checksum mismatch".to_string(),
+                            });
                         }
                     }
                     None => {
                         // Request claims a checksum but none was stored for this part.
-                        return Err(ServerError::BadDigest);
+                        return Err(ServerError::InvalidRequest {
+                            reason: "part checksum mismatch".to_string(),
+                        });
                     }
                 }
             }
@@ -3184,7 +3190,9 @@ impl Coordinator {
             // Value must match computed checksum.
             if let Some(ref computed) = checksum_value {
                 if computed != claimed_value {
-                    return Err(ServerError::BadDigest);
+                    return Err(ServerError::InvalidRequest {
+                        reason: "checksum mismatch".to_string(),
+                    });
                 }
             }
         }
@@ -7557,8 +7565,8 @@ mod tests {
             .complete_multipart_upload("bucket", "key", &upload_id, &parts, None)
             .unwrap_err();
         assert!(
-            matches!(err, ServerError::BadDigest),
-            "expected BadDigest, got {err:?}"
+            matches!(err, ServerError::InvalidRequest { .. }),
+            "expected InvalidRequest, got {err:?}"
         );
     }
 

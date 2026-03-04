@@ -93,7 +93,7 @@ fn test_object_checksum_sha256() {
             .send()
             .await;
         assert_eq!(err_status(&result), 400);
-        assert_s3_err_code(&result, "BadDigest");
+        assert_s3_err_code(&result, "InvalidRequest");
 
         cleanup(&bucket, &[key]).await;
     });
@@ -156,7 +156,7 @@ fn test_object_checksum_crc64nvme() {
             .send()
             .await;
         assert_eq!(err_status(&result), 400);
-        assert_s3_err_code(&result, "BadDigest");
+        assert_s3_err_code(&result, "InvalidRequest");
 
         cleanup(&bucket, &[key]).await;
     });
@@ -472,7 +472,7 @@ fn test_multipart_checksum_sha256() {
             .send()
             .await;
         assert_eq!(err_status(&result), 400);
-        assert_s3_err_code(&result, "BadDigest");
+        assert_s3_err_code(&result, "InvalidRequest");
 
         // -- missing part checksum rejected --
         let key2 = "mymultipart2";

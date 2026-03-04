@@ -91,6 +91,9 @@ pub fn authenticate_post_sigv4(
         return Err(AuthError::MalformedAuth);
     }
     let access_key_id = parts[0];
+    if access_key_id.is_empty() {
+        return Err(AuthError::MalformedAuth);
+    }
     let cred_date = parts[1];
     let region = parts[2];
     let service = parts[3];

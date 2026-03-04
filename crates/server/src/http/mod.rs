@@ -115,16 +115,7 @@ impl HttpFrontend {
 
         let request_method = match req.header("access-control-request-method") {
             Some(m) => m,
-            None => {
-                return S3Response::error(
-                    &ServerError::InvalidRequest {
-                        reason:
-                            "Insufficient information. Access-Control-Request-Method request header needed."
-                                .to_string(),
-                    },
-                    &req.path,
-                )
-            }
+            None => return S3Response::forbidden(),
         };
 
         let request_headers_str = req.header("access-control-request-headers");
@@ -1156,6 +1147,23 @@ impl HttpFrontend {
             .unwrap_or_default()
             .as_secs();
 
+        // Pre-auth time skew check for SigV4 requests: AWS rejects expired requests
+        // before signature verification. Only applies to well-formed SigV4 auth headers.
+        let is_sigv4 = req
+            .header("authorization")
+            .is_some_and(|h| h.starts_with("AWS4-HMAC-SHA256"));
+        if is_sigv4 {
+            if let Some(date_str) = req.header("x-amz-date") {
+                if let Some(epoch) = auth::parse_amz_date(date_str) {
+                    let skew = now.abs_diff(epoch);
+                    if skew > 15 * 60 {
+                        return Err(ServerError::Auth(auth::AuthError::RequestExpired));
+                    }
+                }
+                // malformed date → fall through to auth which will handle it
+            }
+        }
+
         let auth_result = authenticate_request(
             &req.method,
             &req.path,
@@ -1176,18 +1184,25 @@ impl HttpFrontend {
                 principal: None,
                 request_epoch_secs: None,
             },
+            // Missing x-amz-date when declared as signed → RequestTimeTooSkewed
+            Err(auth::AuthError::MissingSignedHeader { header: "x-amz-date" }) => {
+                return Err(ServerError::Auth(auth::AuthError::RequestExpired));
+            }
             Err(err) => return Err(ServerError::Auth(err)),
         };
 
-        // Enforce ±15 minute time skew on x-amz-date to prevent replay attacks.
-        // Reject malformed timestamps — skipping the check would weaken replay protection.
-        if req.header("x-amz-date").is_some() {
-            let request_epoch = auth.request_epoch_secs.ok_or(ServerError::InvalidRequest {
-                reason: "malformed x-amz-date timestamp".to_string(),
-            })?;
-            let skew = now.abs_diff(request_epoch);
-            if skew > 15 * 60 {
-                return Err(ServerError::Auth(auth::AuthError::RequestExpired));
+        // Post-auth time skew check for non-SigV4 requests (e.g. anonymous with x-amz-date).
+        // SigV4 requests already checked above.
+        if !is_sigv4 {
+            if req.header("x-amz-date").is_some() {
+                let request_epoch =
+                    auth.request_epoch_secs.ok_or(ServerError::InvalidRequest {
+                        reason: "malformed x-amz-date timestamp".to_string(),
+                    })?;
+                let skew = now.abs_diff(request_epoch);
+                if skew > 15 * 60 {
+                    return Err(ServerError::Auth(auth::AuthError::RequestExpired));
+                }
             }
         }
 
@@ -1508,7 +1523,9 @@ fn validate_checksum_headers(req: &S3Request) -> Result<(), ServerError> {
                 _ => continue,
             };
             if claimed != actual_b64 {
-                return Err(ServerError::BadDigest);
+                return Err(ServerError::InvalidRequest {
+                    reason: format!("{} checksum mismatch", algo),
+                });
             }
         }
     }
@@ -2445,8 +2462,8 @@ mod tests {
             key: "k".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
-            Err(ServerError::BadDigest) => {}
-            Err(e) => panic!("expected BadDigest, got {e:?}"),
+            Err(ServerError::InvalidRequest { .. }) => {}
+            Err(e) => panic!("expected InvalidRequest, got {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
     }

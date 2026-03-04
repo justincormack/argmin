@@ -560,7 +560,8 @@ mod tests {
     }
 
     #[test]
-    fn authenticate_header_invalid_token() {
+    fn authenticate_header_unsigned_security_token_rejected() {
+        // AWS requires x-amz-security-token to be signed; unsigned → SignatureMismatch.
         let mut store = example_store();
         store.add_record(CredentialRecord {
             access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
@@ -590,7 +591,7 @@ mod tests {
             0,
         )
         .unwrap_err();
-        assert!(matches!(err, AuthError::InvalidToken));
+        assert!(matches!(err, AuthError::SignatureMismatch));
     }
 
     #[test]
