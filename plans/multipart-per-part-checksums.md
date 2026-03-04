@@ -104,6 +104,30 @@ Acceptance:
 
 1. Storage unit tests cover round-trip persistence for new fields.
 
+### Step 1b: Add CRC32/CRC32C combine primitives (no full-object read at complete)
+
+Files:
+
+- `crates/server/src/coordinator.rs`
+- `crates/server/src/http/mod.rs` (if shared helpers are placed here)
+- `crates/crc64/src/lib.rs` (reference for API shape only)
+- `crates/server/src` tests (unit tests for combine correctness)
+
+Tasks:
+
+1. Implement CRC32 and CRC32C checksum-combine math so object-level FULL_OBJECT
+   checksums can be derived from per-part checksums + part lengths.
+2. Expose a small, tested helper API used by multipart complete logic.
+3. Validate combine helpers against direct whole-buffer checksum results for
+   2-part and 3-part inputs.
+
+Acceptance:
+
+1. Dedicated unit tests prove `combine(part1, part2, len2)` equals checksum of
+   concatenated bytes for CRC32 and CRC32C.
+2. `CompleteMultipartUpload` can use combine helpers without reconstructing
+   full object bytes for CRC32/CRC32C FULL_OBJECT checksums.
+
 ### Step 2: CreateMultipartUpload checksum contract
 
 Files:
@@ -160,7 +184,7 @@ Tasks:
 2. Validate per-part checksums in request against stored part checksums.
 3. Compute object checksum by checksum type:
 - `COMPOSITE` (SHA1/SHA256): hash concatenated raw part checksums and append `-N`.
-- `FULL_OBJECT` (CRC*): compute full-object checksum.
+- `FULL_OBJECT` (CRC*): compute from per-part checksums using combine math.
 4. Compare provided object checksum (if present); on mismatch return `BadDigest`.
 5. Persist final object checksum + `x-amz-checksum-type` in metadata blob.
 6. Return checksum fields in complete response XML.
@@ -168,12 +192,6 @@ Tasks:
 Acceptance:
 
 1. `test_multipart_checksum_sha256` passes, including `BadDigest` negative cases.
-
-Implementation note:
-
-1. `CRC64NVME` can use existing `crc64::combine`.
-2. For `CRC32`/`CRC32C`, start with correct implementation first (streaming full object
-   read if needed), then optimize to checksum-combine math in a follow-up.
 
 ### Step 5: Surface checksums in list/head/get/object-attributes
 
@@ -226,7 +244,8 @@ Acceptance:
 - Guardrail: add contract tests for explicit combinations we support now.
 
 2. Risk: large complete operations become expensive for FULL_OBJECT CRC.
-- Guardrail: start correct-first; add CRC32/CRC32C combine optimization follow-up.
+- Guardrail: Step 1b requires combine math up front; forbid full-object reads in
+  complete checksum path.
 
 3. Risk: checksum field drift between multipart tables and committed object manifest.
 - Guardrail: keep checksum fields in `multipart_parts` -> `object_parts` commit path
@@ -234,7 +253,6 @@ Acceptance:
 
 ## Follow-up (after this slice)
 
-1. Implement CRC32/CRC32C combine math to avoid full-object reads at complete.
-2. Add `GET ?partNumber=` support so per-part checksum retrieval via `GetObject`
+1. Add `GET ?partNumber=` support so per-part checksum retrieval via `GetObject`
    can match Ceph helper behavior exactly.
-3. Add fault-injection tests for checksum metadata failure points.
+2. Add fault-injection tests for checksum metadata failure points.
