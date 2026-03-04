@@ -963,6 +963,9 @@ impl HttpFrontend {
                     &key,
                     &result.etag,
                     result.version_id,
+                    result.checksum_algorithm,
+                    result.checksum_type,
+                    result.checksum_value.as_deref(),
                 ))
             }
             S3Operation::AbortMultipartUpload { bucket, key } => {
@@ -2350,7 +2353,8 @@ mod tests {
     }
 
     #[test]
-    fn upload_part_checksum_rejected_when_upload_has_no_algorithm() {
+    fn upload_part_checksum_accepted_when_upload_has_no_algorithm() {
+        use base64::Engine;
         let tmp = tempfile::tempdir().unwrap();
         let fe = setup_frontend(tmp.path());
         fe.coordinator
@@ -2358,23 +2362,24 @@ mod tests {
             .unwrap();
 
         // Upload created without checksum algorithm.
+        // AWS SDK v2+ sends CRC32 by default — it should be accepted and verified.
         let upload_id = create_upload_with_checksum(&fe, "mybucket", "k", None);
+        let data = vec![1u8, 2, 3, 4];
+        let correct_crc = base64::engine::general_purpose::STANDARD
+            .encode(checksum::crc32::checksum(&data).to_be_bytes());
         let req = S3Request {
             method: String::new(),
             path: String::new(),
             query_string: format!("partNumber=1&uploadId={upload_id}"),
-            headers: vec![("x-amz-checksum-crc32".to_string(), "AAAAAA==".to_string())],
-            body: vec![1, 2, 3, 4],
+            headers: vec![("x-amz-checksum-crc32".to_string(), correct_crc)],
+            body: data,
         };
         let op = S3Operation::UploadPart {
             bucket: "mybucket".to_string(),
             key: "k".to_string(),
         };
-        match fe.dispatch_routed(&req, &test_auth(), op) {
-            Err(ServerError::InvalidRequest { .. }) => {}
-            Err(e) => panic!("expected InvalidRequest, got {e:?}"),
-            Ok(_) => panic!("expected error, got Ok"),
-        }
+        let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
+        assert_eq!(resp.status_code, 200);
     }
 
     #[test]

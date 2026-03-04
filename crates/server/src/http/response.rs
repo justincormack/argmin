@@ -5,7 +5,7 @@ use crate::coordinator::{
     ListObjectsResult, ListPartsResult, PutObjectResult,
 };
 use crate::error::ServerError;
-use storage::BucketInfo;
+use storage::{BucketInfo, ChecksumAlgorithm, ChecksumType};
 
 use super::xml;
 
@@ -531,11 +531,31 @@ impl S3Response {
     }
 
     /// Build a response for CompleteMultipartUpload (200 OK, XML body).
-    pub fn complete_multipart_upload(bucket: &str, key: &str, etag: &str, version_id: u64) -> Self {
-        let body = xml::complete_multipart_upload_xml(bucket, key, etag);
+    pub fn complete_multipart_upload(
+        bucket: &str,
+        key: &str,
+        etag: &str,
+        version_id: u64,
+        checksum_algorithm: Option<ChecksumAlgorithm>,
+        checksum_type: Option<ChecksumType>,
+        checksum_value: Option<&str>,
+    ) -> Self {
+        let body = xml::complete_multipart_upload_xml(
+            bucket,
+            key,
+            etag,
+            checksum_algorithm,
+            checksum_value,
+        );
         let mut resp = Self::new(200).xml_body(body);
         if version_id != 0 {
             resp = resp.header("x-amz-version-id", &format_version_id(version_id));
+        }
+        if let Some(algo) = checksum_algorithm {
+            resp = resp.header("x-amz-checksum-algorithm", algo.as_str());
+        }
+        if let Some(ct) = checksum_type {
+            resp = resp.header("x-amz-checksum-type", ct.as_str());
         }
         resp
     }

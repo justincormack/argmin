@@ -211,6 +211,8 @@ pub struct CreateMultipartUploadResult {
 pub struct CompletePart {
     pub part_number: u32,
     pub etag: String,
+    /// Per-part checksum from the request XML: (algorithm implied by element name, base64 value).
+    pub checksum: Option<(ChecksumAlgorithm, String)>,
 }
 
 /// Result of a CompleteMultipartUpload operation.
@@ -218,6 +220,12 @@ pub struct CompletePart {
 pub struct CompleteMultipartUploadResult {
     pub etag: String,
     pub version_id: u64,
+    /// Object-level checksum algorithm (if configured).
+    pub checksum_algorithm: Option<ChecksumAlgorithm>,
+    /// Object-level checksum type.
+    pub checksum_type: Option<ChecksumType>,
+    /// Object-level checksum (base64-encoded).
+    pub checksum_value: Option<String>,
 }
 
 /// Minimum part size for non-final parts (5 MiB).
@@ -2487,14 +2495,10 @@ impl Coordinator {
                 });
             }
             (Some(algo), _) => Some(algo),
-            (None, Some(part_algo)) => {
-                return Err(ServerError::InvalidRequest {
-                    reason: format!(
-                        "checksum header {} not allowed: upload was not configured with a checksum algorithm",
-                        part_algo.as_str()
-                    ),
-                });
-            }
+            // AWS SDK v2+ sends CRC32 by default on all requests. Accept the
+            // checksum for verification even when the upload has no algorithm;
+            // it won't contribute to the object-level checksum.
+            (None, Some(part_algo)) => Some(part_algo),
             (None, None) => None,
         };
 
@@ -2661,6 +2665,13 @@ impl Coordinator {
             });
         }
 
+        // Resolve checksum configuration early so per-part validation can use it.
+        let checksum_algo = upload.checksum_algorithm;
+        let checksum_type = match (checksum_algo, upload.checksum_type) {
+            (Some(algo), None) => Some(ChecksumType::default_for(algo)),
+            (_, ct) => ct,
+        };
+
         // 4. Validate all parts exist and ETags match.
         let mut part_records: Vec<MultipartPartRecord> = Vec::with_capacity(parts.len());
         for cp in parts {
@@ -2681,6 +2692,36 @@ impl Coordinator {
                 return Err(ServerError::InvalidPart {
                     part_number: cp.part_number,
                 });
+            }
+
+            // Validate per-part checksum from request against stored value.
+            if let Some((ref claimed_algo, ref claimed_b64)) = cp.checksum {
+                // The checksum element type must match the upload's algorithm.
+                if let Some(upload_algo) = checksum_algo {
+                    if *claimed_algo != upload_algo {
+                        return Err(ServerError::InvalidRequest {
+                            reason: format!(
+                                "checksum element type {} does not match upload algorithm {}",
+                                claimed_algo.as_str(),
+                                upload_algo.as_str()
+                            ),
+                        });
+                    }
+                }
+                use base64::Engine;
+                match &part.checksum {
+                    Some(stored_bytes) => {
+                        let stored_b64 =
+                            base64::engine::general_purpose::STANDARD.encode(stored_bytes);
+                        if *claimed_b64 != stored_b64 {
+                            return Err(ServerError::BadDigest);
+                        }
+                    }
+                    None => {
+                        // Request claims a checksum but none was stored for this part.
+                        return Err(ServerError::BadDigest);
+                    }
+                }
             }
 
             part_records.push(part);
@@ -2713,6 +2754,112 @@ impl Coordinator {
         // 8. Compute total object size.
         let total_size: u64 = part_records.iter().map(|p| p.size).sum();
 
+        // 8b. Compute object-level checksum if the upload was configured with one.
+        let checksum_value = if let (Some(algo), Some(ctype)) = (checksum_algo, checksum_type) {
+            use base64::Engine;
+            let b64 = base64::engine::general_purpose::STANDARD;
+            match ctype {
+                ChecksumType::Composite => {
+                    // Concatenate raw part checksums, hash them, append -N.
+                    let mut concat = Vec::new();
+                    for part in &part_records {
+                        match &part.checksum {
+                            Some(bytes) => concat.extend_from_slice(bytes),
+                            None => {
+                                return Err(ServerError::InvalidRequest {
+                                    reason:
+                                        "COMPOSITE checksum requires all parts to have checksums"
+                                            .to_string(),
+                                });
+                            }
+                        }
+                    }
+                    let hash = compute_checksum(algo, &concat);
+                    Some(format!("{}-{}", b64.encode(&hash), part_records.len()))
+                }
+                ChecksumType::FullObject => {
+                    // Combine part CRCs using mathematical combine.
+                    match algo {
+                        ChecksumAlgorithm::Crc32 => {
+                            let mut combined: u32 = 0;
+                            for part in &part_records {
+                                let bytes = part.checksum.as_ref().ok_or_else(|| {
+                                    ServerError::InvalidRequest {
+                                        reason: "FULL_OBJECT checksum requires all parts to have checksums".to_string(),
+                                    }
+                                })?;
+                                let part_crc =
+                                    u32::from_be_bytes(bytes.as_slice().try_into().map_err(
+                                        |_| ServerError::InvalidRequest {
+                                            reason: "invalid CRC32 checksum length".to_string(),
+                                        },
+                                    )?);
+                                combined = checksum::crc32::combine(combined, part_crc, part.size);
+                            }
+                            Some(b64.encode(combined.to_be_bytes()))
+                        }
+                        ChecksumAlgorithm::Crc32c => {
+                            let mut combined: u32 = 0;
+                            for part in &part_records {
+                                let bytes = part.checksum.as_ref().ok_or_else(|| {
+                                    ServerError::InvalidRequest {
+                                        reason: "FULL_OBJECT checksum requires all parts to have checksums".to_string(),
+                                    }
+                                })?;
+                                let part_crc =
+                                    u32::from_be_bytes(bytes.as_slice().try_into().map_err(
+                                        |_| ServerError::InvalidRequest {
+                                            reason: "invalid CRC32C checksum length".to_string(),
+                                        },
+                                    )?);
+                                combined = checksum::crc32c::combine(combined, part_crc, part.size);
+                            }
+                            Some(b64.encode(combined.to_be_bytes()))
+                        }
+                        ChecksumAlgorithm::Crc64nvme => {
+                            let mut combined: u64 = 0;
+                            for part in &part_records {
+                                let bytes = part.checksum.as_ref().ok_or_else(|| {
+                                    ServerError::InvalidRequest {
+                                        reason: "FULL_OBJECT checksum requires all parts to have checksums".to_string(),
+                                    }
+                                })?;
+                                let part_crc =
+                                    u64::from_be_bytes(bytes.as_slice().try_into().map_err(
+                                        |_| ServerError::InvalidRequest {
+                                            reason: "invalid CRC64NVME checksum length".to_string(),
+                                        },
+                                    )?);
+                                combined = crc64::combine(combined, part_crc, part.size);
+                            }
+                            Some(b64.encode(combined.to_be_bytes()))
+                        }
+                        // SHA algorithms don't support FULL_OBJECT for multipart.
+                        // This was rejected at CreateMultipartUpload time.
+                        ChecksumAlgorithm::Sha1 | ChecksumAlgorithm::Sha256 => {
+                            unreachable!("SHA + FULL_OBJECT rejected at CreateMultipartUpload time")
+                        }
+                    }
+                }
+            }
+        } else {
+            None
+        };
+
+        // 8c. Persist checksum in metadata blob.
+        let mut metadata_blob_bytes = upload.metadata_blob.clone();
+        if let (Some(algo), Some(ref val)) = (checksum_algo, &checksum_value) {
+            let (mut blob, _) =
+                crate::metadata_blob::MetadataBlob::deserialize(&metadata_blob_bytes)?;
+            blob.set(algo.header_name(), val);
+            if let Some(ctype) = checksum_type {
+                blob.set("x-amz-checksum-type", ctype.as_str());
+            }
+            metadata_blob_bytes = blob.serialize().map_err(|e| ServerError::InvalidRequest {
+                reason: format!("failed to serialize metadata blob: {e}"),
+            })?;
+        }
+
         // 9. Build the object metadata and manifest parts.
         let obj_req = PutObjectMetaReq {
             bucket: bucket.to_string(),
@@ -2727,7 +2874,7 @@ impl Coordinator {
             ec_m: 0,
             data_layout: Some(DataLayout::MultipartManifest),
             parts_count: Some(part_records.len() as u32),
-            metadata_blob: Some(upload.metadata_blob.clone()),
+            metadata_blob: Some(metadata_blob_bytes),
         };
 
         let object_parts: Vec<ObjectPartRecord> = part_records
@@ -2766,6 +2913,9 @@ impl Coordinator {
         Ok(CompleteMultipartUploadResult {
             etag: etag_str,
             version_id,
+            checksum_algorithm: checksum_algo,
+            checksum_type: checksum_type,
+            checksum_value,
         })
     }
 
@@ -5778,6 +5928,7 @@ mod tests {
             complete_parts.push(CompletePart {
                 part_number,
                 etag: result.etag,
+                checksum: None,
             });
         }
         (create.upload_id, complete_parts)
@@ -5839,6 +5990,7 @@ mod tests {
             CompletePart {
                 part_number: 2,
                 etag: "\"0000000000000000\"".to_string(),
+                checksum: None,
             },
         );
 
@@ -5964,6 +6116,7 @@ mod tests {
             CompletePart {
                 part_number: 1,
                 etag: new_part1.etag,
+                checksum: None,
             },
             parts[1].clone(),
         ];
@@ -6461,6 +6614,7 @@ mod tests {
             complete_parts.push(CompletePart {
                 part_number: *part_number,
                 etag: result.etag,
+                checksum: None,
             });
         }
         coord
@@ -6754,6 +6908,311 @@ mod tests {
         assert!(
             matches!(err, ServerError::IntegrityError { .. }),
             "expected IntegrityError for incomplete manifest, got {err:?}"
+        );
+    }
+
+    // ── CompleteMultipartUpload checksum tests ──────────────────────────
+
+    /// Helper: create a multipart upload with a checksum algorithm, upload parts with checksums,
+    /// and return (upload_id, complete_parts_with_checksums, part_data_list).
+    fn create_checksum_upload(
+        coord: &Coordinator,
+        bucket: &str,
+        key: &str,
+        algo: ChecksumAlgorithm,
+        ctype: Option<ChecksumType>,
+        part_data: &[&[u8]],
+    ) -> (String, Vec<CompletePart>) {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+
+        let metadata = MetadataBlob::new();
+        let create = coord
+            .create_multipart_upload(bucket, key, &metadata, Some(algo), ctype)
+            .unwrap();
+        let mut complete_parts = Vec::new();
+        for (i, data) in part_data.iter().enumerate() {
+            let part_number = (i + 1) as u32;
+            let checksum_b64 = b64.encode(compute_checksum(algo, data));
+            let result = coord
+                .upload_part(
+                    bucket,
+                    key,
+                    &create.upload_id,
+                    part_number,
+                    data,
+                    Some((algo, &checksum_b64)),
+                )
+                .unwrap();
+            complete_parts.push(CompletePart {
+                part_number,
+                etag: result.etag,
+                checksum: Some((algo, checksum_b64)),
+            });
+        }
+        (create.upload_id, complete_parts)
+    }
+
+    #[test]
+    fn complete_multipart_sha256_composite_checksum() {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let big = vec![0xABu8; 5 * 1024 * 1024];
+        let small = b"final-part";
+        let (upload_id, parts) = create_checksum_upload(
+            &coord,
+            "bucket",
+            "key",
+            ChecksumAlgorithm::Sha256,
+            None, // defaults to COMPOSITE
+            &[&big, small],
+        );
+
+        let result = coord
+            .complete_multipart_upload("bucket", "key", &upload_id, &parts)
+            .unwrap();
+
+        assert_eq!(result.checksum_algorithm, Some(ChecksumAlgorithm::Sha256));
+        assert_eq!(result.checksum_type, Some(ChecksumType::Composite));
+        let val = result.checksum_value.unwrap();
+        assert!(val.ends_with("-2"), "expected -2 suffix, got {val}");
+
+        // Verify the composite checksum manually:
+        // hash(concat(raw_sha256_part1, raw_sha256_part2))
+        let raw1 = compute_checksum(ChecksumAlgorithm::Sha256, &big);
+        let raw2 = compute_checksum(ChecksumAlgorithm::Sha256, small);
+        let mut concat = Vec::new();
+        concat.extend_from_slice(&raw1);
+        concat.extend_from_slice(&raw2);
+        let expected_hash = compute_checksum(ChecksumAlgorithm::Sha256, &concat);
+        let expected = format!("{}-2", b64.encode(&expected_hash));
+        assert_eq!(val, expected);
+    }
+
+    #[test]
+    fn complete_multipart_crc32_full_object_checksum() {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let big = vec![0xABu8; 5 * 1024 * 1024];
+        let small = b"final-part";
+        let (upload_id, parts) = create_checksum_upload(
+            &coord,
+            "bucket",
+            "key",
+            ChecksumAlgorithm::Crc32,
+            Some(ChecksumType::FullObject),
+            &[&big, small],
+        );
+
+        let result = coord
+            .complete_multipart_upload("bucket", "key", &upload_id, &parts)
+            .unwrap();
+
+        assert_eq!(result.checksum_algorithm, Some(ChecksumAlgorithm::Crc32));
+        assert_eq!(result.checksum_type, Some(ChecksumType::FullObject));
+
+        // Verify: combine matches computing CRC32 of concatenated data.
+        let mut full_data = big.clone();
+        full_data.extend_from_slice(small);
+        let expected_crc = checksum::crc32::checksum(&full_data);
+        let expected = b64.encode(expected_crc.to_be_bytes());
+        assert_eq!(result.checksum_value.unwrap(), expected);
+    }
+
+    #[test]
+    fn complete_multipart_crc32c_full_object_checksum() {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let big = vec![0xCDu8; 5 * 1024 * 1024];
+        let small = b"last";
+        let (upload_id, parts) = create_checksum_upload(
+            &coord,
+            "bucket",
+            "key",
+            ChecksumAlgorithm::Crc32c,
+            Some(ChecksumType::FullObject),
+            &[&big, small],
+        );
+
+        let result = coord
+            .complete_multipart_upload("bucket", "key", &upload_id, &parts)
+            .unwrap();
+
+        assert_eq!(result.checksum_algorithm, Some(ChecksumAlgorithm::Crc32c));
+        assert_eq!(result.checksum_type, Some(ChecksumType::FullObject));
+
+        let mut full_data = big.clone();
+        full_data.extend_from_slice(small);
+        let expected_crc = checksum::crc32c::checksum(&full_data);
+        let expected = b64.encode(expected_crc.to_be_bytes());
+        assert_eq!(result.checksum_value.unwrap(), expected);
+    }
+
+    #[test]
+    fn complete_multipart_crc64nvme_full_object_checksum() {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let big = vec![0xEFu8; 5 * 1024 * 1024];
+        let small = b"end";
+        let (upload_id, parts) = create_checksum_upload(
+            &coord,
+            "bucket",
+            "key",
+            ChecksumAlgorithm::Crc64nvme,
+            Some(ChecksumType::FullObject),
+            &[&big, small],
+        );
+
+        let result = coord
+            .complete_multipart_upload("bucket", "key", &upload_id, &parts)
+            .unwrap();
+
+        assert_eq!(
+            result.checksum_algorithm,
+            Some(ChecksumAlgorithm::Crc64nvme)
+        );
+        assert_eq!(result.checksum_type, Some(ChecksumType::FullObject));
+
+        let mut full_data = big.clone();
+        full_data.extend_from_slice(small);
+        let expected_crc = crc64::checksum(&full_data);
+        let expected = b64.encode(expected_crc.to_be_bytes());
+        assert_eq!(result.checksum_value.unwrap(), expected);
+    }
+
+    #[test]
+    fn complete_multipart_crc32_composite_checksum() {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        // CRC32 + COMPOSITE is intentionally allowed (produces hash-of-hashes-N).
+        let big = vec![0x11u8; 5 * 1024 * 1024];
+        let small = b"tail";
+        let (upload_id, parts) = create_checksum_upload(
+            &coord,
+            "bucket",
+            "key",
+            ChecksumAlgorithm::Crc32,
+            Some(ChecksumType::Composite),
+            &[&big, small],
+        );
+
+        let result = coord
+            .complete_multipart_upload("bucket", "key", &upload_id, &parts)
+            .unwrap();
+
+        assert_eq!(result.checksum_algorithm, Some(ChecksumAlgorithm::Crc32));
+        assert_eq!(result.checksum_type, Some(ChecksumType::Composite));
+        let val = result.checksum_value.unwrap();
+        assert!(val.ends_with("-2"), "expected -2 suffix, got {val}");
+
+        // Verify: hash of concatenated raw CRC32 bytes.
+        let raw1 = compute_checksum(ChecksumAlgorithm::Crc32, &big);
+        let raw2 = compute_checksum(ChecksumAlgorithm::Crc32, small);
+        let mut concat = Vec::new();
+        concat.extend_from_slice(&raw1);
+        concat.extend_from_slice(&raw2);
+        let hash = compute_checksum(ChecksumAlgorithm::Crc32, &concat);
+        let expected = format!("{}-2", b64.encode(&hash));
+        assert_eq!(val, expected);
+    }
+
+    #[test]
+    fn complete_multipart_bad_part_checksum_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let big = vec![0xAAu8; 5 * 1024 * 1024];
+        let small = b"end";
+        let (upload_id, mut parts) = create_checksum_upload(
+            &coord,
+            "bucket",
+            "key",
+            ChecksumAlgorithm::Crc32,
+            Some(ChecksumType::FullObject),
+            &[&big, small],
+        );
+
+        // Tamper with part 1's checksum value in the request.
+        parts[0].checksum = Some((ChecksumAlgorithm::Crc32, "AAAAAAAA".to_string()));
+
+        let err = coord
+            .complete_multipart_upload("bucket", "key", &upload_id, &parts)
+            .unwrap_err();
+        assert!(
+            matches!(err, ServerError::BadDigest),
+            "expected BadDigest, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn complete_multipart_no_checksum_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let big = vec![0u8; 5 * 1024 * 1024];
+        let small = b"last";
+        let (upload_id, parts) =
+            create_upload_with_parts(&coord, "bucket", "key", &[(1, &big), (2, small)]);
+
+        let result = coord
+            .complete_multipart_upload("bucket", "key", &upload_id, &parts)
+            .unwrap();
+
+        assert_eq!(result.checksum_algorithm, None);
+        assert_eq!(result.checksum_type, None);
+        assert_eq!(result.checksum_value, None);
+    }
+
+    #[test]
+    fn complete_multipart_wrong_checksum_element_type_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let big = vec![0xAAu8; 5 * 1024 * 1024];
+        let small = b"end";
+        let (upload_id, mut parts) = create_checksum_upload(
+            &coord,
+            "bucket",
+            "key",
+            ChecksumAlgorithm::Crc32,
+            Some(ChecksumType::FullObject),
+            &[&big, small],
+        );
+
+        // Replace the CRC32 checksum with a SHA256-tagged element (wrong algorithm).
+        // Use the correct CRC32 value so only the element type is wrong.
+        let correct_value = parts[0].checksum.as_ref().unwrap().1.clone();
+        parts[0].checksum = Some((ChecksumAlgorithm::Sha256, correct_value));
+
+        let err = coord
+            .complete_multipart_upload("bucket", "key", &upload_id, &parts)
+            .unwrap_err();
+        assert!(
+            matches!(err, ServerError::InvalidRequest { .. }),
+            "expected InvalidRequest for wrong element type, got {err:?}"
         );
     }
 }

@@ -168,6 +168,17 @@ impl ChecksumAlgorithm {
             Self::Crc64nvme => "x-amz-checksum-crc64nvme",
         }
     }
+
+    /// XML element name for this checksum (e.g. `ChecksumCRC32`).
+    pub fn xml_element_name(self) -> &'static str {
+        match self {
+            Self::Crc32 => "ChecksumCRC32",
+            Self::Crc32c => "ChecksumCRC32C",
+            Self::Sha1 => "ChecksumSHA1",
+            Self::Sha256 => "ChecksumSHA256",
+            Self::Crc64nvme => "ChecksumCRC64NVME",
+        }
+    }
 }
 
 /// Checksum type for multipart uploads: COMPOSITE (SHA) or FULL_OBJECT (CRC).

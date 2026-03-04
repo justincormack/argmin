@@ -5,7 +5,7 @@ use crate::coordinator::{
 };
 use crate::error::ServerError;
 use auth::canonical::uri_encode_path;
-use storage::BucketInfo;
+use storage::{BucketInfo, ChecksumAlgorithm};
 
 use super::response::format_version_id;
 
@@ -1328,13 +1328,26 @@ fn uri_encode_key(s: &str) -> String {
 }
 
 /// Format a CompleteMultipartUploadResult XML response.
-pub fn complete_multipart_upload_xml(bucket: &str, key: &str, etag: &str) -> String {
+pub fn complete_multipart_upload_xml(
+    bucket: &str,
+    key: &str,
+    etag: &str,
+    checksum_algorithm: Option<ChecksumAlgorithm>,
+    checksum_value: Option<&str>,
+) -> String {
     // Location uses path-style: http://s3.amazonaws.com/<bucket>/<key>
     let location = format!(
         "http://s3.amazonaws.com/{}/{}",
         uri_encode_key(bucket),
         uri_encode_key(key)
     );
+    let checksum_xml = match (checksum_algorithm, checksum_value) {
+        (Some(algo), Some(val)) => {
+            let elem = algo.xml_element_name();
+            format!("<{elem}>{}</{elem}>", xml_escape(val))
+        }
+        _ => String::new(),
+    };
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <CompleteMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
@@ -1342,11 +1355,13 @@ pub fn complete_multipart_upload_xml(bucket: &str, key: &str, etag: &str) -> Str
          <Bucket>{}</Bucket>\
          <Key>{}</Key>\
          <ETag>{}</ETag>\
+         {}\
          </CompleteMultipartUploadResult>",
         xml_escape(&location),
         xml_escape(bucket),
         xml_escape(key),
         xml_escape(etag),
+        checksum_xml,
     )
 }
 
@@ -1468,6 +1483,51 @@ pub fn list_parts_xml(
     xml
 }
 
+/// S3 checksum XML element names mapped to their algorithms.
+const CHECKSUM_ELEMENTS: &[(&str, ChecksumAlgorithm)] = &[
+    ("ChecksumCRC32C", ChecksumAlgorithm::Crc32c),
+    ("ChecksumCRC32", ChecksumAlgorithm::Crc32),
+    ("ChecksumSHA1", ChecksumAlgorithm::Sha1),
+    ("ChecksumSHA256", ChecksumAlgorithm::Sha256),
+    ("ChecksumCRC64NVME", ChecksumAlgorithm::Crc64nvme),
+];
+
+/// Extract the checksum element from a `<Part>` XML fragment.
+/// Returns the algorithm and base64 value. Rejects multiple checksum elements.
+fn extract_checksum_element(
+    part_content: &str,
+) -> Result<Option<(ChecksumAlgorithm, String)>, ServerError> {
+    let mut found: Option<(ChecksumAlgorithm, String)> = None;
+    // Note: ChecksumCRC32C must be checked before ChecksumCRC32 to avoid
+    // prefix-matching CRC32C as CRC32 (already ordered in CHECKSUM_ELEMENTS).
+    for &(elem, algo) in CHECKSUM_ELEMENTS {
+        let open = format!("<{}>", elem);
+        let close = format!("</{}>", elem);
+        if let Some(start) = part_content.find(&open) {
+            if found.is_some() {
+                return Err(ServerError::InvalidRequest {
+                    reason: "multiple checksum elements in a single Part".to_string(),
+                });
+            }
+            let val_start = start + open.len();
+            if let Some(end) = part_content[val_start..].find(&close) {
+                // Reject duplicate of the same element type.
+                let after_close = val_start + end + close.len();
+                if part_content[after_close..].contains(&open) {
+                    return Err(ServerError::InvalidRequest {
+                        reason: "multiple checksum elements in a single Part".to_string(),
+                    });
+                }
+                found = Some((
+                    algo,
+                    part_content[val_start..val_start + end].trim().to_string(),
+                ));
+            }
+        }
+    }
+    Ok(found)
+}
+
 /// Parse a CompleteMultipartUpload request XML body into a list of parts.
 ///
 /// Expected format:
@@ -1510,7 +1570,14 @@ pub fn parse_complete_multipart_upload_xml(body: &[u8]) -> Result<Vec<CompletePa
             .ok_or_else(malformed)?;
         let etag = xml_unescape(part_content[etag_start..etag_start + etag_end].trim());
 
-        parts.push(CompletePart { part_number, etag });
+        // Extract optional per-part checksum (ChecksumCRC32, ChecksumSHA256, etc.)
+        let checksum = extract_checksum_element(part_content)?;
+
+        parts.push(CompletePart {
+            part_number,
+            etag,
+            checksum,
+        });
     }
 
     if parts.is_empty() {
@@ -2670,7 +2737,7 @@ mod tests {
 
     #[test]
     fn complete_multipart_upload_xml_format() {
-        let xml = complete_multipart_upload_xml("mybucket", "mykey", "\"etag123\"");
+        let xml = complete_multipart_upload_xml("mybucket", "mykey", "\"etag123\"", None, None);
         assert!(xml.contains("<Location>http://s3.amazonaws.com/mybucket/mykey</Location>"));
         assert!(xml.contains("<Bucket>mybucket</Bucket>"));
         assert!(xml.contains("<Key>mykey</Key>"));
@@ -2680,15 +2747,77 @@ mod tests {
 
     #[test]
     fn complete_multipart_upload_xml_location_encodes_key() {
-        let xml = complete_multipart_upload_xml("mybucket", "path/to/my key", "\"e\"");
+        let xml = complete_multipart_upload_xml("mybucket", "path/to/my key", "\"e\"", None, None);
         assert!(xml.contains("mybucket/path/to/my%20key"));
     }
 
     #[test]
     fn complete_multipart_upload_xml_location_encodes_literal_percent() {
         // A key containing literal %20 should encode the % as %25
-        let xml = complete_multipart_upload_xml("mybucket", "key%20name", "\"e\"");
+        let xml = complete_multipart_upload_xml("mybucket", "key%20name", "\"e\"", None, None);
         assert!(xml.contains("mybucket/key%2520name"));
+    }
+
+    #[test]
+    fn complete_multipart_upload_xml_with_checksum() {
+        let xml = complete_multipart_upload_xml(
+            "mybucket",
+            "mykey",
+            "\"etag\"",
+            Some(ChecksumAlgorithm::Sha256),
+            Some("abc123=="),
+        );
+        assert!(
+            xml.contains("<ChecksumSHA256>abc123==</ChecksumSHA256>"),
+            "missing checksum element: {xml}"
+        );
+    }
+
+    #[test]
+    fn parse_complete_multipart_with_part_checksums() {
+        let body = b"\
+            <CompleteMultipartUpload>\
+            <Part><PartNumber>1</PartNumber><ETag>\"e1\"</ETag>\
+            <ChecksumCRC32>AABBCC==</ChecksumCRC32></Part>\
+            <Part><PartNumber>2</PartNumber><ETag>\"e2\"</ETag></Part>\
+            </CompleteMultipartUpload>";
+        let parts = parse_complete_multipart_upload_xml(body).unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(
+            parts[0].checksum,
+            Some((ChecksumAlgorithm::Crc32, "AABBCC==".to_string()))
+        );
+        assert_eq!(parts[1].checksum, None);
+    }
+
+    #[test]
+    fn parse_complete_multipart_multiple_checksum_elements_rejected() {
+        let body = b"\
+            <CompleteMultipartUpload>\
+            <Part><PartNumber>1</PartNumber><ETag>\"e1\"</ETag>\
+            <ChecksumCRC32>AA==</ChecksumCRC32>\
+            <ChecksumSHA256>BB==</ChecksumSHA256></Part>\
+            </CompleteMultipartUpload>";
+        let err = parse_complete_multipart_upload_xml(body).unwrap_err();
+        assert!(
+            matches!(err, ServerError::InvalidRequest { .. }),
+            "expected InvalidRequest, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_complete_multipart_duplicate_same_checksum_element_rejected() {
+        let body = b"\
+            <CompleteMultipartUpload>\
+            <Part><PartNumber>1</PartNumber><ETag>\"e1\"</ETag>\
+            <ChecksumCRC32>AA==</ChecksumCRC32>\
+            <ChecksumCRC32>BB==</ChecksumCRC32></Part>\
+            </CompleteMultipartUpload>";
+        let err = parse_complete_multipart_upload_xml(body).unwrap_err();
+        assert!(
+            matches!(err, ServerError::InvalidRequest { .. }),
+            "expected InvalidRequest, got {err:?}"
+        );
     }
 
     #[test]

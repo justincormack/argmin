@@ -274,6 +274,18 @@ impl MetadataBlob {
             .map(|e| e.value.as_str())
     }
 
+    /// Set a metadata key-value pair, replacing any existing entry with the same key.
+    pub fn set(&mut self, key: &str, value: &str) {
+        if let Some(entry) = self.entries.iter_mut().find(|e| e.key == key) {
+            entry.value = value.to_string();
+        } else {
+            self.entries.push(MetadataEntry {
+                key: key.to_string(),
+                value: value.to_string(),
+            });
+        }
+    }
+
     /// Return checksum header entries (x-amz-checksum-*) stored in the blob.
     pub fn checksum_entries(&self) -> impl Iterator<Item = &MetadataEntry> {
         self.entries
