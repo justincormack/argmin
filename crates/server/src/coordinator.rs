@@ -2351,6 +2351,8 @@ impl Coordinator {
             key: key.to_string(),
             metadata_blob,
             owner_principal: Some(bucket_info.owner_principal),
+            checksum_algorithm: None,
+            checksum_type: None,
         })?;
 
         Ok(CreateMultipartUploadResult { upload_id })
@@ -2527,6 +2529,7 @@ impl Coordinator {
             ec_k: self.ec_config.data_shards,
             ec_m: self.ec_config.parity_shards,
             last_modified: now,
+            checksum: None,
         });
 
         let prev_gen = match upsert_result {
@@ -2701,6 +2704,7 @@ impl Coordinator {
                     ec_k: p.ec_k,
                     ec_m: p.ec_m,
                     shard_pg_id,
+                    checksum: p.checksum.clone(),
                 }
             })
             .collect();

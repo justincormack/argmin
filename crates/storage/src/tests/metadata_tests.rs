@@ -534,6 +534,8 @@ fn mpu_create_and_get_upload() {
             key: "k".to_string(),
             metadata_blob: vec![1, 2, 3],
             owner_principal: Some("alice".to_string()),
+            checksum_algorithm: None,
+            checksum_type: None,
         })
         .unwrap();
 
@@ -545,6 +547,223 @@ fn mpu_create_and_get_upload() {
     assert_eq!(rec.metadata_blob, vec![1, 2, 3]);
     assert_eq!(rec.owner_principal, Some("alice".to_string()));
     assert!(rec.initiated_at > 0);
+}
+
+#[test]
+fn mpu_create_upload_with_checksum_fields() {
+    let (_dir, store) = make_pg_store();
+    store
+        .create_multipart_upload(&CreateMultipartUploadReq {
+            upload_id: "uid-cksum".to_string(),
+            bucket: "b".to_string(),
+            key: "k".to_string(),
+            metadata_blob: vec![],
+            owner_principal: None,
+            checksum_algorithm: Some(ChecksumAlgorithm::Sha256),
+            checksum_type: Some(ChecksumType::Composite),
+        })
+        .unwrap();
+
+    let rec = store.get_multipart_upload("uid-cksum").unwrap();
+    assert_eq!(rec.checksum_algorithm, Some(ChecksumAlgorithm::Sha256));
+    assert_eq!(rec.checksum_type, Some(ChecksumType::Composite));
+
+    // None case round-trips as well
+    store
+        .create_multipart_upload(&CreateMultipartUploadReq {
+            upload_id: "uid-no-cksum".to_string(),
+            bucket: "b".to_string(),
+            key: "k2".to_string(),
+            metadata_blob: vec![],
+            owner_principal: None,
+            checksum_algorithm: None,
+            checksum_type: None,
+        })
+        .unwrap();
+    let rec2 = store.get_multipart_upload("uid-no-cksum").unwrap();
+    assert_eq!(rec2.checksum_algorithm, None);
+    assert_eq!(rec2.checksum_type, None);
+}
+
+#[test]
+fn mpu_part_checksum_round_trip() {
+    let (_dir, store) = make_pg_store();
+    store
+        .create_multipart_upload(&CreateMultipartUploadReq {
+            upload_id: "uid-pc".to_string(),
+            bucket: "b".to_string(),
+            key: "k".to_string(),
+            metadata_blob: vec![],
+            owner_principal: None,
+            checksum_algorithm: Some(ChecksumAlgorithm::Crc32),
+            checksum_type: Some(ChecksumType::FullObject),
+        })
+        .unwrap();
+
+    let checksum_bytes = vec![0xDE, 0xAD, 0xBE, 0xEF];
+    store
+        .upsert_multipart_part(&MultipartPartRecord {
+            upload_id: "uid-pc".to_string(),
+            part_number: 1,
+            generation: 0,
+            size: 1024,
+            etag: vec![0xAA],
+            etag_kind: 0,
+            part_okh: [1u8; 16],
+            part_vid: 0,
+            ec_k: 4,
+            ec_m: 2,
+            last_modified: 100,
+            checksum: Some(checksum_bytes.clone()),
+        })
+        .unwrap();
+
+    let part = store.get_multipart_part("uid-pc", 1).unwrap();
+    assert_eq!(part.checksum, Some(checksum_bytes));
+
+    // None checksum round-trips
+    store
+        .upsert_multipart_part(&MultipartPartRecord {
+            upload_id: "uid-pc".to_string(),
+            part_number: 2,
+            generation: 0,
+            size: 512,
+            etag: vec![0xBB],
+            etag_kind: 0,
+            part_okh: [2u8; 16],
+            part_vid: 1,
+            ec_k: 4,
+            ec_m: 2,
+            last_modified: 200,
+            checksum: None,
+        })
+        .unwrap();
+
+    let part2 = store.get_multipart_part("uid-pc", 2).unwrap();
+    assert_eq!(part2.checksum, None);
+}
+
+#[test]
+fn mpu_object_part_checksum_round_trip() {
+    let (_dir, store) = make_pg_store();
+
+    let checksum_bytes = vec![0x01, 0x02, 0x03, 0x04];
+    store
+        .commit_object_parts(&[
+            ObjectPartRecord {
+                bucket: "b".to_string(),
+                key: "k".to_string(),
+                version_id: 1,
+                part_number: 1,
+                size: 5 * 1024 * 1024,
+                etag: vec![0xAA],
+                etag_kind: 0,
+                part_okh: [1u8; 16],
+                part_vid: 0,
+                ec_k: 4,
+                ec_m: 2,
+                shard_pg_id: 0,
+                checksum: Some(checksum_bytes.clone()),
+            },
+            ObjectPartRecord {
+                bucket: "b".to_string(),
+                key: "k".to_string(),
+                version_id: 1,
+                part_number: 2,
+                size: 1024,
+                etag: vec![0xBB],
+                etag_kind: 0,
+                part_okh: [2u8; 16],
+                part_vid: 1,
+                ec_k: 4,
+                ec_m: 2,
+                shard_pg_id: 0,
+                checksum: None,
+            },
+        ])
+        .unwrap();
+
+    let committed = store.get_object_parts("b", "k", 1).unwrap();
+    assert_eq!(committed.len(), 2);
+    assert_eq!(committed[0].checksum, Some(checksum_bytes));
+    assert_eq!(committed[1].checksum, None);
+}
+
+#[test]
+fn mpu_complete_multipart_commit_preserves_checksums() {
+    let (_dir, store) = make_pg_store();
+
+    // Create upload and object row (needed for complete_multipart_commit).
+    store
+        .create_multipart_upload(&CreateMultipartUploadReq {
+            upload_id: "uid-cmc".to_string(),
+            bucket: "b".to_string(),
+            key: "k".to_string(),
+            metadata_blob: vec![],
+            owner_principal: None,
+            checksum_algorithm: Some(ChecksumAlgorithm::Sha256),
+            checksum_type: Some(ChecksumType::Composite),
+        })
+        .unwrap();
+
+    let obj = PutObjectMetaReq {
+        bucket: "b".to_string(),
+        key: "k".to_string(),
+        version_id: 0,
+        size: 6 * 1024 * 1024,
+        total_size: 6 * 1024 * 1024,
+        etag: vec![0xCC],
+        etag_kind: 1,
+        ec_k: 4,
+        ec_m: 2,
+        status: 0,
+        data_layout: Some(DataLayout::MultipartManifest),
+        parts_count: Some(2),
+        metadata_blob: Some(vec![]),
+    };
+
+    let cksum = vec![0xDE, 0xAD];
+    let parts = vec![
+        ObjectPartRecord {
+            bucket: "b".to_string(),
+            key: "k".to_string(),
+            version_id: 0,
+            part_number: 1,
+            size: 5 * 1024 * 1024,
+            etag: vec![0xAA],
+            etag_kind: 0,
+            part_okh: [1u8; 16],
+            part_vid: 0,
+            ec_k: 4,
+            ec_m: 2,
+            shard_pg_id: 0,
+            checksum: Some(cksum.clone()),
+        },
+        ObjectPartRecord {
+            bucket: "b".to_string(),
+            key: "k".to_string(),
+            version_id: 0,
+            part_number: 2,
+            size: 1024 * 1024,
+            etag: vec![0xBB],
+            etag_kind: 0,
+            part_okh: [2u8; 16],
+            part_vid: 1,
+            ec_k: 4,
+            ec_m: 2,
+            shard_pg_id: 0,
+            checksum: None,
+        },
+    ];
+
+    store
+        .complete_multipart_commit("uid-cmc", &obj, &parts)
+        .unwrap();
+
+    let committed = store.get_object_parts("b", "k", 0).unwrap();
+    assert_eq!(committed.len(), 2);
+    assert_eq!(committed[0].checksum, Some(cksum));
+    assert_eq!(committed[1].checksum, None);
 }
 
 #[test]
@@ -567,6 +786,8 @@ fn mpu_set_upload_state_transition() {
             key: "k".to_string(),
             metadata_blob: vec![],
             owner_principal: None,
+            checksum_algorithm: None,
+            checksum_type: None,
         })
         .unwrap();
 
@@ -609,6 +830,8 @@ fn mpu_delete_upload_cascades_parts() {
             key: "k".to_string(),
             metadata_blob: vec![],
             owner_principal: None,
+            checksum_algorithm: None,
+            checksum_type: None,
         })
         .unwrap();
 
@@ -626,6 +849,7 @@ fn mpu_delete_upload_cascades_parts() {
             ec_k: 4,
             ec_m: 2,
             last_modified: 0,
+            checksum: None,
         })
         .unwrap();
 
@@ -658,6 +882,8 @@ fn mpu_upsert_part_and_get() {
             key: "k".to_string(),
             metadata_blob: vec![],
             owner_principal: None,
+            checksum_algorithm: None,
+            checksum_type: None,
         })
         .unwrap();
 
@@ -675,6 +901,7 @@ fn mpu_upsert_part_and_get() {
             ec_k: 4,
             ec_m: 2,
             last_modified: 100,
+            checksum: None,
         })
         .unwrap();
     assert_eq!(prev, None);
@@ -700,6 +927,7 @@ fn mpu_upsert_part_and_get() {
             ec_k: 4,
             ec_m: 2,
             last_modified: 200,
+            checksum: None,
         })
         .unwrap();
     assert_eq!(prev, Some(0));
@@ -720,6 +948,8 @@ fn mpu_list_parts_pagination() {
             key: "k".to_string(),
             metadata_blob: vec![],
             owner_principal: None,
+            checksum_algorithm: None,
+            checksum_type: None,
         })
         .unwrap();
 
@@ -738,6 +968,7 @@ fn mpu_list_parts_pagination() {
                 ec_k: 4,
                 ec_m: 2,
                 last_modified: 0,
+                checksum: None,
             })
             .unwrap();
     }
@@ -795,6 +1026,8 @@ fn mpu_list_uploads_pagination() {
                 key: key.to_string(),
                 metadata_blob: vec![],
                 owner_principal: None,
+                checksum_algorithm: None,
+                checksum_type: None,
             })
             .unwrap();
     }
@@ -845,6 +1078,8 @@ fn mpu_list_uploads_with_prefix() {
                 key: key.to_string(),
                 metadata_blob: vec![],
                 owner_principal: None,
+                checksum_algorithm: None,
+                checksum_type: None,
             })
             .unwrap();
     }
@@ -875,6 +1110,8 @@ fn mpu_list_uploads_same_key_multiple_upload_ids() {
                 key: "same-key".to_string(),
                 metadata_blob: vec![],
                 owner_principal: None,
+                checksum_algorithm: None,
+                checksum_type: None,
             })
             .unwrap();
     }
@@ -923,6 +1160,8 @@ fn mpu_list_uploads_stale_marker_returns_remaining() {
                 key: "key".to_string(),
                 metadata_blob: vec![],
                 owner_principal: None,
+                checksum_algorithm: None,
+                checksum_type: None,
             })
             .unwrap();
     }
@@ -961,6 +1200,8 @@ fn mpu_corrupted_part_okh_returns_error() {
             key: "k".to_string(),
             metadata_blob: vec![],
             owner_principal: None,
+            checksum_algorithm: None,
+            checksum_type: None,
         })
         .unwrap();
 
@@ -978,6 +1219,7 @@ fn mpu_corrupted_part_okh_returns_error() {
             ec_k: 4,
             ec_m: 2,
             last_modified: 0,
+            checksum: None,
         })
         .unwrap();
 
@@ -1017,6 +1259,7 @@ fn mpu_corrupted_object_part_okh_returns_error() {
             ec_k: 4,
             ec_m: 2,
             shard_pg_id: 0,
+            checksum: None,
         }])
         .unwrap();
 
@@ -1047,6 +1290,8 @@ fn mpu_get_missing_part_returns_part_not_found() {
             key: "k".to_string(),
             metadata_blob: vec![],
             owner_principal: None,
+            checksum_algorithm: None,
+            checksum_type: None,
         })
         .unwrap();
 
@@ -1073,6 +1318,8 @@ fn mpu_set_upload_state_rejects_in_progress_target() {
             key: "k".to_string(),
             metadata_blob: vec![],
             owner_principal: None,
+            checksum_algorithm: None,
+            checksum_type: None,
         })
         .unwrap();
 
@@ -1136,6 +1383,7 @@ fn mpu_upsert_part_nonexistent_upload_returns_no_such_upload() {
             ec_k: 4,
             ec_m: 2,
             last_modified: 0,
+            checksum: None,
         })
         .unwrap_err();
     assert!(
@@ -1177,6 +1425,7 @@ fn mpu_commit_object_parts_rollback_on_duplicate() {
         ec_k: 4,
         ec_m: 2,
         shard_pg_id: 0,
+        checksum: None,
     };
 
     // First commit succeeds
@@ -1214,6 +1463,7 @@ fn mpu_commit_and_get_object_parts() {
             ec_k: 4,
             ec_m: 2,
             shard_pg_id: 0,
+            checksum: None,
         },
         ObjectPartRecord {
             bucket: "b".to_string(),
@@ -1228,6 +1478,7 @@ fn mpu_commit_and_get_object_parts() {
             ec_k: 4,
             ec_m: 2,
             shard_pg_id: 0,
+            checksum: None,
         },
     ];
 
@@ -1264,6 +1515,7 @@ fn mpu_delete_object_parts() {
             ec_k: 4,
             ec_m: 2,
             shard_pg_id: 0,
+            checksum: None,
         }])
         .unwrap();
 
@@ -1286,6 +1538,8 @@ fn create_upload(store: &dyn PgMetadataStore, upload_id: &str) {
             key: "k".to_string(),
             metadata_blob: vec![],
             owner_principal: None,
+            checksum_algorithm: None,
+            checksum_type: None,
         })
         .unwrap();
 }
@@ -1304,6 +1558,7 @@ fn make_part(upload_id: &str, part_number: u32, generation: u32) -> MultipartPar
         ec_k: 4,
         ec_m: 2,
         last_modified: 1000,
+        checksum: None,
     }
 }
 
@@ -1369,6 +1624,7 @@ fn mpu_commit_partial_batch_failure_rolls_back_all() {
         ec_k: 4,
         ec_m: 2,
         shard_pg_id: 0,
+        checksum: None,
     };
     store
         .commit_object_parts(std::slice::from_ref(&part1))
@@ -1547,6 +1803,7 @@ fn mpu_commit_object_parts_connection_usable_after_multiple_failures() {
         ec_k: 4,
         ec_m: 2,
         shard_pg_id: 0,
+        checksum: None,
     };
 
     store
@@ -1705,6 +1962,7 @@ fn mpu_commit_object_parts_commit_failure_via_lock_contention() {
         ec_k: 4,
         ec_m: 2,
         shard_pg_id: 0,
+        checksum: None,
     };
     let err = store
         .commit_object_parts(std::slice::from_ref(&part))

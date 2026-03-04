@@ -111,6 +111,108 @@ impl ShardStatus {
     }
 }
 
+/// Checksum algorithm for multipart uploads.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChecksumAlgorithm {
+    Crc32 = 0,
+    Crc32c = 1,
+    Sha1 = 2,
+    Sha256 = 3,
+    Crc64nvme = 4,
+}
+
+impl ChecksumAlgorithm {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Crc32),
+            1 => Some(Self::Crc32c),
+            2 => Some(Self::Sha1),
+            3 => Some(Self::Sha256),
+            4 => Some(Self::Crc64nvme),
+            _ => None,
+        }
+    }
+
+    /// Parse from an S3 API header value. Accepts the canonical uppercase
+    /// form used by S3 (`SHA256`, `CRC32`, etc.).
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "CRC32" => Some(Self::Crc32),
+            "CRC32C" => Some(Self::Crc32c),
+            "SHA1" => Some(Self::Sha1),
+            "SHA256" => Some(Self::Sha256),
+            "CRC64NVME" => Some(Self::Crc64nvme),
+            _ => None,
+        }
+    }
+
+    /// S3 API canonical name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Crc32 => "CRC32",
+            Self::Crc32c => "CRC32C",
+            Self::Sha1 => "SHA1",
+            Self::Sha256 => "SHA256",
+            Self::Crc64nvme => "CRC64NVME",
+        }
+    }
+
+    /// The `x-amz-checksum-*` header suffix for this algorithm.
+    pub fn header_name(self) -> &'static str {
+        match self {
+            Self::Crc32 => "x-amz-checksum-crc32",
+            Self::Crc32c => "x-amz-checksum-crc32c",
+            Self::Sha1 => "x-amz-checksum-sha1",
+            Self::Sha256 => "x-amz-checksum-sha256",
+            Self::Crc64nvme => "x-amz-checksum-crc64nvme",
+        }
+    }
+}
+
+/// Checksum type for multipart uploads: COMPOSITE (SHA) or FULL_OBJECT (CRC).
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChecksumType {
+    Composite = 0,
+    FullObject = 1,
+}
+
+impl ChecksumType {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Composite),
+            1 => Some(Self::FullObject),
+            _ => None,
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "COMPOSITE" => Some(Self::Composite),
+            "FULL_OBJECT" => Some(Self::FullObject),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Composite => "COMPOSITE",
+            Self::FullObject => "FULL_OBJECT",
+        }
+    }
+
+    /// Return the default checksum type for a given algorithm.
+    pub fn default_for(algo: ChecksumAlgorithm) -> Self {
+        match algo {
+            ChecksumAlgorithm::Sha1 | ChecksumAlgorithm::Sha256 => Self::Composite,
+            ChecksumAlgorithm::Crc32 | ChecksumAlgorithm::Crc32c | ChecksumAlgorithm::Crc64nvme => {
+                Self::FullObject
+            }
+        }
+    }
+}
+
 /// Object data layout discriminator.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,6 +371,10 @@ pub struct MultipartUploadRecord {
     /// Serialized user metadata headers.
     pub metadata_blob: Vec<u8>,
     pub owner_principal: Option<String>,
+    /// Checksum algorithm requested for this upload.
+    pub checksum_algorithm: Option<ChecksumAlgorithm>,
+    /// Checksum type (COMPOSITE or FULL_OBJECT).
+    pub checksum_type: Option<ChecksumType>,
 }
 
 /// In-progress multipart part record.
@@ -288,6 +394,8 @@ pub struct MultipartPartRecord {
     pub ec_m: u8,
     /// Last modified timestamp (unix milliseconds).
     pub last_modified: u64,
+    /// Raw checksum bytes for this part (None if no checksum).
+    pub checksum: Option<Vec<u8>>,
 }
 
 /// Committed part record in the object manifest.
@@ -306,6 +414,8 @@ pub struct ObjectPartRecord {
     pub ec_m: u8,
     /// PG where this part's shards are stored.
     pub shard_pg_id: u32,
+    /// Raw checksum bytes for this part (None if no checksum).
+    pub checksum: Option<Vec<u8>>,
 }
 
 /// Request to create a multipart upload.
@@ -315,6 +425,8 @@ pub struct CreateMultipartUploadReq {
     pub key: String,
     pub metadata_blob: Vec<u8>,
     pub owner_principal: Option<String>,
+    pub checksum_algorithm: Option<ChecksumAlgorithm>,
+    pub checksum_type: Option<ChecksumType>,
 }
 
 /// Request to list multipart uploads.
@@ -391,6 +503,85 @@ mod tests {
     fn data_layout_from_u8_invalid() {
         assert_eq!(DataLayout::from_u8(2), None);
         assert_eq!(DataLayout::from_u8(255), None);
+    }
+
+    // ── ChecksumAlgorithm enum tests ────────────────────────────────
+
+    #[test]
+    fn checksum_algorithm_from_u8_round_trip() {
+        for v in 0..=4u8 {
+            let algo = ChecksumAlgorithm::from_u8(v).unwrap();
+            assert_eq!(algo as u8, v);
+        }
+        assert_eq!(ChecksumAlgorithm::from_u8(5), None);
+        assert_eq!(ChecksumAlgorithm::from_u8(255), None);
+    }
+
+    #[test]
+    fn checksum_algorithm_from_str() {
+        assert_eq!(
+            ChecksumAlgorithm::from_str("SHA256"),
+            Some(ChecksumAlgorithm::Sha256)
+        );
+        assert_eq!(
+            ChecksumAlgorithm::from_str("CRC64NVME"),
+            Some(ChecksumAlgorithm::Crc64nvme)
+        );
+        assert_eq!(ChecksumAlgorithm::from_str("bogus"), None);
+    }
+
+    #[test]
+    fn checksum_algorithm_as_str_round_trip() {
+        for v in 0..=4u8 {
+            let algo = ChecksumAlgorithm::from_u8(v).unwrap();
+            assert_eq!(ChecksumAlgorithm::from_str(algo.as_str()), Some(algo));
+        }
+    }
+
+    // ── ChecksumType enum tests ──────────────────────────────────────
+
+    #[test]
+    fn checksum_type_from_u8_round_trip() {
+        assert_eq!(ChecksumType::from_u8(0), Some(ChecksumType::Composite));
+        assert_eq!(ChecksumType::from_u8(1), Some(ChecksumType::FullObject));
+        assert_eq!(ChecksumType::from_u8(2), None);
+    }
+
+    #[test]
+    fn checksum_type_from_str() {
+        assert_eq!(
+            ChecksumType::from_str("COMPOSITE"),
+            Some(ChecksumType::Composite)
+        );
+        assert_eq!(
+            ChecksumType::from_str("FULL_OBJECT"),
+            Some(ChecksumType::FullObject)
+        );
+        assert_eq!(ChecksumType::from_str("bogus"), None);
+    }
+
+    #[test]
+    fn checksum_type_default_for_algorithm() {
+        assert_eq!(
+            ChecksumType::default_for(ChecksumAlgorithm::Sha256),
+            ChecksumType::Composite
+        );
+        assert_eq!(
+            ChecksumType::default_for(ChecksumAlgorithm::Sha1),
+            ChecksumType::Composite
+        );
+        assert_eq!(
+            ChecksumType::default_for(ChecksumAlgorithm::Crc32),
+            ChecksumType::FullObject
+        );
+        assert_eq!(
+            ChecksumType::default_for(ChecksumAlgorithm::Crc32c),
+            ChecksumType::FullObject
+        );
+        assert_eq!(
+            ChecksumType::default_for(ChecksumAlgorithm::Crc64nvme),
+            ChecksumType::FullObject
+        );
     }
 
     // ── UploadState enum tests ─────────────────────────────────────

@@ -137,6 +137,31 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(CREATE_MPU_BUCKET_KEY_INDEX, [])?;
     conn.execute(CREATE_MULTIPART_PARTS_TABLE, [])?;
     conn.execute(CREATE_OBJECT_PARTS_TABLE, [])?;
+    migrate_checksum_columns(conn)?;
+    Ok(())
+}
+
+/// Add checksum columns to multipart tables.
+///
+/// Idempotent — silently ignores "duplicate column name" errors.
+fn migrate_checksum_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let migrations = [
+        "ALTER TABLE multipart_uploads ADD COLUMN checksum_algorithm INTEGER",
+        "ALTER TABLE multipart_uploads ADD COLUMN checksum_type INTEGER",
+        "ALTER TABLE multipart_parts ADD COLUMN checksum BLOB",
+        "ALTER TABLE object_parts ADD COLUMN checksum BLOB",
+    ];
+    for sql in &migrations {
+        match conn.execute(sql, []) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
+                if msg.contains("duplicate column name") =>
+            {
+                // Column already exists, skip.
+            }
+            Err(e) => return Err(e),
+        }
+    }
     Ok(())
 }
 

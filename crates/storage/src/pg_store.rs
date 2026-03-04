@@ -134,6 +134,7 @@ impl PgStore {
             ec_k: row.get::<_, u8>(8)?,
             ec_m: row.get::<_, u8>(9)?,
             last_modified: row.get::<_, i64>(10)? as u64,
+            checksum: row.get(11)?,
         })
     }
 
@@ -809,11 +810,14 @@ impl PgMetadataStore for PgStore {
 
     fn create_multipart_upload(&self, req: &CreateMultipartUploadReq) -> Result<(), MetadataError> {
         let now = PgStore::now_millis();
+        let algo = req.checksum_algorithm.map(|a| a as u8);
+        let ctype = req.checksum_type.map(|t| t as u8);
         self.conn
             .execute(
                 "INSERT INTO multipart_uploads \
-                 (upload_id, bucket, key, initiated_at, state, metadata_blob, owner_principal) \
-                 VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)",
+                 (upload_id, bucket, key, initiated_at, state, metadata_blob, owner_principal, \
+                  checksum_algorithm, checksum_type) \
+                 VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, ?8)",
                 params![
                     req.upload_id,
                     req.bucket,
@@ -821,6 +825,8 @@ impl PgMetadataStore for PgStore {
                     now as i64,
                     req.metadata_blob,
                     req.owner_principal,
+                    algo,
+                    ctype,
                 ],
             )
             .map_err(|e| MetadataError::Db {
@@ -837,11 +843,13 @@ impl PgMetadataStore for PgStore {
         self.conn
             .query_row(
                 "SELECT upload_id, bucket, key, initiated_at, state, metadata_blob, \
-                 owner_principal \
+                 owner_principal, checksum_algorithm, checksum_type \
                  FROM multipart_uploads WHERE upload_id = ?1",
                 params![upload_id],
                 |row| {
                     let state_raw = row.get::<_, u8>(4)?;
+                    let algo_raw: Option<u8> = row.get(7)?;
+                    let ctype_raw: Option<u8> = row.get(8)?;
                     Ok(MultipartUploadRecord {
                         upload_id: row.get(0)?,
                         bucket: row.get(1)?,
@@ -856,6 +864,28 @@ impl PgMetadataStore for PgStore {
                         })?,
                         metadata_blob: row.get(5)?,
                         owner_principal: row.get(6)?,
+                        checksum_algorithm: algo_raw
+                            .map(|v| {
+                                ChecksumAlgorithm::from_u8(v).ok_or_else(|| {
+                                    rusqlite::Error::FromSqlConversionFailure(
+                                        7,
+                                        rusqlite::types::Type::Integer,
+                                        Box::from(format!("invalid checksum algorithm: {v}")),
+                                    )
+                                })
+                            })
+                            .transpose()?,
+                        checksum_type: ctype_raw
+                            .map(|v| {
+                                ChecksumType::from_u8(v).ok_or_else(|| {
+                                    rusqlite::Error::FromSqlConversionFailure(
+                                        8,
+                                        rusqlite::types::Type::Integer,
+                                        Box::from(format!("invalid checksum type: {v}")),
+                                    )
+                                })
+                            })
+                            .transpose()?,
                     })
                 },
             )
@@ -1005,7 +1035,7 @@ impl PgMetadataStore for PgStore {
         let where_str = where_clauses.join(" AND ");
         let sql = format!(
             "SELECT upload_id, bucket, key, initiated_at, state, metadata_blob, \
-             owner_principal \
+             owner_principal, checksum_algorithm, checksum_type \
              FROM multipart_uploads \
              WHERE {where_str} \
              ORDER BY key ASC, initiated_at ASC, upload_id ASC \
@@ -1023,6 +1053,8 @@ impl PgMetadataStore for PgStore {
         let rows = stmt
             .query_map(params_refs.as_slice(), |row| {
                 let state_raw = row.get::<_, u8>(4)?;
+                let algo_raw: Option<u8> = row.get(7)?;
+                let ctype_raw: Option<u8> = row.get(8)?;
                 Ok(MultipartUploadRecord {
                     upload_id: row.get(0)?,
                     bucket: row.get(1)?,
@@ -1037,6 +1069,28 @@ impl PgMetadataStore for PgStore {
                     })?,
                     metadata_blob: row.get(5)?,
                     owner_principal: row.get(6)?,
+                    checksum_algorithm: algo_raw
+                        .map(|v| {
+                            ChecksumAlgorithm::from_u8(v).ok_or_else(|| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    7,
+                                    rusqlite::types::Type::Integer,
+                                    Box::from(format!("invalid checksum algorithm: {v}")),
+                                )
+                            })
+                        })
+                        .transpose()?,
+                    checksum_type: ctype_raw
+                        .map(|v| {
+                            ChecksumType::from_u8(v).ok_or_else(|| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    8,
+                                    rusqlite::types::Type::Integer,
+                                    Box::from(format!("invalid checksum type: {v}")),
+                                )
+                            })
+                        })
+                        .transpose()?,
                 })
             })
             .map_err(|e| MetadataError::Db {
@@ -1100,8 +1154,8 @@ impl PgMetadataStore for PgStore {
             self.conn.execute(
                 "INSERT OR REPLACE INTO multipart_parts \
                  (upload_id, part_number, generation, size, etag, etag_kind, \
-                  part_okh, part_vid, ec_k, ec_m, last_modified) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                  part_okh, part_vid, ec_k, ec_m, last_modified, checksum) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     part.upload_id,
                     part.part_number,
@@ -1114,6 +1168,7 @@ impl PgMetadataStore for PgStore {
                     part.ec_k,
                     part.ec_m,
                     part.last_modified as i64,
+                    part.checksum,
                 ],
             )?;
 
@@ -1157,7 +1212,7 @@ impl PgMetadataStore for PgStore {
         self.conn
             .query_row(
                 "SELECT upload_id, part_number, generation, size, etag, etag_kind, \
-                 part_okh, part_vid, ec_k, ec_m, last_modified \
+                 part_okh, part_vid, ec_k, ec_m, last_modified, checksum \
                  FROM multipart_parts WHERE upload_id = ?1 AND part_number = ?2",
                 params![upload_id, part_number],
                 Self::row_to_multipart_part,
@@ -1201,7 +1256,7 @@ impl PgMetadataStore for PgStore {
             params_vec.push(Box::new(marker));
             params_vec.push(Box::new(limit));
             "SELECT upload_id, part_number, generation, size, etag, etag_kind, \
-             part_okh, part_vid, ec_k, ec_m, last_modified \
+             part_okh, part_vid, ec_k, ec_m, last_modified, checksum \
              FROM multipart_parts \
              WHERE upload_id = ?1 AND part_number > ?2 \
              ORDER BY part_number ASC LIMIT ?3"
@@ -1209,7 +1264,7 @@ impl PgMetadataStore for PgStore {
         } else {
             params_vec.push(Box::new(limit));
             "SELECT upload_id, part_number, generation, size, etag, etag_kind, \
-             part_okh, part_vid, ec_k, ec_m, last_modified \
+             part_okh, part_vid, ec_k, ec_m, last_modified, checksum \
              FROM multipart_parts \
              WHERE upload_id = ?1 \
              ORDER BY part_number ASC LIMIT ?2"
@@ -1268,8 +1323,8 @@ impl PgMetadataStore for PgStore {
             let mut stmt = self.conn.prepare(
                 "INSERT INTO object_parts \
                  (bucket, key, version_id, part_number, size, etag, etag_kind, \
-                  part_okh, part_vid, ec_k, ec_m, shard_pg_id) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                  part_okh, part_vid, ec_k, ec_m, shard_pg_id, checksum) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             )?;
 
             for part in parts {
@@ -1286,6 +1341,7 @@ impl PgMetadataStore for PgStore {
                     part.ec_k,
                     part.ec_m,
                     part.shard_pg_id,
+                    part.checksum,
                 ])?;
             }
             Ok(())
@@ -1322,7 +1378,7 @@ impl PgMetadataStore for PgStore {
             .conn
             .prepare(
                 "SELECT bucket, key, version_id, part_number, size, etag, etag_kind, \
-                 part_okh, part_vid, ec_k, ec_m, shard_pg_id \
+                 part_okh, part_vid, ec_k, ec_m, shard_pg_id, checksum \
                  FROM object_parts \
                  WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 \
                  ORDER BY part_number ASC",
@@ -1348,6 +1404,7 @@ impl PgMetadataStore for PgStore {
                     ec_k: row.get::<_, u8>(9)?,
                     ec_m: row.get::<_, u8>(10)?,
                     shard_pg_id: row.get::<_, i64>(11)? as u32,
+                    checksum: row.get(12)?,
                 })
             })
             .map_err(|e| MetadataError::Db {
@@ -1488,8 +1545,8 @@ impl PgMetadataStore for PgStore {
                 let mut stmt = self.conn.prepare(
                     "INSERT INTO object_parts \
                      (bucket, key, version_id, part_number, size, etag, etag_kind, \
-                      part_okh, part_vid, ec_k, ec_m, shard_pg_id) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                      part_okh, part_vid, ec_k, ec_m, shard_pg_id, checksum) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 )?;
                 for part in parts {
                     stmt.execute(params![
@@ -1505,6 +1562,7 @@ impl PgMetadataStore for PgStore {
                         part.ec_k,
                         part.ec_m,
                         part.shard_pg_id,
+                        part.checksum,
                     ])?;
                 }
             }
