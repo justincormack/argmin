@@ -824,51 +824,81 @@ impl Coordinator {
                 record: src_record,
                 pgs,
             } = self.lock_object_pgs_for_read(src_bucket, src_key, src_version_id)?;
-            let src_shard_pg = pgs.shard();
 
-            Self::require_inline_layout(&src_record)?;
-
-            let src_etag_crc = etag_bytes_to_crc64(&src_record.etag).unwrap_or(0);
-            let src_etag = format_etag(src_etag_crc);
+            let src_etag = format_object_etag(
+                &src_record.etag,
+                src_record.etag_kind,
+                src_record.parts_count,
+            );
             check_copy_source_conditions(src_cond, &src_etag, src_record.last_modified)?;
 
-            let src_okh = object_key_hash(src_bucket, src_key);
-            let src_version_id = src_record.version_id;
-            let total = src_record.total_size as usize;
-            let data = self
-                .read_range(
-                    src_shard_pg,
-                    &src_okh,
-                    src_version_id,
-                    &src_record,
-                    0,
-                    total - 1,
-                )
-                .map_err(|e| match e {
-                    ServerError::Store(storage::StoreError::NotFound) => {
-                        ServerError::ObjectNotFound {
-                            bucket: src_bucket.to_string(),
-                            key: src_key.to_string(),
-                        }
+            let not_found = |e: ServerError| match e {
+                ServerError::Store(storage::StoreError::NotFound) => {
+                    ServerError::ObjectNotFound {
+                        bucket: src_bucket.to_string(),
+                        key: src_key.to_string(),
                     }
-                    other => other,
-                })?;
+                }
+                other => other,
+            };
 
-            // Verify full-object CRC against stored etag
-            let actual_crc = crc64::checksum(&data);
-            if actual_crc != src_etag_crc {
-                return Err(ServerError::IntegrityError {
-                    bucket: src_bucket.to_string(),
-                    key: src_key.to_string(),
-                    expected: src_etag_crc,
-                    actual: actual_crc,
-                });
+            if src_record.data_layout == DataLayout::MultipartManifest {
+                // Multipart source: metadata from row, data from parts.
+                let meta_pg = pgs.meta();
+                let obj_parts = meta_pg
+                    .get_object_parts(src_bucket, src_key, src_record.version_id)
+                    .map_err(ServerError::Metadata)?;
+                drop(pgs);
+
+                let data = if src_record.size == 0 {
+                    vec![]
+                } else {
+                    self.read_multipart_range(src_bucket, src_key, &obj_parts, 0, src_record.size as usize - 1)
+                        .map_err(not_found)?
+                };
+
+                let metadata = src_record
+                    .metadata_blob
+                    .as_ref()
+                    .map(|b| MetadataBlob::deserialize(b).map(|(m, _)| m))
+                    .transpose()?
+                    .unwrap_or_default();
+
+                (metadata, data)
+            } else {
+                // Inline legacy source.
+                let src_shard_pg = pgs.shard();
+                let src_etag_crc = etag_bytes_to_crc64(&src_record.etag).unwrap_or(0);
+                let src_okh = object_key_hash(src_bucket, src_key);
+                let src_version_id = src_record.version_id;
+                let total = src_record.total_size as usize;
+                let data = self
+                    .read_range(
+                        src_shard_pg,
+                        &src_okh,
+                        src_version_id,
+                        &src_record,
+                        0,
+                        total - 1,
+                    )
+                    .map_err(not_found)?;
+
+                // Verify full-object CRC against stored etag
+                let actual_crc = crc64::checksum(&data);
+                if actual_crc != src_etag_crc {
+                    return Err(ServerError::IntegrityError {
+                        bucket: src_bucket.to_string(),
+                        key: src_key.to_string(),
+                        expected: src_etag_crc,
+                        actual: actual_crc,
+                    });
+                }
+
+                let metadata_size = (src_record.total_size - src_record.size) as usize;
+                let (src_metadata, _) = MetadataBlob::deserialize(&data[..metadata_size])?;
+                let user_data = data[metadata_size..].to_vec();
+                (src_metadata, user_data)
             }
-
-            let metadata_size = (src_record.total_size - src_record.size) as usize;
-            let (src_metadata, _) = MetadataBlob::deserialize(&data[..metadata_size])?;
-            let user_data = data[metadata_size..].to_vec();
-            (src_metadata, user_data)
         }; // source locks dropped here
 
         // Phase 2: Write destination object
@@ -1257,6 +1287,158 @@ impl Coordinator {
         Ok(buf[local_start..=local_end].to_vec())
     }
 
+    /// Read a full part's data from its shard PG.
+    ///
+    /// Uses the part's `shard_pg_id`, `part_okh`, `part_vid`, and EC config
+    /// to locate and reconstruct the part data.
+    fn read_part_data(
+        &self,
+        part: &ObjectPartRecord,
+    ) -> Result<Vec<u8>, ServerError> {
+        let pg = self.storage_node.get_pg(part.shard_pg_id)?;
+        let k = part.ec_k as usize;
+        let m = part.ec_m as usize;
+
+        // Compute shard size from part size and EC config.
+        let padded = (part.size as usize).div_ceil(k) * k;
+        let shard_size = padded / k;
+
+        if shard_size == 0 {
+            return Ok(vec![]);
+        }
+
+        // Read all k data shards (indices 0..k).
+        let needed: Vec<usize> = (0..k).collect();
+        let mut all_shards: Vec<Option<Vec<u8>>> = Vec::with_capacity(k + m);
+        let mut present_count = 0;
+
+        for i in 0..(k + m) {
+            let shard_key = ShardKey::new(&part.part_okh, part.part_vid, i as u8);
+            match pg.read_shard(&shard_key) {
+                Ok(sd) => {
+                    all_shards.push(Some(sd.data));
+                    present_count += 1;
+                }
+                Err(_) => {
+                    all_shards.push(None);
+                }
+            }
+        }
+
+        if present_count < k {
+            return Err(ServerError::Store(storage::StoreError::NotFound));
+        }
+
+        // Check if all data shards are present (happy path).
+        let all_data_present = (0..k).all(|i| all_shards[i].is_some());
+        if !all_data_present {
+            // EC reconstruct missing data shards.
+            let missing_needed: Vec<usize> = needed
+                .iter()
+                .copied()
+                .filter(|&i| all_shards[i].is_none())
+                .collect();
+
+            let present_indices: Vec<usize> =
+                (0..(k + m)).filter(|&i| all_shards[i].is_some()).collect();
+            let present_refs: Vec<&[u8]> = present_indices
+                .iter()
+                .map(|&i| all_shards[i].as_ref().unwrap().as_slice())
+                .collect();
+
+            let tmp_codec;
+            let codec = if part.ec_k == self.ec_config.data_shards
+                && part.ec_m == self.ec_config.parity_shards
+            {
+                &self.ec_codec
+            } else {
+                let ec_config = EcConfig::new(part.ec_k, part.ec_m)?;
+                tmp_codec = ErasureCodec::new(ec_config)?;
+                &tmp_codec
+            };
+
+            let mut outputs: Vec<Vec<u8>> = missing_needed
+                .iter()
+                .map(|_| vec![0u8; shard_size])
+                .collect();
+            let mut output_refs: Vec<&mut [u8]> =
+                outputs.iter_mut().map(|v| v.as_mut_slice()).collect();
+
+            codec.reconstruct(
+                &present_indices,
+                &present_refs,
+                &missing_needed,
+                &mut output_refs,
+            )?;
+
+            for (idx, &missing_idx) in missing_needed.iter().enumerate() {
+                all_shards[missing_idx] = Some(outputs[idx].clone());
+            }
+        }
+
+        // Concatenate data shards and truncate to actual part size.
+        let mut buf = Vec::with_capacity(padded);
+        for shard in all_shards.iter().take(k) {
+            buf.extend_from_slice(shard.as_ref().unwrap());
+        }
+        buf.truncate(part.size as usize);
+        Ok(buf)
+    }
+
+    /// Read a byte range from a multipart object by traversing its part manifest.
+    ///
+    /// Maps [start, end] (inclusive) to the relevant parts, reads each,
+    /// and concatenates the needed slices.
+    fn read_multipart_range(
+        &self,
+        bucket: &str,
+        key: &str,
+        parts: &[ObjectPartRecord],
+        start: usize,
+        end: usize,
+    ) -> Result<Vec<u8>, ServerError> {
+        let total_len = end - start + 1;
+        let mut result = Vec::with_capacity(total_len);
+        let mut offset: usize = 0;
+
+        for part in parts {
+            let part_start = offset;
+            let part_end = offset + part.size as usize; // exclusive
+
+            if part_start > end {
+                break; // Past the requested range.
+            }
+            if part.size == 0 || part_end <= start {
+                offset = part_end;
+                continue; // Zero-size or before the requested range.
+            }
+
+            // This part overlaps with [start, end].
+            let slice_start = start.saturating_sub(part_start);
+            let slice_end = if end < part_end - 1 {
+                end - part_start
+            } else {
+                part.size as usize - 1
+            };
+
+            let data = self.read_part_data(part)?;
+            result.extend_from_slice(&data[slice_start..=slice_end]);
+            offset = part_end;
+        }
+
+        // Verify manifest covered the full requested range.
+        if result.len() != total_len {
+            return Err(ServerError::IntegrityError {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                expected: total_len as u64,
+                actual: result.len() as u64,
+            });
+        }
+
+        Ok(result)
+    }
+
     /// Get an object from storage.
     pub fn get_object(
         &self,
@@ -1276,57 +1458,99 @@ impl Coordinator {
             });
         }
 
-        Self::require_inline_layout(&record)?;
-
-        let okh = object_key_hash(bucket, key);
-        let object_version_id = record.version_id;
-        let etag_crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
-        let shard_pg = pgs.shard();
-
-        // Check conditions before reading shard data
-        let etag_str = format_etag(etag_crc);
+        let etag_str = format_object_etag(&record.etag, record.etag_kind, record.parts_count);
         check_read_conditions(cond, &etag_str, record.last_modified)?;
 
-        let total = record.total_size as usize;
-        let data = self
-            .read_range(shard_pg, &okh, object_version_id, &record, 0, total - 1)
-            .map_err(|e| match e {
-                ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
+        if record.data_layout == DataLayout::MultipartManifest {
+            // Multipart: metadata is in object row, data spans multiple parts.
+            let meta_pg = pgs.meta();
+            let obj_parts = meta_pg
+                .get_object_parts(bucket, key, record.version_id)
+                .map_err(ServerError::Metadata)?;
+            drop(pgs);
+
+            let data = if record.size == 0 {
+                vec![]
+            } else {
+                self.read_multipart_range(bucket, key, &obj_parts, 0, record.size as usize - 1)
+                    .map_err(|e| match e {
+                        ServerError::Store(storage::StoreError::NotFound) => {
+                            ServerError::ObjectNotFound {
+                                bucket: bucket.to_string(),
+                                key: key.to_string(),
+                            }
+                        }
+                        other => other,
+                    })?
+            };
+
+            let metadata = record
+                .metadata_blob
+                .as_ref()
+                .map(|b| MetadataBlob::deserialize(b).map(|(m, _)| m))
+                .transpose()?
+                .unwrap_or_default();
+
+            Ok(GetObjectResult {
+                data,
+                metadata,
+                etag: etag_str,
+                size: record.size,
+                last_modified: record.last_modified,
+                version_id: record.version_id,
+                tags: record.tags,
+            })
+        } else {
+            // Inline legacy: metadata + user data stored as single blob in shards.
+            let okh = object_key_hash(bucket, key);
+            let object_version_id = record.version_id;
+            let etag_crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
+            let shard_pg = pgs.shard();
+
+            let total = record.total_size as usize;
+            let data = self
+                .read_range(shard_pg, &okh, object_version_id, &record, 0, total - 1)
+                .map_err(|e| match e {
+                    ServerError::Store(storage::StoreError::NotFound) => {
+                        ServerError::ObjectNotFound {
+                            bucket: bucket.to_string(),
+                            key: key.to_string(),
+                        }
+                    }
+                    other => other,
+                })?;
+
+            // Verify full-object CRC against stored etag
+            let actual_crc = crc64::checksum(&data);
+            if actual_crc != etag_crc {
+                return Err(ServerError::IntegrityError {
                     bucket: bucket.to_string(),
                     key: key.to_string(),
-                },
-                other => other,
-            })?;
+                    expected: etag_crc,
+                    actual: actual_crc,
+                });
+            }
 
-        // Verify full-object CRC against stored etag
-        let actual_crc = crc64::checksum(&data);
-        if actual_crc != etag_crc {
-            return Err(ServerError::IntegrityError {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-                expected: etag_crc,
-                actual: actual_crc,
-            });
+            let metadata_size = (record.total_size - record.size) as usize;
+            let (metadata, _) = MetadataBlob::deserialize(&data[..metadata_size])?;
+            let user_data = data[metadata_size..].to_vec();
+
+            Ok(GetObjectResult {
+                data: user_data,
+                metadata,
+                etag: etag_str,
+                size: record.size,
+                last_modified: record.last_modified,
+                version_id: record.version_id,
+                tags: record.tags,
+            })
         }
-
-        let metadata_size = (record.total_size - record.size) as usize;
-        let (metadata, _) = MetadataBlob::deserialize(&data[..metadata_size])?;
-        let user_data = data[metadata_size..].to_vec();
-
-        Ok(GetObjectResult {
-            data: user_data,
-            metadata,
-            etag: format_etag(etag_crc),
-            size: record.size,
-            last_modified: record.last_modified,
-            version_id: record.version_id,
-            tags: record.tags,
-        })
     }
 
     /// Head object: returns metadata without body.
     ///
-    /// Reads only the shards covering the metadata blob.
+    /// For inline objects, reads only the shards covering the metadata blob.
+    /// For multipart objects, metadata is in the object row (no shard read).
     pub fn head_object(
         &self,
         bucket: &str,
@@ -1345,39 +1569,50 @@ impl Coordinator {
             });
         }
 
-        Self::require_inline_layout(&record)?;
-
-        let okh = object_key_hash(bucket, key);
-        let object_version_id = record.version_id;
-        let etag_crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
-        let shard_pg = pgs.shard();
-
-        // Check conditions before reading shard data
-        let etag_str = format_etag(etag_crc);
+        let etag_str = format_object_etag(&record.etag, record.etag_kind, record.parts_count);
         check_read_conditions(cond, &etag_str, record.last_modified)?;
 
-        let metadata_size = (record.total_size - record.size) as usize;
-        let data = self
-            .read_range(
-                shard_pg,
-                &okh,
-                object_version_id,
-                &record,
-                0,
-                metadata_size - 1,
-            )
-            .map_err(|e| match e {
-                ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
-                    bucket: bucket.to_string(),
-                    key: key.to_string(),
-                },
-                other => other,
-            })?;
+        let metadata = if record.data_layout == DataLayout::MultipartManifest {
+            // Multipart: metadata stored in object row, no shard read needed.
+            record
+                .metadata_blob
+                .as_ref()
+                .map(|b| MetadataBlob::deserialize(b).map(|(m, _)| m))
+                .transpose()?
+                .unwrap_or_default()
+        } else {
+            // Inline legacy: read metadata from shard data.
+            let okh = object_key_hash(bucket, key);
+            let object_version_id = record.version_id;
+            let shard_pg = pgs.shard();
 
-        let (metadata, _) = MetadataBlob::deserialize(&data)?;
+            let metadata_size = (record.total_size - record.size) as usize;
+            let data = self
+                .read_range(
+                    shard_pg,
+                    &okh,
+                    object_version_id,
+                    &record,
+                    0,
+                    metadata_size - 1,
+                )
+                .map_err(|e| match e {
+                    ServerError::Store(storage::StoreError::NotFound) => {
+                        ServerError::ObjectNotFound {
+                            bucket: bucket.to_string(),
+                            key: key.to_string(),
+                        }
+                    }
+                    other => other,
+                })?;
+
+            let (m, _) = MetadataBlob::deserialize(&data)?;
+            m
+        };
+
         Ok(HeadObjectResult {
             metadata,
-            etag: format_etag(etag_crc),
+            etag: etag_str,
             size: record.size,
             last_modified: record.last_modified,
             version_id: record.version_id,
@@ -1407,15 +1642,7 @@ impl Coordinator {
             });
         }
 
-        Self::require_inline_layout(&record)?;
-
-        let okh = object_key_hash(bucket, key);
-        let object_version_id = record.version_id;
-        let etag_crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
-        let shard_pg = pgs.shard();
-
-        // Check conditions before reading shard data
-        let etag_str = format_etag(etag_crc);
+        let etag_str = format_object_etag(&record.etag, record.etag_kind, record.parts_count);
         check_read_conditions(cond, &etag_str, record.last_modified)?;
 
         // Resolve byte range against user data size
@@ -1426,51 +1653,80 @@ impl Coordinator {
                     total_size: record.size,
                 })?;
 
-        let metadata_size = (record.total_size - record.size) as usize;
+        let not_found = |e: ServerError| match e {
+            ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+            },
+            other => other,
+        };
 
-        // Read metadata (always need it for response headers)
-        let meta_data = self
-            .read_range(
-                shard_pg,
-                &okh,
-                object_version_id,
-                &record,
-                0,
-                metadata_size - 1,
-            )
-            .map_err(|e| match e {
-                ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
-                    bucket: bucket.to_string(),
-                    key: key.to_string(),
-                },
-                other => other,
-            })?;
-        let (metadata, _) = MetadataBlob::deserialize(&meta_data)?;
+        let (metadata, user_data) = if record.data_layout == DataLayout::MultipartManifest {
+            // Multipart: metadata from object row, data spans parts.
+            let meta_pg = pgs.meta();
+            let obj_parts = meta_pg
+                .get_object_parts(bucket, key, record.version_id)
+                .map_err(ServerError::Metadata)?;
+            drop(pgs);
 
-        // Read user data range
-        let blob_start = metadata_size + user_start as usize;
-        let blob_end = metadata_size + user_end as usize;
-        let user_data = self
-            .read_range(
-                shard_pg,
-                &okh,
-                object_version_id,
-                &record,
-                blob_start,
-                blob_end,
-            )
-            .map_err(|e| match e {
-                ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
-                    bucket: bucket.to_string(),
-                    key: key.to_string(),
-                },
-                other => other,
-            })?;
+            let data = self
+                .read_multipart_range(
+                    bucket,
+                    key,
+                    &obj_parts,
+                    user_start as usize,
+                    user_end as usize,
+                )
+                .map_err(not_found)?;
+
+            let metadata = record
+                .metadata_blob
+                .as_ref()
+                .map(|b| MetadataBlob::deserialize(b).map(|(m, _)| m))
+                .transpose()?
+                .unwrap_or_default();
+
+            (metadata, data)
+        } else {
+            // Inline legacy: metadata + user data in shards.
+            let okh = object_key_hash(bucket, key);
+            let object_version_id = record.version_id;
+            let shard_pg = pgs.shard();
+
+            let metadata_size = (record.total_size - record.size) as usize;
+
+            let meta_data = self
+                .read_range(
+                    shard_pg,
+                    &okh,
+                    object_version_id,
+                    &record,
+                    0,
+                    metadata_size - 1,
+                )
+                .map_err(not_found)?;
+            let (metadata, _) = MetadataBlob::deserialize(&meta_data)?;
+
+            let blob_start = metadata_size + user_start as usize;
+            let blob_end = metadata_size + user_end as usize;
+            let data = self
+                .read_range(
+                    shard_pg,
+                    &okh,
+                    object_version_id,
+                    &record,
+                    blob_start,
+                    blob_end,
+                )
+                .map_err(not_found)?;
+
+            (metadata, data)
+        };
 
         Ok(GetObjectRangeResult {
             data: user_data,
             metadata,
-            etag: format_etag(etag_crc),
+            etag: etag_str,
             size: record.size,
             last_modified: record.last_modified,
             range_start: user_start,
@@ -2259,18 +2515,27 @@ impl Coordinator {
 
         let object_parts: Vec<ObjectPartRecord> = part_records
             .iter()
-            .map(|p| ObjectPartRecord {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-                version_id,
-                part_number: p.part_number,
-                size: p.size,
-                etag: p.etag.clone(),
-                etag_kind: p.etag_kind,
-                part_okh: p.part_okh,
-                part_vid: p.part_vid,
-                ec_k: p.ec_k,
-                ec_m: p.ec_m,
+            .map(|p| {
+                let shard_pg_id = derive_pg_shards(
+                    &format!("mpu/{}", p.upload_id),
+                    &format!("{}/{}", p.part_number, p.generation),
+                    p.part_vid,
+                    self.pg_count,
+                );
+                ObjectPartRecord {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                    version_id,
+                    part_number: p.part_number,
+                    size: p.size,
+                    etag: p.etag.clone(),
+                    etag_kind: p.etag_kind,
+                    part_okh: p.part_okh,
+                    part_vid: p.part_vid,
+                    ec_k: p.ec_k,
+                    ec_m: p.ec_m,
+                    shard_pg_id,
+                }
             })
             .collect();
 
@@ -5977,6 +6242,383 @@ mod tests {
         assert!(
             matches!(err, ServerError::NoSuchUpload { .. }),
             "expected NoSuchUpload, got {err:?}"
+        );
+    }
+
+    // --- Multipart-aware read tests (Step 9) ---
+
+    const MIN_PART: usize = 5 * 1024 * 1024; // 5 MiB
+
+    /// Make part data: first MIN_PART bytes are `fill`, rest is padding.
+    /// For the final part, `size` can be less than MIN_PART.
+    fn make_part(fill: u8, size: usize) -> Vec<u8> {
+        vec![fill; size]
+    }
+
+    /// Helper: create a completed multipart object with given (part_number, data) pairs.
+    fn create_completed_multipart_vec(
+        coord: &Coordinator,
+        bucket: &str,
+        key: &str,
+        part_data: &[(u32, Vec<u8>)],
+    ) -> CompleteMultipartUploadResult {
+        let metadata = MetadataBlob::new();
+        let create = coord
+            .create_multipart_upload(bucket, key, &metadata)
+            .unwrap();
+        let mut complete_parts = Vec::new();
+        for (part_number, data) in part_data {
+            let result = coord
+                .upload_part(bucket, key, &create.upload_id, *part_number, data)
+                .unwrap();
+            complete_parts.push(CompletePart {
+                part_number: *part_number,
+                etag: result.etag,
+            });
+        }
+        coord
+            .complete_multipart_upload(bucket, key, &create.upload_id, &complete_parts)
+            .unwrap()
+    }
+
+    #[test]
+    fn get_multipart_object_full() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let part1 = make_part(0xAA, MIN_PART);
+        let part2 = make_part(0xBB, 100);
+        let expected: Vec<u8> = [part1.as_slice(), part2.as_slice()].concat();
+
+        let result = create_completed_multipart_vec(
+            &coord,
+            "bucket",
+            "key",
+            &[(1, part1), (2, part2)],
+        );
+
+        let obj = coord
+            .get_object("bucket", "key", None, &ReadCondition::default())
+            .unwrap();
+        assert_eq!(obj.data, expected);
+        assert_eq!(obj.etag, result.etag);
+        assert_eq!(obj.size, expected.len() as u64);
+        assert!(obj.etag.ends_with("-2\""), "etag = {}", obj.etag);
+    }
+
+    #[test]
+    fn get_multipart_object_single_part() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        create_completed_multipart_vec(
+            &coord,
+            "bucket",
+            "key",
+            &[(1, b"only-part".to_vec())],
+        );
+
+        let obj = coord
+            .get_object("bucket", "key", None, &ReadCondition::default())
+            .unwrap();
+        assert_eq!(obj.data, b"only-part");
+    }
+
+    #[test]
+    fn head_multipart_object() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let part1 = make_part(0xAA, MIN_PART);
+        let part2 = make_part(0xBB, 200);
+        let total_size = part1.len() + part2.len();
+
+        let result = create_completed_multipart_vec(
+            &coord,
+            "bucket",
+            "key",
+            &[(1, part1), (2, part2)],
+        );
+
+        let head = coord
+            .head_object("bucket", "key", None, &ReadCondition::default())
+            .unwrap();
+        assert_eq!(head.size, total_size as u64);
+        assert_eq!(head.etag, result.etag);
+        assert!(head.etag.ends_with("-2\""), "etag = {}", head.etag);
+    }
+
+    #[test]
+    fn get_multipart_object_range_within_part() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let part1 = make_part(0xAA, MIN_PART);
+        let part2 = make_part(0xBB, 100);
+
+        create_completed_multipart_vec(
+            &coord,
+            "bucket",
+            "key",
+            &[(1, part1), (2, part2)],
+        );
+
+        // Range within first part: bytes 10-19
+        let range = coord
+            .get_object_range(
+                "bucket",
+                "key",
+                None,
+                ByteRange::Range { start: 10, end: 19 },
+                &ReadCondition::default(),
+            )
+            .unwrap();
+        assert_eq!(range.data, vec![0xAA; 10]);
+        assert_eq!(range.range_start, 10);
+        assert_eq!(range.range_end, 19);
+    }
+
+    #[test]
+    fn get_multipart_object_range_spanning_parts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let part1 = make_part(0xAA, MIN_PART);
+        let part2 = make_part(0xBB, MIN_PART);
+        let part3 = make_part(0xCC, 100);
+
+        create_completed_multipart_vec(
+            &coord,
+            "bucket",
+            "key",
+            &[(1, part1), (2, part2), (3, part3)],
+        );
+
+        // Range spanning part1/part2 boundary: last 4 bytes of part1 + first 4 of part2
+        let boundary = MIN_PART as u64;
+        let range = coord
+            .get_object_range(
+                "bucket",
+                "key",
+                None,
+                ByteRange::Range {
+                    start: boundary - 4,
+                    end: boundary + 3,
+                },
+                &ReadCondition::default(),
+            )
+            .unwrap();
+        let mut expected = vec![0xAA; 4];
+        expected.extend_from_slice(&[0xBB; 4]);
+        assert_eq!(range.data, expected);
+    }
+
+    #[test]
+    fn get_multipart_object_range_suffix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let part1 = make_part(0xAA, MIN_PART);
+        let part2 = make_part(0xBB, 100);
+
+        create_completed_multipart_vec(
+            &coord,
+            "bucket",
+            "key",
+            &[(1, part1), (2, part2)],
+        );
+
+        // Suffix range: last 50 bytes (all within part2)
+        let range = coord
+            .get_object_range(
+                "bucket",
+                "key",
+                None,
+                ByteRange::Suffix { length: 50 },
+                &ReadCondition::default(),
+            )
+            .unwrap();
+        assert_eq!(range.data, vec![0xBB; 50]);
+    }
+
+    #[test]
+    fn copy_multipart_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("src-bucket").unwrap();
+        coord.create_bucket("dst-bucket").unwrap();
+
+        let part1 = make_part(0xAA, MIN_PART);
+        let part2 = make_part(0xBB, 200);
+        let expected: Vec<u8> = [part1.as_slice(), part2.as_slice()].concat();
+
+        create_completed_multipart_vec(
+            &coord,
+            "src-bucket",
+            "src-key",
+            &[(1, part1), (2, part2)],
+        );
+
+        // Copy multipart source to destination (creates inline object).
+        coord
+            .copy_object(
+                "src-bucket",
+                "src-key",
+                None,
+                "dst-bucket",
+                "dst-key",
+                &ReadCondition::default(),
+                &WriteCondition::default(),
+                MetadataDirective::Copy,
+                &[],
+            )
+            .unwrap();
+
+        // Destination should have the concatenated data as inline object.
+        let dst = coord
+            .get_object("dst-bucket", "dst-key", None, &ReadCondition::default())
+            .unwrap();
+        assert_eq!(dst.data, expected);
+    }
+
+    #[test]
+    fn get_multipart_object_zero_byte_single_part() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        create_completed_multipart_vec(
+            &coord,
+            "bucket",
+            "key",
+            &[(1, vec![])],
+        );
+
+        let obj = coord
+            .get_object("bucket", "key", None, &ReadCondition::default())
+            .unwrap();
+        assert!(obj.data.is_empty());
+        assert_eq!(obj.size, 0);
+    }
+
+    #[test]
+    fn get_multipart_object_zero_byte_final_part() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let part1 = make_part(0xAA, MIN_PART);
+        let expected = part1.clone();
+
+        create_completed_multipart_vec(
+            &coord,
+            "bucket",
+            "key",
+            &[(1, part1), (2, vec![])],
+        );
+
+        let obj = coord
+            .get_object("bucket", "key", None, &ReadCondition::default())
+            .unwrap();
+        assert_eq!(obj.data, expected);
+        assert_eq!(obj.size, MIN_PART as u64);
+    }
+
+    #[test]
+    fn head_multipart_object_zero_byte() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        create_completed_multipart_vec(
+            &coord,
+            "bucket",
+            "key",
+            &[(1, vec![])],
+        );
+
+        let head = coord
+            .head_object("bucket", "key", None, &ReadCondition::default())
+            .unwrap();
+        assert_eq!(head.size, 0);
+    }
+
+    #[test]
+    fn copy_multipart_source_zero_byte() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("src").unwrap();
+        coord.create_bucket("dst").unwrap();
+
+        create_completed_multipart_vec(
+            &coord,
+            "src",
+            "key",
+            &[(1, vec![])],
+        );
+
+        coord
+            .copy_object(
+                "src",
+                "key",
+                None,
+                "dst",
+                "key",
+                &ReadCondition::default(),
+                &WriteCondition::default(),
+                MetadataDirective::Copy,
+                &[],
+            )
+            .unwrap();
+
+        let dst = coord
+            .get_object("dst", "key", None, &ReadCondition::default())
+            .unwrap();
+        assert!(dst.data.is_empty());
+    }
+
+    #[test]
+    fn read_multipart_range_detects_incomplete_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        // Create a multipart object, then corrupt manifest by deleting a part row.
+        let part1 = make_part(0xAA, MIN_PART);
+        let part2 = make_part(0xBB, 100);
+
+        let result = create_completed_multipart_vec(
+            &coord,
+            "bucket",
+            "key",
+            &[(1, part1), (2, part2)],
+        );
+
+        // Get the real manifest, then replace with only part 2 (gap: part 1 missing).
+        let meta_pg_id = derive_pg("bucket", "key", coord.pg_count);
+        let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
+        let real_parts = pg
+            .get_object_parts("bucket", "key", result.version_id)
+            .unwrap();
+        assert_eq!(real_parts.len(), 2);
+        let part2_record = real_parts[1].clone(); // real part 2 with valid shards
+        pg.delete_object_parts("bucket", "key", result.version_id)
+            .unwrap();
+        pg.commit_object_parts(&[part2_record]).unwrap();
+        drop(pg);
+
+        let err = coord
+            .get_object("bucket", "key", None, &ReadCondition::default())
+            .unwrap_err();
+        assert!(
+            matches!(err, ServerError::IntegrityError { .. }),
+            "expected IntegrityError for incomplete manifest, got {err:?}"
         );
     }
 }

@@ -1268,8 +1268,8 @@ impl PgMetadataStore for PgStore {
             let mut stmt = self.conn.prepare(
                 "INSERT INTO object_parts \
                  (bucket, key, version_id, part_number, size, etag, etag_kind, \
-                  part_okh, part_vid, ec_k, ec_m) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                  part_okh, part_vid, ec_k, ec_m, shard_pg_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             )?;
 
             for part in parts {
@@ -1285,6 +1285,7 @@ impl PgMetadataStore for PgStore {
                     part.part_vid as i64,
                     part.ec_k,
                     part.ec_m,
+                    part.shard_pg_id,
                 ])?;
             }
             Ok(())
@@ -1321,7 +1322,7 @@ impl PgMetadataStore for PgStore {
             .conn
             .prepare(
                 "SELECT bucket, key, version_id, part_number, size, etag, etag_kind, \
-                 part_okh, part_vid, ec_k, ec_m \
+                 part_okh, part_vid, ec_k, ec_m, shard_pg_id \
                  FROM object_parts \
                  WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 \
                  ORDER BY part_number ASC",
@@ -1346,6 +1347,7 @@ impl PgMetadataStore for PgStore {
                     part_vid: row.get::<_, i64>(8)? as u64,
                     ec_k: row.get::<_, u8>(9)?,
                     ec_m: row.get::<_, u8>(10)?,
+                    shard_pg_id: row.get::<_, i64>(11)? as u32,
                 })
             })
             .map_err(|e| MetadataError::Db {
@@ -1486,8 +1488,8 @@ impl PgMetadataStore for PgStore {
                 let mut stmt = self.conn.prepare(
                     "INSERT INTO object_parts \
                      (bucket, key, version_id, part_number, size, etag, etag_kind, \
-                      part_okh, part_vid, ec_k, ec_m) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                      part_okh, part_vid, ec_k, ec_m, shard_pg_id) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 )?;
                 for part in parts {
                     stmt.execute(params![
@@ -1502,6 +1504,7 @@ impl PgMetadataStore for PgStore {
                         part.part_vid as i64,
                         part.ec_k,
                         part.ec_m,
+                        part.shard_pg_id,
                     ])?;
                 }
             }

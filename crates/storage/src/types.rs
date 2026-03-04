@@ -304,6 +304,8 @@ pub struct ObjectPartRecord {
     pub part_vid: u64,
     pub ec_k: u8,
     pub ec_m: u8,
+    /// PG where this part's shards are stored.
+    pub shard_pg_id: u32,
 }
 
 /// Request to create a multipart upload.

@@ -83,6 +83,7 @@ CREATE TABLE IF NOT EXISTS object_parts (
     part_vid         INTEGER NOT NULL,
     ec_k             INTEGER NOT NULL,
     ec_m             INTEGER NOT NULL,
+    shard_pg_id      INTEGER NOT NULL,
     PRIMARY KEY (bucket, key, version_id, part_number)
 )";
 

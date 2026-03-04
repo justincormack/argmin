@@ -1016,6 +1016,7 @@ fn mpu_corrupted_object_part_okh_returns_error() {
             part_vid: 0,
             ec_k: 4,
             ec_m: 2,
+            shard_pg_id: 0,
         }])
         .unwrap();
 
@@ -1175,6 +1176,7 @@ fn mpu_commit_object_parts_rollback_on_duplicate() {
         part_vid: 0,
         ec_k: 4,
         ec_m: 2,
+        shard_pg_id: 0,
     };
 
     // First commit succeeds
@@ -1211,6 +1213,7 @@ fn mpu_commit_and_get_object_parts() {
             part_vid: 0,
             ec_k: 4,
             ec_m: 2,
+            shard_pg_id: 0,
         },
         ObjectPartRecord {
             bucket: "b".to_string(),
@@ -1224,6 +1227,7 @@ fn mpu_commit_and_get_object_parts() {
             part_vid: 1,
             ec_k: 4,
             ec_m: 2,
+            shard_pg_id: 0,
         },
     ];
 
@@ -1259,6 +1263,7 @@ fn mpu_delete_object_parts() {
             part_vid: 0,
             ec_k: 4,
             ec_m: 2,
+            shard_pg_id: 0,
         }])
         .unwrap();
 
@@ -1363,6 +1368,7 @@ fn mpu_commit_partial_batch_failure_rolls_back_all() {
         part_vid: 0,
         ec_k: 4,
         ec_m: 2,
+        shard_pg_id: 0,
     };
     store
         .commit_object_parts(std::slice::from_ref(&part1))
@@ -1540,6 +1546,7 @@ fn mpu_commit_object_parts_connection_usable_after_multiple_failures() {
         part_vid: 0,
         ec_k: 4,
         ec_m: 2,
+        shard_pg_id: 0,
     };
 
     store
@@ -1697,6 +1704,7 @@ fn mpu_commit_object_parts_commit_failure_via_lock_contention() {
         part_vid: 0,
         ec_k: 4,
         ec_m: 2,
+        shard_pg_id: 0,
     };
     let err = store
         .commit_object_parts(std::slice::from_ref(&part))
