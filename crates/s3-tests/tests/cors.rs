@@ -387,12 +387,13 @@ fn test_cors_actual_request_headers() {
 #[test]
 fn test_cors_actual_request_public_bucket() {
     s3_tests::run(async {
-        use aws_sdk_s3::types::BucketCannedAcl;
+        use aws_sdk_s3::types::{BucketCannedAcl, ObjectOwnership};
         let client = CTX.client();
         let bucket = unique_bucket();
         client
             .create_bucket()
             .bucket(&bucket)
+            .object_ownership(ObjectOwnership::BucketOwnerPreferred)
             .acl(BucketCannedAcl::PublicRead)
             .send()
             .await
@@ -459,12 +460,13 @@ fn test_cors_actual_request_public_bucket() {
 #[test]
 fn test_cors_actual_request_no_match() {
     s3_tests::run(async {
-        use aws_sdk_s3::types::BucketCannedAcl;
+        use aws_sdk_s3::types::{BucketCannedAcl, ObjectOwnership};
         let client = CTX.client();
         let bucket = unique_bucket();
         client
             .create_bucket()
             .bucket(&bucket)
+            .object_ownership(ObjectOwnership::BucketOwnerPreferred)
             .acl(BucketCannedAcl::PublicRead)
             .send()
             .await

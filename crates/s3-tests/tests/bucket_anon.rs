@@ -1,5 +1,5 @@
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::BucketCannedAcl;
+use aws_sdk_s3::types::{BucketCannedAcl, ObjectOwnership};
 use s3_tests::{unique_bucket, CTX};
 
 /// Build an agent that returns all HTTP responses (including 4xx/5xx) as Ok.
@@ -17,6 +17,7 @@ async fn setup_public_bucket() -> String {
     client
         .create_bucket()
         .bucket(&bucket)
+        .object_ownership(ObjectOwnership::BucketOwnerPreferred)
         .acl(BucketCannedAcl::PublicRead)
         .send()
         .await

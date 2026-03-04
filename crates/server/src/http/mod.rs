@@ -241,7 +241,11 @@ impl HttpFrontend {
                         }
                     }
                 } else {
-                    None
+                    // AWS default since April 2023: BucketOwnerEnforced
+                    if public_read {
+                        return Err(ServerError::InvalidBucketAclWithObjectOwnership);
+                    }
+                    Some(xml::get_ownership_controls_xml("BucketOwnerEnforced"))
                 };
                 self.coordinator
                     .create_bucket_for_owner(owner_principal, &bucket, public_read)?;

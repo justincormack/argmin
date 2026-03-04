@@ -1716,6 +1716,7 @@ fn test_bucket_list_objects_anonymous() {
         client
             .create_bucket()
             .bucket(&bucket)
+            .object_ownership(aws_sdk_s3::types::ObjectOwnership::BucketOwnerPreferred)
             .acl(aws_sdk_s3::types::BucketCannedAcl::PublicRead)
             .send()
             .await
@@ -1751,6 +1752,7 @@ fn test_bucket_listv2_objects_anonymous() {
         client
             .create_bucket()
             .bucket(&bucket)
+            .object_ownership(aws_sdk_s3::types::ObjectOwnership::BucketOwnerPreferred)
             .acl(aws_sdk_s3::types::BucketCannedAcl::PublicRead)
             .send()
             .await

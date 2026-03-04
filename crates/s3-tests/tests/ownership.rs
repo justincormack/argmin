@@ -17,7 +17,7 @@ async fn cleanup(bucket: &str) {
 
 // ── test_create_bucket_no_ownership_controls ────────────────────────
 
-/// GET on a fresh bucket with no ownership controls set should 404.
+/// A fresh bucket (no ownership header) should default to BucketOwnerEnforced.
 #[test]
 fn test_create_bucket_no_ownership_controls() {
     s3_tests::run(async {
@@ -25,18 +25,18 @@ fn test_create_bucket_no_ownership_controls() {
         let bucket = unique_bucket();
         client.create_bucket().bucket(&bucket).send().await.unwrap();
 
-        // GET ownership controls should fail — not set
-        let err = client
+        // GET ownership controls should return BucketOwnerEnforced (AWS default)
+        let resp = client
             .get_bucket_ownership_controls()
             .bucket(&bucket)
             .send()
             .await
-            .unwrap_err();
-        let raw = format!("{:?}", err);
-        assert!(
-            raw.contains("OwnershipControlsNotFoundError") || raw.contains("404"),
-            "expected OwnershipControlsNotFoundError, got: {}",
-            raw
+            .unwrap();
+        let rules = resp.ownership_controls().unwrap().rules();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(
+            rules[0].object_ownership,
+            ObjectOwnership::BucketOwnerEnforced
         );
 
         cleanup(&bucket).await;
@@ -241,9 +241,16 @@ fn test_put_bucket_ownership_enforced_rejects_public_acl() {
     s3_tests::run(async {
         let bucket = unique_bucket();
 
-        // Create bucket with public-read ACL
+        // Create bucket with public-read ACL (need BucketOwnerPreferred to allow ACLs)
         let url = format!("{}/{}", CTX.endpoint(), bucket);
-        let status = send_signed_put(&url, b"", &[("x-amz-acl", "public-read")]);
+        let status = send_signed_put(
+            &url,
+            b"",
+            &[
+                ("x-amz-object-ownership", "BucketOwnerPreferred"),
+                ("x-amz-acl", "public-read"),
+            ],
+        );
         assert_eq!(status, 200, "create public-read bucket failed: {}", status);
 
         // PUT BucketOwnerEnforced should fail — bucket is public-read
@@ -377,9 +384,16 @@ fn test_put_bucket_ownership_bucket_owner_enforced() {
         let client = CTX.client();
         let bucket = unique_bucket();
 
-        // Create bucket with public-read ACL
+        // Create bucket with public-read ACL (need BucketOwnerPreferred to allow ACLs)
         let url = format!("{}/{}", CTX.endpoint(), bucket);
-        let status = send_signed_put(&url, b"", &[("x-amz-acl", "public-read")]);
+        let status = send_signed_put(
+            &url,
+            b"",
+            &[
+                ("x-amz-object-ownership", "BucketOwnerPreferred"),
+                ("x-amz-acl", "public-read"),
+            ],
+        );
         assert_eq!(status, 200, "create public-read bucket failed: {status}");
 
         // PutBucketOwnershipControls BOE should fail — bucket is public-read
