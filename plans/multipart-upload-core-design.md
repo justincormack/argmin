@@ -509,6 +509,34 @@ Acceptance:
    - too-small non-final part
    - retry semantics
 
+### Step 7b: Multipart fault-injection test strategy (deferred)
+
+Files:
+
+- `plans/fault-injection.md` (design and test methodology)
+- `crates/storage/src/test_util/faults.rs` (or successor fault hooks)
+- multipart coordinator/storage tests
+
+Tasks:
+
+1. Define deterministic failure points for multipart write paths:
+   - `UploadPart`: fail after shard write set but before metadata upsert.
+   - `CompleteMultipartUpload`: fail after each stage (`set_upload_state`,
+     `put_object_meta`, `commit_object_parts`) to exercise partial-progress recovery.
+2. Add test harness controls so failures can be injected by operation/phase
+   without timing-based races.
+3. Add end-to-end tests that assert post-failure invariants:
+   - no leaked visible metadata state
+   - no leaked current-generation part shards on failed upsert
+   - retry behavior converges to a valid completed or aborted state
+4. Document expected recovery semantics for each injected failure point.
+
+Acceptance:
+
+1. Deterministic tests reproduce and validate cleanup/retry behavior for the
+   two known risk areas above.
+2. Test docs clearly map each fault point to expected system state.
+
 ### Step 8: AbortMultipartUpload and ListParts
 
 Files:
