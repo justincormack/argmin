@@ -509,12 +509,7 @@ impl S3Response {
     }
 
     /// Build a response for CompleteMultipartUpload (200 OK, XML body).
-    pub fn complete_multipart_upload(
-        bucket: &str,
-        key: &str,
-        etag: &str,
-        version_id: u64,
-    ) -> Self {
+    pub fn complete_multipart_upload(bucket: &str, key: &str, etag: &str, version_id: u64) -> Self {
         let body = xml::complete_multipart_upload_xml(bucket, key, etag);
         let mut resp = Self::new(200).xml_body(body);
         if version_id != 0 {
@@ -557,8 +552,14 @@ impl S3Response {
         max_parts: u32,
         result: &ListPartsResult,
     ) -> Self {
-        let body =
-            xml::list_parts_xml(bucket, key, upload_id, part_number_marker, max_parts, result);
+        let body = xml::list_parts_xml(
+            bucket,
+            key,
+            upload_id,
+            part_number_marker,
+            max_parts,
+            result,
+        );
         Self::new(200).xml_body(body)
     }
 

@@ -592,10 +592,7 @@ impl HttpFrontend {
                     }
                 }
                 let want_parts = requested.iter().any(|&a| a == "ObjectParts");
-                let max_parts: u32 = match req
-                    .headers
-                    .iter()
-                    .find(|(k, _)| k == "x-amz-max-parts")
+                let max_parts: u32 = match req.headers.iter().find(|(k, _)| k == "x-amz-max-parts")
                 {
                     None => 1000,
                     Some((_, v)) => v.parse().map_err(|_| ServerError::InvalidArgument {
@@ -857,16 +854,22 @@ impl HttpFrontend {
                     .map(|(k, v)| (k.as_str(), v.as_str()))
                     .collect();
                 let metadata = MetadataBlob::from_headers(&header_pairs)?;
-                let result = self.coordinator.create_multipart_upload(&bucket, &key, &metadata)?;
-                Ok(S3Response::create_multipart_upload(&bucket, &key, &result.upload_id))
+                let result = self
+                    .coordinator
+                    .create_multipart_upload(&bucket, &key, &metadata)?;
+                Ok(S3Response::create_multipart_upload(
+                    &bucket,
+                    &key,
+                    &result.upload_id,
+                ))
             }
             S3Operation::UploadPart { bucket, key } => {
                 self.authorize_bucket_write(auth, &bucket)?;
-                let upload_id = req.query_param("uploadId").ok_or_else(|| {
-                    ServerError::InvalidRequest {
-                        reason: "missing uploadId query parameter".to_string(),
-                    }
-                })?;
+                let upload_id =
+                    req.query_param("uploadId")
+                        .ok_or_else(|| ServerError::InvalidRequest {
+                            reason: "missing uploadId query parameter".to_string(),
+                        })?;
                 let part_number: u32 = req
                     .query_param("partNumber")
                     .ok_or_else(|| ServerError::InvalidRequest {
@@ -877,33 +880,41 @@ impl HttpFrontend {
                         reason: "partNumber must be a positive integer".to_string(),
                     })?;
                 let result = self.coordinator.upload_part(
-                    &bucket, &key, &upload_id, part_number, &req.body,
+                    &bucket,
+                    &key,
+                    &upload_id,
+                    part_number,
+                    &req.body,
                 )?;
                 Ok(S3Response::upload_part(&result.etag))
             }
             S3Operation::CompleteMultipartUpload { bucket, key } => {
                 self.authorize_bucket_write(auth, &bucket)?;
-                let upload_id = req.query_param("uploadId").ok_or_else(|| {
-                    ServerError::InvalidRequest {
-                        reason: "missing uploadId query parameter".to_string(),
-                    }
-                })?;
+                let upload_id =
+                    req.query_param("uploadId")
+                        .ok_or_else(|| ServerError::InvalidRequest {
+                            reason: "missing uploadId query parameter".to_string(),
+                        })?;
                 let parts = xml::parse_complete_multipart_upload_xml(&req.body)?;
-                let result = self.coordinator.complete_multipart_upload(
-                    &bucket, &key, &upload_id, &parts,
-                )?;
+                let result = self
+                    .coordinator
+                    .complete_multipart_upload(&bucket, &key, &upload_id, &parts)?;
                 Ok(S3Response::complete_multipart_upload(
-                    &bucket, &key, &result.etag, result.version_id,
+                    &bucket,
+                    &key,
+                    &result.etag,
+                    result.version_id,
                 ))
             }
             S3Operation::AbortMultipartUpload { bucket, key } => {
                 self.authorize_bucket_write(auth, &bucket)?;
-                let upload_id = req.query_param("uploadId").ok_or_else(|| {
-                    ServerError::InvalidRequest {
-                        reason: "missing uploadId query parameter".to_string(),
-                    }
-                })?;
-                self.coordinator.abort_multipart_upload(&bucket, &key, &upload_id)?;
+                let upload_id =
+                    req.query_param("uploadId")
+                        .ok_or_else(|| ServerError::InvalidRequest {
+                            reason: "missing uploadId query parameter".to_string(),
+                        })?;
+                self.coordinator
+                    .abort_multipart_upload(&bucket, &key, &upload_id)?;
                 Ok(S3Response::abort_multipart_upload())
             }
             S3Operation::ListMultipartUploads { bucket } => {
@@ -935,11 +946,11 @@ impl HttpFrontend {
             }
             S3Operation::ListParts { bucket, key } => {
                 self.authorize_bucket_read(auth, &bucket)?;
-                let upload_id = req.query_param("uploadId").ok_or_else(|| {
-                    ServerError::InvalidRequest {
-                        reason: "missing uploadId query parameter".to_string(),
-                    }
-                })?;
+                let upload_id =
+                    req.query_param("uploadId")
+                        .ok_or_else(|| ServerError::InvalidRequest {
+                            reason: "missing uploadId query parameter".to_string(),
+                        })?;
                 let part_number_marker: Option<u32> = req
                     .query_param("part-number-marker")
                     .map(|s| {
@@ -955,10 +966,19 @@ impl HttpFrontend {
                     })?,
                 };
                 let result = self.coordinator.list_parts(
-                    &bucket, &key, &upload_id, part_number_marker, max_parts,
+                    &bucket,
+                    &key,
+                    &upload_id,
+                    part_number_marker,
+                    max_parts,
                 )?;
                 Ok(S3Response::list_parts(
-                    &bucket, &key, &upload_id, part_number_marker, max_parts, &result,
+                    &bucket,
+                    &key,
+                    &upload_id,
+                    part_number_marker,
+                    max_parts,
+                    &result,
                 ))
             }
             // OptionsRequest is handled before auth in handle_s3_request
@@ -1421,9 +1441,14 @@ mod tests {
         let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
         let bucket_db = SqliteBucketDb::open_in_memory().unwrap();
         let ec_config = EcConfig::new(4, 2).unwrap();
-        let coordinator =
-            Coordinator::new(storage_node, bucket_db, ec_config, 4, "us-east-1".to_string())
-                .unwrap();
+        let coordinator = Coordinator::new(
+            storage_node,
+            bucket_db,
+            ec_config,
+            4,
+            "us-east-1".to_string(),
+        )
+        .unwrap();
         let credentials = auth::CredentialStore::new();
         HttpFrontend {
             coordinator,
@@ -1649,10 +1674,7 @@ mod tests {
                     "x-amz-object-attributes".to_string(),
                     "ObjectParts".to_string(),
                 ),
-                (
-                    "x-amz-part-number-marker".to_string(),
-                    "xyz".to_string(),
-                ),
+                ("x-amz-part-number-marker".to_string(), "xyz".to_string()),
             ],
             body: vec![],
         };
@@ -1714,7 +1736,10 @@ mod tests {
             .map(|(_, v)| v.clone())
             .expect("UploadPart response must have ETag header");
         // ETag must be quoted
-        assert!(etag.starts_with('"') && etag.ends_with('"'), "ETag not quoted: {etag}");
+        assert!(
+            etag.starts_with('"') && etag.ends_with('"'),
+            "ETag not quoted: {etag}"
+        );
 
         // 3. CompleteMultipartUpload with quoted ETag from UploadPart response
         let complete_xml = format!(
@@ -1736,7 +1761,10 @@ mod tests {
         let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
         assert_eq!(resp.status_code, 200);
         let body = std::str::from_utf8(&resp.body).unwrap();
-        assert!(body.contains("<CompleteMultipartUploadResult"), "missing result element: {body}");
+        assert!(
+            body.contains("<CompleteMultipartUploadResult"),
+            "missing result element: {body}"
+        );
         assert!(body.contains("<Key>mykey</Key>"), "missing key: {body}");
         assert!(body.contains("<ETag>"), "missing etag: {body}");
     }

@@ -374,8 +374,7 @@ impl PgMetadataStore for FaultyPgStore {
         obj: &PutObjectMetaReq,
         parts: &[ObjectPartRecord],
     ) -> Result<(), MetadataError> {
-        self.inner
-            .complete_multipart_commit(upload_id, obj, parts)
+        self.inner.complete_multipart_commit(upload_id, obj, parts)
     }
 }
 

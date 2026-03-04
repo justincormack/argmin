@@ -1419,9 +1419,7 @@ pub fn list_parts_xml(
         xml_escape(upload_id),
     );
     if let Some(pm) = part_number_marker {
-        xml.push_str(&format!(
-            "<PartNumberMarker>{pm}</PartNumberMarker>"
-        ));
+        xml.push_str(&format!("<PartNumberMarker>{pm}</PartNumberMarker>"));
     } else {
         xml.push_str("<PartNumberMarker>0</PartNumberMarker>");
     }
@@ -1493,9 +1491,7 @@ pub fn parse_complete_multipart_upload_xml(body: &[u8]) -> Result<Vec<CompletePa
         let etag_end = part_content[etag_start..]
             .find("</ETag>")
             .ok_or_else(malformed)?;
-        let etag = xml_unescape(
-            part_content[etag_start..etag_start + etag_end].trim(),
-        );
+        let etag = xml_unescape(part_content[etag_start..etag_start + etag_end].trim());
 
         parts.push(CompletePart { part_number, etag });
     }
@@ -2530,13 +2526,7 @@ mod tests {
             max_parts: 2,
             part_number_marker: 0,
         };
-        let xml = get_object_attributes_xml(
-            &["ObjectParts"],
-            "\"x\"",
-            0,
-            &[],
-            Some(&parts_info),
-        );
+        let xml = get_object_attributes_xml(&["ObjectParts"], "\"x\"", 0, &[], Some(&parts_info));
         assert!(xml.contains("<ObjectParts>"));
         assert!(xml.contains("<PartsCount>3</PartsCount>"));
         assert!(xml.contains("<PartNumberMarker>0</PartNumberMarker>"));
@@ -2562,13 +2552,7 @@ mod tests {
             max_parts: 1000,
             part_number_marker: 0,
         };
-        let xml = get_object_attributes_xml(
-            &["ObjectParts"],
-            "\"x\"",
-            0,
-            &[],
-            Some(&parts_info),
-        );
+        let xml = get_object_attributes_xml(&["ObjectParts"], "\"x\"", 0, &[], Some(&parts_info));
         assert!(xml.contains("<IsTruncated>false</IsTruncated>"));
         assert!(!xml.contains("<NextPartNumberMarker>"));
         assert!(xml.contains("<PartsCount>1</PartsCount>"));
@@ -2745,8 +2729,7 @@ mod tests {
             next_key_marker: None,
             next_upload_id_marker: None,
         };
-        let xml =
-            list_multipart_uploads_xml("mybucket", Some("file"), None, None, 1000, &result);
+        let xml = list_multipart_uploads_xml("mybucket", Some("file"), None, None, 1000, &result);
         assert!(xml.contains("<Prefix>file</Prefix>"));
         assert!(xml.contains("<Key>file1.txt</Key>"));
         assert!(xml.contains("<UploadId>id1</UploadId>"));
@@ -2875,14 +2858,24 @@ mod tests {
 
     #[test]
     fn error_xml_no_such_upload() {
-        let xml = error_xml("NoSuchUpload", "no such upload: abc", "/bucket/key", "req-1");
+        let xml = error_xml(
+            "NoSuchUpload",
+            "no such upload: abc",
+            "/bucket/key",
+            "req-1",
+        );
         assert!(xml.contains("<Code>NoSuchUpload</Code>"));
         assert!(xml.contains("<Message>no such upload: abc</Message>"));
     }
 
     #[test]
     fn error_xml_invalid_part() {
-        let xml = error_xml("InvalidPart", "invalid part: part 3", "/bucket/key", "req-1");
+        let xml = error_xml(
+            "InvalidPart",
+            "invalid part: part 3",
+            "/bucket/key",
+            "req-1",
+        );
         assert!(xml.contains("<Code>InvalidPart</Code>"));
     }
 

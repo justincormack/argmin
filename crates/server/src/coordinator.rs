@@ -862,12 +862,10 @@ impl Coordinator {
             check_copy_source_conditions(src_cond, &src_etag, src_record.last_modified)?;
 
             let not_found = |e: ServerError| match e {
-                ServerError::Store(storage::StoreError::NotFound) => {
-                    ServerError::ObjectNotFound {
-                        bucket: src_bucket.to_string(),
-                        key: src_key.to_string(),
-                    }
-                }
+                ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
+                    bucket: src_bucket.to_string(),
+                    key: src_key.to_string(),
+                },
                 other => other,
             };
 
@@ -882,8 +880,14 @@ impl Coordinator {
                 let data = if src_record.size == 0 {
                     vec![]
                 } else {
-                    self.read_multipart_range(src_bucket, src_key, &obj_parts, 0, src_record.size as usize - 1)
-                        .map_err(not_found)?
+                    self.read_multipart_range(
+                        src_bucket,
+                        src_key,
+                        &obj_parts,
+                        0,
+                        src_record.size as usize - 1,
+                    )
+                    .map_err(not_found)?
                 };
 
                 let metadata = src_record
@@ -1320,10 +1324,7 @@ impl Coordinator {
     ///
     /// Uses the part's `shard_pg_id`, `part_okh`, `part_vid`, and EC config
     /// to locate and reconstruct the part data.
-    fn read_part_data(
-        &self,
-        part: &ObjectPartRecord,
-    ) -> Result<Vec<u8>, ServerError> {
+    fn read_part_data(&self, part: &ObjectPartRecord) -> Result<Vec<u8>, ServerError> {
         let pg = self.storage_node.get_pg(part.shard_pg_id)?;
         let k = part.ec_k as usize;
         let m = part.ec_m as usize;
@@ -1710,47 +1711,45 @@ impl Coordinator {
             m
         };
 
-        let object_parts =
-            if want_parts && record.data_layout == DataLayout::MultipartManifest {
-                let meta_pg = pgs.meta();
-                let all_parts =
-                    meta_pg.get_object_parts(bucket, key, record.version_id)?;
-                let total_parts_count = all_parts.len() as u32;
-                let marker = part_number_marker.unwrap_or(0);
+        let object_parts = if want_parts && record.data_layout == DataLayout::MultipartManifest {
+            let meta_pg = pgs.meta();
+            let all_parts = meta_pg.get_object_parts(bucket, key, record.version_id)?;
+            let total_parts_count = all_parts.len() as u32;
+            let marker = part_number_marker.unwrap_or(0);
 
-                let filtered: Vec<_> = all_parts
-                    .into_iter()
-                    .filter(|p| p.part_number > marker)
-                    .collect();
+            let filtered: Vec<_> = all_parts
+                .into_iter()
+                .filter(|p| p.part_number > marker)
+                .collect();
 
-                let is_truncated = filtered.len() > max_parts as usize;
-                let take_count = (max_parts as usize).min(filtered.len());
-                let page: Vec<ObjectPartEntry> = filtered
-                    .into_iter()
-                    .take(take_count)
-                    .map(|p| ObjectPartEntry {
-                        part_number: p.part_number,
-                        size: p.size,
-                    })
-                    .collect();
-
-                let next_part_number_marker = if is_truncated {
-                    Some(page.last().map_or(marker, |p| p.part_number))
-                } else {
-                    None
-                };
-
-                Some(ObjectPartsInfo {
-                    total_parts_count,
-                    parts: page,
-                    is_truncated,
-                    next_part_number_marker,
-                    max_parts,
-                    part_number_marker: marker,
+            let is_truncated = filtered.len() > max_parts as usize;
+            let take_count = (max_parts as usize).min(filtered.len());
+            let page: Vec<ObjectPartEntry> = filtered
+                .into_iter()
+                .take(take_count)
+                .map(|p| ObjectPartEntry {
+                    part_number: p.part_number,
+                    size: p.size,
                 })
+                .collect();
+
+            let next_part_number_marker = if is_truncated {
+                Some(page.last().map_or(marker, |p| p.part_number))
             } else {
                 None
             };
+
+            Some(ObjectPartsInfo {
+                total_parts_count,
+                parts: page,
+                is_truncated,
+                next_part_number_marker,
+                max_parts,
+                part_number_marker: marker,
+            })
+        } else {
+            None
+        };
 
         Ok(GetObjectAttributesResult {
             metadata,
@@ -1911,9 +1910,8 @@ impl Coordinator {
 
                 // Check delete conditions
                 if !cond.is_empty() {
-                    let etag_str = format_object_etag(
-                        &record.etag, record.etag_kind, record.parts_count,
-                    );
+                    let etag_str =
+                        format_object_etag(&record.etag, record.etag_kind, record.parts_count);
                     check_delete_conditions(cond, &etag_str, record.last_modified, record.size)?;
                 }
 
@@ -2242,11 +2240,7 @@ impl Coordinator {
                 version_id: record.version_id,
                 is_latest,
                 size: record.size,
-                etag: format_object_etag(
-                    &record.etag,
-                    record.etag_kind,
-                    record.parts_count,
-                ),
+                etag: format_object_etag(&record.etag, record.etag_kind, record.parts_count),
                 last_modified: record.last_modified,
                 is_delete_marker: record.status == 1,
             });
@@ -2427,8 +2421,7 @@ impl Coordinator {
 
             // Out of order: drop meta_pg, relock both in ascending order, revalidate.
             drop(meta_pg);
-            let (meta_pg, shard_guard) =
-                self.storage_node.lock_two_pgs(meta_pg_id, shard_pg_id)?;
+            let (meta_pg, shard_guard) = self.storage_node.lock_two_pgs(meta_pg_id, shard_pg_id)?;
 
             let upload = meta_pg.get_multipart_upload(upload_id)?;
             if upload.bucket != bucket || upload.key != key {
@@ -2746,7 +2739,9 @@ impl Coordinator {
         //    Completing → treat as NoSuchUpload (upload is being finalized).
         match meta_pg.set_upload_state(upload_id, UploadState::Aborting) {
             Ok(()) => {}
-            Err(storage::MetadataError::UploadNotInProgress { state }) if state == UploadState::Aborting as u8 => {
+            Err(storage::MetadataError::UploadNotInProgress { state })
+                if state == UploadState::Aborting as u8 =>
+            {
                 // Already aborting — continue cleanup idempotently.
             }
             Err(storage::MetadataError::UploadNotInProgress { .. }) => {
@@ -5687,10 +5682,7 @@ mod tests {
         let part = pg.get_multipart_part(&create.upload_id, 1).unwrap();
         assert_eq!(part.generation, 2); // 0, 1, 2
         assert_eq!(part.size, "writer-C".len() as u64);
-        assert_eq!(
-            format_etag(crc64::checksum(b"writer-C")),
-            etag3
-        );
+        assert_eq!(format_etag(crc64::checksum(b"writer-C")), etag3);
     }
 
     // --- CompleteMultipartUpload tests ---
@@ -5729,12 +5721,8 @@ mod tests {
         let big_part = vec![0xABu8; 5 * 1024 * 1024];
         let small_last = b"final-part";
 
-        let (upload_id, parts) = create_upload_with_parts(
-            &coord,
-            "bucket",
-            "key",
-            &[(1, &big_part), (2, small_last)],
-        );
+        let (upload_id, parts) =
+            create_upload_with_parts(&coord, "bucket", "key", &[(1, &big_part), (2, small_last)]);
 
         let result = coord
             .complete_multipart_upload("bucket", "key", &upload_id, &parts)
@@ -5752,7 +5740,9 @@ mod tests {
         assert_eq!(obj.size, big_part.len() as u64 + small_last.len() as u64);
 
         // object_parts should be committed.
-        let committed = pg.get_object_parts("bucket", "key", result.version_id).unwrap();
+        let committed = pg
+            .get_object_parts("bucket", "key", result.version_id)
+            .unwrap();
         assert_eq!(committed.len(), 2);
         assert_eq!(committed[0].part_number, 1);
         assert_eq!(committed[1].part_number, 2);
@@ -5768,12 +5758,8 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
-        let (upload_id, mut parts) = create_upload_with_parts(
-            &coord,
-            "bucket",
-            "key",
-            &[(1, b"data1"), (3, b"data3")],
-        );
+        let (upload_id, mut parts) =
+            create_upload_with_parts(&coord, "bucket", "key", &[(1, b"data1"), (3, b"data3")]);
 
         // Request completion with part 2 which was never uploaded.
         parts.insert(
@@ -5796,12 +5782,8 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
-        let (upload_id, mut parts) = create_upload_with_parts(
-            &coord,
-            "bucket",
-            "key",
-            &[(1, b"data1")],
-        );
+        let (upload_id, mut parts) =
+            create_upload_with_parts(&coord, "bucket", "key", &[(1, b"data1")]);
 
         // Tamper with the ETag.
         parts[0].etag = "\"ffffffffffffffff\"".to_string();
@@ -5818,12 +5800,8 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
-        let (upload_id, parts) = create_upload_with_parts(
-            &coord,
-            "bucket",
-            "key",
-            &[(1, b"data1"), (2, b"data2")],
-        );
+        let (upload_id, parts) =
+            create_upload_with_parts(&coord, "bucket", "key", &[(1, b"data1"), (2, b"data2")]);
 
         // Reverse the order.
         let reversed = vec![parts[1].clone(), parts[0].clone()];
@@ -5863,12 +5841,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         // A single part can be any size (it's the "final" part).
-        let (upload_id, parts) = create_upload_with_parts(
-            &coord,
-            "bucket",
-            "key",
-            &[(1, b"tiny")],
-        );
+        let (upload_id, parts) = create_upload_with_parts(&coord, "bucket", "key", &[(1, b"tiny")]);
 
         let result = coord
             .complete_multipart_upload("bucket", "key", &upload_id, &parts)
@@ -5900,12 +5873,8 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         // Upload two small parts.
-        let (upload_id, parts) = create_upload_with_parts(
-            &coord,
-            "bucket",
-            "key",
-            &[(1, b"small"), (2, b"last")],
-        );
+        let (upload_id, parts) =
+            create_upload_with_parts(&coord, "bucket", "key", &[(1, b"small"), (2, b"last")]);
 
         // First attempt fails because part 1 is too small.
         let err = coord
@@ -5938,12 +5907,8 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
-        let (upload_id, parts) = create_upload_with_parts(
-            &coord,
-            "bucket",
-            "key",
-            &[(1, b"data1")],
-        );
+        let (upload_id, parts) =
+            create_upload_with_parts(&coord, "bucket", "key", &[(1, b"data1")]);
 
         // Duplicate part number 1.
         let duped = vec![parts[0].clone(), parts[0].clone()];
@@ -5960,12 +5925,8 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         // First multipart upload to key.
-        let (upload_id1, parts1) = create_upload_with_parts(
-            &coord,
-            "bucket",
-            "key",
-            &[(1, b"first-upload")],
-        );
+        let (upload_id1, parts1) =
+            create_upload_with_parts(&coord, "bucket", "key", &[(1, b"first-upload")]);
         let result1 = coord
             .complete_multipart_upload("bucket", "key", &upload_id1, &parts1)
             .unwrap();
@@ -6002,12 +5963,8 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
-        let (upload_id, parts) = create_upload_with_parts(
-            &coord,
-            "bucket",
-            "key",
-            &[(1, b"data1")],
-        );
+        let (upload_id, parts) =
+            create_upload_with_parts(&coord, "bucket", "key", &[(1, b"data1")]);
         let result = coord
             .complete_multipart_upload("bucket", "key", &upload_id, &parts)
             .unwrap();
@@ -6032,12 +5989,8 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
         coord.put_bucket_versioning("bucket", 1).unwrap();
 
-        let (upload_id, parts) = create_upload_with_parts(
-            &coord,
-            "bucket",
-            "key",
-            &[(1, b"data1")],
-        );
+        let (upload_id, parts) =
+            create_upload_with_parts(&coord, "bucket", "key", &[(1, b"data1")]);
         let result = coord
             .complete_multipart_upload("bucket", "key", &upload_id, &parts)
             .unwrap();
@@ -6062,12 +6015,8 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
-        let (upload_id, _parts) = create_upload_with_parts(
-            &coord,
-            "bucket",
-            "key",
-            &[(1, b"part1"), (2, b"part2")],
-        );
+        let (upload_id, _parts) =
+            create_upload_with_parts(&coord, "bucket", "key", &[(1, b"part1"), (2, b"part2")]);
 
         coord
             .abort_multipart_upload("bucket", "key", &upload_id)
@@ -6083,7 +6032,9 @@ mod tests {
         );
 
         // ListMultipartUploads should be empty.
-        let uploads = coord.list_multipart_uploads("bucket", None, None, None, 100).unwrap();
+        let uploads = coord
+            .list_multipart_uploads("bucket", None, None, None, 100)
+            .unwrap();
         assert!(uploads.uploads.is_empty());
     }
 
@@ -6156,12 +6107,8 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         // Create and complete an upload.
-        let (upload_id, parts) = create_upload_with_parts(
-            &coord,
-            "bucket",
-            "key",
-            &[(1, b"data1")],
-        );
+        let (upload_id, parts) =
+            create_upload_with_parts(&coord, "bucket", "key", &[(1, b"data1")]);
         coord
             .complete_multipart_upload("bucket", "key", &upload_id, &parts)
             .unwrap();
@@ -6176,7 +6123,9 @@ mod tests {
         );
 
         // Object should still exist (visible in listing).
-        let list = coord.list_objects_v2("bucket", None, None, None, 100).unwrap();
+        let list = coord
+            .list_objects_v2("bucket", None, None, None, 100)
+            .unwrap();
         assert_eq!(list.objects.len(), 1);
         assert_eq!(list.objects[0].key, "key");
     }
@@ -6280,12 +6229,8 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
-        let (upload_id, complete_parts) = create_upload_with_parts(
-            &coord,
-            "bucket",
-            "key",
-            &[(1, b"hello")],
-        );
+        let (upload_id, complete_parts) =
+            create_upload_with_parts(&coord, "bucket", "key", &[(1, b"hello")]);
 
         let result = coord
             .list_parts("bucket", "key", &upload_id, None, 100)
@@ -6461,12 +6406,8 @@ mod tests {
         let part2 = make_part(0xBB, 100);
         let expected: Vec<u8> = [part1.as_slice(), part2.as_slice()].concat();
 
-        let result = create_completed_multipart_vec(
-            &coord,
-            "bucket",
-            "key",
-            &[(1, part1), (2, part2)],
-        );
+        let result =
+            create_completed_multipart_vec(&coord, "bucket", "key", &[(1, part1), (2, part2)]);
 
         let obj = coord
             .get_object("bucket", "key", None, &ReadCondition::default())
@@ -6483,12 +6424,7 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
-        create_completed_multipart_vec(
-            &coord,
-            "bucket",
-            "key",
-            &[(1, b"only-part".to_vec())],
-        );
+        create_completed_multipart_vec(&coord, "bucket", "key", &[(1, b"only-part".to_vec())]);
 
         let obj = coord
             .get_object("bucket", "key", None, &ReadCondition::default())
@@ -6506,12 +6442,8 @@ mod tests {
         let part2 = make_part(0xBB, 200);
         let total_size = part1.len() + part2.len();
 
-        let result = create_completed_multipart_vec(
-            &coord,
-            "bucket",
-            "key",
-            &[(1, part1), (2, part2)],
-        );
+        let result =
+            create_completed_multipart_vec(&coord, "bucket", "key", &[(1, part1), (2, part2)]);
 
         let head = coord
             .head_object("bucket", "key", None, &ReadCondition::default())
@@ -6530,12 +6462,7 @@ mod tests {
         let part1 = make_part(0xAA, MIN_PART);
         let part2 = make_part(0xBB, 100);
 
-        create_completed_multipart_vec(
-            &coord,
-            "bucket",
-            "key",
-            &[(1, part1), (2, part2)],
-        );
+        create_completed_multipart_vec(&coord, "bucket", "key", &[(1, part1), (2, part2)]);
 
         // Range within first part: bytes 10-19
         let range = coord
@@ -6597,12 +6524,7 @@ mod tests {
         let part1 = make_part(0xAA, MIN_PART);
         let part2 = make_part(0xBB, 100);
 
-        create_completed_multipart_vec(
-            &coord,
-            "bucket",
-            "key",
-            &[(1, part1), (2, part2)],
-        );
+        create_completed_multipart_vec(&coord, "bucket", "key", &[(1, part1), (2, part2)]);
 
         // Suffix range: last 50 bytes (all within part2)
         let range = coord
@@ -6628,12 +6550,7 @@ mod tests {
         let part2 = make_part(0xBB, 200);
         let expected: Vec<u8> = [part1.as_slice(), part2.as_slice()].concat();
 
-        create_completed_multipart_vec(
-            &coord,
-            "src-bucket",
-            "src-key",
-            &[(1, part1), (2, part2)],
-        );
+        create_completed_multipart_vec(&coord, "src-bucket", "src-key", &[(1, part1), (2, part2)]);
 
         // Copy multipart source to destination (creates inline object).
         coord
@@ -6663,12 +6580,7 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
-        create_completed_multipart_vec(
-            &coord,
-            "bucket",
-            "key",
-            &[(1, vec![])],
-        );
+        create_completed_multipart_vec(&coord, "bucket", "key", &[(1, vec![])]);
 
         let obj = coord
             .get_object("bucket", "key", None, &ReadCondition::default())
@@ -6686,12 +6598,7 @@ mod tests {
         let part1 = make_part(0xAA, MIN_PART);
         let expected = part1.clone();
 
-        create_completed_multipart_vec(
-            &coord,
-            "bucket",
-            "key",
-            &[(1, part1), (2, vec![])],
-        );
+        create_completed_multipart_vec(&coord, "bucket", "key", &[(1, part1), (2, vec![])]);
 
         let obj = coord
             .get_object("bucket", "key", None, &ReadCondition::default())
@@ -6706,12 +6613,7 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
-        create_completed_multipart_vec(
-            &coord,
-            "bucket",
-            "key",
-            &[(1, vec![])],
-        );
+        create_completed_multipart_vec(&coord, "bucket", "key", &[(1, vec![])]);
 
         let head = coord
             .head_object("bucket", "key", None, &ReadCondition::default())
@@ -6726,12 +6628,7 @@ mod tests {
         coord.create_bucket("src").unwrap();
         coord.create_bucket("dst").unwrap();
 
-        create_completed_multipart_vec(
-            &coord,
-            "src",
-            "key",
-            &[(1, vec![])],
-        );
+        create_completed_multipart_vec(&coord, "src", "key", &[(1, vec![])]);
 
         coord
             .copy_object(
@@ -6763,12 +6660,8 @@ mod tests {
         let part1 = make_part(0xAA, MIN_PART);
         let part2 = make_part(0xBB, 100);
 
-        let result = create_completed_multipart_vec(
-            &coord,
-            "bucket",
-            "key",
-            &[(1, part1), (2, part2)],
-        );
+        let result =
+            create_completed_multipart_vec(&coord, "bucket", "key", &[(1, part1), (2, part2)]);
 
         // Get the real manifest, then replace with only part 2 (gap: part 1 missing).
         let meta_pg_id = derive_pg("bucket", "key", coord.pg_count);

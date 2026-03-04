@@ -714,10 +714,7 @@ fn test_object_copy_versioning_multipart_upload() {
 
         // Clean up: delete both versions
         let dst_version = copy_resp.version_id().unwrap().to_string();
-        for (key, vid) in [
-            (src_key, src_version),
-            (dst_key, dst_version),
-        ] {
+        for (key, vid) in [(src_key, src_version), (dst_key, dst_version)] {
             client
                 .delete_object()
                 .bucket(&bucket)

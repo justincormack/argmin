@@ -96,7 +96,11 @@ pub enum ServerError {
     InvalidPartOrder,
 
     #[error("entity too small: part {part_number} is {size} bytes (min {min})")]
-    EntityTooSmall { part_number: u32, size: u64, min: u64 },
+    EntityTooSmall {
+        part_number: u32,
+        size: u64,
+        min: u64,
+    },
 
     #[error("not implemented: {feature}")]
     NotImplemented { feature: String },
@@ -488,7 +492,10 @@ mod tests {
 
     #[test]
     fn s3_error_code_invalid_part_order() {
-        assert_eq!(ServerError::InvalidPartOrder.s3_error_code(), "InvalidPartOrder");
+        assert_eq!(
+            ServerError::InvalidPartOrder.s3_error_code(),
+            "InvalidPartOrder"
+        );
         assert_eq!(ServerError::InvalidPartOrder.http_status(), 400);
     }
 

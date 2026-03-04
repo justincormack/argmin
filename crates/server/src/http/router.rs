@@ -347,24 +347,20 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
                 key,
             })
         }
-        ("PUT", Some(key)) if has_query_key(query, "partNumber") => {
-            Ok(S3Operation::UploadPart {
-                bucket: bucket.to_string(),
-                key,
-            })
-        }
+        ("PUT", Some(key)) if has_query_key(query, "partNumber") => Ok(S3Operation::UploadPart {
+            bucket: bucket.to_string(),
+            key,
+        }),
         ("DELETE", Some(key)) if has_query_key(query, "uploadId") => {
             Ok(S3Operation::AbortMultipartUpload {
                 bucket: bucket.to_string(),
                 key,
             })
         }
-        ("GET", Some(key)) if has_query_key(query, "uploadId") => {
-            Ok(S3Operation::ListParts {
-                bucket: bucket.to_string(),
-                key,
-            })
-        }
+        ("GET", Some(key)) if has_query_key(query, "uploadId") => Ok(S3Operation::ListParts {
+            bucket: bucket.to_string(),
+            key,
+        }),
 
         // Object-level operations
         ("PUT", Some(key)) => Ok(S3Operation::PutObject {

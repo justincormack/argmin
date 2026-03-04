@@ -27,11 +27,7 @@ async fn cleanup(bucket: &str, keys: &[&str]) {
 }
 
 /// Helper: create multipart upload, upload parts, complete, return (etag, version_id).
-async fn do_multipart_upload(
-    bucket: &str,
-    key: &str,
-    parts_data: &[Vec<u8>],
-) -> String {
+async fn do_multipart_upload(bucket: &str, key: &str, parts_data: &[Vec<u8>]) -> String {
     let client = CTX.client();
 
     let create = client
@@ -178,12 +174,7 @@ fn test_multipart_upload_abort() {
             .unwrap();
 
         // The object should not exist
-        let result = client
-            .get_object()
-            .bucket(&bucket)
-            .key(key)
-            .send()
-            .await;
+        let result = client.get_object().bucket(&bucket).key(key).send().await;
         assert!(result.is_err());
 
         cleanup(&bucket, &[]).await;
@@ -1114,7 +1105,10 @@ fn test_multipart_composite_etag() {
         let part_data = vec![b'e'; 256];
         let etag = do_multipart_upload(&bucket, key, &[part_data]).await;
         // Multipart ETags have the format "hex-N" where N is part count
-        assert!(etag.contains("-1"), "expected composite ETag with -1 suffix, got: {etag}");
+        assert!(
+            etag.contains("-1"),
+            "expected composite ETag with -1 suffix, got: {etag}"
+        );
 
         cleanup(&bucket, &[key]).await;
     });
