@@ -7,7 +7,7 @@
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::CompletedMultipartUpload;
 use aws_sdk_s3::types::CompletedPart;
-use s3_tests::{assert_s3_err_code, unique_bucket, CTX};
+use s3_tests::{assert_s3_err_code, err_status, unique_bucket, CTX};
 
 const PART_SIZE: usize = 5 * 1024 * 1024; // 5 MB minimum part size
 
@@ -1261,15 +1261,215 @@ fn test_multipart_upload_multiple_sizes() {
 // ── PartNumber GET semantics ────────────────────────────────────────
 
 #[test]
-#[ignore = "not implemented: PartNumber GET query parameter"]
 fn test_multipart_get_part() {
-    s3_tests::run(async {});
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "mymultipart";
+
+        let part_sizes = [PART_SIZE, PART_SIZE, PART_SIZE, 1024 * 1024];
+        let parts_data: Vec<Vec<u8>> = part_sizes
+            .iter()
+            .enumerate()
+            .map(|(i, &sz)| vec![(i as u8) + b'A'; sz])
+            .collect();
+
+        let etag = do_multipart_upload(&bucket, key, &parts_data).await;
+        let part_count = part_sizes.len() as i32;
+
+        // HeadObject + GetObject for each valid part
+        let mut data_offset = 0usize;
+        for (i, data) in parts_data.iter().enumerate() {
+            let pn = (i + 1) as i32;
+
+            // HeadObject with partNumber
+            let head = client
+                .head_object()
+                .bucket(&bucket)
+                .key(key)
+                .part_number(pn)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                head.parts_count(),
+                Some(part_count),
+                "PartsCount for part {pn}"
+            );
+            assert_eq!(
+                head.e_tag().unwrap(),
+                etag,
+                "ETag mismatch on HEAD part {pn}"
+            );
+
+            // GetObject with partNumber
+            let resp = client
+                .get_object()
+                .bucket(&bucket)
+                .key(key)
+                .part_number(pn)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.parts_count(),
+                Some(part_count),
+                "PartsCount for GET part {pn}"
+            );
+            assert_eq!(
+                resp.e_tag().unwrap(),
+                etag,
+                "ETag mismatch on GET part {pn}"
+            );
+            assert_eq!(
+                resp.content_length(),
+                Some(data.len() as i64),
+                "ContentLength for part {pn}"
+            );
+
+            let body = resp.body.collect().await.unwrap().into_bytes();
+            assert_eq!(&body[..], &data[..], "data mismatch for part {pn}");
+            data_offset += data.len();
+        }
+        let _ = data_offset; // consumed all data
+
+        // Out-of-range partNumber on GET → error
+        // Ceph returns 400 InvalidPart; AWS docs suggest 416.
+        // Assert the status we currently implement; live-S3 run will detect divergence.
+        let result = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .part_number(part_count + 1)
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "InvalidPart");
+
+        // Out-of-range partNumber on HEAD → same error
+        let result = client
+            .head_object()
+            .bucket(&bucket)
+            .key(key)
+            .part_number(part_count + 1)
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+
+        cleanup(&bucket, &[key]).await;
+    });
 }
 
 #[test]
-#[ignore = "not implemented: PartNumber GET query parameter"]
 fn test_non_multipart_get_part() {
-    s3_tests::run(async {});
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "singlepart";
+
+        let resp = client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from(b"body".to_vec()))
+            .send()
+            .await
+            .unwrap();
+        let etag = resp.e_tag().unwrap().to_string();
+
+        // GET PartNumber > 1 → error
+        let result = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .part_number(2)
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "InvalidPart");
+
+        // HEAD PartNumber > 1 → same error
+        let result = client
+            .head_object()
+            .bucket(&bucket)
+            .key(key)
+            .part_number(2)
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+
+        // PartNumber = 1 → returns entire object
+        let resp = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .part_number(1)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.e_tag().unwrap(), etag);
+        let body = resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&body[..], b"body");
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+// ── Zero-byte final part with partNumber ────────────────────────────
+
+#[test]
+fn test_multipart_get_zero_byte_final_part() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "zerobyte-final";
+
+        let part1 = vec![b'X'; PART_SIZE];
+        let part2 = vec![]; // zero-byte final part
+        let etag = do_multipart_upload(&bucket, key, &[part1.clone(), part2]).await;
+
+        // GET partNumber=1 → normal data
+        let resp = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .part_number(1)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.parts_count(), Some(2));
+        assert_eq!(resp.e_tag().unwrap(), etag);
+        let body = resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(body.len(), PART_SIZE);
+
+        // GET partNumber=2 → zero-byte part, should not panic
+        let resp = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .part_number(2)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.parts_count(), Some(2));
+        assert_eq!(resp.content_length(), Some(0));
+        let body = resp.body.collect().await.unwrap().into_bytes();
+        assert!(body.is_empty());
+
+        // HEAD partNumber=2 → zero-byte
+        let head = client
+            .head_object()
+            .bucket(&bucket)
+            .key(key)
+            .part_number(2)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(head.parts_count(), Some(2));
+        assert_eq!(head.content_length(), Some(0));
+
+        cleanup(&bucket, &[key]).await;
+    });
 }
 
 // ── UploadPartCopy (not implemented) ────────────────────────────────

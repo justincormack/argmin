@@ -679,4 +679,137 @@ fn test_multipart_use_cksum_helper_sha1() {
     });
 }
 
+// ── test_get_object_part_with_checksum ────────────────────────────────
+// Multipart CRC32 upload, then GET each part individually and verify
+// data + per-part checksum header.
+
+#[test]
+fn test_get_object_part_with_checksum() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "partnum-cksum";
+
+        // Create multipart upload with CRC32
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .checksum_algorithm(ChecksumAlgorithm::Crc32)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap();
+
+        let parts_data: Vec<Vec<u8>> = vec![
+            vec![b'X'; PART_SIZE],
+            vec![b'Y'; PART_SIZE],
+            vec![b'Z'; 1024],
+        ];
+
+        // Upload parts with CRC32 checksums
+        let mut completed_parts = Vec::new();
+        let mut expected_checksums = Vec::new();
+        for (i, data) in parts_data.iter().enumerate() {
+            let part_number = (i + 1) as i32;
+            let crc = checksum_crc32(data);
+            let resp = client
+                .upload_part()
+                .bucket(&bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .part_number(part_number)
+                .body(ByteStream::from(data.clone()))
+                .checksum_algorithm(ChecksumAlgorithm::Crc32)
+                .checksum_crc32(&crc)
+                .send()
+                .await
+                .unwrap();
+            let returned_crc = resp.checksum_crc32().unwrap().to_string();
+            assert_eq!(returned_crc, crc);
+            expected_checksums.push(crc.clone());
+            completed_parts.push(
+                CompletedPart::builder()
+                    .e_tag(resp.e_tag().unwrap())
+                    .part_number(part_number)
+                    .checksum_crc32(&crc)
+                    .build(),
+            );
+        }
+
+        // Complete
+        client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .set_parts(Some(completed_parts))
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        // GET each part and verify data + checksum (no ChecksumMode needed)
+        for (i, data) in parts_data.iter().enumerate() {
+            let part_number = (i + 1) as i32;
+            let resp = client
+                .get_object()
+                .bucket(&bucket)
+                .key(key)
+                .part_number(part_number)
+                .send()
+                .await
+                .unwrap();
+
+            // Verify parts_count
+            assert_eq!(
+                resp.parts_count(),
+                Some(3),
+                "parts_count for part {}",
+                part_number
+            );
+
+            // Extract checksum before consuming body
+            let got_crc = resp
+                .checksum_crc32()
+                .expect("expected per-part CRC32 checksum without ENABLED")
+                .to_string();
+
+            // Verify data matches
+            let body = resp.body.collect().await.unwrap().into_bytes();
+            assert_eq!(
+                body.len(),
+                data.len(),
+                "body length mismatch for part {}",
+                part_number
+            );
+            assert_eq!(
+                &body[..],
+                &data[..],
+                "data mismatch for part {}",
+                part_number
+            );
+
+            // Verify per-part CRC32 checksum
+            assert_eq!(
+                got_crc, expected_checksums[i],
+                "checksum mismatch for part {}",
+                part_number
+            );
+        }
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+/// CRC32 of data, base64-encoded.
+fn checksum_crc32(data: &[u8]) -> String {
+    use base64::Engine;
+    let crc = checksum::crc32::checksum(data);
+    base64::engine::general_purpose::STANDARD.encode(crc.to_be_bytes())
+}
+
 // GetObjectAttributes checksum tests moved to object_attributes.rs

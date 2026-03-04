@@ -10,6 +10,7 @@ server = { path = "../server" }
 auth = { path = "../auth" }
 ec = { path = "../ec" }
 storage = { path = "../storage" }
+checksum = { path = "../checksum" }
 
 # AWS SDK (independent S3 client for validation)
 aws-sdk-s3 = "1"

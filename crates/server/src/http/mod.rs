@@ -492,7 +492,32 @@ impl HttpFrontend {
                 self.authorize_bucket_read(auth, &bucket)?;
                 let cond = read_condition_from_headers(req);
                 let vid = parse_version_id(req)?;
-                if let Some(range_header) = req.header("range") {
+                // partNumber takes precedence over Range header (AWS behavior)
+                if let Some(pn_str) = req.query_param("partNumber") {
+                    let part_number: u32 =
+                        pn_str.parse().map_err(|_| ServerError::InvalidArgument {
+                            reason: "partNumber must be a positive integer".into(),
+                        })?;
+                    if part_number == 0 {
+                        return Err(ServerError::InvalidArgument {
+                            reason: "partNumber must be >= 1".into(),
+                        });
+                    }
+                    let result =
+                        self.coordinator
+                            .get_object_part(&bucket, &key, vid, part_number, &cond)?;
+                    let tags = result.tags.clone();
+                    let mut resp = S3Response::get_object_part(result);
+                    apply_response_overrides(&mut resp, req);
+                    if let Some(tags_xml) = tags {
+                        let count = xml::count_tags_in_xml(&tags_xml);
+                        if count > 0 {
+                            resp.headers
+                                .push(("x-amz-tagging-count".to_string(), count.to_string()));
+                        }
+                    }
+                    Ok(resp)
+                } else if let Some(range_header) = req.header("range") {
                     let byte_range = crate::range::ByteRange::parse(range_header)?;
                     match self
                         .coordinator
@@ -545,18 +570,45 @@ impl HttpFrontend {
                 self.authorize_bucket_read(auth, &bucket)?;
                 let cond = read_condition_from_headers(req);
                 let vid = parse_version_id(req)?;
-                let result = self.coordinator.head_object(&bucket, &key, vid, &cond)?;
-                let checksum_mode = req.header("x-amz-checksum-mode");
-                let mut resp = S3Response::head_object(&result, checksum_mode);
-                // Add x-amz-tagging-count if the object has tags
-                if let Some(tags_xml) = &result.tags {
-                    let count = xml::count_tags_in_xml(tags_xml);
-                    if count > 0 {
-                        resp.headers
-                            .push(("x-amz-tagging-count".to_string(), count.to_string()));
+                if let Some(pn_str) = req.query_param("partNumber") {
+                    let part_number: u32 =
+                        pn_str.parse().map_err(|_| ServerError::InvalidArgument {
+                            reason: "partNumber must be a positive integer".into(),
+                        })?;
+                    if part_number == 0 {
+                        return Err(ServerError::InvalidArgument {
+                            reason: "partNumber must be >= 1".into(),
+                        });
                     }
+                    let result = self.coordinator.head_object_part(
+                        &bucket,
+                        &key,
+                        vid,
+                        part_number,
+                        &cond,
+                    )?;
+                    let mut resp = S3Response::head_object_part(&result);
+                    if let Some(tags_xml) = &result.tags {
+                        let count = xml::count_tags_in_xml(tags_xml);
+                        if count > 0 {
+                            resp.headers
+                                .push(("x-amz-tagging-count".to_string(), count.to_string()));
+                        }
+                    }
+                    Ok(resp)
+                } else {
+                    let result = self.coordinator.head_object(&bucket, &key, vid, &cond)?;
+                    let checksum_mode = req.header("x-amz-checksum-mode");
+                    let mut resp = S3Response::head_object(&result, checksum_mode);
+                    if let Some(tags_xml) = &result.tags {
+                        let count = xml::count_tags_in_xml(tags_xml);
+                        if count > 0 {
+                            resp.headers
+                                .push(("x-amz-tagging-count".to_string(), count.to_string()));
+                        }
+                    }
+                    Ok(resp)
                 }
-                Ok(resp)
             }
             S3Operation::GetObjectAttributes { bucket, key } => {
                 self.authorize_bucket_read(auth, &bucket)?;
@@ -1798,14 +1850,8 @@ mod tests {
             path: String::new(),
             query_string: format!("uploadId={upload_id}"),
             headers: vec![
-                (
-                    "x-amz-checksum-algorithm".to_string(),
-                    "CRC32".to_string(),
-                ),
-                (
-                    "x-amz-checksum-algorithm".to_string(),
-                    "SHA256".to_string(),
-                ),
+                ("x-amz-checksum-algorithm".to_string(), "CRC32".to_string()),
+                ("x-amz-checksum-algorithm".to_string(), "SHA256".to_string()),
                 ("x-amz-checksum-crc32".to_string(), "AAAAAA==".to_string()),
             ],
             body: xml.into_bytes(),
@@ -2697,14 +2743,8 @@ mod tests {
             path: String::new(),
             query_string: format!("partNumber=1&uploadId={upload_id}"),
             headers: vec![
-                (
-                    "x-amz-checksum-algorithm".to_string(),
-                    "CRC32".to_string(),
-                ),
-                (
-                    "x-amz-checksum-algorithm".to_string(),
-                    "SHA256".to_string(),
-                ),
+                ("x-amz-checksum-algorithm".to_string(), "CRC32".to_string()),
+                ("x-amz-checksum-algorithm".to_string(), "SHA256".to_string()),
                 ("x-amz-checksum-crc32".to_string(), "AAAAAA==".to_string()),
             ],
             body: vec![1, 2, 3, 4],
@@ -2718,5 +2758,332 @@ mod tests {
             Err(e) => panic!("expected InvalidRequest, got {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
+    }
+
+    // ── GET ?partNumber=N tests ─────────────────────────────────────
+
+    /// Helper: do a full multipart upload through the HTTP frontend.
+    /// When `algo` is set, computes and includes per-part checksums.
+    fn do_multipart_upload(
+        fe: &HttpFrontend,
+        bucket: &str,
+        key: &str,
+        parts: &[(u32, Vec<u8>)],
+        algo: Option<&str>,
+    ) {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let upload_id = create_upload_with_checksum(fe, bucket, key, algo);
+        let mut part_info: Vec<(u32, String, Option<String>)> = Vec::new();
+        for (part_number, data) in parts {
+            let mut headers = Vec::new();
+            let mut checksum_b64 = None;
+            if let Some(a) = algo {
+                let algo_enum = storage::ChecksumAlgorithm::from_str(a).unwrap();
+                let raw: Vec<u8> = match algo_enum {
+                    storage::ChecksumAlgorithm::Crc32 => {
+                        checksum::crc32::checksum(data).to_be_bytes().to_vec()
+                    }
+                    storage::ChecksumAlgorithm::Crc32c => {
+                        checksum::crc32c::checksum(data).to_be_bytes().to_vec()
+                    }
+                    _ => unimplemented!("test only supports CRC32/CRC32C"),
+                };
+                let encoded = b64.encode(&raw);
+                headers.push((algo_enum.header_name().to_string(), encoded.clone()));
+                checksum_b64 = Some(encoded);
+            }
+            let req = S3Request {
+                method: String::new(),
+                path: String::new(),
+                query_string: format!("partNumber={part_number}&uploadId={upload_id}"),
+                headers,
+                body: data.clone(),
+            };
+            let op = S3Operation::UploadPart {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+            };
+            let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
+            let etag = resp
+                .headers
+                .iter()
+                .find(|(k, _)| k == "ETag")
+                .map(|(_, v)| v.clone())
+                .unwrap();
+            part_info.push((*part_number, etag, checksum_b64));
+        }
+        let mut xml_parts = String::new();
+        for (pn, etag, cksum) in &part_info {
+            xml_parts.push_str(&format!(
+                "<Part><PartNumber>{pn}</PartNumber><ETag>{etag}</ETag>"
+            ));
+            if let (Some(a), Some(val)) = (algo, cksum) {
+                let algo_enum = storage::ChecksumAlgorithm::from_str(a).unwrap();
+                let elem = algo_enum.xml_element_name();
+                xml_parts.push_str(&format!("<{elem}>{val}</{elem}>"));
+            }
+            xml_parts.push_str("</Part>");
+        }
+        let xml = format!("<CompleteMultipartUpload>{xml_parts}</CompleteMultipartUpload>");
+        let req = S3Request {
+            method: String::new(),
+            path: String::new(),
+            query_string: format!("uploadId={upload_id}"),
+            headers: vec![],
+            body: xml.into_bytes(),
+        };
+        let op = S3Operation::CompleteMultipartUpload {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+        };
+        let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
+        assert_eq!(resp.status_code, 200);
+    }
+
+    #[test]
+    fn get_object_part_multipart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+
+        // 5 MiB minimum for non-final parts
+        let part1 = vec![0xAA; 5 * 1024 * 1024];
+        let part2 = vec![0xBB; 5 * 1024 * 1024];
+        let part3 = vec![0xCC; 100];
+        do_multipart_upload(
+            &fe,
+            "mybucket",
+            "k",
+            &[(1, part1.clone()), (2, part2.clone()), (3, part3.clone())],
+            None,
+        );
+
+        // GET partNumber=2
+        let req = make_req("partNumber=2");
+        let op = S3Operation::GetObject {
+            bucket: "mybucket".to_string(),
+            key: "k".to_string(),
+        };
+        let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
+        assert_eq!(resp.status_code, 206);
+
+        // Verify data
+        assert_eq!(resp.body, part2);
+
+        // Verify Content-Range
+        let content_range = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k == "Content-Range")
+            .map(|(_, v)| v.as_str())
+            .unwrap();
+        let total = 5 * 1024 * 1024 + 5 * 1024 * 1024 + 100;
+        let start = 5 * 1024 * 1024;
+        let end = 2 * 5 * 1024 * 1024 - 1;
+        assert_eq!(content_range, format!("bytes {start}-{end}/{total}"));
+
+        // Verify x-amz-mp-parts-count
+        let parts_count = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k == "x-amz-mp-parts-count")
+            .map(|(_, v)| v.as_str())
+            .unwrap();
+        assert_eq!(parts_count, "3");
+    }
+
+    #[test]
+    fn get_object_part_invalid_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+
+        // PUT a simple object
+        let req = S3Request {
+            method: String::new(),
+            path: String::new(),
+            query_string: String::new(),
+            headers: vec![],
+            body: b"hello".to_vec(),
+        };
+        let op = S3Operation::PutObject {
+            bucket: "mybucket".to_string(),
+            key: "k".to_string(),
+        };
+        fe.dispatch_routed(&req, &test_auth(), op).unwrap();
+
+        // partNumber=0 → InvalidArgument
+        let req = make_req("partNumber=0");
+        let op = S3Operation::GetObject {
+            bucket: "mybucket".to_string(),
+            key: "k".to_string(),
+        };
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::InvalidArgument { .. }) => {}
+            Err(e) => panic!("expected InvalidArgument, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn get_object_part_out_of_range() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+
+        let part1 = vec![0xAA; 5 * 1024 * 1024];
+        let part2 = vec![0xBB; 5 * 1024 * 1024];
+        let part3 = vec![0xCC; 100];
+        do_multipart_upload(
+            &fe,
+            "mybucket",
+            "k",
+            &[(1, part1), (2, part2), (3, part3)],
+            None,
+        );
+
+        // partNumber=99 on a 3-part object → 400 InvalidPart
+        let req = make_req("partNumber=99");
+        let op = S3Operation::GetObject {
+            bucket: "mybucket".to_string(),
+            key: "k".to_string(),
+        };
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::InvalidPart { part_number: 99 }) => {}
+            Err(e) => panic!("expected InvalidPart, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn get_object_part_non_multipart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+
+        let data = b"hello world";
+        let req = S3Request {
+            method: String::new(),
+            path: String::new(),
+            query_string: String::new(),
+            headers: vec![],
+            body: data.to_vec(),
+        };
+        let op = S3Operation::PutObject {
+            bucket: "mybucket".to_string(),
+            key: "k".to_string(),
+        };
+        fe.dispatch_routed(&req, &test_auth(), op).unwrap();
+
+        // partNumber=1 on inline object → 206 with full data
+        let req = make_req("partNumber=1");
+        let op = S3Operation::GetObject {
+            bucket: "mybucket".to_string(),
+            key: "k".to_string(),
+        };
+        let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
+        assert_eq!(resp.status_code, 206);
+        assert_eq!(resp.body, data);
+
+        let parts_count = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k == "x-amz-mp-parts-count")
+            .map(|(_, v)| v.as_str())
+            .unwrap();
+        assert_eq!(parts_count, "1");
+
+        let content_range = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k == "Content-Range")
+            .map(|(_, v)| v.as_str())
+            .unwrap();
+        assert_eq!(
+            content_range,
+            format!("bytes 0-{}/{}", data.len() - 1, data.len())
+        );
+    }
+
+    #[test]
+    fn get_object_part_non_multipart_out_of_range() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+
+        let req = S3Request {
+            method: String::new(),
+            path: String::new(),
+            query_string: String::new(),
+            headers: vec![],
+            body: b"hello".to_vec(),
+        };
+        let op = S3Operation::PutObject {
+            bucket: "mybucket".to_string(),
+            key: "k".to_string(),
+        };
+        fe.dispatch_routed(&req, &test_auth(), op).unwrap();
+
+        // partNumber=2 on non-multipart → 400 InvalidPart
+        let req = make_req("partNumber=2");
+        let op = S3Operation::GetObject {
+            bucket: "mybucket".to_string(),
+            key: "k".to_string(),
+        };
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::InvalidPart { part_number: 2 }) => {}
+            Err(e) => panic!("expected InvalidPart, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn get_object_part_with_checksum() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+
+        let part1 = vec![0xAA; 5 * 1024 * 1024];
+        let part2 = vec![0xBB; 100];
+        do_multipart_upload(
+            &fe,
+            "mybucket",
+            "k",
+            &[(1, part1), (2, part2)],
+            Some("CRC32"),
+        );
+
+        // GET partNumber=1 — checksum always emitted for part GETs
+        let req = make_req("partNumber=1");
+        let op = S3Operation::GetObject {
+            bucket: "mybucket".to_string(),
+            key: "k".to_string(),
+        };
+        let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
+        assert_eq!(resp.status_code, 206);
+
+        // Should have per-part checksum header (always, not just with ENABLED)
+        let has_checksum = resp
+            .headers
+            .iter()
+            .any(|(k, _)| k == "x-amz-checksum-crc32");
+        assert!(has_checksum, "expected x-amz-checksum-crc32 header");
+
+        // Should also have checksum-type header
+        let has_type = resp.headers.iter().any(|(k, _)| k == "x-amz-checksum-type");
+        assert!(has_type, "expected x-amz-checksum-type header");
     }
 }

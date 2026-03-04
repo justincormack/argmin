@@ -1,8 +1,9 @@
 /// Build HTTP responses for S3 operations.
 use crate::coordinator::{
-    CopyObjectResult, DeleteObjectResult, DeleteObjectsResult, GetObjectRangeResult,
-    GetObjectResult, HeadObjectResult, ListMultipartUploadsResult, ListObjectVersionsResult,
-    ListObjectsResult, ListPartsResult, PutObjectResult,
+    CopyObjectResult, DeleteObjectResult, DeleteObjectsResult, GetObjectPartResult,
+    GetObjectRangeResult, GetObjectResult, HeadObjectPartResult, HeadObjectResult,
+    ListMultipartUploadsResult, ListObjectVersionsResult, ListObjectsResult, ListPartsResult,
+    PutObjectResult,
 };
 use crate::error::ServerError;
 use storage::{BucketInfo, ChecksumAlgorithm, ChecksumType};
@@ -219,6 +220,58 @@ impl S3Response {
         resp
     }
 
+    /// Build a response for HeadObject with partNumber.
+    /// Returns 200 with Content-Length of the part and x-amz-mp-parts-count.
+    pub fn head_object_part(result: &HeadObjectPartResult) -> Self {
+        let mut resp = Self::new(200)
+            .header("ETag", &result.etag)
+            .header("Content-Length", &result.part_size.to_string())
+            .header("Last-Modified", &format_http_date(result.last_modified))
+            .header("Accept-Ranges", "bytes")
+            .header("x-amz-mp-parts-count", &result.parts_count.to_string());
+        if result.version_id != 0 {
+            let vid = format_version_id(result.version_id);
+            resp = resp.header("x-amz-version-id", &vid);
+        }
+
+        if let Some(ct) = result.metadata.get("content-type") {
+            resp = resp.header("Content-Type", ct);
+        } else {
+            resp = resp.header("Content-Type", "application/octet-stream");
+        }
+        if let Some(ce) = result.metadata.get("content-encoding") {
+            resp = resp.header("Content-Encoding", ce);
+        }
+        if let Some(cc) = result.metadata.get("cache-control") {
+            resp = resp.header("Cache-Control", cc);
+        }
+        if let Some(cd) = result.metadata.get("content-disposition") {
+            resp = resp.header("Content-Disposition", cd);
+        }
+        if let Some(cl) = result.metadata.get("content-language") {
+            resp = resp.header("Content-Language", cl);
+        }
+        if let Some(ex) = result.metadata.get("expires") {
+            resp = resp.header("Expires", ex);
+        }
+
+        for entry in &result.metadata.entries {
+            if entry.key.starts_with("x-amz-meta-") {
+                resp = resp.header(&entry.key, &entry.value);
+            }
+        }
+
+        // Per-part checksum (always emitted for part-level requests)
+        if let Some((header_name, b64_value)) = &result.checksum {
+            resp = resp.header(header_name, b64_value);
+        }
+        if let Some(ct) = result.metadata.get("x-amz-checksum-type") {
+            resp = resp.header("x-amz-checksum-type", ct);
+        }
+
+        resp
+    }
+
     /// Build a response for a successful range GetObject (206 Partial Content).
     pub fn get_object_range(result: GetObjectRangeResult) -> Self {
         let content_range = format!(
@@ -260,6 +313,68 @@ impl S3Response {
             if entry.key.starts_with("x-amz-meta-") {
                 resp = resp.header(&entry.key, &entry.value);
             }
+        }
+
+        resp.data_body(result.data)
+    }
+
+    /// Build a response for a part-level GetObject (206 Partial Content).
+    /// Per-part checksum and checksum-type are always emitted (Ceph/AWS
+    /// return them without requiring ChecksumMode=ENABLED on part GETs).
+    pub fn get_object_part(result: GetObjectPartResult) -> Self {
+        let mut resp = Self::new(206)
+            .header("ETag", &result.etag)
+            .header("Last-Modified", &format_http_date(result.last_modified))
+            .header("Accept-Ranges", "bytes")
+            .header("x-amz-mp-parts-count", &result.parts_count.to_string());
+        // Only emit Content-Range for non-empty parts; a zero-byte part has
+        // no valid byte range to express.
+        if !result.data.is_empty() {
+            let content_range = format!(
+                "bytes {}-{}/{}",
+                result.part_start, result.part_end, result.size
+            );
+            resp = resp.header("Content-Range", &content_range);
+        }
+        if result.version_id != 0 {
+            let vid = format_version_id(result.version_id);
+            resp = resp.header("x-amz-version-id", &vid);
+        }
+
+        if let Some(ct) = result.metadata.get("content-type") {
+            resp = resp.header("Content-Type", ct);
+        } else {
+            resp = resp.header("Content-Type", "application/octet-stream");
+        }
+        if let Some(ce) = result.metadata.get("content-encoding") {
+            resp = resp.header("Content-Encoding", ce);
+        }
+        if let Some(cc) = result.metadata.get("cache-control") {
+            resp = resp.header("Cache-Control", cc);
+        }
+        if let Some(cd) = result.metadata.get("content-disposition") {
+            resp = resp.header("Content-Disposition", cd);
+        }
+        if let Some(cl) = result.metadata.get("content-language") {
+            resp = resp.header("Content-Language", cl);
+        }
+        if let Some(ex) = result.metadata.get("expires") {
+            resp = resp.header("Expires", ex);
+        }
+
+        for entry in &result.metadata.entries {
+            if entry.key.starts_with("x-amz-meta-") {
+                resp = resp.header(&entry.key, &entry.value);
+            }
+        }
+
+        // Per-part checksum (always emitted for part-level GETs)
+        if let Some((header_name, b64_value)) = &result.checksum {
+            resp = resp.header(header_name, b64_value);
+        }
+        // Checksum type (e.g. COMPOSITE, FULL_OBJECT)
+        if let Some(ct) = result.metadata.get("x-amz-checksum-type") {
+            resp = resp.header("x-amz-checksum-type", ct);
         }
 
         resp.data_body(result.data)

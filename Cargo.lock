@@ -1925,6 +1925,7 @@ dependencies = [
  "aws-credential-types",
  "aws-sdk-s3",
  "base64",
+ "checksum",
  "ec",
  "ring",
  "serde_json",

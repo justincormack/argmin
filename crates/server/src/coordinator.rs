@@ -60,6 +60,21 @@ pub struct HeadObjectResult {
     pub tags: Option<String>,
 }
 
+/// Result of a HeadObject with partNumber.
+#[derive(Debug)]
+pub struct HeadObjectPartResult {
+    pub metadata: MetadataBlob,
+    pub etag: String,
+    pub part_size: u64,
+    pub total_size: u64,
+    pub last_modified: u64,
+    pub parts_count: u32,
+    pub version_id: u64,
+    pub tags: Option<String>,
+    /// Per-part checksum: (header_name, base64_value).
+    pub checksum: Option<(String, String)>,
+}
+
 /// A single part entry for GetObjectAttributes ObjectParts response.
 #[derive(Debug)]
 pub struct ObjectPartEntry {
@@ -103,6 +118,23 @@ pub struct GetObjectRangeResult {
     pub range_end: u64,
     pub version_id: u64,
     pub tags: Option<String>,
+}
+
+/// Result of a part-level GetObject operation (206 Partial Content).
+#[derive(Debug)]
+pub struct GetObjectPartResult {
+    pub data: Vec<u8>,
+    pub metadata: MetadataBlob,
+    pub etag: String,
+    pub size: u64,
+    pub last_modified: u64,
+    pub part_start: u64,
+    pub part_end: u64,
+    pub parts_count: u32,
+    pub version_id: u64,
+    pub tags: Option<String>,
+    /// Per-part checksum: (header_name, base64_value).
+    pub checksum: Option<(String, String)>,
 }
 
 /// Metadata handling directive for `CopyObject`.
@@ -1593,6 +1625,262 @@ impl Coordinator {
                 last_modified: record.last_modified,
                 version_id: record.version_id,
                 tags: record.tags,
+            })
+        }
+    }
+
+    /// Retrieve a single part of an object by part number.
+    ///
+    /// For multipart objects, returns the data for the specified part along with
+    /// its checksum and byte range within the full object.
+    /// For non-multipart objects, `part_number == 1` returns the full body.
+    pub fn get_object_part(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<u64>,
+        part_number: u32,
+        cond: &ReadCondition,
+    ) -> Result<GetObjectPartResult, ServerError> {
+        let LockedReadObject { record, pgs } =
+            self.lock_object_pgs_for_read(bucket, key, version_id)?;
+
+        if record.status == 1 {
+            return Err(ServerError::DeleteMarkerHit {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+            });
+        }
+
+        let etag_str = format_object_etag(&record.etag, record.etag_kind, record.parts_count);
+        check_read_conditions(cond, &etag_str, record.last_modified)?;
+
+        if record.data_layout == DataLayout::MultipartManifest {
+            let meta_pg = pgs.meta();
+            let obj_parts = meta_pg
+                .get_object_parts(bucket, key, record.version_id)
+                .map_err(ServerError::Metadata)?;
+            drop(pgs);
+
+            // Find the requested part
+            let part = obj_parts
+                .iter()
+                .find(|p| p.part_number == part_number)
+                .ok_or(ServerError::InvalidPart { part_number })?;
+
+            let data = self.read_part_data(part).map_err(|e| match e {
+                ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                },
+                other => other,
+            })?;
+
+            // Compute byte offset of this part within the full object
+            let part_start: u64 = obj_parts
+                .iter()
+                .take_while(|p| p.part_number < part_number)
+                .map(|p| p.size)
+                .sum();
+            let part_end = part_start + part.size.saturating_sub(1);
+
+            // Decode per-part checksum
+            let metadata = record
+                .metadata_blob
+                .as_ref()
+                .map(|b| MetadataBlob::deserialize(b).map(|(m, _)| m))
+                .transpose()?
+                .unwrap_or_default();
+
+            let checksum = if let Some(raw) = &part.checksum {
+                use base64::Engine;
+                // Look up algorithm from object metadata
+                metadata
+                    .get("x-amz-checksum-algorithm")
+                    .and_then(ChecksumAlgorithm::from_str)
+                    .map(|algo| {
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(raw);
+                        (algo.header_name().to_string(), b64)
+                    })
+            } else {
+                None
+            };
+
+            Ok(GetObjectPartResult {
+                data,
+                metadata,
+                etag: etag_str,
+                size: record.size,
+                last_modified: record.last_modified,
+                part_start,
+                part_end,
+                parts_count: obj_parts.len() as u32,
+                version_id: record.version_id,
+                tags: record.tags,
+                checksum,
+            })
+        } else {
+            // Non-multipart: only partNumber=1 is valid
+            if part_number != 1 {
+                return Err(ServerError::InvalidPart { part_number });
+            }
+
+            // Read full object data (same as get_object inline path)
+            let okh = object_key_hash(bucket, key);
+            let object_version_id = record.version_id;
+            let etag_crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
+            let shard_pg = pgs.shard();
+
+            let total = record.total_size as usize;
+            let raw = self
+                .read_range(shard_pg, &okh, object_version_id, &record, 0, total - 1)
+                .map_err(|e| match e {
+                    ServerError::Store(storage::StoreError::NotFound) => {
+                        ServerError::ObjectNotFound {
+                            bucket: bucket.to_string(),
+                            key: key.to_string(),
+                        }
+                    }
+                    other => other,
+                })?;
+
+            let actual_crc = crc64::checksum(&raw);
+            if actual_crc != etag_crc {
+                return Err(ServerError::IntegrityError {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                    expected: etag_crc,
+                    actual: actual_crc,
+                });
+            }
+
+            let metadata_size = (record.total_size - record.size) as usize;
+            let (metadata, _) = MetadataBlob::deserialize(&raw[..metadata_size])?;
+            let user_data = raw[metadata_size..].to_vec();
+
+            Ok(GetObjectPartResult {
+                data: user_data,
+                metadata,
+                etag: etag_str,
+                size: record.size,
+                last_modified: record.last_modified,
+                part_start: 0,
+                part_end: record.size.saturating_sub(1),
+                parts_count: 1,
+                version_id: record.version_id,
+                tags: record.tags,
+                checksum: None,
+            })
+        }
+    }
+
+    /// Head a single part of an object by part number (no body).
+    pub fn head_object_part(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<u64>,
+        part_number: u32,
+        cond: &ReadCondition,
+    ) -> Result<HeadObjectPartResult, ServerError> {
+        let LockedReadObject { record, pgs } =
+            self.lock_object_pgs_for_read(bucket, key, version_id)?;
+
+        if record.status == 1 {
+            return Err(ServerError::DeleteMarkerHit {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+            });
+        }
+
+        let etag_str = format_object_etag(&record.etag, record.etag_kind, record.parts_count);
+        check_read_conditions(cond, &etag_str, record.last_modified)?;
+
+        if record.data_layout == DataLayout::MultipartManifest {
+            let meta_pg = pgs.meta();
+            let obj_parts = meta_pg
+                .get_object_parts(bucket, key, record.version_id)
+                .map_err(ServerError::Metadata)?;
+            drop(pgs);
+
+            let part = obj_parts
+                .iter()
+                .find(|p| p.part_number == part_number)
+                .ok_or(ServerError::InvalidPart { part_number })?;
+
+            let metadata = record
+                .metadata_blob
+                .as_ref()
+                .map(|b| MetadataBlob::deserialize(b).map(|(m, _)| m))
+                .transpose()?
+                .unwrap_or_default();
+
+            let checksum = if let Some(raw) = &part.checksum {
+                use base64::Engine;
+                metadata
+                    .get("x-amz-checksum-algorithm")
+                    .and_then(ChecksumAlgorithm::from_str)
+                    .map(|algo| {
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(raw);
+                        (algo.header_name().to_string(), b64)
+                    })
+            } else {
+                None
+            };
+
+            Ok(HeadObjectPartResult {
+                metadata,
+                etag: etag_str,
+                part_size: part.size,
+                total_size: record.size,
+                last_modified: record.last_modified,
+                parts_count: obj_parts.len() as u32,
+                version_id: record.version_id,
+                tags: record.tags,
+                checksum,
+            })
+        } else {
+            if part_number != 1 {
+                return Err(ServerError::InvalidPart { part_number });
+            }
+
+            let metadata = {
+                let okh = object_key_hash(bucket, key);
+                let object_version_id = record.version_id;
+                let shard_pg = pgs.shard();
+                let metadata_size = (record.total_size - record.size) as usize;
+                let data = self
+                    .read_range(
+                        shard_pg,
+                        &okh,
+                        object_version_id,
+                        &record,
+                        0,
+                        metadata_size - 1,
+                    )
+                    .map_err(|e| match e {
+                        ServerError::Store(storage::StoreError::NotFound) => {
+                            ServerError::ObjectNotFound {
+                                bucket: bucket.to_string(),
+                                key: key.to_string(),
+                            }
+                        }
+                        other => other,
+                    })?;
+                let (m, _) = MetadataBlob::deserialize(&data)?;
+                m
+            };
+
+            Ok(HeadObjectPartResult {
+                metadata,
+                etag: etag_str,
+                part_size: record.size,
+                total_size: record.size,
+                last_modified: record.last_modified,
+                parts_count: 1,
+                version_id: record.version_id,
+                tags: record.tags,
+                checksum: None,
             })
         }
     }
@@ -6895,6 +7183,51 @@ mod tests {
             .unwrap();
         assert_eq!(obj.data, expected);
         assert_eq!(obj.size, MIN_PART as u64);
+    }
+
+    #[test]
+    fn get_object_part_zero_byte_single_part() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        create_completed_multipart_vec(&coord, "bucket", "key", &[(1, vec![])]);
+
+        let result = coord
+            .get_object_part("bucket", "key", None, 1, &ReadCondition::default())
+            .unwrap();
+        assert!(result.data.is_empty());
+        assert_eq!(result.size, 0);
+        assert_eq!(result.parts_count, 1);
+        assert_eq!(result.part_start, 0);
+        assert_eq!(result.part_end, 0);
+    }
+
+    #[test]
+    fn get_object_part_zero_byte_final_part() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let part1 = make_part(0xAA, MIN_PART);
+        create_completed_multipart_vec(&coord, "bucket", "key", &[(1, part1.clone()), (2, vec![])]);
+
+        // Part 1 should return full data
+        let result = coord
+            .get_object_part("bucket", "key", None, 1, &ReadCondition::default())
+            .unwrap();
+        assert_eq!(result.data, part1);
+        assert_eq!(result.part_start, 0);
+        assert_eq!(result.part_end, MIN_PART as u64 - 1);
+
+        // Part 2 (zero-byte) should return empty data
+        let result = coord
+            .get_object_part("bucket", "key", None, 2, &ReadCondition::default())
+            .unwrap();
+        assert!(result.data.is_empty());
+        assert_eq!(result.parts_count, 2);
+        assert_eq!(result.part_start, MIN_PART as u64);
+        assert_eq!(result.part_end, MIN_PART as u64);
     }
 
     #[test]
