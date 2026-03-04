@@ -5,8 +5,8 @@ use ec::{EcConfig, ErasureCodec};
 use storage::traits::{GlobalService, PgMetadataStore, ShardStore};
 use storage::{
     BucketInfo, CreateMultipartUploadReq, DataLayout, ListMultipartUploadsReq,
-    ListObjectVersionsReq, ListObjectsReq, MultipartUploadRecord, ObjectRecord, PutObjectMetaReq,
-    ShardKey, SharedStorageNode, SqliteBucketDb,
+    ListObjectVersionsReq, ListObjectsReq, MultipartPartRecord, MultipartUploadRecord,
+    ObjectRecord, PutObjectMetaReq, ShardKey, SharedStorageNode, SqliteBucketDb,
 };
 
 use crate::conditional::{
@@ -16,7 +16,7 @@ use crate::conditional::{
 use crate::error::ServerError;
 use crate::etag::{crc64_to_etag_bytes, etag_bytes_to_crc64, format_etag};
 use crate::metadata_blob::MetadataBlob;
-use crate::pg::{derive_pg, derive_pg_shards, object_key_hash};
+use crate::pg::{derive_pg, derive_pg_shards, object_key_hash, part_key_hash};
 use crate::range::ByteRange;
 
 /// Maximum object size for single PUT (256 MB).
@@ -155,6 +155,12 @@ pub struct DeleteError {
 pub struct DeleteObjectsResult {
     pub deleted: Vec<DeletedObject>,
     pub errors: Vec<DeleteError>,
+}
+
+/// Result of an UploadPart operation.
+#[derive(Debug)]
+pub struct UploadPartResult {
+    pub etag: String,
 }
 
 /// Result of a CreateMultipartUpload operation.
@@ -1873,6 +1879,217 @@ impl Coordinator {
         })?;
 
         Ok(CreateMultipartUploadResult { upload_id })
+    }
+
+    /// Upload a part to an in-progress multipart upload.
+    ///
+    /// Validates part number, resolves the upload, EC-encodes the data,
+    /// writes shards, upserts the part record, and best-effort deletes
+    /// any prior generation's shards.
+    pub fn upload_part(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number: u32,
+        data: &[u8],
+    ) -> Result<UploadPartResult, ServerError> {
+        // 1. Validate part number range [1, 10000].
+        if part_number == 0 || part_number > 10_000 {
+            return Err(ServerError::InvalidArgument {
+                reason: format!("part number must be between 1 and 10000, got {part_number}"),
+            });
+        }
+
+        // 2. Lock meta PG and shard PG in global ascending order.
+        //
+        //    The shard PG depends on the generation, which is read from metadata.
+        //    We use the same loop-and-revalidate pattern as lock_object_pgs_for_write:
+        //    if meta_pg_id > shard_pg_id, drop, relock in order, and re-read.
+        let meta_pg_id = derive_pg(bucket, key, self.pg_count);
+
+        let (meta_pg, shard_guard, generation, _shard_pg_id) = loop {
+            let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
+
+            // Validate upload exists, belongs to this bucket/key, and is InProgress.
+            let upload = meta_pg.get_multipart_upload(upload_id)?;
+            if upload.bucket != bucket || upload.key != key {
+                return Err(ServerError::NoSuchUpload {
+                    upload_id: upload_id.to_string(),
+                });
+            }
+            if upload.state != storage::UploadState::InProgress {
+                return Err(ServerError::NoSuchUpload {
+                    upload_id: upload_id.to_string(),
+                });
+            }
+
+            // Determine next generation for this part number.
+            let generation = match meta_pg.get_multipart_part(upload_id, part_number) {
+                Ok(existing) => existing.generation + 1,
+                Err(storage::MetadataError::PartNotFound { .. }) => 0,
+                Err(e) => return Err(ServerError::Metadata(e)),
+            };
+
+            let shard_pg_id = derive_pg_shards(
+                &format!("mpu/{upload_id}"),
+                &format!("{part_number}/{generation}"),
+                generation as u64,
+                self.pg_count,
+            );
+
+            if shard_pg_id == meta_pg_id {
+                break (meta_pg, None, generation, shard_pg_id);
+            }
+
+            if meta_pg_id < shard_pg_id {
+                // Already in ascending order.
+                let shard_guard = self.storage_node.get_pg(shard_pg_id)?;
+                break (meta_pg, Some(shard_guard), generation, shard_pg_id);
+            }
+
+            // Out of order: drop meta_pg, relock both in ascending order, revalidate.
+            drop(meta_pg);
+            let (meta_pg, shard_guard) =
+                self.storage_node.lock_two_pgs(meta_pg_id, shard_pg_id)?;
+
+            let upload = meta_pg.get_multipart_upload(upload_id)?;
+            if upload.bucket != bucket || upload.key != key {
+                return Err(ServerError::NoSuchUpload {
+                    upload_id: upload_id.to_string(),
+                });
+            }
+            if upload.state != storage::UploadState::InProgress {
+                return Err(ServerError::NoSuchUpload {
+                    upload_id: upload_id.to_string(),
+                });
+            }
+
+            let generation = match meta_pg.get_multipart_part(upload_id, part_number) {
+                Ok(existing) => existing.generation + 1,
+                Err(storage::MetadataError::PartNotFound { .. }) => 0,
+                Err(e) => return Err(ServerError::Metadata(e)),
+            };
+
+            let verify_shard_pg_id = derive_pg_shards(
+                &format!("mpu/{upload_id}"),
+                &format!("{part_number}/{generation}"),
+                generation as u64,
+                self.pg_count,
+            );
+
+            // Generation changed while relocking — shard PG may differ. Retry.
+            if verify_shard_pg_id != shard_pg_id {
+                continue;
+            }
+
+            break (meta_pg, shard_guard, generation, shard_pg_id);
+        };
+
+        // 3. Compute part identity.
+        let part_okh = part_key_hash(upload_id, part_number, generation);
+        let part_vid = generation as u64;
+
+        // 4. EC-encode part data (no metadata blob for parts — raw data only).
+        let etag_crc = crc64::checksum(data);
+
+        let k = self.ec_config.data_shards as usize;
+        let m = self.ec_config.parity_shards as usize;
+        let mut padded = data.to_vec();
+        let remainder = padded.len() % k;
+        if remainder != 0 {
+            padded.resize(padded.len() + (k - remainder), 0);
+        }
+
+        let shard_size = padded.len() / k;
+        let data_shards: Vec<&[u8]> = (0..k)
+            .map(|i| &padded[i * shard_size..(i + 1) * shard_size])
+            .collect();
+        let mut parity_bufs: Vec<Vec<u8>> = (0..m).map(|_| vec![0u8; shard_size]).collect();
+        let mut parity_refs: Vec<&mut [u8]> =
+            parity_bufs.iter_mut().map(|v| v.as_mut_slice()).collect();
+        self.ec_codec.encode(&data_shards, &mut parity_refs)?;
+
+        // 5. Write shards, with cleanup on failure.
+        let shard_pg: &storage::PgStore = shard_guard.as_deref().unwrap_or(&meta_pg);
+        let mut written_shards: Vec<ShardKey> = Vec::with_capacity(k + m);
+        let write_result: Result<(), ServerError> = (|| {
+            for i in 0..(k + m) {
+                let shard_key = ShardKey::new(&part_okh, part_vid, i as u8);
+                let shard_data = if i < k {
+                    data_shards[i]
+                } else {
+                    &parity_bufs[i - k]
+                };
+                shard_pg.write_shard(&shard_key, shard_data)?;
+                written_shards.push(shard_key);
+            }
+            Ok(())
+        })();
+
+        if let Err(e) = write_result {
+            for shard_key in &written_shards {
+                let _ = shard_pg.delete_shard(shard_key);
+            }
+            return Err(e);
+        }
+
+        // 6. Upsert part metadata.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let upsert_result = meta_pg.upsert_multipart_part(&MultipartPartRecord {
+            upload_id: upload_id.to_string(),
+            part_number,
+            generation,
+            size: data.len() as u64,
+            etag: crc64_to_etag_bytes(etag_crc),
+            etag_kind: 0,
+            part_okh,
+            part_vid,
+            ec_k: self.ec_config.data_shards,
+            ec_m: self.ec_config.parity_shards,
+            last_modified: now,
+        });
+
+        let prev_gen = match upsert_result {
+            Ok(prev) => prev,
+            Err(e) => {
+                // Best-effort cleanup of written shards.
+                for shard_key in &written_shards {
+                    let _ = shard_pg.delete_shard(shard_key);
+                }
+                return Err(e.into());
+            }
+        };
+
+        // 7. Best-effort delete prior generation's shards.
+        //    Drop all held PG guards first to avoid deadlock, since the
+        //    old generation may map to any PG including those we hold.
+        drop(shard_guard);
+        drop(meta_pg);
+        if let Some(old_gen) = prev_gen {
+            let old_okh = part_key_hash(upload_id, part_number, old_gen);
+            let old_vid = old_gen as u64;
+            let old_shard_pg_id = derive_pg_shards(
+                &format!("mpu/{upload_id}"),
+                &format!("{part_number}/{old_gen}"),
+                old_vid,
+                self.pg_count,
+            );
+            if let Ok(old_pg) = self.storage_node.get_pg(old_shard_pg_id) {
+                for i in 0..(k + m) {
+                    let old_key = ShardKey::new(&old_okh, old_vid, i as u8);
+                    let _ = old_pg.delete_shard(&old_key);
+                }
+            }
+        }
+
+        Ok(UploadPartResult {
+            etag: format_etag(etag_crc),
+        })
     }
 
     /// List in-progress multipart uploads for a bucket.
@@ -4449,5 +4666,270 @@ mod tests {
         let mut expected = upload_ids.clone();
         expected.sort();
         assert_eq!(seen, expected);
+    }
+
+    // ── UploadPart tests ──────────────────────────────────────────────
+
+    #[test]
+    fn upload_part_first_upload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let metadata = MetadataBlob::new();
+        let create = coord
+            .create_multipart_upload("bucket", "key", &metadata)
+            .unwrap();
+
+        let result = coord
+            .upload_part("bucket", "key", &create.upload_id, 1, b"hello world")
+            .unwrap();
+
+        // ETag should be a quoted hex CRC64.
+        assert!(result.etag.starts_with('"'));
+        assert!(result.etag.ends_with('"'));
+
+        // Verify part metadata was recorded.
+        let meta_pg_id = derive_pg("bucket", "key", coord.pg_count);
+        let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
+        let part = pg.get_multipart_part(&create.upload_id, 1).unwrap();
+        assert_eq!(part.part_number, 1);
+        assert_eq!(part.generation, 0);
+        assert_eq!(part.size, 11); // "hello world".len()
+    }
+
+    #[test]
+    fn upload_part_reupload_increments_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let metadata = MetadataBlob::new();
+        let create = coord
+            .create_multipart_upload("bucket", "key", &metadata)
+            .unwrap();
+
+        // First upload → generation 0.
+        coord
+            .upload_part("bucket", "key", &create.upload_id, 1, b"first")
+            .unwrap();
+
+        // Re-upload same part number → generation 1.
+        let result = coord
+            .upload_part("bucket", "key", &create.upload_id, 1, b"second")
+            .unwrap();
+
+        let meta_pg_id = derive_pg("bucket", "key", coord.pg_count);
+        let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
+        let part = pg.get_multipart_part(&create.upload_id, 1).unwrap();
+        assert_eq!(part.generation, 1);
+        assert_eq!(part.size, 6); // "second".len()
+
+        // ETag should reflect the new data.
+        let expected_crc = crc64::checksum(b"second");
+        assert_eq!(result.etag, format_etag(expected_crc));
+    }
+
+    #[test]
+    fn upload_part_invalid_part_number_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let metadata = MetadataBlob::new();
+        let create = coord
+            .create_multipart_upload("bucket", "key", &metadata)
+            .unwrap();
+
+        let err = coord
+            .upload_part("bucket", "key", &create.upload_id, 0, b"data")
+            .unwrap_err();
+        assert!(matches!(err, ServerError::InvalidArgument { .. }));
+    }
+
+    #[test]
+    fn upload_part_invalid_part_number_exceeds_max() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let metadata = MetadataBlob::new();
+        let create = coord
+            .create_multipart_upload("bucket", "key", &metadata)
+            .unwrap();
+
+        let err = coord
+            .upload_part("bucket", "key", &create.upload_id, 10_001, b"data")
+            .unwrap_err();
+        assert!(matches!(err, ServerError::InvalidArgument { .. }));
+    }
+
+    #[test]
+    fn upload_part_nonexistent_upload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let err = coord
+            .upload_part("bucket", "key", "bogus-upload-id", 1, b"data")
+            .unwrap_err();
+        assert!(matches!(err, ServerError::NoSuchUpload { .. }));
+    }
+
+    #[test]
+    fn upload_part_multiple_parts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let metadata = MetadataBlob::new();
+        let create = coord
+            .create_multipart_upload("bucket", "key", &metadata)
+            .unwrap();
+
+        coord
+            .upload_part("bucket", "key", &create.upload_id, 1, b"part-one")
+            .unwrap();
+        coord
+            .upload_part("bucket", "key", &create.upload_id, 2, b"part-two")
+            .unwrap();
+        coord
+            .upload_part("bucket", "key", &create.upload_id, 3, b"part-three")
+            .unwrap();
+
+        // Verify all three parts exist.
+        let meta_pg_id = derive_pg("bucket", "key", coord.pg_count);
+        let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
+
+        let parts_resp = pg
+            .list_multipart_parts(&storage::ListPartsReq {
+                upload_id: create.upload_id.clone(),
+                part_number_marker: None,
+                max_parts: 100,
+            })
+            .unwrap();
+        assert_eq!(parts_resp.parts.len(), 3);
+        assert_eq!(parts_resp.parts[0].part_number, 1);
+        assert_eq!(parts_resp.parts[1].part_number, 2);
+        assert_eq!(parts_resp.parts[2].part_number, 3);
+    }
+
+    #[test]
+    fn upload_part_repeated_reupload_generations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let metadata = MetadataBlob::new();
+        let create = coord
+            .create_multipart_upload("bucket", "key", &metadata)
+            .unwrap();
+
+        // Upload same part 4 times — generation should increment each time.
+        for i in 0..4u32 {
+            let data = format!("version-{i}");
+            coord
+                .upload_part("bucket", "key", &create.upload_id, 1, data.as_bytes())
+                .unwrap();
+        }
+
+        let meta_pg_id = derive_pg("bucket", "key", coord.pg_count);
+        let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
+        let part = pg.get_multipart_part(&create.upload_id, 1).unwrap();
+        assert_eq!(part.generation, 3);
+        assert_eq!(part.size, "version-3".len() as u64);
+    }
+
+    #[test]
+    fn upload_part_boundary_part_numbers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let metadata = MetadataBlob::new();
+        let create = coord
+            .create_multipart_upload("bucket", "key", &metadata)
+            .unwrap();
+
+        // Part 1 (min valid).
+        coord
+            .upload_part("bucket", "key", &create.upload_id, 1, b"a")
+            .unwrap();
+        // Part 10000 (max valid).
+        coord
+            .upload_part("bucket", "key", &create.upload_id, 10_000, b"z")
+            .unwrap();
+
+        let meta_pg_id = derive_pg("bucket", "key", coord.pg_count);
+        let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
+        pg.get_multipart_part(&create.upload_id, 1).unwrap();
+        pg.get_multipart_part(&create.upload_id, 10_000).unwrap();
+    }
+
+    #[test]
+    fn upload_part_wrong_bucket_key_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let metadata = MetadataBlob::new();
+        let create = coord
+            .create_multipart_upload("bucket", "key", &metadata)
+            .unwrap();
+
+        // Try uploading with wrong key — should be rejected even if upload_id is valid.
+        let err = coord
+            .upload_part("bucket", "wrong-key", &create.upload_id, 1, b"data")
+            .unwrap_err();
+        assert!(matches!(err, ServerError::NoSuchUpload { .. }));
+
+        // Try uploading with wrong bucket.
+        coord.create_bucket("other-bucket").unwrap();
+        let err = coord
+            .upload_part("other-bucket", "key", &create.upload_id, 1, b"data")
+            .unwrap_err();
+        assert!(matches!(err, ServerError::NoSuchUpload { .. }));
+    }
+
+    #[test]
+    fn upload_part_same_part_last_writer_wins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let metadata = MetadataBlob::new();
+        let create = coord
+            .create_multipart_upload("bucket", "key", &metadata)
+            .unwrap();
+
+        // Simulate concurrent same-part uploads sequentially.
+        // Each successive upload should overwrite, with generation incrementing.
+        let etag1 = coord
+            .upload_part("bucket", "key", &create.upload_id, 1, b"writer-A")
+            .unwrap()
+            .etag;
+        let etag2 = coord
+            .upload_part("bucket", "key", &create.upload_id, 1, b"writer-B")
+            .unwrap()
+            .etag;
+        let etag3 = coord
+            .upload_part("bucket", "key", &create.upload_id, 1, b"writer-C")
+            .unwrap()
+            .etag;
+
+        // Each write has different data → different ETags.
+        assert_ne!(etag1, etag2);
+        assert_ne!(etag2, etag3);
+
+        // Final state should reflect the last writer.
+        let meta_pg_id = derive_pg("bucket", "key", coord.pg_count);
+        let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
+        let part = pg.get_multipart_part(&create.upload_id, 1).unwrap();
+        assert_eq!(part.generation, 2); // 0, 1, 2
+        assert_eq!(part.size, "writer-C".len() as u64);
+        assert_eq!(
+            format_etag(crc64::checksum(b"writer-C")),
+            etag3
+        );
     }
 }

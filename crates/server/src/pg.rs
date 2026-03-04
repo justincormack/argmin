@@ -32,6 +32,18 @@ pub fn object_key_hash(bucket: &str, key: &str) -> [u8; 16] {
     result
 }
 
+/// Compute the 16-byte part key hash for multipart upload shard keys.
+///
+/// `part_okh = SHA-256("mpu/" + upload_id + "/" + part_number + "/" + generation)[:16]`
+pub fn part_key_hash(upload_id: &str, part_number: u32, generation: u32) -> [u8; 16] {
+    use ring::digest;
+    let input = format!("mpu/{upload_id}/{part_number}/{generation}");
+    let hash = digest::digest(&digest::SHA256, input.as_bytes());
+    let mut result = [0u8; 16];
+    result.copy_from_slice(&hash.as_ref()[..16]);
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
