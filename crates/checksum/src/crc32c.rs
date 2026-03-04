@@ -36,9 +36,8 @@ pub fn checksum(data: &[u8]) -> u32 {
         let n = remaining.len().min(CHUNK);
         // SAFETY: pointer is valid for n bytes. The cast to *mut is
         // safe because ISA-L does not mutate the buffer.
-        crc = unsafe {
-            ec_sys::crc32_iscsi(remaining.as_ptr() as *mut _, n as std::ffi::c_int, crc)
-        };
+        crc =
+            unsafe { ec_sys::crc32_iscsi(remaining.as_ptr() as *mut _, n as std::ffi::c_int, crc) };
         remaining = &remaining[n..];
     }
     crc ^ !0u32

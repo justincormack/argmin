@@ -21,10 +21,10 @@ use crate::coordinator::Coordinator;
 use crate::coordinator::MetadataDirective;
 use crate::error::ServerError;
 use crate::metadata_blob::MetadataBlob;
-use storage::{ChecksumAlgorithm, ChecksumType};
 use request::S3Request;
 use response::S3Response;
 use router::{route, S3Operation};
+use storage::{ChecksumAlgorithm, ChecksumType};
 
 /// Parse versionId query parameter from an S3 request.
 /// Returns `Ok(None)` if the parameter is absent, `Ok(Some(id))` if valid,
@@ -877,8 +877,7 @@ impl HttpFrontend {
                 // Validate: checksum-type without checksum-algorithm is invalid.
                 if checksum_type.is_some() && checksum_algorithm.is_none() {
                     return Err(ServerError::InvalidArgument {
-                        reason: "x-amz-checksum-type requires x-amz-checksum-algorithm"
-                            .to_string(),
+                        reason: "x-amz-checksum-type requires x-amz-checksum-algorithm".to_string(),
                     });
                 }
 
@@ -1852,10 +1851,7 @@ mod tests {
             method: String::new(),
             path: String::new(),
             query_string: "uploads".to_string(),
-            headers: vec![(
-                "x-amz-checksum-algorithm".to_string(),
-                "BOGUS".to_string(),
-            )],
+            headers: vec![("x-amz-checksum-algorithm".to_string(), "BOGUS".to_string())],
             body: vec![],
         };
         let op = S3Operation::CreateMultipartUpload {
@@ -1910,10 +1906,7 @@ mod tests {
             method: String::new(),
             path: String::new(),
             query_string: "uploads".to_string(),
-            headers: vec![(
-                "x-amz-checksum-type".to_string(),
-                "COMPOSITE".to_string(),
-            )],
+            headers: vec![("x-amz-checksum-type".to_string(), "COMPOSITE".to_string())],
             body: vec![],
         };
         let op = S3Operation::CreateMultipartUpload {
@@ -1940,14 +1933,8 @@ mod tests {
             path: String::new(),
             query_string: "uploads".to_string(),
             headers: vec![
-                (
-                    "x-amz-checksum-algorithm".to_string(),
-                    "SHA256".to_string(),
-                ),
-                (
-                    "x-amz-checksum-type".to_string(),
-                    "FULL_OBJECT".to_string(),
-                ),
+                ("x-amz-checksum-algorithm".to_string(), "SHA256".to_string()),
+                ("x-amz-checksum-type".to_string(), "FULL_OBJECT".to_string()),
             ],
             body: vec![],
         };
@@ -1976,10 +1963,7 @@ mod tests {
             query_string: "uploads".to_string(),
             headers: vec![
                 ("x-amz-checksum-algorithm".to_string(), "CRC32".to_string()),
-                (
-                    "x-amz-checksum-type".to_string(),
-                    "FULL_OBJECT".to_string(),
-                ),
+                ("x-amz-checksum-type".to_string(), "FULL_OBJECT".to_string()),
             ],
             body: vec![],
         };
@@ -2047,10 +2031,7 @@ mod tests {
             method: String::new(),
             path: String::new(),
             query_string: "uploads".to_string(),
-            headers: vec![(
-                "x-amz-checksum-algorithm".to_string(),
-                "SHA256".to_string(),
-            )],
+            headers: vec![("x-amz-checksum-algorithm".to_string(), "SHA256".to_string())],
             body: vec![],
         };
         let op = S3Operation::CreateMultipartUpload {

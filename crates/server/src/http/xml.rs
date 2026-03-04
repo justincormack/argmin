@@ -2709,13 +2709,7 @@ mod tests {
 
     #[test]
     fn initiate_xml_includes_checksum_fields() {
-        let xml = initiate_multipart_upload_xml(
-            "b",
-            "k",
-            "u",
-            Some("CRC32"),
-            Some("FULL_OBJECT"),
-        );
+        let xml = initiate_multipart_upload_xml("b", "k", "u", Some("CRC32"), Some("FULL_OBJECT"));
         assert!(xml.contains("<ChecksumAlgorithm>CRC32</ChecksumAlgorithm>"));
         assert!(xml.contains("<ChecksumType>FULL_OBJECT</ChecksumType>"));
     }
