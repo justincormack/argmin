@@ -1,5 +1,5 @@
 use aws_sdk_s3::primitives::ByteStream;
-use s3_tests::{err_status, unique_bucket, CTX};
+use s3_tests::{cleanup_versioned_bucket, err_status, unique_bucket, CTX};
 
 /// Create a bucket, returning its name.
 async fn setup_bucket() -> String {
@@ -545,12 +545,8 @@ fn test_object_copy_versioned_bucket() {
         assert_eq!(resp.content_length(), Some(data.len() as i64));
 
         cleanup(&bucket3, &["bar321foo4"]).await;
-        cleanup(&bucket2, &["bar321foo3"]).await;
-        cleanup(
-            &bucket1,
-            &["foo123bar", "bar321foo", "bar321foo2", "foo123bar2"],
-        )
-        .await;
+        cleanup_versioned_bucket(client, &bucket2).await;
+        cleanup_versioned_bucket(client, &bucket1).await;
     });
 }
 
@@ -618,7 +614,7 @@ fn test_object_copy_versioned_url_encoding() {
             .await
             .unwrap();
 
-        cleanup(&bucket, &[src_key, dst_key]).await;
+        cleanup_versioned_bucket(client, &bucket).await;
     });
 }
 

@@ -2,7 +2,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     BucketVersioningStatus, Delete, ObjectIdentifier, VersioningConfiguration,
 };
-use s3_tests::{err_status, unique_bucket, CTX};
+use s3_tests::{cleanup_versioned_bucket, err_status, unique_bucket, CTX};
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
@@ -624,7 +624,7 @@ fn test_versioning_obj_suspended_copy() {
         let bucket = setup_versioned_bucket().await;
         let key1 = "testobj1";
 
-        let (version_ids, _) = create_multiple_versions(&bucket, key1, 1).await;
+        let (_version_ids, _) = create_multiple_versions(&bucket, key1, 1).await;
 
         // Suspend versioning
         client
@@ -708,49 +708,8 @@ fn test_versioning_obj_suspended_copy() {
         assert_eq!(&body[..], b"null content");
 
         // Cleanup
-        client
-            .delete_object()
-            .bucket(&bucket2)
-            .key(key1)
-            .send()
-            .await
-            .unwrap();
-        client
-            .delete_bucket()
-            .bucket(&bucket2)
-            .send()
-            .await
-            .unwrap();
-        let _ = client
-            .delete_object()
-            .bucket(&bucket)
-            .key(key2)
-            .version_id("null")
-            .send()
-            .await;
-        let _ = client
-            .delete_object()
-            .bucket(&bucket)
-            .key(key2)
-            .send()
-            .await;
-        for vid in &version_ids {
-            let _ = client
-                .delete_object()
-                .bucket(&bucket)
-                .key(key1)
-                .version_id(vid)
-                .send()
-                .await;
-        }
-        let _ = client
-            .delete_object()
-            .bucket(&bucket)
-            .key(key1)
-            .version_id("null")
-            .send()
-            .await;
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        cleanup_versioned_bucket(client, &bucket2).await;
+        cleanup_versioned_bucket(client, &bucket).await;
     });
 }
 
@@ -922,41 +881,9 @@ fn test_versioning_copy_obj_version() {
         let body = resp.body.collect().await.unwrap().into_bytes();
         assert_eq!(std::str::from_utf8(&body).unwrap(), contents[num - 1]);
 
-        // Cleanup bucket2
-        for i in 0..num {
-            client
-                .delete_object()
-                .bucket(&bucket2)
-                .key(format!("key_{}", i))
-                .send()
-                .await
-                .unwrap();
-        }
-        client
-            .delete_object()
-            .bucket(&bucket2)
-            .key("new_key")
-            .send()
-            .await
-            .unwrap();
-        client
-            .delete_bucket()
-            .bucket(&bucket2)
-            .send()
-            .await
-            .unwrap();
-
-        // Cleanup bucket1
-        for k in &copy_keys {
-            client
-                .delete_object()
-                .bucket(&bucket)
-                .key(k)
-                .send()
-                .await
-                .unwrap();
-        }
-        cleanup_versioned(&bucket, key, &version_ids).await;
+        // Cleanup
+        cleanup_versioned_bucket(client, &bucket2).await;
+        cleanup_versioned_bucket(client, &bucket).await;
     });
 }
 
@@ -1182,15 +1109,7 @@ fn test_versioning_bucket_atomic_upload_return_version_id() {
             version_id.as_str()
         );
 
-        client
-            .delete_object()
-            .bucket(&bucket)
-            .key("bar")
-            .version_id(&version_id)
-            .send()
-            .await
-            .unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        cleanup_versioned_bucket(client, &bucket).await;
 
         // Default (no versioning): should not return a version ID
         let bucket2 = unique_bucket();
@@ -1257,19 +1176,7 @@ fn test_versioning_bucket_atomic_upload_return_version_id() {
             resp.version_id().is_none(),
             "expected no version ID for suspended bucket"
         );
-        client
-            .delete_object()
-            .bucket(&bucket3)
-            .key("baz")
-            .send()
-            .await
-            .unwrap();
-        client
-            .delete_bucket()
-            .bucket(&bucket3)
-            .send()
-            .await
-            .unwrap();
+        cleanup_versioned_bucket(client, &bucket3).await;
     });
 }
 

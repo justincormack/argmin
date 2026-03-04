@@ -109,6 +109,66 @@ pub async fn delete_all_and_bucket(client: &Client, bucket: &str, keys: &[String
         .expect("delete bucket");
 }
 
+/// Delete all object versions and delete markers in a bucket, then delete the bucket.
+///
+/// This is needed for versioned buckets on AWS where simple delete_object creates
+/// delete markers rather than removing objects.
+pub async fn cleanup_versioned_bucket(client: &Client, bucket: &str) {
+    loop {
+        let resp = client
+            .list_object_versions()
+            .bucket(bucket)
+            .send()
+            .await
+            .expect("list object versions");
+
+        let mut objects: Vec<aws_sdk_s3::types::ObjectIdentifier> = Vec::new();
+
+        for v in resp.versions() {
+            objects.push(
+                aws_sdk_s3::types::ObjectIdentifier::builder()
+                    .key(v.key().unwrap_or_default())
+                    .version_id(v.version_id().unwrap_or_default())
+                    .build()
+                    .unwrap(),
+            );
+        }
+        for m in resp.delete_markers() {
+            objects.push(
+                aws_sdk_s3::types::ObjectIdentifier::builder()
+                    .key(m.key().unwrap_or_default())
+                    .version_id(m.version_id().unwrap_or_default())
+                    .build()
+                    .unwrap(),
+            );
+        }
+
+        if objects.is_empty() {
+            break;
+        }
+
+        let delete = aws_sdk_s3::types::Delete::builder()
+            .set_objects(Some(objects))
+            .quiet(true)
+            .build()
+            .unwrap();
+        client
+            .delete_objects()
+            .bucket(bucket)
+            .delete(delete)
+            .send()
+            .await
+            .expect("delete objects");
+    }
+
+    client
+        .delete_bucket()
+        .bucket(bucket)
+        .send()
+        .await
+        .expect("delete bucket");
+}
+
 /// Assert that an S3 SDK error contains the expected error code string.
 pub fn assert_s3_err_code<T, E: std::fmt::Debug>(
     result: &Result<T, aws_sdk_s3::error::SdkError<E>>,
