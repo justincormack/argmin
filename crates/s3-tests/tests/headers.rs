@@ -936,12 +936,8 @@ fn test_put_expect_garbage() {
             .expect("transport error");
         let status = resp.status().as_u16();
         let _ = resp.body_mut().read_to_string();
-        // 200 (server ignores) or 417 (Expectation Failed) — both acceptable
-        assert!(
-            status == 200 || status == 417,
-            "expected 200 or 417, got {}",
-            status
-        );
+        // AWS ignores unknown Expect values and processes the request normally
+        assert_eq!(status, 200, "expected 200, got {}", status);
         // Object may have been created if status was 200
         cleanup(&bucket, &["obj"]).await;
     });
@@ -994,16 +990,11 @@ fn test_put_body_sha256_mismatch() {
             .expect("transport error");
         let status = resp.status().as_u16();
         let rbody = resp.body_mut().read_to_string().unwrap();
-        // Server detects body hash mismatch: either SignatureDoesNotMatch or InvalidRequest
+        // Body hash mismatch: signature covers x-amz-content-sha256 → SignatureDoesNotMatch
+        assert_eq!(status, 403, "expected 403, got {}", status);
         assert!(
-            status == 400 || status == 403,
-            "expected 400 or 403, got {}",
-            status
-        );
-        assert!(
-            rbody.contains("<Code>SignatureDoesNotMatch</Code>")
-                || rbody.contains("<Code>InvalidRequest</Code>"),
-            "expected SignatureDoesNotMatch or InvalidRequest in body: {}",
+            rbody.contains("<Code>SignatureDoesNotMatch</Code>"),
+            "expected SignatureDoesNotMatch in body: {}",
             rbody
         );
         cleanup(&bucket, &[]).await;

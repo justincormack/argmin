@@ -383,11 +383,8 @@ fn test_presigned_delete_object() {
             .expect("transport error");
         let status = resp.status().as_u16();
         let _ = resp.body_mut().read_to_string();
-        assert!(
-            status == 200 || status == 204,
-            "expected 200/204, got {}",
-            status
-        );
+        // AWS DeleteObject returns 204 No Content
+        assert_eq!(status, 204, "expected 204, got {}", status);
 
         // Verify deleted
         let result = client
@@ -558,12 +555,8 @@ fn test_presigned_get_tampered_key() {
         let mut resp = agent().get(&tampered).call().expect("transport error");
         let status = resp.status().as_u16();
         let _ = resp.body_mut().read_to_string();
-        // Should fail: either 403 (signature mismatch) or 404 (not found)
-        assert!(
-            status == 403 || status == 404,
-            "expected 403/404, got {}",
-            status
-        );
+        // Signature covers the path; tampered key → SignatureDoesNotMatch
+        assert_eq!(status, 403, "expected 403, got {}", status);
 
         cleanup(&bucket, &["original"]).await;
     });
@@ -829,12 +822,8 @@ fn test_object_raw_get_x_amz_expires_out_max_range() {
             .expect("transport error");
         let status = resp.status().as_u16();
         let _ = resp.body_mut().read_to_string();
-        // Should be rejected as expires exceeds max range
-        assert!(
-            status == 400 || status == 403,
-            "expected 400 or 403 for out-of-range expires, got {}",
-            status
-        );
+        // Presigned URL validation: expires > 604800 is an auth parameter error
+        assert_eq!(status, 403, "expected 403 for out-of-range expires, got {}", status);
 
         cleanup(&bucket, &["obj"]).await;
     });
@@ -873,11 +862,8 @@ fn test_object_raw_get_x_amz_expires_out_positive_range() {
         let mut resp = agent().get(&tampered_url).call().expect("transport error");
         let status = resp.status().as_u16();
         let _ = resp.body_mut().read_to_string();
-        assert!(
-            status == 400 || status == 403,
-            "expected 400 or 403 for negative expires, got {}",
-            status
-        );
+        // Negative X-Amz-Expires is a malformed parameter
+        assert_eq!(status, 400, "expected 400 for negative expires, got {}", status);
 
         cleanup(&bucket, &["obj"]).await;
     });
@@ -915,11 +901,8 @@ fn test_object_raw_get_x_amz_expires_out_range_zero() {
         let mut resp = agent().get(&tampered_url).call().expect("transport error");
         let status = resp.status().as_u16();
         let _ = resp.body_mut().read_to_string();
-        assert!(
-            status == 400 || status == 403,
-            "expected 400 or 403 for zero expires, got {}",
-            status
-        );
+        // Zero expires means immediately expired → auth expiry
+        assert_eq!(status, 403, "expected 403 for zero expires, got {}", status);
 
         cleanup(&bucket, &["obj"]).await;
     });
@@ -950,11 +933,8 @@ fn test_object_raw_put_authenticated_expired() {
             .expect("transport error");
         let status = resp.status().as_u16();
         let _ = resp.body_mut().read_to_string();
-        assert!(
-            status == 400 || status == 403,
-            "expected 400 or 403 for expired PUT, got {}",
-            status
-        );
+        // Expired presigned URL → auth expiry
+        assert_eq!(status, 403, "expected 403 for expired PUT, got {}", status);
 
         cleanup(&bucket, &[]).await;
     });
