@@ -28,7 +28,8 @@ We are using the Ceph test suite and porting these to native tests 1:1, these te
 ## Cleanliness
 
 Make sure `cargo clippy` is clean, even if it is pedantic. Always run tests after making changes and make sure
-they still pass. Review your code to make sure it is clear, correct and secure. Always run `cargo fmt`.
+they still pass. Review your code to make sure it is clear, correct and secure. Always run `cargo fmt` after
+making any edits.
 
 ## Diary
 
