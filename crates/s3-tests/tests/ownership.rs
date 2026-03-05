@@ -173,12 +173,20 @@ fn test_create_bucket_bucket_owner_enforced() {
             "PutObject with bucket-owner-full-control should succeed, got {status}"
         );
 
-        // PutObject with ACL=private should fail
+        // PutObject with ACL=private should succeed (private is compatible with BOE)
         let obj_url2 = format!("{}/{}/put-object-private", CTX.endpoint(), bucket);
         let status = send_signed_put(&obj_url2, b"data", &[("x-amz-acl", "private")]);
         assert_eq!(
+            status, 200,
+            "PutObject with ACL=private should succeed under BOE, got {status}"
+        );
+
+        // PutObject with ACL=public-read should fail
+        let obj_url3 = format!("{}/{}/put-object-public", CTX.endpoint(), bucket);
+        let status = send_signed_put(&obj_url3, b"data", &[("x-amz-acl", "public-read")]);
+        assert_eq!(
             status, 400,
-            "PutObject with ACL=private should fail under BOE, got {status}"
+            "PutObject with ACL=public-read should fail under BOE, got {status}"
         );
 
         // CopyObject without ACL should succeed
@@ -191,7 +199,7 @@ fn test_create_bucket_bucket_owner_enforced() {
             .await
             .unwrap();
 
-        // CopyObject with ACL=private should fail
+        // CopyObject with ACL=private should succeed (private is compatible with BOE)
         let copy_url = format!("{}/{}/copy-object-private", CTX.endpoint(), bucket);
         let status = send_signed_put(
             &copy_url,
@@ -205,11 +213,29 @@ fn test_create_bucket_bucket_owner_enforced() {
             ],
         );
         assert_eq!(
-            status, 400,
-            "CopyObject with ACL=private should fail under BOE, got {status}"
+            status, 200,
+            "CopyObject with ACL=private should succeed under BOE, got {status}"
         );
 
-        // PutBucketAcl private should fail
+        // CopyObject with ACL=public-read should fail
+        let copy_url2 = format!("{}/{}/copy-object-public", CTX.endpoint(), bucket);
+        let status = send_signed_put(
+            &copy_url2,
+            b"",
+            &[
+                ("x-amz-acl", "public-read"),
+                (
+                    "x-amz-copy-source",
+                    &format!("{}/put-object-no-acl", bucket),
+                ),
+            ],
+        );
+        assert_eq!(
+            status, 400,
+            "CopyObject with ACL=public-read should fail under BOE, got {status}"
+        );
+
+        // PutBucketAcl private should fail (all PutBucketAcl rejected under BOE)
         let acl_url = format!("{}/{}?acl", CTX.endpoint(), bucket);
         let status = send_signed_put(&acl_url, b"", &[("x-amz-acl", "private")]);
         assert_eq!(
@@ -218,7 +244,13 @@ fn test_create_bucket_bucket_owner_enforced() {
         );
 
         // Cleanup objects
-        for key in ["put-object-no-acl", "put-object-bofc", "copy-object-no-acl"] {
+        for key in [
+            "put-object-no-acl",
+            "put-object-bofc",
+            "put-object-private",
+            "copy-object-no-acl",
+            "copy-object-private",
+        ] {
             client
                 .delete_object()
                 .bucket(&bucket)
@@ -239,19 +271,8 @@ fn test_create_bucket_bucket_owner_enforced() {
 #[test]
 fn test_put_bucket_ownership_enforced_rejects_public_acl() {
     s3_tests::run(async {
-        let bucket = unique_bucket();
-
-        // Create bucket with public-read ACL (need BucketOwnerPreferred to allow ACLs)
-        let url = format!("{}/{}", CTX.endpoint(), bucket);
-        let status = send_signed_put(
-            &url,
-            b"",
-            &[
-                ("x-amz-object-ownership", "BucketOwnerPreferred"),
-                ("x-amz-acl", "public-read"),
-            ],
-        );
-        assert_eq!(status, 200, "create public-read bucket failed: {}", status);
+        let client = CTX.client();
+        let bucket = s3_tests::create_public_bucket(client).await;
 
         // PUT BucketOwnerEnforced should fail — bucket is public-read
         let oc_url = format!("{}/{}?ownershipControls", CTX.endpoint(), bucket);
@@ -382,19 +403,7 @@ fn test_bucket_owner_enforced_allows_bucket_owner_full_control() {
 fn test_put_bucket_ownership_bucket_owner_enforced() {
     s3_tests::run(async {
         let client = CTX.client();
-        let bucket = unique_bucket();
-
-        // Create bucket with public-read ACL (need BucketOwnerPreferred to allow ACLs)
-        let url = format!("{}/{}", CTX.endpoint(), bucket);
-        let status = send_signed_put(
-            &url,
-            b"",
-            &[
-                ("x-amz-object-ownership", "BucketOwnerPreferred"),
-                ("x-amz-acl", "public-read"),
-            ],
-        );
-        assert_eq!(status, 200, "create public-read bucket failed: {status}");
+        let bucket = s3_tests::create_public_bucket(client).await;
 
         // PutBucketOwnershipControls BOE should fail — bucket is public-read
         let oc_url = format!("{}/{}?ownershipControls", CTX.endpoint(), bucket);
@@ -429,15 +438,23 @@ fn test_put_bucket_ownership_bucket_owner_enforced() {
             .await
             .unwrap();
 
-        // PutObject with ACL=private should fail
+        // PutObject with ACL=private should succeed (private is compatible with BOE)
         let obj_url = format!("{}/{}/put-object-private", CTX.endpoint(), bucket);
         let status = send_signed_put(&obj_url, b"data", &[("x-amz-acl", "private")]);
         assert_eq!(
-            status, 400,
-            "PutObject with ACL=private should fail under BOE, got {status}"
+            status, 200,
+            "PutObject with ACL=private should succeed under BOE, got {status}"
         );
 
-        // CopyObject with ACL=private should fail
+        // PutObject with ACL=public-read should fail
+        let obj_url2 = format!("{}/{}/put-object-public", CTX.endpoint(), bucket);
+        let status = send_signed_put(&obj_url2, b"data", &[("x-amz-acl", "public-read")]);
+        assert_eq!(
+            status, 400,
+            "PutObject with ACL=public-read should fail under BOE, got {status}"
+        );
+
+        // CopyObject with ACL=private should succeed (private is compatible with BOE)
         let copy_url = format!("{}/{}/copy-object-private", CTX.endpoint(), bucket);
         let status = send_signed_put(
             &copy_url,
@@ -451,11 +468,11 @@ fn test_put_bucket_ownership_bucket_owner_enforced() {
             ],
         );
         assert_eq!(
-            status, 400,
-            "CopyObject with ACL=private should fail under BOE, got {status}"
+            status, 200,
+            "CopyObject with ACL=private should succeed under BOE, got {status}"
         );
 
-        // PutBucketAcl private should fail
+        // PutBucketAcl private should fail (all PutBucketAcl rejected under BOE)
         let status = send_signed_put(&acl_url, b"", &[("x-amz-acl", "private")]);
         assert_eq!(
             status, 400,
@@ -463,13 +480,19 @@ fn test_put_bucket_ownership_bucket_owner_enforced() {
         );
 
         // Cleanup
-        client
-            .delete_object()
-            .bucket(&bucket)
-            .key("put-object-no-acl")
-            .send()
-            .await
-            .unwrap();
+        for key in [
+            "put-object-no-acl",
+            "put-object-private",
+            "copy-object-private",
+        ] {
+            client
+                .delete_object()
+                .bucket(&bucket)
+                .key(key)
+                .send()
+                .await
+                .unwrap();
+        }
         cleanup(&bucket).await;
     });
 }

@@ -362,6 +362,7 @@ impl HttpFrontend {
                             if let Ok(val) = xml::parse_ownership_controls_xml(oc_xml.as_bytes()) {
                                 if val == "BucketOwnerEnforced"
                                     && acl_value != "bucket-owner-full-control"
+                                    && acl_value != "private"
                                 {
                                     return Err(ServerError::AccessControlListNotSupported);
                                 }
@@ -438,7 +439,7 @@ impl HttpFrontend {
                 } else {
                     // Normal PutObject path
                     self.authorize_bucket_write(auth, &bucket)?;
-                    // Enforce BucketOwnerEnforced: reject x-amz-acl unless bucket-owner-full-control
+                    // Enforce BucketOwnerEnforced: reject x-amz-acl unless bucket-owner-full-control or private
                     if let Some(acl_value) = req.header("x-amz-acl") {
                         if let Some(ref oc_xml) =
                             self.coordinator.get_bucket_ownership_controls(&bucket)?
@@ -446,6 +447,7 @@ impl HttpFrontend {
                             if let Ok(val) = xml::parse_ownership_controls_xml(oc_xml.as_bytes()) {
                                 if val == "BucketOwnerEnforced"
                                     && acl_value != "bucket-owner-full-control"
+                                    && acl_value != "private"
                                 {
                                     return Err(ServerError::AccessControlListNotSupported);
                                 }
@@ -854,7 +856,7 @@ impl HttpFrontend {
                 let acl = parse_bucket_acl(req)?;
                 match acl {
                     BucketAcl::Private => {
-                        // Enforce BucketOwnerEnforced — no ACL ops allowed
+                        // Enforce BucketOwnerEnforced — all PutBucketAcl calls rejected
                         if let Some(ref oc_xml) =
                             self.coordinator.get_bucket_ownership_controls(&bucket)?
                         {

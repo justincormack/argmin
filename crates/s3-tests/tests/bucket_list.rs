@@ -1712,15 +1712,7 @@ fn anon_agent() -> ureq::Agent {
 fn test_bucket_list_objects_anonymous() {
     s3_tests::run(async {
         let client = CTX.client();
-        let bucket = unique_bucket();
-        client
-            .create_bucket()
-            .bucket(&bucket)
-            .object_ownership(aws_sdk_s3::types::ObjectOwnership::BucketOwnerPreferred)
-            .acl(aws_sdk_s3::types::BucketCannedAcl::PublicRead)
-            .send()
-            .await
-            .unwrap();
+        let bucket = s3_tests::create_public_bucket(client).await;
         for key in SET_B {
             client
                 .put_object()
@@ -1748,15 +1740,7 @@ fn test_bucket_list_objects_anonymous() {
 fn test_bucket_listv2_objects_anonymous() {
     s3_tests::run(async {
         let client = CTX.client();
-        let bucket = unique_bucket();
-        client
-            .create_bucket()
-            .bucket(&bucket)
-            .object_ownership(aws_sdk_s3::types::ObjectOwnership::BucketOwnerPreferred)
-            .acl(aws_sdk_s3::types::BucketCannedAcl::PublicRead)
-            .send()
-            .await
-            .unwrap();
+        let bucket = s3_tests::create_public_bucket(client).await;
         for key in SET_B {
             client
                 .put_object()

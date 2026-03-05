@@ -1,5 +1,4 @@
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{BucketCannedAcl, ObjectOwnership};
 use s3_tests::{unique_bucket, CTX};
 
 /// Build an agent that returns all HTTP responses (including 4xx/5xx) as Ok.
@@ -12,17 +11,7 @@ fn agent() -> ureq::Agent {
 
 /// Create a public-read bucket, returning its name.
 async fn setup_public_bucket() -> String {
-    let client = CTX.client();
-    let bucket = unique_bucket();
-    client
-        .create_bucket()
-        .bucket(&bucket)
-        .object_ownership(ObjectOwnership::BucketOwnerPreferred)
-        .acl(BucketCannedAcl::PublicRead)
-        .send()
-        .await
-        .unwrap();
-    bucket
+    s3_tests::create_public_bucket(CTX.client()).await
 }
 
 /// Create a private bucket (default), returning its name.

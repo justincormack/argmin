@@ -89,6 +89,71 @@ pub async fn create_objects_with_keys(client: &Client, keys: &[&str]) -> (String
     (bucket, owned_keys)
 }
 
+/// Create a public-read bucket.
+///
+/// Disables bucket-level BlockPublicAccess, sets ObjectOwnership to
+/// BucketOwnerPreferred, then applies the public-read ACL. Note that
+/// account-level BlockPublicAccess (if enabled) can still override
+/// bucket-level settings and cause these calls to fail.
+pub async fn create_public_bucket(client: &Client) -> String {
+    use aws_sdk_s3::types::{
+        BucketCannedAcl, ObjectOwnership, OwnershipControlsRule, PublicAccessBlockConfiguration,
+    };
+
+    let bucket = unique_bucket();
+
+    // 1. Create the bucket (private, default ownership)
+    client
+        .create_bucket()
+        .bucket(&bucket)
+        .send()
+        .await
+        .expect("create bucket");
+
+    // 2. Disable BlockPublicAccess on this bucket
+    let pab = PublicAccessBlockConfiguration::builder()
+        .block_public_acls(false)
+        .ignore_public_acls(false)
+        .block_public_policy(false)
+        .restrict_public_buckets(false)
+        .build();
+    client
+        .put_public_access_block()
+        .bucket(&bucket)
+        .public_access_block_configuration(pab)
+        .send()
+        .await
+        .expect("disable public access block");
+
+    // 3. Set ownership to BucketOwnerPreferred (required to use canned ACLs)
+    let ownership_rule = OwnershipControlsRule::builder()
+        .object_ownership(ObjectOwnership::BucketOwnerPreferred)
+        .build()
+        .unwrap();
+    let ownership = aws_sdk_s3::types::OwnershipControls::builder()
+        .rules(ownership_rule)
+        .build()
+        .unwrap();
+    client
+        .put_bucket_ownership_controls()
+        .bucket(&bucket)
+        .ownership_controls(ownership)
+        .send()
+        .await
+        .expect("set ownership controls");
+
+    // 4. Apply public-read ACL
+    client
+        .put_bucket_acl()
+        .bucket(&bucket)
+        .acl(BucketCannedAcl::PublicRead)
+        .send()
+        .await
+        .expect("set public-read ACL");
+
+    bucket
+}
+
 /// Delete all listed keys from the bucket, then delete the bucket itself.
 pub async fn delete_all_and_bucket(client: &Client, bucket: &str, keys: &[String]) {
     for key in keys {

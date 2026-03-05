@@ -387,17 +387,8 @@ fn test_cors_actual_request_headers() {
 #[test]
 fn test_cors_actual_request_public_bucket() {
     s3_tests::run(async {
-        use aws_sdk_s3::types::{BucketCannedAcl, ObjectOwnership};
         let client = CTX.client();
-        let bucket = unique_bucket();
-        client
-            .create_bucket()
-            .bucket(&bucket)
-            .object_ownership(ObjectOwnership::BucketOwnerPreferred)
-            .acl(BucketCannedAcl::PublicRead)
-            .send()
-            .await
-            .unwrap();
+        let bucket = s3_tests::create_public_bucket(client).await;
 
         let rule = CorsRule::builder()
             .allowed_origins("http://example.com")
@@ -460,17 +451,8 @@ fn test_cors_actual_request_public_bucket() {
 #[test]
 fn test_cors_actual_request_no_match() {
     s3_tests::run(async {
-        use aws_sdk_s3::types::{BucketCannedAcl, ObjectOwnership};
         let client = CTX.client();
-        let bucket = unique_bucket();
-        client
-            .create_bucket()
-            .bucket(&bucket)
-            .object_ownership(ObjectOwnership::BucketOwnerPreferred)
-            .acl(BucketCannedAcl::PublicRead)
-            .send()
-            .await
-            .unwrap();
+        let bucket = s3_tests::create_public_bucket(client).await;
 
         let rule = CorsRule::builder()
             .allowed_origins("http://specific.com")

@@ -1,7 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{BucketCannedAcl, ObjectOwnership};
 use ring::{digest, hmac};
 use s3_tests::{unique_bucket, CTX};
 
@@ -22,17 +21,7 @@ async fn setup_bucket() -> String {
 }
 
 async fn setup_public_bucket() -> String {
-    let client = CTX.client();
-    let bucket = unique_bucket();
-    client
-        .create_bucket()
-        .bucket(&bucket)
-        .object_ownership(ObjectOwnership::BucketOwnerPreferred)
-        .acl(BucketCannedAcl::PublicRead)
-        .send()
-        .await
-        .unwrap();
-    bucket
+    s3_tests::create_public_bucket(CTX.client()).await
 }
 
 async fn cleanup(bucket: &str, keys: &[&str]) {

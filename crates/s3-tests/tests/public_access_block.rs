@@ -1,4 +1,4 @@
-use aws_sdk_s3::types::{BucketCannedAcl, ObjectOwnership};
+use aws_sdk_s3::types::ObjectOwnership;
 use s3_tests::{unique_bucket, CTX};
 
 /// Build an agent that returns all HTTP responses (including 4xx/5xx) as Ok.
@@ -220,16 +220,7 @@ fn test_block_public_put_bucket_acls() {
 fn test_ignore_public_acls() {
     s3_tests::run(async {
         let client = CTX.client();
-        let bucket = unique_bucket();
-        // Create a public-read bucket
-        client
-            .create_bucket()
-            .bucket(&bucket)
-            .object_ownership(ObjectOwnership::BucketOwnerPreferred)
-            .acl(BucketCannedAcl::PublicRead)
-            .send()
-            .await
-            .unwrap();
+        let bucket = s3_tests::create_public_bucket(client).await;
 
         let alt_client = CTX.alt_client();
 
@@ -342,18 +333,10 @@ fn test_ignore_public_acls() {
 fn test_get_public_access_block_requires_owner() {
     s3_tests::run(async {
         let client = CTX.client();
-        let bucket = unique_bucket();
-        // Create a public-read bucket
-        client
-            .create_bucket()
-            .bucket(&bucket)
-            .object_ownership(ObjectOwnership::BucketOwnerPreferred)
-            .acl(BucketCannedAcl::PublicRead)
-            .send()
-            .await
-            .unwrap();
+        let bucket = s3_tests::create_public_bucket(client).await;
 
         // Put a PAB config so there's something to GET
+        // (create_public_bucket already disabled PAB, re-enable block_public_acls)
         let pab = aws_sdk_s3::types::PublicAccessBlockConfiguration::builder()
             .block_public_acls(true)
             .build();
