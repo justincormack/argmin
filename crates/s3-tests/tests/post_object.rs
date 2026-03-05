@@ -591,6 +591,9 @@ fn test_post_object_set_key_from_filename() {
             &[
                 serde_json::json!({"bucket": bucket}),
                 serde_json::json!(["starts-with", "$key", "uploads/"]),
+                serde_json::json!({"x-amz-algorithm": "AWS4-HMAC-SHA256"}),
+                serde_json::json!({"x-amz-credential": &credential}),
+                serde_json::json!({"x-amz-date": &full_date}),
             ],
         );
         let signature = sign_policy_v4(&policy_b64, secret, &short_date, region);
@@ -1186,6 +1189,9 @@ fn test_post_object_case_insensitive_condition_fields() {
             &[
                 serde_json::json!({"bucket": bucket}),
                 serde_json::json!({"Key": key}),
+                serde_json::json!({"x-amz-algorithm": "AWS4-HMAC-SHA256"}),
+                serde_json::json!({"x-amz-credential": &credential}),
+                serde_json::json!({"x-amz-date": &full_date}),
             ],
         );
         let signature = sign_policy_v4(&policy_b64, secret, &short_date, region);
@@ -1250,8 +1256,65 @@ fn test_post_object_escaped_field_values() {
     });
 }
 
+/// Policy with only bucket + starts-with $key but no SigV4 conditions → 403
 #[test]
-#[ignore = "not implemented: POST policy extra-field rejection"]
+fn test_post_object_missing_sigv4_policy_conditions() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key_template = "uploads/${filename}";
+
+        let (short_date, full_date) = current_dates();
+        let secret = CTX.secret_key();
+        let access_key = CTX.access_key();
+        let region = CTX.region();
+        let credential = format!("{}/{}/{}/s3/aws4_request", access_key, short_date, region);
+
+        // Policy intentionally omits SigV4 conditions
+        let policy_b64 = make_policy_raw(
+            &epoch_to_iso8601(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    + 3600,
+            ),
+            &[
+                serde_json::json!({"bucket": bucket}),
+                serde_json::json!(["starts-with", "$key", "uploads/"]),
+            ],
+        );
+        let signature = sign_policy_v4(&policy_b64, secret, &short_date, region);
+
+        let fields: Vec<(&str, &str)> = vec![
+            ("key", key_template),
+            ("x-amz-algorithm", "AWS4-HMAC-SHA256"),
+            ("x-amz-credential", &credential),
+            ("x-amz-date", &full_date),
+            ("policy", &policy_b64),
+            ("x-amz-signature", &signature),
+        ];
+
+        let (status, _) = post_object(&bucket, &fields, b"file content", "myfile.txt");
+        assert_eq!(status, 403, "expected 403, got {}", status);
+
+        // Cleanup
+        let _ = CTX
+            .client()
+            .delete_object()
+            .bucket(&bucket)
+            .key("uploads/myfile.txt")
+            .send()
+            .await;
+        CTX.client()
+            .delete_bucket()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+    });
+}
+
+#[test]
 fn test_post_object_missing_policy_condition() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;
@@ -1263,8 +1326,7 @@ fn test_post_object_missing_policy_condition() {
         let region = CTX.region();
         let credential = format!("{}/{}/{}/s3/aws4_request", access_key, short_date, region);
 
-        // Policy doesn't include Content-Type condition, but form has it
-        // S3 ignores unknown form fields not in policy, so this should succeed
+        // Policy doesn't include Content-Type condition, but form has it — AWS rejects with 403
         let policy_b64 = make_policy(&bucket, key, 3600, &[]);
         let signature = sign_policy_v4(&policy_b64, secret, &short_date, region);
 
@@ -1683,11 +1745,10 @@ fn test_post_object_metadata() {
 #[test]
 fn test_post_object_user_specified_header() {
     s3_tests::run(async {
-        let client = CTX.client();
         let bucket = setup_bucket().await;
         let key = "post-ignored";
 
-        // Include an unknown form field — should be ignored
+        // Include an unknown form field without a policy condition — AWS rejects with 403
         let mut fields = sigv4_fields(&bucket, key, &[]);
         fields.push(("x-unknown-field".to_string(), "whatever".to_string()));
         let field_refs: Vec<(&str, &str)> = fields
@@ -1696,16 +1757,22 @@ fn test_post_object_user_specified_header() {
             .collect();
 
         let (status, _) = post_object(&bucket, &field_refs, b"data", "test.txt");
-        assert_eq!(status, 204, "expected 204, got {}", status);
+        assert_eq!(status, 403, "expected 403, got {}", status);
 
-        client
+        // Cleanup
+        let _ = CTX
+            .client()
             .delete_object()
             .bucket(&bucket)
             .key(key)
             .send()
+            .await;
+        CTX.client()
+            .delete_bucket()
+            .bucket(&bucket)
+            .send()
             .await
             .unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
 }
 
@@ -1716,7 +1783,7 @@ fn test_post_object_ignored_header() {
         let bucket = setup_bucket().await;
         let key = "post-ignored-hdr";
 
-        // Include a form field that the server should silently ignore
+        // x-ignore-* fields are exempt from policy coverage per AWS docs
         let mut fields = sigv4_fields(&bucket, key, &[]);
         fields.push(("x-ignore-me".to_string(), "value".to_string()));
         let field_refs: Vec<(&str, &str)> = fields

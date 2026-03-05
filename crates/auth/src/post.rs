@@ -180,6 +180,9 @@ pub fn validate_post_policy(
         .and_then(|v| v.as_array())
         .ok_or(PostPolicyError::Malformed("missing conditions"))?;
 
+    // Track which field names are covered by policy conditions
+    let mut covered_fields = std::collections::HashSet::new();
+
     for condition in conditions {
         if let Some(obj) = condition.as_object() {
             // Empty condition object is invalid
@@ -193,10 +196,12 @@ pub fn validate_post_policy(
                     .ok_or(PostPolicyError::Malformed("condition value must be string"))?;
                 let field_name = key.to_ascii_lowercase();
                 if field_name == "bucket" {
+                    covered_fields.insert("bucket".to_string());
                     if bucket != expected {
                         return Err(PostPolicyError::ConditionFailed("bucket"));
                     }
                 } else {
+                    covered_fields.insert(field_name.clone());
                     let form_val = find_field(form_fields, &field_name);
                     if form_val != Some(expected) {
                         return Err(PostPolicyError::ConditionFailed("exact match"));
@@ -229,6 +234,7 @@ pub fn validate_post_policy(
                             "field reference must start with $",
                         ))?
                         .to_ascii_lowercase();
+                    covered_fields.insert(field_name.clone());
                     let form_val = find_field(form_fields, &field_name).unwrap_or("");
                     if !form_val.starts_with(prefix) {
                         return Err(PostPolicyError::ConditionFailed("starts-with"));
@@ -246,6 +252,7 @@ pub fn validate_post_policy(
                             "field reference must start with $",
                         ))?
                         .to_ascii_lowercase();
+                    covered_fields.insert(field_name.clone());
                     let form_val = find_field(form_fields, &field_name);
                     if form_val != Some(expected) {
                         return Err(PostPolicyError::ConditionFailed("eq"));
@@ -269,6 +276,24 @@ pub fn validate_post_policy(
                     if size < min || size > max {
                         return Err(PostPolicyError::ConditionFailed("content-length-range"));
                     }
+                }
+            }
+        }
+    }
+
+    // Check that every non-exempt form field has a covering condition
+    for (field_name, _) in form_fields {
+        let lower = field_name.to_ascii_lowercase();
+        match lower.as_str() {
+            // These fields are part of the auth mechanism itself, not user data.
+            // x-ignore-* fields are explicitly exempt per AWS docs.
+            "policy" | "x-amz-signature" | "signature" | "awsaccesskeyid" | "file" => {}
+            f if f.starts_with("x-ignore-") => {}
+            _ => {
+                if !covered_fields.contains(&lower) {
+                    return Err(PostPolicyError::ConditionFailed(
+                        "form field not covered by policy",
+                    ));
                 }
             }
         }
@@ -533,5 +558,62 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, AuthError::SignatureMismatch));
+    }
+
+    fn future_policy_b64(conditions: &[serde_json::Value]) -> String {
+        use base64::Engine;
+        let policy = serde_json::json!({
+            "expiration": "2099-12-31T23:59:59Z",
+            "conditions": conditions,
+        });
+        base64::engine::general_purpose::STANDARD.encode(policy.to_string().as_bytes())
+    }
+
+    #[test]
+    fn policy_rejects_uncovered_form_field() {
+        let policy_b64 = future_policy_b64(&[
+            serde_json::json!({"bucket": "my-bucket"}),
+            serde_json::json!({"key": "obj"}),
+        ]);
+        let form_fields = vec![
+            ("key", "obj"),
+            ("Content-Type", "text/plain"), // no condition for this
+        ];
+        let err = validate_post_policy(&policy_b64, &form_fields, 0, "my-bucket", 0).unwrap_err();
+        assert!(
+            matches!(err, PostPolicyError::ConditionFailed(_)),
+            "expected ConditionFailed, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn policy_allows_exempt_fields() {
+        let policy_b64 = future_policy_b64(&[
+            serde_json::json!({"bucket": "my-bucket"}),
+            serde_json::json!({"key": "obj"}),
+        ]);
+        // Exempt fields should not require conditions
+        let form_fields = vec![
+            ("key", "obj"),
+            ("policy", "abc"),
+            ("x-amz-signature", "deadbeef"),
+        ];
+        validate_post_policy(&policy_b64, &form_fields, 0, "my-bucket", 0).unwrap();
+    }
+
+    #[test]
+    fn policy_allows_x_ignore_fields() {
+        let policy_b64 = future_policy_b64(&[
+            serde_json::json!({"bucket": "my-bucket"}),
+            serde_json::json!({"key": "obj"}),
+        ]);
+        // x-ignore-* fields are exempt from policy coverage per AWS docs
+        let form_fields = vec![
+            ("key", "obj"),
+            ("x-ignore-foo", "bar"),
+            ("x-ignore-something", "else"),
+        ];
+        validate_post_policy(&policy_b64, &form_fields, 0, "my-bucket", 0).unwrap();
     }
 }
