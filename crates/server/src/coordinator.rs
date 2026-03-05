@@ -2228,7 +2228,7 @@ impl Coordinator {
                 if !cond.is_empty() {
                     let etag_str =
                         format_object_etag(&record.etag, record.etag_kind, record.parts_count);
-                    check_delete_conditions(cond, &etag_str, record.last_modified, record.size)?;
+                    check_delete_conditions(cond, &etag_str)?;
                 }
 
                 if record.data_layout == DataLayout::MultipartManifest {
@@ -3532,11 +3532,7 @@ mod tests {
         if_match: None,
         if_none_match: None,
     };
-    const NO_DELETE: &DeleteCondition = &DeleteCondition {
-        if_match: None,
-        if_match_last_modified_time: None,
-        if_match_size: None,
-    };
+    const NO_DELETE: &DeleteCondition = &DeleteCondition { if_match: None };
 
     fn setup_coordinator(dir: &Path) -> Coordinator {
         let pg_ids: Vec<u32> = (0..4).collect();

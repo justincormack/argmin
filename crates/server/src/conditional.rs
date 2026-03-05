@@ -27,8 +27,6 @@ pub struct WriteCondition {
 #[derive(Debug, Default)]
 pub struct DeleteCondition {
     pub if_match: Option<String>,
-    pub if_match_last_modified_time: Option<u64>,
-    pub if_match_size: Option<u64>,
 }
 
 /// Extract read conditions from an S3 request's headers.
@@ -42,24 +40,53 @@ pub fn read_condition_from_headers(req: &S3Request) -> ReadCondition {
 }
 
 /// Extract write conditions from an S3 request's headers.
-pub fn write_condition_from_headers(req: &S3Request) -> WriteCondition {
-    WriteCondition {
+///
+/// AWS S3 only supports `If-Match: <etag>` and `If-None-Match: *` on writes.
+/// `If-Match: *` and `If-None-Match: <etag>` return 501 NotImplemented.
+pub fn write_condition_from_headers(req: &S3Request) -> Result<WriteCondition, ServerError> {
+    if let Some(val) = req.header("if-match") {
+        if val.trim() == "*" {
+            return Err(ServerError::NotImplemented {
+                feature: "A header you provided implies functionality that is not implemented"
+                    .to_string(),
+            });
+        }
+    }
+    if let Some(val) = req.header("if-none-match") {
+        if val.trim() != "*" {
+            return Err(ServerError::NotImplemented {
+                feature: "A header you provided implies functionality that is not implemented"
+                    .to_string(),
+            });
+        }
+    }
+    Ok(WriteCondition {
         if_match: req.header("if-match").map(str::to_string),
         if_none_match: req.header("if-none-match").map(str::to_string),
-    }
+    })
 }
 
 /// Extract delete conditions from an S3 request's headers.
-pub fn delete_condition_from_headers(req: &S3Request) -> DeleteCondition {
-    DeleteCondition {
-        if_match: req.header("if-match").map(str::to_string),
-        if_match_last_modified_time: req
-            .header("x-amz-if-match-last-modified-time")
-            .and_then(parse_http_date),
-        if_match_size: req
-            .header("x-amz-if-match-size")
-            .and_then(|s| s.trim().parse::<u64>().ok()),
+///
+/// AWS S3 only supports `If-Match` on DeleteObject (general-purpose buckets).
+/// `x-amz-if-match-last-modified-time` and `x-amz-if-match-size` are
+/// directory-bucket-only features and return 501 NotImplemented.
+pub fn delete_condition_from_headers(req: &S3Request) -> Result<DeleteCondition, ServerError> {
+    if req.header("x-amz-if-match-last-modified-time").is_some() {
+        return Err(ServerError::NotImplemented {
+            feature: "A header you provided implies functionality that is not implemented"
+                .to_string(),
+        });
     }
+    if req.header("x-amz-if-match-size").is_some() {
+        return Err(ServerError::NotImplemented {
+            feature: "A header you provided implies functionality that is not implemented"
+                .to_string(),
+        });
+    }
+    Ok(DeleteCondition {
+        if_match: req.header("if-match").map(str::to_string),
+    })
 }
 
 /// Compare a single `ETag` value against an object's etag for equality.
@@ -194,34 +221,15 @@ pub fn check_write_conditions(
 ///
 /// - If-Match: * → pass (object existence already checked by caller)
 /// - If-Match: <etag> → 412 if mismatch
-/// - x-amz-if-match-last-modified-time → 412 if last_modified doesn't match
-/// - x-amz-if-match-size → 412 if size doesn't match
 ///
 /// # Errors
 ///
 /// Returns `PreconditionFailed` (412) if any condition fails.
-pub fn check_delete_conditions(
-    cond: &DeleteCondition,
-    etag: &str,
-    last_modified: u64,
-    size: u64,
-) -> Result<(), ServerError> {
+pub fn check_delete_conditions(cond: &DeleteCondition, etag: &str) -> Result<(), ServerError> {
     if let Some(ref required_etag) = cond.if_match {
         if required_etag.trim() == "*" {
-            // Wildcard matches any existing object — continue to check other conditions
+            // Wildcard matches any existing object
         } else if !etags_match(required_etag, etag) {
-            return Err(ServerError::PreconditionFailed);
-        }
-    }
-    if let Some(required_last_modified) = cond.if_match_last_modified_time {
-        // Compare at second precision: HTTP dates are second-granularity,
-        // but last_modified is stored in milliseconds.
-        if last_modified / 1000 != required_last_modified / 1000 {
-            return Err(ServerError::PreconditionFailed);
-        }
-    }
-    if let Some(required_size) = cond.if_match_size {
-        if size != required_size {
             return Err(ServerError::PreconditionFailed);
         }
     }
@@ -309,8 +317,6 @@ impl DeleteCondition {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.if_match.is_none()
-            && self.if_match_last_modified_time.is_none()
-            && self.if_match_size.is_none()
     }
 }
 
@@ -443,34 +449,6 @@ mod tests {
     }
 
     #[test]
-    fn write_if_none_match_specific_etag_prevents_overwrite() {
-        let cond = WriteCondition {
-            if_none_match: Some(test_etag()),
-            ..Default::default()
-        };
-        let err = check_write_conditions(&cond, Some(&test_etag())).unwrap_err();
-        assert!(matches!(err, ServerError::PreconditionFailed));
-    }
-
-    #[test]
-    fn write_if_none_match_specific_etag_allows_different() {
-        let cond = WriteCondition {
-            if_none_match: Some(other_etag()),
-            ..Default::default()
-        };
-        assert!(check_write_conditions(&cond, Some(&test_etag())).is_ok());
-    }
-
-    #[test]
-    fn write_if_none_match_specific_etag_allows_create() {
-        let cond = WriteCondition {
-            if_none_match: Some(test_etag()),
-            ..Default::default()
-        };
-        assert!(check_write_conditions(&cond, None).is_ok());
-    }
-
-    #[test]
     fn write_if_match_allows_matching_overwrite() {
         let cond = WriteCondition {
             if_match: Some(test_etag()),
@@ -499,6 +477,72 @@ mod tests {
         assert!(matches!(err, ServerError::PreconditionFailed));
     }
 
+    // ── Write condition validation (501 rejection) ────────────────────
+
+    fn make_req_with_headers(headers: Vec<(&str, &str)>) -> S3Request {
+        S3Request {
+            method: String::new(),
+            path: String::new(),
+            query_string: String::new(),
+            headers: headers
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            body: vec![],
+        }
+    }
+
+    #[test]
+    fn write_if_match_wildcard_returns_not_implemented() {
+        let req = make_req_with_headers(vec![("if-match", "*")]);
+        let err = write_condition_from_headers(&req).unwrap_err();
+        assert!(matches!(err, ServerError::NotImplemented { .. }));
+    }
+
+    #[test]
+    fn write_if_none_match_specific_etag_returns_not_implemented() {
+        let req = make_req_with_headers(vec![("if-none-match", "\"abcdef1234567890\"")]);
+        let err = write_condition_from_headers(&req).unwrap_err();
+        assert!(matches!(err, ServerError::NotImplemented { .. }));
+    }
+
+    #[test]
+    fn write_if_match_specific_etag_accepted() {
+        let req = make_req_with_headers(vec![("if-match", "\"abcdef1234567890\"")]);
+        assert!(write_condition_from_headers(&req).is_ok());
+    }
+
+    #[test]
+    fn write_if_none_match_star_accepted() {
+        let req = make_req_with_headers(vec![("if-none-match", "*")]);
+        assert!(write_condition_from_headers(&req).is_ok());
+    }
+
+    // ── Delete condition validation (501 rejection) ────────────────────
+
+    #[test]
+    fn delete_if_match_last_modified_time_returns_not_implemented() {
+        let req = make_req_with_headers(vec![(
+            "x-amz-if-match-last-modified-time",
+            "Thu, 01 Jan 2026 00:00:00 GMT",
+        )]);
+        let err = delete_condition_from_headers(&req).unwrap_err();
+        assert!(matches!(err, ServerError::NotImplemented { .. }));
+    }
+
+    #[test]
+    fn delete_if_match_size_returns_not_implemented() {
+        let req = make_req_with_headers(vec![("x-amz-if-match-size", "100")]);
+        let err = delete_condition_from_headers(&req).unwrap_err();
+        assert!(matches!(err, ServerError::NotImplemented { .. }));
+    }
+
+    #[test]
+    fn delete_if_match_accepted() {
+        let req = make_req_with_headers(vec![("if-match", "\"abcdef1234567890\"")]);
+        assert!(delete_condition_from_headers(&req).is_ok());
+    }
+
     // ── Delete conditions ──────────────────────────────────────────────
 
     #[test]
@@ -507,7 +551,7 @@ mod tests {
             if_match: Some(test_etag()),
             ..Default::default()
         };
-        assert!(check_delete_conditions(&cond, &test_etag(), 1000, 100).is_ok());
+        assert!(check_delete_conditions(&cond, &test_etag()).is_ok());
     }
 
     #[test]
@@ -516,7 +560,7 @@ mod tests {
             if_match: Some(other_etag()),
             ..Default::default()
         };
-        let err = check_delete_conditions(&cond, &test_etag(), 1000, 100).unwrap_err();
+        let err = check_delete_conditions(&cond, &test_etag()).unwrap_err();
         assert!(matches!(err, ServerError::PreconditionFailed));
     }
 
@@ -526,45 +570,7 @@ mod tests {
             if_match: Some("*".to_string()),
             ..Default::default()
         };
-        assert!(check_delete_conditions(&cond, &test_etag(), 1000, 100).is_ok());
-    }
-
-    #[test]
-    fn delete_if_match_last_modified_time_passes() {
-        let cond = DeleteCondition {
-            if_match_last_modified_time: Some(1000),
-            ..Default::default()
-        };
-        assert!(check_delete_conditions(&cond, &test_etag(), 1000, 100).is_ok());
-    }
-
-    #[test]
-    fn delete_if_match_last_modified_time_fails() {
-        let cond = DeleteCondition {
-            if_match_last_modified_time: Some(2000),
-            ..Default::default()
-        };
-        let err = check_delete_conditions(&cond, &test_etag(), 1000, 100).unwrap_err();
-        assert!(matches!(err, ServerError::PreconditionFailed));
-    }
-
-    #[test]
-    fn delete_if_match_size_passes() {
-        let cond = DeleteCondition {
-            if_match_size: Some(100),
-            ..Default::default()
-        };
-        assert!(check_delete_conditions(&cond, &test_etag(), 1000, 100).is_ok());
-    }
-
-    #[test]
-    fn delete_if_match_size_fails() {
-        let cond = DeleteCondition {
-            if_match_size: Some(999),
-            ..Default::default()
-        };
-        let err = check_delete_conditions(&cond, &test_etag(), 1000, 100).unwrap_err();
-        assert!(matches!(err, ServerError::PreconditionFailed));
+        assert!(check_delete_conditions(&cond, &test_etag()).is_ok());
     }
 
     #[test]
@@ -577,7 +583,7 @@ mod tests {
         assert!(check_write_conditions(&write, None).is_ok());
 
         let delete = DeleteCondition::default();
-        assert!(check_delete_conditions(&delete, &test_etag(), 1000, 100).is_ok());
+        assert!(check_delete_conditions(&delete, &test_etag()).is_ok());
     }
 
     // ── is_empty ──────────────────────────────────────────────────────
@@ -607,16 +613,6 @@ mod tests {
         assert!(DeleteCondition::default().is_empty());
         assert!(!DeleteCondition {
             if_match: Some("x".into()),
-            ..Default::default()
-        }
-        .is_empty());
-        assert!(!DeleteCondition {
-            if_match_last_modified_time: Some(1000),
-            ..Default::default()
-        }
-        .is_empty());
-        assert!(!DeleteCondition {
-            if_match_size: Some(100),
             ..Default::default()
         }
         .is_empty());

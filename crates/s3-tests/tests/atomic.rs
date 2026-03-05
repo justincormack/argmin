@@ -206,7 +206,7 @@ fn test_atomic_dual_write() {
     });
 }
 
-/// Conditional overwrite with if_match("*") succeeds atomically.
+/// Conditional overwrite with if_match(<etag>) succeeds atomically.
 ///
 /// Matches Ceph: test_atomic_conditional_write_1mb
 #[test]
@@ -216,8 +216,8 @@ fn test_atomic_conditional_write() {
         let bucket = setup_bucket().await;
         let key = "atomic-cond-write";
 
-        // Write 'A'
-        client
+        // Write 'A', capture etag
+        let resp = client
             .put_object()
             .bucket(&bucket)
             .key(key)
@@ -225,13 +225,14 @@ fn test_atomic_conditional_write() {
             .send()
             .await
             .unwrap();
+        let etag_a = resp.e_tag().unwrap().to_string();
 
-        // Conditional overwrite with if_match("*") — must succeed
+        // Conditional overwrite with if_match(<etag>) — must succeed
         client
             .put_object()
             .bucket(&bucket)
             .key(key)
-            .if_match("*")
+            .if_match(&etag_a)
             .body(ByteStream::from(make_body(b'B', SIZE)))
             .send()
             .await

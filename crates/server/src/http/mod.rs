@@ -369,7 +369,7 @@ impl HttpFrontend {
                         }
                     }
                     let src_cond = copy_source_condition_from_headers(req);
-                    let dst_cond = write_condition_from_headers(req);
+                    let dst_cond = write_condition_from_headers(req)?;
                     let directive = match req.header("x-amz-metadata-directive") {
                         Some(d) if d.eq_ignore_ascii_case("REPLACE") => MetadataDirective::Replace,
                         _ => MetadataDirective::Copy,
@@ -470,7 +470,7 @@ impl HttpFrontend {
                         .iter()
                         .map(|(k, v)| (k.as_str(), v.as_str()))
                         .collect();
-                    let cond = write_condition_from_headers(req);
+                    let cond = write_condition_from_headers(req)?;
                     let result = self.coordinator.put_object(
                         &bucket,
                         &key,
@@ -570,7 +570,7 @@ impl HttpFrontend {
             }
             S3Operation::DeleteObject { bucket, key } => {
                 self.authorize_bucket_write(auth, &bucket)?;
-                let cond = delete_condition_from_headers(req);
+                let cond = delete_condition_from_headers(req)?;
                 let vid = parse_version_id(req)?;
                 let result = self.coordinator.delete_object(&bucket, &key, vid, &cond)?;
                 Ok(S3Response::delete_object(&result))
@@ -712,7 +712,7 @@ impl HttpFrontend {
             S3Operation::DeleteObjects { bucket } => {
                 self.authorize_bucket_write(auth, &bucket)?;
                 let (entries, quiet) = xml::parse_delete_objects_xml(&req.body)?;
-                let cond = delete_condition_from_headers(req);
+                let cond = delete_condition_from_headers(req)?;
                 let result = self.coordinator.delete_objects(&bucket, &entries, &cond)?;
                 Ok(S3Response::delete_objects(&result, quiet))
             }

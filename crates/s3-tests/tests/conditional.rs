@@ -831,47 +831,37 @@ fn test_put_object_ifmatch_overwrite_existed_good() {
     });
 }
 
-// ── PUT If-None-Match (non-star) ────────────────────────────────────────
+// ── PUT unsupported conditional headers → 501 ──────────────────────────
 
 #[test]
-fn test_put_object_ifnonmatch_good() {
+fn test_put_object_ifmatch_wildcard_not_implemented() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;
         put_object(&bucket, "obj", b"data").await;
 
-        // Non-matching etag → should succeed
-        CTX.client()
+        // If-Match: * on write → 501 NotImplemented
+        let result = CTX
+            .client()
             .put_object()
             .bucket(&bucket)
             .key("obj")
-            .if_none_match("\"0000000000000000\"")
+            .if_match("*")
             .body(ByteStream::from_static(b"updated"))
             .send()
-            .await
-            .unwrap();
-
-        let resp = CTX
-            .client()
-            .get_object()
-            .bucket(&bucket)
-            .key("obj")
-            .send()
-            .await
-            .unwrap();
-        let data = resp.body.collect().await.unwrap().into_bytes();
-        assert_eq!(&data[..], b"updated");
+            .await;
+        assert_eq!(err_status(&result), 501);
 
         cleanup(&bucket, &["obj"]).await;
     });
 }
 
 #[test]
-fn test_put_object_ifnonmatch_failed() {
+fn test_put_object_ifnonematch_specific_not_implemented() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;
         let etag = put_object(&bucket, "obj", b"data").await;
 
-        // Matching etag → should fail with 412
+        // If-None-Match: <specific etag> on write → 501 NotImplemented
         let result = CTX
             .client()
             .put_object()
@@ -881,7 +871,7 @@ fn test_put_object_ifnonmatch_failed() {
             .body(ByteStream::from_static(b"updated"))
             .send()
             .await;
-        assert!(result.is_err(), "expected 412 PreconditionFailed");
+        assert_eq!(err_status(&result), 501);
 
         cleanup(&bucket, &["obj"]).await;
     });
@@ -945,47 +935,39 @@ fn test_copy_object_ifmatch_failed() {
     });
 }
 
+// ── Copy destination unsupported conditional headers → 501 ──────────────
+
 #[test]
-fn test_copy_object_ifnonematch_good() {
+fn test_copy_object_ifmatch_wildcard_not_implemented() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;
         put_object(&bucket, "src", b"source data").await;
         put_object(&bucket, "dst", b"old dst").await;
 
-        // If-None-Match on destination with non-matching etag → should succeed
-        CTX.client()
+        // If-Match: * on copy destination → 501 NotImplemented
+        let result = CTX
+            .client()
             .copy_object()
             .bucket(&bucket)
             .key("dst")
             .copy_source(format!("{}/src", bucket))
-            .if_none_match("\"0000000000000000\"")
+            .if_match("*")
             .send()
-            .await
-            .unwrap();
-
-        let resp = CTX
-            .client()
-            .get_object()
-            .bucket(&bucket)
-            .key("dst")
-            .send()
-            .await
-            .unwrap();
-        let data = resp.body.collect().await.unwrap().into_bytes();
-        assert_eq!(&data[..], b"source data");
+            .await;
+        assert_eq!(err_status(&result), 501);
 
         cleanup(&bucket, &["src", "dst"]).await;
     });
 }
 
 #[test]
-fn test_copy_object_ifnonematch_failed() {
+fn test_copy_object_ifnonematch_specific_not_implemented() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;
         put_object(&bucket, "src", b"source data").await;
         let dst_etag = put_object(&bucket, "dst", b"old dst").await;
 
-        // If-None-Match on destination with matching etag → should fail
+        // If-None-Match: <specific etag> on copy destination → 501 NotImplemented
         let result = CTX
             .client()
             .copy_object()
@@ -995,7 +977,7 @@ fn test_copy_object_ifnonematch_failed() {
             .if_none_match(&dst_etag)
             .send()
             .await;
-        assert!(result.is_err(), "expected 412 PreconditionFailed");
+        assert_eq!(err_status(&result), 501);
 
         cleanup(&bucket, &["src", "dst"]).await;
     });
@@ -1036,101 +1018,46 @@ fn test_delete_object_if_match() {
     });
 }
 
+// ── DELETE unsupported conditional headers → 501 ────────────────────────
+
 #[test]
-fn test_delete_object_if_match_last_modified_time() {
+fn test_delete_object_if_match_last_modified_time_not_implemented() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = setup_bucket().await;
         put_object(&bucket, "obj", b"hello").await;
 
-        // Get the object's last-modified time
-        let head = client
-            .head_object()
-            .bucket(&bucket)
-            .key("obj")
-            .send()
-            .await
-            .unwrap();
-        let last_modified = *head.last_modified().unwrap();
-
-        // Delete with wrong last-modified → 412
-        let wrong_time = DateTime::from_secs(0);
+        // x-amz-if-match-last-modified-time on general-purpose bucket → 501
         let result = client
             .delete_object()
             .bucket(&bucket)
             .key("obj")
-            .if_match_last_modified_time(wrong_time)
+            .if_match_last_modified_time(DateTime::from_secs(0))
             .send()
             .await;
-        assert_eq!(err_status(&result), 412);
+        assert_eq!(err_status(&result), 501);
 
-        // Verify object still exists
-        client
-            .head_object()
-            .bucket(&bucket)
-            .key("obj")
-            .send()
-            .await
-            .unwrap();
-
-        // Delete with correct last-modified → succeeds
-        client
-            .delete_object()
-            .bucket(&bucket)
-            .key("obj")
-            .if_match_last_modified_time(last_modified)
-            .send()
-            .await
-            .unwrap();
-
-        // Verify object is gone
-        let result = client.head_object().bucket(&bucket).key("obj").send().await;
-        assert!(result.is_err());
-
-        cleanup(&bucket, &[]).await;
+        cleanup(&bucket, &["obj"]).await;
     });
 }
 
 #[test]
-fn test_delete_object_if_match_size() {
+fn test_delete_object_if_match_size_not_implemented() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = setup_bucket().await;
         put_object(&bucket, "obj", b"hello").await;
 
-        // Delete with wrong size → 412
+        // x-amz-if-match-size on general-purpose bucket → 501
         let result = client
-            .delete_object()
-            .bucket(&bucket)
-            .key("obj")
-            .if_match_size(999)
-            .send()
-            .await;
-        assert_eq!(err_status(&result), 412);
-
-        // Verify object still exists
-        client
-            .head_object()
-            .bucket(&bucket)
-            .key("obj")
-            .send()
-            .await
-            .unwrap();
-
-        // Delete with correct size (5 bytes for "hello") → succeeds
-        client
             .delete_object()
             .bucket(&bucket)
             .key("obj")
             .if_match_size(5)
             .send()
-            .await
-            .unwrap();
+            .await;
+        assert_eq!(err_status(&result), 501);
 
-        // Verify object is gone
-        let result = client.head_object().bucket(&bucket).key("obj").send().await;
-        assert!(result.is_err());
-
-        cleanup(&bucket, &[]).await;
+        cleanup(&bucket, &["obj"]).await;
     });
 }
