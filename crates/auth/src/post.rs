@@ -28,6 +28,7 @@ pub fn authenticate_post(
                 access_key_id: None,
                 principal: None,
                 request_epoch_secs: None,
+                streaming: None,
             });
         }
         (Some(akid), Some(policy), Some(sig)) => (akid, policy, sig),
@@ -65,6 +66,7 @@ pub fn authenticate_post(
         access_key_id: Some(akid.to_string()),
         principal: Some(record.principal.clone()),
         request_epoch_secs: None,
+        streaming: None,
     })
 }
 
@@ -126,6 +128,7 @@ pub fn authenticate_post_sigv4(
         access_key_id: Some(access_key_id.to_string()),
         principal: Some(record.principal.clone()),
         request_epoch_secs: None,
+        streaming: None,
     })
 }
 

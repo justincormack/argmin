@@ -1,4 +1,5 @@
 /// HTTP frontend: parses requests, authenticates, dispatches to coordinator.
+pub mod chunked;
 pub mod multipart;
 pub mod request;
 pub mod response;
@@ -67,7 +68,13 @@ impl HttpFrontend {
 
         let auth = self.authenticate(s3req);
         let result = match auth {
-            Ok(auth) => self.dispatch_routed(s3req, &auth, operation),
+            Ok(auth) => match self.maybe_decode_chunked(s3req, &auth) {
+                Ok(decoded_opt) => {
+                    let req = decoded_opt.as_ref().unwrap_or(s3req);
+                    self.dispatch_routed(req, &auth, operation)
+                }
+                Err(err) => Err(err),
+            },
             Err(err) => Err(err),
         };
 
@@ -1211,6 +1218,7 @@ impl HttpFrontend {
                 access_key_id: None,
                 principal: None,
                 request_epoch_secs: None,
+                streaming: None,
             },
             // Missing x-amz-date when declared as signed → AccessDenied
             // AWS: "AWS authentication requires a valid Date or x-amz-date header"
@@ -1223,9 +1231,11 @@ impl HttpFrontend {
         };
 
         // Verify payload integrity: if the client provided an actual content hash
-        // (not UNSIGNED-PAYLOAD), recompute and compare to detect transit corruption.
+        // (not UNSIGNED-PAYLOAD and not STREAMING-*), recompute and compare to
+        // detect transit corruption. STREAMING-* bodies are verified by the
+        // chunked decoder.
         if let Some(claimed) = req.header("x-amz-content-sha256") {
-            if claimed != "UNSIGNED-PAYLOAD" {
+            if claimed != "UNSIGNED-PAYLOAD" && !claimed.starts_with("STREAMING-") {
                 let actual = auth::canonical::sha256_hex(&req.body);
                 if actual != claimed {
                     return Err(ServerError::XAmzContentSHA256Mismatch {
@@ -1237,6 +1247,54 @@ impl HttpFrontend {
         }
 
         Ok(auth)
+    }
+
+    /// If the request uses aws-chunked encoding, decode the body and return
+    /// a new S3Request with the decoded payload. Returns None for non-chunked requests.
+    fn maybe_decode_chunked(
+        &self,
+        req: &S3Request,
+        auth: &AuthContext,
+    ) -> Result<Option<S3Request>, ServerError> {
+        let content_sha = match req.header("x-amz-content-sha256") {
+            Some(v) if v.starts_with("STREAMING-") => v,
+            _ => return Ok(None),
+        };
+
+        let is_signed = content_sha.starts_with("STREAMING-AWS4-HMAC-SHA256");
+
+        let streaming_ctx = if is_signed {
+            Some(
+                auth.streaming
+                    .as_ref()
+                    .ok_or_else(|| ServerError::Auth(auth::AuthError::SignatureMismatch))?,
+            )
+        } else {
+            None
+        };
+
+        let decoded = chunked::decode_chunked_body(&req.body, streaming_ctx)?;
+
+        // Validate decoded length against x-amz-decoded-content-length if present.
+        if let Some(expected_str) = req.header("x-amz-decoded-content-length") {
+            let expected =
+                expected_str
+                    .parse::<usize>()
+                    .map_err(|_| ServerError::InvalidRequest {
+                        reason: format!("invalid x-amz-decoded-content-length: {}", expected_str),
+                    })?;
+            if decoded.data.len() != expected {
+                return Err(ServerError::MalformedChunkedBody {
+                    reason: format!(
+                        "decoded content length mismatch: expected {}, got {}",
+                        expected,
+                        decoded.data.len()
+                    ),
+                });
+            }
+        }
+
+        Ok(Some(req.with_decoded_body(decoded.data, decoded.trailers)))
     }
 
     fn require_principal<'a>(&self, auth: &'a AuthContext) -> Result<&'a str, ServerError> {
@@ -1686,6 +1744,7 @@ mod tests {
             access_key_id: Some("AKID".to_string()),
             principal: Some("testuser".to_string()),
             request_epoch_secs: Some(0),
+            streaming: None,
         }
     }
 
@@ -3123,5 +3182,71 @@ mod tests {
         // Should also have checksum-type header
         let has_type = resp.headers.iter().any(|(k, _)| k == "x-amz-checksum-type");
         assert!(has_type, "expected x-amz-checksum-type header");
+    }
+
+    // ── aws-chunked decode edge cases ──────────────────────────────────
+
+    #[test]
+    fn signed_streaming_without_context_returns_signature_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fe = setup_frontend(tmp.path());
+
+        // Auth context claims signed streaming but has no streaming context.
+        let auth = auth::AuthContext {
+            mode: auth::AuthMode::HeaderSigV4,
+            access_key_id: Some("AKID".to_string()),
+            principal: Some("testuser".to_string()),
+            request_epoch_secs: Some(0),
+            streaming: None, // missing!
+        };
+
+        let req = S3Request {
+            method: "PUT".to_string(),
+            path: "/mybucket/key".to_string(),
+            query_string: String::new(),
+            headers: vec![
+                (
+                    "x-amz-content-sha256".to_string(),
+                    "STREAMING-AWS4-HMAC-SHA256-PAYLOAD".to_string(),
+                ),
+                ("content-encoding".to_string(), "aws-chunked".to_string()),
+                ("x-amz-decoded-content-length".to_string(), "5".to_string()),
+            ],
+            body: b"5\r\nhello\r\n0\r\n\r\n".to_vec(),
+        };
+
+        match fe.maybe_decode_chunked(&req, &auth) {
+            Err(ServerError::Auth(auth::AuthError::SignatureMismatch)) => {} // expected
+            other => panic!("expected SignatureMismatch, got {:?}", other.err()),
+        }
+    }
+
+    #[test]
+    fn non_numeric_decoded_content_length_returns_400() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fe = setup_frontend(tmp.path());
+
+        let req = S3Request {
+            method: "PUT".to_string(),
+            path: "/mybucket/key".to_string(),
+            query_string: String::new(),
+            headers: vec![
+                (
+                    "x-amz-content-sha256".to_string(),
+                    "STREAMING-UNSIGNED-PAYLOAD".to_string(),
+                ),
+                ("content-encoding".to_string(), "aws-chunked".to_string()),
+                (
+                    "x-amz-decoded-content-length".to_string(),
+                    "not-a-number".to_string(),
+                ),
+            ],
+            body: b"5\r\nhello\r\n0\r\n\r\n".to_vec(),
+        };
+
+        match fe.maybe_decode_chunked(&req, &test_auth()) {
+            Err(ServerError::InvalidRequest { .. }) => {} // expected
+            other => panic!("expected InvalidRequest, got {:?}", other.err()),
+        }
     }
 }

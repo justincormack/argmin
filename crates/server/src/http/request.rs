@@ -93,6 +93,55 @@ impl S3Request {
         }
     }
 
+    /// Create a new S3Request with a decoded body and trailer headers,
+    /// stripping `aws-chunked` from Content-Encoding.
+    pub fn with_decoded_body(&self, body: Vec<u8>, trailers: Vec<(String, String)>) -> Self {
+        let mut headers: Vec<(String, String)> = self
+            .headers
+            .iter()
+            .map(|(k, v)| {
+                if k == "content-encoding" {
+                    // Strip "aws-chunked" from Content-Encoding.
+                    let filtered: Vec<&str> = v
+                        .split(',')
+                        .map(|s| s.trim())
+                        .filter(|s| !s.eq_ignore_ascii_case("aws-chunked"))
+                        .collect();
+                    if filtered.is_empty() {
+                        // Drop the header entirely if nothing remains.
+                        return (k.clone(), String::new());
+                    }
+                    (k.clone(), filtered.join(", "))
+                } else if k == "content-length" {
+                    // Update to decoded length.
+                    (k.clone(), body.len().to_string())
+                } else {
+                    (k.clone(), v.clone())
+                }
+            })
+            .filter(|(k, v)| !(k == "content-encoding" && v.is_empty()))
+            .collect();
+
+        // Merge trailer headers: replace existing headers with same name,
+        // or append if not present. This avoids duplicate checksum headers
+        // when the trailer provides a value that was also in the initial headers.
+        for (tk, tv) in trailers {
+            if let Some(existing) = headers.iter_mut().find(|(k, _)| *k == tk) {
+                existing.1 = tv;
+            } else {
+                headers.push((tk, tv));
+            }
+        }
+
+        S3Request {
+            method: self.method.clone(),
+            path: self.path.clone(),
+            query_string: self.query_string.clone(),
+            headers,
+            body,
+        }
+    }
+
     /// Get headers as borrowed pairs for auth verification.
     pub fn header_pairs(&self) -> Vec<(&str, &str)> {
         self.headers

@@ -18,7 +18,7 @@ aws-config = "1"
 aws-credential-types = "1"
 
 # Async runtime (required by AWS SDK)
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs"] }
 
 # Test infrastructure
 tempfile = "3"

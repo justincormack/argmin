@@ -17,6 +17,19 @@ pub enum AuthMode {
     Anonymous,
 }
 
+/// Signing context needed for verifying aws-chunked streaming signatures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamingSigningContext {
+    /// The derived signing key (32 bytes).
+    pub signing_key: [u8; 32],
+    /// The seed signature from the Authorization header (hex string).
+    pub seed_signature: String,
+    /// The credential scope string (e.g. "20130524/us-east-1/s3/aws4_request").
+    pub scope: String,
+    /// The request timestamp (e.g. "20130524T000000Z").
+    pub timestamp: String,
+}
+
 /// Authenticated request context shared with higher layers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthContext {
@@ -24,6 +37,8 @@ pub struct AuthContext {
     pub access_key_id: Option<String>,
     pub principal: Option<String>,
     pub request_epoch_secs: Option<u64>,
+    /// Present when the request uses STREAMING-AWS4-HMAC-SHA256-* content hash.
+    pub streaming: Option<StreamingSigningContext>,
 }
 
 /// Authenticate a request and return identity context.
@@ -121,11 +136,39 @@ fn authenticate_header(
         now_epoch_secs,
     )?;
 
+    // Build streaming signing context for STREAMING-AWS4-HMAC-SHA256-* requests.
+    let streaming = if body_hash.starts_with("STREAMING-AWS4-HMAC-SHA256") {
+        let timestamp = header_value(headers, "x-amz-date")
+            .unwrap_or("")
+            .to_string();
+        let scope = format!(
+            "{}/{}/{}/aws4_request",
+            parsed.credential.date, parsed.credential.region, parsed.credential.service
+        );
+        let signing_key = derive_signing_key(
+            &record.secret_key,
+            &parsed.credential.date,
+            &parsed.credential.region,
+            &parsed.credential.service,
+        );
+        let mut key_bytes = [0u8; 32];
+        key_bytes.copy_from_slice(signing_key.as_ref());
+        Some(StreamingSigningContext {
+            signing_key: key_bytes,
+            seed_signature: parsed.signature.clone(),
+            scope,
+            timestamp,
+        })
+    } else {
+        None
+    };
+
     Ok(AuthContext {
         mode: AuthMode::HeaderSigV4,
         access_key_id: Some(access_key_id),
         principal: Some(record.principal.clone()),
         request_epoch_secs: header_value(headers, "x-amz-date").and_then(parse_amz_date),
+        streaming,
     })
 }
 
@@ -267,6 +310,7 @@ fn authenticate_presigned(
         access_key_id: Some(credential.access_key_id),
         principal: Some(record.principal.clone()),
         request_epoch_secs: Some(request_epoch),
+        streaming: None,
     })
 }
 

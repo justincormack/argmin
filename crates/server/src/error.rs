@@ -111,6 +111,9 @@ pub enum ServerError {
         server_hash: String,
     },
 
+    #[error("malformed chunked body: {reason}")]
+    MalformedChunkedBody { reason: String },
+
     #[error("internal error: {reason}")]
     InternalError { reason: String },
 
@@ -170,6 +173,7 @@ impl ServerError {
             Self::InvalidPart { .. } => "InvalidPart",
             Self::InvalidPartOrder => "InvalidPartOrder",
             Self::EntityTooSmall { .. } => "EntityTooSmall",
+            Self::MalformedChunkedBody { .. } => "InvalidRequest",
             Self::XAmzContentSHA256Mismatch { .. } => "XAmzContentSHA256Mismatch",
             Self::NotImplemented { .. } => "NotImplemented",
             Self::InternalError { .. } => "InternalError",
@@ -204,7 +208,8 @@ impl ServerError {
             Self::InvalidTag { .. } => 400,
             Self::AccessControlListNotSupported
             | Self::InvalidBucketAclWithObjectOwnership
-            | Self::XAmzContentSHA256Mismatch { .. } => 400,
+            | Self::XAmzContentSHA256Mismatch { .. }
+            | Self::MalformedChunkedBody { .. } => 400,
             Self::AccessDenied => 403,
             Self::NoSuchUpload { .. } => 404,
             Self::InvalidPart { .. } | Self::InvalidPartOrder | Self::EntityTooSmall { .. } => 400,

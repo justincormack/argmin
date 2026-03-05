@@ -36,6 +36,7 @@ mod tests {
             access_key_id: Some("ak".to_string()),
             principal: Some("owner".to_string()),
             request_epoch_secs: Some(1),
+            streaming: None,
         }
     }
 
@@ -45,6 +46,7 @@ mod tests {
             access_key_id: Some("ak2".to_string()),
             principal: Some("other".to_string()),
             request_epoch_secs: Some(1),
+            streaming: None,
         }
     }
 
@@ -54,6 +56,7 @@ mod tests {
             access_key_id: None,
             principal: None,
             request_epoch_secs: None,
+            streaming: None,
         }
     }
 
