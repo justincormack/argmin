@@ -1196,10 +1196,14 @@ pub fn get_object_attributes_xml(
                             xml.push_str(&xml_escape(value));
                             xml.push_str("</ChecksumType>");
                         } else if let Some(xml_tag) = checksum_header_to_xml_tag(header_key) {
+                            // Strip the composite "-N" suffix (part count) from checksum
+                            // values. GetObjectAttributes uses ChecksumType to convey
+                            // composite vs full-object; the hash itself has no suffix.
+                            let bare = strip_composite_suffix(value);
                             xml.push('<');
                             xml.push_str(xml_tag);
                             xml.push('>');
-                            xml.push_str(&xml_escape(value));
+                            xml.push_str(&xml_escape(bare));
                             xml.push_str("</");
                             xml.push_str(xml_tag);
                             xml.push('>');
@@ -1267,6 +1271,21 @@ pub fn get_object_attributes_xml(
 
     xml.push_str("</GetObjectAttributesResponse>");
     xml
+}
+
+/// Strip the composite checksum "-N" suffix (e.g. "abc=-3" → "abc=").
+///
+/// AWS returns the bare hash (no part count) in GetObjectAttributes; the part
+/// count is conveyed by `<ChecksumType>COMPOSITE</ChecksumType>` instead.
+/// Standard base64 never contains '-', so a trailing "-\d+" is always the
+/// composite suffix.
+fn strip_composite_suffix(value: &str) -> &str {
+    if let Some(pos) = value.rfind('-') {
+        if value[pos + 1..].bytes().all(|b| b.is_ascii_digit()) && !value[pos + 1..].is_empty() {
+            return &value[..pos];
+        }
+    }
+    value
 }
 
 /// Map a metadata header key like `x-amz-checksum-sha256` to an XML element
@@ -3190,6 +3209,39 @@ mod tests {
         assert!(xml.contains("<ChecksumCRC32>AAAAAA==</ChecksumCRC32>"));
         assert!(xml.contains("<ChecksumType>FULL_OBJECT</ChecksumType>"));
         assert!(xml.contains("</Checksum>"));
+    }
+
+    #[test]
+    fn get_object_attributes_strips_composite_suffix() {
+        let xml = get_object_attributes_xml(
+            &["Checksum"],
+            "\"x\"",
+            0,
+            &[
+                (
+                    "x-amz-checksum-sha256",
+                    "uWBwpe1dxI4Vw8Gf0X9ynOdw/SS6VBzfWm9giiv1sf4=-3",
+                ),
+                ("x-amz-checksum-type", "COMPOSITE"),
+            ],
+            None,
+            None,
+        );
+        assert!(xml.contains(
+            "<ChecksumSHA256>uWBwpe1dxI4Vw8Gf0X9ynOdw/SS6VBzfWm9giiv1sf4=</ChecksumSHA256>"
+        ));
+        assert!(!xml.contains("-3</ChecksumSHA256>"));
+        assert!(xml.contains("<ChecksumType>COMPOSITE</ChecksumType>"));
+    }
+
+    #[test]
+    fn strip_composite_suffix_works() {
+        assert_eq!(strip_composite_suffix("abc=-3"), "abc=");
+        assert_eq!(strip_composite_suffix("abc=-123"), "abc=");
+        assert_eq!(strip_composite_suffix("abc="), "abc=");
+        assert_eq!(strip_composite_suffix("plain"), "plain");
+        // Empty after dash is not a suffix
+        assert_eq!(strip_composite_suffix("abc=-"), "abc=-");
     }
 
     // ── Multipart error XML coverage ─────────────────────────────────

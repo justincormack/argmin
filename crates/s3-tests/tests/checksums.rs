@@ -403,8 +403,25 @@ async fn run_multipart_checksum_test(tc: &MultipartChecksumTestCase) {
     let cksum_info = attr_resp.checksum().expect("expected Checksum in response");
     let attr_cksum = get_cksum_from_checksum(cksum_info, &tc.algo)
         .expect("GetObjectAttributes should return checksum");
+    // GetObjectAttributes returns the bare hash without the composite "-N" suffix;
+    // the part count is conveyed by ChecksumType instead.
+    let expected_bare = tc
+        .composite_cksum
+        .rfind('-')
+        .and_then(|pos| {
+            if tc.composite_cksum[pos + 1..]
+                .bytes()
+                .all(|b| b.is_ascii_digit())
+                && !tc.composite_cksum[pos + 1..].is_empty()
+            {
+                Some(&tc.composite_cksum[..pos])
+            } else {
+                None
+            }
+        })
+        .unwrap_or(tc.composite_cksum);
     assert_eq!(
-        attr_cksum, tc.composite_cksum,
+        attr_cksum, expected_bare,
         "GetObjectAttributes checksum mismatch"
     );
     assert_eq!(
