@@ -223,6 +223,30 @@ fn test_get_object_ifmodifiedsince_failed() {
     });
 }
 
+#[test]
+fn test_get_object_ifmodifiedsince_future_ignored() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        put_object(&bucket, "obj", b"hello").await;
+
+        // Per RFC 7232 §3.3: future dates must be ignored → returns 200
+        let future = DateTime::from_secs(4_102_444_800); // 2100-01-01
+        let resp = CTX
+            .client()
+            .get_object()
+            .bucket(&bucket)
+            .key("obj")
+            .if_modified_since(future)
+            .send()
+            .await
+            .unwrap();
+        let data = resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], b"hello");
+
+        cleanup(&bucket, &["obj"]).await;
+    });
+}
+
 // ── GET If-Unmodified-Since ─────────────────────────────────────────────
 
 #[test]
@@ -735,6 +759,28 @@ fn test_copy_object_source_ifmodifiedsince_failed() {
         assert!(result.is_err(), "expected 412 PreconditionFailed");
 
         cleanup(&bucket, &["src"]).await;
+    });
+}
+
+#[test]
+fn test_copy_object_source_ifmodifiedsince_future_ignored() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        put_object(&bucket, "src", b"source data").await;
+
+        // Per RFC 7232 §3.3: future dates must be ignored → copy succeeds
+        let future = DateTime::from_secs(4_102_444_800); // 2100-01-01
+        CTX.client()
+            .copy_object()
+            .bucket(&bucket)
+            .key("dst")
+            .copy_source(format!("{}/src", bucket))
+            .copy_source_if_modified_since(future)
+            .send()
+            .await
+            .unwrap();
+
+        cleanup(&bucket, &["src", "dst"]).await;
     });
 }
 

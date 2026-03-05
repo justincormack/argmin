@@ -151,9 +151,10 @@ pub fn check_read_conditions(
     }
 
     // Step 2: If-Unmodified-Since (only evaluated if If-Match is absent)
+    // Compare at second precision since HTTP dates have no sub-second component.
     if cond.if_match.is_none() {
         if let Some(since) = cond.if_unmodified_since {
-            if last_modified > since {
+            if last_modified / 1000 > since / 1000 {
                 return Err(ServerError::PreconditionFailed);
             }
         }
@@ -171,9 +172,10 @@ pub fn check_read_conditions(
 
     // Step 4: If-Modified-Since (only evaluated if If-None-Match is absent)
     // Per RFC 7232 §3.3: ignore if the date is in the future.
+    // Compare at second precision since HTTP dates have no sub-second component.
     if cond.if_none_match.is_none() {
         if let Some(since) = cond.if_modified_since {
-            if since < now_millis() && last_modified <= since {
+            if since <= now_millis() && last_modified / 1000 <= since / 1000 {
                 return Err(ServerError::NotModified {
                     etag: etag.to_string(),
                     last_modified,
@@ -280,9 +282,10 @@ pub fn check_copy_source_conditions(
     }
 
     // Step 2: If-Unmodified-Since (only if If-Match absent)
+    // Compare at second precision since HTTP dates have no sub-second component.
     if cond.if_match.is_none() {
         if let Some(since) = cond.if_unmodified_since {
-            if last_modified > since {
+            if last_modified / 1000 > since / 1000 {
                 return Err(ServerError::PreconditionFailed);
             }
         }
@@ -297,9 +300,10 @@ pub fn check_copy_source_conditions(
 
     // Step 4: If-Modified-Since (only if If-None-Match absent) — returns 412 (not 304)
     // Per RFC 7232 §3.3: ignore if the date is in the future.
+    // Compare at second precision since HTTP dates have no sub-second component.
     if cond.if_none_match.is_none() {
         if let Some(since) = cond.if_modified_since {
-            if since < now_millis() && last_modified <= since {
+            if since <= now_millis() && last_modified / 1000 <= since / 1000 {
                 return Err(ServerError::PreconditionFailed);
             }
         }
@@ -404,6 +408,27 @@ mod tests {
         };
         // Object last_modified (1000) > since (500) → Ok
         assert!(check_read_conditions(&cond, &test_etag(), 1000).is_ok());
+    }
+
+    #[test]
+    fn read_if_modified_since_future_ignored() {
+        // Per RFC 7232 §3.3: future dates must be ignored → Ok
+        let future = now_millis() + 60_000;
+        let cond = ReadCondition {
+            if_modified_since: Some(future),
+            ..Default::default()
+        };
+        assert!(check_read_conditions(&cond, &test_etag(), 1000).is_ok());
+    }
+
+    #[test]
+    fn read_if_modified_since_same_second() {
+        // Object at 1500ms, header at 1000ms (same second) → NotModified
+        let cond = ReadCondition {
+            if_modified_since: Some(1000),
+            ..Default::default()
+        };
+        assert!(check_read_conditions(&cond, &test_etag(), 1500).is_err());
     }
 
     #[test]
