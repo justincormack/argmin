@@ -1333,9 +1333,7 @@ fn test_multipart_get_part() {
         }
         let _ = data_offset; // consumed all data
 
-        // Out-of-range partNumber on GET → error
-        // Ceph returns 400 InvalidPart; AWS docs suggest 416.
-        // Assert the status we currently implement; live-S3 run will detect divergence.
+        // Out-of-range partNumber on GET → 416 Range Not Satisfiable (AWS behavior)
         let result = client
             .get_object()
             .bucket(&bucket)
@@ -1343,8 +1341,7 @@ fn test_multipart_get_part() {
             .part_number(part_count + 1)
             .send()
             .await;
-        assert_eq!(err_status(&result), 400);
-        assert_s3_err_code(&result, "InvalidPart");
+        assert_eq!(err_status(&result), 416);
 
         // Out-of-range partNumber on HEAD → same error
         let result = client
@@ -1354,7 +1351,7 @@ fn test_multipart_get_part() {
             .part_number(part_count + 1)
             .send()
             .await;
-        assert_eq!(err_status(&result), 400);
+        assert_eq!(err_status(&result), 416);
 
         cleanup(&bucket, &[key]).await;
     });
@@ -1377,7 +1374,7 @@ fn test_non_multipart_get_part() {
             .unwrap();
         let etag = resp.e_tag().unwrap().to_string();
 
-        // GET PartNumber > 1 → error
+        // GET PartNumber > 1 → 416 Range Not Satisfiable (AWS behavior)
         let result = client
             .get_object()
             .bucket(&bucket)
@@ -1385,8 +1382,7 @@ fn test_non_multipart_get_part() {
             .part_number(2)
             .send()
             .await;
-        assert_eq!(err_status(&result), 400);
-        assert_s3_err_code(&result, "InvalidPart");
+        assert_eq!(err_status(&result), 416);
 
         // HEAD PartNumber > 1 → same error
         let result = client
@@ -1396,7 +1392,7 @@ fn test_non_multipart_get_part() {
             .part_number(2)
             .send()
             .await;
-        assert_eq!(err_status(&result), 400);
+        assert_eq!(err_status(&result), 416);
 
         // PartNumber = 1 → returns entire object
         let resp = client

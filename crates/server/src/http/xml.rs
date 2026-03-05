@@ -548,7 +548,7 @@ fn encode_value(value: &str, encoding_type: Option<&str>) -> String {
 }
 
 /// Escape special XML characters.
-fn xml_escape(s: &str) -> String {
+pub fn xml_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {

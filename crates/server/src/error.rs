@@ -105,6 +105,12 @@ pub enum ServerError {
     #[error("not implemented: {feature}")]
     NotImplemented { feature: String },
 
+    #[error("x-amz-content-sha256 mismatch: client={client_hash}, server={server_hash}")]
+    XAmzContentSHA256Mismatch {
+        client_hash: String,
+        server_hash: String,
+    },
+
     #[error("internal error: {reason}")]
     InternalError { reason: String },
 
@@ -127,10 +133,17 @@ impl ServerError {
             Self::ObjectNotFound { .. } => "NoSuchKey",
             Self::DeleteMarkerHit { .. } => "NoSuchKey",
             Self::Auth(auth::AuthError::MissingAuth) => "AccessDenied",
-            Self::Auth(auth::AuthError::MalformedAuth) => "InvalidArgument",
+            Self::Auth(auth::AuthError::MalformedAuth) => "AuthorizationHeaderMalformed",
+            Self::Auth(auth::AuthError::UnsupportedAuthType) => "InvalidArgument",
             Self::Auth(auth::AuthError::UnknownAccessKey) => "InvalidAccessKeyId",
             Self::Auth(auth::AuthError::SignatureMismatch) => "SignatureDoesNotMatch",
             Self::Auth(auth::AuthError::RequestExpired) => "RequestTimeTooSkewed",
+            Self::Auth(auth::AuthError::InvalidQueryParam { .. }) => {
+                "AuthorizationQueryParametersError"
+            }
+            Self::Auth(auth::AuthError::MissingQueryParam { .. }) => {
+                "AuthorizationQueryParametersError"
+            }
             Self::Auth(_) => "AccessDenied",
             Self::PreconditionFailed => "PreconditionFailed",
             Self::NotModified { .. } => "NotModified",
@@ -157,6 +170,7 @@ impl ServerError {
             Self::InvalidPart { .. } => "InvalidPart",
             Self::InvalidPartOrder => "InvalidPartOrder",
             Self::EntityTooSmall { .. } => "EntityTooSmall",
+            Self::XAmzContentSHA256Mismatch { .. } => "XAmzContentSHA256Mismatch",
             Self::NotImplemented { .. } => "NotImplemented",
             Self::InternalError { .. } => "InternalError",
             Self::IntegrityError { .. } => "InternalError",
@@ -174,7 +188,10 @@ impl ServerError {
             Self::BucketNotEmpty => 409,
             Self::ObjectNotFound { .. } => 404,
             Self::DeleteMarkerHit { .. } => 404,
-            Self::Auth(auth::AuthError::MalformedAuth) => 400,
+            Self::Auth(auth::AuthError::MalformedAuth)
+            | Self::Auth(auth::AuthError::UnsupportedAuthType)
+            | Self::Auth(auth::AuthError::InvalidQueryParam { .. })
+            | Self::Auth(auth::AuthError::MissingQueryParam { .. }) => 400,
             Self::Auth(_) => 403,
             Self::InvalidRequest { .. }
             | Self::InvalidArgument { .. }
@@ -185,7 +202,9 @@ impl ServerError {
             Self::NoSuchPublicAccessBlockConfiguration { .. } => 404,
             Self::OwnershipControlsNotFound { .. } => 404,
             Self::InvalidTag { .. } => 400,
-            Self::AccessControlListNotSupported | Self::InvalidBucketAclWithObjectOwnership => 400,
+            Self::AccessControlListNotSupported
+            | Self::InvalidBucketAclWithObjectOwnership
+            | Self::XAmzContentSHA256Mismatch { .. } => 400,
             Self::AccessDenied => 403,
             Self::NoSuchUpload { .. } => 404,
             Self::InvalidPart { .. } | Self::InvalidPartOrder | Self::EntityTooSmall { .. } => 400,
@@ -279,13 +298,27 @@ mod tests {
     #[test]
     fn s3_error_code_auth_malformed() {
         let err = ServerError::Auth(auth::AuthError::MalformedAuth);
-        assert_eq!(err.s3_error_code(), "InvalidArgument");
+        assert_eq!(err.s3_error_code(), "AuthorizationHeaderMalformed");
     }
 
     #[test]
     fn http_status_auth_malformed_400() {
         assert_eq!(
             ServerError::Auth(auth::AuthError::MalformedAuth).http_status(),
+            400
+        );
+    }
+
+    #[test]
+    fn s3_error_code_unsupported_auth_type() {
+        let err = ServerError::Auth(auth::AuthError::UnsupportedAuthType);
+        assert_eq!(err.s3_error_code(), "InvalidArgument");
+    }
+
+    #[test]
+    fn http_status_unsupported_auth_type_400() {
+        assert_eq!(
+            ServerError::Auth(auth::AuthError::UnsupportedAuthType).http_status(),
             400
         );
     }

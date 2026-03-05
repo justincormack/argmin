@@ -1444,15 +1444,15 @@ fn test_bucket_listv2_continuationtoken_empty() {
         let client = CTX.client();
         let (bucket, keys) = create_objects_with_keys(client, SET_B).await;
 
-        // Empty continuation token should behave like no token
-        let resp = client
+        // AWS rejects empty continuation token with 400 InvalidArgument
+        let result = client
             .list_objects_v2()
             .bucket(&bucket)
             .continuation_token("")
             .send()
-            .await
-            .unwrap();
-        assert_eq!(get_keys(resp.contents()).len(), 7);
+            .await;
+        assert!(result.is_err());
+        assert_eq!(err_status(&result), 400);
 
         delete_all_and_bucket(client, &bucket, &keys).await;
     });

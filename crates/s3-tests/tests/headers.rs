@@ -267,7 +267,7 @@ fn test_put_bad_checksum_sha256() {
         let status = resp.status().as_u16();
         let rbody = resp.body_mut().read_to_string().unwrap();
         assert_eq!(status, 403, "expected 403, got {}", status);
-        assert_error_code(&rbody, "SignatureDoesNotMatch");
+        assert_error_code(&rbody, "AccessDenied");
         cleanup(&bucket, &[]).await;
     });
 }
@@ -292,7 +292,7 @@ fn test_put_bad_checksum_crc32() {
         let status = resp.status().as_u16();
         let rbody = resp.body_mut().read_to_string().unwrap();
         assert_eq!(status, 403, "expected 403, got {}", status);
-        assert_error_code(&rbody, "SignatureDoesNotMatch");
+        assert_error_code(&rbody, "AccessDenied");
         cleanup(&bucket, &[]).await;
     });
 }
@@ -317,7 +317,7 @@ fn test_put_bad_checksum_crc32c() {
         let status = resp.status().as_u16();
         let rbody = resp.body_mut().read_to_string().unwrap();
         assert_eq!(status, 403, "expected 403, got {}", status);
-        assert_error_code(&rbody, "SignatureDoesNotMatch");
+        assert_error_code(&rbody, "AccessDenied");
         cleanup(&bucket, &[]).await;
     });
 }
@@ -342,7 +342,7 @@ fn test_put_bad_checksum_crc64nvme() {
         let status = resp.status().as_u16();
         let rbody = resp.body_mut().read_to_string().unwrap();
         assert_eq!(status, 403, "expected 403, got {}", status);
-        assert_error_code(&rbody, "SignatureDoesNotMatch");
+        assert_error_code(&rbody, "AccessDenied");
         cleanup(&bucket, &[]).await;
     });
 }
@@ -367,7 +367,7 @@ fn test_put_bad_checksum_sha1() {
         let status = resp.status().as_u16();
         let rbody = resp.body_mut().read_to_string().unwrap();
         assert_eq!(status, 403, "expected 403, got {}", status);
-        assert_error_code(&rbody, "SignatureDoesNotMatch");
+        assert_error_code(&rbody, "AccessDenied");
         cleanup(&bucket, &[]).await;
     });
 }
@@ -392,7 +392,7 @@ fn test_put_empty_checksum_sha256() {
         let status = resp.status().as_u16();
         let rbody = resp.body_mut().read_to_string().unwrap();
         assert_eq!(status, 403, "expected 403, got {}", status);
-        assert_error_code(&rbody, "SignatureDoesNotMatch");
+        assert_error_code(&rbody, "AccessDenied");
         cleanup(&bucket, &[]).await;
     });
 }
@@ -432,7 +432,7 @@ fn test_put_multiple_checksums() {
         let status = resp.status().as_u16();
         let rbody = resp.body_mut().read_to_string().unwrap();
         assert_eq!(status, 403, "expected 403, got {}", status);
-        assert_error_code(&rbody, "SignatureDoesNotMatch");
+        assert_error_code(&rbody, "AccessDenied");
         cleanup(&bucket, &[]).await;
     });
 }
@@ -512,8 +512,8 @@ fn test_put_empty_authorization() {
             .expect("transport error");
         let status = resp.status().as_u16();
         let rbody = resp.body_mut().read_to_string().unwrap();
-        assert_eq!(status, 400, "expected 400, got {}", status);
-        assert_error_code(&rbody, "InvalidArgument");
+        assert_eq!(status, 403, "expected 403, got {}", status);
+        assert_error_code(&rbody, "AccessDenied");
         cleanup(&bucket, &[]).await;
     });
 }
@@ -565,8 +565,8 @@ fn test_bucket_put_empty_authorization() {
             .expect("transport error");
         let status = resp.status().as_u16();
         let rbody = resp.body_mut().read_to_string().unwrap();
-        assert_eq!(status, 400, "expected 400, got {}", status);
-        assert_error_code(&rbody, "InvalidArgument");
+        assert_eq!(status, 403, "expected 403, got {}", status);
+        assert_error_code(&rbody, "AccessDenied");
     });
 }
 
@@ -820,7 +820,7 @@ fn test_put_date_missing_signed() {
         let status = resp.status().as_u16();
         let rbody = resp.body_mut().read_to_string().unwrap();
         assert_eq!(status, 403, "expected 403, got {}", status);
-        assert_error_code(&rbody, "RequestTimeTooSkewed");
+        assert_error_code(&rbody, "AccessDenied");
         cleanup(&bucket, &[]).await;
     });
 }
@@ -958,7 +958,7 @@ fn test_bucket_create_bad_acl() {
         let status = resp.status().as_u16();
         let rbody = resp.body_mut().read_to_string().unwrap();
         assert_eq!(status, 403, "expected 403, got {}", status);
-        assert_error_code(&rbody, "SignatureDoesNotMatch");
+        assert_error_code(&rbody, "AccessDenied");
     });
 }
 
@@ -985,14 +985,9 @@ fn test_put_body_sha256_mismatch() {
             .expect("transport error");
         let status = resp.status().as_u16();
         let rbody = resp.body_mut().read_to_string().unwrap();
-        // Body doesn't match x-amz-content-sha256 → 400 before signature check
+        // Body doesn't match x-amz-content-sha256 → 400
         assert_eq!(status, 400, "expected 400, got {}", status);
-        assert!(
-            rbody.contains("<Code>XAmzContentSHA256Mismatch</Code>")
-                || rbody.contains("<Code>InvalidRequest</Code>"),
-            "expected XAmzContentSHA256Mismatch or InvalidRequest in body: {}",
-            rbody
-        );
+        assert_error_code(&rbody, "XAmzContentSHA256Mismatch");
         cleanup(&bucket, &[]).await;
     });
 }
@@ -1018,7 +1013,7 @@ fn test_put_content_sha256_mismatch() {
         let status = resp.status().as_u16();
         let rbody = resp.body_mut().read_to_string().unwrap();
         assert_eq!(status, 400, "expected 400, got {}", status);
-        assert_error_code(&rbody, "InvalidRequest");
+        assert_error_code(&rbody, "XAmzContentSHA256Mismatch");
         cleanup(&bucket, &[]).await;
     });
 }
@@ -1128,7 +1123,10 @@ fn test_put_missing_credential() {
         let url = format!("{}/{}/obj", CTX.endpoint(), bucket);
         let auth =
             "AWS4-HMAC-SHA256 SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=abc123";
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         let (y, m, d) = days_to_ymd(now / 86400);
         let secs_today = now % 86400;
         let (hh, mm, ss) = (secs_today / 3600, (secs_today % 3600) / 60, secs_today % 60);
@@ -1143,7 +1141,7 @@ fn test_put_missing_credential() {
         let status = resp.status().as_u16();
         let rbody = resp.body_mut().read_to_string().unwrap();
         assert_eq!(status, 400, "expected 400, got {}", status);
-        assert_error_code(&rbody, "InvalidArgument");
+        assert_error_code(&rbody, "AuthorizationHeaderMalformed");
         cleanup(&bucket, &[]).await;
     });
 }
@@ -1153,7 +1151,10 @@ fn test_put_missing_signature() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;
         let url = format!("{}/{}/obj", CTX.endpoint(), bucket);
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         let (y, m, d) = days_to_ymd(now / 86400);
         let secs_today = now % 86400;
         let (hh, mm, ss) = (secs_today / 3600, (secs_today % 3600) / 60, secs_today % 60);
@@ -1179,7 +1180,7 @@ fn test_put_missing_signature() {
         let status = resp.status().as_u16();
         let rbody = resp.body_mut().read_to_string().unwrap();
         assert_eq!(status, 400, "expected 400, got {}", status);
-        assert_error_code(&rbody, "InvalidArgument");
+        assert_error_code(&rbody, "AuthorizationHeaderMalformed");
         cleanup(&bucket, &[]).await;
     });
 }
@@ -1189,7 +1190,10 @@ fn test_put_bad_credential_scope() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;
         let url = format!("{}/{}/obj", CTX.endpoint(), bucket);
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         let (y, m, d) = days_to_ymd(now / 86400);
         let secs_today = now % 86400;
         let (hh, mm, ss) = (secs_today / 3600, (secs_today % 3600) / 60, secs_today % 60);
@@ -1211,7 +1215,7 @@ fn test_put_bad_credential_scope() {
         let status = resp.status().as_u16();
         let rbody = resp.body_mut().read_to_string().unwrap();
         assert_eq!(status, 400, "expected 400, got {}", status);
-        assert_error_code(&rbody, "InvalidArgument");
+        assert_error_code(&rbody, "AuthorizationHeaderMalformed");
         cleanup(&bucket, &[]).await;
     });
 }
@@ -1239,7 +1243,7 @@ fn test_put_wrong_region() {
         let status = resp.status().as_u16();
         let rbody = resp.body_mut().read_to_string().unwrap();
         assert_eq!(status, 403, "expected 403, got {}", status);
-        assert_error_code(&rbody, "SignatureDoesNotMatch");
+        assert_error_code(&rbody, "AccessDenied");
         cleanup(&bucket, &[]).await;
     });
 }
@@ -1267,7 +1271,7 @@ fn test_put_wrong_service() {
         let status = resp.status().as_u16();
         let rbody = resp.body_mut().read_to_string().unwrap();
         assert_eq!(status, 403, "expected 403, got {}", status);
-        assert_error_code(&rbody, "SignatureDoesNotMatch");
+        assert_error_code(&rbody, "AccessDenied");
         cleanup(&bucket, &[]).await;
     });
 }

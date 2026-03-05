@@ -8,9 +8,8 @@ static BUCKET_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Bucket name prefix, configurable via `S3_TEST_BUCKET_PREFIX`.
 /// Defaults to `"test"`.
-static BUCKET_PREFIX: LazyLock<String> = LazyLock::new(|| {
-    std::env::var("S3_TEST_BUCKET_PREFIX").unwrap_or_else(|_| "test".to_string())
-});
+static BUCKET_PREFIX: LazyLock<String> =
+    LazyLock::new(|| std::env::var("S3_TEST_BUCKET_PREFIX").unwrap_or_else(|_| "test".to_string()));
 
 /// Return the bucket prefix (from `S3_TEST_BUCKET_PREFIX` or `"test"`).
 pub fn bucket_prefix() -> &'static str {

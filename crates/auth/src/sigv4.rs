@@ -27,7 +27,7 @@ pub fn parse_auth_header(value: &str) -> Result<SigV4Auth, AuthError> {
     let value = value.trim();
     let rest = value
         .strip_prefix("AWS4-HMAC-SHA256")
-        .ok_or(AuthError::MalformedAuth)?
+        .ok_or(AuthError::UnsupportedAuthType)?
         .trim_start();
 
     // Parse the three components: Credential, SignedHeaders, Signature
@@ -158,10 +158,19 @@ pub fn verify_request(
 
     // AWS requires all x-amz-* headers to be signed (security: prevents injection
     // of unsigned x-amz-* headers).
+    let mut unsigned_headers: Vec<String> = Vec::new();
     for (name, _) in headers {
-        if name.starts_with("x-amz-") && !auth.signed_headers.iter().any(|sh| sh == name) {
-            return Err(AuthError::SignatureMismatch);
+        if name.starts_with("x-amz-")
+            && !auth.signed_headers.iter().any(|sh| sh == name)
+            && !unsigned_headers.iter().any(|h| h == name)
+        {
+            unsigned_headers.push((*name).to_string());
         }
+    }
+    if !unsigned_headers.is_empty() {
+        return Err(AuthError::UnsignedHeaders {
+            headers: unsigned_headers,
+        });
     }
 
     let canonical_hdrs = canonical_headers(&signed_header_pairs);

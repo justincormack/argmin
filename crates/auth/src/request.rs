@@ -42,6 +42,10 @@ pub fn authenticate_request(
     now_epoch_secs: u64,
 ) -> Result<AuthContext, AuthError> {
     if let Some(auth_header) = header_value(headers, "authorization") {
+        // Empty Authorization header → AccessDenied (AWS behavior)
+        if auth_header.trim().is_empty() {
+            return Err(AuthError::AccessDenied);
+        }
         return authenticate_header(
             method,
             path,
@@ -561,7 +565,7 @@ mod tests {
 
     #[test]
     fn authenticate_header_unsigned_security_token_rejected() {
-        // AWS requires x-amz-security-token to be signed; unsigned → SignatureMismatch.
+        // AWS requires x-amz-security-token to be signed; unsigned → UnsignedHeaders.
         let mut store = example_store();
         store.add_record(CredentialRecord {
             access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
@@ -591,7 +595,7 @@ mod tests {
             0,
         )
         .unwrap_err();
-        assert!(matches!(err, AuthError::SignatureMismatch));
+        assert!(matches!(err, AuthError::UnsignedHeaders { .. }));
     }
 
     #[test]

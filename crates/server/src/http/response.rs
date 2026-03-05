@@ -21,6 +21,36 @@ pub fn format_version_id(version_id: u64) -> String {
     }
 }
 
+/// RFC 2047 Q-encoding for non-ASCII header values.
+///
+/// AWS S3 returns non-ASCII user metadata (x-amz-meta-*) encoded as RFC 2047
+/// encoded-words. This is a legacy HTTP convention (see RFC 9110 §5.5, RFC 2047)
+/// that AWS follows for metadata round-tripping. Values are encoded as
+/// `=?UTF-8?Q?...?=` where non-printable-ASCII bytes become `=XX` hex pairs
+/// and spaces become underscores.
+///
+/// Reference: <https://docs.aws.amazon.com/AmazonS3/latest/userguide/UsingMetadata.html>
+fn rfc2047_encode(value: &str) -> String {
+    let mut encoded = String::from("=?UTF-8?Q?");
+    for byte in value.bytes() {
+        match byte {
+            // Printable ASCII (except =, ?, _) pass through
+            b'!'..=b'<' | b'>'..=b'>' | b'@'..=b'^' | b'`'..=b'~' => {
+                encoded.push(byte as char);
+            }
+            // Space → underscore (RFC 2047 convention)
+            b' ' => encoded.push('_'),
+            // Everything else (non-ASCII, control chars, =, ?, _) → =XX
+            _ => {
+                encoded.push('=');
+                encoded.push_str(&format!("{:02X}", byte));
+            }
+        }
+    }
+    encoded.push_str("?=");
+    encoded
+}
+
 /// An HTTP response to send back.
 pub struct S3Response {
     pub status_code: u16,
@@ -40,6 +70,16 @@ impl S3Response {
     fn header(mut self, name: &str, value: &str) -> Self {
         self.headers.push((name.to_string(), value.to_string()));
         self
+    }
+
+    /// Set a metadata header, RFC 2047 encoding the value if it contains
+    /// non-ASCII bytes (matching AWS S3 behavior).
+    fn meta_header(self, name: &str, value: &str) -> Self {
+        if value.is_ascii() {
+            self.header(name, value)
+        } else {
+            self.header(name, &rfc2047_encode(value))
+        }
     }
 
     fn xml_body(mut self, xml: String) -> Self {
@@ -144,7 +184,7 @@ impl S3Response {
         // x-amz-meta-* headers
         for entry in &result.metadata.entries {
             if entry.key.starts_with("x-amz-meta-") {
-                resp = resp.header(&entry.key, &entry.value);
+                resp = resp.meta_header(&entry.key, &entry.value);
             }
         }
 
@@ -200,7 +240,7 @@ impl S3Response {
 
         for entry in &result.metadata.entries {
             if entry.key.starts_with("x-amz-meta-") {
-                resp = resp.header(&entry.key, &entry.value);
+                resp = resp.meta_header(&entry.key, &entry.value);
             }
         }
 
@@ -257,7 +297,7 @@ impl S3Response {
 
         for entry in &result.metadata.entries {
             if entry.key.starts_with("x-amz-meta-") {
-                resp = resp.header(&entry.key, &entry.value);
+                resp = resp.meta_header(&entry.key, &entry.value);
             }
         }
 
@@ -311,7 +351,7 @@ impl S3Response {
 
         for entry in &result.metadata.entries {
             if entry.key.starts_with("x-amz-meta-") {
-                resp = resp.header(&entry.key, &entry.value);
+                resp = resp.meta_header(&entry.key, &entry.value);
             }
         }
 
@@ -364,7 +404,7 @@ impl S3Response {
 
         for entry in &result.metadata.entries {
             if entry.key.starts_with("x-amz-meta-") {
-                resp = resp.header(&entry.key, &entry.value);
+                resp = resp.meta_header(&entry.key, &entry.value);
             }
         }
 
@@ -739,6 +779,47 @@ impl S3Response {
 
     /// Build an error response.
     pub fn error(err: &ServerError, resource: &str) -> Self {
+        // Special cases that need extra XML elements
+        match err {
+            ServerError::XAmzContentSHA256Mismatch {
+                client_hash,
+                server_hash,
+            } => {
+                let body = format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                     <Error>\
+                     <Code>XAmzContentSHA256Mismatch</Code>\
+                     <Message>The provided &apos;x-amz-content-sha256&apos; header does not match what was computed.</Message>\
+                     <ClientComputedContentSHA256>{}</ClientComputedContentSHA256>\
+                     <S3ComputedContentSHA256>{}</S3ComputedContentSHA256>\
+                     <Resource>{}</Resource>\
+                     <RequestId>request-id</RequestId>\
+                     </Error>",
+                    xml::xml_escape(client_hash),
+                    xml::xml_escape(server_hash),
+                    xml::xml_escape(resource),
+                );
+                return Self::new(400).xml_body(body);
+            }
+            ServerError::Auth(auth::AuthError::UnsignedHeaders { headers }) => {
+                let headers_str = headers.join(";");
+                let body = format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                     <Error>\
+                     <Code>AccessDenied</Code>\
+                     <Message>There were headers present in the request which were not signed</Message>\
+                     <HeadersNotSigned>{}</HeadersNotSigned>\
+                     <Resource>{}</Resource>\
+                     <RequestId>request-id</RequestId>\
+                     </Error>",
+                    xml::xml_escape(&headers_str),
+                    xml::xml_escape(resource),
+                );
+                return Self::new(403).xml_body(body);
+            }
+            _ => {}
+        }
+
         let fallback;
         let message = match err {
             ServerError::InvalidRequest { reason } => reason.as_str(),

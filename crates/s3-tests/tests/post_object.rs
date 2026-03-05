@@ -198,7 +198,17 @@ fn sigv4_fields(
     let region = CTX.region();
 
     let credential = format!("{}/{}/{}/s3/aws4_request", access_key, short_date, region);
-    let policy_b64 = make_policy(bucket, key, 3600, extra_conditions);
+
+    // AWS requires ALL form fields to have matching policy conditions.
+    // The SigV4 fields must be included in the policy.
+    let mut all_conditions = vec![
+        serde_json::json!({"x-amz-algorithm": "AWS4-HMAC-SHA256"}),
+        serde_json::json!({"x-amz-credential": &credential}),
+        serde_json::json!({"x-amz-date": &full_date}),
+    ];
+    all_conditions.extend_from_slice(extra_conditions);
+
+    let policy_b64 = make_policy(bucket, key, 3600, &all_conditions);
     let signature = sign_policy_v4(&policy_b64, secret, &short_date, region);
 
     vec![

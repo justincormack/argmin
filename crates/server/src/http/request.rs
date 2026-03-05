@@ -35,13 +35,25 @@ impl S3Request {
         let path = parts.uri.path().to_string();
         let query_string = parts.uri.query().unwrap_or("").to_string();
 
-        // Extract headers as lowercase name/value pairs
+        // Extract headers as lowercase name/value pairs.
+        // to_str() only accepts visible ASCII. For non-ASCII bytes (obs-text),
+        // fall back to strict UTF-8. Non-UTF8 obs-text bytes (e.g. raw 0x80)
+        // are rejected here — supporting them would require carrying raw bytes
+        // through SigV4 canonicalization, which currently operates on Strings.
+        // In practice the AWS SDK always sends valid UTF-8. Latin-1
+        // reinterpretation for x-amz-meta-* storage happens later in
+        // MetadataBlob::from_headers().
         let mut headers = Vec::with_capacity(parts.headers.len());
         for (name, value) in &parts.headers {
-            let val_str = value.to_str().map_err(|_| ServerError::InvalidRequest {
-                reason: format!("non-ASCII header value for {}", name),
-            })?;
-            headers.push((name.as_str().to_string(), val_str.to_string()));
+            let val_str = match value.to_str() {
+                Ok(s) => s.to_string(),
+                Err(_) => std::str::from_utf8(value.as_bytes())
+                    .map_err(|_| ServerError::InvalidRequest {
+                        reason: format!("invalid UTF-8 in header value for {}", name),
+                    })?
+                    .to_string(),
+            };
+            headers.push((name.as_str().to_string(), val_str));
         }
 
         // Validate Content-Length header if present (reject negative/non-numeric)
@@ -450,5 +462,56 @@ mod tests {
     fn parse_copy_source_missing_key() {
         assert!(parse_copy_source("/bucket").is_err());
         assert!(parse_copy_source("bucket").is_err());
+    }
+
+    #[test]
+    fn from_hyper_accepts_utf8_non_ascii_headers() {
+        let mut headers = http::HeaderMap::new();
+        // "café" in UTF-8: 0x63 0x61 0x66 0xC3 0xA9
+        headers.insert(
+            "x-amz-meta-tag",
+            http::HeaderValue::from_bytes(b"caf\xc3\xa9").unwrap(),
+        );
+        let uri = http::Uri::from_static("/bucket/key");
+        let (mut parts, _) = http::Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(())
+            .unwrap()
+            .into_parts();
+        parts.headers = headers;
+        let req = S3Request::from_hyper(&parts, bytes::Bytes::new()).unwrap();
+        assert_eq!(req.header("x-amz-meta-tag"), Some("caf\u{e9}"));
+    }
+
+    #[test]
+    fn from_hyper_rejects_non_utf8_obs_text() {
+        // Raw 0x80 is valid obs-text but not valid UTF-8.
+        // Rejected because SigV4 canonicalization operates on Strings;
+        // supporting raw obs-text would require a byte-level header
+        // representation through the auth layer.
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-amz-meta-raw",
+            http::HeaderValue::from_bytes(b"val\x80").unwrap(),
+        );
+        let uri = http::Uri::from_static("/bucket/key");
+        let (mut parts, _) = http::Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(())
+            .unwrap()
+            .into_parts();
+        parts.headers = headers;
+        match S3Request::from_hyper(&parts, bytes::Bytes::new()) {
+            Err(ServerError::InvalidRequest { reason }) => {
+                assert!(
+                    reason.contains("invalid UTF-8") && reason.contains("x-amz-meta-raw"),
+                    "unexpected reason: {}",
+                    reason
+                );
+            }
+            other => panic!("expected InvalidRequest, got {:?}", other.err()),
+        }
     }
 }

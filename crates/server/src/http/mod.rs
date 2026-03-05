@@ -304,6 +304,14 @@ impl HttpFrontend {
                 }
 
                 let continuation_token_raw = req.query_param("continuation-token");
+                // AWS rejects empty continuation-token with InvalidArgument
+                if let Some(ref ct) = continuation_token_raw {
+                    if ct.is_empty() {
+                        return Err(ServerError::InvalidArgument {
+                            reason: "The continuation token provided is incorrect".to_string(),
+                        });
+                    }
+                }
                 let start_after_raw = req.query_param("start-after");
                 let continuation_token = continuation_token_raw
                     .as_deref()
@@ -498,9 +506,15 @@ impl HttpFrontend {
                             reason: "partNumber must be >= 1".into(),
                         });
                     }
-                    let result =
-                        self.coordinator
-                            .get_object_part(&bucket, &key, vid, part_number, &cond)?;
+                    let result = self
+                        .coordinator
+                        .get_object_part(&bucket, &key, vid, part_number, &cond)
+                        .map_err(|e| match e {
+                            ServerError::InvalidPart { .. } => {
+                                ServerError::InvalidRange { total_size: 0 }
+                            }
+                            other => other,
+                        })?;
                     let tags = result.tags.clone();
                     let mut resp = S3Response::get_object_part(result);
                     apply_response_overrides(&mut resp, req);
@@ -575,13 +589,15 @@ impl HttpFrontend {
                             reason: "partNumber must be >= 1".into(),
                         });
                     }
-                    let result = self.coordinator.head_object_part(
-                        &bucket,
-                        &key,
-                        vid,
-                        part_number,
-                        &cond,
-                    )?;
+                    let result = self
+                        .coordinator
+                        .head_object_part(&bucket, &key, vid, part_number, &cond)
+                        .map_err(|e| match e {
+                            ServerError::InvalidPart { .. } => {
+                                ServerError::InvalidRange { total_size: 0 }
+                            }
+                            other => other,
+                        })?;
                     let mut resp = S3Response::head_object_part(&result);
                     if let Some(tags_xml) = &result.tags {
                         let count = xml::count_tags_in_xml(tags_xml);
@@ -1184,9 +1200,12 @@ impl HttpFrontend {
                 principal: None,
                 request_epoch_secs: None,
             },
-            // Missing x-amz-date when declared as signed → RequestTimeTooSkewed
-            Err(auth::AuthError::MissingSignedHeader { header: "x-amz-date" }) => {
-                return Err(ServerError::Auth(auth::AuthError::RequestExpired));
+            // Missing x-amz-date when declared as signed → AccessDenied
+            // AWS: "AWS authentication requires a valid Date or x-amz-date header"
+            Err(auth::AuthError::MissingSignedHeader {
+                header: "x-amz-date",
+            }) => {
+                return Err(ServerError::Auth(auth::AuthError::AccessDenied));
             }
             Err(err) => return Err(ServerError::Auth(err)),
         };
@@ -1195,10 +1214,9 @@ impl HttpFrontend {
         // SigV4 requests already checked above.
         if !is_sigv4 {
             if req.header("x-amz-date").is_some() {
-                let request_epoch =
-                    auth.request_epoch_secs.ok_or(ServerError::InvalidRequest {
-                        reason: "malformed x-amz-date timestamp".to_string(),
-                    })?;
+                let request_epoch = auth.request_epoch_secs.ok_or(ServerError::InvalidRequest {
+                    reason: "malformed x-amz-date timestamp".to_string(),
+                })?;
                 let skew = now.abs_diff(request_epoch);
                 if skew > 15 * 60 {
                     return Err(ServerError::Auth(auth::AuthError::RequestExpired));
@@ -1212,8 +1230,9 @@ impl HttpFrontend {
             if claimed != "UNSIGNED-PAYLOAD" {
                 let actual = auth::canonical::sha256_hex(&req.body);
                 if actual != claimed {
-                    return Err(ServerError::InvalidRequest {
-                        reason: "payload content SHA-256 mismatch".to_string(),
+                    return Err(ServerError::XAmzContentSHA256Mismatch {
+                        client_hash: claimed.to_string(),
+                        server_hash: actual,
                     });
                 }
             }
@@ -2970,15 +2989,15 @@ mod tests {
             None,
         );
 
-        // partNumber=99 on a 3-part object → 400 InvalidPart
+        // partNumber=99 on a 3-part object → 416 InvalidRange
         let req = make_req("partNumber=99");
         let op = S3Operation::GetObject {
             bucket: "mybucket".to_string(),
             key: "k".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
-            Err(ServerError::InvalidPart { part_number: 99 }) => {}
-            Err(e) => panic!("expected InvalidPart, got {e:?}"),
+            Err(ServerError::InvalidRange { .. }) => {}
+            Err(e) => panic!("expected InvalidRange, got {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
     }
@@ -3056,15 +3075,15 @@ mod tests {
         };
         fe.dispatch_routed(&req, &test_auth(), op).unwrap();
 
-        // partNumber=2 on non-multipart → 400 InvalidPart
+        // partNumber=2 on non-multipart → 416 InvalidRange
         let req = make_req("partNumber=2");
         let op = S3Operation::GetObject {
             bucket: "mybucket".to_string(),
             key: "k".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
-            Err(ServerError::InvalidPart { part_number: 2 }) => {}
-            Err(e) => panic!("expected InvalidPart, got {e:?}"),
+            Err(ServerError::InvalidRange { .. }) => {}
+            Err(e) => panic!("expected InvalidRange, got {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
     }

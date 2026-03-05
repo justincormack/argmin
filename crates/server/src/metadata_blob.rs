@@ -48,9 +48,10 @@ const STORED_HEADERS: &[&str] = &[
 ];
 
 /// Check if a string contains bytes invalid in HTTP headers:
-/// ASCII control characters (0x00-0x1F) or non-ASCII bytes (>= 0x7F).
+/// ASCII control characters (0x00-0x1F) and DEL (0x7F). Non-ASCII
+/// printable bytes (>= 0x80) are allowed (AWS accepts unicode metadata).
 fn has_invalid_header_bytes(s: &str) -> bool {
-    s.bytes().any(|b| !(0x20..0x7f).contains(&b))
+    s.bytes().any(|b| b < 0x20 || b == 0x7f)
 }
 
 /// Strip `aws-chunked` from a comma-separated Content-Encoding value.
@@ -80,6 +81,18 @@ impl MetadataBlob {
     /// Extracts content-type, content-encoding, cache-control, content-disposition,
     /// content-language, expires, and all x-amz-meta-* headers.
     /// Rejects values containing control characters to prevent header injection.
+    ///
+    /// For `x-amz-meta-*` headers with non-ASCII values, bytes are reinterpreted
+    /// as Latin-1 (ISO 8859-1) code points before storage. This matches AWS S3's
+    /// documented behavior: non-US-ASCII metadata is stored with each HTTP octet
+    /// mapped to its corresponding Unicode code point, and returned RFC 2047
+    /// Q-encoded. This reinterpretation must happen after SigV4 verification,
+    /// which operates on the raw header bytes as received.
+    ///
+    /// References:
+    /// - <https://docs.aws.amazon.com/AmazonS3/latest/userguide/UsingMetadata.html>
+    /// - RFC 9110 §5.5 (obs-text in field values)
+    /// - RFC 2047 (MIME encoded-words in headers)
     pub fn from_headers(headers: &[(&str, &str)]) -> Result<Self, ServerError> {
         let mut entries = Vec::new();
         for &(name, value) in headers {
@@ -93,19 +106,22 @@ impl MetadataBlob {
                         ),
                     });
                 }
-                if lower == "content-encoding" {
-                    if let Some(filtered) = strip_aws_chunked(value) {
-                        entries.push(MetadataEntry {
-                            key: lower,
-                            value: filtered,
-                        });
+                let stored_value = if lower == "content-encoding" {
+                    match strip_aws_chunked(value) {
+                        Some(filtered) => filtered,
+                        None => continue,
                     }
+                } else if lower.starts_with("x-amz-meta-") && !value.is_ascii() {
+                    // AWS compatibility: reinterpret non-ASCII bytes as
+                    // Latin-1 code points for user metadata only.
+                    value.bytes().map(|b| b as char).collect()
                 } else {
-                    entries.push(MetadataEntry {
-                        key: lower,
-                        value: value.to_string(),
-                    });
-                }
+                    value.to_string()
+                };
+                entries.push(MetadataEntry {
+                    key: lower,
+                    value: stored_value,
+                });
             }
         }
         Ok(Self { entries })
@@ -480,14 +496,15 @@ mod tests {
     }
 
     #[test]
-    fn from_headers_rejects_non_ascii() {
+    fn from_headers_accepts_non_ascii() {
+        // AWS accepts unicode metadata values
         let headers = [("X-Amz-Meta-Name", "caf\u{00e9}")]; // "café"
-        assert!(MetadataBlob::from_headers(&headers).is_err());
+        assert!(MetadataBlob::from_headers(&headers).is_ok());
 
         let headers = [("Content-Type", "text/plain; charset=\u{00fc}")];
-        assert!(MetadataBlob::from_headers(&headers).is_err());
+        assert!(MetadataBlob::from_headers(&headers).is_ok());
 
-        // DEL (0x7F) should also be rejected
+        // DEL (0x7F) is a control character and should be rejected
         let headers = [("X-Amz-Meta-Del", "val\x7f")];
         assert!(MetadataBlob::from_headers(&headers).is_err());
     }

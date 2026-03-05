@@ -621,28 +621,48 @@ fn test_object_metadata_replaced_on_put() {
     });
 }
 
-/// Non-ASCII (unicode) metadata values are rejected with 400.
-///
-/// The S3 spec only allows visible ASCII (0x20-0x7E) in HTTP header values.
-/// The Ceph test `test_object_set_get_unicode_metadata` is marked
-/// `fails_on_rgw` for the same reason — non-ASCII metadata is not portable.
+/// AWS accepts non-ASCII (unicode) metadata values.
 #[test]
-fn test_object_metadata_unicode_rejected() {
+fn test_object_metadata_unicode_accepted() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = setup_bucket().await;
 
         let unicode_value = "Hello World\u{e9}"; // "Hello Worldé"
-        let result = client
+        client
             .put_object()
             .bucket(&bucket)
             .key("unicode-meta")
             .metadata("meta1", unicode_value)
             .body(ByteStream::from_static(b"bar"))
             .send()
-            .await;
-        assert_eq!(err_status(&result), 400);
+            .await
+            .unwrap();
 
+        // Verify round-trip: both AWS and our server RFC 2047 encode
+        // non-ASCII metadata values in response headers.
+        let resp = client
+            .get_object()
+            .bucket(&bucket)
+            .key("unicode-meta")
+            .send()
+            .await
+            .unwrap();
+        let meta = resp.metadata().unwrap();
+        let returned = meta.get("meta1").unwrap();
+        assert_eq!(
+            returned, "=?UTF-8?Q?Hello_World=C3=83=C2=A9?=",
+            "expected RFC 2047 Q-encoded value, got: {}",
+            returned
+        );
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key("unicode-meta")
+            .send()
+            .await
+            .unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
 }
