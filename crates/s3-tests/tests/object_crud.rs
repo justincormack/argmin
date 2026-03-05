@@ -1245,7 +1245,8 @@ fn test_object_content_encoding_aws_chunked() {
             .unwrap();
         assert_eq!(resp.content_encoding(), Some("deflate, gzip"));
 
-        // 3. gzip, aws-chunked — aws-chunked stripped, returns gzip
+        // 3. gzip, aws-chunked — stored as-is (AWS stores user-provided Content-Encoding verbatim;
+        //    aws-chunked is only stripped when the server processes actual chunked transfer)
         client
             .put_object()
             .bucket(&bucket)
@@ -1262,9 +1263,9 @@ fn test_object_content_encoding_aws_chunked() {
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.content_encoding(), Some("gzip"));
+        assert_eq!(resp.content_encoding(), Some("gzip, aws-chunked"));
 
-        // 4. aws-chunked, gzip — aws-chunked stripped, returns gzip
+        // 4. aws-chunked, gzip — stored as-is
         client
             .put_object()
             .bucket(&bucket)
@@ -1281,9 +1282,9 @@ fn test_object_content_encoding_aws_chunked() {
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.content_encoding(), Some("gzip"));
+        assert_eq!(resp.content_encoding(), Some("aws-chunked, gzip"));
 
-        // 5. aws-chunked only — no Content-Encoding stored
+        // 5. aws-chunked only — stored as-is
         client
             .put_object()
             .bucket(&bucket)
@@ -1300,26 +1301,7 @@ fn test_object_content_encoding_aws_chunked() {
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.content_encoding(), None);
-
-        // 6. aws-chunked, aws-chunked — no Content-Encoding stored
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .content_encoding("aws-chunked, aws-chunked")
-            .body(ByteStream::from_static(b"data"))
-            .send()
-            .await
-            .unwrap();
-        let resp = client
-            .head_object()
-            .bucket(&bucket)
-            .key(key)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.content_encoding(), None);
+        assert_eq!(resp.content_encoding(), Some("aws-chunked"));
 
         // Cleanup
         client
