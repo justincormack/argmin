@@ -1222,20 +1222,6 @@ impl HttpFrontend {
             Err(err) => return Err(ServerError::Auth(err)),
         };
 
-        // Post-auth time skew check for non-SigV4 requests (e.g. anonymous with x-amz-date).
-        // SigV4 requests already checked above.
-        if !is_sigv4 {
-            if req.header("x-amz-date").is_some() {
-                let request_epoch = auth.request_epoch_secs.ok_or(ServerError::InvalidRequest {
-                    reason: "malformed x-amz-date timestamp".to_string(),
-                })?;
-                let skew = now.abs_diff(request_epoch);
-                if skew > 15 * 60 {
-                    return Err(ServerError::Auth(auth::AuthError::RequestExpired));
-                }
-            }
-        }
-
         // Verify payload integrity: if the client provided an actual content hash
         // (not UNSIGNED-PAYLOAD), recompute and compare to detect transit corruption.
         if let Some(claimed) = req.header("x-amz-content-sha256") {

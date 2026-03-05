@@ -615,6 +615,7 @@ fn test_put_wrong_secret_key() {
 
 // ── Group 4: Date Header ────────────────────────────────────────────────
 
+/// AWS ignores x-amz-date on anonymous/unsigned requests.
 #[test]
 fn test_get_date_empty_anonymous() {
     s3_tests::run(async {
@@ -630,19 +631,21 @@ fn test_get_date_empty_anonymous() {
             .unwrap();
 
         let url = format!("{}/{}/obj", CTX.endpoint(), bucket);
-        let mut resp = agent()
+        let resp = agent()
             .get(&url)
             .header("x-amz-date", "")
             .call()
             .expect("transport error");
-        let status = resp.status().as_u16();
-        let rbody = resp.body_mut().read_to_string().unwrap();
-        assert_eq!(status, 400, "expected 400, got {}", status);
-        assert_error_code(&rbody, "InvalidRequest");
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "AWS ignores x-amz-date on anonymous requests"
+        );
         cleanup(&bucket, &["obj"]).await;
     });
 }
 
+/// AWS ignores x-amz-date on anonymous/unsigned requests.
 #[test]
 fn test_get_date_invalid_anonymous() {
     s3_tests::run(async {
@@ -658,19 +661,21 @@ fn test_get_date_invalid_anonymous() {
             .unwrap();
 
         let url = format!("{}/{}/obj", CTX.endpoint(), bucket);
-        let mut resp = agent()
+        let resp = agent()
             .get(&url)
             .header("x-amz-date", "garbage")
             .call()
             .expect("transport error");
-        let status = resp.status().as_u16();
-        let rbody = resp.body_mut().read_to_string().unwrap();
-        assert_eq!(status, 400, "expected 400, got {}", status);
-        assert_error_code(&rbody, "InvalidRequest");
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "AWS ignores x-amz-date on anonymous requests"
+        );
         cleanup(&bucket, &["obj"]).await;
     });
 }
 
+/// AWS ignores x-amz-date on anonymous/unsigned requests.
 #[test]
 fn test_get_date_before_epoch_anonymous() {
     s3_tests::run(async {
@@ -686,15 +691,16 @@ fn test_get_date_before_epoch_anonymous() {
             .unwrap();
 
         let url = format!("{}/{}/obj", CTX.endpoint(), bucket);
-        let mut resp = agent()
+        let resp = agent()
             .get(&url)
             .header("x-amz-date", "19690101T000000Z")
             .call()
             .expect("transport error");
-        let status = resp.status().as_u16();
-        let rbody = resp.body_mut().read_to_string().unwrap();
-        assert_eq!(status, 400, "expected 400, got {}", status);
-        assert_error_code(&rbody, "InvalidRequest");
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "AWS ignores x-amz-date on anonymous requests"
+        );
         cleanup(&bucket, &["obj"]).await;
     });
 }
