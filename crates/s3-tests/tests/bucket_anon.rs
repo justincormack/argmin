@@ -1,4 +1,5 @@
 use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::ObjectCannedAcl;
 use s3_tests::{unique_bucket, CTX};
 
 /// Build an agent that returns all HTTP responses (including 4xx/5xx) as Ok.
@@ -43,6 +44,7 @@ fn test_anon_get_object_public_bucket() {
             .put_object()
             .bucket(&bucket)
             .key("obj")
+            .acl(ObjectCannedAcl::PublicRead)
             .body(ByteStream::from_static(b"public data"))
             .send()
             .await
@@ -104,6 +106,7 @@ fn test_anon_head_object_public_bucket() {
             .put_object()
             .bucket(&bucket)
             .key("obj")
+            .acl(ObjectCannedAcl::PublicRead)
             .body(ByteStream::from_static(b"head me"))
             .send()
             .await

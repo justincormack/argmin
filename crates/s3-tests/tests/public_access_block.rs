@@ -1,4 +1,4 @@
-use aws_sdk_s3::types::ObjectOwnership;
+use aws_sdk_s3::types::{ObjectCannedAcl, ObjectOwnership};
 use s3_tests::{unique_bucket, CTX};
 
 /// Build an agent that returns all HTTP responses (including 4xx/5xx) as Ok.
@@ -222,40 +222,36 @@ fn test_ignore_public_acls() {
         let client = CTX.client();
         let bucket = s3_tests::create_public_bucket(client).await;
 
-        let alt_client = CTX.alt_client();
-
-        // Upload an object
+        // Upload an object with public-read ACL (needed for object-level access on AWS)
         client
             .put_object()
             .bucket(&bucket)
             .key("key1")
+            .acl(ObjectCannedAcl::PublicRead)
             .body(aws_sdk_s3::primitives::ByteStream::from_static(b"abcde"))
             .send()
             .await
             .unwrap();
 
-        // Verify alt_client (non-owner) can list objects on public-read bucket
-        let list_resp = alt_client.list_objects_v2().bucket(&bucket).send().await;
-        assert!(
-            list_resp.is_ok(),
-            "public-read bucket should allow alt_client list_objects"
+        // Verify anonymous user can list objects on public-read bucket
+        let list_url = format!("{}/?list-type=2", format!("{}/{}", CTX.endpoint(), bucket));
+        let mut list_resp = agent().get(&list_url).call().expect("transport error");
+        assert_eq!(
+            list_resp.status().as_u16(),
+            200,
+            "public-read bucket should allow anonymous list_objects"
         );
-        let list_output = list_resp.unwrap();
-        let contents = list_output.contents();
+        let list_body = list_resp.body_mut().read_to_string().unwrap();
         assert!(
-            contents.iter().any(|o| o.key() == Some("key1")),
+            list_body.contains("<Key>key1</Key>"),
             "list should contain key1"
         );
 
-        // Verify alt_client can GET object on public-read bucket
-        let get_resp = alt_client
-            .get_object()
-            .bucket(&bucket)
-            .key("key1")
-            .send()
-            .await
-            .unwrap();
-        let data = get_resp.body.collect().await.unwrap().into_bytes();
+        // Verify anonymous user can GET object on public-read bucket
+        let get_url = format!("{}/key1", format!("{}/{}", CTX.endpoint(), bucket));
+        let mut get_resp = agent().get(&get_url).call().expect("transport error");
+        assert_eq!(get_resp.status().as_u16(), 200);
+        let data = get_resp.body_mut().read_to_vec().unwrap();
         assert_eq!(&data[..], b"abcde");
 
         // Set IgnorePublicAcls = true
@@ -278,23 +274,22 @@ fn test_ignore_public_acls() {
             "PutBucketAcl should succeed (IgnorePublicAcls doesn't block setting)"
         );
 
-        // alt_client list_objects should now fail (public ACL is ignored)
-        let list_err = alt_client.list_objects_v2().bucket(&bucket).send().await;
-        assert!(
-            list_err.is_err(),
-            "expected alt_client list_objects to fail when IgnorePublicAcls is set"
+        // Anonymous list_objects should now fail (public ACL is ignored)
+        let mut list_resp2 = agent().get(&list_url).call().expect("transport error");
+        let _ = list_resp2.body_mut().read_to_string();
+        assert_eq!(
+            list_resp2.status().as_u16(),
+            403,
+            "expected anonymous list_objects to fail when IgnorePublicAcls is set"
         );
 
-        // alt_client GET object should also fail
-        let get_err = alt_client
-            .get_object()
-            .bucket(&bucket)
-            .key("key1")
-            .send()
-            .await;
-        assert!(
-            get_err.is_err(),
-            "expected alt_client get_object to fail when IgnorePublicAcls is set"
+        // Anonymous GET object should also fail
+        let mut get_resp2 = agent().get(&get_url).call().expect("transport error");
+        let _ = get_resp2.body_mut().read_to_string();
+        assert_eq!(
+            get_resp2.status().as_u16(),
+            403,
+            "expected anonymous get_object to fail when IgnorePublicAcls is set"
         );
 
         // Authenticated owner access should still work

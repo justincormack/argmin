@@ -1,5 +1,5 @@
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{CorsConfiguration, CorsRule};
+use aws_sdk_s3::types::{CorsConfiguration, CorsRule, ObjectCannedAcl};
 use s3_tests::{unique_bucket, CTX};
 
 /// Build an agent that returns all HTTP responses (including 4xx/5xx) as Ok.
@@ -412,6 +412,7 @@ fn test_cors_actual_request_public_bucket() {
             .put_object()
             .bucket(&bucket)
             .key("obj")
+            .acl(ObjectCannedAcl::PublicRead)
             .body(ByteStream::from_static(b"hello"))
             .send()
             .await
@@ -475,6 +476,7 @@ fn test_cors_actual_request_no_match() {
             .put_object()
             .bucket(&bucket)
             .key("obj")
+            .acl(ObjectCannedAcl::PublicRead)
             .body(ByteStream::from_static(b"hello"))
             .send()
             .await

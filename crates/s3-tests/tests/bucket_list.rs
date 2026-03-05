@@ -1817,8 +1817,14 @@ fn test_bucket_listv2_objects_anonymous_fail() {
 fn test_bucket_list_long_name() {
     s3_tests::run(async {
         let client = CTX.client();
-        // Use a 63-char bucket name (max allowed)
-        let bucket = "a".repeat(63);
+        // Use a 63-char bucket name (max allowed), unique via unique_bucket() padding
+        let base = s3_tests::unique_bucket();
+        let bucket = if base.len() >= 63 {
+            base[..63].to_string()
+        } else {
+            format!("{}{}", base, "a".repeat(63 - base.len()))
+        };
+        assert_eq!(bucket.len(), 63);
         client.create_bucket().bucket(&bucket).send().await.unwrap();
 
         let resp = client.list_objects().bucket(&bucket).send().await.unwrap();
