@@ -1,4 +1,4 @@
-use aws_sdk_s3::types::{ObjectCannedAcl, ObjectOwnership};
+use aws_sdk_s3::types::{BucketCannedAcl, ObjectCannedAcl, ObjectOwnership};
 use s3_tests::{unique_bucket, CTX};
 
 /// Build an agent that returns all HTTP responses (including 4xx/5xx) as Ok.
@@ -207,8 +207,13 @@ fn test_block_public_put_bucket_acls() {
         );
 
         // PutBucketAcl with private should succeed
-        let resp = send_signed_put(&url, b"", &[("x-amz-acl", "private")]);
-        assert_eq!(resp, 200, "expected 200 for private ACL, got {}", resp);
+        client
+            .put_bucket_acl()
+            .bucket(&bucket)
+            .acl(BucketCannedAcl::Private)
+            .send()
+            .await
+            .unwrap();
 
         cleanup(&bucket).await;
     });
@@ -267,12 +272,13 @@ fn test_ignore_public_acls() {
             .unwrap();
 
         // Re-apply public-read ACL (matching Ceph test: ACL still set, but ignored)
-        let acl_url = format!("{}/{}?acl", CTX.endpoint(), bucket);
-        let resp = send_signed_put(&acl_url, b"", &[("x-amz-acl", "public-read")]);
-        assert_eq!(
-            resp, 200,
-            "PutBucketAcl should succeed (IgnorePublicAcls doesn't block setting)"
-        );
+        client
+            .put_bucket_acl()
+            .bucket(&bucket)
+            .acl(BucketCannedAcl::PublicRead)
+            .send()
+            .await
+            .unwrap();
 
         // Anonymous list_objects should now fail (public ACL is ignored)
         let mut list_resp2 = agent().get(&list_url).call().expect("transport error");
