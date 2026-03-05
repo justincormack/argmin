@@ -74,6 +74,12 @@ pub fn authenticate_request(
         );
     }
 
+    // If x-amz-date is present without Authorization or presigned params,
+    // AWS treats this as an incomplete signed request and returns 403.
+    if header_value(headers, "x-amz-date").is_some() {
+        return Err(AuthError::AccessDenied);
+    }
+
     Err(AuthError::MissingAuth)
 }
 
@@ -442,6 +448,18 @@ mod tests {
         let err = authenticate_request("GET", "/", "", &headers, b"", &store, "us-east-1", "s3", 0)
             .unwrap_err();
         assert!(matches!(err, AuthError::MissingAuth));
+    }
+
+    #[test]
+    fn authenticate_amz_date_without_auth_is_denied() {
+        let store = example_store();
+        let headers = [
+            ("host", "examplebucket.s3.amazonaws.com"),
+            ("x-amz-date", "20130524T000000Z"),
+        ];
+        let err = authenticate_request("GET", "/", "", &headers, b"", &store, "us-east-1", "s3", 0)
+            .unwrap_err();
+        assert!(matches!(err, AuthError::AccessDenied));
     }
 
     #[test]

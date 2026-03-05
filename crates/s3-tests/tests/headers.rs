@@ -615,7 +615,7 @@ fn test_put_wrong_secret_key() {
 
 // ── Group 4: Date Header ────────────────────────────────────────────────
 
-/// AWS ignores x-amz-date on anonymous/unsigned requests.
+/// x-amz-date without Authorization → AWS returns 403 (incomplete signed request).
 #[test]
 fn test_get_date_empty_anonymous() {
     s3_tests::run(async {
@@ -638,14 +638,14 @@ fn test_get_date_empty_anonymous() {
             .expect("transport error");
         assert_eq!(
             resp.status().as_u16(),
-            200,
-            "AWS ignores x-amz-date on anonymous requests"
+            403,
+            "x-amz-date without Authorization is rejected"
         );
         cleanup(&bucket, &["obj"]).await;
     });
 }
 
-/// AWS ignores x-amz-date on anonymous/unsigned requests.
+/// x-amz-date without Authorization → AWS returns 403 (incomplete signed request).
 #[test]
 fn test_get_date_invalid_anonymous() {
     s3_tests::run(async {
@@ -668,14 +668,14 @@ fn test_get_date_invalid_anonymous() {
             .expect("transport error");
         assert_eq!(
             resp.status().as_u16(),
-            200,
-            "AWS ignores x-amz-date on anonymous requests"
+            403,
+            "x-amz-date without Authorization is rejected"
         );
         cleanup(&bucket, &["obj"]).await;
     });
 }
 
-/// AWS ignores x-amz-date on anonymous/unsigned requests.
+/// x-amz-date without Authorization → AWS returns 403 (incomplete signed request).
 #[test]
 fn test_get_date_before_epoch_anonymous() {
     s3_tests::run(async {
@@ -698,8 +698,8 @@ fn test_get_date_before_epoch_anonymous() {
             .expect("transport error");
         assert_eq!(
             resp.status().as_u16(),
-            200,
-            "AWS ignores x-amz-date on anonymous requests"
+            403,
+            "x-amz-date without Authorization is rejected"
         );
         cleanup(&bucket, &["obj"]).await;
     });
