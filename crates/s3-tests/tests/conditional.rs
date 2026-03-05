@@ -198,14 +198,23 @@ fn test_get_object_ifmodifiedsince_failed() {
         let bucket = setup_bucket().await;
         put_object(&bucket, "obj", b"hello").await;
 
-        // Use a date far in the future → object not modified since → 304
-        let future = DateTime::from_secs(4_102_444_800); // 2100-01-01
+        // Use the object's own last-modified time → not modified since → 304
+        // (RFC 7232 §3.3: future dates must be ignored, so we use the actual timestamp)
+        let head = CTX
+            .client()
+            .head_object()
+            .bucket(&bucket)
+            .key("obj")
+            .send()
+            .await
+            .unwrap();
+        let last_modified = *head.last_modified().unwrap();
         let result = CTX
             .client()
             .get_object()
             .bucket(&bucket)
             .key("obj")
-            .if_modified_since(future)
+            .if_modified_since(last_modified)
             .send()
             .await;
         assert_eq!(err_status(&result), 304);
@@ -703,15 +712,24 @@ fn test_copy_object_source_ifmodifiedsince_failed() {
         let bucket = setup_bucket().await;
         put_object(&bucket, "src", b"source data").await;
 
-        // Date far in future → not modified since → 412
-        let future = DateTime::from_secs(4_102_444_800);
+        // Use the source object's own last-modified time → not modified since → 412
+        // (RFC 7232 §3.3: future dates must be ignored, so we use the actual timestamp)
+        let head = CTX
+            .client()
+            .head_object()
+            .bucket(&bucket)
+            .key("src")
+            .send()
+            .await
+            .unwrap();
+        let last_modified = *head.last_modified().unwrap();
         let result = CTX
             .client()
             .copy_object()
             .bucket(&bucket)
             .key("dst")
             .copy_source(format!("{}/src", bucket))
-            .copy_source_if_modified_since(future)
+            .copy_source_if_modified_since(last_modified)
             .send()
             .await;
         assert!(result.is_err(), "expected 412 PreconditionFailed");

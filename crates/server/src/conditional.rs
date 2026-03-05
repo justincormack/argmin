@@ -2,10 +2,20 @@
 ///
 /// Implements RFC 7232 §6 evaluation order for reads, plus S3-specific
 /// conditional semantics for writes and deletes.
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use crate::error::ServerError;
 use crate::etag::parse_etag;
 use crate::http::request::S3Request;
 use crate::http::response::parse_http_date;
+
+/// Return the current time in milliseconds since the Unix epoch.
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 
 /// Conditions for read operations (GET, HEAD, Range GET).
 #[derive(Debug, Default)]
@@ -160,9 +170,10 @@ pub fn check_read_conditions(
     }
 
     // Step 4: If-Modified-Since (only evaluated if If-None-Match is absent)
+    // Per RFC 7232 §3.3: ignore if the date is in the future.
     if cond.if_none_match.is_none() {
         if let Some(since) = cond.if_modified_since {
-            if last_modified <= since {
+            if since < now_millis() && last_modified <= since {
                 return Err(ServerError::NotModified {
                     etag: etag.to_string(),
                     last_modified,
@@ -285,9 +296,10 @@ pub fn check_copy_source_conditions(
     }
 
     // Step 4: If-Modified-Since (only if If-None-Match absent) — returns 412 (not 304)
+    // Per RFC 7232 §3.3: ignore if the date is in the future.
     if cond.if_none_match.is_none() {
         if let Some(since) = cond.if_modified_since {
-            if last_modified <= since {
+            if since < now_millis() && last_modified <= since {
                 return Err(ServerError::PreconditionFailed);
             }
         }
