@@ -471,15 +471,14 @@ fn test_get_paginated_multipart_object_attributes() {
         assert_eq!(p3.is_truncated(), Some(false));
         assert_eq!(p3.parts().len(), 1);
         assert_eq!(p3.parts()[0].part_number(), Some(3));
-        assert!(p3.next_part_number_marker().is_none());
+        assert!(p3.next_part_number_marker().is_some());
 
         cleanup(&bucket, &[key]).await;
     });
 }
 
-/// max_parts=0 should return IsTruncated=true, empty parts list,
-/// TotalPartsCount with the real count, and a NextPartNumberMarker so
-/// the caller knows where pagination would start.
+/// max_parts=0 should return IsTruncated=false, empty parts list,
+/// and TotalPartsCount with the real count.
 /// Uses CRC32 checksums so AWS returns full ObjectParts detail.
 #[test]
 fn test_get_zero_max_parts_object_attributes() {
@@ -551,9 +550,8 @@ fn test_get_zero_max_parts_object_attributes() {
 
         let parts_info = resp.object_parts().expect("expected ObjectParts");
         assert_eq!(parts_info.total_parts_count(), Some(2));
-        assert_eq!(parts_info.is_truncated(), Some(true));
+        assert_eq!(parts_info.is_truncated(), Some(false));
         assert!(parts_info.parts().is_empty());
-        // NextPartNumberMarker must be present so callers can advance
         assert!(parts_info.next_part_number_marker().is_some());
 
         cleanup(&bucket, &[key]).await;

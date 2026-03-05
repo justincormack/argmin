@@ -2038,7 +2038,7 @@ impl Coordinator {
                     .filter(|p| p.part_number > marker)
                     .collect();
 
-                let is_truncated = filtered.len() > max_parts as usize;
+                let is_truncated = max_parts > 0 && filtered.len() > max_parts as usize;
                 let take_count = (max_parts as usize).min(filtered.len());
                 let page: Vec<ObjectPartEntry> = filtered
                     .into_iter()
@@ -2057,10 +2057,10 @@ impl Coordinator {
                     })
                     .collect();
 
-                let next_part_number_marker = if is_truncated {
-                    Some(page.last().map_or(marker, |p| p.part_number))
+                let next_part_number_marker = if !page.is_empty() {
+                    page.last().map(|p| p.part_number)
                 } else {
-                    None
+                    Some(marker)
                 };
 
                 Some(ObjectPartsInfo {
