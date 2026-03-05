@@ -1,5 +1,6 @@
 use aws_sdk_s3::primitives::ByteStream;
-use s3_tests::{err_status, unique_bucket, CTX};
+use aws_sdk_s3::types::VersioningConfiguration;
+use s3_tests::{cleanup_versioned_bucket, err_status, unique_bucket, CTX};
 
 // ── CreateBucket ─────────────────────────────────────────────────────
 
@@ -84,6 +85,55 @@ fn test_bucket_delete_nonempty() {
             .await
             .unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+/// Deleting a versioned bucket that contains only delete markers must fail
+/// with 409 BucketNotEmpty. On AWS, delete_object on a versioned bucket
+/// creates a delete marker rather than removing the object.
+#[test]
+fn test_bucket_delete_nonempty_delete_markers() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        // Enable versioning
+        client
+            .put_bucket_versioning()
+            .bucket(&bucket)
+            .versioning_configuration(
+                VersioningConfiguration::builder()
+                    .status(aws_sdk_s3::types::BucketVersioningStatus::Enabled)
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        // Put an object, then delete it (creates a delete marker)
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("key")
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key("key")
+            .send()
+            .await
+            .unwrap();
+
+        // Bucket still has versions + delete marker; delete must fail
+        let result = client.delete_bucket().bucket(&bucket).send().await;
+        assert_eq!(err_status(&result), 409);
+
+        // Clean up properly
+        cleanup_versioned_bucket(client, &bucket).await;
     });
 }
 

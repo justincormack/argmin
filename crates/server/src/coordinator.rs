@@ -406,16 +406,18 @@ impl Coordinator {
     }
 
     pub fn delete_bucket(&self, name: &str) -> Result<(), ServerError> {
-        // Check emptiness: list objects and multipart uploads across all PGs.
+        // Check emptiness: list all object versions (including delete markers)
+        // and multipart uploads across all PGs.
         for &pg_id in self.storage_node.pg_ids() {
             let pg = self.storage_node.get_pg(pg_id)?;
-            let resp = pg.list_objects(&ListObjectsReq {
+            let resp = pg.list_object_versions(&ListObjectVersionsReq {
                 bucket: name.to_string(),
                 prefix: None,
-                start_after: None,
+                key_marker: None,
+                version_id_marker: None,
                 max_keys: 1,
             })?;
-            if !resp.objects.is_empty() {
+            if !resp.versions.is_empty() {
                 return Err(ServerError::BucketNotEmpty);
             }
             let mpu_resp = pg.list_multipart_uploads(&ListMultipartUploadsReq {
