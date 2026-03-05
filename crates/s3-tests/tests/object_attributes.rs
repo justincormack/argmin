@@ -311,15 +311,9 @@ fn test_get_multipart_object_attributes() {
             .await
             .unwrap();
 
+        // Non-checksummed multipart: AWS only returns PartsCount, no Part elements
         let parts_info = resp.object_parts().expect("expected ObjectParts");
         assert_eq!(parts_info.total_parts_count(), Some(2));
-        let parts = parts_info.parts();
-        assert_eq!(parts.len(), 2);
-        assert_eq!(parts[0].part_number(), Some(1));
-        assert_eq!(parts[0].size(), Some(PART_SIZE as i64));
-        assert_eq!(parts[1].part_number(), Some(2));
-        assert_eq!(parts[1].size(), Some(1024));
-        assert_eq!(parts_info.is_truncated(), Some(false));
 
         assert_eq!(resp.object_size(), Some((PART_SIZE + 1024) as i64));
 
@@ -347,18 +341,17 @@ fn test_get_single_multipart_object_attributes() {
             .await
             .unwrap();
 
+        // Non-checksummed multipart: AWS only returns PartsCount
         let parts_info = resp.object_parts().expect("expected ObjectParts");
         assert_eq!(parts_info.total_parts_count(), Some(1));
-        assert_eq!(parts_info.parts().len(), 1);
-        assert_eq!(parts_info.parts()[0].part_number(), Some(1));
-        assert_eq!(parts_info.parts()[0].size(), Some(PART_SIZE as i64));
 
         cleanup(&bucket, &["mpu-single"]).await;
     });
 }
 
-/// Three-part multipart upload with pagination: max_parts(1), verify truncation
-/// and NextPartNumberMarker, then fetch next page.
+/// Three-part checksummed multipart upload with pagination: max_parts(1),
+/// verify truncation and NextPartNumberMarker, then fetch next page.
+/// Uses CRC32 checksums so AWS returns full ObjectParts detail.
 #[test]
 fn test_get_paginated_multipart_object_attributes() {
     s3_tests::run(async {
@@ -366,18 +359,66 @@ fn test_get_paginated_multipart_object_attributes() {
         let bucket = unique_bucket();
         client.create_bucket().bucket(&bucket).send().await.unwrap();
 
-        let parts: Vec<Vec<u8>> = vec![
+        let key = "mpu-page";
+        let parts_data: Vec<Vec<u8>> = vec![
             vec![b'a'; PART_SIZE],
             vec![b'b'; PART_SIZE],
             vec![b'c'; 1024],
         ];
-        do_multipart_upload(&bucket, "mpu-page", &parts).await;
+
+        // Create checksummed multipart upload
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .checksum_algorithm(ChecksumAlgorithm::Crc32)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap();
+
+        let mut completed_parts = Vec::new();
+        for (i, data) in parts_data.iter().enumerate() {
+            let part_number = (i + 1) as i32;
+            let resp = client
+                .upload_part()
+                .bucket(&bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .part_number(part_number)
+                .body(ByteStream::from(data.clone()))
+                .checksum_algorithm(ChecksumAlgorithm::Crc32)
+                .send()
+                .await
+                .unwrap();
+            completed_parts.push(
+                CompletedPart::builder()
+                    .e_tag(resp.e_tag().unwrap())
+                    .checksum_crc32(resp.checksum_crc32().unwrap())
+                    .part_number(part_number)
+                    .build(),
+            );
+        }
+
+        client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .set_parts(Some(completed_parts))
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
 
         // Page 1: max_parts=1
         let resp = client
             .get_object_attributes()
             .bucket(&bucket)
-            .key("mpu-page")
+            .key(key)
             .object_attributes(ObjectAttributes::ObjectParts)
             .max_parts(1)
             .send()
@@ -397,7 +438,7 @@ fn test_get_paginated_multipart_object_attributes() {
         let resp2 = client
             .get_object_attributes()
             .bucket(&bucket)
-            .key("mpu-page")
+            .key(key)
             .object_attributes(ObjectAttributes::ObjectParts)
             .max_parts(1)
             .part_number_marker(next_marker)
@@ -418,7 +459,7 @@ fn test_get_paginated_multipart_object_attributes() {
         let resp3 = client
             .get_object_attributes()
             .bucket(&bucket)
-            .key("mpu-page")
+            .key(key)
             .object_attributes(ObjectAttributes::ObjectParts)
             .max_parts(1)
             .part_number_marker(next_marker2)
@@ -432,13 +473,14 @@ fn test_get_paginated_multipart_object_attributes() {
         assert_eq!(p3.parts()[0].part_number(), Some(3));
         assert!(p3.next_part_number_marker().is_none());
 
-        cleanup(&bucket, &["mpu-page"]).await;
+        cleanup(&bucket, &[key]).await;
     });
 }
 
 /// max_parts=0 should return IsTruncated=true, empty parts list,
 /// TotalPartsCount with the real count, and a NextPartNumberMarker so
 /// the caller knows where pagination would start.
+/// Uses CRC32 checksums so AWS returns full ObjectParts detail.
 #[test]
 fn test_get_zero_max_parts_object_attributes() {
     s3_tests::run(async {
@@ -446,14 +488,61 @@ fn test_get_zero_max_parts_object_attributes() {
         let bucket = unique_bucket();
         client.create_bucket().bucket(&bucket).send().await.unwrap();
 
-        let part1 = vec![b'a'; PART_SIZE];
-        let part2 = vec![b'b'; 1024];
-        do_multipart_upload(&bucket, "mpu-zero", &[part1, part2]).await;
+        let key = "mpu-zero";
+        let parts_data = [vec![b'a'; PART_SIZE], vec![b'b'; 1024]];
+
+        // Create checksummed multipart upload
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .checksum_algorithm(ChecksumAlgorithm::Crc32)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap();
+
+        let mut completed_parts = Vec::new();
+        for (i, data) in parts_data.iter().enumerate() {
+            let part_number = (i + 1) as i32;
+            let resp = client
+                .upload_part()
+                .bucket(&bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .part_number(part_number)
+                .body(ByteStream::from(data.clone()))
+                .checksum_algorithm(ChecksumAlgorithm::Crc32)
+                .send()
+                .await
+                .unwrap();
+            completed_parts.push(
+                CompletedPart::builder()
+                    .e_tag(resp.e_tag().unwrap())
+                    .checksum_crc32(resp.checksum_crc32().unwrap())
+                    .part_number(part_number)
+                    .build(),
+            );
+        }
+
+        client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .set_parts(Some(completed_parts))
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
 
         let resp = client
             .get_object_attributes()
             .bucket(&bucket)
-            .key("mpu-zero")
+            .key(key)
             .object_attributes(ObjectAttributes::ObjectParts)
             .max_parts(0)
             .send()
@@ -467,7 +556,7 @@ fn test_get_zero_max_parts_object_attributes() {
         // NextPartNumberMarker must be present so callers can advance
         assert!(parts_info.next_part_number_marker().is_some());
 
-        cleanup(&bucket, &["mpu-zero"]).await;
+        cleanup(&bucket, &[key]).await;
     });
 }
 
@@ -570,8 +659,8 @@ fn test_get_multipart_checksum_object_attributes() {
         );
         assert_eq!(
             checksum.checksum_type(),
-            Some(&aws_sdk_s3::types::ChecksumType::FullObject),
-            "expected FULL_OBJECT type"
+            Some(&aws_sdk_s3::types::ChecksumType::Composite),
+            "expected COMPOSITE type"
         );
 
         // ObjectParts should include per-part checksums
@@ -594,6 +683,280 @@ fn test_get_multipart_checksum_object_attributes() {
         assert!(head.checksum_crc32().is_some());
         assert_eq!(
             head.checksum_type(),
+            Some(&aws_sdk_s3::types::ChecksumType::Composite)
+        );
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+// ── ChecksumType default and validation tests ─────────────────────────
+
+/// Helper: create a checksummed multipart upload and complete it.
+/// Returns the CompleteMultipartUpload response.
+async fn do_checksummed_multipart_upload(
+    bucket: &str,
+    key: &str,
+    algo: ChecksumAlgorithm,
+    checksum_type: Option<aws_sdk_s3::types::ChecksumType>,
+) -> aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput {
+    let client = CTX.client();
+    let mut create = client
+        .create_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .checksum_algorithm(algo.clone());
+    if let Some(ct) = checksum_type {
+        create = create.checksum_type(ct);
+    }
+    let create_resp = create.send().await.unwrap();
+    let upload_id = create_resp.upload_id().unwrap();
+
+    let part_data = vec![b'Z'; PART_SIZE];
+    let resp = client
+        .upload_part()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .part_number(1)
+        .body(ByteStream::from(part_data))
+        .checksum_algorithm(algo.clone())
+        .send()
+        .await
+        .unwrap();
+
+    let mut part_builder = CompletedPart::builder()
+        .e_tag(resp.e_tag().unwrap())
+        .part_number(1);
+
+    // Attach the per-part checksum
+    match algo {
+        ChecksumAlgorithm::Crc32 => {
+            part_builder = part_builder.checksum_crc32(resp.checksum_crc32().unwrap());
+        }
+        ChecksumAlgorithm::Crc32C => {
+            part_builder = part_builder.checksum_crc32_c(resp.checksum_crc32_c().unwrap());
+        }
+        ChecksumAlgorithm::Sha256 => {
+            part_builder = part_builder.checksum_sha256(resp.checksum_sha256().unwrap());
+        }
+        ChecksumAlgorithm::Sha1 => {
+            part_builder = part_builder.checksum_sha1(resp.checksum_sha1().unwrap());
+        }
+        ChecksumAlgorithm::Crc64Nvme => {
+            part_builder = part_builder.checksum_crc64_nvme(resp.checksum_crc64_nvme().unwrap());
+        }
+        _ => {}
+    }
+
+    client
+        .complete_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .parts(part_builder.build())
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap()
+}
+
+/// CRC32 multipart with no explicit checksum_type defaults to COMPOSITE.
+#[test]
+fn test_multipart_crc32_default_composite() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let key = "mpu-crc32-default";
+        let complete =
+            do_checksummed_multipart_upload(&bucket, key, ChecksumAlgorithm::Crc32, None).await;
+
+        // Composite checksums have a -N suffix (e.g. "AAAAAA==-1")
+        let cksum = complete.checksum_crc32().expect("expected CRC32 checksum");
+        assert!(
+            cksum.contains('-'),
+            "expected composite checksum with -N suffix, got: {cksum}"
+        );
+
+        let resp = client
+            .get_object_attributes()
+            .bucket(&bucket)
+            .key(key)
+            .object_attributes(ObjectAttributes::Checksum)
+            .send()
+            .await
+            .unwrap();
+        let checksum = resp.checksum().expect("expected Checksum");
+        assert_eq!(
+            checksum.checksum_type(),
+            Some(&aws_sdk_s3::types::ChecksumType::Composite)
+        );
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+/// CRC32C multipart with no explicit checksum_type defaults to COMPOSITE.
+#[test]
+fn test_multipart_crc32c_default_composite() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let key = "mpu-crc32c-default";
+        let complete =
+            do_checksummed_multipart_upload(&bucket, key, ChecksumAlgorithm::Crc32C, None).await;
+
+        let cksum = complete
+            .checksum_crc32_c()
+            .expect("expected CRC32C checksum");
+        assert!(
+            cksum.contains('-'),
+            "expected composite checksum with -N suffix, got: {cksum}"
+        );
+
+        let resp = client
+            .get_object_attributes()
+            .bucket(&bucket)
+            .key(key)
+            .object_attributes(ObjectAttributes::Checksum)
+            .send()
+            .await
+            .unwrap();
+        let checksum = resp.checksum().expect("expected Checksum");
+        assert_eq!(
+            checksum.checksum_type(),
+            Some(&aws_sdk_s3::types::ChecksumType::Composite)
+        );
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+/// SHA256 multipart with no explicit checksum_type defaults to COMPOSITE.
+#[test]
+fn test_multipart_sha256_default_composite() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let key = "mpu-sha256-default";
+        let complete =
+            do_checksummed_multipart_upload(&bucket, key, ChecksumAlgorithm::Sha256, None).await;
+
+        let cksum = complete
+            .checksum_sha256()
+            .expect("expected SHA256 checksum");
+        assert!(
+            cksum.contains('-'),
+            "expected composite checksum with -N suffix, got: {cksum}"
+        );
+
+        let resp = client
+            .get_object_attributes()
+            .bucket(&bucket)
+            .key(key)
+            .object_attributes(ObjectAttributes::Checksum)
+            .send()
+            .await
+            .unwrap();
+        let checksum = resp.checksum().expect("expected Checksum");
+        assert_eq!(
+            checksum.checksum_type(),
+            Some(&aws_sdk_s3::types::ChecksumType::Composite)
+        );
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+/// CRC64NVME multipart defaults to FULL_OBJECT (only supported type).
+#[test]
+fn test_multipart_crc64nvme_default_full_object() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let key = "mpu-crc64nvme-default";
+        let _complete =
+            do_checksummed_multipart_upload(&bucket, key, ChecksumAlgorithm::Crc64Nvme, None).await;
+
+        let resp = client
+            .get_object_attributes()
+            .bucket(&bucket)
+            .key(key)
+            .object_attributes(ObjectAttributes::Checksum)
+            .send()
+            .await
+            .unwrap();
+        let checksum = resp.checksum().expect("expected Checksum");
+        assert_eq!(
+            checksum.checksum_type(),
+            Some(&aws_sdk_s3::types::ChecksumType::FullObject)
+        );
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+/// CRC64NVME with explicit COMPOSITE should be rejected.
+#[test]
+fn test_multipart_crc64nvme_composite_rejected() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let result = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key("mpu-crc64nvme-composite")
+            .checksum_algorithm(ChecksumAlgorithm::Crc64Nvme)
+            .checksum_type(aws_sdk_s3::types::ChecksumType::Composite)
+            .send()
+            .await;
+        assert!(result.is_err(), "expected error for CRC64NVME + COMPOSITE");
+
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+/// CRC32 with explicit FULL_OBJECT should be accepted.
+#[test]
+fn test_multipart_crc32_explicit_full_object() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let key = "mpu-crc32-full-object";
+        let _complete = do_checksummed_multipart_upload(
+            &bucket,
+            key,
+            ChecksumAlgorithm::Crc32,
+            Some(aws_sdk_s3::types::ChecksumType::FullObject),
+        )
+        .await;
+
+        let resp = client
+            .get_object_attributes()
+            .bucket(&bucket)
+            .key(key)
+            .object_attributes(ObjectAttributes::Checksum)
+            .send()
+            .await
+            .unwrap();
+        let checksum = resp.checksum().expect("expected Checksum");
+        assert_eq!(
+            checksum.checksum_type(),
             Some(&aws_sdk_s3::types::ChecksumType::FullObject)
         );
 

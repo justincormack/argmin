@@ -88,6 +88,9 @@ pub struct ObjectPartEntry {
 #[derive(Debug)]
 pub struct ObjectPartsInfo {
     pub total_parts_count: u32,
+    /// True for checksummed multipart uploads (full detail: parts, pagination).
+    /// False for non-checksummed multipart (only PartsCount in XML).
+    pub has_detail: bool,
     pub parts: Vec<ObjectPartEntry>,
     pub is_truncated: bool,
     pub next_part_number_marker: Option<u32>,
@@ -2020,49 +2023,71 @@ impl Coordinator {
         };
 
         let object_parts = if want_parts && record.data_layout == DataLayout::MultipartManifest {
-            let meta_pg = pgs.meta();
-            let all_parts = meta_pg.get_object_parts(bucket, key, record.version_id)?;
-            let total_parts_count = all_parts.len() as u32;
-            let marker = part_number_marker.unwrap_or(0);
+            // Check if this multipart upload used checksums
+            let has_checksum = metadata.get("x-amz-checksum-algorithm").is_some();
 
-            let filtered: Vec<_> = all_parts
-                .into_iter()
-                .filter(|p| p.part_number > marker)
-                .collect();
+            if has_checksum {
+                // Checksummed multipart: full detail with parts, pagination
+                let meta_pg = pgs.meta();
+                let all_parts = meta_pg.get_object_parts(bucket, key, record.version_id)?;
+                let total_parts_count = all_parts.len() as u32;
+                let marker = part_number_marker.unwrap_or(0);
 
-            let is_truncated = filtered.len() > max_parts as usize;
-            let take_count = (max_parts as usize).min(filtered.len());
-            let page: Vec<ObjectPartEntry> = filtered
-                .into_iter()
-                .take(take_count)
-                .map(|p| {
-                    use base64::Engine;
-                    let checksum = p
-                        .checksum
-                        .as_ref()
-                        .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes));
-                    ObjectPartEntry {
-                        part_number: p.part_number,
-                        size: p.size,
-                        checksum,
-                    }
+                let filtered: Vec<_> = all_parts
+                    .into_iter()
+                    .filter(|p| p.part_number > marker)
+                    .collect();
+
+                let is_truncated = filtered.len() > max_parts as usize;
+                let take_count = (max_parts as usize).min(filtered.len());
+                let page: Vec<ObjectPartEntry> = filtered
+                    .into_iter()
+                    .take(take_count)
+                    .map(|p| {
+                        use base64::Engine;
+                        let checksum = p
+                            .checksum
+                            .as_ref()
+                            .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes));
+                        ObjectPartEntry {
+                            part_number: p.part_number,
+                            size: p.size,
+                            checksum,
+                        }
+                    })
+                    .collect();
+
+                let next_part_number_marker = if is_truncated {
+                    Some(page.last().map_or(marker, |p| p.part_number))
+                } else {
+                    None
+                };
+
+                Some(ObjectPartsInfo {
+                    total_parts_count,
+                    has_detail: true,
+                    parts: page,
+                    is_truncated,
+                    next_part_number_marker,
+                    max_parts,
+                    part_number_marker: marker,
                 })
-                .collect();
-
-            let next_part_number_marker = if is_truncated {
-                Some(page.last().map_or(marker, |p| p.part_number))
             } else {
-                None
-            };
+                // Non-checksummed multipart: only PartsCount
+                let meta_pg = pgs.meta();
+                let all_parts = meta_pg.get_object_parts(bucket, key, record.version_id)?;
+                let total_parts_count = all_parts.len() as u32;
 
-            Some(ObjectPartsInfo {
-                total_parts_count,
-                parts: page,
-                is_truncated,
-                next_part_number_marker,
-                max_parts,
-                part_number_marker: marker,
-            })
+                Some(ObjectPartsInfo {
+                    total_parts_count,
+                    has_detail: false,
+                    parts: Vec::new(),
+                    is_truncated: false,
+                    next_part_number_marker: None,
+                    max_parts,
+                    part_number_marker: part_number_marker.unwrap_or(0),
+                })
+            }
         } else {
             None
         };

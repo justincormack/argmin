@@ -1222,37 +1222,41 @@ pub fn get_object_attributes_xml(
                     xml.push_str("<PartsCount>");
                     xml.push_str(&parts_info.total_parts_count.to_string());
                     xml.push_str("</PartsCount>");
-                    xml.push_str("<PartNumberMarker>");
-                    xml.push_str(&parts_info.part_number_marker.to_string());
-                    xml.push_str("</PartNumberMarker>");
-                    xml.push_str("<MaxParts>");
-                    xml.push_str(&parts_info.max_parts.to_string());
-                    xml.push_str("</MaxParts>");
-                    xml.push_str("<IsTruncated>");
-                    xml.push_str(if parts_info.is_truncated {
-                        "true"
-                    } else {
-                        "false"
-                    });
-                    xml.push_str("</IsTruncated>");
-                    if let Some(next) = parts_info.next_part_number_marker {
-                        xml.push_str("<NextPartNumberMarker>");
-                        xml.push_str(&next.to_string());
-                        xml.push_str("</NextPartNumberMarker>");
-                    }
-                    for part in &parts_info.parts {
-                        xml.push_str("<Part>");
-                        xml.push_str("<PartNumber>");
-                        xml.push_str(&part.part_number.to_string());
-                        xml.push_str("</PartNumber>");
-                        xml.push_str("<Size>");
-                        xml.push_str(&part.size.to_string());
-                        xml.push_str("</Size>");
-                        if let (Some(algo), Some(ref val)) = (checksum_algorithm, &part.checksum) {
-                            let elem = algo.xml_element_name();
-                            xml.push_str(&format!("<{elem}>{}</{elem}>", xml_escape(val)));
+                    if parts_info.has_detail {
+                        xml.push_str("<PartNumberMarker>");
+                        xml.push_str(&parts_info.part_number_marker.to_string());
+                        xml.push_str("</PartNumberMarker>");
+                        xml.push_str("<MaxParts>");
+                        xml.push_str(&parts_info.max_parts.to_string());
+                        xml.push_str("</MaxParts>");
+                        xml.push_str("<IsTruncated>");
+                        xml.push_str(if parts_info.is_truncated {
+                            "true"
+                        } else {
+                            "false"
+                        });
+                        xml.push_str("</IsTruncated>");
+                        if let Some(next) = parts_info.next_part_number_marker {
+                            xml.push_str("<NextPartNumberMarker>");
+                            xml.push_str(&next.to_string());
+                            xml.push_str("</NextPartNumberMarker>");
                         }
-                        xml.push_str("</Part>");
+                        for part in &parts_info.parts {
+                            xml.push_str("<Part>");
+                            xml.push_str("<PartNumber>");
+                            xml.push_str(&part.part_number.to_string());
+                            xml.push_str("</PartNumber>");
+                            xml.push_str("<Size>");
+                            xml.push_str(&part.size.to_string());
+                            xml.push_str("</Size>");
+                            if let (Some(algo), Some(ref val)) =
+                                (checksum_algorithm, &part.checksum)
+                            {
+                                let elem = algo.xml_element_name();
+                                xml.push_str(&format!("<{elem}>{}</{elem}>", xml_escape(val)));
+                            }
+                            xml.push_str("</Part>");
+                        }
                     }
                     xml.push_str("</ObjectParts>");
                 }
@@ -2616,6 +2620,7 @@ mod tests {
         use crate::coordinator::{ObjectPartEntry, ObjectPartsInfo};
         let parts_info = ObjectPartsInfo {
             total_parts_count: 3,
+            has_detail: true,
             parts: vec![
                 ObjectPartEntry {
                     part_number: 1,
@@ -2651,6 +2656,7 @@ mod tests {
         use crate::coordinator::{ObjectPartEntry, ObjectPartsInfo};
         let parts_info = ObjectPartsInfo {
             total_parts_count: 1,
+            has_detail: true,
             parts: vec![ObjectPartEntry {
                 part_number: 1,
                 size: 100,
@@ -2666,6 +2672,27 @@ mod tests {
         assert!(xml.contains("<IsTruncated>false</IsTruncated>"));
         assert!(!xml.contains("<NextPartNumberMarker>"));
         assert!(xml.contains("<PartsCount>1</PartsCount>"));
+    }
+
+    #[test]
+    fn get_object_attributes_object_parts_no_detail() {
+        use crate::coordinator::ObjectPartsInfo;
+        let parts_info = ObjectPartsInfo {
+            total_parts_count: 3,
+            has_detail: false,
+            parts: Vec::new(),
+            is_truncated: false,
+            next_part_number_marker: None,
+            max_parts: 1000,
+            part_number_marker: 0,
+        };
+        let xml =
+            get_object_attributes_xml(&["ObjectParts"], "\"x\"", 0, &[], Some(&parts_info), None);
+        assert!(xml.contains("<ObjectParts><PartsCount>3</PartsCount></ObjectParts>"));
+        assert!(!xml.contains("<IsTruncated>"));
+        assert!(!xml.contains("<PartNumberMarker>"));
+        assert!(!xml.contains("<MaxParts>"));
+        assert!(!xml.contains("<Part>"));
     }
 
     #[test]
@@ -3116,6 +3143,7 @@ mod tests {
         use storage::ChecksumAlgorithm;
         let parts_info = ObjectPartsInfo {
             total_parts_count: 2,
+            has_detail: true,
             parts: vec![
                 ObjectPartEntry {
                     part_number: 1,

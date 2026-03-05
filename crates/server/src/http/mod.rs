@@ -966,6 +966,16 @@ impl HttpFrontend {
                     }
                 }
 
+                // CRC64NVME only supports FULL_OBJECT; reject COMPOSITE.
+                if let (Some(ChecksumAlgorithm::Crc64nvme), Some(ChecksumType::Composite)) =
+                    (checksum_algorithm, checksum_type)
+                {
+                    return Err(ServerError::InvalidArgument {
+                        reason: "COMPOSITE checksum type is not supported for CRC64NVME"
+                            .to_string(),
+                    });
+                }
+
                 let result = self.coordinator.create_multipart_upload(
                     &bucket,
                     &key,

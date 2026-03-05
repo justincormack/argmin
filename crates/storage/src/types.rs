@@ -216,10 +216,12 @@ impl ChecksumType {
     /// Return the default checksum type for a given algorithm.
     pub fn default_for(algo: ChecksumAlgorithm) -> Self {
         match algo {
+            // SHA: only COMPOSITE is supported
             ChecksumAlgorithm::Sha1 | ChecksumAlgorithm::Sha256 => Self::Composite,
-            ChecksumAlgorithm::Crc32 | ChecksumAlgorithm::Crc32c | ChecksumAlgorithm::Crc64nvme => {
-                Self::FullObject
-            }
+            // CRC32/CRC32C: default is COMPOSITE (FULL_OBJECT available but must be explicit)
+            ChecksumAlgorithm::Crc32 | ChecksumAlgorithm::Crc32c => Self::Composite,
+            // CRC64NVME: only FULL_OBJECT is supported (no composite)
+            ChecksumAlgorithm::Crc64nvme => Self::FullObject,
         }
     }
 }
@@ -583,11 +585,11 @@ mod tests {
         );
         assert_eq!(
             ChecksumType::default_for(ChecksumAlgorithm::Crc32),
-            ChecksumType::FullObject
+            ChecksumType::Composite
         );
         assert_eq!(
             ChecksumType::default_for(ChecksumAlgorithm::Crc32c),
-            ChecksumType::FullObject
+            ChecksumType::Composite
         );
         assert_eq!(
             ChecksumType::default_for(ChecksumAlgorithm::Crc64nvme),
