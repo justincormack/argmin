@@ -539,6 +539,37 @@ fn test_unsigned_chunked_put() {
 }
 
 #[test]
+fn test_unsigned_chunked_legacy_token_rejected() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let data = b"hello from unsigned chunked legacy token";
+        let path = format!("/{}/unsigned-chunked-legacy-rejected", bucket);
+        let content_sha256 = "STREAMING-UNSIGNED-PAYLOAD";
+
+        let sign = sign_streaming_request("PUT", &path, content_sha256, data.len(), &[]);
+        let wire = build_unsigned_chunked_body(data);
+
+        let url = format!("{}{}", CTX.endpoint(), path);
+        let mut resp = agent()
+            .put(&url)
+            .header("Authorization", &sign.authorization)
+            .header("x-amz-date", &sign.amz_date)
+            .header("x-amz-content-sha256", content_sha256)
+            .header("content-encoding", "aws-chunked")
+            .header("x-amz-decoded-content-length", &data.len().to_string())
+            .header("content-length", &wire.len().to_string())
+            .send(&wire[..])
+            .expect("transport error");
+        let status = resp.status().as_u16();
+        let body_str = resp.body_mut().read_to_string().unwrap_or_default();
+        assert_eq!(status, 400, "expected 400, got {}: {}", status, body_str);
+        assert_error_code(&body_str, "InvalidArgument");
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
 fn test_signed_chunked_put() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;
