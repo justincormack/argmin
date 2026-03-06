@@ -1281,6 +1281,52 @@ impl Coordinator {
         Ok(())
     }
 
+    /// Scavenge abandoned streaming upload sessions across all PGs.
+    ///
+    /// Aborts any session older than `max_age_ms` milliseconds. Intended to
+    /// be called at startup and periodically to clean up sessions left behind
+    /// by crashed processes.
+    ///
+    /// Returns the number of sessions scavenged.
+    pub fn scavenge_stale_sessions(&self, max_age_ms: u64) -> usize {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let cutoff = now.saturating_sub(max_age_ms);
+        let mut count = 0;
+
+        for pg_id in 0..self.pg_count {
+            let pg = match self.storage_node.get_pg(pg_id) {
+                Ok(pg) => pg,
+                Err(_) => continue,
+            };
+
+            let sessions = match pg.list_all_stream_uploads() {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+
+            // Drop the PG lock before aborting — abort_stream_put acquires
+            // its own locks in the correct order.
+            drop(pg);
+
+            for session in sessions {
+                if session.created_at < cutoff {
+                    if self.abort_stream_put(
+                        &session.bucket,
+                        &session.key,
+                        &session.session_id,
+                    ).is_ok() {
+                        count += 1;
+                    }
+                }
+            }
+        }
+
+        count
+    }
+
     /// Copy an object from one location to another.
     ///
     /// Supports conditional headers on both source and destination,
@@ -9326,5 +9372,252 @@ mod tests {
             matches!(err, ServerError::InvalidRequest { .. }),
             "expected InvalidRequest for wrong op_kind, got {err:?}"
         );
+    }
+
+    // ── Phase 5: Cleanup hardening tests ────────────────────────────
+
+    #[test]
+    fn scavenge_stale_sessions_cleans_old() {
+        let dir = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        // Begin a session (creates with current timestamp).
+        let session_id = coord.begin_stream_put("bucket", "key").unwrap();
+        coord
+            .append_stream_chunk("bucket", "key", &session_id, 0, b"data")
+            .unwrap();
+
+        // Scavenge with a very large max_age so all sessions created "now" are stale.
+        // We pass max_age = u64::MAX which makes cutoff = now.saturating_sub(MAX) = 0,
+        // meaning all sessions with created_at > 0 would NOT be stale. Instead, use
+        // a generous window: any session older than 1ms is stale.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let count = coord.scavenge_stale_sessions(1);
+        assert_eq!(count, 1);
+
+        // Session should be gone — appending should fail.
+        let err = coord
+            .append_stream_chunk("bucket", "key", &session_id, 1, b"more")
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ServerError::Metadata(storage::MetadataError::StreamSessionNotFound { .. })
+            ),
+            "expected session not found after scavenge, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn scavenge_does_not_affect_committed_objects() {
+        // A committed (finalized) session should have no staging rows, so
+        // scavenge should not affect the object or its chunk manifest.
+        let dir = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let session_id = coord.begin_stream_put("bucket", "key").unwrap();
+        coord
+            .append_stream_chunk("bucket", "key", &session_id, 0, b"safe-data")
+            .unwrap();
+        let crc = crc64::checksum(b"safe-data");
+        coord
+            .finalize_stream_put(
+                "bucket",
+                "key",
+                &session_id,
+                crc,
+                9,
+                &MetadataBlob::new(),
+                &WriteCondition::default(),
+            )
+            .unwrap();
+
+        // Scavenge with max_age=0 — should find nothing to clean.
+        let count = coord.scavenge_stale_sessions(0);
+        assert_eq!(count, 0);
+
+        // Object should still be readable.
+        let result = coord.get_object("bucket", "key", None, NO_READ).unwrap();
+        assert_eq!(result.data, b"safe-data");
+    }
+
+    #[test]
+    fn object_not_visible_before_finalize() {
+        // Atomic visibility: object is not readable before finalize.
+        let dir = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let session_id = coord.begin_stream_put("bucket", "new-key").unwrap();
+        coord
+            .append_stream_chunk("bucket", "new-key", &session_id, 0, b"pending")
+            .unwrap();
+
+        // Key should not exist yet.
+        let err = coord
+            .get_object("bucket", "new-key", None, NO_READ)
+            .unwrap_err();
+        assert!(matches!(err, ServerError::ObjectNotFound { .. }));
+
+        // HEAD should also fail.
+        let err = coord
+            .head_object("bucket", "new-key", None, NO_READ)
+            .unwrap_err();
+        assert!(matches!(err, ServerError::ObjectNotFound { .. }));
+    }
+
+    #[test]
+    fn chunk_manifest_integrity_readback() {
+        // Storage-level verification: committed chunk manifest rows match
+        // what was written, and shard data is intact.
+        let dir = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let session_id = coord.begin_stream_put("bucket", "verify").unwrap();
+        coord
+            .append_stream_chunk("bucket", "verify", &session_id, 0, b"chunk-0-")
+            .unwrap();
+        coord
+            .append_stream_chunk("bucket", "verify", &session_id, 1, b"chunk-1-")
+            .unwrap();
+        let full = b"chunk-0-chunk-1-";
+        let crc = crc64::checksum(full);
+        coord
+            .finalize_stream_put(
+                "bucket",
+                "verify",
+                &session_id,
+                crc,
+                16,
+                &MetadataBlob::new(),
+                &WriteCondition::default(),
+            )
+            .unwrap();
+
+        // Read back via storage layer directly.
+        let meta_pg_id = crate::pg::derive_pg("bucket", "verify", coord.pg_count);
+        {
+            let meta_pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
+            let record = meta_pg.get_object_meta("bucket", "verify").unwrap();
+            let chunks = meta_pg
+                .get_stream_object_chunks("bucket", "verify", record.version_id)
+                .unwrap();
+
+            assert_eq!(chunks.len(), 2);
+            assert_eq!(chunks[0].chunk_index, 0);
+            assert_eq!(chunks[0].size, 8);
+            assert_eq!(chunks[1].chunk_index, 1);
+            assert_eq!(chunks[1].size, 8);
+        } // Drop PG lock before coordinator calls.
+
+        // Verify full readback via coordinator.
+        let result = coord
+            .get_object("bucket", "verify", None, NO_READ)
+            .unwrap();
+        assert_eq!(result.data, full);
+
+        // Verify CRC matches.
+        assert_eq!(crc64::checksum(&result.data), crc);
+    }
+
+    #[test]
+    fn stream_put_delete_then_reput() {
+        // Overwrite cycle: stream-put → delete → normal put → GET succeeds.
+        let dir = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        // 1. Stream-write.
+        let session_id = coord.begin_stream_put("bucket", "cycle").unwrap();
+        coord
+            .append_stream_chunk("bucket", "cycle", &session_id, 0, b"v1")
+            .unwrap();
+        let crc = crc64::checksum(b"v1");
+        coord
+            .finalize_stream_put(
+                "bucket",
+                "cycle",
+                &session_id,
+                crc,
+                2,
+                &MetadataBlob::new(),
+                &WriteCondition::default(),
+            )
+            .unwrap();
+
+        // 2. Delete.
+        coord
+            .delete_object(
+                "bucket",
+                "cycle",
+                None,
+                &crate::conditional::DeleteCondition::default(),
+            )
+            .unwrap();
+
+        // 3. Normal put.
+        coord
+            .put_object(
+                "bucket",
+                "cycle",
+                b"v2-normal",
+                &[],
+                &WriteCondition::default(),
+            )
+            .unwrap();
+
+        // 4. GET should return normal-put data, no chunk manifest interference.
+        let result = coord
+            .get_object("bucket", "cycle", None, NO_READ)
+            .unwrap();
+        assert_eq!(result.data, b"v2-normal");
+    }
+
+    #[test]
+    fn stream_put_overwrite_with_stream_put() {
+        // Stream-write → stream-write overwrite: second write's chunks replace first.
+        let dir = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        // First stream-write.
+        let s1 = coord.begin_stream_put("bucket", "key").unwrap();
+        coord
+            .append_stream_chunk("bucket", "key", &s1, 0, b"old-data")
+            .unwrap();
+        coord
+            .finalize_stream_put(
+                "bucket",
+                "key",
+                &s1,
+                crc64::checksum(b"old-data"),
+                8,
+                &MetadataBlob::new(),
+                &WriteCondition::default(),
+            )
+            .unwrap();
+
+        // Second stream-write (overwrite).
+        let s2 = coord.begin_stream_put("bucket", "key").unwrap();
+        coord
+            .append_stream_chunk("bucket", "key", &s2, 0, b"new-data")
+            .unwrap();
+        coord
+            .finalize_stream_put(
+                "bucket",
+                "key",
+                &s2,
+                crc64::checksum(b"new-data"),
+                8,
+                &MetadataBlob::new(),
+                &WriteCondition::default(),
+            )
+            .unwrap();
+
+        let result = coord.get_object("bucket", "key", None, NO_READ).unwrap();
+        assert_eq!(result.data, b"new-data");
     }
 }

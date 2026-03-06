@@ -531,6 +531,10 @@ impl PgMetadataStore for MemoryPgStore {
         })
     }
 
+    fn list_all_stream_uploads(&self) -> Result<Vec<StreamUploadRecord>, MetadataError> {
+        Ok(vec![])
+    }
+
     fn append_stream_chunk(&self, _chunk: &StreamUploadChunkRecord) -> Result<(), MetadataError> {
         Err(MetadataError::NotImplemented {
             context: "streaming uploads (pending Phase 2)",

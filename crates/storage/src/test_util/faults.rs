@@ -397,6 +397,10 @@ impl PgMetadataStore for FaultyPgStore {
         self.inner.delete_stream_upload(session_id)
     }
 
+    fn list_all_stream_uploads(&self) -> Result<Vec<StreamUploadRecord>, MetadataError> {
+        self.inner.list_all_stream_uploads()
+    }
+
     fn append_stream_chunk(&self, chunk: &StreamUploadChunkRecord) -> Result<(), MetadataError> {
         self.inner.append_stream_chunk(chunk)
     }

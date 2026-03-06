@@ -1731,6 +1731,54 @@ impl PgMetadataStore for PgStore {
         Ok(())
     }
 
+    fn list_all_stream_uploads(&self) -> Result<Vec<StreamUploadRecord>, MetadataError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT session_id, bucket, key, op_kind, upload_id, part_number, state, \
+                 created_at FROM stream_uploads",
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "list all stream uploads (prepare)",
+                source: e,
+            })?;
+        let rows = stmt
+            .query_map([], |row| {
+                let op_kind_raw: u8 = row.get(3)?;
+                let state_raw: u8 = row.get(6)?;
+                Ok(StreamUploadRecord {
+                    session_id: row.get(0)?,
+                    bucket: row.get(1)?,
+                    key: row.get(2)?,
+                    op_kind: StreamUploadKind::from_u8(op_kind_raw).ok_or_else(|| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            3,
+                            rusqlite::types::Type::Integer,
+                            Box::from(format!("invalid op_kind: {op_kind_raw}")),
+                        )
+                    })?,
+                    upload_id: row.get(4)?,
+                    part_number: row.get::<_, Option<i64>>(5)?.map(|n| n as u32),
+                    state: StreamUploadState::from_u8(state_raw).ok_or_else(|| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            6,
+                            rusqlite::types::Type::Integer,
+                            Box::from(format!("invalid stream state: {state_raw}")),
+                        )
+                    })?,
+                    created_at: row.get::<_, i64>(7)? as u64,
+                })
+            })
+            .map_err(|e| MetadataError::Db {
+                context: "list all stream uploads (query)",
+                source: e,
+            })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| MetadataError::Db {
+            context: "list all stream uploads (collect)",
+            source: e,
+        })
+    }
+
     fn append_stream_chunk(&self, chunk: &StreamUploadChunkRecord) -> Result<(), MetadataError> {
         self.conn
             .execute(

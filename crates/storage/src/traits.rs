@@ -204,6 +204,11 @@ pub trait PgMetadataStore {
     /// Delete a streaming upload session and its staging chunks (CASCADE).
     fn delete_stream_upload(&self, session_id: &str) -> Result<(), MetadataError>;
 
+    /// List all streaming upload sessions on this PG.
+    ///
+    /// Used by the startup scavenger to find abandoned sessions.
+    fn list_all_stream_uploads(&self) -> Result<Vec<StreamUploadRecord>, MetadataError>;
+
     /// Append a staging chunk record to an in-progress streaming session.
     fn append_stream_chunk(&self, chunk: &StreamUploadChunkRecord) -> Result<(), MetadataError>;
 
