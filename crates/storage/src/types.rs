@@ -136,7 +136,7 @@ impl ChecksumAlgorithm {
 
     /// Parse from an S3 API header value. Only accepts the canonical
     /// uppercase form (`SHA256`, `CRC32`, `CRC32C`, `SHA1`, `CRC64NVME`).
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "CRC32" => Some(Self::Crc32),
             "CRC32C" => Some(Self::Crc32c),
@@ -198,7 +198,7 @@ impl ChecksumType {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "COMPOSITE" => Some(Self::Composite),
             "FULL_OBJECT" => Some(Self::FullObject),
@@ -533,21 +533,21 @@ mod tests {
     #[test]
     fn checksum_algorithm_from_str() {
         assert_eq!(
-            ChecksumAlgorithm::from_str("SHA256"),
+            ChecksumAlgorithm::parse("SHA256"),
             Some(ChecksumAlgorithm::Sha256)
         );
         assert_eq!(
-            ChecksumAlgorithm::from_str("CRC64NVME"),
+            ChecksumAlgorithm::parse("CRC64NVME"),
             Some(ChecksumAlgorithm::Crc64nvme)
         );
-        assert_eq!(ChecksumAlgorithm::from_str("bogus"), None);
+        assert_eq!(ChecksumAlgorithm::parse("bogus"), None);
     }
 
     #[test]
     fn checksum_algorithm_as_str_round_trip() {
         for v in 0..=4u8 {
             let algo = ChecksumAlgorithm::from_u8(v).unwrap();
-            assert_eq!(ChecksumAlgorithm::from_str(algo.as_str()), Some(algo));
+            assert_eq!(ChecksumAlgorithm::parse(algo.as_str()), Some(algo));
         }
     }
 
@@ -563,14 +563,14 @@ mod tests {
     #[test]
     fn checksum_type_from_str() {
         assert_eq!(
-            ChecksumType::from_str("COMPOSITE"),
+            ChecksumType::parse("COMPOSITE"),
             Some(ChecksumType::Composite)
         );
         assert_eq!(
-            ChecksumType::from_str("FULL_OBJECT"),
+            ChecksumType::parse("FULL_OBJECT"),
             Some(ChecksumType::FullObject)
         );
-        assert_eq!(ChecksumType::from_str("bogus"), None);
+        assert_eq!(ChecksumType::parse("bogus"), None);
     }
 
     #[test]

@@ -664,7 +664,7 @@ impl HttpFrontend {
                         });
                     }
                 }
-                let want_parts = requested.iter().any(|&a| a == "ObjectParts");
+                let want_parts = requested.contains(&"ObjectParts");
                 let max_parts: u32 = match req.headers.iter().find(|(k, _)| k == "x-amz-max-parts")
                 {
                     None => 1000,
@@ -703,7 +703,7 @@ impl HttpFrontend {
                 let obj_checksum_algo = result
                     .metadata
                     .get("x-amz-checksum-algorithm")
-                    .and_then(ChecksumAlgorithm::from_str);
+                    .and_then(ChecksumAlgorithm::parse);
                 let body_xml = xml::get_object_attributes_xml(
                     &requested,
                     &result.etag,
@@ -937,7 +937,7 @@ impl HttpFrontend {
                 // Parse optional checksum algorithm/type headers.
                 let checksum_algorithm = match req.header("x-amz-checksum-algorithm") {
                     None => None,
-                    Some(v) => Some(ChecksumAlgorithm::from_str(v).ok_or_else(|| {
+                    Some(v) => Some(ChecksumAlgorithm::parse(v).ok_or_else(|| {
                         ServerError::InvalidArgument {
                             reason: format!("unsupported checksum algorithm: {v}"),
                         }
@@ -945,7 +945,7 @@ impl HttpFrontend {
                 };
                 let checksum_type = match req.header("x-amz-checksum-type") {
                     None => None,
-                    Some(v) => Some(ChecksumType::from_str(v).ok_or_else(|| {
+                    Some(v) => Some(ChecksumType::parse(v).ok_or_else(|| {
                         ServerError::InvalidArgument {
                             reason: format!("unsupported checksum type: {v}"),
                         }
@@ -1810,7 +1810,7 @@ fn extract_checksum_header(
                 }
             }
             // CHECKSUM_HEADERS uses known-good algo names.
-            let algo = ChecksumAlgorithm::from_str(algo_name).unwrap();
+            let algo = ChecksumAlgorithm::parse(algo_name).unwrap();
             found = Some((algo, claimed.to_string()));
         }
     }
@@ -3030,7 +3030,7 @@ mod tests {
             let mut headers = Vec::new();
             let mut checksum_b64 = None;
             if let Some(a) = algo {
-                let algo_enum = storage::ChecksumAlgorithm::from_str(a).unwrap();
+                let algo_enum = storage::ChecksumAlgorithm::parse(a).unwrap();
                 let raw: Vec<u8> = match algo_enum {
                     storage::ChecksumAlgorithm::Crc32 => {
                         checksum::crc32::checksum(data).to_be_bytes().to_vec()
@@ -3070,7 +3070,7 @@ mod tests {
                 "<Part><PartNumber>{pn}</PartNumber><ETag>{etag}</ETag>"
             ));
             if let (Some(a), Some(val)) = (algo, cksum) {
-                let algo_enum = storage::ChecksumAlgorithm::from_str(a).unwrap();
+                let algo_enum = storage::ChecksumAlgorithm::parse(a).unwrap();
                 let elem = algo_enum.xml_element_name();
                 xml_parts.push_str(&format!("<{elem}>{val}</{elem}>"));
             }

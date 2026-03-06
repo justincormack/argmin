@@ -1733,7 +1733,7 @@ impl Coordinator {
                 // Look up algorithm from object metadata
                 metadata
                     .get("x-amz-checksum-algorithm")
-                    .and_then(ChecksumAlgorithm::from_str)
+                    .and_then(ChecksumAlgorithm::parse)
                     .map(|algo| {
                         let b64 = base64::engine::general_purpose::STANDARD.encode(raw);
                         (algo.header_name().to_string(), b64)
@@ -1855,7 +1855,7 @@ impl Coordinator {
                 use base64::Engine;
                 metadata
                     .get("x-amz-checksum-algorithm")
-                    .and_then(ChecksumAlgorithm::from_str)
+                    .and_then(ChecksumAlgorithm::parse)
                     .map(|algo| {
                         let b64 = base64::engine::general_purpose::STANDARD.encode(raw);
                         (algo.header_name().to_string(), b64)
@@ -1996,6 +1996,7 @@ impl Coordinator {
 
     /// Retrieve object attributes, optionally including multipart ObjectParts
     /// with pagination support.
+    #[allow(clippy::too_many_arguments)]
     pub fn get_object_attributes(
         &self,
         bucket: &str,
@@ -3460,7 +3461,7 @@ impl Coordinator {
             etag: etag_str,
             version_id,
             checksum_algorithm: checksum_algo,
-            checksum_type: checksum_type,
+            checksum_type,
             checksum_value,
         })
     }
