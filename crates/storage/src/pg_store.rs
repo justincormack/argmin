@@ -22,6 +22,10 @@ use crate::schema::init_pg_schema;
 use crate::traits::{PgMetadataStore, ShardStore};
 use crate::types::*;
 
+/// Part chunk rows use version_id = 0 during staging (pre-CompleteMultipartUpload).
+/// The real version_id is assigned at finalization time.
+const PART_CHUNK_STAGING_VERSION_ID: u64 = 0;
+
 /// Per-PG store combining shard file I/O with SQLite metadata.
 pub struct PgStore {
     pg_id: u32,
@@ -135,6 +139,18 @@ impl PgStore {
             ec_m: row.get::<_, u8>(9)?,
             last_modified: row.get::<_, i64>(10)? as u64,
             checksum: row.get(11)?,
+        })
+    }
+
+    /// Parse a 16-byte blob into a fixed-size array, returning a typed DB error
+    /// instead of panicking if the length is wrong.
+    fn parse_okh_blob(blob: &[u8], col_idx: usize) -> Result<[u8; 16], rusqlite::Error> {
+        blob.try_into().map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                col_idx,
+                rusqlite::types::Type::Blob,
+                Box::from(format!("expected 16-byte chunk_okh, got {}", blob.len())),
+            )
         })
     }
 
@@ -1595,6 +1611,747 @@ impl PgMetadataStore for PgStore {
                 })
             }
         }
+    }
+    // ── Streaming upload session methods ──────────────────────────────
+
+    fn create_stream_upload(&self, req: &CreateStreamUploadReq) -> Result<(), MetadataError> {
+        let now = PgStore::now_millis();
+        self.conn
+            .execute(
+                "INSERT INTO stream_uploads \
+                 (session_id, bucket, key, op_kind, upload_id, part_number, state, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
+                params![
+                    req.session_id,
+                    req.bucket,
+                    req.key,
+                    req.op_kind as u8,
+                    req.upload_id,
+                    req.part_number.map(|n| n as i64),
+                    now as i64,
+                ],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "create stream upload",
+                source: e,
+            })?;
+        Ok(())
+    }
+
+    fn get_stream_upload(&self, session_id: &str) -> Result<StreamUploadRecord, MetadataError> {
+        self.conn
+            .query_row(
+                "SELECT session_id, bucket, key, op_kind, upload_id, part_number, state, \
+                 created_at FROM stream_uploads WHERE session_id = ?1",
+                params![session_id],
+                |row| {
+                    let op_kind_raw: u8 = row.get(3)?;
+                    let state_raw: u8 = row.get(6)?;
+                    Ok(StreamUploadRecord {
+                        session_id: row.get(0)?,
+                        bucket: row.get(1)?,
+                        key: row.get(2)?,
+                        op_kind: StreamUploadKind::from_u8(op_kind_raw).ok_or_else(|| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                3,
+                                rusqlite::types::Type::Integer,
+                                Box::from(format!("invalid op_kind: {op_kind_raw}")),
+                            )
+                        })?,
+                        upload_id: row.get(4)?,
+                        part_number: row.get::<_, Option<i64>>(5)?.map(|n| n as u32),
+                        state: StreamUploadState::from_u8(state_raw).ok_or_else(|| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                6,
+                                rusqlite::types::Type::Integer,
+                                Box::from(format!("invalid stream state: {state_raw}")),
+                            )
+                        })?,
+                        created_at: row.get::<_, i64>(7)? as u64,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| MetadataError::Db {
+                context: "get stream upload",
+                source: e,
+            })?
+            .ok_or_else(|| MetadataError::StreamSessionNotFound {
+                session_id: session_id.to_string(),
+            })
+    }
+
+    fn set_stream_upload_state(
+        &self,
+        session_id: &str,
+        new_state: StreamUploadState,
+    ) -> Result<(), MetadataError> {
+        let current: u8 = self
+            .conn
+            .query_row(
+                "SELECT state FROM stream_uploads WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| MetadataError::Db {
+                context: "get stream upload state",
+                source: e,
+            })?
+            .ok_or_else(|| MetadataError::StreamSessionNotFound {
+                session_id: session_id.to_string(),
+            })?;
+
+        if current != StreamUploadState::InProgress as u8 {
+            return Err(MetadataError::StreamSessionNotInProgress { state: current });
+        }
+
+        self.conn
+            .execute(
+                "UPDATE stream_uploads SET state = ?1 WHERE session_id = ?2",
+                params![new_state as u8, session_id],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "set stream upload state",
+                source: e,
+            })?;
+        Ok(())
+    }
+
+    fn delete_stream_upload(&self, session_id: &str) -> Result<(), MetadataError> {
+        self.conn
+            .execute(
+                "DELETE FROM stream_uploads WHERE session_id = ?1",
+                params![session_id],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "delete stream upload",
+                source: e,
+            })?;
+        Ok(())
+    }
+
+    fn append_stream_chunk(&self, chunk: &StreamUploadChunkRecord) -> Result<(), MetadataError> {
+        self.conn
+            .execute(
+                "INSERT INTO stream_upload_chunks \
+                 (session_id, chunk_index, size, chunk_okh, chunk_vid, shard_pg_id, ec_k, ec_m) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    chunk.session_id,
+                    chunk.chunk_index,
+                    chunk.size as i64,
+                    chunk.chunk_okh.as_slice(),
+                    chunk.chunk_vid as i64,
+                    chunk.shard_pg_id,
+                    chunk.ec_k,
+                    chunk.ec_m,
+                ],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "append stream chunk",
+                source: e,
+            })?;
+        Ok(())
+    }
+
+    fn list_stream_chunks(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<StreamUploadChunkRecord>, MetadataError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT session_id, chunk_index, size, chunk_okh, chunk_vid, shard_pg_id, \
+                 ec_k, ec_m FROM stream_upload_chunks \
+                 WHERE session_id = ?1 ORDER BY chunk_index ASC",
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "prepare list stream chunks",
+                source: e,
+            })?;
+
+        let rows = stmt
+            .query_map(params![session_id], |row| {
+                let okh_blob: Vec<u8> = row.get(3)?;
+                let okh = PgStore::parse_okh_blob(&okh_blob, 3)?;
+                Ok(StreamUploadChunkRecord {
+                    session_id: row.get(0)?,
+                    chunk_index: row.get(1)?,
+                    size: row.get::<_, i64>(2)? as u64,
+                    chunk_okh: okh,
+                    chunk_vid: row.get::<_, i64>(4)? as u64,
+                    shard_pg_id: row.get(5)?,
+                    ec_k: row.get(6)?,
+                    ec_m: row.get(7)?,
+                })
+            })
+            .map_err(|e| MetadataError::Db {
+                context: "list stream chunks",
+                source: e,
+            })?;
+
+        let mut chunks = Vec::new();
+        for row in rows {
+            chunks.push(row.map_err(|e| MetadataError::Db {
+                context: "list stream chunks row",
+                source: e,
+            })?);
+        }
+        Ok(chunks)
+    }
+
+    fn commit_stream_put(
+        &self,
+        session_id: &str,
+        obj: &PutObjectMetaReq,
+        chunks: &[StreamObjectChunkRecord],
+    ) -> Result<(), MetadataError> {
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| MetadataError::Db {
+                context: "commit stream put (begin txn)",
+                source: e,
+            })?;
+
+        let result: Result<(), MetadataError> = (|| {
+            // 1. Verify session exists, is InProgress, is PutObject kind, and matches
+            //    the target bucket/key. Then transition to Completing.
+            let row: Option<(u8, u8, String, String)> = self
+                .conn
+                .query_row(
+                    "SELECT state, op_kind, bucket, key FROM stream_uploads \
+                     WHERE session_id = ?1",
+                    params![session_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()
+                .map_err(|e| MetadataError::Db {
+                    context: "commit stream put (lookup session)",
+                    source: e,
+                })?;
+
+            let (current, op_kind, sess_bucket, sess_key) =
+                row.ok_or_else(|| MetadataError::StreamSessionNotFound {
+                    session_id: session_id.to_string(),
+                })?;
+
+            if current != StreamUploadState::InProgress as u8 {
+                return Err(MetadataError::StreamSessionNotInProgress { state: current });
+            }
+            if op_kind != StreamUploadKind::PutObject as u8
+                || sess_bucket != obj.bucket
+                || sess_key != obj.key
+            {
+                return Err(MetadataError::StreamSessionNotFound {
+                    session_id: session_id.to_string(),
+                });
+            }
+
+            self.conn
+                .execute(
+                    "UPDATE stream_uploads SET state = ?1 WHERE session_id = ?2",
+                    params![StreamUploadState::Completing as u8, session_id],
+                )
+                .map_err(|e| MetadataError::Db {
+                    context: "commit stream put (set completing)",
+                    source: e,
+                })?;
+
+            // 2. Write/overwrite object metadata row.
+            let now = PgStore::now_millis();
+            let data_layout = obj.data_layout.map(|dl| dl as u8).unwrap_or(0);
+            let parts_count = obj.parts_count.map(|n| n as i64);
+
+            let obj_sql = if obj.version_id == 0 {
+                "INSERT OR REPLACE INTO objects \
+                 (bucket, key, version_id, size, total_size, etag, etag_kind, last_modified, \
+                  storage_class, ec_k, ec_m, status, data_layout, parts_count, metadata_blob) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14)"
+            } else {
+                "INSERT INTO objects \
+                 (bucket, key, version_id, size, total_size, etag, etag_kind, last_modified, \
+                  storage_class, ec_k, ec_m, status, data_layout, parts_count, metadata_blob) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14)"
+            };
+            self.conn
+                .execute(
+                    obj_sql,
+                    params![
+                        obj.bucket,
+                        obj.key,
+                        obj.version_id as i64,
+                        obj.size as i64,
+                        obj.total_size as i64,
+                        obj.etag,
+                        obj.etag_kind,
+                        now as i64,
+                        obj.ec_k,
+                        obj.ec_m,
+                        obj.status,
+                        data_layout,
+                        parts_count,
+                        obj.metadata_blob,
+                    ],
+                )
+                .map_err(|e| MetadataError::Db {
+                    context: "commit stream put (write object)",
+                    source: e,
+                })?;
+
+            // 3. Delete any prior stream_object_chunks for this version.
+            self.conn
+                .execute(
+                    "DELETE FROM stream_object_chunks \
+                     WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
+                    params![obj.bucket, obj.key, obj.version_id as i64],
+                )
+                .map_err(|e| MetadataError::Db {
+                    context: "commit stream put (delete prior chunks)",
+                    source: e,
+                })?;
+
+            // 4. Insert committed chunk manifest rows.
+            {
+                let mut stmt = self
+                    .conn
+                    .prepare(
+                        "INSERT INTO stream_object_chunks \
+                         (bucket, key, version_id, chunk_index, size, chunk_okh, chunk_vid, \
+                          shard_pg_id, ec_k, ec_m) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    )
+                    .map_err(|e| MetadataError::Db {
+                        context: "commit stream put (prepare insert chunks)",
+                        source: e,
+                    })?;
+                for chunk in chunks {
+                    if chunk.bucket != obj.bucket
+                        || chunk.key != obj.key
+                        || chunk.version_id != obj.version_id
+                    {
+                        return Err(MetadataError::StreamSessionNotFound {
+                            session_id: session_id.to_string(),
+                        });
+                    }
+                    stmt.execute(params![
+                        chunk.bucket,
+                        chunk.key,
+                        chunk.version_id as i64,
+                        chunk.chunk_index,
+                        chunk.size as i64,
+                        chunk.chunk_okh.as_slice(),
+                        chunk.chunk_vid as i64,
+                        chunk.shard_pg_id,
+                        chunk.ec_k,
+                        chunk.ec_m,
+                    ])
+                    .map_err(|e| MetadataError::Db {
+                        context: "commit stream put (insert chunk)",
+                        source: e,
+                    })?;
+                }
+            }
+
+            // 5. Delete staging rows.
+            self.conn
+                .execute(
+                    "DELETE FROM stream_uploads WHERE session_id = ?1",
+                    params![session_id],
+                )
+                .map_err(|e| MetadataError::Db {
+                    context: "commit stream put (delete staging)",
+                    source: e,
+                })?;
+
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                if let Err(e) = self.conn.execute_batch("COMMIT") {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    return Err(MetadataError::Db {
+                        context: "commit stream put (commit txn)",
+                        source: e,
+                    });
+                }
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    fn commit_stream_part(
+        &self,
+        session_id: &str,
+        part: &MultipartPartRecord,
+        chunks: &[MultipartPartChunkRecord],
+    ) -> Result<(), MetadataError> {
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| MetadataError::Db {
+                context: "commit stream part (begin txn)",
+                source: e,
+            })?;
+
+        let result: Result<(), MetadataError> = (|| {
+            // 1. Verify session exists, is InProgress, is UploadPart kind, and matches
+            //    the target bucket/key/upload_id/part_number. Then transition to Completing.
+            let sess_row =
+                self.conn
+                    .query_row(
+                        "SELECT state, op_kind, bucket, key, upload_id, part_number \
+                     FROM stream_uploads WHERE session_id = ?1",
+                        params![session_id],
+                        |row| {
+                            Ok(StreamUploadRecord {
+                                session_id: session_id.to_string(),
+                                state: StreamUploadState::from_u8(row.get::<_, u8>(0)?)
+                                    .ok_or_else(|| {
+                                        rusqlite::Error::FromSqlConversionFailure(
+                                            0,
+                                            rusqlite::types::Type::Integer,
+                                            Box::from("invalid stream state"),
+                                        )
+                                    })?,
+                                op_kind: StreamUploadKind::from_u8(row.get::<_, u8>(1)?)
+                                    .ok_or_else(|| {
+                                        rusqlite::Error::FromSqlConversionFailure(
+                                            1,
+                                            rusqlite::types::Type::Integer,
+                                            Box::from("invalid op_kind"),
+                                        )
+                                    })?,
+                                bucket: row.get(2)?,
+                                key: row.get(3)?,
+                                upload_id: row.get(4)?,
+                                part_number: row.get::<_, Option<i64>>(5)?.map(|n| n as u32),
+                                created_at: 0,
+                            })
+                        },
+                    )
+                    .optional()
+                    .map_err(|e| MetadataError::Db {
+                        context: "commit stream part (lookup session)",
+                        source: e,
+                    })?
+                    .ok_or_else(|| MetadataError::StreamSessionNotFound {
+                        session_id: session_id.to_string(),
+                    })?;
+
+            if sess_row.state != StreamUploadState::InProgress {
+                return Err(MetadataError::StreamSessionNotInProgress {
+                    state: sess_row.state as u8,
+                });
+            }
+            // Validate session binding matches commit target.
+            if sess_row.op_kind != StreamUploadKind::UploadPart
+                || sess_row.upload_id.as_deref() != Some(&part.upload_id)
+                || sess_row.part_number != Some(part.part_number)
+            {
+                return Err(MetadataError::StreamSessionNotFound {
+                    session_id: session_id.to_string(),
+                });
+            }
+            let sess_bucket = sess_row.bucket;
+            let sess_key = sess_row.key;
+
+            self.conn
+                .execute(
+                    "UPDATE stream_uploads SET state = ?1 WHERE session_id = ?2",
+                    params![StreamUploadState::Completing as u8, session_id],
+                )
+                .map_err(|e| MetadataError::Db {
+                    context: "commit stream part (set completing)",
+                    source: e,
+                })?;
+
+            // 2. Upsert multipart part metadata.
+            let prev_gen: Option<u32> = self
+                .conn
+                .query_row(
+                    "SELECT generation FROM multipart_parts \
+                     WHERE upload_id = ?1 AND part_number = ?2",
+                    params![part.upload_id, part.part_number],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| MetadataError::Db {
+                    context: "commit stream part (read prev gen)",
+                    source: e,
+                })?;
+
+            let new_gen = prev_gen.map(|g| g + 1).unwrap_or(1);
+
+            self.conn
+                .execute(
+                    "INSERT OR REPLACE INTO multipart_parts \
+                     (upload_id, part_number, generation, size, etag, etag_kind, \
+                      part_okh, part_vid, ec_k, ec_m, last_modified, checksum) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    params![
+                        part.upload_id,
+                        part.part_number,
+                        new_gen,
+                        part.size as i64,
+                        part.etag,
+                        part.etag_kind,
+                        part.part_okh.as_slice(),
+                        part.part_vid as i64,
+                        part.ec_k,
+                        part.ec_m,
+                        part.last_modified as i64,
+                        part.checksum,
+                    ],
+                )
+                .map_err(|e| MetadataError::Db {
+                    context: "commit stream part (upsert part)",
+                    source: e,
+                })?;
+
+            // 3. Delete prior part chunks for this part number (re-upload support).
+            //    Uses session binding (already validated) so this runs even with
+            //    zero committed chunks.
+            self.conn
+                .execute(
+                    "DELETE FROM multipart_part_chunks \
+                     WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 \
+                     AND part_number = ?4",
+                    params![
+                        sess_bucket,
+                        sess_key,
+                        PART_CHUNK_STAGING_VERSION_ID as i64,
+                        part.part_number
+                    ],
+                )
+                .map_err(|e| MetadataError::Db {
+                    context: "commit stream part (delete prior chunks)",
+                    source: e,
+                })?;
+
+            // 4. Insert committed part chunk manifest rows.
+            {
+                let mut stmt = self
+                    .conn
+                    .prepare(
+                        "INSERT INTO multipart_part_chunks \
+                         (bucket, key, version_id, part_number, chunk_index, size, chunk_okh, \
+                          chunk_vid, shard_pg_id, ec_k, ec_m) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    )
+                    .map_err(|e| MetadataError::Db {
+                        context: "commit stream part (prepare insert chunks)",
+                        source: e,
+                    })?;
+                for chunk in chunks {
+                    if chunk.bucket != sess_bucket
+                        || chunk.key != sess_key
+                        || chunk.version_id != PART_CHUNK_STAGING_VERSION_ID
+                        || chunk.part_number != part.part_number
+                    {
+                        return Err(MetadataError::StreamSessionNotFound {
+                            session_id: session_id.to_string(),
+                        });
+                    }
+                    stmt.execute(params![
+                        chunk.bucket,
+                        chunk.key,
+                        chunk.version_id as i64,
+                        chunk.part_number,
+                        chunk.chunk_index,
+                        chunk.size as i64,
+                        chunk.chunk_okh.as_slice(),
+                        chunk.chunk_vid as i64,
+                        chunk.shard_pg_id,
+                        chunk.ec_k,
+                        chunk.ec_m,
+                    ])
+                    .map_err(|e| MetadataError::Db {
+                        context: "commit stream part (insert chunk)",
+                        source: e,
+                    })?;
+                }
+            }
+
+            // 5. Delete staging rows.
+            self.conn
+                .execute(
+                    "DELETE FROM stream_uploads WHERE session_id = ?1",
+                    params![session_id],
+                )
+                .map_err(|e| MetadataError::Db {
+                    context: "commit stream part (delete staging)",
+                    source: e,
+                })?;
+
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                if let Err(e) = self.conn.execute_batch("COMMIT") {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    return Err(MetadataError::Db {
+                        context: "commit stream part (commit txn)",
+                        source: e,
+                    });
+                }
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    fn get_stream_object_chunks(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: u64,
+    ) -> Result<Vec<StreamObjectChunkRecord>, MetadataError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT bucket, key, version_id, chunk_index, size, chunk_okh, chunk_vid, \
+                 shard_pg_id, ec_k, ec_m FROM stream_object_chunks \
+                 WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 \
+                 ORDER BY chunk_index ASC",
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "prepare get stream object chunks",
+                source: e,
+            })?;
+
+        let rows = stmt
+            .query_map(params![bucket, key, version_id as i64], |row| {
+                let okh_blob: Vec<u8> = row.get(5)?;
+                let okh = PgStore::parse_okh_blob(&okh_blob, 5)?;
+                Ok(StreamObjectChunkRecord {
+                    bucket: row.get(0)?,
+                    key: row.get(1)?,
+                    version_id: row.get::<_, i64>(2)? as u64,
+                    chunk_index: row.get(3)?,
+                    size: row.get::<_, i64>(4)? as u64,
+                    chunk_okh: okh,
+                    chunk_vid: row.get::<_, i64>(6)? as u64,
+                    shard_pg_id: row.get(7)?,
+                    ec_k: row.get(8)?,
+                    ec_m: row.get(9)?,
+                })
+            })
+            .map_err(|e| MetadataError::Db {
+                context: "get stream object chunks",
+                source: e,
+            })?;
+
+        let mut chunks = Vec::new();
+        for row in rows {
+            chunks.push(row.map_err(|e| MetadataError::Db {
+                context: "get stream object chunks row",
+                source: e,
+            })?);
+        }
+        Ok(chunks)
+    }
+
+    fn delete_stream_object_chunks(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: u64,
+    ) -> Result<(), MetadataError> {
+        self.conn
+            .execute(
+                "DELETE FROM stream_object_chunks \
+                 WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
+                params![bucket, key, version_id as i64],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "delete stream object chunks",
+                source: e,
+            })?;
+        Ok(())
+    }
+
+    fn get_multipart_part_chunks(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: u64,
+        part_number: u32,
+    ) -> Result<Vec<MultipartPartChunkRecord>, MetadataError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT bucket, key, version_id, part_number, chunk_index, size, chunk_okh, \
+                 chunk_vid, shard_pg_id, ec_k, ec_m FROM multipart_part_chunks \
+                 WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 AND part_number = ?4 \
+                 ORDER BY chunk_index ASC",
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "prepare get multipart part chunks",
+                source: e,
+            })?;
+
+        let rows = stmt
+            .query_map(
+                params![bucket, key, version_id as i64, part_number],
+                |row| {
+                    let okh_blob: Vec<u8> = row.get(6)?;
+                    let okh = PgStore::parse_okh_blob(&okh_blob, 6)?;
+                    Ok(MultipartPartChunkRecord {
+                        bucket: row.get(0)?,
+                        key: row.get(1)?,
+                        version_id: row.get::<_, i64>(2)? as u64,
+                        part_number: row.get(3)?,
+                        chunk_index: row.get(4)?,
+                        size: row.get::<_, i64>(5)? as u64,
+                        chunk_okh: okh,
+                        chunk_vid: row.get::<_, i64>(7)? as u64,
+                        shard_pg_id: row.get(8)?,
+                        ec_k: row.get(9)?,
+                        ec_m: row.get(10)?,
+                    })
+                },
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "get multipart part chunks",
+                source: e,
+            })?;
+
+        let mut chunks = Vec::new();
+        for row in rows {
+            chunks.push(row.map_err(|e| MetadataError::Db {
+                context: "get multipart part chunks row",
+                source: e,
+            })?);
+        }
+        Ok(chunks)
+    }
+
+    fn delete_multipart_part_chunks(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: u64,
+    ) -> Result<(), MetadataError> {
+        self.conn
+            .execute(
+                "DELETE FROM multipart_part_chunks \
+                 WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
+                params![bucket, key, version_id as i64],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "delete multipart part chunks",
+                source: e,
+            })?;
+        Ok(())
     }
 }
 

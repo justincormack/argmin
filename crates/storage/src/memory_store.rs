@@ -159,7 +159,7 @@ impl PgMetadataStore for MemoryPgStore {
             ec_m: req.ec_m,
             status: req.status,
             tags: None,
-            data_layout: req.data_layout.unwrap_or(DataLayout::InlineLegacy),
+            data_layout: req.data_layout.unwrap_or(DataLayout::ChunkManifestInternal),
             parts_count: req.parts_count,
             metadata_blob: req.metadata_blob.clone(),
         };
@@ -498,6 +498,118 @@ impl PgMetadataStore for MemoryPgStore {
     ) -> Result<(), MetadataError> {
         Err(MetadataError::NotImplemented {
             context: "multipart metadata (pending Step 3)",
+        })
+    }
+
+    // ── Streaming upload session methods (stubs) ─────────────────────
+
+    fn create_stream_upload(&self, _req: &CreateStreamUploadReq) -> Result<(), MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "streaming uploads (pending Phase 2)",
+        })
+    }
+
+    fn get_stream_upload(&self, _session_id: &str) -> Result<StreamUploadRecord, MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "streaming uploads (pending Phase 2)",
+        })
+    }
+
+    fn set_stream_upload_state(
+        &self,
+        _session_id: &str,
+        _new_state: StreamUploadState,
+    ) -> Result<(), MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "streaming uploads (pending Phase 2)",
+        })
+    }
+
+    fn delete_stream_upload(&self, _session_id: &str) -> Result<(), MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "streaming uploads (pending Phase 2)",
+        })
+    }
+
+    fn append_stream_chunk(&self, _chunk: &StreamUploadChunkRecord) -> Result<(), MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "streaming uploads (pending Phase 2)",
+        })
+    }
+
+    fn list_stream_chunks(
+        &self,
+        _session_id: &str,
+    ) -> Result<Vec<StreamUploadChunkRecord>, MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "streaming uploads (pending Phase 2)",
+        })
+    }
+
+    fn commit_stream_put(
+        &self,
+        _session_id: &str,
+        _obj: &PutObjectMetaReq,
+        _chunks: &[StreamObjectChunkRecord],
+    ) -> Result<(), MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "streaming uploads (pending Phase 2)",
+        })
+    }
+
+    fn commit_stream_part(
+        &self,
+        _session_id: &str,
+        _part: &MultipartPartRecord,
+        _chunks: &[MultipartPartChunkRecord],
+    ) -> Result<(), MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "streaming uploads (pending Phase 2)",
+        })
+    }
+
+    fn get_stream_object_chunks(
+        &self,
+        _bucket: &str,
+        _key: &str,
+        _version_id: u64,
+    ) -> Result<Vec<StreamObjectChunkRecord>, MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "streaming uploads (pending Phase 2)",
+        })
+    }
+
+    fn delete_stream_object_chunks(
+        &self,
+        _bucket: &str,
+        _key: &str,
+        _version_id: u64,
+    ) -> Result<(), MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "streaming uploads (pending Phase 2)",
+        })
+    }
+
+    fn get_multipart_part_chunks(
+        &self,
+        _bucket: &str,
+        _key: &str,
+        _version_id: u64,
+        _part_number: u32,
+    ) -> Result<Vec<MultipartPartChunkRecord>, MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "streaming uploads (pending Phase 2)",
+        })
+    }
+
+    fn delete_multipart_part_chunks(
+        &self,
+        _bucket: &str,
+        _key: &str,
+        _version_id: u64,
+    ) -> Result<(), MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "streaming uploads (pending Phase 2)",
         })
     }
 }

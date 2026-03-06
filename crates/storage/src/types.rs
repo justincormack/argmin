@@ -230,16 +230,16 @@ impl ChecksumType {
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataLayout {
-    /// Single contiguous payload (current model).
-    InlineLegacy = 0,
-    /// Composite manifest of independent parts.
+    /// Internal chunk manifest (normal PutObject writes).
+    ChunkManifestInternal = 0,
+    /// Composite manifest of independent parts (S3 multipart).
     MultipartManifest = 1,
 }
 
 impl DataLayout {
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
-            0 => Some(Self::InlineLegacy),
+            0 => Some(Self::ChunkManifestInternal),
             1 => Some(Self::MultipartManifest),
             _ => None,
         }
@@ -268,7 +268,7 @@ pub struct ObjectRecord {
     pub status: u8,
     /// Serialized tagging XML (None = no tags).
     pub tags: Option<String>,
-    /// Object data layout (InlineLegacy or MultipartManifest).
+    /// Object data layout (ChunkManifestInternal or MultipartManifest).
     pub data_layout: DataLayout,
     /// Number of parts (set for MultipartManifest objects).
     pub parts_count: Option<u32>,
@@ -310,7 +310,7 @@ pub struct PutObjectMetaReq {
     pub ec_m: u8,
     /// 0 = Live, 1 = DeleteMarker.
     pub status: u8,
-    /// Object data layout. None defaults to InlineLegacy (0).
+    /// Object data layout. None defaults to ChunkManifestInternal (0).
     pub data_layout: Option<DataLayout>,
     /// Number of parts (set for MultipartManifest objects).
     pub parts_count: Option<u32>,
@@ -474,6 +474,120 @@ pub struct ListPartsResp {
     pub next_part_number_marker: Option<u32>,
 }
 
+// ── Streaming upload types ─────────────────────────────────────────
+
+/// Streaming upload operation kind.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamUploadKind {
+    PutObject = 0,
+    UploadPart = 1,
+}
+
+impl StreamUploadKind {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::PutObject),
+            1 => Some(Self::UploadPart),
+            _ => None,
+        }
+    }
+}
+
+/// Streaming upload session state machine.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamUploadState {
+    InProgress = 0,
+    Completing = 1,
+    Completed = 2,
+    Aborted = 3,
+}
+
+impl StreamUploadState {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::InProgress),
+            1 => Some(Self::Completing),
+            2 => Some(Self::Completed),
+            3 => Some(Self::Aborted),
+            _ => None,
+        }
+    }
+}
+
+/// In-progress streaming upload session record.
+#[derive(Debug, Clone)]
+pub struct StreamUploadRecord {
+    pub session_id: String,
+    pub bucket: String,
+    pub key: String,
+    pub op_kind: StreamUploadKind,
+    /// For UploadPart: the multipart upload_id.
+    pub upload_id: Option<String>,
+    /// For UploadPart: the part number.
+    pub part_number: Option<u32>,
+    pub state: StreamUploadState,
+    pub created_at: u64,
+}
+
+/// Request to create a streaming upload session.
+pub struct CreateStreamUploadReq {
+    pub session_id: String,
+    pub bucket: String,
+    pub key: String,
+    pub op_kind: StreamUploadKind,
+    pub upload_id: Option<String>,
+    pub part_number: Option<u32>,
+}
+
+/// Staging chunk record for an in-progress streaming session.
+#[derive(Debug, Clone)]
+pub struct StreamUploadChunkRecord {
+    pub session_id: String,
+    pub chunk_index: u32,
+    pub size: u64,
+    /// 16-byte object key hash for shard keys.
+    pub chunk_okh: [u8; 16],
+    /// Version field for shard keys.
+    pub chunk_vid: u64,
+    /// PG where this chunk's shards are stored.
+    pub shard_pg_id: u32,
+    pub ec_k: u8,
+    pub ec_m: u8,
+}
+
+/// Committed chunk record for a normal PutObject.
+#[derive(Debug, Clone)]
+pub struct StreamObjectChunkRecord {
+    pub bucket: String,
+    pub key: String,
+    pub version_id: u64,
+    pub chunk_index: u32,
+    pub size: u64,
+    pub chunk_okh: [u8; 16],
+    pub chunk_vid: u64,
+    pub shard_pg_id: u32,
+    pub ec_k: u8,
+    pub ec_m: u8,
+}
+
+/// Committed chunk record for a multipart part.
+#[derive(Debug, Clone)]
+pub struct MultipartPartChunkRecord {
+    pub bucket: String,
+    pub key: String,
+    pub version_id: u64,
+    pub part_number: u32,
+    pub chunk_index: u32,
+    pub size: u64,
+    pub chunk_okh: [u8; 16],
+    pub chunk_vid: u64,
+    pub shard_pg_id: u32,
+    pub ec_k: u8,
+    pub ec_m: u8,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,8 +617,11 @@ mod tests {
     // ── DataLayout enum tests ──────────────────────────────────────
 
     #[test]
-    fn data_layout_from_u8_inline_legacy() {
-        assert_eq!(DataLayout::from_u8(0), Some(DataLayout::InlineLegacy));
+    fn data_layout_from_u8_chunk_manifest_internal() {
+        assert_eq!(
+            DataLayout::from_u8(0),
+            Some(DataLayout::ChunkManifestInternal)
+        );
     }
 
     #[test]
@@ -610,6 +727,54 @@ mod tests {
     fn upload_state_from_u8_invalid() {
         assert_eq!(UploadState::from_u8(3), None);
         assert_eq!(UploadState::from_u8(255), None);
+    }
+
+    // ── StreamUploadKind enum tests ──────────────────────────────────
+
+    #[test]
+    fn stream_upload_kind_from_u8_valid() {
+        assert_eq!(
+            StreamUploadKind::from_u8(0),
+            Some(StreamUploadKind::PutObject)
+        );
+        assert_eq!(
+            StreamUploadKind::from_u8(1),
+            Some(StreamUploadKind::UploadPart)
+        );
+    }
+
+    #[test]
+    fn stream_upload_kind_from_u8_invalid() {
+        assert_eq!(StreamUploadKind::from_u8(2), None);
+        assert_eq!(StreamUploadKind::from_u8(255), None);
+    }
+
+    // ── StreamUploadState enum tests ─────────────────────────────────
+
+    #[test]
+    fn stream_upload_state_from_u8_valid() {
+        assert_eq!(
+            StreamUploadState::from_u8(0),
+            Some(StreamUploadState::InProgress)
+        );
+        assert_eq!(
+            StreamUploadState::from_u8(1),
+            Some(StreamUploadState::Completing)
+        );
+        assert_eq!(
+            StreamUploadState::from_u8(2),
+            Some(StreamUploadState::Completed)
+        );
+        assert_eq!(
+            StreamUploadState::from_u8(3),
+            Some(StreamUploadState::Aborted)
+        );
+    }
+
+    #[test]
+    fn stream_upload_state_from_u8_invalid() {
+        assert_eq!(StreamUploadState::from_u8(4), None);
+        assert_eq!(StreamUploadState::from_u8(255), None);
     }
 
     #[test]

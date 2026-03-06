@@ -87,6 +87,67 @@ CREATE TABLE IF NOT EXISTS object_parts (
     PRIMARY KEY (bucket, key, version_id, part_number)
 )";
 
+/// In-progress streaming upload session table.
+const CREATE_STREAM_UPLOADS_TABLE: &str = "\
+CREATE TABLE IF NOT EXISTS stream_uploads (
+    session_id    TEXT PRIMARY KEY,
+    bucket        TEXT NOT NULL,
+    key           TEXT NOT NULL,
+    op_kind       INTEGER NOT NULL,
+    upload_id     TEXT,
+    part_number   INTEGER,
+    state         INTEGER NOT NULL DEFAULT 0,
+    created_at    INTEGER NOT NULL
+)";
+
+/// Staging chunk records for in-progress streaming sessions.
+const CREATE_STREAM_UPLOAD_CHUNKS_TABLE: &str = "\
+CREATE TABLE IF NOT EXISTS stream_upload_chunks (
+    session_id    TEXT NOT NULL,
+    chunk_index   INTEGER NOT NULL,
+    size          INTEGER NOT NULL,
+    chunk_okh     BLOB NOT NULL,
+    chunk_vid     INTEGER NOT NULL,
+    shard_pg_id   INTEGER NOT NULL,
+    ec_k          INTEGER NOT NULL,
+    ec_m          INTEGER NOT NULL,
+    PRIMARY KEY (session_id, chunk_index),
+    FOREIGN KEY (session_id) REFERENCES stream_uploads(session_id) ON DELETE CASCADE
+)";
+
+/// Committed chunk manifest for normal PutObject.
+const CREATE_STREAM_OBJECT_CHUNKS_TABLE: &str = "\
+CREATE TABLE IF NOT EXISTS stream_object_chunks (
+    bucket        TEXT NOT NULL,
+    key           TEXT NOT NULL,
+    version_id    INTEGER NOT NULL,
+    chunk_index   INTEGER NOT NULL,
+    size          INTEGER NOT NULL,
+    chunk_okh     BLOB NOT NULL,
+    chunk_vid     INTEGER NOT NULL,
+    shard_pg_id   INTEGER NOT NULL,
+    ec_k          INTEGER NOT NULL,
+    ec_m          INTEGER NOT NULL,
+    PRIMARY KEY (bucket, key, version_id, chunk_index)
+)";
+
+/// Committed chunk manifest for multipart parts.
+const CREATE_MULTIPART_PART_CHUNKS_TABLE: &str = "\
+CREATE TABLE IF NOT EXISTS multipart_part_chunks (
+    bucket        TEXT NOT NULL,
+    key           TEXT NOT NULL,
+    version_id    INTEGER NOT NULL,
+    part_number   INTEGER NOT NULL,
+    chunk_index   INTEGER NOT NULL,
+    size          INTEGER NOT NULL,
+    chunk_okh     BLOB NOT NULL,
+    chunk_vid     INTEGER NOT NULL,
+    shard_pg_id   INTEGER NOT NULL,
+    ec_k          INTEGER NOT NULL,
+    ec_m          INTEGER NOT NULL,
+    PRIMARY KEY (bucket, key, version_id, part_number, chunk_index)
+)";
+
 /// Index for list operations: bucket + key ordering.
 const CREATE_OBJECTS_LIST_INDEX: &str = "\
 CREATE INDEX IF NOT EXISTS idx_objects_list ON objects (bucket, key)";
@@ -137,6 +198,10 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(CREATE_MPU_BUCKET_KEY_INDEX, [])?;
     conn.execute(CREATE_MULTIPART_PARTS_TABLE, [])?;
     conn.execute(CREATE_OBJECT_PARTS_TABLE, [])?;
+    conn.execute(CREATE_STREAM_UPLOADS_TABLE, [])?;
+    conn.execute(CREATE_STREAM_UPLOAD_CHUNKS_TABLE, [])?;
+    conn.execute(CREATE_STREAM_OBJECT_CHUNKS_TABLE, [])?;
+    conn.execute(CREATE_MULTIPART_PART_CHUNKS_TABLE, [])?;
     migrate_checksum_columns(conn)?;
     Ok(())
 }

@@ -477,7 +477,7 @@ fn file_metadata_object_has_inline_legacy_layout() {
         .unwrap();
 
     let obj = store.get_object_meta("b", "k").unwrap();
-    assert_eq!(obj.data_layout, DataLayout::InlineLegacy);
+    assert_eq!(obj.data_layout, DataLayout::ChunkManifestInternal);
     assert_eq!(obj.parts_count, None);
     assert_eq!(obj.metadata_blob, None);
 }
@@ -514,7 +514,7 @@ fn file_metadata_invalid_data_layout_returns_error() {
         )
         .unwrap();
 
-    // Reading should fail, not silently default to InlineLegacy
+    // Reading should fail, not silently default to ChunkManifestInternal
     let err = store.get_object_meta("b", "k").unwrap_err();
     assert!(
         matches!(err, crate::error::MetadataError::Db { .. }),
@@ -2265,4 +2265,1145 @@ mod prop_tests {
             prop_assert_eq!(got, expected);
         }
     }
+}
+
+// ── Streaming upload session tests (PgStore) ─────────────────────────
+
+#[test]
+fn stream_upload_create_get_delete() {
+    let (_dir, store) = make_pg_store();
+
+    store
+        .create_stream_upload(&CreateStreamUploadReq {
+            session_id: "sess-1".to_string(),
+            bucket: "b".to_string(),
+            key: "k".to_string(),
+            op_kind: StreamUploadKind::PutObject,
+            upload_id: None,
+            part_number: None,
+        })
+        .unwrap();
+
+    let rec = store.get_stream_upload("sess-1").unwrap();
+    assert_eq!(rec.session_id, "sess-1");
+    assert_eq!(rec.bucket, "b");
+    assert_eq!(rec.key, "k");
+    assert_eq!(rec.op_kind, StreamUploadKind::PutObject);
+    assert_eq!(rec.state, StreamUploadState::InProgress);
+    assert!(rec.upload_id.is_none());
+    assert!(rec.part_number.is_none());
+
+    store.delete_stream_upload("sess-1").unwrap();
+
+    let err = store.get_stream_upload("sess-1").unwrap_err();
+    assert!(matches!(
+        err,
+        crate::error::MetadataError::StreamSessionNotFound { .. }
+    ));
+}
+
+#[test]
+fn stream_upload_state_transitions() {
+    let (_dir, store) = make_pg_store();
+
+    store
+        .create_stream_upload(&CreateStreamUploadReq {
+            session_id: "sess-2".to_string(),
+            bucket: "b".to_string(),
+            key: "k".to_string(),
+            op_kind: StreamUploadKind::PutObject,
+            upload_id: None,
+            part_number: None,
+        })
+        .unwrap();
+
+    // Transition to Completing
+    store
+        .set_stream_upload_state("sess-2", StreamUploadState::Completing)
+        .unwrap();
+
+    let rec = store.get_stream_upload("sess-2").unwrap();
+    assert_eq!(rec.state, StreamUploadState::Completing);
+
+    // Cannot transition again (not InProgress)
+    let err = store
+        .set_stream_upload_state("sess-2", StreamUploadState::Aborted)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        crate::error::MetadataError::StreamSessionNotInProgress { .. }
+    ));
+}
+
+#[test]
+fn stream_upload_not_found() {
+    let (_dir, store) = make_pg_store();
+
+    let err = store.get_stream_upload("nonexistent").unwrap_err();
+    assert!(matches!(
+        err,
+        crate::error::MetadataError::StreamSessionNotFound { .. }
+    ));
+
+    let err = store
+        .set_stream_upload_state("nonexistent", StreamUploadState::Aborted)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        crate::error::MetadataError::StreamSessionNotFound { .. }
+    ));
+}
+
+#[test]
+fn stream_upload_upload_part_kind() {
+    let (_dir, store) = make_pg_store();
+
+    store
+        .create_stream_upload(&CreateStreamUploadReq {
+            session_id: "sess-part".to_string(),
+            bucket: "b".to_string(),
+            key: "k".to_string(),
+            op_kind: StreamUploadKind::UploadPart,
+            upload_id: Some("mpu-123".to_string()),
+            part_number: Some(3),
+        })
+        .unwrap();
+
+    let rec = store.get_stream_upload("sess-part").unwrap();
+    assert_eq!(rec.op_kind, StreamUploadKind::UploadPart);
+    assert_eq!(rec.upload_id.as_deref(), Some("mpu-123"));
+    assert_eq!(rec.part_number, Some(3));
+}
+
+#[test]
+fn stream_chunk_append_and_list() {
+    let (_dir, store) = make_pg_store();
+
+    store
+        .create_stream_upload(&CreateStreamUploadReq {
+            session_id: "sess-chunks".to_string(),
+            bucket: "b".to_string(),
+            key: "k".to_string(),
+            op_kind: StreamUploadKind::PutObject,
+            upload_id: None,
+            part_number: None,
+        })
+        .unwrap();
+
+    for i in 0..3u32 {
+        store
+            .append_stream_chunk(&StreamUploadChunkRecord {
+                session_id: "sess-chunks".to_string(),
+                chunk_index: i,
+                size: (i as u64 + 1) * 1000,
+                chunk_okh: [i as u8; 16],
+                chunk_vid: 42,
+                shard_pg_id: i,
+                ec_k: 4,
+                ec_m: 2,
+            })
+            .unwrap();
+    }
+
+    let chunks = store.list_stream_chunks("sess-chunks").unwrap();
+    assert_eq!(chunks.len(), 3);
+    assert_eq!(chunks[0].chunk_index, 0);
+    assert_eq!(chunks[0].size, 1000);
+    assert_eq!(chunks[1].chunk_index, 1);
+    assert_eq!(chunks[1].size, 2000);
+    assert_eq!(chunks[2].chunk_index, 2);
+    assert_eq!(chunks[2].size, 3000);
+    assert_eq!(chunks[0].chunk_okh, [0u8; 16]);
+    assert_eq!(chunks[2].shard_pg_id, 2);
+}
+
+#[test]
+fn stream_chunk_cascade_delete() {
+    let (_dir, store) = make_pg_store();
+
+    store
+        .create_stream_upload(&CreateStreamUploadReq {
+            session_id: "sess-cascade".to_string(),
+            bucket: "b".to_string(),
+            key: "k".to_string(),
+            op_kind: StreamUploadKind::PutObject,
+            upload_id: None,
+            part_number: None,
+        })
+        .unwrap();
+
+    store
+        .append_stream_chunk(&StreamUploadChunkRecord {
+            session_id: "sess-cascade".to_string(),
+            chunk_index: 0,
+            size: 4096,
+            chunk_okh: [0xAA; 16],
+            chunk_vid: 1,
+            shard_pg_id: 0,
+            ec_k: 4,
+            ec_m: 2,
+        })
+        .unwrap();
+
+    // Deleting session cascades to chunks
+    store.delete_stream_upload("sess-cascade").unwrap();
+
+    let chunks = store.list_stream_chunks("sess-cascade").unwrap();
+    assert!(chunks.is_empty());
+}
+
+#[test]
+fn commit_stream_put_atomic() {
+    let (_dir, store) = make_pg_store();
+
+    // Create session and append chunks
+    store
+        .create_stream_upload(&CreateStreamUploadReq {
+            session_id: "sess-commit".to_string(),
+            bucket: "b".to_string(),
+            key: "k".to_string(),
+            op_kind: StreamUploadKind::PutObject,
+            upload_id: None,
+            part_number: None,
+        })
+        .unwrap();
+
+    store
+        .append_stream_chunk(&StreamUploadChunkRecord {
+            session_id: "sess-commit".to_string(),
+            chunk_index: 0,
+            size: 4_000_000,
+            chunk_okh: [0x11; 16],
+            chunk_vid: 1,
+            shard_pg_id: 0,
+            ec_k: 4,
+            ec_m: 2,
+        })
+        .unwrap();
+
+    store
+        .append_stream_chunk(&StreamUploadChunkRecord {
+            session_id: "sess-commit".to_string(),
+            chunk_index: 1,
+            size: 2_000_000,
+            chunk_okh: [0x22; 16],
+            chunk_vid: 1,
+            shard_pg_id: 1,
+            ec_k: 4,
+            ec_m: 2,
+        })
+        .unwrap();
+
+    // Commit
+    let obj = PutObjectMetaReq {
+        bucket: "b".to_string(),
+        key: "k".to_string(),
+        version_id: 0,
+        size: 6_000_000,
+        total_size: 6_000_000,
+        etag: vec![0xAB; 8],
+        etag_kind: 0,
+        ec_k: 4,
+        ec_m: 2,
+        status: 0,
+        data_layout: Some(DataLayout::ChunkManifestInternal),
+        parts_count: None,
+        metadata_blob: None,
+    };
+
+    let committed_chunks = vec![
+        StreamObjectChunkRecord {
+            bucket: "b".to_string(),
+            key: "k".to_string(),
+            version_id: 0,
+            chunk_index: 0,
+            size: 4_000_000,
+            chunk_okh: [0x11; 16],
+            chunk_vid: 1,
+            shard_pg_id: 0,
+            ec_k: 4,
+            ec_m: 2,
+        },
+        StreamObjectChunkRecord {
+            bucket: "b".to_string(),
+            key: "k".to_string(),
+            version_id: 0,
+            chunk_index: 1,
+            size: 2_000_000,
+            chunk_okh: [0x22; 16],
+            chunk_vid: 1,
+            shard_pg_id: 1,
+            ec_k: 4,
+            ec_m: 2,
+        },
+    ];
+
+    store
+        .commit_stream_put("sess-commit", &obj, &committed_chunks)
+        .unwrap();
+
+    // Object metadata is committed
+    let record = store.get_object_meta("b", "k").unwrap();
+    assert_eq!(record.size, 6_000_000);
+    assert_eq!(record.data_layout, DataLayout::ChunkManifestInternal);
+
+    // Committed chunks are readable
+    let chunks = store.get_stream_object_chunks("b", "k", 0).unwrap();
+    assert_eq!(chunks.len(), 2);
+    assert_eq!(chunks[0].chunk_index, 0);
+    assert_eq!(chunks[0].size, 4_000_000);
+    assert_eq!(chunks[0].chunk_okh, [0x11; 16]);
+    assert_eq!(chunks[0].shard_pg_id, 0);
+    assert_eq!(chunks[1].chunk_index, 1);
+    assert_eq!(chunks[1].size, 2_000_000);
+    assert_eq!(chunks[1].shard_pg_id, 1);
+
+    // Staging rows are cleaned up
+    let err = store.get_stream_upload("sess-commit").unwrap_err();
+    assert!(matches!(
+        err,
+        crate::error::MetadataError::StreamSessionNotFound { .. }
+    ));
+    let staging = store.list_stream_chunks("sess-commit").unwrap();
+    assert!(staging.is_empty());
+}
+
+#[test]
+fn commit_stream_put_overwrite_unversioned() {
+    let (_dir, store) = make_pg_store();
+
+    // First write
+    store
+        .create_stream_upload(&CreateStreamUploadReq {
+            session_id: "s1".to_string(),
+            bucket: "b".to_string(),
+            key: "k".to_string(),
+            op_kind: StreamUploadKind::PutObject,
+            upload_id: None,
+            part_number: None,
+        })
+        .unwrap();
+    store
+        .commit_stream_put(
+            "s1",
+            &PutObjectMetaReq {
+                bucket: "b".to_string(),
+                key: "k".to_string(),
+                version_id: 0,
+                size: 100,
+                total_size: 100,
+                etag: vec![1],
+                etag_kind: 0,
+                ec_k: 4,
+                ec_m: 2,
+                status: 0,
+                data_layout: Some(DataLayout::ChunkManifestInternal),
+                parts_count: None,
+                metadata_blob: None,
+            },
+            &[StreamObjectChunkRecord {
+                bucket: "b".to_string(),
+                key: "k".to_string(),
+                version_id: 0,
+                chunk_index: 0,
+                size: 100,
+                chunk_okh: [1; 16],
+                chunk_vid: 1,
+                shard_pg_id: 0,
+                ec_k: 4,
+                ec_m: 2,
+            }],
+        )
+        .unwrap();
+
+    // Second write overwrites
+    store
+        .create_stream_upload(&CreateStreamUploadReq {
+            session_id: "s2".to_string(),
+            bucket: "b".to_string(),
+            key: "k".to_string(),
+            op_kind: StreamUploadKind::PutObject,
+            upload_id: None,
+            part_number: None,
+        })
+        .unwrap();
+    store
+        .commit_stream_put(
+            "s2",
+            &PutObjectMetaReq {
+                bucket: "b".to_string(),
+                key: "k".to_string(),
+                version_id: 0,
+                size: 200,
+                total_size: 200,
+                etag: vec![2],
+                etag_kind: 0,
+                ec_k: 4,
+                ec_m: 2,
+                status: 0,
+                data_layout: Some(DataLayout::ChunkManifestInternal),
+                parts_count: None,
+                metadata_blob: None,
+            },
+            &[StreamObjectChunkRecord {
+                bucket: "b".to_string(),
+                key: "k".to_string(),
+                version_id: 0,
+                chunk_index: 0,
+                size: 200,
+                chunk_okh: [2; 16],
+                chunk_vid: 2,
+                shard_pg_id: 1,
+                ec_k: 4,
+                ec_m: 2,
+            }],
+        )
+        .unwrap();
+
+    // Verify overwrite: new data
+    let record = store.get_object_meta("b", "k").unwrap();
+    assert_eq!(record.size, 200);
+
+    // Chunks replaced
+    let chunks = store.get_stream_object_chunks("b", "k", 0).unwrap();
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].size, 200);
+    assert_eq!(chunks[0].chunk_okh, [2; 16]);
+}
+
+#[test]
+fn delete_stream_object_chunks_cleanup() {
+    let (_dir, store) = make_pg_store();
+
+    store
+        .create_stream_upload(&CreateStreamUploadReq {
+            session_id: "s-del".to_string(),
+            bucket: "b".to_string(),
+            key: "k".to_string(),
+            op_kind: StreamUploadKind::PutObject,
+            upload_id: None,
+            part_number: None,
+        })
+        .unwrap();
+    store
+        .commit_stream_put(
+            "s-del",
+            &PutObjectMetaReq {
+                bucket: "b".to_string(),
+                key: "k".to_string(),
+                version_id: 0,
+                size: 100,
+                total_size: 100,
+                etag: vec![1],
+                etag_kind: 0,
+                ec_k: 4,
+                ec_m: 2,
+                status: 0,
+                data_layout: Some(DataLayout::ChunkManifestInternal),
+                parts_count: None,
+                metadata_blob: None,
+            },
+            &[StreamObjectChunkRecord {
+                bucket: "b".to_string(),
+                key: "k".to_string(),
+                version_id: 0,
+                chunk_index: 0,
+                size: 100,
+                chunk_okh: [1; 16],
+                chunk_vid: 1,
+                shard_pg_id: 0,
+                ec_k: 4,
+                ec_m: 2,
+            }],
+        )
+        .unwrap();
+
+    // Delete committed chunks
+    store.delete_stream_object_chunks("b", "k", 0).unwrap();
+    let chunks = store.get_stream_object_chunks("b", "k", 0).unwrap();
+    assert!(chunks.is_empty());
+
+    // Idempotent
+    store.delete_stream_object_chunks("b", "k", 0).unwrap();
+}
+
+#[test]
+fn commit_stream_put_rejects_non_in_progress() {
+    let (_dir, store) = make_pg_store();
+
+    store
+        .create_stream_upload(&CreateStreamUploadReq {
+            session_id: "sess-bad".to_string(),
+            bucket: "b".to_string(),
+            key: "k".to_string(),
+            op_kind: StreamUploadKind::PutObject,
+            upload_id: None,
+            part_number: None,
+        })
+        .unwrap();
+
+    // Manually transition to Aborted
+    store
+        .set_stream_upload_state("sess-bad", StreamUploadState::Aborted)
+        .unwrap();
+
+    // commit_stream_put should fail with StreamSessionNotInProgress
+    let err = store
+        .commit_stream_put(
+            "sess-bad",
+            &PutObjectMetaReq {
+                bucket: "b".to_string(),
+                key: "k".to_string(),
+                version_id: 0,
+                size: 0,
+                total_size: 0,
+                etag: vec![],
+                etag_kind: 0,
+                ec_k: 4,
+                ec_m: 2,
+                status: 0,
+                data_layout: None,
+                parts_count: None,
+                metadata_blob: None,
+            },
+            &[],
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crate::error::MetadataError::StreamSessionNotInProgress { .. }
+        ),
+        "expected StreamSessionNotInProgress, got: {err:?}"
+    );
+}
+
+#[test]
+fn multipart_part_chunks_crud() {
+    let (_dir, store) = make_pg_store();
+
+    // Insert part chunks directly (simulating committed state)
+    let conn = store.connection();
+    conn.execute(
+        "INSERT INTO multipart_part_chunks \
+         (bucket, key, version_id, part_number, chunk_index, size, chunk_okh, \
+          chunk_vid, shard_pg_id, ec_k, ec_m) \
+         VALUES ('b', 'k', 1, 1, 0, 4000000, X'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', 10, 0, 4, 2)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO multipart_part_chunks \
+         (bucket, key, version_id, part_number, chunk_index, size, chunk_okh, \
+          chunk_vid, shard_pg_id, ec_k, ec_m) \
+         VALUES ('b', 'k', 1, 1, 1, 2000000, X'BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB', 10, 1, 4, 2)",
+        [],
+    )
+    .unwrap();
+
+    // Read back
+    let chunks = store.get_multipart_part_chunks("b", "k", 1, 1).unwrap();
+    assert_eq!(chunks.len(), 2);
+    assert_eq!(chunks[0].chunk_index, 0);
+    assert_eq!(chunks[0].size, 4_000_000);
+    assert_eq!(chunks[1].chunk_index, 1);
+    assert_eq!(chunks[1].size, 2_000_000);
+
+    // Delete
+    store.delete_multipart_part_chunks("b", "k", 1).unwrap();
+    let chunks = store.get_multipart_part_chunks("b", "k", 1, 1).unwrap();
+    assert!(chunks.is_empty());
+}
+
+#[test]
+fn commit_stream_part_replaces_prior_chunks_on_reupload() {
+    let (_dir, store) = make_pg_store();
+
+    // Create the multipart upload first
+    store
+        .create_multipart_upload(&CreateMultipartUploadReq {
+            upload_id: "mpu-1".to_string(),
+            bucket: "b".to_string(),
+            key: "k".to_string(),
+            metadata_blob: vec![],
+            owner_principal: None,
+            checksum_algorithm: None,
+            checksum_type: None,
+        })
+        .unwrap();
+
+    let make_part = |size: u64| MultipartPartRecord {
+        upload_id: "mpu-1".to_string(),
+        part_number: 1,
+        generation: 0,
+        size,
+        etag: vec![1],
+        etag_kind: 0,
+        part_okh: [0xAA; 16],
+        part_vid: 1,
+        ec_k: 4,
+        ec_m: 2,
+        last_modified: 1000,
+        checksum: None,
+    };
+
+    // First upload: 3 chunks
+    store
+        .create_stream_upload(&CreateStreamUploadReq {
+            session_id: "sp-1".to_string(),
+            bucket: "b".to_string(),
+            key: "k".to_string(),
+            op_kind: StreamUploadKind::UploadPart,
+            upload_id: Some("mpu-1".to_string()),
+            part_number: Some(1),
+        })
+        .unwrap();
+
+    let chunks_v1: Vec<MultipartPartChunkRecord> = (0..3)
+        .map(|i| MultipartPartChunkRecord {
+            bucket: "b".to_string(),
+            key: "k".to_string(),
+            version_id: 0,
+            part_number: 1,
+            chunk_index: i,
+            size: 1000,
+            chunk_okh: [0x11; 16],
+            chunk_vid: 1,
+            shard_pg_id: i,
+            ec_k: 4,
+            ec_m: 2,
+        })
+        .collect();
+
+    store
+        .commit_stream_part("sp-1", &make_part(3000), &chunks_v1)
+        .unwrap();
+
+    let chunks = store.get_multipart_part_chunks("b", "k", 0, 1).unwrap();
+    assert_eq!(chunks.len(), 3);
+
+    // Re-upload same part: only 1 chunk (fewer than before)
+    store
+        .create_stream_upload(&CreateStreamUploadReq {
+            session_id: "sp-2".to_string(),
+            bucket: "b".to_string(),
+            key: "k".to_string(),
+            op_kind: StreamUploadKind::UploadPart,
+            upload_id: Some("mpu-1".to_string()),
+            part_number: Some(1),
+        })
+        .unwrap();
+
+    let chunks_v2 = vec![MultipartPartChunkRecord {
+        bucket: "b".to_string(),
+        key: "k".to_string(),
+        version_id: 0,
+        part_number: 1,
+        chunk_index: 0,
+        size: 5000,
+        chunk_okh: [0x22; 16],
+        chunk_vid: 2,
+        shard_pg_id: 0,
+        ec_k: 4,
+        ec_m: 2,
+    }];
+
+    store
+        .commit_stream_part("sp-2", &make_part(5000), &chunks_v2)
+        .unwrap();
+
+    // Verify: only 1 chunk (stale rows deleted)
+    let chunks = store.get_multipart_part_chunks("b", "k", 0, 1).unwrap();
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].size, 5000);
+    assert_eq!(chunks[0].chunk_okh, [0x22; 16]);
+}
+
+#[test]
+fn commit_stream_put_rejects_wrong_kind() {
+    let (_dir, store) = make_pg_store();
+
+    // Create an UploadPart session
+    store
+        .create_stream_upload(&CreateStreamUploadReq {
+            session_id: "sess-wrong-kind".to_string(),
+            bucket: "b".to_string(),
+            key: "k".to_string(),
+            op_kind: StreamUploadKind::UploadPart,
+            upload_id: Some("mpu-x".to_string()),
+            part_number: Some(1),
+        })
+        .unwrap();
+
+    // Try to commit_stream_put with it — should fail
+    let err = store
+        .commit_stream_put(
+            "sess-wrong-kind",
+            &PutObjectMetaReq {
+                bucket: "b".to_string(),
+                key: "k".to_string(),
+                version_id: 0,
+                size: 0,
+                total_size: 0,
+                etag: vec![],
+                etag_kind: 0,
+                ec_k: 4,
+                ec_m: 2,
+                status: 0,
+                data_layout: None,
+                parts_count: None,
+                metadata_blob: None,
+            },
+            &[],
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crate::error::MetadataError::StreamSessionNotFound { .. }
+        ),
+        "expected StreamSessionNotFound for wrong kind, got: {err:?}"
+    );
+}
+
+#[test]
+fn commit_stream_put_rejects_wrong_bucket_key() {
+    let (_dir, store) = make_pg_store();
+
+    store
+        .create_stream_upload(&CreateStreamUploadReq {
+            session_id: "sess-mismatch".to_string(),
+            bucket: "b1".to_string(),
+            key: "k1".to_string(),
+            op_kind: StreamUploadKind::PutObject,
+            upload_id: None,
+            part_number: None,
+        })
+        .unwrap();
+
+    // Commit with different bucket/key
+    let err = store
+        .commit_stream_put(
+            "sess-mismatch",
+            &PutObjectMetaReq {
+                bucket: "b2".to_string(),
+                key: "k2".to_string(),
+                version_id: 0,
+                size: 0,
+                total_size: 0,
+                etag: vec![],
+                etag_kind: 0,
+                ec_k: 4,
+                ec_m: 2,
+                status: 0,
+                data_layout: None,
+                parts_count: None,
+                metadata_blob: None,
+            },
+            &[],
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crate::error::MetadataError::StreamSessionNotFound { .. }
+        ),
+        "expected StreamSessionNotFound for wrong bucket/key, got: {err:?}"
+    );
+}
+
+#[test]
+fn commit_stream_part_rejects_wrong_upload_id() {
+    let (_dir, store) = make_pg_store();
+
+    store
+        .create_multipart_upload(&CreateMultipartUploadReq {
+            upload_id: "mpu-correct".to_string(),
+            bucket: "b".to_string(),
+            key: "k".to_string(),
+            metadata_blob: vec![],
+            owner_principal: None,
+            checksum_algorithm: None,
+            checksum_type: None,
+        })
+        .unwrap();
+
+    store
+        .create_stream_upload(&CreateStreamUploadReq {
+            session_id: "sp-mismatch".to_string(),
+            bucket: "b".to_string(),
+            key: "k".to_string(),
+            op_kind: StreamUploadKind::UploadPart,
+            upload_id: Some("mpu-correct".to_string()),
+            part_number: Some(1),
+        })
+        .unwrap();
+
+    // Commit with wrong upload_id in part record
+    let err = store
+        .commit_stream_part(
+            "sp-mismatch",
+            &MultipartPartRecord {
+                upload_id: "mpu-WRONG".to_string(),
+                part_number: 1,
+                generation: 0,
+                size: 100,
+                etag: vec![1],
+                etag_kind: 0,
+                part_okh: [0xAA; 16],
+                part_vid: 1,
+                ec_k: 4,
+                ec_m: 2,
+                last_modified: 1000,
+                checksum: None,
+            },
+            &[],
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crate::error::MetadataError::StreamSessionNotFound { .. }
+        ),
+        "expected StreamSessionNotFound for wrong upload_id, got: {err:?}"
+    );
+}
+
+#[test]
+fn commit_stream_part_zero_chunks_clears_prior() {
+    let (_dir, store) = make_pg_store();
+
+    store
+        .create_multipart_upload(&CreateMultipartUploadReq {
+            upload_id: "mpu-zc".to_string(),
+            bucket: "b".to_string(),
+            key: "k".to_string(),
+            metadata_blob: vec![],
+            owner_principal: None,
+            checksum_algorithm: None,
+            checksum_type: None,
+        })
+        .unwrap();
+
+    // First upload: 2 chunks
+    store
+        .create_stream_upload(&CreateStreamUploadReq {
+            session_id: "sp-zc1".to_string(),
+            bucket: "b".to_string(),
+            key: "k".to_string(),
+            op_kind: StreamUploadKind::UploadPart,
+            upload_id: Some("mpu-zc".to_string()),
+            part_number: Some(1),
+        })
+        .unwrap();
+    store
+        .commit_stream_part(
+            "sp-zc1",
+            &MultipartPartRecord {
+                upload_id: "mpu-zc".to_string(),
+                part_number: 1,
+                generation: 0,
+                size: 2000,
+                etag: vec![1],
+                etag_kind: 0,
+                part_okh: [0xAA; 16],
+                part_vid: 1,
+                ec_k: 4,
+                ec_m: 2,
+                last_modified: 1000,
+                checksum: None,
+            },
+            &[
+                MultipartPartChunkRecord {
+                    bucket: "b".to_string(),
+                    key: "k".to_string(),
+                    version_id: 0,
+                    part_number: 1,
+                    chunk_index: 0,
+                    size: 1000,
+                    chunk_okh: [0x11; 16],
+                    chunk_vid: 1,
+                    shard_pg_id: 0,
+                    ec_k: 4,
+                    ec_m: 2,
+                },
+                MultipartPartChunkRecord {
+                    bucket: "b".to_string(),
+                    key: "k".to_string(),
+                    version_id: 0,
+                    part_number: 1,
+                    chunk_index: 1,
+                    size: 1000,
+                    chunk_okh: [0x22; 16],
+                    chunk_vid: 1,
+                    shard_pg_id: 1,
+                    ec_k: 4,
+                    ec_m: 2,
+                },
+            ],
+        )
+        .unwrap();
+
+    assert_eq!(
+        store
+            .get_multipart_part_chunks("b", "k", 0, 1)
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // Re-upload with zero chunks — must clear prior rows
+    store
+        .create_stream_upload(&CreateStreamUploadReq {
+            session_id: "sp-zc2".to_string(),
+            bucket: "b".to_string(),
+            key: "k".to_string(),
+            op_kind: StreamUploadKind::UploadPart,
+            upload_id: Some("mpu-zc".to_string()),
+            part_number: Some(1),
+        })
+        .unwrap();
+    store
+        .commit_stream_part(
+            "sp-zc2",
+            &MultipartPartRecord {
+                upload_id: "mpu-zc".to_string(),
+                part_number: 1,
+                generation: 0,
+                size: 0,
+                etag: vec![2],
+                etag_kind: 0,
+                part_okh: [0xBB; 16],
+                part_vid: 2,
+                ec_k: 4,
+                ec_m: 2,
+                last_modified: 2000,
+                checksum: None,
+            },
+            &[], // zero chunks
+        )
+        .unwrap();
+
+    let chunks = store.get_multipart_part_chunks("b", "k", 0, 1).unwrap();
+    assert!(
+        chunks.is_empty(),
+        "stale chunks should be deleted on zero-chunk re-upload"
+    );
+}
+
+#[test]
+fn commit_stream_put_rejects_mismatched_chunk_target() {
+    let (_dir, store) = make_pg_store();
+
+    store
+        .create_stream_upload(&CreateStreamUploadReq {
+            session_id: "sp-ct".to_string(),
+            bucket: "b".to_string(),
+            key: "k".to_string(),
+            op_kind: StreamUploadKind::PutObject,
+            upload_id: None,
+            part_number: None,
+        })
+        .unwrap();
+
+    // Chunk with wrong bucket
+    let err = store
+        .commit_stream_put(
+            "sp-ct",
+            &PutObjectMetaReq {
+                bucket: "b".to_string(),
+                key: "k".to_string(),
+                version_id: 0,
+                size: 100,
+                total_size: 100,
+                etag: vec![1],
+                etag_kind: 0,
+                ec_k: 4,
+                ec_m: 2,
+                status: 0,
+                data_layout: Some(DataLayout::ChunkManifestInternal),
+                parts_count: None,
+                metadata_blob: None,
+            },
+            &[StreamObjectChunkRecord {
+                bucket: "WRONG".to_string(),
+                key: "k".to_string(),
+                version_id: 0,
+                chunk_index: 0,
+                size: 100,
+                chunk_okh: [1; 16],
+                chunk_vid: 1,
+                shard_pg_id: 0,
+                ec_k: 4,
+                ec_m: 2,
+            }],
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crate::error::MetadataError::StreamSessionNotFound { .. }
+        ),
+        "expected rejection for mismatched chunk bucket, got: {err:?}"
+    );
+}
+
+#[test]
+fn commit_stream_part_rejects_mismatched_chunk_part_number() {
+    let (_dir, store) = make_pg_store();
+
+    store
+        .create_multipart_upload(&CreateMultipartUploadReq {
+            upload_id: "mpu-cpc".to_string(),
+            bucket: "b".to_string(),
+            key: "k".to_string(),
+            metadata_blob: vec![],
+            owner_principal: None,
+            checksum_algorithm: None,
+            checksum_type: None,
+        })
+        .unwrap();
+
+    store
+        .create_stream_upload(&CreateStreamUploadReq {
+            session_id: "sp-cpc".to_string(),
+            bucket: "b".to_string(),
+            key: "k".to_string(),
+            op_kind: StreamUploadKind::UploadPart,
+            upload_id: Some("mpu-cpc".to_string()),
+            part_number: Some(1),
+        })
+        .unwrap();
+
+    // Chunk has part_number=99, but session is for part 1
+    let err = store
+        .commit_stream_part(
+            "sp-cpc",
+            &MultipartPartRecord {
+                upload_id: "mpu-cpc".to_string(),
+                part_number: 1,
+                generation: 0,
+                size: 100,
+                etag: vec![1],
+                etag_kind: 0,
+                part_okh: [0xAA; 16],
+                part_vid: 1,
+                ec_k: 4,
+                ec_m: 2,
+                last_modified: 1000,
+                checksum: None,
+            },
+            &[MultipartPartChunkRecord {
+                bucket: "b".to_string(),
+                key: "k".to_string(),
+                version_id: 0,
+                part_number: 99, // wrong!
+                chunk_index: 0,
+                size: 100,
+                chunk_okh: [1; 16],
+                chunk_vid: 1,
+                shard_pg_id: 0,
+                ec_k: 4,
+                ec_m: 2,
+            }],
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crate::error::MetadataError::StreamSessionNotFound { .. }
+        ),
+        "expected rejection for mismatched chunk part_number, got: {err:?}"
+    );
+}
+
+#[test]
+fn commit_stream_part_rejects_nonzero_chunk_version_id() {
+    let (_dir, store) = make_pg_store();
+
+    store
+        .create_multipart_upload(&CreateMultipartUploadReq {
+            upload_id: "mpu-vid".to_string(),
+            bucket: "b".to_string(),
+            key: "k".to_string(),
+            metadata_blob: vec![],
+            owner_principal: None,
+            checksum_algorithm: None,
+            checksum_type: None,
+        })
+        .unwrap();
+
+    store
+        .create_stream_upload(&CreateStreamUploadReq {
+            session_id: "sp-vid".to_string(),
+            bucket: "b".to_string(),
+            key: "k".to_string(),
+            op_kind: StreamUploadKind::UploadPart,
+            upload_id: Some("mpu-vid".to_string()),
+            part_number: Some(1),
+        })
+        .unwrap();
+
+    // Chunk has version_id=42 — must be 0 pre-CompleteMultipartUpload
+    let err = store
+        .commit_stream_part(
+            "sp-vid",
+            &MultipartPartRecord {
+                upload_id: "mpu-vid".to_string(),
+                part_number: 1,
+                generation: 0,
+                size: 100,
+                etag: vec![1],
+                etag_kind: 0,
+                part_okh: [0xAA; 16],
+                part_vid: 1,
+                ec_k: 4,
+                ec_m: 2,
+                last_modified: 1000,
+                checksum: None,
+            },
+            &[MultipartPartChunkRecord {
+                bucket: "b".to_string(),
+                key: "k".to_string(),
+                version_id: 42, // wrong — must be 0
+                part_number: 1,
+                chunk_index: 0,
+                size: 100,
+                chunk_okh: [1; 16],
+                chunk_vid: 1,
+                shard_pg_id: 0,
+                ec_k: 4,
+                ec_m: 2,
+            }],
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crate::error::MetadataError::StreamSessionNotFound { .. }
+        ),
+        "expected rejection for nonzero chunk version_id, got: {err:?}"
+    );
+}
+
+#[test]
+fn malformed_chunk_okh_returns_db_error() {
+    let (_dir, store) = make_pg_store();
+
+    // Insert a chunk with wrong-length okh directly via SQL
+    let conn = store.connection();
+    conn.execute(
+        "INSERT INTO stream_object_chunks \
+         (bucket, key, version_id, chunk_index, size, chunk_okh, chunk_vid, \
+          shard_pg_id, ec_k, ec_m) \
+         VALUES ('b', 'k', 0, 0, 100, X'AABB', 1, 0, 4, 2)",
+        [],
+    )
+    .unwrap();
+
+    let err = store.get_stream_object_chunks("b", "k", 0).unwrap_err();
+    assert!(
+        matches!(err, crate::error::MetadataError::Db { .. }),
+        "expected Db error for malformed okh, got: {err:?}"
+    );
 }

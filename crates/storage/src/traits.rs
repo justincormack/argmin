@@ -185,6 +185,96 @@ pub trait PgMetadataStore {
         obj: &PutObjectMetaReq,
         parts: &[ObjectPartRecord],
     ) -> Result<(), MetadataError>;
+
+    // ── Streaming upload session methods ──────────────────────────────
+
+    /// Create a new streaming upload session.
+    fn create_stream_upload(&self, req: &CreateStreamUploadReq) -> Result<(), MetadataError>;
+
+    /// Get a streaming upload session by ID.
+    fn get_stream_upload(&self, session_id: &str) -> Result<StreamUploadRecord, MetadataError>;
+
+    /// Transition a streaming upload session state. Only valid from InProgress.
+    fn set_stream_upload_state(
+        &self,
+        session_id: &str,
+        new_state: StreamUploadState,
+    ) -> Result<(), MetadataError>;
+
+    /// Delete a streaming upload session and its staging chunks (CASCADE).
+    fn delete_stream_upload(&self, session_id: &str) -> Result<(), MetadataError>;
+
+    /// Append a staging chunk record to an in-progress streaming session.
+    fn append_stream_chunk(&self, chunk: &StreamUploadChunkRecord) -> Result<(), MetadataError>;
+
+    /// List staging chunk records for a streaming session, ordered by chunk_index.
+    fn list_stream_chunks(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<StreamUploadChunkRecord>, MetadataError>;
+
+    /// Atomically finalize a streaming PutObject.
+    ///
+    /// In a single transaction:
+    /// 1. Transition session to Completing
+    /// 2. Write/overwrite the object metadata row
+    /// 3. Delete any prior stream_object_chunks for this version_id
+    /// 4. Insert committed chunk manifest rows
+    /// 5. Delete the stream_uploads + stream_upload_chunks staging rows
+    /// 6. Mark session Completed (implicitly via deletion)
+    fn commit_stream_put(
+        &self,
+        session_id: &str,
+        obj: &PutObjectMetaReq,
+        chunks: &[StreamObjectChunkRecord],
+    ) -> Result<(), MetadataError>;
+
+    /// Atomically finalize a streaming UploadPart.
+    ///
+    /// In a single transaction:
+    /// 1. Transition session to Completing
+    /// 2. Upsert multipart part metadata
+    /// 3. Insert committed part chunk manifest rows
+    /// 4. Delete the stream_uploads + stream_upload_chunks staging rows
+    fn commit_stream_part(
+        &self,
+        session_id: &str,
+        part: &MultipartPartRecord,
+        chunks: &[MultipartPartChunkRecord],
+    ) -> Result<(), MetadataError>;
+
+    /// Read committed chunk manifest for a ChunkManifestInternal object.
+    fn get_stream_object_chunks(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: u64,
+    ) -> Result<Vec<StreamObjectChunkRecord>, MetadataError>;
+
+    /// Delete committed chunk manifest for an object version.
+    fn delete_stream_object_chunks(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: u64,
+    ) -> Result<(), MetadataError>;
+
+    /// Read committed chunk manifest for a multipart part.
+    fn get_multipart_part_chunks(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: u64,
+        part_number: u32,
+    ) -> Result<Vec<MultipartPartChunkRecord>, MetadataError>;
+
+    /// Delete all committed part chunks for an object version.
+    fn delete_multipart_part_chunks(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: u64,
+    ) -> Result<(), MetadataError>;
 }
 
 /// Global metadata service (bucket table).

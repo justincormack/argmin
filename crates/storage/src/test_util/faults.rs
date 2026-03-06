@@ -376,6 +376,95 @@ impl PgMetadataStore for FaultyPgStore {
     ) -> Result<(), MetadataError> {
         self.inner.complete_multipart_commit(upload_id, obj, parts)
     }
+
+    fn create_stream_upload(&self, req: &CreateStreamUploadReq) -> Result<(), MetadataError> {
+        self.inner.create_stream_upload(req)
+    }
+
+    fn get_stream_upload(&self, session_id: &str) -> Result<StreamUploadRecord, MetadataError> {
+        self.inner.get_stream_upload(session_id)
+    }
+
+    fn set_stream_upload_state(
+        &self,
+        session_id: &str,
+        new_state: StreamUploadState,
+    ) -> Result<(), MetadataError> {
+        self.inner.set_stream_upload_state(session_id, new_state)
+    }
+
+    fn delete_stream_upload(&self, session_id: &str) -> Result<(), MetadataError> {
+        self.inner.delete_stream_upload(session_id)
+    }
+
+    fn append_stream_chunk(&self, chunk: &StreamUploadChunkRecord) -> Result<(), MetadataError> {
+        self.inner.append_stream_chunk(chunk)
+    }
+
+    fn list_stream_chunks(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<StreamUploadChunkRecord>, MetadataError> {
+        self.inner.list_stream_chunks(session_id)
+    }
+
+    fn commit_stream_put(
+        &self,
+        session_id: &str,
+        obj: &PutObjectMetaReq,
+        chunks: &[StreamObjectChunkRecord],
+    ) -> Result<(), MetadataError> {
+        self.inner.commit_stream_put(session_id, obj, chunks)
+    }
+
+    fn commit_stream_part(
+        &self,
+        session_id: &str,
+        part: &MultipartPartRecord,
+        chunks: &[MultipartPartChunkRecord],
+    ) -> Result<(), MetadataError> {
+        self.inner.commit_stream_part(session_id, part, chunks)
+    }
+
+    fn get_stream_object_chunks(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: u64,
+    ) -> Result<Vec<StreamObjectChunkRecord>, MetadataError> {
+        self.inner.get_stream_object_chunks(bucket, key, version_id)
+    }
+
+    fn delete_stream_object_chunks(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: u64,
+    ) -> Result<(), MetadataError> {
+        self.inner
+            .delete_stream_object_chunks(bucket, key, version_id)
+    }
+
+    fn get_multipart_part_chunks(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: u64,
+        part_number: u32,
+    ) -> Result<Vec<MultipartPartChunkRecord>, MetadataError> {
+        self.inner
+            .get_multipart_part_chunks(bucket, key, version_id, part_number)
+    }
+
+    fn delete_multipart_part_chunks(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: u64,
+    ) -> Result<(), MetadataError> {
+        self.inner
+            .delete_multipart_part_chunks(bucket, key, version_id)
+    }
 }
 
 #[cfg(test)]
