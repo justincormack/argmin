@@ -69,6 +69,24 @@ This is similar to multipart internals, but not exposed as multipart API.
 4. Internal chunk metadata may store per-chunk integrity fields, but object-level
    checksum semantics are unchanged.
 
+### Metadata placement policy
+
+1. User metadata is stored in DB metadata rows (`metadata_blob`) and is not
+   embedded in streamed/EC payload chunks.
+2. Streamed chunk manifests represent user payload bytes only.
+3. This avoids range offset coupling, keeps `HeadObject` metadata-only, and
+   keeps one metadata read path for both multipart and non-multipart objects.
+
+### Finalize input contract
+
+1. `finalize_stream_put` receives caller-computed final payload checksum state
+   (`crc64`, `total_size`) and metadata blob.
+2. Phase 2 uses caller-side running checksum accumulation during append; it does
+   not require re-reading chunk data at finalize.
+3. `stream_upload_chunks` does not store per-chunk CRC columns in this phase.
+4. Metadata blob is passed at finalize time (not persisted on `stream_uploads`)
+   in this phase; metadata remains DB-only on committed object rows.
+
 ### Data layout changes
 
 Use exactly these object data layouts in `DataLayout`:
@@ -94,7 +112,7 @@ Add internal staging tables (names illustrative):
 `stream_uploads` tracks one in-progress streaming write session for both
 `PutObject` and `UploadPart` (operation kind on session row).
 `stream_upload_chunks` stores staging chunk records (size, etag/checksum, shard
-location, EC params, sequence index).
+location, EC params, sequence index) for payload bytes only.
 
 Finalize semantics are explicit and transactional:
 
@@ -117,31 +135,32 @@ Finalize semantics are explicit and transactional:
    store placement references (PG/shard location metadata), not co-located
    payload bytes.
 4. Session metadata placement is explicit: `stream_uploads` and
-   `stream_upload_chunks` live on a session PG selected by placement hash of
-   `session_id` (not an ad-hoc in-memory map).
+   `stream_upload_chunks` live on the object metadata PG derived from
+   `(bucket,key)` so finalize remains a single-PG atomic transaction for session
+   and object metadata updates.
 
 ## Concurrency model
 
 ### Invariants to preserve
 
 1. Single-object multi-PG operations still lock in global ascending PG ID order.
-2. Session state transitions are serialized by session-PG transactions under the
-   session PG lock (existing PG mutex model, not a separate correctness mutex).
-3. Metadata decisions for finalize happen under metadata PG lock.
+2. Session state transitions are serialized by transactions on the metadata PG
+   (existing PG mutex model, not a separate correctness mutex).
+3. Metadata decisions for finalize happen under the same metadata PG lock.
 4. We never hold a PG lock while waiting for network input from client.
 5. Object visibility remains atomic: object is invisible until finalize commit.
 
 ### Lock window design
 
 1. **Chunk write**: short lock window.
-   - Lock session PG + all shard PGs for that chunk in global ascending order.
-   - Do not lock metadata PG during append.
+   - Lock metadata/session PG + all shard PGs for that chunk in global
+     ascending order.
    - Validate session state.
    - Encode+write shard set for one chunk.
    - Upsert chunk row.
    - Unlock.
 2. **Finalize**: short critical section.
-   - Lock session PG + metadata PG (plus any required secondary PG by existing
+   - Lock metadata/session PG (plus any required secondary PG by existing
      ordering rules), in global ascending PG order.
    - Re-check write preconditions.
    - Allocate version id.
@@ -265,6 +284,7 @@ Result: bounded memory independent of object size.
    `DataLayout::MultipartManifest = 1`.
 2. Add staging + committed chunk manifest tables (`stream_uploads`,
    `stream_upload_chunks`, `stream_object_chunks`, `multipart_part_chunks`).
+   `stream_upload*` rows are stored on the metadata PG for `(bucket,key)`.
 3. Add storage trait methods for:
    - create/get/update/abort session
    - append/list chunk rows
@@ -275,13 +295,34 @@ Result: bounded memory independent of object size.
 1. Storage-layer tests pass.
 2. Atomic finalize transaction semantics proven by tests.
 
+### Phase 1b: Metadata/data decoupling (standalone)
+
+Move user metadata storage to DB-only semantics before streaming append/finalize
+work. This phase is intentionally testable in isolation.
+
+1. Ensure normal object write/read paths persist user metadata in
+   `objects.metadata_blob` and do not reconstruct it from EC payload.
+2. Ensure payload size accounting/range logic uses user payload bytes only (no
+   metadata prefix math).
+3. Keep external behavior unchanged for metadata headers, ETag/checksum, and
+   conditional evaluation.
+4. Add focused tests for:
+   - metadata roundtrip on put/get/head/copy with no payload-prefix dependency
+   - range reads on metadata-bearing objects (offsets unaffected by metadata)
+   - overwrite/delete paths preserving metadata consistency.
+
+**Exit criteria**
+1. Metadata is fully decoupled from payload bytes in object read/write paths.
+2. Standalone metadata-decoupling tests pass without streaming session APIs.
+3. Existing object API tests remain green.
+
 ### Phase 2: Coordinator streaming session API
 
 Add coordinator methods:
 
 1. `begin_stream_put(...) -> session_id`
 2. `append_stream_chunk(session_id, bytes, chunk_index, checksum_ctx...)`
-3. `finalize_stream_put(session_id) -> PutObjectResult`
+3. `finalize_stream_put(session_id, crc64, total_size, metadata_blob) -> PutObjectResult`
 4. `abort_stream_put(session_id)`
 
 Include:
@@ -289,6 +330,8 @@ Include:
 1. Session state machine (`InProgress`, `Completing`, `Completed`, `Aborted`).
 2. Preconditions checked at finalize under lock.
 3. Best-effort + deterministic cleanup paths.
+4. Running checksum accumulation and size accounting in caller path; no finalize
+   re-read of chunk data.
 
 **Exit criteria**
 1. Unit tests for happy path + all state errors.
@@ -396,12 +439,13 @@ Include:
 ## Recommended implementation order
 
 1. Phase 1 (schema + traits)
-2. Phase 2 (coordinator session lifecycle)
-3. Phase 3a (non-chunked streaming ingest)
-4. Phase 3b (aws-chunked incremental streaming ingest)
-5. Phase 5 cleanup hardening (before enabling larger limits)
-6. Phase 4 read/copy streaming
-7. Phase 6 limit lift and rollout
+2. Phase 1b (metadata/data decoupling)
+3. Phase 2 (coordinator session lifecycle)
+4. Phase 3a (non-chunked streaming ingest)
+5. Phase 3b (aws-chunked incremental streaming ingest)
+6. Phase 5 cleanup hardening (before enabling larger limits)
+7. Phase 4 read/copy streaming
+8. Phase 6 limit lift and rollout
 
 This order keeps correctness and crash safety ahead of throughput tuning.
 Phase 5 validation uses storage-level manifest/shard integrity checks; full

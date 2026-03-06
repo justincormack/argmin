@@ -22,9 +22,9 @@ Bucket-only operations are out of scope.
 
 1. Single-object multi-PG operations must lock PGs in global ascending PG ID order.
 2. Streaming chunk appends must never hold a lock while waiting for network input.
-3. Streaming chunk append lock scope is session PG + chunk shard PGs only; do not lock metadata PG on append.
-4. Streaming finalize lock scope includes session PG + metadata PG (and any required secondary PGs), in global order.
-5. Session state transitions are serialized via session-PG transactions (no ad-hoc in-memory correctness lock).
+3. Streaming chunk append lock scope is metadata/session PG + chunk shard PGs.
+4. Streaming finalize lock scope includes metadata/session PG (and any required secondary PGs), in global order.
+5. Session state transitions are serialized via metadata-PG transactions over session rows (no ad-hoc in-memory correctness lock).
 6. Latest-version reads must bind metadata lookup and shard placement under one consistent lock window.
 7. Version ID allocation for versioned writes must be derived while holding the metadata PG lock and revalidated when relocking is required.
 8. Full-object reads (`GET` and copy-source full reads) must verify reconstructed data CRC against stored ETag.
@@ -43,8 +43,8 @@ Use `TwoPgGuards::meta()` and `TwoPgGuards::shard()` for access.
 For streaming write paths, use dedicated coordinator streaming APIs and shared
 lock helpers for:
 
-- session PG + shard PG append lock orchestration
-- session PG + metadata PG finalize lock orchestration
+- metadata/session PG + shard PG append lock orchestration
+- metadata/session PG finalize lock orchestration
 - transactional finalize that commits metadata and removes staging rows together
 
 Do not open-code this pattern in object paths:
@@ -72,8 +72,8 @@ Do not open-code this pattern in object paths:
    - `lock_object_pgs_for_read` / `lock_object_pgs_for_write` for non-streaming
      object paths?
    - shared streaming lock helpers/APIs for streamed append/finalize paths?
-3. Are lock-order assumptions unchanged and explicit (including session PG)?
-4. For streaming append: no metadata PG lock and no network wait under lock?
+3. Are lock-order assumptions unchanged and explicit (including metadata/session PG)?
+4. For streaming append: metadata/session PG + shard PG lock scope, and no network wait under lock?
 5. For streaming finalize: metadata commit + staging-row removal in one
    transaction?
 6. Are CRC checks preserved for full-object reads?
