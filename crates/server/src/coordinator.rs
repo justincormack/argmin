@@ -4,10 +4,12 @@ use std::sync::{Arc, MutexGuard};
 use ec::{EcConfig, ErasureCodec};
 use storage::traits::{GlobalService, PgMetadataStore, ShardStore};
 use storage::{
-    BucketInfo, ChecksumAlgorithm, ChecksumType, CreateMultipartUploadReq, DataLayout,
-    ListMultipartUploadsReq, ListObjectVersionsReq, ListObjectsReq, ListPartsReq,
-    MultipartPartRecord, MultipartUploadRecord, ObjectPartRecord, ObjectRecord, PutObjectMetaReq,
-    ShardKey, SharedStorageNode, SqliteBucketDb, UploadState,
+    BucketInfo, ChecksumAlgorithm, ChecksumType, CreateMultipartUploadReq,
+    CreateStreamUploadReq, DataLayout, ListMultipartUploadsReq, ListObjectVersionsReq,
+    ListObjectsReq, ListPartsReq, MultipartPartRecord, MultipartUploadRecord, ObjectPartRecord,
+    ObjectRecord, PutObjectMetaReq, ShardKey, SharedStorageNode, SqliteBucketDb,
+    StreamObjectChunkRecord, StreamUploadChunkRecord, StreamUploadKind, StreamUploadState,
+    UploadState,
 };
 
 use crate::conditional::{
@@ -20,7 +22,7 @@ use crate::etag::{
     format_object_etag,
 };
 use crate::metadata_blob::MetadataBlob;
-use crate::pg::{derive_pg, derive_pg_shards, object_key_hash, part_key_hash};
+use crate::pg::{chunk_key_hash, derive_pg, derive_pg_shards, object_key_hash, part_key_hash};
 use crate::range::ByteRange;
 
 /// Maximum object size for single PUT (256 MB).
@@ -897,6 +899,362 @@ impl Coordinator {
             meta_pg,
             shard_pg,
         )
+    }
+
+    // ── Streaming upload session API ──────────────────────────────────
+
+    /// Begin a streaming PutObject upload session.
+    ///
+    /// Creates a session on the metadata PG for `(bucket, key)`. The caller
+    /// feeds chunks via `append_stream_chunk` and commits via
+    /// `finalize_stream_put`.
+    pub fn begin_stream_put(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<String, ServerError> {
+        // Verify bucket exists.
+        let _bucket_info = self.head_bucket(bucket)?;
+
+        // Generate session ID (same pattern as multipart upload_id).
+        let rng = ring::rand::SystemRandom::new();
+        let mut id_bytes = [0u8; 16];
+        ring::rand::SecureRandom::fill(&rng, &mut id_bytes).map_err(|_| {
+            ServerError::InternalError {
+                reason: "failed to generate session ID".to_string(),
+            }
+        })?;
+        let session_id = id_bytes.iter().fold(String::with_capacity(32), |mut s, b| {
+            use std::fmt::Write;
+            write!(s, "{b:02x}").unwrap();
+            s
+        });
+
+        // Lock metadata PG and create session.
+        let meta_pg_id = derive_pg(bucket, key, self.pg_count);
+        let pg = self.storage_node.get_pg(meta_pg_id)?;
+        pg.create_stream_upload(&CreateStreamUploadReq {
+            session_id: session_id.clone(),
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            op_kind: StreamUploadKind::PutObject,
+            upload_id: None,
+            part_number: None,
+        })?;
+
+        Ok(session_id)
+    }
+
+    /// Append a chunk of data to an in-progress streaming session.
+    ///
+    /// Locks the metadata/session PG and the chunk's shard PG in global
+    /// ascending order. Validates the session is InProgress, EC-encodes the
+    /// chunk, writes shards, and records a staging chunk row.
+    ///
+    /// The caller must not hold any PG locks when calling this method.
+    pub fn append_stream_chunk(
+        &self,
+        bucket: &str,
+        key: &str,
+        session_id: &str,
+        chunk_index: u32,
+        data: &[u8],
+    ) -> Result<(), ServerError> {
+        let meta_pg_id = derive_pg(bucket, key, self.pg_count);
+
+        // Derive chunk shard placement.
+        let chunk_okh = chunk_key_hash(session_id, chunk_index);
+        let chunk_vid: u64 = 0;
+        let shard_pg_id = derive_pg_shards(
+            &format!("chunk/{session_id}"),
+            &chunk_index.to_string(),
+            0,
+            self.pg_count,
+        );
+
+        // Lock metadata PG + shard PG in global ascending order.
+        let (meta_guard, shard_guard) = if shard_pg_id == meta_pg_id {
+            (self.storage_node.get_pg(meta_pg_id)?, None)
+        } else if meta_pg_id < shard_pg_id {
+            let mg = self.storage_node.get_pg(meta_pg_id)?;
+            let sg = self.storage_node.get_pg(shard_pg_id)?;
+            (mg, Some(sg))
+        } else {
+            let (mg, sg) = self.storage_node.lock_two_pgs(meta_pg_id, shard_pg_id)?;
+            (mg, sg)
+        };
+        let shard_pg: &storage::PgStore = shard_guard.as_deref().unwrap_or(&meta_guard);
+
+        // Validate session is InProgress and matches bucket/key/op_kind.
+        let session = meta_guard.get_stream_upload(session_id)?;
+        if session.state != StreamUploadState::InProgress {
+            return Err(ServerError::InvalidRequest {
+                reason: "stream session is not in progress".to_string(),
+            });
+        }
+        if session.bucket != bucket || session.key != key {
+            return Err(ServerError::InvalidRequest {
+                reason: "session bucket/key mismatch".to_string(),
+            });
+        }
+        if session.op_kind != StreamUploadKind::PutObject {
+            return Err(ServerError::InvalidRequest {
+                reason: "session is not a PutObject session".to_string(),
+            });
+        }
+
+        // Reject duplicate chunk_index — writing shards then failing on PK
+        // constraint would delete the already-staged chunk's shard data.
+        let existing_chunks = meta_guard
+            .list_stream_chunks(session_id)
+            .map_err(ServerError::Metadata)?;
+        if existing_chunks.iter().any(|c| c.chunk_index == chunk_index) {
+            return Err(ServerError::InvalidRequest {
+                reason: format!("duplicate chunk_index {chunk_index}"),
+            });
+        }
+
+        // EC-encode chunk data.
+        let k = self.ec_config.data_shards as usize;
+        let m = self.ec_config.parity_shards as usize;
+        let mut padded = data.to_vec();
+        let remainder = padded.len() % k;
+        if remainder != 0 {
+            padded.resize(padded.len() + (k - remainder), 0);
+        }
+
+        let shard_size = padded.len() / k;
+        let data_shards: Vec<&[u8]> = (0..k)
+            .map(|i| &padded[i * shard_size..(i + 1) * shard_size])
+            .collect();
+        let mut parity_bufs: Vec<Vec<u8>> = (0..m).map(|_| vec![0u8; shard_size]).collect();
+        let mut parity_refs: Vec<&mut [u8]> =
+            parity_bufs.iter_mut().map(|v| v.as_mut_slice()).collect();
+        self.ec_codec.encode(&data_shards, &mut parity_refs)?;
+
+        // Write shards with cleanup on failure.
+        let mut written_shards: Vec<ShardKey> = Vec::with_capacity(k + m);
+        let write_result: Result<(), ServerError> = (|| {
+            for i in 0..(k + m) {
+                let shard_key = ShardKey::new(&chunk_okh, chunk_vid, i as u8);
+                let shard_data = if i < k {
+                    data_shards[i]
+                } else {
+                    &parity_bufs[i - k]
+                };
+                shard_pg.write_shard(&shard_key, shard_data)?;
+                written_shards.push(shard_key);
+            }
+            Ok(())
+        })();
+
+        if let Err(e) = write_result {
+            for shard_key in &written_shards {
+                let _ = shard_pg.delete_shard(shard_key);
+            }
+            return Err(e);
+        }
+
+        // Record staging chunk row.
+        let chunk_result = meta_guard.append_stream_chunk(&StreamUploadChunkRecord {
+            session_id: session_id.to_string(),
+            chunk_index,
+            size: data.len() as u64,
+            chunk_okh,
+            chunk_vid,
+            shard_pg_id,
+            ec_k: self.ec_config.data_shards,
+            ec_m: self.ec_config.parity_shards,
+        });
+
+        if let Err(e) = chunk_result {
+            // Best-effort cleanup of written shards.
+            for shard_key in &written_shards {
+                let _ = shard_pg.delete_shard(shard_key);
+            }
+            return Err(ServerError::Metadata(e));
+        }
+
+        Ok(())
+    }
+
+    /// Finalize a streaming PutObject session.
+    ///
+    /// Locks the metadata PG, allocates a version_id, builds committed chunk
+    /// manifest from staging rows, and atomically commits the object via
+    /// `commit_stream_put`.
+    ///
+    /// The caller passes the running CRC64 checksum, total size, and metadata
+    /// blob computed during the append phase. No chunk data is re-read.
+    #[allow(clippy::too_many_arguments)]
+    pub fn finalize_stream_put(
+        &self,
+        bucket: &str,
+        key: &str,
+        session_id: &str,
+        crc64: u64,
+        total_size: u64,
+        metadata_blob: &MetadataBlob,
+        cond: &WriteCondition,
+    ) -> Result<PutObjectResult, ServerError> {
+        let bucket_info = self.head_bucket(bucket)?;
+        let blob_bytes = metadata_blob.serialize()?;
+
+        let meta_pg_id = derive_pg(bucket, key, self.pg_count);
+        let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
+
+        // Validate session is InProgress and matches bucket/key.
+        let session = meta_guard.get_stream_upload(session_id)?;
+        if session.state != StreamUploadState::InProgress {
+            return Err(ServerError::InvalidRequest {
+                reason: "stream session is not in progress".to_string(),
+            });
+        }
+        if session.bucket != bucket || session.key != key {
+            return Err(ServerError::InvalidRequest {
+                reason: "session bucket/key mismatch".to_string(),
+            });
+        }
+        if session.op_kind != StreamUploadKind::PutObject {
+            return Err(ServerError::InvalidRequest {
+                reason: "session is not a PutObject session".to_string(),
+            });
+        }
+
+        // Check write conditions.
+        if !cond.is_empty() {
+            let existing_etag = match meta_guard.get_object_meta(bucket, key) {
+                Ok(record) => {
+                    let crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
+                    Some(format_etag(crc))
+                }
+                Err(storage::MetadataError::ObjectNotFound) => None,
+                Err(e) => return Err(ServerError::Metadata(e)),
+            };
+            if cond.if_match.is_some() && existing_etag.is_none() {
+                return Err(ServerError::ObjectNotFound {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                });
+            }
+            check_write_conditions(cond, existing_etag.as_deref())?;
+        }
+
+        // Allocate version_id.
+        let version_id = if bucket_info.versioning == 1 {
+            meta_guard.next_version_id(bucket, key)?
+        } else {
+            0
+        };
+
+        // Build committed chunk manifest from staging rows and validate total_size.
+        let staging_chunks = meta_guard
+            .list_stream_chunks(session_id)
+            .map_err(ServerError::Metadata)?;
+        let chunks_total: u64 = staging_chunks.iter().map(|c| c.size).sum();
+        if chunks_total != total_size {
+            return Err(ServerError::InvalidRequest {
+                reason: format!(
+                    "total_size mismatch: caller passed {total_size} but staged chunks sum to {chunks_total}"
+                ),
+            });
+        }
+        let committed_chunks: Vec<StreamObjectChunkRecord> = staging_chunks
+            .iter()
+            .map(|c| StreamObjectChunkRecord {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                version_id,
+                chunk_index: c.chunk_index,
+                size: c.size,
+                chunk_okh: c.chunk_okh,
+                chunk_vid: c.chunk_vid,
+                shard_pg_id: c.shard_pg_id,
+                ec_k: c.ec_k,
+                ec_m: c.ec_m,
+            })
+            .collect();
+
+        // Atomic finalize: commit object metadata + chunk manifest, delete staging.
+        meta_guard
+            .commit_stream_put(
+                session_id,
+                &PutObjectMetaReq {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                    version_id,
+                    status: 0,
+                    size: total_size,
+                    total_size,
+                    etag: crc64_to_etag_bytes(crc64),
+                    etag_kind: 0,
+                    ec_k: self.ec_config.data_shards,
+                    ec_m: self.ec_config.parity_shards,
+                    data_layout: None,
+                    parts_count: None,
+                    metadata_blob: Some(blob_bytes),
+                },
+                &committed_chunks,
+            )
+            .map_err(ServerError::Metadata)?;
+
+        Ok(PutObjectResult {
+            etag: format_etag(crc64),
+            version_id,
+        })
+    }
+
+    /// Abort a streaming upload session.
+    ///
+    /// Marks the session as Aborted and deletes staging rows. Best-effort
+    /// cleans up shard data written during append.
+    pub fn abort_stream_put(
+        &self,
+        bucket: &str,
+        key: &str,
+        session_id: &str,
+    ) -> Result<(), ServerError> {
+        let meta_pg_id = derive_pg(bucket, key, self.pg_count);
+        let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
+
+        // Validate session exists and matches bucket/key.
+        let session = meta_guard.get_stream_upload(session_id)?;
+        if session.bucket != bucket || session.key != key {
+            return Err(ServerError::InvalidRequest {
+                reason: "session bucket/key mismatch".to_string(),
+            });
+        }
+
+        // Collect staging chunks for shard cleanup before deleting session.
+        let staging_chunks = meta_guard
+            .list_stream_chunks(session_id)
+            .map_err(ServerError::Metadata)?;
+
+        // Set state to Aborted, then delete session (CASCADE deletes staging chunks).
+        meta_guard
+            .set_stream_upload_state(session_id, StreamUploadState::Aborted)
+            .map_err(ServerError::Metadata)?;
+        meta_guard
+            .delete_stream_upload(session_id)
+            .map_err(ServerError::Metadata)?;
+
+        // Drop the PG lock before best-effort shard cleanup, which may need
+        // to lock other PGs.
+        drop(meta_guard);
+
+        // Best-effort cleanup of chunk shards.
+        for chunk in &staging_chunks {
+            if let Ok(shard_guard) = self.storage_node.get_pg(chunk.shard_pg_id) {
+                let k = chunk.ec_k as usize;
+                let m = chunk.ec_m as usize;
+                for i in 0..(k + m) {
+                    let shard_key = ShardKey::new(&chunk.chunk_okh, chunk.chunk_vid, i as u8);
+                    let _ = shard_guard.delete_shard(&shard_key);
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Copy an object from one location to another.
@@ -7787,6 +8145,546 @@ mod tests {
         assert!(
             matches!(err, ServerError::InvalidRequest { .. }),
             "expected InvalidRequest for wrong element type, got {err:?}"
+        );
+    }
+
+    // ── Streaming upload session tests ──────────────────────────────────
+
+    #[test]
+    fn stream_put_happy_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        // Begin session.
+        let session_id = coord.begin_stream_put("bucket", "mykey").unwrap();
+        assert_eq!(session_id.len(), 32);
+
+        // Append two chunks.
+        let chunk0 = b"hello ";
+        let chunk1 = b"world";
+        coord
+            .append_stream_chunk("bucket", "mykey", &session_id, 0, chunk0)
+            .unwrap();
+        coord
+            .append_stream_chunk("bucket", "mykey", &session_id, 1, chunk1)
+            .unwrap();
+
+        // Finalize with caller-computed CRC64 and total_size.
+        let mut full_data = Vec::new();
+        full_data.extend_from_slice(chunk0);
+        full_data.extend_from_slice(chunk1);
+        let crc = crc64::checksum(&full_data);
+        let metadata = MetadataBlob::from_headers(&[("x-amz-meta-foo", "bar")]).unwrap();
+        let result = coord
+            .finalize_stream_put(
+                "bucket",
+                "mykey",
+                &session_id,
+                crc,
+                full_data.len() as u64,
+                &metadata,
+                &WriteCondition::default(),
+            )
+            .unwrap();
+
+        assert_eq!(result.etag, format_etag(crc));
+        assert_eq!(result.version_id, 0);
+
+        // Verify object is visible via head_object.
+        let head = coord.head_object("bucket", "mykey", None, NO_READ).unwrap();
+        assert_eq!(head.size, full_data.len() as u64);
+        assert_eq!(head.etag, format_etag(crc));
+        assert_eq!(head.metadata.get("x-amz-meta-foo"), Some("bar"));
+    }
+
+    #[test]
+    fn stream_put_zero_byte_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let session_id = coord.begin_stream_put("bucket", "mykey").unwrap();
+
+        // Finalize with no chunks appended — zero-byte object.
+        let crc = crc64::checksum(&[]);
+        let metadata = MetadataBlob::new();
+        let result = coord
+            .finalize_stream_put(
+                "bucket",
+                "mykey",
+                &session_id,
+                crc,
+                0,
+                &metadata,
+                &WriteCondition::default(),
+            )
+            .unwrap();
+
+        assert_eq!(result.etag, format_etag(crc));
+
+        let head = coord.head_object("bucket", "mykey", None, NO_READ).unwrap();
+        assert_eq!(head.size, 0);
+    }
+
+    #[test]
+    fn stream_put_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let session_id = coord.begin_stream_put("bucket", "mykey").unwrap();
+        coord
+            .append_stream_chunk("bucket", "mykey", &session_id, 0, b"data")
+            .unwrap();
+
+        // Abort the session.
+        coord
+            .abort_stream_put("bucket", "mykey", &session_id)
+            .unwrap();
+
+        // Object should not exist.
+        let err = coord.head_object("bucket", "mykey", None, NO_READ).unwrap_err();
+        assert!(matches!(err, ServerError::ObjectNotFound { .. }));
+    }
+
+    #[test]
+    fn stream_put_append_after_finalize_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let session_id = coord.begin_stream_put("bucket", "mykey").unwrap();
+        let crc = crc64::checksum(&[]);
+        let metadata = MetadataBlob::new();
+        coord
+            .finalize_stream_put(
+                "bucket",
+                "mykey",
+                &session_id,
+                crc,
+                0,
+                &metadata,
+                &WriteCondition::default(),
+            )
+            .unwrap();
+
+        // Session is deleted after finalize — append should fail.
+        let err = coord
+            .append_stream_chunk("bucket", "mykey", &session_id, 0, b"data")
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ServerError::Metadata(storage::MetadataError::StreamSessionNotFound { .. })
+            ),
+            "expected StreamSessionNotFound, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn stream_put_finalize_after_abort_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let session_id = coord.begin_stream_put("bucket", "mykey").unwrap();
+        coord
+            .abort_stream_put("bucket", "mykey", &session_id)
+            .unwrap();
+
+        let crc = crc64::checksum(&[]);
+        let metadata = MetadataBlob::new();
+        let err = coord
+            .finalize_stream_put(
+                "bucket",
+                "mykey",
+                &session_id,
+                crc,
+                0,
+                &metadata,
+                &WriteCondition::default(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ServerError::Metadata(storage::MetadataError::StreamSessionNotFound { .. })
+            ),
+            "expected StreamSessionNotFound, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn stream_put_bucket_key_mismatch_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let session_id = coord.begin_stream_put("bucket", "key1").unwrap();
+
+        // Attempt append with wrong key.
+        let err = coord
+            .append_stream_chunk("bucket", "key2", &session_id, 0, b"data")
+            .unwrap_err();
+        // The session lives on key1's metadata PG. If key2 maps to a different PG,
+        // the session won't be found. If same PG, the bucket/key check catches it.
+        assert!(
+            matches!(
+                err,
+                ServerError::InvalidRequest { .. }
+                    | ServerError::Metadata(storage::MetadataError::StreamSessionNotFound { .. })
+            ),
+            "expected mismatch error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn stream_put_bucket_key_mismatch_finalize() {
+        let dir = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let session_id = coord.begin_stream_put("bucket", "key1").unwrap();
+
+        let crc = crc64::checksum(&[]);
+        let metadata = MetadataBlob::new();
+        let err = coord
+            .finalize_stream_put(
+                "bucket",
+                "key2",
+                &session_id,
+                crc,
+                0,
+                &metadata,
+                &WriteCondition::default(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ServerError::InvalidRequest { .. }
+                    | ServerError::Metadata(storage::MetadataError::StreamSessionNotFound { .. })
+            ),
+            "expected mismatch error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn stream_put_nonexistent_bucket() {
+        let dir = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(dir.path());
+
+        let err = coord.begin_stream_put("nonexistent", "key").unwrap_err();
+        assert!(matches!(err, ServerError::BucketNotFound { .. }));
+    }
+
+    #[test]
+    fn stream_put_overwrite_existing_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        // Write an existing object via normal put.
+        coord
+            .put_object("bucket", "key", b"old-data", &[], &WriteCondition::default())
+            .unwrap();
+
+        // Stream-put a new version.
+        let session_id = coord.begin_stream_put("bucket", "key").unwrap();
+        let new_data = b"new-streamed-data";
+        coord
+            .append_stream_chunk("bucket", "key", &session_id, 0, new_data)
+            .unwrap();
+
+        let crc = crc64::checksum(new_data.as_slice());
+        let metadata = MetadataBlob::new();
+        let result = coord
+            .finalize_stream_put(
+                "bucket",
+                "key",
+                &session_id,
+                crc,
+                new_data.len() as u64,
+                &metadata,
+                &WriteCondition::default(),
+            )
+            .unwrap();
+        assert_eq!(result.etag, format_etag(crc));
+
+        // Head should show the new object.
+        let head = coord.head_object("bucket", "key", None, NO_READ).unwrap();
+        assert_eq!(head.size, new_data.len() as u64);
+    }
+
+    #[test]
+    fn stream_put_with_write_condition() {
+        let dir = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        // Write initial object.
+        let initial = coord
+            .put_object("bucket", "key", b"initial", &[], &WriteCondition::default())
+            .unwrap();
+
+        // Stream put with if-match on the correct etag succeeds.
+        let session_id = coord.begin_stream_put("bucket", "key").unwrap();
+        coord
+            .append_stream_chunk("bucket", "key", &session_id, 0, b"updated")
+            .unwrap();
+        let crc = crc64::checksum(b"updated");
+        let metadata = MetadataBlob::new();
+        let cond = WriteCondition {
+            if_match: Some(initial.etag.clone()),
+            if_none_match: None,
+        };
+        coord
+            .finalize_stream_put("bucket", "key", &session_id, crc, 7, &metadata, &cond)
+            .unwrap();
+
+        // Stream put with if-match on a wrong etag fails.
+        let session_id2 = coord.begin_stream_put("bucket", "key").unwrap();
+        coord
+            .append_stream_chunk("bucket", "key", &session_id2, 0, b"third")
+            .unwrap();
+        let bad_cond = WriteCondition {
+            if_match: Some("\"0000000000000000\"".to_string()),
+            if_none_match: None,
+        };
+        let err = coord
+            .finalize_stream_put(
+                "bucket",
+                "key",
+                &session_id2,
+                crc64::checksum(b"third"),
+                5,
+                &metadata,
+                &bad_cond,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, ServerError::PreconditionFailed { .. }),
+            "expected PreconditionFailed, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn stream_put_multiple_chunks_correct_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let session_id = coord.begin_stream_put("bucket", "key").unwrap();
+
+        // Append 3 chunks.
+        let chunks: Vec<&[u8]> = vec![b"aaa", b"bbb", b"ccc"];
+        for (i, chunk) in chunks.iter().enumerate() {
+            coord
+                .append_stream_chunk("bucket", "key", &session_id, i as u32, chunk)
+                .unwrap();
+        }
+
+        let mut full_data = Vec::new();
+        for chunk in &chunks {
+            full_data.extend_from_slice(chunk);
+        }
+        let crc = crc64::checksum(&full_data);
+        let metadata = MetadataBlob::new();
+        let result = coord
+            .finalize_stream_put(
+                "bucket",
+                "key",
+                &session_id,
+                crc,
+                full_data.len() as u64,
+                &metadata,
+                &WriteCondition::default(),
+            )
+            .unwrap();
+        assert_eq!(result.etag, format_etag(crc));
+
+        // Verify the committed chunk manifest exists in the metadata PG.
+        let meta_pg_id = crate::pg::derive_pg("bucket", "key", 4);
+        let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
+        let committed = pg
+            .get_stream_object_chunks("bucket", "key", result.version_id)
+            .unwrap();
+        assert_eq!(committed.len(), 3);
+        for (i, chunk) in committed.iter().enumerate() {
+            assert_eq!(chunk.chunk_index, i as u32);
+            assert_eq!(chunk.size, 3); // "aaa", "bbb", "ccc" are all 3 bytes
+        }
+    }
+
+    #[test]
+    fn stream_put_abort_cleans_up_shards() {
+        let dir = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let session_id = coord.begin_stream_put("bucket", "key").unwrap();
+        coord
+            .append_stream_chunk("bucket", "key", &session_id, 0, b"data-to-clean")
+            .unwrap();
+
+        // Record shard keys before abort for verification.
+        let chunk_okh = crate::pg::chunk_key_hash(&session_id, 0);
+        let shard_pg_id = crate::pg::derive_pg_shards(
+            &format!("chunk/{session_id}"),
+            "0",
+            0,
+            4,
+        );
+
+        coord
+            .abort_stream_put("bucket", "key", &session_id)
+            .unwrap();
+
+        // Verify shards were cleaned up.
+        let pg = coord.storage_node.get_pg(shard_pg_id).unwrap();
+        for i in 0..6 {
+            // k=4, m=2
+            let shard_key = ShardKey::new(&chunk_okh, 0, i);
+            let result = pg.read_shard(&shard_key);
+            assert!(result.is_err(), "shard {i} should have been deleted");
+        }
+    }
+
+    #[test]
+    fn stream_put_get_object_not_yet_supported() {
+        // Stream-finalized objects use chunk manifests for shard data.
+        // The current get_object read path doesn't consult stream_object_chunks,
+        // so GET on a stream-put object will fail until Phase 4 adds chunk-
+        // manifest readers. This test documents that known limitation.
+        let dir = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let session_id = coord.begin_stream_put("bucket", "key").unwrap();
+        coord
+            .append_stream_chunk("bucket", "key", &session_id, 0, b"hello")
+            .unwrap();
+        let crc = crc64::checksum(b"hello");
+        let metadata = MetadataBlob::new();
+        coord
+            .finalize_stream_put(
+                "bucket",
+                "key",
+                &session_id,
+                crc,
+                5,
+                &metadata,
+                &WriteCondition::default(),
+            )
+            .unwrap();
+
+        // HEAD works (metadata-only).
+        let head = coord.head_object("bucket", "key", None, NO_READ).unwrap();
+        assert_eq!(head.size, 5);
+
+        // GET fails because read path uses object_key_hash, not chunk manifest.
+        let err = coord.get_object("bucket", "key", None, NO_READ).unwrap_err();
+        assert!(
+            matches!(err, ServerError::ObjectNotFound { .. } | ServerError::Store(_)),
+            "expected read failure for chunk-manifest object, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn stream_put_duplicate_chunk_index_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let session_id = coord.begin_stream_put("bucket", "key").unwrap();
+        coord
+            .append_stream_chunk("bucket", "key", &session_id, 0, b"first")
+            .unwrap();
+
+        // Appending the same chunk_index again should be rejected.
+        let err = coord
+            .append_stream_chunk("bucket", "key", &session_id, 0, b"second")
+            .unwrap_err();
+        assert!(
+            matches!(err, ServerError::InvalidRequest { .. }),
+            "expected InvalidRequest for duplicate chunk_index, got {err:?}"
+        );
+
+        // Original chunk should still be intact — verify by finalizing.
+        let crc = crc64::checksum(b"first");
+        let metadata = MetadataBlob::new();
+        coord
+            .finalize_stream_put(
+                "bucket",
+                "key",
+                &session_id,
+                crc,
+                5,
+                &metadata,
+                &WriteCondition::default(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn stream_put_total_size_mismatch_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let session_id = coord.begin_stream_put("bucket", "key").unwrap();
+        coord
+            .append_stream_chunk("bucket", "key", &session_id, 0, b"hello")
+            .unwrap();
+
+        // Finalize with wrong total_size.
+        let crc = crc64::checksum(b"hello");
+        let metadata = MetadataBlob::new();
+        let err = coord
+            .finalize_stream_put(
+                "bucket",
+                "key",
+                &session_id,
+                crc,
+                999, // wrong — actual is 5
+                &metadata,
+                &WriteCondition::default(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, ServerError::InvalidRequest { .. }),
+            "expected InvalidRequest for total_size mismatch, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn stream_put_append_wrong_op_kind_rejected() {
+        // Create an UploadPart session directly via storage layer, then try
+        // to append via coordinator (which validates op_kind == PutObject).
+        let dir = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let meta_pg_id = crate::pg::derive_pg("bucket", "key", 4);
+        let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
+        pg.create_stream_upload(&CreateStreamUploadReq {
+            session_id: "fake-upload-part-session".to_string(),
+            bucket: "bucket".to_string(),
+            key: "key".to_string(),
+            op_kind: StreamUploadKind::UploadPart,
+            upload_id: Some("mpu-123".to_string()),
+            part_number: Some(1),
+        })
+        .unwrap();
+        drop(pg);
+
+        let err = coord
+            .append_stream_chunk("bucket", "key", "fake-upload-part-session", 0, b"data")
+            .unwrap_err();
+        assert!(
+            matches!(err, ServerError::InvalidRequest { .. }),
+            "expected InvalidRequest for wrong op_kind, got {err:?}"
         );
     }
 }

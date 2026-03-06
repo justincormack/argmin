@@ -32,6 +32,18 @@ pub fn object_key_hash(bucket: &str, key: &str) -> [u8; 16] {
     result
 }
 
+/// Compute the 16-byte chunk key hash for streaming upload shard keys.
+///
+/// `chunk_okh = SHA-256("chunk/" + session_id + "/" + chunk_index)[:16]`
+pub fn chunk_key_hash(session_id: &str, chunk_index: u32) -> [u8; 16] {
+    use ring::digest;
+    let input = format!("chunk/{session_id}/{chunk_index}");
+    let hash = digest::digest(&digest::SHA256, input.as_bytes());
+    let mut result = [0u8; 16];
+    result.copy_from_slice(&hash.as_ref()[..16]);
+    result
+}
+
 /// Compute the 16-byte part key hash for multipart upload shard keys.
 ///
 /// `part_okh = SHA-256("mpu/" + upload_id + "/" + part_number + "/" + generation)[:16]`
@@ -111,6 +123,33 @@ mod tests {
             pg_v0 != pg_v1 || pg_v1 != pg_v2,
             "all versions mapped to same PG"
         );
+    }
+
+    #[test]
+    fn chunk_key_hash_deterministic() {
+        let a = chunk_key_hash("session-abc", 0);
+        let b = chunk_key_hash("session-abc", 0);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn chunk_key_hash_different_indices() {
+        let a = chunk_key_hash("session-abc", 0);
+        let b = chunk_key_hash("session-abc", 1);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn chunk_key_hash_different_sessions() {
+        let a = chunk_key_hash("session-abc", 0);
+        let b = chunk_key_hash("session-def", 0);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn chunk_key_hash_length() {
+        let hash = chunk_key_hash("session", 42);
+        assert_eq!(hash.len(), 16);
     }
 
     #[test]
