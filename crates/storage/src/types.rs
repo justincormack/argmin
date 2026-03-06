@@ -253,7 +253,7 @@ pub struct ObjectRecord {
     pub key: String,
     pub version_id: u64,
     pub size: u64,
-    /// Total stored size: metadata blob + user data, before EC padding.
+    /// Total stored size in shards (user data only), before EC padding.
     pub total_size: u64,
     /// Binary etag (e.g. CRC64-NVME bytes), max 64 bytes.
     pub etag: Vec<u8>,

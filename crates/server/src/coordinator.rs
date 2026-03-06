@@ -755,42 +755,38 @@ impl Coordinator {
         meta_pg: &storage::PgStore,
         shard_pg: &storage::PgStore,
     ) -> Result<PutObjectResult, ServerError> {
-        // 1. Serialize blob
+        // 1. Serialize metadata blob for DB storage (not embedded in shard data).
         let blob_bytes = metadata_blob.serialize()?;
 
-        // 2. Concatenate: blob_bytes || user_data
-        let mut full_data = Vec::with_capacity(blob_bytes.len() + user_data.len());
-        full_data.extend_from_slice(&blob_bytes);
-        full_data.extend_from_slice(user_data);
+        // 2. Compute ETag (CRC64 of user data only).
+        let etag_crc = crc64::checksum(user_data);
 
-        // 3. Compute ETag (CRC64 of full_data before padding)
-        let etag_crc = crc64::checksum(&full_data);
-
-        // 4. Pad to multiple of k for equal shard sizes
+        // 3. Pad user data to multiple of k for equal shard sizes.
         let k = self.ec_config.data_shards as usize;
         let m = self.ec_config.parity_shards as usize;
-        let remainder = full_data.len() % k;
+        let mut padded_data = user_data.to_vec();
+        let remainder = padded_data.len() % k;
         if remainder != 0 {
             let pad = k - remainder;
-            full_data.resize(full_data.len() + pad, 0);
+            padded_data.resize(padded_data.len() + pad, 0);
         }
 
-        // 5. Split into k data shards
-        let shard_size = full_data.len() / k;
+        // 4. Split into k data shards
+        let shard_size = padded_data.len() / k;
         let data_shards: Vec<&[u8]> = (0..k)
-            .map(|i| &full_data[i * shard_size..(i + 1) * shard_size])
+            .map(|i| &padded_data[i * shard_size..(i + 1) * shard_size])
             .collect();
 
-        // 6. Allocate parity buffers and encode
+        // 5. Allocate parity buffers and encode
         let mut parity_bufs: Vec<Vec<u8>> = (0..m).map(|_| vec![0u8; shard_size]).collect();
         let mut parity_refs: Vec<&mut [u8]> =
             parity_bufs.iter_mut().map(|v| v.as_mut_slice()).collect();
         self.ec_codec.encode(&data_shards, &mut parity_refs)?;
 
-        // 7. Compute object_key_hash
+        // 6. Compute object_key_hash
         let okh = object_key_hash(bucket, key);
 
-        // 9. Write all k+m shards, with cleanup on failure
+        // 7. Write all k+m shards, with cleanup on failure
         let mut written_shards: Vec<ShardKey> = Vec::with_capacity(k + m);
         let write_result: Result<(), ServerError> = (|| {
             for i in 0..(k + m) {
@@ -814,21 +810,23 @@ impl Coordinator {
             return Err(e);
         }
 
-        // 10. Record metadata (to metadata PG)
+        // 8. Record metadata (to metadata PG).
+        //    Metadata blob stored in DB row; size == total_size (user data only).
+        let user_size = user_data.len() as u64;
         let meta_result = meta_pg.put_object_meta(&PutObjectMetaReq {
             bucket: bucket.to_string(),
             key: key.to_string(),
             version_id,
             status: 0,
-            size: user_data.len() as u64,
-            total_size: (blob_bytes.len() + user_data.len()) as u64,
+            size: user_size,
+            total_size: user_size,
             etag: crc64_to_etag_bytes(etag_crc),
             etag_kind: 0,
             ec_k: self.ec_config.data_shards,
             ec_m: self.ec_config.parity_shards,
             data_layout: None,
             parts_count: None,
-            metadata_blob: None,
+            metadata_blob: Some(blob_bytes),
         });
 
         if let Err(e) = meta_result {
@@ -987,25 +985,28 @@ impl Coordinator {
 
                 (metadata, data)
             } else {
-                // Inline legacy source.
+                // Non-multipart source: metadata from DB row, user data from shards.
                 let src_shard_pg = pgs.shard();
                 let src_etag_crc = etag_bytes_to_crc64(&src_record.etag).unwrap_or(0);
                 let src_okh = object_key_hash(src_bucket, src_key);
                 let src_version_id = src_record.version_id;
-                let total = src_record.total_size as usize;
-                let data = self
-                    .read_range(
+                let user_size = src_record.size as usize;
+                let user_data = if user_size == 0 {
+                    vec![]
+                } else {
+                    self.read_range(
                         src_shard_pg,
                         &src_okh,
                         src_version_id,
                         &src_record,
                         0,
-                        total - 1,
+                        user_size - 1,
                     )
-                    .map_err(not_found)?;
+                    .map_err(not_found)?
+                };
 
-                // Verify full-object CRC against stored etag
-                let actual_crc = crc64::checksum(&data);
+                // Verify CRC against stored etag (user data only).
+                let actual_crc = crc64::checksum(&user_data);
                 if actual_crc != src_etag_crc {
                     return Err(ServerError::IntegrityError {
                         bucket: src_bucket.to_string(),
@@ -1015,9 +1016,13 @@ impl Coordinator {
                     });
                 }
 
-                let metadata_size = (src_record.total_size - src_record.size) as usize;
-                let (src_metadata, _) = MetadataBlob::deserialize(&data[..metadata_size])?;
-                let user_data = data[metadata_size..].to_vec();
+                let src_metadata = src_record
+                    .metadata_blob
+                    .as_ref()
+                    .map(|b| MetadataBlob::deserialize(b).map(|(m, _)| m))
+                    .transpose()?
+                    .unwrap_or_default();
+
                 (src_metadata, user_data)
             }
         }; // source locks dropped here
@@ -1332,7 +1337,7 @@ impl Coordinator {
 
     /// Compute shard_size from total stored size and EC k.
     ///
-    /// `total_size` is the pre-padding size (metadata + user data).
+    /// `total_size` is the pre-padding size (user data only).
     /// Returns the per-shard size after padding to a multiple of k.
     fn compute_shard_size(total_size: u64, ec_k: u8) -> usize {
         let k = ec_k as u64;
@@ -1350,7 +1355,7 @@ impl Coordinator {
         (first..=last).collect()
     }
 
-    /// Read a byte range [start, end] (inclusive) from the stored blob (metadata + user data).
+    /// Read a byte range [start, end] (inclusive) from the stored user data.
     ///
     /// Returns the requested bytes. Reads only the shards covering the range,
     /// falling back to EC reconstruction if any are missing.
@@ -1619,27 +1624,30 @@ impl Coordinator {
                 tags: record.tags,
             })
         } else {
-            // Inline legacy: metadata + user data stored as single blob in shards.
+            // Non-multipart: metadata from DB row, user data from shards.
             let okh = object_key_hash(bucket, key);
             let object_version_id = record.version_id;
             let etag_crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
             let shard_pg = pgs.shard();
 
-            let total = record.total_size as usize;
-            let data = self
-                .read_range(shard_pg, &okh, object_version_id, &record, 0, total - 1)
-                .map_err(|e| match e {
-                    ServerError::Store(storage::StoreError::NotFound) => {
-                        ServerError::ObjectNotFound {
-                            bucket: bucket.to_string(),
-                            key: key.to_string(),
+            let user_size = record.size as usize;
+            let user_data = if user_size == 0 {
+                vec![]
+            } else {
+                self.read_range(shard_pg, &okh, object_version_id, &record, 0, user_size - 1)
+                    .map_err(|e| match e {
+                        ServerError::Store(storage::StoreError::NotFound) => {
+                            ServerError::ObjectNotFound {
+                                bucket: bucket.to_string(),
+                                key: key.to_string(),
+                            }
                         }
-                    }
-                    other => other,
-                })?;
+                        other => other,
+                    })?
+            };
 
-            // Verify full-object CRC against stored etag
-            let actual_crc = crc64::checksum(&data);
+            // Verify CRC against stored etag (user data only).
+            let actual_crc = crc64::checksum(&user_data);
             if actual_crc != etag_crc {
                 return Err(ServerError::IntegrityError {
                     bucket: bucket.to_string(),
@@ -1649,9 +1657,12 @@ impl Coordinator {
                 });
             }
 
-            let metadata_size = (record.total_size - record.size) as usize;
-            let (metadata, _) = MetadataBlob::deserialize(&data[..metadata_size])?;
-            let user_data = data[metadata_size..].to_vec();
+            let metadata = record
+                .metadata_blob
+                .as_ref()
+                .map(|b| MetadataBlob::deserialize(b).map(|(m, _)| m))
+                .transpose()?
+                .unwrap_or_default();
 
             Ok(GetObjectResult {
                 data: user_data,
@@ -1761,26 +1772,28 @@ impl Coordinator {
                 return Err(ServerError::InvalidPart { part_number });
             }
 
-            // Read full object data (same as get_object inline path)
             let okh = object_key_hash(bucket, key);
             let object_version_id = record.version_id;
             let etag_crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
             let shard_pg = pgs.shard();
 
-            let total = record.total_size as usize;
-            let raw = self
-                .read_range(shard_pg, &okh, object_version_id, &record, 0, total - 1)
-                .map_err(|e| match e {
-                    ServerError::Store(storage::StoreError::NotFound) => {
-                        ServerError::ObjectNotFound {
-                            bucket: bucket.to_string(),
-                            key: key.to_string(),
+            let user_size = record.size as usize;
+            let user_data = if user_size == 0 {
+                vec![]
+            } else {
+                self.read_range(shard_pg, &okh, object_version_id, &record, 0, user_size - 1)
+                    .map_err(|e| match e {
+                        ServerError::Store(storage::StoreError::NotFound) => {
+                            ServerError::ObjectNotFound {
+                                bucket: bucket.to_string(),
+                                key: key.to_string(),
+                            }
                         }
-                    }
-                    other => other,
-                })?;
+                        other => other,
+                    })?
+            };
 
-            let actual_crc = crc64::checksum(&raw);
+            let actual_crc = crc64::checksum(&user_data);
             if actual_crc != etag_crc {
                 return Err(ServerError::IntegrityError {
                     bucket: bucket.to_string(),
@@ -1790,9 +1803,12 @@ impl Coordinator {
                 });
             }
 
-            let metadata_size = (record.total_size - record.size) as usize;
-            let (metadata, _) = MetadataBlob::deserialize(&raw[..metadata_size])?;
-            let user_data = raw[metadata_size..].to_vec();
+            let metadata = record
+                .metadata_blob
+                .as_ref()
+                .map(|b| MetadataBlob::deserialize(b).map(|(m, _)| m))
+                .transpose()?
+                .unwrap_or_default();
 
             Ok(GetObjectPartResult {
                 data: user_data,
@@ -1880,32 +1896,12 @@ impl Coordinator {
                 return Err(ServerError::InvalidPart { part_number });
             }
 
-            let metadata = {
-                let okh = object_key_hash(bucket, key);
-                let object_version_id = record.version_id;
-                let shard_pg = pgs.shard();
-                let metadata_size = (record.total_size - record.size) as usize;
-                let data = self
-                    .read_range(
-                        shard_pg,
-                        &okh,
-                        object_version_id,
-                        &record,
-                        0,
-                        metadata_size - 1,
-                    )
-                    .map_err(|e| match e {
-                        ServerError::Store(storage::StoreError::NotFound) => {
-                            ServerError::ObjectNotFound {
-                                bucket: bucket.to_string(),
-                                key: key.to_string(),
-                            }
-                        }
-                        other => other,
-                    })?;
-                let (m, _) = MetadataBlob::deserialize(&data)?;
-                m
-            };
+            let metadata = record
+                .metadata_blob
+                .as_ref()
+                .map(|b| MetadataBlob::deserialize(b).map(|(m, _)| m))
+                .transpose()?
+                .unwrap_or_default();
 
             Ok(HeadObjectPartResult {
                 metadata,
@@ -1923,8 +1919,7 @@ impl Coordinator {
 
     /// Head object: returns metadata without body.
     ///
-    /// For inline objects, reads only the shards covering the metadata blob.
-    /// For multipart objects, metadata is in the object row (no shard read).
+    /// Metadata is always read from the DB row (no shard read needed).
     pub fn head_object(
         &self,
         bucket: &str,
@@ -1932,7 +1927,7 @@ impl Coordinator {
         version_id: Option<u64>,
         cond: &ReadCondition,
     ) -> Result<HeadObjectResult, ServerError> {
-        let LockedReadObject { record, pgs } =
+        let LockedReadObject { record, .. } =
             self.lock_object_pgs_for_read(bucket, key, version_id)?;
 
         // If latest version is a delete marker, return 404 with x-amz-delete-marker
@@ -1946,43 +1941,13 @@ impl Coordinator {
         let etag_str = format_object_etag(&record.etag, record.etag_kind, record.parts_count);
         check_read_conditions(cond, &etag_str, record.last_modified)?;
 
-        let metadata = if record.data_layout == DataLayout::MultipartManifest {
-            // Multipart: metadata stored in object row, no shard read needed.
-            record
-                .metadata_blob
-                .as_ref()
-                .map(|b| MetadataBlob::deserialize(b).map(|(m, _)| m))
-                .transpose()?
-                .unwrap_or_default()
-        } else {
-            // Inline legacy: read metadata from shard data.
-            let okh = object_key_hash(bucket, key);
-            let object_version_id = record.version_id;
-            let shard_pg = pgs.shard();
-
-            let metadata_size = (record.total_size - record.size) as usize;
-            let data = self
-                .read_range(
-                    shard_pg,
-                    &okh,
-                    object_version_id,
-                    &record,
-                    0,
-                    metadata_size - 1,
-                )
-                .map_err(|e| match e {
-                    ServerError::Store(storage::StoreError::NotFound) => {
-                        ServerError::ObjectNotFound {
-                            bucket: bucket.to_string(),
-                            key: key.to_string(),
-                        }
-                    }
-                    other => other,
-                })?;
-
-            let (m, _) = MetadataBlob::deserialize(&data)?;
-            m
-        };
+        // Metadata always from DB row (both multipart and non-multipart).
+        let metadata = record
+            .metadata_blob
+            .as_ref()
+            .map(|b| MetadataBlob::deserialize(b).map(|(m, _)| m))
+            .transpose()?
+            .unwrap_or_default();
 
         Ok(HeadObjectResult {
             metadata,
@@ -2020,41 +1985,13 @@ impl Coordinator {
         let etag_str = format_object_etag(&record.etag, record.etag_kind, record.parts_count);
         check_read_conditions(cond, &etag_str, record.last_modified)?;
 
-        let metadata = if record.data_layout == DataLayout::MultipartManifest {
-            record
-                .metadata_blob
-                .as_ref()
-                .map(|b| MetadataBlob::deserialize(b).map(|(m, _)| m))
-                .transpose()?
-                .unwrap_or_default()
-        } else {
-            let okh = object_key_hash(bucket, key);
-            let object_version_id = record.version_id;
-            let shard_pg = pgs.shard();
-
-            let metadata_size = (record.total_size - record.size) as usize;
-            let data = self
-                .read_range(
-                    shard_pg,
-                    &okh,
-                    object_version_id,
-                    &record,
-                    0,
-                    metadata_size - 1,
-                )
-                .map_err(|e| match e {
-                    ServerError::Store(storage::StoreError::NotFound) => {
-                        ServerError::ObjectNotFound {
-                            bucket: bucket.to_string(),
-                            key: key.to_string(),
-                        }
-                    }
-                    other => other,
-                })?;
-
-            let (m, _) = MetadataBlob::deserialize(&data)?;
-            m
-        };
+        // Metadata always from DB row (both multipart and non-multipart).
+        let metadata = record
+            .metadata_blob
+            .as_ref()
+            .map(|b| MetadataBlob::deserialize(b).map(|(m, _)| m))
+            .transpose()?
+            .unwrap_or_default();
 
         let object_parts = if want_parts && record.data_layout == DataLayout::MultipartManifest {
             // Check if this multipart upload used checksums
@@ -2204,35 +2141,26 @@ impl Coordinator {
 
             (metadata, data)
         } else {
-            // Inline legacy: metadata + user data in shards.
+            // Non-multipart: metadata from DB row, user data range from shards.
             let okh = object_key_hash(bucket, key);
             let object_version_id = record.version_id;
             let shard_pg = pgs.shard();
 
-            let metadata_size = (record.total_size - record.size) as usize;
+            let metadata = record
+                .metadata_blob
+                .as_ref()
+                .map(|b| MetadataBlob::deserialize(b).map(|(m, _)| m))
+                .transpose()?
+                .unwrap_or_default();
 
-            let meta_data = self
-                .read_range(
-                    shard_pg,
-                    &okh,
-                    object_version_id,
-                    &record,
-                    0,
-                    metadata_size - 1,
-                )
-                .map_err(not_found)?;
-            let (metadata, _) = MetadataBlob::deserialize(&meta_data)?;
-
-            let blob_start = metadata_size + user_start as usize;
-            let blob_end = metadata_size + user_end as usize;
             let data = self
                 .read_range(
                     shard_pg,
                     &okh,
                     object_version_id,
                     &record,
-                    blob_start,
-                    blob_end,
+                    user_start as usize,
+                    user_end as usize,
                 )
                 .map_err(not_found)?;
 
@@ -2837,18 +2765,18 @@ impl Coordinator {
                 )
                 .map_err(not_found)?
             } else {
+                // Non-multipart source: read user data range directly from shards.
                 let src_shard_pg = pgs.shard();
                 let src_okh = object_key_hash(src_bucket, src_key);
                 let src_version_id = src_record.version_id;
-                let metadata_size = (src_record.total_size - src_record.size) as usize;
 
                 self.read_range(
                     src_shard_pg,
                     &src_okh,
                     src_version_id,
                     &src_record,
-                    metadata_size + read_start as usize,
-                    metadata_size + read_end as usize,
+                    read_start as usize,
+                    read_end as usize,
                 )
                 .map_err(not_found)?
             }
@@ -7427,6 +7355,56 @@ mod tests {
         assert_eq!(result.parts_count, 2);
         assert_eq!(result.part_start, MIN_PART as u64);
         assert_eq!(result.part_end, MIN_PART as u64);
+    }
+
+    #[test]
+    fn head_object_part_non_multipart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        coord
+            .put_object(
+                "bucket",
+                "key",
+                b"hello world",
+                &[("x-amz-meta-foo", "bar")],
+                NO_WRITE,
+            )
+            .unwrap();
+
+        // partNumber=1 on non-multipart object returns the full object.
+        let result = coord
+            .head_object_part("bucket", "key", None, 1, &ReadCondition::default())
+            .unwrap();
+        assert_eq!(result.part_size, 11);
+        assert_eq!(result.total_size, 11);
+        assert_eq!(result.parts_count, 1);
+        assert_eq!(result.metadata.get("x-amz-meta-foo"), Some("bar"));
+
+        // partNumber=2 on non-multipart object returns InvalidPart.
+        let err = coord
+            .head_object_part("bucket", "key", None, 2, &ReadCondition::default())
+            .unwrap_err();
+        assert!(matches!(err, ServerError::InvalidPart { part_number: 2 }));
+    }
+
+    #[test]
+    fn head_object_part_non_multipart_zero_byte() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        coord
+            .put_object("bucket", "key", b"", &[], NO_WRITE)
+            .unwrap();
+
+        let result = coord
+            .head_object_part("bucket", "key", None, 1, &ReadCondition::default())
+            .unwrap();
+        assert_eq!(result.part_size, 0);
+        assert_eq!(result.total_size, 0);
+        assert_eq!(result.parts_count, 1);
     }
 
     #[test]

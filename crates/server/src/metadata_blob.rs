@@ -1,4 +1,4 @@
-/// C2 metadata blob: prepended to object data before EC encoding.
+/// C2 metadata blob: stored in the object metadata DB row.
 ///
 /// Wire format (V1):
 /// ```text
