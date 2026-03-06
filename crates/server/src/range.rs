@@ -121,6 +121,23 @@ impl ByteRange {
     }
 }
 
+/// Parse an `x-amz-copy-source-range` header value.
+///
+/// AWS only allows the `bytes=start-end` form for copy-source-range (no suffix
+/// or open-ended ranges). Returns `(start, end)` inclusive on success.
+/// Malformed values produce `InvalidArgument` to match AWS/Ceph behavior.
+pub fn parse_copy_source_range(header: &str) -> Result<(u64, u64), ServerError> {
+    let range = ByteRange::parse(header).map_err(|_| ServerError::InvalidArgument {
+        reason: format!("invalid copy source range: {header}"),
+    })?;
+    match range {
+        ByteRange::Range { start, end } => Ok((start, end)),
+        _ => Err(ServerError::InvalidArgument {
+            reason: format!("invalid copy source range: {header}"),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

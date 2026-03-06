@@ -691,6 +691,12 @@ impl S3Response {
         resp
     }
 
+    /// Build a response for UploadPartCopy (200 OK, XML body with CopyPartResult).
+    pub fn upload_part_copy(etag: &str, last_modified: u64) -> Self {
+        let body = xml::copy_part_result_xml(etag, last_modified);
+        Self::new(200).xml_body(body)
+    }
+
     /// Build a response for CompleteMultipartUpload (200 OK, XML body).
     pub fn complete_multipart_upload(
         bucket: &str,

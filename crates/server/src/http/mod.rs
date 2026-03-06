@@ -999,7 +999,6 @@ impl HttpFrontend {
                 ))
             }
             S3Operation::UploadPart { bucket, key } => {
-                self.authorize_bucket_write(auth, &bucket)?;
                 let upload_id =
                     req.query_param("uploadId")
                         .ok_or_else(|| ServerError::InvalidRequest {
@@ -1015,25 +1014,67 @@ impl HttpFrontend {
                         reason: "partNumber must be a positive integer".to_string(),
                     })?;
 
-                // Extract claimed checksum from request headers (at most one).
-                let claimed_checksum = extract_checksum_header(req)?;
-                let claimed_ref = claimed_checksum
-                    .as_ref()
-                    .map(|(algo, val)| (*algo, val.as_str()));
+                if let Some(copy_source) = req.header("x-amz-copy-source") {
+                    // UploadPartCopy path
+                    let (src_bucket, src_key, src_version_id_str) =
+                        request::parse_copy_source(copy_source)?;
+                    let src_version_id = match src_version_id_str {
+                        None => None,
+                        Some(v) if v == "null" => Some(0),
+                        Some(v) => {
+                            Some(v.parse::<u64>().map_err(|_| ServerError::InvalidArgument {
+                                reason: format!("invalid versionId in copy source: {v}"),
+                            })?)
+                        }
+                    };
+                    self.authorize_bucket_write(auth, &bucket)?;
+                    self.authorize_bucket_read(auth, &src_bucket)?;
+                    let src_cond = copy_source_condition_from_headers(req);
+                    let copy_source_range =
+                        if let Some(range_header) = req.header("x-amz-copy-source-range") {
+                            Some(crate::range::parse_copy_source_range(range_header)?)
+                        } else {
+                            None
+                        };
+                    let result = self.coordinator.upload_part_copy(
+                        &src_bucket,
+                        &src_key,
+                        src_version_id,
+                        &bucket,
+                        &key,
+                        &upload_id,
+                        part_number,
+                        &src_cond,
+                        copy_source_range,
+                    )?;
+                    Ok(S3Response::upload_part_copy(
+                        &result.etag,
+                        result.last_modified,
+                    ))
+                } else {
+                    // Normal UploadPart path
+                    self.authorize_bucket_write(auth, &bucket)?;
 
-                let result = self.coordinator.upload_part(
-                    &bucket,
-                    &key,
-                    &upload_id,
-                    part_number,
-                    &req.body,
-                    claimed_ref,
-                )?;
-                Ok(S3Response::upload_part(
-                    &result.etag,
-                    result.checksum_algorithm,
-                    result.checksum_bytes.as_deref(),
-                ))
+                    // Extract claimed checksum from request headers (at most one).
+                    let claimed_checksum = extract_checksum_header(req)?;
+                    let claimed_ref = claimed_checksum
+                        .as_ref()
+                        .map(|(algo, val)| (*algo, val.as_str()));
+
+                    let result = self.coordinator.upload_part(
+                        &bucket,
+                        &key,
+                        &upload_id,
+                        part_number,
+                        &req.body,
+                        claimed_ref,
+                    )?;
+                    Ok(S3Response::upload_part(
+                        &result.etag,
+                        result.checksum_algorithm,
+                        result.checksum_bytes.as_deref(),
+                    ))
+                }
             }
             S3Operation::CompleteMultipartUpload { bucket, key } => {
                 self.authorize_bucket_write(auth, &bucket)?;

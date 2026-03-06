@@ -237,6 +237,21 @@ pub struct UploadPartResult {
     pub checksum_bytes: Option<Vec<u8>>,
 }
 
+/// Result of an UploadPartCopy operation.
+#[derive(Debug)]
+pub struct UploadPartCopyResult {
+    pub etag: String,
+    pub last_modified: u64,
+}
+
+/// Internal result from the shared part-write path.
+struct WritePartInnerResult {
+    etag: String,
+    checksum_algorithm: Option<ChecksumAlgorithm>,
+    checksum_bytes: Option<Vec<u8>>,
+    last_modified: u64,
+}
+
 /// Result of a CreateMultipartUpload operation.
 #[derive(Debug)]
 pub struct CreateMultipartUploadResult {
@@ -2711,6 +2726,135 @@ impl Coordinator {
         data: &[u8],
         claimed_checksum: Option<(ChecksumAlgorithm, &str)>,
     ) -> Result<UploadPartResult, ServerError> {
+        let inner =
+            self.write_part_inner(bucket, key, upload_id, part_number, data, claimed_checksum)?;
+        Ok(UploadPartResult {
+            etag: inner.etag,
+            checksum_algorithm: inner.checksum_algorithm,
+            checksum_bytes: inner.checksum_bytes,
+        })
+    }
+
+    /// Copy a byte range from an existing object as a multipart upload part.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upload_part_copy(
+        &self,
+        src_bucket: &str,
+        src_key: &str,
+        src_version_id: Option<u64>,
+        dst_bucket: &str,
+        dst_key: &str,
+        upload_id: &str,
+        part_number: u32,
+        src_cond: &ReadCondition,
+        copy_source_range: Option<(u64, u64)>,
+    ) -> Result<UploadPartCopyResult, ServerError> {
+        // Phase 1: Read source object (only the needed range)
+        let source_data = {
+            let LockedReadObject {
+                record: src_record,
+                pgs,
+            } = self.lock_object_pgs_for_read(src_bucket, src_key, src_version_id)?;
+
+            // Reject delete markers — they are not copyable objects.
+            if src_record.status == 1 {
+                return Err(ServerError::ObjectNotFound {
+                    bucket: src_bucket.to_string(),
+                    key: src_key.to_string(),
+                });
+            }
+
+            let src_etag = format_object_etag(
+                &src_record.etag,
+                src_record.etag_kind,
+                src_record.parts_count,
+            );
+            check_copy_source_conditions(src_cond, &src_etag, src_record.last_modified)?;
+
+            let source_size = src_record.size;
+
+            // Validate range against source size up front.
+            // AWS returns InvalidArgument (400) for out-of-bounds copy-source-range.
+            if let Some((_, end)) = copy_source_range {
+                if end >= source_size {
+                    return Err(ServerError::InvalidArgument {
+                        reason: format!(
+                            "Range specified is not valid for source object of size: {source_size}"
+                        ),
+                    });
+                }
+            }
+
+            let (read_start, read_end) =
+                copy_source_range.unwrap_or((0, source_size.saturating_sub(1)));
+
+            let not_found = |e: ServerError| match e {
+                ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
+                    bucket: src_bucket.to_string(),
+                    key: src_key.to_string(),
+                },
+                other => other,
+            };
+
+            if source_size == 0 {
+                vec![]
+            } else if src_record.data_layout == DataLayout::MultipartManifest {
+                let meta_pg = pgs.meta();
+                let obj_parts = meta_pg
+                    .get_object_parts(src_bucket, src_key, src_record.version_id)
+                    .map_err(ServerError::Metadata)?;
+                drop(pgs);
+
+                self.read_multipart_range(
+                    src_bucket,
+                    src_key,
+                    &obj_parts,
+                    read_start as usize,
+                    read_end as usize,
+                )
+                .map_err(not_found)?
+            } else {
+                let src_shard_pg = pgs.shard();
+                let src_okh = object_key_hash(src_bucket, src_key);
+                let src_version_id = src_record.version_id;
+                let metadata_size = (src_record.total_size - src_record.size) as usize;
+
+                self.read_range(
+                    src_shard_pg,
+                    &src_okh,
+                    src_version_id,
+                    &src_record,
+                    metadata_size + read_start as usize,
+                    metadata_size + read_end as usize,
+                )
+                .map_err(not_found)?
+            }
+        }; // source locks dropped here
+
+        let part_data = &source_data;
+
+        // Phase 3: Write part data (no claimed checksum for copy)
+        let inner =
+            self.write_part_inner(dst_bucket, dst_key, upload_id, part_number, part_data, None)?;
+        Ok(UploadPartCopyResult {
+            etag: inner.etag,
+            last_modified: inner.last_modified,
+        })
+    }
+
+    /// Shared implementation for writing a multipart part.
+    ///
+    /// Validates part number, locks PGs, EC-encodes data, writes shards,
+    /// upserts part metadata, and cleans up prior generations.
+    fn write_part_inner(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number: u32,
+        data: &[u8],
+        claimed_checksum: Option<(ChecksumAlgorithm, &str)>,
+    ) -> Result<WritePartInnerResult, ServerError> {
         // 1. Validate part number range [1, 10000].
         if part_number == 0 || part_number > 10_000 {
             return Err(ServerError::InvalidArgument {
@@ -2870,7 +3014,7 @@ impl Coordinator {
             parity_bufs.iter_mut().map(|v| v.as_mut_slice()).collect();
         self.ec_codec.encode(&data_shards, &mut parity_refs)?;
 
-        // 5. Write shards, with cleanup on failure.
+        // 6. Write shards, with cleanup on failure.
         let shard_pg: &storage::PgStore = shard_guard.as_deref().unwrap_or(&meta_pg);
         let mut written_shards: Vec<ShardKey> = Vec::with_capacity(k + m);
         let write_result: Result<(), ServerError> = (|| {
@@ -2894,7 +3038,7 @@ impl Coordinator {
             return Err(e);
         }
 
-        // 6. Upsert part metadata.
+        // 7. Upsert part metadata.
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -2926,7 +3070,7 @@ impl Coordinator {
             }
         };
 
-        // 7. Best-effort delete prior generation's shards.
+        // 8. Best-effort delete prior generation's shards.
         //    Drop all held PG guards first to avoid deadlock, since the
         //    old generation may map to any PG including those we hold.
         drop(shard_guard);
@@ -2948,10 +3092,11 @@ impl Coordinator {
             }
         }
 
-        Ok(UploadPartResult {
+        Ok(WritePartInnerResult {
             etag: format_etag(etag_crc),
             checksum_algorithm: effective_algo,
             checksum_bytes,
+            last_modified: now,
         })
     }
 

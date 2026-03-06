@@ -1468,54 +1468,701 @@ fn test_multipart_get_zero_byte_final_part() {
     });
 }
 
-// ── UploadPartCopy (not implemented) ────────────────────────────────
+// ── UploadPartCopy ──────────────────────────────────────────────────
 
 #[test]
-#[ignore = "not implemented: UploadPartCopy"]
 fn test_multipart_copy_small() {
-    s3_tests::run(async {});
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let src_key = "copy-src-small";
+        let dst_key = "copy-dst-small";
+
+        // Create source object
+        let src_data = vec![b'x'; PART_SIZE];
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(src_key)
+            .body(ByteStream::from(src_data.clone()))
+            .send()
+            .await
+            .unwrap();
+
+        // Create multipart upload, upload_part_copy entire source as one part
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(dst_key)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap();
+
+        let copy_resp = client
+            .upload_part_copy()
+            .bucket(&bucket)
+            .key(dst_key)
+            .upload_id(upload_id)
+            .part_number(1)
+            .copy_source(format!("{}/{}", bucket, src_key))
+            .send()
+            .await
+            .unwrap();
+
+        let etag = copy_resp.copy_part_result().unwrap().e_tag().unwrap();
+
+        // Complete multipart upload
+        client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(dst_key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(CompletedPart::builder().e_tag(etag).part_number(1).build())
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        // Verify GET returns correct data
+        let get = client
+            .get_object()
+            .bucket(&bucket)
+            .key(dst_key)
+            .send()
+            .await
+            .unwrap();
+        let body = get.body.collect().await.unwrap().into_bytes();
+        assert_eq!(body.as_ref(), &src_data[..]);
+
+        cleanup(&bucket, &[src_key, dst_key]).await;
+    });
 }
 
 #[test]
-#[ignore = "not implemented: UploadPartCopy"]
 fn test_multipart_copy_without_range() {
-    s3_tests::run(async {});
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let src_key = "copy-src-no-range";
+        let dst_key = "copy-dst-no-range";
+
+        // Create source with known data
+        let src_data = vec![b'A'; PART_SIZE + 1000];
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(src_key)
+            .body(ByteStream::from(src_data.clone()))
+            .send()
+            .await
+            .unwrap();
+
+        // UploadPartCopy without range copies full object
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(dst_key)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap();
+
+        let copy_resp = client
+            .upload_part_copy()
+            .bucket(&bucket)
+            .key(dst_key)
+            .upload_id(upload_id)
+            .part_number(1)
+            .copy_source(format!("{}/{}", bucket, src_key))
+            .send()
+            .await
+            .unwrap();
+
+        let etag = copy_resp.copy_part_result().unwrap().e_tag().unwrap();
+
+        client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(dst_key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(CompletedPart::builder().e_tag(etag).part_number(1).build())
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let get = client
+            .get_object()
+            .bucket(&bucket)
+            .key(dst_key)
+            .send()
+            .await
+            .unwrap();
+        let body = get.body.collect().await.unwrap().into_bytes();
+        assert_eq!(body.len(), src_data.len());
+        assert_eq!(body.as_ref(), &src_data[..]);
+
+        cleanup(&bucket, &[src_key, dst_key]).await;
+    });
 }
 
 #[test]
-#[ignore = "not implemented: UploadPartCopy"]
 fn test_multipart_copy_invalid_range() {
-    s3_tests::run(async {});
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let src_key = "copy-src-invalid-range";
+        let dst_key = "copy-dst-invalid-range";
+
+        // Create small source
+        let src_data = vec![b'Z'; 1000];
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(src_key)
+            .body(ByteStream::from(src_data))
+            .send()
+            .await
+            .unwrap();
+
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(dst_key)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap();
+
+        // Range beyond source size → InvalidArgument (400)
+        let result = client
+            .upload_part_copy()
+            .bucket(&bucket)
+            .key(dst_key)
+            .upload_id(upload_id)
+            .part_number(1)
+            .copy_source(format!("{}/{}", bucket, src_key))
+            .copy_source_range("bytes=0-9999")
+            .send()
+            .await;
+        let status = err_status(&result);
+        assert!(status == 400, "expected 400, got {status}");
+        assert_s3_err_code(&result, "InvalidArgument");
+
+        // Cleanup
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(dst_key)
+            .upload_id(upload_id)
+            .send()
+            .await
+            .unwrap();
+        cleanup(&bucket, &[src_key]).await;
+    });
 }
 
 #[test]
-#[ignore = "not implemented: UploadPartCopy"]
 fn test_multipart_copy_improper_range() {
-    s3_tests::run(async {});
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let src_key = "copy-src-improper";
+        let dst_key = "copy-dst-improper";
+
+        let src_data = vec![b'M'; 1000];
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(src_key)
+            .body(ByteStream::from(src_data))
+            .send()
+            .await
+            .unwrap();
+
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(dst_key)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap();
+
+        // start > end → InvalidArgument (400)
+        let result = client
+            .upload_part_copy()
+            .bucket(&bucket)
+            .key(dst_key)
+            .upload_id(upload_id)
+            .part_number(1)
+            .copy_source(format!("{}/{}", bucket, src_key))
+            .copy_source_range("bytes=500-100")
+            .send()
+            .await;
+        let status = err_status(&result);
+        assert!(status == 400, "expected 400, got {status}");
+        assert_s3_err_code(&result, "InvalidArgument");
+
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(dst_key)
+            .upload_id(upload_id)
+            .send()
+            .await
+            .unwrap();
+        cleanup(&bucket, &[src_key]).await;
+    });
 }
 
 #[test]
-#[ignore = "not implemented: UploadPartCopy"]
 fn test_multipart_copy_special_names() {
-    s3_tests::run(async {});
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let src_key = "special key with spaces/and/slashes";
+        let dst_key = "copy-dst-special";
+
+        let src_data = vec![b'S'; PART_SIZE];
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(src_key)
+            .body(ByteStream::from(src_data.clone()))
+            .send()
+            .await
+            .unwrap();
+
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(dst_key)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap();
+
+        let copy_resp = client
+            .upload_part_copy()
+            .bucket(&bucket)
+            .key(dst_key)
+            .upload_id(upload_id)
+            .part_number(1)
+            .copy_source(format!("{}/{}", bucket, src_key))
+            .send()
+            .await
+            .unwrap();
+
+        let etag = copy_resp.copy_part_result().unwrap().e_tag().unwrap();
+
+        client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(dst_key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(CompletedPart::builder().e_tag(etag).part_number(1).build())
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let get = client
+            .get_object()
+            .bucket(&bucket)
+            .key(dst_key)
+            .send()
+            .await
+            .unwrap();
+        let body = get.body.collect().await.unwrap().into_bytes();
+        assert_eq!(body.as_ref(), &src_data[..]);
+
+        cleanup(&bucket, &[src_key, dst_key]).await;
+    });
 }
 
 #[test]
-#[ignore = "not implemented: UploadPartCopy"]
 fn test_multipart_copy_versioned() {
-    s3_tests::run(async {});
+    s3_tests::run(async {
+        use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
+
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+
+        // Enable versioning
+        client
+            .put_bucket_versioning()
+            .bucket(&bucket)
+            .versioning_configuration(
+                VersioningConfiguration::builder()
+                    .status(BucketVersioningStatus::Enabled)
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let src_key = "versioned-src";
+        let dst_key = "versioned-dst";
+
+        // Put version 1
+        let data_v1 = vec![b'1'; PART_SIZE];
+        let put1 = client
+            .put_object()
+            .bucket(&bucket)
+            .key(src_key)
+            .body(ByteStream::from(data_v1.clone()))
+            .send()
+            .await
+            .unwrap();
+        let v1_id = put1.version_id().unwrap().to_string();
+
+        // Put version 2
+        let data_v2 = vec![b'2'; PART_SIZE];
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(src_key)
+            .body(ByteStream::from(data_v2))
+            .send()
+            .await
+            .unwrap();
+
+        // Copy version 1 specifically via ?versionId=
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(dst_key)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap();
+
+        let copy_resp = client
+            .upload_part_copy()
+            .bucket(&bucket)
+            .key(dst_key)
+            .upload_id(upload_id)
+            .part_number(1)
+            .copy_source(format!("{}/{}?versionId={}", bucket, src_key, v1_id))
+            .send()
+            .await
+            .unwrap();
+
+        let etag = copy_resp.copy_part_result().unwrap().e_tag().unwrap();
+
+        client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(dst_key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(CompletedPart::builder().e_tag(etag).part_number(1).build())
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        // Verify we got version 1 data
+        let get = client
+            .get_object()
+            .bucket(&bucket)
+            .key(dst_key)
+            .send()
+            .await
+            .unwrap();
+        let body = get.body.collect().await.unwrap().into_bytes();
+        assert_eq!(body.as_ref(), &data_v1[..]);
+
+        s3_tests::cleanup_versioned_bucket(&client, &bucket).await;
+    });
+}
+
+/// Copying from a delete-marker source should fail with 404/NoSuchKey.
+#[test]
+fn test_multipart_copy_delete_marker_source() {
+    s3_tests::run(async {
+        use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
+
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+
+        // Enable versioning
+        client
+            .put_bucket_versioning()
+            .bucket(&bucket)
+            .versioning_configuration(
+                VersioningConfiguration::builder()
+                    .status(BucketVersioningStatus::Enabled)
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let src_key = "delete-marker-src";
+        let dst_key = "delete-marker-dst";
+
+        // Put then delete to create a delete marker as current version
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(src_key)
+            .body(ByteStream::from(vec![b'd'; PART_SIZE]))
+            .send()
+            .await
+            .unwrap();
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(src_key)
+            .send()
+            .await
+            .unwrap();
+
+        // Attempt upload_part_copy from the delete-marked key
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(dst_key)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap();
+
+        let result = client
+            .upload_part_copy()
+            .bucket(&bucket)
+            .key(dst_key)
+            .upload_id(upload_id)
+            .part_number(1)
+            .copy_source(format!("{}/{}", bucket, src_key))
+            .send()
+            .await;
+        let status = err_status(&result);
+        assert_eq!(status, 404);
+        assert_s3_err_code(&result, "NoSuchKey");
+
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(dst_key)
+            .upload_id(upload_id)
+            .send()
+            .await
+            .unwrap();
+        s3_tests::cleanup_versioned_bucket(&client, &bucket).await;
+    });
 }
 
 #[test]
-#[ignore = "not implemented: UploadPartCopy"]
 fn test_multipart_copy_multiple_sizes() {
-    s3_tests::run(async {});
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let src_key = "copy-src-multi";
+        let dst_key = "copy-dst-multi";
+
+        // Create a source large enough for multiple range-copied parts
+        let total_size = PART_SIZE * 2 + 500;
+        let src_data: Vec<u8> = (0..total_size).map(|i| (i % 256) as u8).collect();
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(src_key)
+            .body(ByteStream::from(src_data.clone()))
+            .send()
+            .await
+            .unwrap();
+
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(dst_key)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap();
+
+        // Part 1: first PART_SIZE bytes
+        let p1 = client
+            .upload_part_copy()
+            .bucket(&bucket)
+            .key(dst_key)
+            .upload_id(upload_id)
+            .part_number(1)
+            .copy_source(format!("{}/{}", bucket, src_key))
+            .copy_source_range(format!("bytes=0-{}", PART_SIZE - 1))
+            .send()
+            .await
+            .unwrap();
+        let etag1 = p1.copy_part_result().unwrap().e_tag().unwrap().to_string();
+
+        // Part 2: next PART_SIZE bytes
+        let p2 = client
+            .upload_part_copy()
+            .bucket(&bucket)
+            .key(dst_key)
+            .upload_id(upload_id)
+            .part_number(2)
+            .copy_source(format!("{}/{}", bucket, src_key))
+            .copy_source_range(format!("bytes={}-{}", PART_SIZE, PART_SIZE * 2 - 1))
+            .send()
+            .await
+            .unwrap();
+        let etag2 = p2.copy_part_result().unwrap().e_tag().unwrap().to_string();
+
+        // Part 3: remaining 500 bytes
+        let p3 = client
+            .upload_part_copy()
+            .bucket(&bucket)
+            .key(dst_key)
+            .upload_id(upload_id)
+            .part_number(3)
+            .copy_source(format!("{}/{}", bucket, src_key))
+            .copy_source_range(format!("bytes={}-{}", PART_SIZE * 2, total_size - 1))
+            .send()
+            .await
+            .unwrap();
+        let etag3 = p3.copy_part_result().unwrap().e_tag().unwrap().to_string();
+
+        client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(dst_key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(&etag1)
+                            .part_number(1)
+                            .build(),
+                    )
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(&etag2)
+                            .part_number(2)
+                            .build(),
+                    )
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(&etag3)
+                            .part_number(3)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        // Verify assembled object matches source
+        let get = client
+            .get_object()
+            .bucket(&bucket)
+            .key(dst_key)
+            .send()
+            .await
+            .unwrap();
+        let body = get.body.collect().await.unwrap().into_bytes();
+        assert_eq!(body.len(), total_size);
+        assert_eq!(body.as_ref(), &src_data[..]);
+
+        cleanup(&bucket, &[src_key, dst_key]).await;
+    });
 }
 
+/// Ceph parity: put object with percent-encoded key (`anyfilename%25.txt` stores as
+/// `anyfilename%.txt`), then attempt upload_part_copy using the raw `%` key. The
+/// raw key resolves differently than the percent-encoded one, so the copy source
+/// should not be found.
 #[test]
-#[ignore = "not implemented: UploadPartCopy"]
 fn test_upload_part_copy_percent_encoded_key() {
-    s3_tests::run(async {});
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let dst_key = "anyfile.txt";
+        // This key contains a literal percent: "anyfilename%.txt"
+        let encoded_key = "anyfilename%25.txt";
+        let raw_key = "anyfilename%.txt";
+
+        // Put the copy source under the percent-encoded key
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(encoded_key)
+            .body(ByteStream::from(b"foo".to_vec()))
+            .send()
+            .await
+            .unwrap();
+
+        // Put the destination object (initial state)
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(dst_key)
+            .body(ByteStream::from(b"foo".to_vec()))
+            .send()
+            .await
+            .unwrap();
+
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(dst_key)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap();
+
+        // Copy using raw_key ("anyfilename%.txt") which is NOT the same as
+        // the percent-encoded key — this should fail with NoSuchKey / 404.
+        let result = client
+            .upload_part_copy()
+            .bucket(&bucket)
+            .key(dst_key)
+            .upload_id(upload_id)
+            .part_number(1)
+            .copy_source(format!("{}/{}", bucket, raw_key))
+            .send()
+            .await;
+        assert!(result.is_err(), "expected error copying with raw % key");
+
+        // Verify the original destination object is untouched
+        let get = client
+            .get_object()
+            .bucket(&bucket)
+            .key(dst_key)
+            .send()
+            .await
+            .unwrap();
+        let body = get.body.collect().await.unwrap().into_bytes();
+        assert_eq!(body.as_ref(), b"foo");
+
+        // Cleanup
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(dst_key)
+            .upload_id(upload_id)
+            .send()
+            .await
+            .unwrap();
+        cleanup(&bucket, &[encoded_key, dst_key]).await;
+    });
 }
 
 // ── Multi-user (not implemented) ────────────────────────────────────

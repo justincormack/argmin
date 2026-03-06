@@ -788,6 +788,19 @@ pub fn copy_object_result_xml(etag: &str, last_modified: u64) -> String {
     )
 }
 
+/// Format a CopyPartResult XML response.
+pub fn copy_part_result_xml(etag: &str, last_modified: u64) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <CopyPartResult>\
+         <ETag>{}</ETag>\
+         <LastModified>{}</LastModified>\
+         </CopyPartResult>",
+        xml_escape(etag),
+        format_timestamp(last_modified),
+    )
+}
+
 /// Format a unix millisecond timestamp as ISO 8601.
 pub(crate) fn format_timestamp(millis: u64) -> String {
     let secs = millis / 1000;
