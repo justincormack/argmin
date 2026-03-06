@@ -204,22 +204,7 @@ async fn handle(
 /// - Use UNSIGNED-PAYLOAD (body not needed for auth verification)
 /// - Are not aws-chunked (no STREAMING-* content hash)
 ///
-/// Currently gated: returns `None` unconditionally because GET for stream-put
-/// objects is not yet implemented (Phase 4). Remove the gate once the read
-/// path supports chunk manifests.
 fn is_streaming_put(parts: &http::request::Parts) -> Option<(String, String)> {
-    // Gate: stream-put objects are not readable via GET until Phase 4.
-    let _ = parts;
-    if true {
-        return None;
-    }
-
-    #[allow(unreachable_code)]
-    is_streaming_put_inner(parts)
-}
-
-/// Inner logic for streaming PUT eligibility, separated for testability.
-fn is_streaming_put_inner(parts: &http::request::Parts) -> Option<(String, String)> {
     if parts.method != http::Method::PUT {
         return None;
     }
@@ -488,7 +473,7 @@ fn internal_error_response() -> S3Response {
 mod tests {
     use super::*;
 
-    /// Build a minimal `http::request::Parts` for testing `is_streaming_put_inner`.
+    /// Build a minimal `http::request::Parts` for testing `is_streaming_put`.
     fn make_parts(
         method: &str,
         uri: &str,
@@ -511,7 +496,7 @@ mod tests {
             "/mybucket/mykey",
             &[("x-amz-content-sha256", "UNSIGNED-PAYLOAD")],
         );
-        let result = is_streaming_put_inner(&parts);
+        let result = is_streaming_put(&parts);
         assert_eq!(result, Some(("mybucket".to_string(), "mykey".to_string())));
     }
 
@@ -522,7 +507,7 @@ mod tests {
             "/mybucket/mykey",
             &[("x-amz-content-sha256", "UNSIGNED-PAYLOAD")],
         );
-        assert_eq!(is_streaming_put_inner(&parts), None);
+        assert_eq!(is_streaming_put(&parts), None);
     }
 
     #[test]
@@ -532,7 +517,7 @@ mod tests {
             "/mybucket/mykey",
             &[("x-amz-content-sha256", "UNSIGNED-PAYLOAD")],
         );
-        assert_eq!(is_streaming_put_inner(&parts), None);
+        assert_eq!(is_streaming_put(&parts), None);
     }
 
     #[test]
@@ -545,7 +530,7 @@ mod tests {
                 ("x-amz-copy-source", "/src-bucket/src-key"),
             ],
         );
-        assert_eq!(is_streaming_put_inner(&parts), None);
+        assert_eq!(is_streaming_put(&parts), None);
     }
 
     #[test]
@@ -555,13 +540,13 @@ mod tests {
             "/mybucket/mykey",
             &[("x-amz-content-sha256", "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890")],
         );
-        assert_eq!(is_streaming_put_inner(&parts), None);
+        assert_eq!(is_streaming_put(&parts), None);
     }
 
     #[test]
     fn streaming_put_no_sha256_header_excluded() {
         let parts = make_parts("PUT", "/mybucket/mykey", &[]);
-        assert_eq!(is_streaming_put_inner(&parts), None);
+        assert_eq!(is_streaming_put(&parts), None);
     }
 
     #[test]
@@ -571,7 +556,7 @@ mod tests {
             "/mybucket/mykey",
             &[("x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")],
         );
-        assert_eq!(is_streaming_put_inner(&parts), None);
+        assert_eq!(is_streaming_put(&parts), None);
     }
 
     #[test]
@@ -581,7 +566,7 @@ mod tests {
             "/mybucket/mykey",
             &[("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER")],
         );
-        assert_eq!(is_streaming_put_inner(&parts), None);
+        assert_eq!(is_streaming_put(&parts), None);
     }
 
     #[test]
@@ -592,7 +577,7 @@ mod tests {
             "/mybucket?versioning",
             &[("x-amz-content-sha256", "UNSIGNED-PAYLOAD")],
         );
-        assert_eq!(is_streaming_put_inner(&parts), None);
+        assert_eq!(is_streaming_put(&parts), None);
     }
 
     #[test]
@@ -602,21 +587,11 @@ mod tests {
             "/mybucket/path/to/deep/key.txt",
             &[("x-amz-content-sha256", "UNSIGNED-PAYLOAD")],
         );
-        let result = is_streaming_put_inner(&parts);
+        let result = is_streaming_put(&parts);
         assert_eq!(
             result,
             Some(("mybucket".to_string(), "path/to/deep/key.txt".to_string()))
         );
     }
 
-    #[test]
-    fn streaming_gate_returns_none() {
-        // The public is_streaming_put is gated to always return None until Phase 4.
-        let parts = make_parts(
-            "PUT",
-            "/mybucket/mykey",
-            &[("x-amz-content-sha256", "UNSIGNED-PAYLOAD")],
-        );
-        assert_eq!(is_streaming_put(&parts), None);
-    }
 }

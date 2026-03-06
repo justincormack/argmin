@@ -756,7 +756,7 @@ impl Coordinator {
         version_id: u64,
         meta_pg: &storage::PgStore,
         shard_pg: &storage::PgStore,
-    ) -> Result<PutObjectResult, ServerError> {
+    ) -> Result<(PutObjectResult, Vec<StreamObjectChunkRecord>), ServerError> {
         // 1. Serialize metadata blob for DB storage (not embedded in shard data).
         let blob_bytes = metadata_blob.serialize()?;
 
@@ -839,10 +839,27 @@ impl Coordinator {
             return Err(ServerError::Metadata(e));
         }
 
-        Ok(PutObjectResult {
-            etag: format_etag(etag_crc),
-            version_id,
-        })
+        // Clean up any stale stream_object_chunks metadata rows from a prior
+        // stream-write of this (bucket, key, version_id). Metadata deletion
+        // must succeed to prevent stale chunk manifests from shadowing the new
+        // object on subsequent reads. Shard data cleanup happens after PG locks
+        // are released by the caller.
+        let stale_chunks = meta_pg
+            .get_stream_object_chunks(bucket, key, version_id)
+            .map_err(ServerError::Metadata)?;
+        if !stale_chunks.is_empty() {
+            meta_pg
+                .delete_stream_object_chunks(bucket, key, version_id)
+                .map_err(ServerError::Metadata)?;
+        }
+
+        Ok((
+            PutObjectResult {
+                etag: format_etag(etag_crc),
+                version_id,
+            },
+            stale_chunks,
+        ))
     }
 
     /// Put an object into storage.
@@ -890,7 +907,7 @@ impl Coordinator {
         }
 
         // 3. Write object while holding both PG locks.
-        self.write_object_inner(
+        let (result, stale_chunks) = self.write_object_inner(
             bucket,
             key,
             &metadata_blob,
@@ -898,7 +915,14 @@ impl Coordinator {
             version_id,
             meta_pg,
             shard_pg,
-        )
+        )?;
+        drop(pgs);
+
+        // Best-effort shard cleanup after releasing PG locks to avoid
+        // lock-order inversion with chunk shard PGs.
+        let _ = self.delete_chunk_shards(&stale_chunks);
+
+        Ok(result)
     }
 
     // ── Streaming upload session API ──────────────────────────────────
@@ -1344,23 +1368,43 @@ impl Coordinator {
                 (metadata, data)
             } else {
                 // Non-multipart source: metadata from DB row, user data from shards.
-                let src_shard_pg = pgs.shard();
                 let src_etag_crc = etag_bytes_to_crc64(&src_record.etag).unwrap_or(0);
-                let src_okh = object_key_hash(src_bucket, src_key);
-                let src_version_id = src_record.version_id;
                 let user_size = src_record.size as usize;
+
+                // Check for chunk manifest (stream-put objects).
+                let meta_pg = pgs.meta();
+                let chunks = meta_pg
+                    .get_stream_object_chunks(src_bucket, src_key, src_record.version_id)
+                    .map_err(ServerError::Metadata)?;
+
                 let user_data = if user_size == 0 {
+                    drop(pgs);
                     vec![]
-                } else {
-                    self.read_range(
-                        src_shard_pg,
-                        &src_okh,
-                        src_version_id,
-                        &src_record,
+                } else if !chunks.is_empty() {
+                    drop(pgs);
+                    self.read_chunk_manifest_range(
+                        src_bucket,
+                        src_key,
+                        &chunks,
                         0,
                         user_size - 1,
                     )
                     .map_err(not_found)?
+                } else {
+                    let src_okh = object_key_hash(src_bucket, src_key);
+                    let src_shard_pg = pgs.shard();
+                    let data = self
+                        .read_range(
+                            src_shard_pg,
+                            &src_okh,
+                            src_record.version_id,
+                            &src_record,
+                            0,
+                            user_size - 1,
+                        )
+                        .map_err(not_found)?;
+                    drop(pgs);
+                    data
                 };
 
                 // Verify CRC against stored etag (user data only).
@@ -1412,7 +1456,7 @@ impl Coordinator {
             check_write_conditions(dst_cond, existing_etag.as_deref())?;
         }
 
-        let put_result = self.write_object_inner(
+        let (put_result, stale_chunks) = self.write_object_inner(
             dst_bucket,
             dst_key,
             &metadata_blob,
@@ -1426,6 +1470,10 @@ impl Coordinator {
         let dst_record = dst_meta_pg
             .get_object_meta(dst_bucket, dst_key)
             .map_err(ServerError::Metadata)?;
+        drop(pgs);
+
+        // Best-effort shard cleanup after releasing PG locks.
+        let _ = self.delete_chunk_shards(&stale_chunks);
 
         Ok(CopyObjectResult {
             etag: put_result.etag,
@@ -1758,6 +1806,147 @@ impl Coordinator {
         Ok(buf[local_start..=local_end].to_vec())
     }
 
+    /// Read full data for a single stream object chunk from its shard PG.
+    ///
+    /// Parallel to `read_part_data` but for `StreamObjectChunkRecord`.
+    fn read_chunk_data(&self, chunk: &StreamObjectChunkRecord) -> Result<Vec<u8>, ServerError> {
+        let pg = self.storage_node.get_pg(chunk.shard_pg_id)?;
+        let k = chunk.ec_k as usize;
+        let m = chunk.ec_m as usize;
+
+        let padded = (chunk.size as usize).div_ceil(k) * k;
+        let shard_size = padded / k;
+
+        if shard_size == 0 {
+            return Ok(vec![]);
+        }
+
+        let needed: Vec<usize> = (0..k).collect();
+        let mut all_shards: Vec<Option<Vec<u8>>> = Vec::with_capacity(k + m);
+        let mut present_count = 0;
+
+        for i in 0..(k + m) {
+            let shard_key = ShardKey::new(&chunk.chunk_okh, chunk.chunk_vid, i as u8);
+            match pg.read_shard(&shard_key) {
+                Ok(sd) => {
+                    all_shards.push(Some(sd.data));
+                    present_count += 1;
+                }
+                Err(_) => {
+                    all_shards.push(None);
+                }
+            }
+        }
+
+        if present_count < k {
+            return Err(ServerError::Store(storage::StoreError::NotFound));
+        }
+
+        let all_data_present = (0..k).all(|i| all_shards[i].is_some());
+        if !all_data_present {
+            let missing_needed: Vec<usize> = needed
+                .iter()
+                .copied()
+                .filter(|&i| all_shards[i].is_none())
+                .collect();
+
+            let present_indices: Vec<usize> =
+                (0..(k + m)).filter(|&i| all_shards[i].is_some()).collect();
+            let present_refs: Vec<&[u8]> = present_indices
+                .iter()
+                .map(|&i| all_shards[i].as_ref().unwrap().as_slice())
+                .collect();
+
+            let tmp_codec;
+            let codec = if chunk.ec_k == self.ec_config.data_shards
+                && chunk.ec_m == self.ec_config.parity_shards
+            {
+                &self.ec_codec
+            } else {
+                let ec_config = EcConfig::new(chunk.ec_k, chunk.ec_m)?;
+                tmp_codec = ErasureCodec::new(ec_config)?;
+                &tmp_codec
+            };
+
+            let mut outputs: Vec<Vec<u8>> = missing_needed
+                .iter()
+                .map(|_| vec![0u8; shard_size])
+                .collect();
+            let mut output_refs: Vec<&mut [u8]> =
+                outputs.iter_mut().map(|v| v.as_mut_slice()).collect();
+
+            codec.reconstruct(
+                &present_indices,
+                &present_refs,
+                &missing_needed,
+                &mut output_refs,
+            )?;
+
+            for (idx, &missing_idx) in missing_needed.iter().enumerate() {
+                all_shards[missing_idx] = Some(outputs[idx].clone());
+            }
+        }
+
+        let mut buf = Vec::with_capacity(padded);
+        for shard in all_shards.iter().take(k) {
+            buf.extend_from_slice(shard.as_ref().unwrap());
+        }
+        buf.truncate(chunk.size as usize);
+        Ok(buf)
+    }
+
+    /// Read a byte range from a chunk-manifest object by traversing its chunks.
+    ///
+    /// Maps [start, end] (inclusive) to the relevant chunks, reads each,
+    /// and concatenates the needed slices.
+    fn read_chunk_manifest_range(
+        &self,
+        bucket: &str,
+        key: &str,
+        chunks: &[StreamObjectChunkRecord],
+        start: usize,
+        end: usize,
+    ) -> Result<Vec<u8>, ServerError> {
+        let total_len = end - start + 1;
+        let mut result = Vec::with_capacity(total_len);
+        let mut offset: usize = 0;
+
+        for chunk in chunks {
+            let chunk_start = offset;
+            let chunk_end = offset + chunk.size as usize; // exclusive
+
+            if chunk_start > end {
+                break;
+            }
+            if chunk.size == 0 || chunk_end <= start {
+                offset = chunk_end;
+                continue;
+            }
+
+            let slice_start = start.saturating_sub(chunk_start);
+            let slice_end = if end < chunk_end - 1 {
+                end - chunk_start
+            } else {
+                chunk.size as usize - 1
+            };
+
+            let data = self.read_chunk_data(chunk)?;
+            result.extend_from_slice(&data[slice_start..=slice_end]);
+            offset = chunk_end;
+        }
+
+        if result.len() != total_len {
+            return Err(ServerError::IntegrityError {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                expected: total_len as u64,
+                actual: result.len() as u64,
+            });
+        }
+
+        Ok(result)
+    }
+
     /// Delete all shards for a list of object parts.
     fn delete_part_shards(&self, parts: &[ObjectPartRecord]) -> Result<(), ServerError> {
         for part in parts {
@@ -1770,6 +1959,20 @@ impl Coordinator {
         }
         Ok(())
     }
+
+    /// Delete all shards for a list of stream object chunks.
+    fn delete_chunk_shards(&self, chunks: &[StreamObjectChunkRecord]) -> Result<(), ServerError> {
+        for chunk in chunks {
+            let pg = self.storage_node.get_pg(chunk.shard_pg_id)?;
+            let total = chunk.ec_k as usize + chunk.ec_m as usize;
+            for i in 0..total {
+                let shard_key = ShardKey::new(&chunk.chunk_okh, chunk.chunk_vid, i as u8);
+                pg.delete_shard(&shard_key)?;
+            }
+        }
+        Ok(())
+    }
+
 
     /// Read a full part's data from its shard PG.
     ///
@@ -1983,16 +2186,22 @@ impl Coordinator {
             })
         } else {
             // Non-multipart: metadata from DB row, user data from shards.
-            let okh = object_key_hash(bucket, key);
-            let object_version_id = record.version_id;
             let etag_crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
-            let shard_pg = pgs.shard();
-
             let user_size = record.size as usize;
+
+            // Check for chunk manifest (stream-put objects).
+            let meta_pg = pgs.meta();
+            let chunks = meta_pg
+                .get_stream_object_chunks(bucket, key, record.version_id)
+                .map_err(ServerError::Metadata)?;
+
             let user_data = if user_size == 0 {
+                drop(pgs);
                 vec![]
-            } else {
-                self.read_range(shard_pg, &okh, object_version_id, &record, 0, user_size - 1)
+            } else if !chunks.is_empty() {
+                // Chunk-manifest object: read from per-chunk shard sets.
+                drop(pgs);
+                self.read_chunk_manifest_range(bucket, key, &chunks, 0, user_size - 1)
                     .map_err(|e| match e {
                         ServerError::Store(storage::StoreError::NotFound) => {
                             ServerError::ObjectNotFound {
@@ -2002,6 +2211,23 @@ impl Coordinator {
                         }
                         other => other,
                     })?
+            } else {
+                // Single shard set (non-streamed write).
+                let okh = object_key_hash(bucket, key);
+                let shard_pg = pgs.shard();
+                let data = self
+                    .read_range(shard_pg, &okh, record.version_id, &record, 0, user_size - 1)
+                    .map_err(|e| match e {
+                        ServerError::Store(storage::StoreError::NotFound) => {
+                            ServerError::ObjectNotFound {
+                                bucket: bucket.to_string(),
+                                key: key.to_string(),
+                            }
+                        }
+                        other => other,
+                    })?;
+                drop(pgs);
+                data
             };
 
             // Verify CRC against stored etag (user data only).
@@ -2130,16 +2356,21 @@ impl Coordinator {
                 return Err(ServerError::InvalidPart { part_number });
             }
 
-            let okh = object_key_hash(bucket, key);
-            let object_version_id = record.version_id;
             let etag_crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
-            let shard_pg = pgs.shard();
-
             let user_size = record.size as usize;
+
+            // Check for chunk manifest (stream-put objects).
+            let meta_pg = pgs.meta();
+            let chunks = meta_pg
+                .get_stream_object_chunks(bucket, key, record.version_id)
+                .map_err(ServerError::Metadata)?;
+
             let user_data = if user_size == 0 {
+                drop(pgs);
                 vec![]
-            } else {
-                self.read_range(shard_pg, &okh, object_version_id, &record, 0, user_size - 1)
+            } else if !chunks.is_empty() {
+                drop(pgs);
+                self.read_chunk_manifest_range(bucket, key, &chunks, 0, user_size - 1)
                     .map_err(|e| match e {
                         ServerError::Store(storage::StoreError::NotFound) => {
                             ServerError::ObjectNotFound {
@@ -2149,6 +2380,22 @@ impl Coordinator {
                         }
                         other => other,
                     })?
+            } else {
+                let okh = object_key_hash(bucket, key);
+                let shard_pg = pgs.shard();
+                let data = self
+                    .read_range(shard_pg, &okh, record.version_id, &record, 0, user_size - 1)
+                    .map_err(|e| match e {
+                        ServerError::Store(storage::StoreError::NotFound) => {
+                            ServerError::ObjectNotFound {
+                                bucket: bucket.to_string(),
+                                key: key.to_string(),
+                            }
+                        }
+                        other => other,
+                    })?;
+                drop(pgs);
+                data
             };
 
             let actual_crc = crc64::checksum(&user_data);
@@ -2499,11 +2746,7 @@ impl Coordinator {
 
             (metadata, data)
         } else {
-            // Non-multipart: metadata from DB row, user data range from shards.
-            let okh = object_key_hash(bucket, key);
-            let object_version_id = record.version_id;
-            let shard_pg = pgs.shard();
-
+            // Non-multipart: metadata from DB row, user data from shards.
             let metadata = record
                 .metadata_blob
                 .as_ref()
@@ -2511,16 +2754,38 @@ impl Coordinator {
                 .transpose()?
                 .unwrap_or_default();
 
-            let data = self
-                .read_range(
-                    shard_pg,
-                    &okh,
-                    object_version_id,
-                    &record,
+            // Check for chunk manifest (stream-put objects).
+            let meta_pg = pgs.meta();
+            let chunks = meta_pg
+                .get_stream_object_chunks(bucket, key, record.version_id)
+                .map_err(ServerError::Metadata)?;
+
+            let data = if !chunks.is_empty() {
+                drop(pgs);
+                self.read_chunk_manifest_range(
+                    bucket,
+                    key,
+                    &chunks,
                     user_start as usize,
                     user_end as usize,
                 )
-                .map_err(not_found)?;
+                .map_err(not_found)?
+            } else {
+                let okh = object_key_hash(bucket, key);
+                let shard_pg = pgs.shard();
+                let d = self
+                    .read_range(
+                        shard_pg,
+                        &okh,
+                        record.version_id,
+                        &record,
+                        user_start as usize,
+                        user_end as usize,
+                    )
+                    .map_err(not_found)?;
+                drop(pgs);
+                d
+            };
 
             (metadata, data)
         };
@@ -2587,18 +2852,31 @@ impl Coordinator {
                     drop(pgs);
                     self.delete_part_shards(&obj_parts)?;
                 } else {
-                    let okh = object_key_hash(bucket, key);
                     let vid = record.version_id;
-                    let total = record.ec_k as usize + record.ec_m as usize;
 
-                    // Delete all shards (idempotent)
-                    for i in 0..total {
-                        let shard_key = ShardKey::new(&okh, vid, i as u8);
-                        shard_pg.delete_shard(&shard_key)?;
+                    // Check for chunk manifest (stream-put objects).
+                    let chunks = meta_pg
+                        .get_stream_object_chunks(bucket, key, vid)
+                        .map_err(ServerError::Metadata)?;
+
+                    if !chunks.is_empty() {
+                        meta_pg
+                            .delete_stream_object_chunks(bucket, key, vid)
+                            .map_err(ServerError::Metadata)?;
+                        meta_pg.delete_object_meta(bucket, key)?;
+                        drop(pgs);
+                        let _ = self.delete_chunk_shards(&chunks);
+                    } else {
+                        let okh = object_key_hash(bucket, key);
+                        let total = record.ec_k as usize + record.ec_m as usize;
+
+                        for i in 0..total {
+                            let shard_key = ShardKey::new(&okh, vid, i as u8);
+                            shard_pg.delete_shard(&shard_key)?;
+                        }
+
+                        meta_pg.delete_object_meta(bucket, key)?;
                     }
-
-                    // Delete metadata record
-                    meta_pg.delete_object_meta(bucket, key)?;
                 }
 
                 Ok(DeleteObjectResult {
@@ -2634,6 +2912,25 @@ impl Coordinator {
                         meta_pg.delete_object_version(bucket, key, vid)?;
                         drop(pgs);
                         self.delete_part_shards(&obj_parts)?;
+
+                        return Ok(DeleteObjectResult {
+                            version_id: vid,
+                            delete_marker: false,
+                        });
+                    }
+
+                    // Check for chunk manifest (stream-put objects).
+                    let chunks = meta_pg
+                        .get_stream_object_chunks(bucket, key, vid)
+                        .map_err(ServerError::Metadata)?;
+
+                    if !chunks.is_empty() {
+                        meta_pg
+                            .delete_stream_object_chunks(bucket, key, vid)
+                            .map_err(ServerError::Metadata)?;
+                        meta_pg.delete_object_version(bucket, key, vid)?;
+                        drop(pgs);
+                        let _ = self.delete_chunk_shards(&chunks);
 
                         return Ok(DeleteObjectResult {
                             version_id: vid,
@@ -3123,20 +3420,36 @@ impl Coordinator {
                 )
                 .map_err(not_found)?
             } else {
-                // Non-multipart source: read user data range directly from shards.
-                let src_shard_pg = pgs.shard();
-                let src_okh = object_key_hash(src_bucket, src_key);
-                let src_version_id = src_record.version_id;
+                // Non-multipart source: check for chunk manifest first.
+                let meta_pg = pgs.meta();
+                let chunks = meta_pg
+                    .get_stream_object_chunks(src_bucket, src_key, src_record.version_id)
+                    .map_err(ServerError::Metadata)?;
 
-                self.read_range(
-                    src_shard_pg,
-                    &src_okh,
-                    src_version_id,
-                    &src_record,
-                    read_start as usize,
-                    read_end as usize,
-                )
-                .map_err(not_found)?
+                if !chunks.is_empty() {
+                    drop(pgs);
+                    self.read_chunk_manifest_range(
+                        src_bucket,
+                        src_key,
+                        &chunks,
+                        read_start as usize,
+                        read_end as usize,
+                    )
+                    .map_err(not_found)?
+                } else {
+                    let src_shard_pg = pgs.shard();
+                    let src_okh = object_key_hash(src_bucket, src_key);
+
+                    self.read_range(
+                        src_shard_pg,
+                        &src_okh,
+                        src_record.version_id,
+                        &src_record,
+                        read_start as usize,
+                        read_end as usize,
+                    )
+                    .map_err(not_found)?
+                }
             }
         }; // source locks dropped here
 
@@ -8552,11 +8865,9 @@ mod tests {
     }
 
     #[test]
-    fn stream_put_get_object_not_yet_supported() {
+    fn stream_put_get_object_readable() {
         // Stream-finalized objects use chunk manifests for shard data.
-        // The current get_object read path doesn't consult stream_object_chunks,
-        // so GET on a stream-put object will fail until Phase 4 adds chunk-
-        // manifest readers. This test documents that known limitation.
+        // GET reads from stream_object_chunks to reconstruct the object.
         let dir = tempfile::tempdir().unwrap();
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
@@ -8583,12 +8894,341 @@ mod tests {
         let head = coord.head_object("bucket", "key", None, NO_READ).unwrap();
         assert_eq!(head.size, 5);
 
-        // GET fails because read path uses object_key_hash, not chunk manifest.
+        // GET returns the correct data.
+        let result = coord.get_object("bucket", "key", None, NO_READ).unwrap();
+        assert_eq!(result.data, b"hello");
+        assert_eq!(result.size, 5);
+    }
+
+    #[test]
+    fn stream_put_get_multi_chunk() {
+        // Stream-put with multiple chunks: GET reconstructs all chunks.
+        let dir = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let session_id = coord.begin_stream_put("bucket", "key").unwrap();
+        coord
+            .append_stream_chunk("bucket", "key", &session_id, 0, b"aaaa")
+            .unwrap();
+        coord
+            .append_stream_chunk("bucket", "key", &session_id, 1, b"bbbb")
+            .unwrap();
+        coord
+            .append_stream_chunk("bucket", "key", &session_id, 2, b"cc")
+            .unwrap();
+
+        let full_data = b"aaaabbbbcc";
+        let crc = crc64::checksum(full_data);
+        coord
+            .finalize_stream_put(
+                "bucket",
+                "key",
+                &session_id,
+                crc,
+                10,
+                &MetadataBlob::new(),
+                &WriteCondition::default(),
+            )
+            .unwrap();
+
+        let result = coord.get_object("bucket", "key", None, NO_READ).unwrap();
+        assert_eq!(result.data, full_data);
+        assert_eq!(result.size, 10);
+    }
+
+    #[test]
+    fn stream_put_range_read() {
+        // Range reads on stream-put objects work correctly.
+        let dir = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let session_id = coord.begin_stream_put("bucket", "key").unwrap();
+        coord
+            .append_stream_chunk("bucket", "key", &session_id, 0, b"AAAA")
+            .unwrap();
+        coord
+            .append_stream_chunk("bucket", "key", &session_id, 1, b"BBBB")
+            .unwrap();
+
+        let full_data = b"AAAABBBB";
+        let crc = crc64::checksum(full_data);
+        coord
+            .finalize_stream_put(
+                "bucket",
+                "key",
+                &session_id,
+                crc,
+                8,
+                &MetadataBlob::new(),
+                &WriteCondition::default(),
+            )
+            .unwrap();
+
+        // Range within first chunk.
+        let r1 = coord
+            .get_object_range(
+                "bucket",
+                "key",
+                None,
+                ByteRange::Range { start: 0, end: 3 },
+                NO_READ,
+            )
+            .unwrap();
+        assert_eq!(r1.data, b"AAAA");
+
+        // Range spanning chunks.
+        let r2 = coord
+            .get_object_range(
+                "bucket",
+                "key",
+                None,
+                ByteRange::Range { start: 2, end: 5 },
+                NO_READ,
+            )
+            .unwrap();
+        assert_eq!(r2.data, b"AABB");
+
+        // Range within second chunk.
+        let r3 = coord
+            .get_object_range(
+                "bucket",
+                "key",
+                None,
+                ByteRange::Range { start: 4, end: 7 },
+                NO_READ,
+            )
+            .unwrap();
+        assert_eq!(r3.data, b"BBBB");
+
+        // Suffix range.
+        let r4 = coord
+            .get_object_range("bucket", "key", None, ByteRange::Suffix { length: 3 }, NO_READ)
+            .unwrap();
+        assert_eq!(r4.data, b"BBB");
+    }
+
+    #[test]
+    fn stream_put_copy_object() {
+        // CopyObject from a stream-put source works correctly.
+        let dir = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let session_id = coord.begin_stream_put("bucket", "src").unwrap();
+        coord
+            .append_stream_chunk("bucket", "src", &session_id, 0, b"copy-me")
+            .unwrap();
+        let crc = crc64::checksum(b"copy-me");
+        coord
+            .finalize_stream_put(
+                "bucket",
+                "src",
+                &session_id,
+                crc,
+                7,
+                &MetadataBlob::new(),
+                &WriteCondition::default(),
+            )
+            .unwrap();
+
+        // Copy to destination.
+        coord
+            .copy_object(
+                "bucket",
+                "src",
+                None,
+                "bucket",
+                "dst",
+                NO_READ,
+                &WriteCondition::default(),
+                MetadataDirective::Copy,
+                &[],
+            )
+            .unwrap();
+
+        // Destination should be a normal (non-chunk-manifest) object.
+        let result = coord.get_object("bucket", "dst", None, NO_READ).unwrap();
+        assert_eq!(result.data, b"copy-me");
+    }
+
+    #[test]
+    fn stream_put_zero_byte_get() {
+        // Zero-byte stream-put objects are readable.
+        let dir = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let session_id = coord.begin_stream_put("bucket", "empty").unwrap();
+        let crc = crc64::checksum(b"");
+        coord
+            .finalize_stream_put(
+                "bucket",
+                "empty",
+                &session_id,
+                crc,
+                0,
+                &MetadataBlob::new(),
+                &WriteCondition::default(),
+            )
+            .unwrap();
+
+        let result = coord
+            .get_object("bucket", "empty", None, NO_READ)
+            .unwrap();
+        assert_eq!(result.data, b"");
+        assert_eq!(result.size, 0);
+    }
+
+    #[test]
+    fn stream_put_get_object_part() {
+        // partNumber=1 on stream-put objects returns the full body.
+        let dir = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let session_id = coord.begin_stream_put("bucket", "key").unwrap();
+        coord
+            .append_stream_chunk("bucket", "key", &session_id, 0, b"partdata")
+            .unwrap();
+        let crc = crc64::checksum(b"partdata");
+        coord
+            .finalize_stream_put(
+                "bucket",
+                "key",
+                &session_id,
+                crc,
+                8,
+                &MetadataBlob::new(),
+                &WriteCondition::default(),
+            )
+            .unwrap();
+
+        let result = coord
+            .get_object_part("bucket", "key", None, 1, NO_READ)
+            .unwrap();
+        assert_eq!(result.data, b"partdata");
+    }
+
+    #[test]
+    fn stream_put_overwrite_with_normal_put_cleans_chunks() {
+        // P0 fix: normal PUT after stream-write must clear stale chunk rows.
+        let dir = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        // Stream-write an object.
+        let session_id = coord.begin_stream_put("bucket", "key").unwrap();
+        coord
+            .append_stream_chunk("bucket", "key", &session_id, 0, b"stream-data")
+            .unwrap();
+        let crc = crc64::checksum(b"stream-data");
+        coord
+            .finalize_stream_put(
+                "bucket",
+                "key",
+                &session_id,
+                crc,
+                11,
+                &MetadataBlob::new(),
+                &WriteCondition::default(),
+            )
+            .unwrap();
+
+        // Verify stream-put is readable.
+        let r1 = coord.get_object("bucket", "key", None, NO_READ).unwrap();
+        assert_eq!(r1.data, b"stream-data");
+
+        // Overwrite with a normal PUT.
+        coord
+            .put_object("bucket", "key", b"normal-data", &[], &WriteCondition::default())
+            .unwrap();
+
+        // GET should return the new data, not stale chunk data.
+        let r2 = coord.get_object("bucket", "key", None, NO_READ).unwrap();
+        assert_eq!(r2.data, b"normal-data");
+    }
+
+    #[test]
+    fn stream_put_delete_cleans_chunks() {
+        // P1 fix: delete must clean up stream_object_chunks and their shards.
+        let dir = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let session_id = coord.begin_stream_put("bucket", "key").unwrap();
+        coord
+            .append_stream_chunk("bucket", "key", &session_id, 0, b"delete-me")
+            .unwrap();
+        let crc = crc64::checksum(b"delete-me");
+        coord
+            .finalize_stream_put(
+                "bucket",
+                "key",
+                &session_id,
+                crc,
+                9,
+                &MetadataBlob::new(),
+                &WriteCondition::default(),
+            )
+            .unwrap();
+
+        // Delete the object.
+        coord
+            .delete_object("bucket", "key", None, &crate::conditional::DeleteCondition::default())
+            .unwrap();
+
+        // Object should be gone.
         let err = coord.get_object("bucket", "key", None, NO_READ).unwrap_err();
-        assert!(
-            matches!(err, ServerError::ObjectNotFound { .. } | ServerError::Store(_)),
-            "expected read failure for chunk-manifest object, got {err:?}"
-        );
+        assert!(matches!(err, ServerError::ObjectNotFound { .. }));
+    }
+
+    #[test]
+    fn stream_put_upload_part_copy_from_stream_source() {
+        // P2 fix: UploadPartCopy must be able to read stream-written source objects.
+        let dir = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        // Stream-write a source object.
+        let session_id = coord.begin_stream_put("bucket", "src").unwrap();
+        coord
+            .append_stream_chunk("bucket", "src", &session_id, 0, b"source-data")
+            .unwrap();
+        let crc = crc64::checksum(b"source-data");
+        coord
+            .finalize_stream_put(
+                "bucket",
+                "src",
+                &session_id,
+                crc,
+                11,
+                &MetadataBlob::new(),
+                &WriteCondition::default(),
+            )
+            .unwrap();
+
+        // Create a multipart upload for the destination.
+        let upload = coord
+            .create_multipart_upload("bucket", "dst", &MetadataBlob::new(), None, None)
+            .unwrap();
+
+        // UploadPartCopy from the stream-written source.
+        let result = coord
+            .upload_part_copy(
+                "bucket",
+                "src",
+                None,
+                "bucket",
+                "dst",
+                &upload.upload_id,
+                1,
+                NO_READ,
+                None,
+            )
+            .unwrap();
+        assert!(!result.etag.is_empty());
     }
 
     #[test]
