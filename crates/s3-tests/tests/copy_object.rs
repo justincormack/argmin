@@ -1,5 +1,5 @@
 use aws_sdk_s3::primitives::ByteStream;
-use s3_tests::{cleanup_versioned_bucket, err_status, unique_bucket, CTX};
+use s3_tests::{assert_s3_err_code, cleanup_versioned_bucket, err_status, unique_bucket, CTX};
 
 /// Create a bucket, returning its name.
 async fn setup_bucket() -> String {
@@ -730,6 +730,63 @@ fn test_object_copy_versioning_multipart_upload() {
 #[ignore = "not implemented: multi-user"]
 fn test_object_copy_not_owned_bucket() {
     s3_tests::run(async {});
+}
+
+/// CopyObject from a delete-marker source should fail with 404/NoSuchKey.
+#[test]
+fn test_copy_object_delete_marker_source() {
+    s3_tests::run(async {
+        use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
+
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+
+        client
+            .put_bucket_versioning()
+            .bucket(&bucket)
+            .versioning_configuration(
+                VersioningConfiguration::builder()
+                    .status(BucketVersioningStatus::Enabled)
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let src_key = "delete-marker-src";
+        let dst_key = "delete-marker-dst";
+
+        // Put then delete to create a delete marker as current version
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(src_key)
+            .body(ByteStream::from_static(b"original"))
+            .send()
+            .await
+            .unwrap();
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(src_key)
+            .send()
+            .await
+            .unwrap();
+
+        // CopyObject from the delete-marked key should fail
+        let result = client
+            .copy_object()
+            .bucket(&bucket)
+            .key(dst_key)
+            .copy_source(format!("{}/{}", bucket, src_key))
+            .send()
+            .await;
+        let status = err_status(&result);
+        assert_eq!(status, 404);
+        assert_s3_err_code(&result, "NoSuchKey");
+
+        cleanup_versioned_bucket(&client, &bucket).await;
+    });
 }
 
 #[test]

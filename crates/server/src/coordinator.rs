@@ -926,6 +926,14 @@ impl Coordinator {
                 pgs,
             } = self.lock_object_pgs_for_read(src_bucket, src_key, src_version_id)?;
 
+            // Reject delete markers — they are not copyable objects.
+            if src_record.status == 1 {
+                return Err(ServerError::ObjectNotFound {
+                    bucket: src_bucket.to_string(),
+                    key: src_key.to_string(),
+                });
+            }
+
             let src_etag = format_object_etag(
                 &src_record.etag,
                 src_record.etag_kind,
