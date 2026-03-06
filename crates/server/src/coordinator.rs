@@ -26,7 +26,7 @@ use crate::pg::{chunk_key_hash, derive_pg, derive_pg_shards, object_key_hash, pa
 use crate::range::ByteRange;
 
 /// Maximum object size for single PUT (256 MB).
-const MAX_OBJECT_SIZE: u64 = 256 * 1024 * 1024;
+pub const MAX_OBJECT_SIZE: u64 = 256 * 1024 * 1024;
 
 /// Hard cap on total records fetched across all PGs for a single list query.
 /// Prevents unbounded memory when delimiter causes u32::MAX per-PG limits.

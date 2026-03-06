@@ -1,7 +1,7 @@
 /// Async hyper HTTP server loop with frontend pool and backpressure.
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -16,9 +16,14 @@ use tokio::sync::Semaphore;
 
 use super::request::{S3Request, MAX_BODY_SIZE};
 use super::response::S3Response;
+use super::router::{route, S3Operation};
 use super::s3_response_to_hyper;
 use super::HttpFrontend;
+use crate::coordinator::MAX_OBJECT_SIZE;
 use crate::error::ServerError;
+
+/// Default internal chunk payload size for streaming writes (4 MiB).
+const STREAM_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 
 /// Tunable timeouts for the HTTP serve layer.
 pub struct ServeConfig {
@@ -128,21 +133,9 @@ pub async fn serve(
 
 /// Handle a single HTTP request: collect body, parse, dispatch, return response.
 ///
-/// The request semaphore is acquired before body collection so that at most
-/// pool_size request bodies are buffered concurrently, bounding memory to
-/// `pool_size * MAX_BODY_SIZE`. If the semaphore cannot be acquired within
-/// REQUEST_WAIT_TIMEOUT, a 503 SlowDown response is returned.
-///
-/// Body collection uses a per-frame idle timeout (BODY_IDLE_TIMEOUT) rather
-/// than a hard total timeout. The timer resets on every data frame, so
-/// legitimate slow-but-steady uploads complete regardless of total transfer
-/// time. Only truly stalled connections are killed.
-///
-/// Tradeoff: slow uploads hold a request permit for the entire body read,
-/// which can delay cheap operations (HEAD, small GET) under heavy upload load.
-/// A future improvement could split body-memory permits from execution permits
-/// to avoid this starvation. For now the idle timeout + 5-second shed timeout
-/// limits the blast radius.
+/// For streaming-eligible writes (PutObject/UploadPart with UNSIGNED-PAYLOAD
+/// and no copy source), body frames are consumed incrementally and fed to
+/// coordinator chunk appends. All other requests collect the full body first.
 ///
 /// Errors are always converted to S3 XML error responses.
 async fn handle(
@@ -150,9 +143,6 @@ async fn handle(
     req: Request<Incoming>,
 ) -> Result<http::Response<Full<Bytes>>, Infallible> {
     // Acquire request permit before body collection to bound memory.
-    // If all workers are busy, shed load with 503 after a brief wait.
-    // The permit is held in this async function (not moved into spawn_blocking)
-    // and released when the function returns.
     let _req_permit = match tokio::time::timeout(
         state.config.request_wait_timeout,
         state.request_semaphore.acquire(),
@@ -168,9 +158,13 @@ async fn handle(
 
     let (parts, body) = req.into_parts();
 
-    // Collect body with size limit and per-frame idle timeout.
-    // The idle timeout resets on every data frame, so slow-but-steady uploads
-    // complete successfully; only truly stalled connections are killed.
+    // Check if this request should use the streaming write path.
+    if let Some((bucket, key)) = is_streaming_put(&parts) {
+        let resp = handle_streaming_put(Arc::clone(&state), parts, body, bucket, key).await;
+        return Ok(s3_response_to_hyper(resp));
+    }
+
+    // Non-streaming path: collect full body, parse, dispatch.
     let body_bytes = match collect_body(body, state.config.body_idle_timeout).await {
         Ok(bytes) => bytes,
         Err(err) => {
@@ -178,7 +172,6 @@ async fn handle(
         }
     };
 
-    // Parse into S3Request
     let s3req = match S3Request::from_hyper(&parts, body_bytes) {
         Ok(req) => req,
         Err(err) => {
@@ -186,25 +179,9 @@ async fn handle(
         }
     };
 
-    // Dispatch on blocking thread pool with try_lock scheduling.
-    // Try each frontend starting from the round-robin position; if all are
-    // locked (busy), fall back to blocking on the first choice.
     let state_ref = Arc::clone(&state);
     let resp = tokio::task::spawn_blocking(move || {
-        let pool_size = state_ref.pool.len();
-        let start = state_ref.counter.fetch_add(1, Ordering::Relaxed) % pool_size;
-
-        for i in 0..pool_size {
-            let idx = (start + i) % pool_size;
-            if let Ok(frontend) = state_ref.pool[idx].try_lock() {
-                return frontend.handle_s3_request(&s3req);
-            }
-        }
-
-        // All busy — block on the original choice
-        let frontend = state_ref.pool[start]
-            .lock()
-            .expect("frontend mutex poisoned");
+        let frontend = acquire_frontend(&state_ref);
         frontend.handle_s3_request(&s3req)
     })
     .await
@@ -218,6 +195,237 @@ async fn handle(
     });
 
     Ok(s3_response_to_hyper(resp))
+}
+
+/// Check if a PUT request should use the streaming write path.
+///
+/// Returns `Some((bucket, key))` for PutObject requests that:
+/// - Are not CopyObject (no `x-amz-copy-source` header)
+/// - Use UNSIGNED-PAYLOAD (body not needed for auth verification)
+/// - Are not aws-chunked (no STREAMING-* content hash)
+///
+/// Currently gated: returns `None` unconditionally because GET for stream-put
+/// objects is not yet implemented (Phase 4). Remove the gate once the read
+/// path supports chunk manifests.
+fn is_streaming_put(parts: &http::request::Parts) -> Option<(String, String)> {
+    // Gate: stream-put objects are not readable via GET until Phase 4.
+    let _ = parts;
+    if true {
+        return None;
+    }
+
+    #[allow(unreachable_code)]
+    is_streaming_put_inner(parts)
+}
+
+/// Inner logic for streaming PUT eligibility, separated for testability.
+fn is_streaming_put_inner(parts: &http::request::Parts) -> Option<(String, String)> {
+    if parts.method != http::Method::PUT {
+        return None;
+    }
+
+    // Check headers via hyper types (not yet parsed into S3Request).
+    let has_copy_source = parts.headers.contains_key("x-amz-copy-source");
+    if has_copy_source {
+        return None;
+    }
+
+    let content_sha256 = parts
+        .headers
+        .get("x-amz-content-sha256")
+        .and_then(|v| v.to_str().ok());
+
+    match content_sha256 {
+        Some("UNSIGNED-PAYLOAD") => {} // Eligible for streaming
+        Some(v) if v.starts_with("STREAMING-") => return None, // Phase 3b
+        Some(_) => return None, // Real SHA256 hash — need full body for verification
+        None => return None,    // No header — need full body for auth
+    }
+
+    let path = parts.uri.path();
+    let query = parts.uri.query().unwrap_or("");
+    let method = parts.method.as_str();
+
+    // Route to check if this is PutObject (not bucket config or other PUT ops).
+    let op = route(method, path, query).ok()?;
+    match op {
+        S3Operation::PutObject { bucket, key } => Some((bucket, key)),
+        // TODO: Phase 3a UploadPart streaming (needs begin_stream_part coordinator method)
+        _ => None,
+    }
+}
+
+/// Handle a streaming PutObject: read body frame-by-frame, feed chunks to
+/// coordinator append API, finalize atomically.
+///
+/// Each chunk append is dispatched via `spawn_blocking` with a brief frontend
+/// lock. Between appends, no frontend is held — body reading is async.
+async fn handle_streaming_put(
+    state: Arc<ServerState>,
+    parts: http::request::Parts,
+    body: Incoming,
+    bucket: String,
+    key: String,
+) -> S3Response {
+    let idle_timeout = state.config.body_idle_timeout;
+
+    // 1. Parse headers (no body) and prepare streaming session.
+    let s3req = match S3Request::from_hyper_headers(&parts) {
+        Ok(req) => req,
+        Err(err) => return S3Response::error(&err, ""),
+    };
+
+    let state2 = Arc::clone(&state);
+    let bucket_clone = bucket.clone();
+    let key_clone = key.clone();
+    let ctx = match tokio::task::spawn_blocking(move || {
+        let frontend = acquire_frontend(&state2);
+        frontend.prepare_streaming_put(&s3req, &bucket_clone, &key_clone)
+    })
+    .await
+    {
+        Ok(Ok(ctx)) => ctx,
+        Ok(Err(err)) => return error_response(&err),
+        Err(_) => return internal_error_response(),
+    };
+
+    // 2. Stream body frames, accumulating into STREAM_CHUNK_SIZE buffers.
+    let ctx = Arc::new(ctx);
+    let mut hasher = crc64::Hasher::new();
+    let mut chunk_index: u32 = 0;
+    let mut buf = Vec::with_capacity(STREAM_CHUNK_SIZE);
+    let mut total_size: u64 = 0;
+    let mut body = body;
+
+    loop {
+        match tokio::time::timeout(idle_timeout, body.frame()).await {
+            Ok(Some(Ok(frame))) => {
+                if let Some(chunk) = frame.data_ref() {
+                    hasher.update(chunk);
+                    total_size += chunk.len() as u64;
+                    if total_size > MAX_OBJECT_SIZE {
+                        abort_streaming(&state, &ctx).await;
+                        return error_response(&ServerError::ObjectTooLarge {
+                            size: total_size,
+                            max: MAX_OBJECT_SIZE,
+                        });
+                    }
+                    buf.extend_from_slice(chunk);
+
+                    // Flush when buffer reaches chunk size.
+                    while buf.len() >= STREAM_CHUNK_SIZE {
+                        let flush_data: Vec<u8> = buf.drain(..STREAM_CHUNK_SIZE).collect();
+                        let idx = chunk_index;
+                        chunk_index += 1;
+                        let ctx_ref = Arc::clone(&ctx);
+                        let st = Arc::clone(&state);
+                        match tokio::task::spawn_blocking(move || {
+                            let frontend = acquire_frontend(&st);
+                            frontend.streaming_append_chunk(&ctx_ref, idx, &flush_data)
+                        })
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(err)) => {
+                                abort_streaming(&state, &ctx).await;
+                                return error_response(&err);
+                            }
+                            Err(_) => {
+                                abort_streaming(&state, &ctx).await;
+                                return internal_error_response();
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(Some(Err(_))) => {
+                abort_streaming(&state, &ctx).await;
+                return error_response(&ServerError::InvalidRequest {
+                    reason: "failed to read request body".to_string(),
+                });
+            }
+            Ok(None) => break, // Body complete
+            Err(_) => {
+                abort_streaming(&state, &ctx).await;
+                return error_response(&ServerError::InvalidRequest {
+                    reason: "request body read timed out".to_string(),
+                });
+            }
+        }
+    }
+
+    // 3. Flush remaining buffer.
+    if !buf.is_empty() {
+        let idx = chunk_index;
+        let ctx_ref = Arc::clone(&ctx);
+        let st = Arc::clone(&state);
+        match tokio::task::spawn_blocking(move || {
+            let frontend = acquire_frontend(&st);
+            frontend.streaming_append_chunk(&ctx_ref, idx, &buf)
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                abort_streaming(&state, &ctx).await;
+                return error_response(&err);
+            }
+            Err(_) => {
+                abort_streaming(&state, &ctx).await;
+                return internal_error_response();
+            }
+        }
+    }
+
+    // 4. Finalize the streaming upload.
+    let crc64 = hasher.finalize();
+    let ctx_ref = Arc::clone(&ctx);
+    let st = Arc::clone(&state);
+    match tokio::task::spawn_blocking(move || {
+        let frontend = acquire_frontend(&st);
+        frontend.finalize_streaming_put(&ctx_ref, crc64, total_size)
+    })
+    .await
+    {
+        Ok(Ok(resp)) => resp,
+        Ok(Err(err)) => {
+            abort_streaming(&state, &ctx).await;
+            error_response(&err)
+        }
+        Err(_) => {
+            abort_streaming(&state, &ctx).await;
+            internal_error_response()
+        }
+    }
+}
+
+/// Best-effort abort of a streaming upload session.
+async fn abort_streaming(
+    state: &Arc<ServerState>,
+    ctx: &Arc<super::StreamingPutContext>,
+) {
+    let st = Arc::clone(state);
+    let ctx = Arc::clone(ctx);
+    let _ = tokio::task::spawn_blocking(move || {
+        let frontend = acquire_frontend(&st);
+        frontend.abort_streaming_put(&ctx);
+    })
+    .await;
+}
+
+/// Acquire a frontend from the pool using round-robin with try_lock.
+fn acquire_frontend(state: &ServerState) -> MutexGuard<'_, HttpFrontend> {
+    let pool_size = state.pool.len();
+    let start = state.counter.fetch_add(1, Ordering::Relaxed) % pool_size;
+
+    for i in 0..pool_size {
+        let idx = (start + i) % pool_size;
+        if let Ok(frontend) = state.pool[idx].try_lock() {
+            return frontend;
+        }
+    }
+
+    state.pool[start].lock().expect("frontend mutex poisoned")
 }
 
 /// Collect a request body with size limiting and per-frame idle timeout.
@@ -261,4 +469,154 @@ async fn collect_body(body: Incoming, idle_timeout: Duration) -> Result<Bytes, S
     }
 
     Ok(Bytes::from(data))
+}
+
+fn error_response(err: &ServerError) -> S3Response {
+    S3Response::error(err, "")
+}
+
+fn internal_error_response() -> S3Response {
+    S3Response::error(
+        &ServerError::InvalidRequest {
+            reason: "internal error".to_string(),
+        },
+        "",
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal `http::request::Parts` for testing `is_streaming_put_inner`.
+    fn make_parts(
+        method: &str,
+        uri: &str,
+        headers: &[(&str, &str)],
+    ) -> http::request::Parts {
+        let mut builder = http::Request::builder()
+            .method(method)
+            .uri(uri);
+        for (k, v) in headers {
+            builder = builder.header(*k, *v);
+        }
+        let (parts, _body) = builder.body(()).unwrap().into_parts();
+        parts
+    }
+
+    #[test]
+    fn streaming_put_eligible() {
+        let parts = make_parts(
+            "PUT",
+            "/mybucket/mykey",
+            &[("x-amz-content-sha256", "UNSIGNED-PAYLOAD")],
+        );
+        let result = is_streaming_put_inner(&parts);
+        assert_eq!(result, Some(("mybucket".to_string(), "mykey".to_string())));
+    }
+
+    #[test]
+    fn streaming_put_not_put_method() {
+        let parts = make_parts(
+            "POST",
+            "/mybucket/mykey",
+            &[("x-amz-content-sha256", "UNSIGNED-PAYLOAD")],
+        );
+        assert_eq!(is_streaming_put_inner(&parts), None);
+    }
+
+    #[test]
+    fn streaming_put_get_method() {
+        let parts = make_parts(
+            "GET",
+            "/mybucket/mykey",
+            &[("x-amz-content-sha256", "UNSIGNED-PAYLOAD")],
+        );
+        assert_eq!(is_streaming_put_inner(&parts), None);
+    }
+
+    #[test]
+    fn streaming_put_copy_source_excluded() {
+        let parts = make_parts(
+            "PUT",
+            "/mybucket/mykey",
+            &[
+                ("x-amz-content-sha256", "UNSIGNED-PAYLOAD"),
+                ("x-amz-copy-source", "/src-bucket/src-key"),
+            ],
+        );
+        assert_eq!(is_streaming_put_inner(&parts), None);
+    }
+
+    #[test]
+    fn streaming_put_real_sha256_excluded() {
+        let parts = make_parts(
+            "PUT",
+            "/mybucket/mykey",
+            &[("x-amz-content-sha256", "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890")],
+        );
+        assert_eq!(is_streaming_put_inner(&parts), None);
+    }
+
+    #[test]
+    fn streaming_put_no_sha256_header_excluded() {
+        let parts = make_parts("PUT", "/mybucket/mykey", &[]);
+        assert_eq!(is_streaming_put_inner(&parts), None);
+    }
+
+    #[test]
+    fn streaming_put_chunked_encoding_excluded() {
+        let parts = make_parts(
+            "PUT",
+            "/mybucket/mykey",
+            &[("x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")],
+        );
+        assert_eq!(is_streaming_put_inner(&parts), None);
+    }
+
+    #[test]
+    fn streaming_put_unsigned_chunked_excluded() {
+        let parts = make_parts(
+            "PUT",
+            "/mybucket/mykey",
+            &[("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER")],
+        );
+        assert_eq!(is_streaming_put_inner(&parts), None);
+    }
+
+    #[test]
+    fn streaming_put_bucket_config_excluded() {
+        // PUT /<bucket>?versioning is a bucket config op, not PutObject.
+        let parts = make_parts(
+            "PUT",
+            "/mybucket?versioning",
+            &[("x-amz-content-sha256", "UNSIGNED-PAYLOAD")],
+        );
+        assert_eq!(is_streaming_put_inner(&parts), None);
+    }
+
+    #[test]
+    fn streaming_put_deep_key() {
+        let parts = make_parts(
+            "PUT",
+            "/mybucket/path/to/deep/key.txt",
+            &[("x-amz-content-sha256", "UNSIGNED-PAYLOAD")],
+        );
+        let result = is_streaming_put_inner(&parts);
+        assert_eq!(
+            result,
+            Some(("mybucket".to_string(), "path/to/deep/key.txt".to_string()))
+        );
+    }
+
+    #[test]
+    fn streaming_gate_returns_none() {
+        // The public is_streaming_put is gated to always return None until Phase 4.
+        let parts = make_parts(
+            "PUT",
+            "/mybucket/mykey",
+            &[("x-amz-content-sha256", "UNSIGNED-PAYLOAD")],
+        );
+        assert_eq!(is_streaming_put(&parts), None);
+    }
 }

@@ -72,6 +72,15 @@ impl S3Request {
         })
     }
 
+    /// Parse hyper request parts into an S3Request with an empty body.
+    ///
+    /// Used by the streaming write path where the body is consumed frame-by-frame
+    /// rather than collected upfront. Auth works because the `x-amz-content-sha256`
+    /// header provides the body hash (typically `UNSIGNED-PAYLOAD`).
+    pub fn from_hyper_headers(parts: &http::request::Parts) -> Result<Self, ServerError> {
+        Self::from_hyper(parts, bytes::Bytes::new())
+    }
+
     /// Get a header value by lowercase name.
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers

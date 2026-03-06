@@ -1638,6 +1638,142 @@ impl HttpFrontend {
             success_status,
         ))
     }
+
+    // ── Streaming write helpers ─────────────────────────────────────
+
+    /// Prepare a streaming PutObject: authenticate, validate, begin session.
+    ///
+    /// Returns a context struct that the async streaming loop uses to drive
+    /// chunk appends and finalization.
+    pub fn prepare_streaming_put(
+        &self,
+        req: &S3Request,
+        bucket: &str,
+        key: &str,
+    ) -> Result<StreamingPutContext, ServerError> {
+        let auth = self.authenticate(req)?;
+        self.authorize_bucket_write(&auth, bucket)?;
+
+        // Enforce BucketOwnerEnforced ACL constraint.
+        if let Some(acl_value) = req.header("x-amz-acl") {
+            if let Some(ref oc_xml) = self.coordinator.get_bucket_ownership_controls(bucket)? {
+                if let Ok(val) = xml::parse_ownership_controls_xml(oc_xml.as_bytes()) {
+                    if val == "BucketOwnerEnforced"
+                        && acl_value != "bucket-owner-full-control"
+                        && acl_value != "private"
+                    {
+                        return Err(ServerError::AccessControlListNotSupported);
+                    }
+                }
+            }
+        }
+
+        validate_checksum_headers(req)?;
+
+        // Parse inline tags before starting the session.
+        let inline_tags_xml = if let Some(tagging_header) = req.header("x-amz-tagging") {
+            let tags = xml::parse_url_encoded_tags(tagging_header)?;
+            if tags.is_empty() {
+                None
+            } else {
+                Some(xml::get_tagging_xml(&tags))
+            }
+        } else {
+            None
+        };
+
+        let header_pairs: Vec<(&str, &str)> = req
+            .headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let metadata_blob = crate::metadata_blob::MetadataBlob::from_headers(&header_pairs)?;
+        let cond = write_condition_from_headers(req)?;
+
+        // Collect checksum response headers to echo back in the response.
+        let mut checksum_response: Vec<(String, String)> = Vec::new();
+        for &(_, header) in CHECKSUM_HEADERS {
+            if let Some(val) = req.header(header) {
+                checksum_response.push((header.to_string(), val.to_string()));
+            }
+        }
+
+        let session_id = self.coordinator.begin_stream_put(bucket, key)?;
+
+        Ok(StreamingPutContext {
+            session_id,
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            metadata_blob,
+            cond,
+            inline_tags_xml,
+            checksum_response,
+        })
+    }
+
+    /// Append a chunk to a streaming session.
+    pub fn streaming_append_chunk(
+        &self,
+        ctx: &StreamingPutContext,
+        chunk_index: u32,
+        data: &[u8],
+    ) -> Result<(), ServerError> {
+        self.coordinator
+            .append_stream_chunk(&ctx.bucket, &ctx.key, &ctx.session_id, chunk_index, data)
+    }
+
+    /// Finalize a streaming PutObject session and return an S3Response.
+    pub fn finalize_streaming_put(
+        &self,
+        ctx: &StreamingPutContext,
+        crc64: u64,
+        total_size: u64,
+    ) -> Result<S3Response, ServerError> {
+        let result = self.coordinator.finalize_stream_put(
+            &ctx.bucket,
+            &ctx.key,
+            &ctx.session_id,
+            crc64,
+            total_size,
+            &ctx.metadata_blob,
+            &ctx.cond,
+        )?;
+
+        if let Some(ref tags_xml) = ctx.inline_tags_xml {
+            self.coordinator.put_object_tags(
+                &ctx.bucket,
+                &ctx.key,
+                Some(result.version_id),
+                tags_xml,
+            )?;
+        }
+
+        let mut resp = S3Response::put_object(&result);
+        for (name, value) in &ctx.checksum_response {
+            resp.headers.push((name.clone(), value.clone()));
+        }
+        Ok(resp)
+    }
+
+    /// Abort a streaming session (best-effort cleanup).
+    pub fn abort_streaming_put(&self, ctx: &StreamingPutContext) {
+        let _ =
+            self.coordinator
+                .abort_stream_put(&ctx.bucket, &ctx.key, &ctx.session_id);
+    }
+}
+
+/// Context for an in-progress streaming PutObject.
+///
+/// Created by `prepare_streaming_put`, used across async/blocking boundaries.
+pub struct StreamingPutContext {
+    pub session_id: String,
+    pub bucket: String,
+    pub key: String,
+    pub metadata_blob: crate::metadata_blob::MetadataBlob,
+    pub cond: crate::conditional::WriteCondition,
+    pub inline_tags_xml: Option<String>,
+    pub checksum_response: Vec<(String, String)>,
 }
 
 /// Convert an S3Response into a hyper-compatible HTTP response.
