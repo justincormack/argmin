@@ -62,6 +62,13 @@ pub enum ServerError {
     #[error("bad digest")]
     BadDigest,
 
+    #[error("invalid chunk size: only the last chunk may be smaller than {min_size} bytes (chunk {chunk} was {chunk_size} bytes)")]
+    InvalidChunkSize {
+        chunk: usize,
+        chunk_size: usize,
+        min_size: usize,
+    },
+
     #[error("no CORS configuration")]
     NoSuchCorsConfiguration { bucket: String },
 
@@ -114,6 +121,15 @@ pub enum ServerError {
     #[error("malformed chunked body: {reason}")]
     MalformedChunkedBody { reason: String },
 
+    #[error("incomplete body")]
+    IncompleteBody,
+
+    #[error("missing content length")]
+    MissingContentLength,
+
+    #[error("malformed trailer: {reason}")]
+    MalformedTrailerError { reason: String },
+
     #[error("internal error: {reason}")]
     InternalError { reason: String },
 
@@ -159,6 +175,7 @@ impl ServerError {
             Self::InvalidRange { .. } => "InvalidRange",
             Self::SlowDown => "SlowDown",
             Self::BadDigest => "BadDigest",
+            Self::InvalidChunkSize { .. } => "InvalidChunkSizeError",
             Self::NoSuchCorsConfiguration { .. } => "NoSuchCORSConfiguration",
             Self::NoSuchTagSet { .. } => "NoSuchTagSet",
             Self::InvalidTag { .. } => "InvalidTag",
@@ -174,6 +191,9 @@ impl ServerError {
             Self::InvalidPartOrder => "InvalidPartOrder",
             Self::EntityTooSmall { .. } => "EntityTooSmall",
             Self::MalformedChunkedBody { .. } => "InvalidRequest",
+            Self::IncompleteBody => "IncompleteBody",
+            Self::MissingContentLength => "MissingContentLength",
+            Self::MalformedTrailerError { .. } => "MalformedTrailerError",
             Self::XAmzContentSHA256Mismatch { .. } => "XAmzContentSHA256Mismatch",
             Self::NotImplemented { .. } => "NotImplemented",
             Self::InternalError { .. } => "InternalError",
@@ -201,6 +221,7 @@ impl ServerError {
             | Self::InvalidArgument { .. }
             | Self::InvalidBucketName { .. }
             | Self::BadDigest => 400,
+            Self::InvalidChunkSize { .. } => 403,
             Self::NoSuchCorsConfiguration { .. } => 404,
             Self::NoSuchTagSet { .. } => 404,
             Self::NoSuchPublicAccessBlockConfiguration { .. } => 404,
@@ -209,7 +230,10 @@ impl ServerError {
             Self::AccessControlListNotSupported
             | Self::InvalidBucketAclWithObjectOwnership
             | Self::XAmzContentSHA256Mismatch { .. }
-            | Self::MalformedChunkedBody { .. } => 400,
+            | Self::MalformedChunkedBody { .. }
+            | Self::IncompleteBody
+            | Self::MalformedTrailerError { .. } => 400,
+            Self::MissingContentLength => 411,
             Self::AccessDenied => 403,
             Self::NoSuchUpload { .. } => 404,
             Self::InvalidPart { .. } | Self::InvalidPartOrder | Self::EntityTooSmall { .. } => 400,

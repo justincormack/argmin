@@ -1302,6 +1302,46 @@ impl HttpFrontend {
             _ => return Ok(None),
         };
 
+        // Whitelist allowed streaming tokens.
+        match content_sha {
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
+            | "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"
+            | "STREAMING-UNSIGNED-PAYLOAD-TRAILER" => {}
+            _ => {
+                return Err(ServerError::InvalidArgument {
+                    reason: format!("unsupported streaming token: {}", content_sha),
+                });
+            }
+        }
+
+        // Require content-encoding contains aws-chunked.
+        let has_aws_chunked = req
+            .header("content-encoding")
+            .map(|ce| {
+                ce.split(',')
+                    .any(|part| part.trim().eq_ignore_ascii_case("aws-chunked"))
+            })
+            .unwrap_or(false);
+        if !has_aws_chunked {
+            return Err(ServerError::MalformedTrailerError {
+                reason: "content-encoding must contain aws-chunked for streaming uploads"
+                    .to_string(),
+            });
+        }
+
+        // Require x-amz-decoded-content-length.
+        let expected_str = req
+            .header("x-amz-decoded-content-length")
+            .ok_or(ServerError::MissingContentLength)?;
+        let expected_len =
+            expected_str
+                .parse::<usize>()
+                .map_err(|_| ServerError::InvalidRequest {
+                    reason: format!("invalid x-amz-decoded-content-length: {}", expected_str),
+                })?;
+
+        let is_trailer_mode = content_sha.ends_with("-TRAILER");
+
         let is_signed = content_sha.starts_with("STREAMING-AWS4-HMAC-SHA256");
 
         let streaming_ctx = if is_signed {
@@ -1314,24 +1354,77 @@ impl HttpFrontend {
             None
         };
 
-        let decoded = chunked::decode_chunked_body(&req.body, streaming_ctx)?;
+        let decoded = chunked::decode_chunked_body(&req.body, streaming_ctx, is_trailer_mode)?;
 
-        // Validate decoded length against x-amz-decoded-content-length if present.
-        if let Some(expected_str) = req.header("x-amz-decoded-content-length") {
-            let expected =
-                expected_str
-                    .parse::<usize>()
-                    .map_err(|_| ServerError::InvalidRequest {
-                        reason: format!("invalid x-amz-decoded-content-length: {}", expected_str),
-                    })?;
-            if decoded.data.len() != expected {
-                return Err(ServerError::MalformedChunkedBody {
+        // Validate decoded length.
+        if decoded.data.len() != expected_len {
+            return Err(ServerError::MalformedChunkedBody {
+                reason: format!(
+                    "decoded content length mismatch: expected {}, got {}",
+                    expected_len,
+                    decoded.data.len()
+                ),
+            });
+        }
+
+        // Trailer declaration validation.
+        // Content trailers = trailers excluding x-amz-trailer-signature.
+        let content_trailers: Vec<&(String, String)> = decoded
+            .trailers
+            .iter()
+            .filter(|(k, _)| k != "x-amz-trailer-signature")
+            .collect();
+
+        let declared_trailer = req.header("x-amz-trailer");
+
+        if !is_trailer_mode && !content_trailers.is_empty() {
+            return Err(ServerError::IncompleteBody);
+        }
+
+        if !content_trailers.is_empty() && declared_trailer.is_none() {
+            return Err(ServerError::MalformedTrailerError {
+                reason: "trailers present in body but x-amz-trailer header missing".to_string(),
+            });
+        }
+
+        if let Some(declared) = declared_trailer {
+            // Parse declared trailer names as comma-separated list.
+            let declared_names: Vec<String> = declared
+                .split(',')
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            if content_trailers.is_empty() {
+                return Err(ServerError::MalformedTrailerError {
                     reason: format!(
-                        "decoded content length mismatch: expected {}, got {}",
-                        expected,
-                        decoded.data.len()
+                        "x-amz-trailer header declares {} but no trailers in body",
+                        declared
                     ),
                 });
+            }
+            // Check that all content trailers were declared.
+            for (name, _) in &content_trailers {
+                if !declared_names.iter().any(|d| d == name.as_str()) {
+                    return Err(ServerError::MalformedTrailerError {
+                        reason: format!(
+                            "undeclared trailer in body: {} (declared: {})",
+                            name, declared
+                        ),
+                    });
+                }
+            }
+            // Check that all declared names appear in body (exact-set).
+            let body_names: Vec<&str> = content_trailers.iter().map(|(k, _)| k.as_str()).collect();
+            for name in &declared_names {
+                if !body_names.contains(&name.as_str()) {
+                    return Err(ServerError::MalformedTrailerError {
+                        reason: format!(
+                            "declared trailer missing from body: {} (declared: {})",
+                            name, declared
+                        ),
+                    });
+                }
             }
         }
 
@@ -1610,6 +1703,28 @@ fn validate_checksum_headers(req: &S3Request) -> Result<(), ServerError> {
                 }
             }
 
+            // Expected byte length for each algorithm.
+            let expected_len = match algo {
+                "SHA256" => 32,
+                "SHA1" => 20,
+                "CRC32" | "CRC32C" => 4,
+                "CRC64NVME" => 8,
+                _ => continue,
+            };
+
+            // Validate checksum value format (base64 decodes to correct length).
+            let decoded_bytes = base64::engine::general_purpose::STANDARD
+                .decode(claimed)
+                .ok();
+            match decoded_bytes {
+                Some(ref bytes) if bytes.len() == expected_len => {}
+                _ => {
+                    return Err(ServerError::InvalidRequest {
+                        reason: format!("Value for {} header is invalid.", header),
+                    });
+                }
+            }
+
             let actual_b64 = match algo {
                 "SHA256" => {
                     let digest = ring::digest::digest(&ring::digest::SHA256, &req.body);
@@ -1639,9 +1754,7 @@ fn validate_checksum_headers(req: &S3Request) -> Result<(), ServerError> {
                 _ => continue,
             };
             if claimed != actual_b64 {
-                return Err(ServerError::InvalidRequest {
-                    reason: format!("{} checksum mismatch", algo),
-                });
+                return Err(ServerError::BadDigest);
             }
         }
     }
@@ -3274,20 +3387,54 @@ mod tests {
             headers: vec![
                 (
                     "x-amz-content-sha256".to_string(),
-                    "STREAMING-UNSIGNED-PAYLOAD".to_string(),
+                    "STREAMING-UNSIGNED-PAYLOAD-TRAILER".to_string(),
                 ),
                 ("content-encoding".to_string(), "aws-chunked".to_string()),
                 (
                     "x-amz-decoded-content-length".to_string(),
                     "not-a-number".to_string(),
                 ),
+                (
+                    "x-amz-trailer".to_string(),
+                    "x-amz-checksum-crc32".to_string(),
+                ),
             ],
-            body: b"5\r\nhello\r\n0\r\n\r\n".to_vec(),
+            body: b"5\r\nhello\r\n0\r\nx-amz-checksum-crc32:AAAA\r\n\r\n".to_vec(),
         };
 
         match fe.maybe_decode_chunked(&req, &test_auth()) {
             Err(ServerError::InvalidRequest { .. }) => {} // expected
             other => panic!("expected InvalidRequest, got {:?}", other.err()),
+        }
+    }
+
+    #[test]
+    fn ecdsa_streaming_token_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fe = setup_frontend(tmp.path());
+
+        let req = S3Request {
+            method: "PUT".to_string(),
+            path: "/mybucket/key".to_string(),
+            query_string: String::new(),
+            headers: vec![
+                (
+                    "x-amz-content-sha256".to_string(),
+                    "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER".to_string(),
+                ),
+                ("content-encoding".to_string(), "aws-chunked".to_string()),
+                ("x-amz-decoded-content-length".to_string(), "5".to_string()),
+                (
+                    "x-amz-trailer".to_string(),
+                    "x-amz-checksum-crc32".to_string(),
+                ),
+            ],
+            body: b"5\r\nhello\r\n0\r\nx-amz-checksum-crc32:AAAA\r\n\r\n".to_vec(),
+        };
+
+        match fe.maybe_decode_chunked(&req, &test_auth()) {
+            Err(ServerError::InvalidArgument { .. }) => {} // expected
+            other => panic!("expected InvalidArgument, got {:?}", other.err()),
         }
     }
 }

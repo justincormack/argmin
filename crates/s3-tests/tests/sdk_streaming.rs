@@ -254,6 +254,61 @@ fn test_sdk_put_large_file() {
     });
 }
 
+/// Large file (1 MB) via ByteStream::from_path + checksum_algorithm(Crc32).
+/// Exercises multi-chunk streaming with trailing checksum (SDK splits into
+/// multiple aws-chunked chunks and appends a CRC32 trailer).
+#[test]
+fn test_sdk_put_large_file_with_trailing_crc32() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "streaming-large-crc32";
+
+        // 1 MB of pattern data — triggers multi-chunk.
+        let data: Vec<u8> = (0..1_048_576).map(|i| (i % 251) as u8).collect();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut tmp.as_file(), &data).unwrap();
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_path(tmp.path()).await.unwrap())
+            .checksum_algorithm(ChecksumAlgorithm::Crc32)
+            .send()
+            .await
+            .unwrap();
+
+        // Verify data roundtrip.
+        let get = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let got = get.body.collect().await.unwrap().into_bytes();
+        assert_eq!(got.len(), data.len(), "body length mismatch");
+        assert_eq!(&got[..], &data[..], "body data mismatch");
+
+        // Verify checksum was stored.
+        let head = client
+            .head_object()
+            .bucket(&bucket)
+            .key(key)
+            .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            head.checksum_crc32().is_some(),
+            "expected CRC32 checksum on HEAD"
+        );
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
 /// Multipart upload using ByteStream::from_path for UploadPart.
 /// Verifies streaming works for multipart operations.
 #[test]
