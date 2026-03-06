@@ -789,6 +789,72 @@ fn test_copy_object_delete_marker_source() {
     });
 }
 
+/// CopyObject targeting a specific delete-marker versionId should fail.
+/// AWS returns 400/InvalidRequest (not 404/NoSuchKey) for this case.
+#[test]
+fn test_copy_object_delete_marker_version_id() {
+    s3_tests::run(async {
+        use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
+
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+
+        client
+            .put_bucket_versioning()
+            .bucket(&bucket)
+            .versioning_configuration(
+                VersioningConfiguration::builder()
+                    .status(BucketVersioningStatus::Enabled)
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let src_key = "dm-version-src";
+        let dst_key = "dm-version-dst";
+
+        // Put then delete to create a delete marker
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(src_key)
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+        let del = client
+            .delete_object()
+            .bucket(&bucket)
+            .key(src_key)
+            .send()
+            .await
+            .unwrap();
+        let dm_version_id = del.version_id().unwrap();
+
+        // CopyObject explicitly targeting the delete-marker versionId
+        let result = client
+            .copy_object()
+            .bucket(&bucket)
+            .key(dst_key)
+            .copy_source(format!(
+                "{}/{}?versionId={}",
+                bucket, src_key, dm_version_id
+            ))
+            .send()
+            .await;
+        assert!(
+            result.is_err(),
+            "expected error copying delete-marker version"
+        );
+        let status = err_status(&result);
+        assert_eq!(status, 400);
+        assert_s3_err_code(&result, "InvalidRequest");
+
+        cleanup_versioned_bucket(&client, &bucket).await;
+    });
+}
+
 #[test]
 #[ignore = "not implemented: multi-user ACL"]
 fn test_object_copy_not_owned_object_bucket() {

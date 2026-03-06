@@ -1967,6 +1967,86 @@ fn test_multipart_copy_delete_marker_source() {
     });
 }
 
+/// UploadPartCopy targeting a specific delete-marker versionId should fail
+/// with 400/InvalidRequest (not 404/NoSuchKey).
+#[test]
+fn test_multipart_copy_delete_marker_version_id() {
+    s3_tests::run(async {
+        use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
+
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+
+        client
+            .put_bucket_versioning()
+            .bucket(&bucket)
+            .versioning_configuration(
+                VersioningConfiguration::builder()
+                    .status(BucketVersioningStatus::Enabled)
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let src_key = "dm-vid-src";
+        let dst_key = "dm-vid-dst";
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(src_key)
+            .body(ByteStream::from(vec![b'd'; PART_SIZE]))
+            .send()
+            .await
+            .unwrap();
+        let del = client
+            .delete_object()
+            .bucket(&bucket)
+            .key(src_key)
+            .send()
+            .await
+            .unwrap();
+        let dm_version_id = del.version_id().unwrap();
+
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(dst_key)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap();
+
+        let result = client
+            .upload_part_copy()
+            .bucket(&bucket)
+            .key(dst_key)
+            .upload_id(upload_id)
+            .part_number(1)
+            .copy_source(format!(
+                "{}/{}?versionId={}",
+                bucket, src_key, dm_version_id
+            ))
+            .send()
+            .await;
+        assert!(result.is_err());
+        let status = err_status(&result);
+        assert_eq!(status, 400);
+        assert_s3_err_code(&result, "InvalidRequest");
+
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(dst_key)
+            .upload_id(upload_id)
+            .send()
+            .await
+            .unwrap();
+        s3_tests::cleanup_versioned_bucket(&client, &bucket).await;
+    });
+}
+
 #[test]
 fn test_multipart_copy_multiple_sizes() {
     s3_tests::run(async {
