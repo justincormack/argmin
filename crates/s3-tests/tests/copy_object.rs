@@ -890,7 +890,9 @@ fn test_copy_object_replace_strips_bogus_inline_checksum() {
             .send()
             .await
             .unwrap();
-        let crc32_val = head.checksum_crc32().expect("expected CRC32 on copied object");
+        let crc32_val = head
+            .checksum_crc32()
+            .expect("expected CRC32 on copied object");
         // Verify it's the real CRC32 of "hello world".
         use base64::Engine;
         let expected_crc = checksum::crc32::checksum(b"hello world");

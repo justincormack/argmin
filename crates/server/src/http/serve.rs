@@ -44,9 +44,9 @@ impl TrailingChecksumHasher {
             "x-amz-checksum-crc32" => Some(Self::Crc32(0)),
             "x-amz-checksum-crc32c" => Some(Self::Crc32c(checksum::crc32c::Hasher::new())),
             "x-amz-checksum-crc64nvme" => Some(Self::Crc64(checksum::crc64::Hasher::new())),
-            "x-amz-checksum-sha256" => {
-                Some(Self::Sha256(ring::digest::Context::new(&ring::digest::SHA256)))
-            }
+            "x-amz-checksum-sha256" => Some(Self::Sha256(ring::digest::Context::new(
+                &ring::digest::SHA256,
+            ))),
             "x-amz-checksum-sha1" => Some(Self::Sha1(ring::digest::Context::new(
                 &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
             ))),
@@ -57,9 +57,7 @@ impl TrailingChecksumHasher {
     fn update(&mut self, data: &[u8]) {
         match self {
             Self::Crc32(crc) => {
-                *crc = unsafe {
-                    ec_sys::crc32_gzip_refl(*crc, data.as_ptr(), data.len() as u64)
-                };
+                *crc = unsafe { ec_sys::crc32_gzip_refl(*crc, data.as_ptr(), data.len() as u64) };
             }
             Self::Crc32c(h) => {
                 h.update(data);
@@ -74,8 +72,14 @@ impl TrailingChecksumHasher {
     /// Finalize and return the algorithm and raw checksum bytes.
     fn finalize_algo_bytes(self) -> (storage::ChecksumAlgorithm, Vec<u8>) {
         match self {
-            Self::Crc32(crc) => (storage::ChecksumAlgorithm::Crc32, crc.to_be_bytes().to_vec()),
-            Self::Crc32c(h) => (storage::ChecksumAlgorithm::Crc32c, h.finalize().to_be_bytes().to_vec()),
+            Self::Crc32(crc) => (
+                storage::ChecksumAlgorithm::Crc32,
+                crc.to_be_bytes().to_vec(),
+            ),
+            Self::Crc32c(h) => (
+                storage::ChecksumAlgorithm::Crc32c,
+                h.finalize().to_be_bytes().to_vec(),
+            ),
             Self::Crc64(h) => (
                 storage::ChecksumAlgorithm::Crc64nvme,
                 h.finalize().to_be_bytes().to_vec(),
@@ -291,10 +295,7 @@ async fn handle(
                 bucket,
                 key,
                 chunked,
-            } => {
-                handle_streaming_put(Arc::clone(&state), parts, body, bucket, key, chunked)
-                    .await
-            }
+            } => handle_streaming_put(Arc::clone(&state), parts, body, bucket, key, chunked).await,
             StreamingWriteOp::UploadPart {
                 bucket,
                 key,
@@ -401,9 +402,7 @@ fn is_streaming_write(parts: &http::request::Parts) -> Option<StreamingWriteOp> 
                 .and_then(|s| s.parse::<u64>().ok())?;
 
             match content_sha256.unwrap() {
-                "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" => {
-                    ChunkedMode::Signed { expected_len }
-                }
+                "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" => ChunkedMode::Signed { expected_len },
                 "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER" => {
                     ChunkedMode::SignedTrailer { expected_len }
                 }
@@ -421,17 +420,15 @@ fn is_streaming_write(parts: &http::request::Parts) -> Option<StreamingWriteOp> 
 
     let op = route(method, path, query).ok()?;
     match op {
-        S3Operation::PutObject { bucket, key } => {
-            Some(StreamingWriteOp::PutObject {
-                bucket,
-                key,
-                chunked: chunked.clone(),
-            })
-        }
+        S3Operation::PutObject { bucket, key } => Some(StreamingWriteOp::PutObject {
+            bucket,
+            key,
+            chunked: chunked.clone(),
+        }),
         S3Operation::UploadPart { bucket, key } => {
             let upload_id = extract_query_param(query, "uploadId")?;
-            let part_number: u32 = extract_query_param(query, "partNumber")
-                .and_then(|s| s.parse().ok())?;
+            let part_number: u32 =
+                extract_query_param(query, "partNumber").and_then(|s| s.parse().ok())?;
             Some(StreamingWriteOp::UploadPart {
                 bucket,
                 key,
@@ -689,10 +686,7 @@ async fn handle_streaming_put(
 }
 
 /// Best-effort abort of a streaming upload session.
-async fn abort_streaming(
-    state: &Arc<ServerState>,
-    ctx: &Arc<super::StreamingPutContext>,
-) {
+async fn abort_streaming(state: &Arc<ServerState>, ctx: &Arc<super::StreamingPutContext>) {
     let st = Arc::clone(state);
     let ctx = Arc::clone(ctx);
     let _ = tokio::task::spawn_blocking(move || {
@@ -928,7 +922,13 @@ async fn handle_streaming_part(
     let st = Arc::clone(&state);
     match tokio::task::spawn_blocking(move || {
         let frontend = acquire_frontend(&st);
-        frontend.finalize_streaming_part(&ctx_ref, crc64, total_size, &trailer_checksums, computed_checksum)
+        frontend.finalize_streaming_part(
+            &ctx_ref,
+            crc64,
+            total_size,
+            &trailer_checksums,
+            computed_checksum,
+        )
     })
     .await
     {
@@ -1079,9 +1079,7 @@ fn extract_checksum_trailers(
 ///
 /// Handles comma-separated trailer declarations and case-insensitive matching.
 /// Returns the hasher for the first recognized checksum trailer name.
-fn trailing_hasher_from_parts(
-    parts: &http::request::Parts,
-) -> Option<TrailingChecksumHasher> {
+fn trailing_hasher_from_parts(parts: &http::request::Parts) -> Option<TrailingChecksumHasher> {
     let header_val = parts
         .headers
         .get("x-amz-trailer")
@@ -1132,12 +1130,10 @@ fn make_chunked_decoder(
             streaming_ctx.cloned(),
             false,
         )),
-        ChunkedMode::SignedTrailer { .. } => {
-            Some(super::chunked::IncrementalChunkedDecoder::new(
-                streaming_ctx.cloned(),
-                true,
-            ))
-        }
+        ChunkedMode::SignedTrailer { .. } => Some(super::chunked::IncrementalChunkedDecoder::new(
+            streaming_ctx.cloned(),
+            true,
+        )),
         ChunkedMode::UnsignedTrailer { .. } => {
             Some(super::chunked::IncrementalChunkedDecoder::new(None, true))
         }
@@ -1220,14 +1216,8 @@ mod tests {
     use super::*;
 
     /// Build a minimal `http::request::Parts` for testing `is_streaming_write`.
-    fn make_parts(
-        method: &str,
-        uri: &str,
-        headers: &[(&str, &str)],
-    ) -> http::request::Parts {
-        let mut builder = http::Request::builder()
-            .method(method)
-            .uri(uri);
+    fn make_parts(method: &str, uri: &str, headers: &[(&str, &str)]) -> http::request::Parts {
+        let mut builder = http::Request::builder().method(method).uri(uri);
         for (k, v) in headers {
             builder = builder.header(*k, *v);
         }
@@ -1288,7 +1278,10 @@ mod tests {
         let parts = make_parts(
             "PUT",
             "/mybucket/mykey",
-            &[("x-amz-content-sha256", "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890")],
+            &[(
+                "x-amz-content-sha256",
+                "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+            )],
         );
         assert_eq!(is_streaming_write(&parts), None);
     }
@@ -1313,7 +1306,10 @@ mod tests {
         let result = is_streaming_write(&parts);
         assert!(matches!(
             result,
-            Some(StreamingWriteOp::PutObject { chunked: ChunkedMode::Signed { .. }, .. })
+            Some(StreamingWriteOp::PutObject {
+                chunked: ChunkedMode::Signed { .. },
+                ..
+            })
         ));
     }
 
@@ -1323,7 +1319,10 @@ mod tests {
             "PUT",
             "/mybucket/mykey",
             &[
-                ("x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"),
+                (
+                    "x-amz-content-sha256",
+                    "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+                ),
                 ("content-encoding", "aws-chunked"),
                 ("x-amz-decoded-content-length", "100"),
             ],
@@ -1331,7 +1330,10 @@ mod tests {
         let result = is_streaming_write(&parts);
         assert!(matches!(
             result,
-            Some(StreamingWriteOp::PutObject { chunked: ChunkedMode::SignedTrailer { .. }, .. })
+            Some(StreamingWriteOp::PutObject {
+                chunked: ChunkedMode::SignedTrailer { .. },
+                ..
+            })
         ));
     }
 
@@ -1349,7 +1351,10 @@ mod tests {
         let result = is_streaming_write(&parts);
         assert!(matches!(
             result,
-            Some(StreamingWriteOp::PutObject { chunked: ChunkedMode::UnsignedTrailer { .. }, .. })
+            Some(StreamingWriteOp::PutObject {
+                chunked: ChunkedMode::UnsignedTrailer { .. },
+                ..
+            })
         ));
     }
 
@@ -1538,7 +1543,8 @@ mod tests {
         let data = b"123456789";
         let expected = checksum::crc32c::checksum(data);
 
-        let mut hasher = TrailingChecksumHasher::from_trailer_header("x-amz-checksum-crc32c").unwrap();
+        let mut hasher =
+            TrailingChecksumHasher::from_trailer_header("x-amz-checksum-crc32c").unwrap();
         hasher.update(data);
         let (algo, bytes) = hasher.finalize_algo_bytes();
         assert_eq!(algo, storage::ChecksumAlgorithm::Crc32c);
@@ -1555,7 +1561,8 @@ mod tests {
         let data = b"hello world!";
         let expected = checksum::crc32c::checksum(data);
 
-        let mut hasher = TrailingChecksumHasher::from_trailer_header("x-amz-checksum-crc32c").unwrap();
+        let mut hasher =
+            TrailingChecksumHasher::from_trailer_header("x-amz-checksum-crc32c").unwrap();
         hasher.update(b"hello ");
         hasher.update(b"world!");
         let (_, bytes) = hasher.finalize_algo_bytes();
@@ -1580,7 +1587,8 @@ mod tests {
         let data = b"123456789";
         let expected = checksum::crc32::checksum(data);
 
-        let mut hasher = TrailingChecksumHasher::from_trailer_header("x-amz-checksum-crc32").unwrap();
+        let mut hasher =
+            TrailingChecksumHasher::from_trailer_header("x-amz-checksum-crc32").unwrap();
         hasher.update(data);
         let (algo, bytes) = hasher.finalize_algo_bytes();
         assert_eq!(algo, storage::ChecksumAlgorithm::Crc32);
@@ -1592,7 +1600,8 @@ mod tests {
         let data = b"123456789";
         let expected = checksum::crc64::checksum(data);
 
-        let mut hasher = TrailingChecksumHasher::from_trailer_header("x-amz-checksum-crc64nvme").unwrap();
+        let mut hasher =
+            TrailingChecksumHasher::from_trailer_header("x-amz-checksum-crc64nvme").unwrap();
         hasher.update(data);
         let (algo, bytes) = hasher.finalize_algo_bytes();
         assert_eq!(algo, storage::ChecksumAlgorithm::Crc64nvme);
@@ -1604,7 +1613,8 @@ mod tests {
         let data = b"123456789";
         let expected = ring::digest::digest(&ring::digest::SHA256, data);
 
-        let mut hasher = TrailingChecksumHasher::from_trailer_header("x-amz-checksum-sha256").unwrap();
+        let mut hasher =
+            TrailingChecksumHasher::from_trailer_header("x-amz-checksum-sha256").unwrap();
         hasher.update(data);
         let (algo, bytes) = hasher.finalize_algo_bytes();
         assert_eq!(algo, storage::ChecksumAlgorithm::Sha256);
@@ -1616,7 +1626,8 @@ mod tests {
         let data = b"123456789";
         let expected = ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, data);
 
-        let mut hasher = TrailingChecksumHasher::from_trailer_header("x-amz-checksum-sha1").unwrap();
+        let mut hasher =
+            TrailingChecksumHasher::from_trailer_header("x-amz-checksum-sha1").unwrap();
         hasher.update(data);
         let (algo, bytes) = hasher.finalize_algo_bytes();
         assert_eq!(algo, storage::ChecksumAlgorithm::Sha1);
@@ -1628,7 +1639,8 @@ mod tests {
         let data = b"hello world!";
         let expected = ring::digest::digest(&ring::digest::SHA256, data);
 
-        let mut hasher = TrailingChecksumHasher::from_trailer_header("x-amz-checksum-sha256").unwrap();
+        let mut hasher =
+            TrailingChecksumHasher::from_trailer_header("x-amz-checksum-sha256").unwrap();
         hasher.update(b"hello ");
         hasher.update(b"world!");
         let (_, bytes) = hasher.finalize_algo_bytes();
@@ -1683,5 +1695,4 @@ mod tests {
         );
         assert!(inline_checksum_hasher_from_parts(&parts).is_none());
     }
-
 }

@@ -2036,8 +2036,8 @@ fn unsigned_payload_put_with_checksum(
         "UNSIGNED-PAYLOAD",
         body.len(),
         &extra,
-        true,  // skip content-encoding (not aws-chunked)
-        true,  // skip decoded-content-length (not aws-chunked)
+        true, // skip content-encoding (not aws-chunked)
+        true, // skip decoded-content-length (not aws-chunked)
     );
 
     let url = format!("{}{}", CTX.endpoint(), path);

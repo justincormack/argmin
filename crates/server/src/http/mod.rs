@@ -1748,8 +1748,13 @@ impl HttpFrontend {
         chunk_index: u32,
         data: &[u8],
     ) -> Result<(), ServerError> {
-        self.coordinator
-            .append_stream_chunk(&ctx.bucket, &ctx.key, &ctx.session_id, chunk_index, data)
+        self.coordinator.append_stream_chunk(
+            &ctx.bucket,
+            &ctx.key,
+            &ctx.session_id,
+            chunk_index,
+            data,
+        )
     }
 
     /// Finalize a streaming PutObject session and return an S3Response.
@@ -1821,9 +1826,9 @@ impl HttpFrontend {
 
     /// Abort a streaming session (best-effort cleanup).
     pub fn abort_streaming_put(&self, ctx: &StreamingPutContext) {
-        let _ =
-            self.coordinator
-                .abort_stream_put(&ctx.bucket, &ctx.key, &ctx.session_id);
+        let _ = self
+            .coordinator
+            .abort_stream_put(&ctx.bucket, &ctx.key, &ctx.session_id);
     }
 
     /// Prepare a streaming UploadPart session.
@@ -1847,9 +1852,9 @@ impl HttpFrontend {
             }
         }
 
-        let session_id =
-            self.coordinator
-                .begin_stream_part(bucket, key, upload_id, part_number)?;
+        let session_id = self
+            .coordinator
+            .begin_stream_part(bucket, key, upload_id, part_number)?;
 
         Ok(StreamingPartContext {
             session_id,
@@ -1870,8 +1875,13 @@ impl HttpFrontend {
         chunk_index: u32,
         data: &[u8],
     ) -> Result<(), ServerError> {
-        self.coordinator
-            .append_stream_chunk(&ctx.bucket, &ctx.key, &ctx.session_id, chunk_index, data)
+        self.coordinator.append_stream_chunk(
+            &ctx.bucket,
+            &ctx.key,
+            &ctx.session_id,
+            chunk_index,
+            data,
+        )
     }
 
     /// Finalize a streaming UploadPart session and return an S3Response.
@@ -1921,9 +1931,7 @@ impl HttpFrontend {
         // The coordinator's result already includes the checksum via
         // S3Response::upload_part. Only echo headers NOT already present
         // (e.g. x-amz-checksum-type). Trailer values take precedence.
-        let already_set: Option<&str> = result
-            .checksum_algorithm
-            .map(|a| a.header_name());
+        let already_set: Option<&str> = result.checksum_algorithm.map(|a| a.header_name());
         for (name, value) in &ctx.checksum_response {
             if already_set == Some(name.as_str()) {
                 continue; // Already set by S3Response::upload_part
@@ -1947,9 +1955,9 @@ impl HttpFrontend {
 
     /// Abort a streaming UploadPart session (best-effort cleanup).
     pub fn abort_streaming_part(&self, ctx: &StreamingPartContext) {
-        let _ =
-            self.coordinator
-                .abort_stream_put(&ctx.bucket, &ctx.key, &ctx.session_id);
+        let _ = self
+            .coordinator
+            .abort_stream_put(&ctx.bucket, &ctx.key, &ctx.session_id);
     }
 }
 
@@ -2091,8 +2099,10 @@ fn validate_checksum_headers(req: &S3Request, verify_body: bool) -> Result<(), S
                         base64::engine::general_purpose::STANDARD.encode(digest.as_ref())
                     }
                     "SHA1" => {
-                        let digest =
-                            ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, &req.body);
+                        let digest = ring::digest::digest(
+                            &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
+                            &req.body,
+                        );
                         base64::engine::general_purpose::STANDARD.encode(digest.as_ref())
                     }
                     "CRC32" => {

@@ -334,10 +334,7 @@ enum ChunkedDecoderState {
 }
 
 impl IncrementalChunkedDecoder {
-    pub fn new(
-        streaming: Option<StreamingSigningContext>,
-        trailer_mode: bool,
-    ) -> Self {
+    pub fn new(streaming: Option<StreamingSigningContext>, trailer_mode: bool) -> Self {
         let prev_sig = streaming.as_ref().map(|s| s.seed_signature.clone());
         Self {
             streaming,
@@ -380,8 +377,7 @@ impl IncrementalChunkedDecoder {
                     // Signed mode requires chunk-signature on every chunk.
                     if self.streaming.is_some() && chunk_sig.is_none() {
                         return Err(ServerError::MalformedChunkedBody {
-                            reason: "missing chunk-signature in signed chunked upload"
-                                .to_string(),
+                            reason: "missing chunk-signature in signed chunked upload".to_string(),
                         });
                     }
 
@@ -468,10 +464,7 @@ impl IncrementalChunkedDecoder {
                             return Ok(payload); // Need more data
                         }
                         // Empty line marks end of trailers.
-                        if self.buf.len() >= 2
-                            && self.buf[0] == b'\r'
-                            && self.buf[1] == b'\n'
-                        {
+                        if self.buf.len() >= 2 && self.buf[0] == b'\r' && self.buf[1] == b'\n' {
                             self.buf.drain(..2);
 
                             // Verify trailer signature if needed.
@@ -507,10 +500,8 @@ impl IncrementalChunkedDecoder {
                         })?;
 
                         if let Some((key, value)) = line_str.split_once(':') {
-                            self.trailers.push((
-                                key.trim().to_ascii_lowercase(),
-                                value.trim().to_string(),
-                            ));
+                            self.trailers
+                                .push((key.trim().to_ascii_lowercase(), value.trim().to_string()));
                         } else {
                             return Err(ServerError::IncompleteBody);
                         }
@@ -887,7 +878,7 @@ mod tests {
         // Feed header + partial data
         let payload1 = dec.feed(b"5\r\nhel").unwrap();
         assert!(payload1.is_empty()); // Not enough data yet
-        // Feed rest of data + terminal
+                                      // Feed rest of data + terminal
         let payload2 = dec.feed(b"lo\r\n0\r\n\r\n").unwrap();
         assert_eq!(payload2, b"hello");
         assert!(dec.is_done());
@@ -938,8 +929,7 @@ mod tests {
         let mut key_bytes = [0u8; 32];
         key_bytes.copy_from_slice(signing_key.as_ref());
 
-        let seed_sig =
-            "seed0000000000000000000000000000000000000000000000000000000000ab";
+        let seed_sig = "seed0000000000000000000000000000000000000000000000000000000000ab";
 
         let ctx = StreamingSigningContext {
             signing_key: key_bytes,
@@ -963,8 +953,7 @@ mod tests {
             "AWS4-HMAC-SHA256-PAYLOAD\n{}\n{}\n{}\n{}\n{}",
             timestamp, scope, chunk_sig, empty_hash, terminal_hash
         );
-        let terminal_sig =
-            hex_encode(hmac::sign(&key, sts_terminal.as_bytes()).as_ref());
+        let terminal_sig = hex_encode(hmac::sign(&key, sts_terminal.as_bytes()).as_ref());
 
         let wire = format!(
             "5;chunk-signature={}\r\nHello\r\n0;chunk-signature={}\r\n\r\n",

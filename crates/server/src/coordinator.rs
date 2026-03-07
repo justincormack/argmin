@@ -4,12 +4,12 @@ use std::sync::{Arc, MutexGuard};
 use ec::{EcConfig, ErasureCodec};
 use storage::traits::{GlobalService, PgMetadataStore, ShardStore};
 use storage::{
-    BucketInfo, ChecksumAlgorithm, ChecksumType, CreateMultipartUploadReq,
-    CreateStreamUploadReq, DataLayout, ListMultipartUploadsReq, ListObjectVersionsReq,
-    ListObjectsReq, ListPartsReq, MultipartPartChunkRecord, MultipartPartRecord,
-    MultipartUploadRecord, ObjectPartRecord, ObjectRecord, PutObjectMetaReq, ShardKey,
-    SharedStorageNode, SqliteBucketDb, StreamObjectChunkRecord, StreamUploadChunkRecord,
-    StreamUploadKind, StreamUploadState, UploadState,
+    BucketInfo, ChecksumAlgorithm, ChecksumType, CreateMultipartUploadReq, CreateStreamUploadReq,
+    DataLayout, ListMultipartUploadsReq, ListObjectVersionsReq, ListObjectsReq, ListPartsReq,
+    MultipartPartChunkRecord, MultipartPartRecord, MultipartUploadRecord, ObjectPartRecord,
+    ObjectRecord, PutObjectMetaReq, ShardKey, SharedStorageNode, SqliteBucketDb,
+    StreamObjectChunkRecord, StreamUploadChunkRecord, StreamUploadKind, StreamUploadState,
+    UploadState,
 };
 
 use crate::conditional::{
@@ -935,11 +935,7 @@ impl Coordinator {
     /// Creates a session on the metadata PG for `(bucket, key)`. The caller
     /// feeds chunks via `append_stream_chunk` and commits via
     /// `finalize_stream_put`.
-    pub fn begin_stream_put(
-        &self,
-        bucket: &str,
-        key: &str,
-    ) -> Result<String, ServerError> {
+    pub fn begin_stream_put(&self, bucket: &str, key: &str) -> Result<String, ServerError> {
         // Verify bucket exists.
         let _bucket_info = self.head_bucket(bucket)?;
 
@@ -1575,14 +1571,12 @@ impl Coordinator {
             drop(pg);
 
             for session in sessions {
-                if session.created_at < cutoff {
-                    if self.abort_stream_put(
-                        &session.bucket,
-                        &session.key,
-                        &session.session_id,
-                    ).is_ok() {
-                        count += 1;
-                    }
+                if session.created_at < cutoff
+                    && self
+                        .abort_stream_put(&session.bucket, &session.key, &session.session_id)
+                        .is_ok()
+                {
+                    count += 1;
                 }
             }
         }
@@ -1691,14 +1685,8 @@ impl Coordinator {
                     vec![]
                 } else if !chunks.is_empty() {
                     drop(pgs);
-                    self.read_chunk_manifest_range(
-                        src_bucket,
-                        src_key,
-                        &chunks,
-                        0,
-                        user_size - 1,
-                    )
-                    .map_err(not_found)?
+                    self.read_chunk_manifest_range(src_bucket, src_key, &chunks, 0, user_size - 1)
+                        .map_err(not_found)?
                 } else {
                     let src_okh = object_key_hash(src_bucket, src_key);
                     let src_shard_pg = pgs.shard();
@@ -1767,14 +1755,11 @@ impl Coordinator {
                         None
                     }
                 }) {
-                    let algo =
-                        ChecksumAlgorithm::parse(algo_val).ok_or_else(|| {
-                            ServerError::InvalidArgument {
-                                reason: format!(
-                                    "unsupported checksum algorithm: {algo_val}"
-                                ),
-                            }
-                        })?;
+                    let algo = ChecksumAlgorithm::parse(algo_val).ok_or_else(|| {
+                        ServerError::InvalidArgument {
+                            reason: format!("unsupported checksum algorithm: {algo_val}"),
+                        }
+                    })?;
                     use base64::Engine;
                     let cksum = compute_checksum(algo, &user_data);
                     let b64 = base64::engine::general_purpose::STANDARD.encode(&cksum);
@@ -2390,7 +2375,6 @@ impl Coordinator {
         Ok(())
     }
 
-
     /// Read a full part's data from its shard PG.
     ///
     /// Uses the part's `shard_pg_id`, `part_okh`, `part_vid`, and EC config
@@ -2530,12 +2514,7 @@ impl Coordinator {
                 let chunks = {
                     let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
                     meta_pg
-                        .get_multipart_part_chunks(
-                            bucket,
-                            key,
-                            part.version_id,
-                            part.part_number,
-                        )
+                        .get_multipart_part_chunks(bucket, key, part.version_id, part.part_number)
                         .map_err(ServerError::Metadata)?
                 };
                 self.read_streaming_part_data(bucket, key, &chunks, 0, part.size as usize - 1)?
@@ -9199,7 +9178,9 @@ mod tests {
             .unwrap();
 
         // Object should not exist.
-        let err = coord.head_object("bucket", "mykey", None, NO_READ).unwrap_err();
+        let err = coord
+            .head_object("bucket", "mykey", None, NO_READ)
+            .unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
     }
 
@@ -9342,7 +9323,13 @@ mod tests {
 
         // Write an existing object via normal put.
         coord
-            .put_object("bucket", "key", b"old-data", &[], &WriteCondition::default())
+            .put_object(
+                "bucket",
+                "key",
+                b"old-data",
+                &[],
+                &WriteCondition::default(),
+            )
             .unwrap();
 
         // Stream-put a new version.
@@ -9485,12 +9472,7 @@ mod tests {
 
         // Record shard keys before abort for verification.
         let chunk_okh = crate::pg::chunk_key_hash(&session_id, 0);
-        let shard_pg_id = crate::pg::derive_pg_shards(
-            &format!("chunk/{session_id}"),
-            "0",
-            0,
-            4,
-        );
+        let shard_pg_id = crate::pg::derive_pg_shards(&format!("chunk/{session_id}"), "0", 0, 4);
 
         coord
             .abort_stream_put("bucket", "key", &session_id)
@@ -9646,7 +9628,13 @@ mod tests {
 
         // Suffix range.
         let r4 = coord
-            .get_object_range("bucket", "key", None, ByteRange::Suffix { length: 3 }, NO_READ)
+            .get_object_range(
+                "bucket",
+                "key",
+                None,
+                ByteRange::Suffix { length: 3 },
+                NO_READ,
+            )
             .unwrap();
         assert_eq!(r4.data, b"BBB");
     }
@@ -9716,9 +9704,7 @@ mod tests {
             )
             .unwrap();
 
-        let result = coord
-            .get_object("bucket", "empty", None, NO_READ)
-            .unwrap();
+        let result = coord.get_object("bucket", "empty", None, NO_READ).unwrap();
         assert_eq!(result.data, b"");
         assert_eq!(result.size, 0);
     }
@@ -9784,7 +9770,13 @@ mod tests {
 
         // Overwrite with a normal PUT.
         coord
-            .put_object("bucket", "key", b"normal-data", &[], &WriteCondition::default())
+            .put_object(
+                "bucket",
+                "key",
+                b"normal-data",
+                &[],
+                &WriteCondition::default(),
+            )
             .unwrap();
 
         // GET should return the new data, not stale chunk data.
@@ -9818,11 +9810,18 @@ mod tests {
 
         // Delete the object.
         coord
-            .delete_object("bucket", "key", None, &crate::conditional::DeleteCondition::default())
+            .delete_object(
+                "bucket",
+                "key",
+                None,
+                &crate::conditional::DeleteCondition::default(),
+            )
             .unwrap();
 
         // Object should be gone.
-        let err = coord.get_object("bucket", "key", None, NO_READ).unwrap_err();
+        let err = coord
+            .get_object("bucket", "key", None, NO_READ)
+            .unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
     }
 
@@ -10142,8 +10141,15 @@ mod tests {
             let crc = checksum::crc64::checksum(data);
             let result = coord
                 .finalize_stream_part(
-                    "bucket", "key", &sess, upload_id, 1, crc,
-                    data.len() as u64, None, None,
+                    "bucket",
+                    "key",
+                    &sess,
+                    upload_id,
+                    1,
+                    crc,
+                    data.len() as u64,
+                    None,
+                    None,
                 )
                 .unwrap();
             CompletePart {
@@ -10217,8 +10223,15 @@ mod tests {
         let crc = checksum::crc64::checksum(data);
         coord
             .finalize_stream_part(
-                "bucket", "key", &sess, &mpu.upload_id, 1, crc,
-                data.len() as u64, None, None,
+                "bucket",
+                "key",
+                &sess,
+                &mpu.upload_id,
+                1,
+                crc,
+                data.len() as u64,
+                None,
+                None,
             )
             .unwrap();
 
@@ -10417,9 +10430,7 @@ mod tests {
         } // Drop PG lock before coordinator calls.
 
         // Verify full readback via coordinator.
-        let result = coord
-            .get_object("bucket", "verify", None, NO_READ)
-            .unwrap();
+        let result = coord.get_object("bucket", "verify", None, NO_READ).unwrap();
         assert_eq!(result.data, full);
 
         // Verify CRC matches.
@@ -10473,9 +10484,7 @@ mod tests {
             .unwrap();
 
         // 4. GET should return normal-put data, no chunk manifest interference.
-        let result = coord
-            .get_object("bucket", "cycle", None, NO_READ)
-            .unwrap();
+        let result = coord.get_object("bucket", "cycle", None, NO_READ).unwrap();
         assert_eq!(result.data, b"v2-normal");
     }
 
