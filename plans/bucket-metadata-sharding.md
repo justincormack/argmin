@@ -133,7 +133,14 @@ Exit criteria:
   - list buckets ordering
   - versioning/CORS/tags/PAB/ownership/ACL
   - delete non-empty bucket still returns `BucketNotEmpty`
-- Add fanout failure test: one PG fails during list -> request fails cleanly.
+- Add fanout behavior tests for sparse available PG sets (where `pg_count` is larger than `pg_ids()`).
+
+Status:
+- Complete.
+- Fanout paths use `self.storage_node.pg_ids()` for consistency with existing coordinator fanout behavior.
+- Added coordinator coverage for:
+  - global merge ordering by bucket name
+  - fanout behavior on sparse available PG sets (`ListBuckets`, `ListObjectsV2`, `ListObjectVersions`, `ListMultipartUploads`) when `pg_count` is larger than available PGs
 
 Exit criteria:
 - s3-tests bucket suites pass.

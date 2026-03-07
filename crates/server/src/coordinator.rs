@@ -4839,6 +4839,26 @@ mod tests {
         Coordinator::new(storage_node, ec_config, 4, "us-east-1".to_string()).unwrap()
     }
 
+    fn bucket_name_not_on_pg(excluded_pg: u32, pg_count: u32) -> String {
+        for i in 0..2048 {
+            let name = format!("bucket-{i}");
+            if derive_bucket_pg(&name, pg_count) != excluded_pg {
+                return name;
+            }
+        }
+        panic!("failed to find bucket name outside pg {excluded_pg}");
+    }
+
+    fn key_name_not_on_pg(bucket: &str, excluded_pg: u32, pg_count: u32) -> String {
+        for i in 0..2048 {
+            let key = format!("key-{i}");
+            if derive_pg(bucket, &key, pg_count) != excluded_pg {
+                return key;
+            }
+        }
+        panic!("failed to find key name outside pg {excluded_pg}");
+    }
+
     #[test]
     fn bucket_crud() {
         let tmp = test_util::tempdir();
@@ -4927,6 +4947,74 @@ mod tests {
             .map(|b| b.name)
             .collect();
         assert_eq!(names, vec!["alpha", "beta", "mango", "zz-top"]);
+    }
+
+    #[test]
+    fn list_buckets_uses_available_pgs_when_pg_count_is_larger() {
+        let tmp = test_util::tempdir();
+        let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &[0, 1, 2]).unwrap());
+        let ec_config = EcConfig::new(4, 2).unwrap();
+        let coord = Coordinator::new(storage_node, ec_config, 4, "us-east-1".to_string()).unwrap();
+        let bucket = bucket_name_not_on_pg(3, 4);
+        coord.create_bucket(&bucket).unwrap();
+
+        let names: Vec<String> = coord
+            .list_buckets()
+            .unwrap()
+            .into_iter()
+            .map(|b| b.name)
+            .collect();
+        assert_eq!(names, vec![bucket]);
+    }
+
+    #[test]
+    fn list_objects_uses_available_pgs_when_pg_count_is_larger() {
+        let tmp = test_util::tempdir();
+        let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &[0, 1, 2]).unwrap());
+        let ec_config = EcConfig::new(4, 2).unwrap();
+        let coord = Coordinator::new(storage_node, ec_config, 4, "us-east-1".to_string()).unwrap();
+        let bucket = bucket_name_not_on_pg(3, 4);
+        coord.create_bucket(&bucket).unwrap();
+
+        let resp = coord
+            .list_objects_v2(&bucket, None, None, None, 1000)
+            .unwrap();
+        assert!(resp.objects.is_empty());
+    }
+
+    #[test]
+    fn list_object_versions_uses_available_pgs_when_pg_count_is_larger() {
+        let tmp = test_util::tempdir();
+        let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &[0, 1, 2]).unwrap());
+        let ec_config = EcConfig::new(4, 2).unwrap();
+        let coord = Coordinator::new(storage_node, ec_config, 4, "us-east-1".to_string()).unwrap();
+        let bucket = bucket_name_not_on_pg(3, 4);
+        coord.create_bucket(&bucket).unwrap();
+
+        let resp = coord
+            .list_object_versions(&bucket, None, None, None, 1000)
+            .unwrap();
+        assert!(resp.versions.is_empty());
+    }
+
+    #[test]
+    fn list_multipart_uploads_uses_available_pgs_when_pg_count_is_larger() {
+        let tmp = test_util::tempdir();
+        let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &[0, 1, 2]).unwrap());
+        let ec_config = EcConfig::new(4, 2).unwrap();
+        let coord = Coordinator::new(storage_node, ec_config, 4, "us-east-1".to_string()).unwrap();
+        let bucket = bucket_name_not_on_pg(3, 4);
+        let key = key_name_not_on_pg(&bucket, 3, 4);
+        coord.create_bucket(&bucket).unwrap();
+        coord
+            .create_multipart_upload(&bucket, &key, &MetadataBlob::new(), None, None)
+            .unwrap();
+
+        let resp = coord
+            .list_multipart_uploads(&bucket, None, None, None, 1000)
+            .unwrap();
+        assert_eq!(resp.uploads.len(), 1);
+        assert_eq!(resp.uploads[0].key, key);
     }
 
     #[test]
