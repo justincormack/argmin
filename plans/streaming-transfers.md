@@ -392,7 +392,6 @@ Include:
 ### Phase 6: Limit lift and rollout
 
 1. Lift single PUT/part limits to 5 GiB where AWS-compatible.
-2. Add metrics and operational docs.
 
 **Exit criteria**
 1. Integration suites pass locally and against AWS where applicable.
