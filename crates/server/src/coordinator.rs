@@ -6,10 +6,10 @@ use storage::traits::{GlobalService, PgMetadataStore, ShardStore};
 use storage::{
     BucketInfo, ChecksumAlgorithm, ChecksumType, CreateMultipartUploadReq,
     CreateStreamUploadReq, DataLayout, ListMultipartUploadsReq, ListObjectVersionsReq,
-    ListObjectsReq, ListPartsReq, MultipartPartRecord, MultipartUploadRecord, ObjectPartRecord,
-    ObjectRecord, PutObjectMetaReq, ShardKey, SharedStorageNode, SqliteBucketDb,
-    StreamObjectChunkRecord, StreamUploadChunkRecord, StreamUploadKind, StreamUploadState,
-    UploadState,
+    ListObjectsReq, ListPartsReq, MultipartPartChunkRecord, MultipartPartRecord,
+    MultipartUploadRecord, ObjectPartRecord, ObjectRecord, PutObjectMetaReq, ShardKey,
+    SharedStorageNode, SqliteBucketDb, StreamObjectChunkRecord, StreamUploadChunkRecord,
+    StreamUploadKind, StreamUploadState, UploadState,
 };
 
 use crate::conditional::{
@@ -969,6 +969,66 @@ impl Coordinator {
         Ok(session_id)
     }
 
+    /// Begin a streaming UploadPart session.
+    ///
+    /// Creates a `StreamUploadKind::UploadPart` session tied to the given
+    /// multipart upload. Validates that the upload exists and is InProgress.
+    pub fn begin_stream_part(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number: u32,
+    ) -> Result<String, ServerError> {
+        // Validate part number range.
+        if part_number == 0 || part_number > 10_000 {
+            return Err(ServerError::InvalidArgument {
+                reason: format!("part number must be between 1 and 10000, got {part_number}"),
+            });
+        }
+
+        // Lock metadata PG and validate upload exists.
+        let meta_pg_id = derive_pg(bucket, key, self.pg_count);
+        let pg = self.storage_node.get_pg(meta_pg_id)?;
+
+        let upload = pg.get_multipart_upload(upload_id)?;
+        if upload.bucket != bucket || upload.key != key {
+            return Err(ServerError::NoSuchUpload {
+                upload_id: upload_id.to_string(),
+            });
+        }
+        if upload.state != UploadState::InProgress {
+            return Err(ServerError::NoSuchUpload {
+                upload_id: upload_id.to_string(),
+            });
+        }
+
+        // Generate session ID.
+        let rng = ring::rand::SystemRandom::new();
+        let mut id_bytes = [0u8; 16];
+        ring::rand::SecureRandom::fill(&rng, &mut id_bytes).map_err(|_| {
+            ServerError::InternalError {
+                reason: "failed to generate session ID".to_string(),
+            }
+        })?;
+        let session_id = id_bytes.iter().fold(String::with_capacity(32), |mut s, b| {
+            use std::fmt::Write;
+            write!(s, "{b:02x}").unwrap();
+            s
+        });
+
+        pg.create_stream_upload(&CreateStreamUploadReq {
+            session_id: session_id.clone(),
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            op_kind: StreamUploadKind::UploadPart,
+            upload_id: Some(upload_id.to_string()),
+            part_number: Some(part_number),
+        })?;
+
+        Ok(session_id)
+    }
+
     /// Append a chunk of data to an in-progress streaming session.
     ///
     /// Locks the metadata/session PG and the chunk's shard PG in global
@@ -1021,12 +1081,6 @@ impl Coordinator {
                 reason: "session bucket/key mismatch".to_string(),
             });
         }
-        if session.op_kind != StreamUploadKind::PutObject {
-            return Err(ServerError::InvalidRequest {
-                reason: "session is not a PutObject session".to_string(),
-            });
-        }
-
         // Reject duplicate chunk_index — writing shards then failing on PK
         // constraint would delete the already-staged chunk's shard data.
         let existing_chunks = meta_guard
@@ -1225,6 +1279,211 @@ impl Coordinator {
         Ok(PutObjectResult {
             etag: format_etag(crc64),
             version_id,
+        })
+    }
+
+    /// Finalize a streaming UploadPart session.
+    ///
+    /// Locks the metadata PG, builds committed chunk manifest from staging
+    /// rows, and atomically commits the part via `commit_stream_part`.
+    /// `computed_checksum` is the actual checksum bytes computed incrementally
+    /// during streaming. If `None`, the checksum is derived from `claimed_checksum`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn finalize_stream_part(
+        &self,
+        bucket: &str,
+        key: &str,
+        session_id: &str,
+        upload_id: &str,
+        part_number: u32,
+        crc64: u64,
+        total_size: u64,
+        claimed_checksum: Option<(ChecksumAlgorithm, &str)>,
+        computed_checksum: Option<(ChecksumAlgorithm, Vec<u8>)>,
+    ) -> Result<UploadPartResult, ServerError> {
+        let meta_pg_id = derive_pg(bucket, key, self.pg_count);
+        let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
+
+        // Validate session.
+        let session = meta_guard.get_stream_upload(session_id)?;
+        if session.state != StreamUploadState::InProgress {
+            return Err(ServerError::InvalidRequest {
+                reason: "stream session is not in progress".to_string(),
+            });
+        }
+        if session.bucket != bucket || session.key != key {
+            return Err(ServerError::InvalidRequest {
+                reason: "session bucket/key mismatch".to_string(),
+            });
+        }
+        if session.op_kind != StreamUploadKind::UploadPart {
+            return Err(ServerError::InvalidRequest {
+                reason: "session is not an UploadPart session".to_string(),
+            });
+        }
+
+        // Validate upload still exists and is InProgress.
+        let upload = meta_guard.get_multipart_upload(upload_id)?;
+        if upload.bucket != bucket || upload.key != key {
+            return Err(ServerError::NoSuchUpload {
+                upload_id: upload_id.to_string(),
+            });
+        }
+        if upload.state != UploadState::InProgress {
+            return Err(ServerError::NoSuchUpload {
+                upload_id: upload_id.to_string(),
+            });
+        }
+
+        // Resolve checksum algorithm: upload-level takes precedence.
+        let claimed_algo = claimed_checksum.as_ref().map(|(a, _)| *a);
+        let effective_algo = match (upload.checksum_algorithm, claimed_algo) {
+            (Some(upload_algo), Some(part_algo)) if upload_algo != part_algo => {
+                return Err(ServerError::InvalidRequest {
+                    reason: format!(
+                        "checksum algorithm mismatch: upload configured with {} but part sent {}",
+                        upload_algo.as_str(),
+                        part_algo.as_str()
+                    ),
+                });
+            }
+            (Some(algo), _) => Some(algo),
+            (None, Some(part_algo)) => Some(part_algo),
+            (None, None) => None,
+        };
+
+        // Use pre-computed checksum from incremental streaming if available,
+        // otherwise decode from claimed checksum header value.
+        let checksum_bytes = if let Some((algo, bytes)) = computed_checksum {
+            if let Some(ea) = effective_algo {
+                if ea != algo {
+                    return Err(ServerError::InvalidRequest {
+                        reason: format!(
+                            "computed checksum algorithm {} doesn't match effective {}",
+                            algo.as_str(),
+                            ea.as_str()
+                        ),
+                    });
+                }
+            }
+            Some(bytes)
+        } else if let Some((_, claimed_b64)) = &claimed_checksum {
+            // Decode claimed checksum from base64. Trust the value since we
+            // can't re-read streamed data to verify.
+            use base64::Engine;
+            Some(
+                base64::engine::general_purpose::STANDARD
+                    .decode(claimed_b64)
+                    .map_err(|_| ServerError::InvalidRequest {
+                        reason: "invalid base64 in checksum value".to_string(),
+                    })?,
+            )
+        } else {
+            None
+        };
+
+        // Determine generation for this part.
+        let generation = match meta_guard.get_multipart_part(upload_id, part_number) {
+            Ok(existing) => existing.generation + 1,
+            Err(storage::MetadataError::PartNotFound { .. }) => 0,
+            Err(e) => return Err(ServerError::Metadata(e)),
+        };
+
+        // Build committed chunk manifest from staging rows.
+        let staging_chunks = meta_guard
+            .list_stream_chunks(session_id)
+            .map_err(ServerError::Metadata)?;
+        let chunks_total: u64 = staging_chunks.iter().map(|c| c.size).sum();
+        if chunks_total != total_size {
+            return Err(ServerError::InvalidRequest {
+                reason: format!(
+                    "total_size mismatch: caller passed {total_size} but staged chunks sum to {chunks_total}"
+                ),
+            });
+        }
+
+        let committed_chunks: Vec<MultipartPartChunkRecord> = staging_chunks
+            .iter()
+            .map(|c| MultipartPartChunkRecord {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                version_id: 0, // placeholder — set at CompleteMultipartUpload time
+                part_number,
+                chunk_index: c.chunk_index,
+                size: c.size,
+                chunk_okh: c.chunk_okh,
+                chunk_vid: c.chunk_vid,
+                shard_pg_id: c.shard_pg_id,
+                ec_k: c.ec_k,
+                ec_m: c.ec_m,
+            })
+            .collect();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let part_record = MultipartPartRecord {
+            upload_id: upload_id.to_string(),
+            part_number,
+            generation,
+            size: total_size,
+            etag: crc64_to_etag_bytes(crc64),
+            etag_kind: 0,
+            part_okh: [0u8; 16], // no single-shard placement for streamed parts
+            part_vid: generation as u64,
+            ec_k: self.ec_config.data_shards,
+            ec_m: self.ec_config.parity_shards,
+            last_modified: now,
+            checksum: checksum_bytes.clone(),
+        };
+
+        // Atomic commit: upsert part, insert chunks, delete staging.
+        meta_guard
+            .commit_stream_part(session_id, &part_record, &committed_chunks)
+            .map_err(ServerError::Metadata)?;
+
+        // Best-effort cleanup of prior generation's shards.
+        // The prior generation used the non-streaming path, so clean its
+        // single shard set. If it was also a streamed part, clean its chunks.
+        drop(meta_guard);
+        if generation > 0 {
+            let old_gen = generation - 1;
+            // Clean old non-streaming shards.
+            let old_okh = part_key_hash(upload_id, part_number, old_gen);
+            let old_vid = old_gen as u64;
+            let old_shard_pg_id = derive_pg_shards(
+                &format!("mpu/{upload_id}"),
+                &format!("{part_number}/{old_gen}"),
+                old_vid,
+                self.pg_count,
+            );
+            if let Ok(old_pg) = self.storage_node.get_pg(old_shard_pg_id) {
+                let k = self.ec_config.data_shards as usize;
+                let m = self.ec_config.parity_shards as usize;
+                for i in 0..(k + m) {
+                    let old_key = ShardKey::new(&old_okh, old_vid, i as u8);
+                    let _ = old_pg.delete_shard(&old_key);
+                }
+            }
+            // Clean old streamed-part chunks (if prior generation was streamed).
+            // commit_stream_part already handles deleting prior multipart_part_chunks
+            // in its transaction, but the shard data on disk needs cleanup.
+            if let Ok(pg) = self.storage_node.get_pg(meta_pg_id) {
+                if let Ok(old_chunks) =
+                    pg.get_multipart_part_chunks(bucket, key, old_vid, part_number)
+                {
+                    drop(pg);
+                    let _ = self.delete_chunk_shards_generic(&old_chunks);
+                }
+            }
+        }
+
+        Ok(UploadPartResult {
+            etag: format_etag(crc64),
+            checksum_algorithm: effective_algo,
+            checksum_bytes,
         })
     }
 
@@ -1478,7 +1737,51 @@ impl Coordinator {
         // Phase 2: Write destination object
         let metadata_blob = match directive {
             MetadataDirective::Copy => src_metadata,
-            MetadataDirective::Replace => MetadataBlob::from_headers(new_headers)?,
+            MetadataDirective::Replace => {
+                let mut blob = MetadataBlob::from_headers(new_headers)?;
+
+                // Strip any client-supplied checksum VALUE headers — CopyObject
+                // has no body so these can't be verified and would persist
+                // unverified values.  If x-amz-checksum-algorithm is present we
+                // recompute the checksum from the copied data instead.
+                let checksum_value_headers: &[&str] = &[
+                    "x-amz-checksum-crc32",
+                    "x-amz-checksum-crc32c",
+                    "x-amz-checksum-crc64nvme",
+                    "x-amz-checksum-sha256",
+                    "x-amz-checksum-sha1",
+                ];
+                blob.entries
+                    .retain(|e| !checksum_value_headers.contains(&e.key.as_str()));
+
+                // If x-amz-checksum-algorithm is declared, compute a fresh
+                // checksum from the copied data and store it in the metadata.
+                if let Some(algo_val) = new_headers.iter().find_map(|(k, v)| {
+                    if k.eq_ignore_ascii_case("x-amz-checksum-algorithm") {
+                        Some(*v)
+                    } else {
+                        None
+                    }
+                }) {
+                    let algo =
+                        ChecksumAlgorithm::parse(algo_val).ok_or_else(|| {
+                            ServerError::InvalidArgument {
+                                reason: format!(
+                                    "unsupported checksum algorithm: {algo_val}"
+                                ),
+                            }
+                        })?;
+                    use base64::Engine;
+                    let cksum = compute_checksum(algo, &user_data);
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&cksum);
+                    blob.entries.push(crate::metadata_blob::MetadataEntry {
+                        key: algo.header_name().to_string(),
+                        value: b64,
+                    });
+                }
+
+                blob
+            }
         };
 
         let dst_bucket_info = self.head_bucket(dst_bucket)?;
@@ -2009,12 +2312,46 @@ impl Coordinator {
     /// Delete all shards for a list of stream object chunks.
     fn delete_chunk_shards(&self, chunks: &[StreamObjectChunkRecord]) -> Result<(), ServerError> {
         for chunk in chunks {
-            let pg = self.storage_node.get_pg(chunk.shard_pg_id)?;
-            let total = chunk.ec_k as usize + chunk.ec_m as usize;
-            for i in 0..total {
-                let shard_key = ShardKey::new(&chunk.chunk_okh, chunk.chunk_vid, i as u8);
-                pg.delete_shard(&shard_key)?;
-            }
+            self.delete_chunk_shard_set(
+                chunk.shard_pg_id,
+                &chunk.chunk_okh,
+                chunk.chunk_vid,
+                chunk.ec_k,
+                chunk.ec_m,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn delete_chunk_shards_generic(
+        &self,
+        chunks: &[MultipartPartChunkRecord],
+    ) -> Result<(), ServerError> {
+        for chunk in chunks {
+            self.delete_chunk_shard_set(
+                chunk.shard_pg_id,
+                &chunk.chunk_okh,
+                chunk.chunk_vid,
+                chunk.ec_k,
+                chunk.ec_m,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn delete_chunk_shard_set(
+        &self,
+        shard_pg_id: u32,
+        chunk_okh: &[u8; 16],
+        chunk_vid: u64,
+        ec_k: u8,
+        ec_m: u8,
+    ) -> Result<(), ServerError> {
+        let pg = self.storage_node.get_pg(shard_pg_id)?;
+        let total = ec_k as usize + ec_m as usize;
+        for i in 0..total {
+            let shard_key = ShardKey::new(chunk_okh, chunk_vid, i as u8);
+            pg.delete_shard(&shard_key)?;
         }
         Ok(())
     }
@@ -5999,6 +6336,117 @@ mod tests {
     }
 
     #[test]
+    fn copy_object_replace_strips_unverified_inline_checksum() {
+        // Regression: CopyObject with REPLACE must not persist client-supplied
+        // checksum value headers, since there is no body to verify them against.
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        coord
+            .put_object("bucket", "src", b"hello", &[], NO_WRITE)
+            .unwrap();
+
+        // Client sends a bogus checksum value header with REPLACE.
+        let new_headers = [
+            ("Content-Type", "text/plain"),
+            ("x-amz-checksum-crc32c", "AAAA=="),
+        ];
+        coord
+            .copy_object(
+                "bucket",
+                "src",
+                None,
+                "bucket",
+                "dst",
+                NO_READ,
+                NO_WRITE,
+                MetadataDirective::Replace,
+                &new_headers,
+            )
+            .unwrap();
+
+        let obj = coord.get_object("bucket", "dst", None, NO_READ).unwrap();
+        assert_eq!(obj.data, b"hello");
+        // The fake checksum must NOT be persisted.
+        assert_eq!(obj.metadata.get("x-amz-checksum-crc32c"), None);
+    }
+
+    #[test]
+    fn copy_object_replace_recomputes_checksum_from_algorithm() {
+        // When x-amz-checksum-algorithm is specified on CopyObject REPLACE,
+        // the checksum should be computed from the copied data.
+        use base64::Engine;
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let data = b"hello";
+        coord
+            .put_object("bucket", "src", data, &[], NO_WRITE)
+            .unwrap();
+
+        let new_headers = [
+            ("Content-Type", "text/plain"),
+            ("x-amz-checksum-algorithm", "CRC32C"),
+        ];
+        coord
+            .copy_object(
+                "bucket",
+                "src",
+                None,
+                "bucket",
+                "dst",
+                NO_READ,
+                NO_WRITE,
+                MetadataDirective::Replace,
+                &new_headers,
+            )
+            .unwrap();
+
+        let obj = coord.get_object("bucket", "dst", None, NO_READ).unwrap();
+        assert_eq!(obj.data, data);
+        // Checksum should be the real CRC32C of "hello", not missing.
+        let expected_crc = checksum::crc32c::checksum(data);
+        let expected_b64 =
+            base64::engine::general_purpose::STANDARD.encode(expected_crc.to_be_bytes());
+        assert_eq!(
+            obj.metadata.get("x-amz-checksum-crc32c"),
+            Some(expected_b64.as_str())
+        );
+    }
+
+    #[test]
+    fn copy_object_replace_rejects_invalid_checksum_algorithm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        coord
+            .put_object("bucket", "src", b"data", &[], NO_WRITE)
+            .unwrap();
+
+        let new_headers = [("x-amz-checksum-algorithm", "BOGUS")];
+        let err = coord
+            .copy_object(
+                "bucket",
+                "src",
+                None,
+                "bucket",
+                "dst",
+                NO_READ,
+                NO_WRITE,
+                MetadataDirective::Replace,
+                &new_headers,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, ServerError::InvalidArgument { .. }),
+            "expected InvalidArgument, got {err:?}"
+        );
+    }
+
+    #[test]
     fn copy_object_source_not_found() {
         let tmp = tempfile::tempdir().unwrap();
         let coord = setup_coordinator(tmp.path());
@@ -9345,9 +9793,8 @@ mod tests {
     }
 
     #[test]
-    fn stream_put_append_wrong_op_kind_rejected() {
-        // Create an UploadPart session directly via storage layer, then try
-        // to append via coordinator (which validates op_kind == PutObject).
+    fn stream_append_accepts_upload_part_session() {
+        // append_stream_chunk accepts both PutObject and UploadPart sessions.
         let dir = tempfile::tempdir().unwrap();
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
@@ -9355,7 +9802,7 @@ mod tests {
         let meta_pg_id = crate::pg::derive_pg("bucket", "key", 4);
         let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
         pg.create_stream_upload(&CreateStreamUploadReq {
-            session_id: "fake-upload-part-session".to_string(),
+            session_id: "upload-part-session".to_string(),
             bucket: "bucket".to_string(),
             key: "key".to_string(),
             op_kind: StreamUploadKind::UploadPart,
@@ -9365,13 +9812,156 @@ mod tests {
         .unwrap();
         drop(pg);
 
+        coord
+            .append_stream_chunk("bucket", "key", "upload-part-session", 0, b"data")
+            .unwrap();
+    }
+
+    // ── Phase 3a: Streaming UploadPart tests ─────────────────────────
+
+    #[test]
+    fn stream_part_happy_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        // Create a multipart upload first.
+        let mpu = coord
+            .create_multipart_upload("bucket", "key", &MetadataBlob::new(), None, None)
+            .unwrap();
+
+        // Begin a streaming part session.
+        let session_id = coord
+            .begin_stream_part("bucket", "key", &mpu.upload_id, 1)
+            .unwrap();
+
+        // Append chunks.
+        let data = b"hello streaming part";
+        coord
+            .append_stream_chunk("bucket", "key", &session_id, 0, data)
+            .unwrap();
+
+        // Finalize.
+        let crc = crc64::checksum(data);
+        let result = coord
+            .finalize_stream_part(
+                "bucket",
+                "key",
+                &session_id,
+                &mpu.upload_id,
+                1,
+                crc,
+                data.len() as u64,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(!result.etag.is_empty());
+    }
+
+    #[test]
+    fn stream_part_no_upload_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
         let err = coord
-            .append_stream_chunk("bucket", "key", "fake-upload-part-session", 0, b"data")
+            .begin_stream_part("bucket", "key", "nonexistent", 1)
+            .unwrap_err();
+        assert!(matches!(err, ServerError::NoSuchUpload { .. }));
+    }
+
+    #[test]
+    fn stream_part_invalid_part_number_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let mpu = coord
+            .create_multipart_upload("bucket", "key", &MetadataBlob::new(), None, None)
+            .unwrap();
+
+        // Part 0 is invalid.
+        let err = coord
+            .begin_stream_part("bucket", "key", &mpu.upload_id, 0)
+            .unwrap_err();
+        assert!(matches!(err, ServerError::InvalidArgument { .. }));
+
+        // Part 10001 is invalid.
+        let err = coord
+            .begin_stream_part("bucket", "key", &mpu.upload_id, 10_001)
+            .unwrap_err();
+        assert!(matches!(err, ServerError::InvalidArgument { .. }));
+    }
+
+    #[test]
+    fn finalize_stream_part_invalid_base64_rejected() {
+        // P2: Malformed base64 in claimed checksum must return an error,
+        // not silently accept a None checksum.
+        let dir = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let mpu = coord
+            .create_multipart_upload("bucket", "key", &MetadataBlob::new(), None, None)
+            .unwrap();
+
+        let session_id = coord
+            .begin_stream_part("bucket", "key", &mpu.upload_id, 1)
+            .unwrap();
+        coord
+            .append_stream_chunk("bucket", "key", &session_id, 0, b"data")
+            .unwrap();
+
+        let err = coord
+            .finalize_stream_part(
+                "bucket",
+                "key",
+                &session_id,
+                &mpu.upload_id,
+                1,
+                crc64::checksum(b"data"),
+                4,
+                Some((storage::ChecksumAlgorithm::Crc32, "not-valid-base64!!!")),
+                None,
+            )
             .unwrap_err();
         assert!(
             matches!(err, ServerError::InvalidRequest { .. }),
-            "expected InvalidRequest for wrong op_kind, got {err:?}"
+            "expected InvalidRequest for bad base64, got {err:?}"
         );
+    }
+
+    #[test]
+    fn finalize_stream_part_wrong_op_kind_rejected() {
+        // A PutObject session cannot be finalized as UploadPart.
+        let dir = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let session_id = coord.begin_stream_put("bucket", "key").unwrap();
+        coord
+            .append_stream_chunk("bucket", "key", &session_id, 0, b"data")
+            .unwrap();
+
+        let mpu = coord
+            .create_multipart_upload("bucket", "key", &MetadataBlob::new(), None, None)
+            .unwrap();
+
+        let err = coord
+            .finalize_stream_part(
+                "bucket",
+                "key",
+                &session_id,
+                &mpu.upload_id,
+                1,
+                crc64::checksum(b"data"),
+                4,
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(err, ServerError::InvalidRequest { .. }));
     }
 
     // ── Phase 5: Cleanup hardening tests ────────────────────────────

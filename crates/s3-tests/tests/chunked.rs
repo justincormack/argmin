@@ -2016,3 +2016,283 @@ fn test_malformed_trailer_line_rejected() {
         cleanup(&bucket, &[]).await;
     });
 }
+
+// ── Streaming UNSIGNED-PAYLOAD with inline checksum ─────────────────────
+
+/// Helper: sign and send a PUT with UNSIGNED-PAYLOAD and an optional inline
+/// checksum header. Returns (status, body_string).
+fn unsigned_payload_put_with_checksum(
+    path: &str,
+    body: &[u8],
+    checksum_header: Option<(&str, &str)>,
+) -> (u16, String) {
+    let mut extra = Vec::new();
+    if let Some((k, v)) = checksum_header {
+        extra.push((k, v));
+    }
+    let sign = sign_streaming_request_custom(
+        "PUT",
+        path,
+        "UNSIGNED-PAYLOAD",
+        body.len(),
+        &extra,
+        true,  // skip content-encoding (not aws-chunked)
+        true,  // skip decoded-content-length (not aws-chunked)
+    );
+
+    let url = format!("{}{}", CTX.endpoint(), path);
+    let mut req = agent()
+        .put(&url)
+        .header("Authorization", &sign.authorization)
+        .header("x-amz-date", &sign.amz_date)
+        .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+
+    if let Some((k, v)) = checksum_header {
+        req = req.header(k, v);
+    }
+
+    let mut resp = req.send(body).expect("transport error");
+    let status = resp.status().as_u16();
+    let body_str = resp.body_mut().read_to_string().unwrap_or_default();
+    (status, body_str)
+}
+
+#[test]
+fn test_streaming_inline_checksum_crc32_valid() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let data = b"hello streaming checksum";
+        let path = format!("/{}/inline-cksum-ok", bucket);
+
+        use base64::Engine;
+        let crc = checksum::crc32::checksum(data);
+        let crc_b64 = base64::engine::general_purpose::STANDARD.encode(crc.to_be_bytes());
+
+        let (status, body_str) = unsigned_payload_put_with_checksum(
+            &path,
+            data,
+            Some(("x-amz-checksum-crc32", &crc_b64)),
+        );
+        assert_eq!(status, 200, "expected 200, got {}: {}", status, body_str);
+
+        cleanup(&bucket, &["inline-cksum-ok"]).await;
+    });
+}
+
+#[test]
+fn test_streaming_inline_checksum_crc32_bad_digest() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let data = b"hello streaming checksum";
+        let path = format!("/{}/inline-cksum-bad", bucket);
+
+        let (status, body_str) = unsigned_payload_put_with_checksum(
+            &path,
+            data,
+            Some(("x-amz-checksum-crc32", "AAAA/w==")),
+        );
+        assert_eq!(status, 400, "expected 400, got {}: {}", status, body_str);
+        assert_error_code(&body_str, "BadDigest");
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_streaming_inline_checksum_crc32c_valid() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let data = b"crc32c inline test data";
+        let path = format!("/{}/inline-crc32c-ok", bucket);
+
+        use base64::Engine;
+        let crc = checksum::crc32c::checksum(data);
+        let crc_b64 = base64::engine::general_purpose::STANDARD.encode(crc.to_be_bytes());
+
+        let (status, body_str) = unsigned_payload_put_with_checksum(
+            &path,
+            data,
+            Some(("x-amz-checksum-crc32c", &crc_b64)),
+        );
+        assert_eq!(status, 200, "expected 200, got {}: {}", status, body_str);
+
+        cleanup(&bucket, &["inline-crc32c-ok"]).await;
+    });
+}
+
+#[test]
+fn test_streaming_inline_checksum_crc32c_bad_digest() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let data = b"crc32c inline test data";
+        let path = format!("/{}/inline-crc32c-bad", bucket);
+
+        let (status, body_str) = unsigned_payload_put_with_checksum(
+            &path,
+            data,
+            Some(("x-amz-checksum-crc32c", "AAAA/w==")),
+        );
+        assert_eq!(status, 400, "expected 400, got {}: {}", status, body_str);
+        assert_error_code(&body_str, "BadDigest");
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_streaming_inline_checksum_sha256_valid() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let data = b"sha256 inline test";
+        let path = format!("/{}/inline-sha256-ok", bucket);
+
+        use base64::Engine;
+        let digest = ring::digest::digest(&ring::digest::SHA256, data);
+        let sha_b64 = base64::engine::general_purpose::STANDARD.encode(digest.as_ref());
+
+        let (status, body_str) = unsigned_payload_put_with_checksum(
+            &path,
+            data,
+            Some(("x-amz-checksum-sha256", &sha_b64)),
+        );
+        assert_eq!(status, 200, "expected 200, got {}: {}", status, body_str);
+
+        cleanup(&bucket, &["inline-sha256-ok"]).await;
+    });
+}
+
+#[test]
+fn test_streaming_inline_checksum_sha256_bad_digest() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let data = b"sha256 inline test";
+        let path = format!("/{}/inline-sha256-bad", bucket);
+
+        use base64::Engine;
+        let digest = ring::digest::digest(&ring::digest::SHA256, b"");
+        let sha_b64 = base64::engine::general_purpose::STANDARD.encode(digest.as_ref());
+
+        let (status, body_str) = unsigned_payload_put_with_checksum(
+            &path,
+            data,
+            Some(("x-amz-checksum-sha256", &sha_b64)),
+        );
+        assert_eq!(status, 400, "expected 400, got {}: {}", status, body_str);
+        assert_error_code(&body_str, "BadDigest");
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+// ── Conflicting inline + trailing checksum ──────────────────────────────
+
+/// Regression test: a request with both a trailing checksum declaration
+/// (x-amz-trailer) and an inline checksum value header must be rejected.
+/// AWS returns: InvalidRequest: Expecting a single x-amz-checksum- header
+#[test]
+fn test_inline_plus_trailing_checksum_rejected() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let data = b"conflict test body";
+        let path = format!("/{}/conflict-cksum", bucket);
+        let content_sha256 = "STREAMING-UNSIGNED-PAYLOAD-TRAILER";
+
+        use base64::Engine;
+        // Compute correct CRC32 for the trailer.
+        let crc = checksum::crc32::checksum(data);
+        let crc_b64 = base64::engine::general_purpose::STANDARD.encode(crc.to_be_bytes());
+        let trailer = format!("x-amz-checksum-crc32:{}", crc_b64);
+
+        // Also include a bogus inline SHA256 header.
+        let bogus_sha256 = base64::engine::general_purpose::STANDARD
+            .encode(ring::digest::digest(&ring::digest::SHA256, b"wrong").as_ref());
+
+        let sign = sign_streaming_request(
+            "PUT",
+            &path,
+            content_sha256,
+            data.len(),
+            &[
+                ("x-amz-trailer", "x-amz-checksum-crc32"),
+                ("x-amz-checksum-sha256", &bogus_sha256),
+            ],
+        );
+        let wire = build_unsigned_chunked_body_with_trailer(data, &trailer);
+
+        let url = format!("{}{}", CTX.endpoint(), path);
+        let mut resp = agent()
+            .put(&url)
+            .header("Authorization", &sign.authorization)
+            .header("x-amz-date", &sign.amz_date)
+            .header("x-amz-content-sha256", content_sha256)
+            .header("content-encoding", "aws-chunked")
+            .header("x-amz-decoded-content-length", &data.len().to_string())
+            .header("content-length", &wire.len().to_string())
+            .header("x-amz-trailer", "x-amz-checksum-crc32")
+            .header("x-amz-checksum-sha256", &bogus_sha256)
+            .send(&wire[..])
+            .expect("transport error");
+        let status = resp.status().as_u16();
+        let body_str = resp.body_mut().read_to_string().unwrap_or_default();
+
+        // AWS rejects with: InvalidRequest: Expecting a single x-amz-checksum- header
+        assert_eq!(status, 400, "expected 400, got {}: {}", status, body_str);
+        assert_error_code(&body_str, "InvalidRequest");
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+/// Same as above but with mixed-case trailer name to verify case-insensitive
+/// conflict detection.
+#[test]
+fn test_inline_plus_trailing_checksum_rejected_mixed_case() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let data = b"mixed case conflict";
+        let path = format!("/{}/conflict-mixed", bucket);
+        let content_sha256 = "STREAMING-UNSIGNED-PAYLOAD-TRAILER";
+
+        use base64::Engine;
+        let crc = checksum::crc32::checksum(data);
+        let crc_b64 = base64::engine::general_purpose::STANDARD.encode(crc.to_be_bytes());
+        let trailer = format!("x-amz-checksum-crc32:{}", crc_b64);
+
+        let bogus_sha256 = base64::engine::general_purpose::STANDARD
+            .encode(ring::digest::digest(&ring::digest::SHA256, b"wrong").as_ref());
+
+        // Use mixed-case trailer name to try to bypass conflict detection.
+        let sign = sign_streaming_request(
+            "PUT",
+            &path,
+            content_sha256,
+            data.len(),
+            &[
+                ("x-amz-trailer", "X-Amz-Checksum-CRC32"),
+                ("x-amz-checksum-sha256", &bogus_sha256),
+            ],
+        );
+        let wire = build_unsigned_chunked_body_with_trailer(data, &trailer);
+
+        let url = format!("{}{}", CTX.endpoint(), path);
+        let mut resp = agent()
+            .put(&url)
+            .header("Authorization", &sign.authorization)
+            .header("x-amz-date", &sign.amz_date)
+            .header("x-amz-content-sha256", content_sha256)
+            .header("content-encoding", "aws-chunked")
+            .header("x-amz-decoded-content-length", &data.len().to_string())
+            .header("content-length", &wire.len().to_string())
+            .header("x-amz-trailer", "X-Amz-Checksum-CRC32")
+            .header("x-amz-checksum-sha256", &bogus_sha256)
+            .send(&wire[..])
+            .expect("transport error");
+        let status = resp.status().as_u16();
+        let body_str = resp.body_mut().read_to_string().unwrap_or_default();
+
+        assert_eq!(status, 400, "expected 400, got {}: {}", status, body_str);
+        assert_error_code(&body_str, "InvalidRequest");
+
+        cleanup(&bucket, &[]).await;
+    });
+}

@@ -461,7 +461,7 @@ impl HttpFrontend {
                             }
                         }
                     }
-                    validate_checksum_headers(req)?;
+                    validate_checksum_headers(req, true)?;
                     // Parse inline tags before writing so invalid tags don't leave orphan objects
                     let inline_tags_xml = if let Some(tagging_header) = req.header("x-amz-tagging")
                     {
@@ -1668,7 +1668,7 @@ impl HttpFrontend {
             }
         }
 
-        validate_checksum_headers(req)?;
+        validate_checksum_headers(req, false)?;
 
         // Parse inline tags before starting the session.
         let inline_tags_xml = if let Some(tagging_header) = req.header("x-amz-tagging") {
@@ -1681,6 +1681,35 @@ impl HttpFrontend {
         } else {
             None
         };
+
+        // Reject if both a trailing checksum (via x-amz-trailer) and an inline
+        // checksum value header are present. AWS returns:
+        //   InvalidRequest: Expecting a single x-amz-checksum- header
+        let has_trailing_checksum = req
+            .header("x-amz-trailer")
+            .map(|v| {
+                v.split(',')
+                    .any(|name| checksum_algo_from_header(name.trim()).is_some())
+            })
+            .unwrap_or(false);
+
+        if has_trailing_checksum {
+            let checksum_value_headers: &[&str] = &[
+                "x-amz-checksum-sha256",
+                "x-amz-checksum-crc64nvme",
+                "x-amz-checksum-crc32",
+                "x-amz-checksum-crc32c",
+                "x-amz-checksum-sha1",
+            ];
+            let has_inline_checksum = checksum_value_headers
+                .iter()
+                .any(|h| req.header(h).is_some());
+            if has_inline_checksum {
+                return Err(ServerError::InvalidRequest {
+                    reason: "Expecting a single x-amz-checksum- header".to_string(),
+                });
+            }
+        }
 
         let header_pairs: Vec<(&str, &str)> = req
             .headers
@@ -1708,6 +1737,7 @@ impl HttpFrontend {
             cond,
             inline_tags_xml,
             checksum_response,
+            streaming_signing: auth.streaming,
         })
     }
 
@@ -1723,19 +1753,43 @@ impl HttpFrontend {
     }
 
     /// Finalize a streaming PutObject session and return an S3Response.
+    ///
+    /// `trailer_checksums` contains checksum headers extracted from aws-chunked
+    /// trailers (e.g. `x-amz-checksum-crc32`). These are merged into the
+    /// metadata blob for storage and echoed back in the response.
     pub fn finalize_streaming_put(
         &self,
         ctx: &StreamingPutContext,
         crc64: u64,
         total_size: u64,
+        trailer_checksums: &[(String, String)],
     ) -> Result<S3Response, ServerError> {
+        // Merge trailer checksums into metadata blob so they're persisted.
+        // Trailer values override any matching initial header entries.
+        let metadata_blob = if trailer_checksums.is_empty() {
+            ctx.metadata_blob.clone()
+        } else {
+            let mut blob = ctx.metadata_blob.clone();
+            for (k, v) in trailer_checksums {
+                if let Some(entry) = blob.entries.iter_mut().find(|e| e.key == *k) {
+                    entry.value = v.clone();
+                } else {
+                    blob.entries.push(crate::metadata_blob::MetadataEntry {
+                        key: k.clone(),
+                        value: v.clone(),
+                    });
+                }
+            }
+            blob
+        };
+
         let result = self.coordinator.finalize_stream_put(
             &ctx.bucket,
             &ctx.key,
             &ctx.session_id,
             crc64,
             total_size,
-            &ctx.metadata_blob,
+            &metadata_blob,
             &ctx.cond,
         )?;
 
@@ -1749,14 +1803,150 @@ impl HttpFrontend {
         }
 
         let mut resp = S3Response::put_object(&result);
+        // Echo checksum headers. Trailer values override initial header values.
         for (name, value) in &ctx.checksum_response {
-            resp.headers.push((name.clone(), value.clone()));
+            if let Some((_, tv)) = trailer_checksums.iter().find(|(k, _)| k == name) {
+                resp.headers.push((name.clone(), tv.clone()));
+            } else {
+                resp.headers.push((name.clone(), value.clone()));
+            }
+        }
+        for (name, value) in trailer_checksums {
+            if !ctx.checksum_response.iter().any(|(k, _)| k == name) {
+                resp.headers.push((name.clone(), value.clone()));
+            }
         }
         Ok(resp)
     }
 
     /// Abort a streaming session (best-effort cleanup).
     pub fn abort_streaming_put(&self, ctx: &StreamingPutContext) {
+        let _ =
+            self.coordinator
+                .abort_stream_put(&ctx.bucket, &ctx.key, &ctx.session_id);
+    }
+
+    /// Prepare a streaming UploadPart session.
+    pub fn prepare_streaming_part(
+        &self,
+        req: &S3Request,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number: u32,
+    ) -> Result<StreamingPartContext, ServerError> {
+        let auth = self.authenticate(req)?;
+        self.authorize_bucket_write(&auth, bucket)?;
+
+        let claimed_checksum = extract_checksum_header(req)?;
+
+        let mut checksum_response: Vec<(String, String)> = Vec::new();
+        for &(_, header) in CHECKSUM_HEADERS {
+            if let Some(val) = req.header(header) {
+                checksum_response.push((header.to_string(), val.to_string()));
+            }
+        }
+
+        let session_id =
+            self.coordinator
+                .begin_stream_part(bucket, key, upload_id, part_number)?;
+
+        Ok(StreamingPartContext {
+            session_id,
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            upload_id: upload_id.to_string(),
+            part_number,
+            claimed_checksum,
+            checksum_response,
+            streaming_signing: auth.streaming,
+        })
+    }
+
+    /// Append a chunk to a streaming UploadPart session.
+    pub fn streaming_append_part_chunk(
+        &self,
+        ctx: &StreamingPartContext,
+        chunk_index: u32,
+        data: &[u8],
+    ) -> Result<(), ServerError> {
+        self.coordinator
+            .append_stream_chunk(&ctx.bucket, &ctx.key, &ctx.session_id, chunk_index, data)
+    }
+
+    /// Finalize a streaming UploadPart session and return an S3Response.
+    ///
+    /// `trailer_checksums` contains checksum headers from aws-chunked trailers.
+    /// `computed_checksum` is the incrementally computed checksum (algo, bytes).
+    #[allow(clippy::too_many_arguments)]
+    pub fn finalize_streaming_part(
+        &self,
+        ctx: &StreamingPartContext,
+        crc64: u64,
+        total_size: u64,
+        trailer_checksums: &[(String, String)],
+        computed_checksum: Option<(ChecksumAlgorithm, Vec<u8>)>,
+    ) -> Result<S3Response, ServerError> {
+        // If trailer checksums are present, use the first one as the claimed
+        // checksum (overriding any from request headers). Trailing checksums
+        // take precedence since they are computed after the body is sent.
+        let trailer_claim = if let Some((k, v)) = trailer_checksums.first() {
+            checksum_algo_from_header(k).map(|algo| (algo, v.as_str()))
+        } else {
+            None
+        };
+        let claimed_ref = trailer_claim.or_else(|| {
+            ctx.claimed_checksum
+                .as_ref()
+                .map(|(algo, val)| (*algo, val.as_str()))
+        });
+
+        let result = self.coordinator.finalize_stream_part(
+            &ctx.bucket,
+            &ctx.key,
+            &ctx.session_id,
+            &ctx.upload_id,
+            ctx.part_number,
+            crc64,
+            total_size,
+            claimed_ref,
+            computed_checksum,
+        )?;
+
+        let mut resp = S3Response::upload_part(
+            &result.etag,
+            result.checksum_algorithm,
+            result.checksum_bytes.as_deref(),
+        );
+        // The coordinator's result already includes the checksum via
+        // S3Response::upload_part. Only echo headers NOT already present
+        // (e.g. x-amz-checksum-type). Trailer values take precedence.
+        let already_set: Option<&str> = result
+            .checksum_algorithm
+            .map(|a| a.header_name());
+        for (name, value) in &ctx.checksum_response {
+            if already_set == Some(name.as_str()) {
+                continue; // Already set by S3Response::upload_part
+            }
+            if let Some((_, tv)) = trailer_checksums.iter().find(|(k, _)| k == name) {
+                resp.headers.push((name.clone(), tv.clone()));
+            } else {
+                resp.headers.push((name.clone(), value.clone()));
+            }
+        }
+        for (name, value) in trailer_checksums {
+            if already_set == Some(name.as_str()) {
+                continue; // Already set by S3Response::upload_part
+            }
+            if !ctx.checksum_response.iter().any(|(k, _)| k == name) {
+                resp.headers.push((name.clone(), value.clone()));
+            }
+        }
+        Ok(resp)
+    }
+
+    /// Abort a streaming UploadPart session (best-effort cleanup).
+    pub fn abort_streaming_part(&self, ctx: &StreamingPartContext) {
         let _ =
             self.coordinator
                 .abort_stream_put(&ctx.bucket, &ctx.key, &ctx.session_id);
@@ -1774,6 +1964,23 @@ pub struct StreamingPutContext {
     pub cond: crate::conditional::WriteCondition,
     pub inline_tags_xml: Option<String>,
     pub checksum_response: Vec<(String, String)>,
+    /// Signing context for aws-chunked modes, None for unsigned/plain.
+    pub streaming_signing: Option<auth::StreamingSigningContext>,
+}
+
+/// Context for an in-progress streaming UploadPart.
+///
+/// Created by `prepare_streaming_part`, used across async/blocking boundaries.
+pub struct StreamingPartContext {
+    pub session_id: String,
+    pub bucket: String,
+    pub key: String,
+    pub upload_id: String,
+    pub part_number: u32,
+    pub claimed_checksum: Option<(ChecksumAlgorithm, String)>,
+    pub checksum_response: Vec<(String, String)>,
+    /// Signing context for aws-chunked modes, None for unsigned/plain.
+    pub streaming_signing: Option<auth::StreamingSigningContext>,
 }
 
 /// Convert an S3Response into a hyper-compatible HTTP response.
@@ -1806,12 +2013,28 @@ const CHECKSUM_HEADERS: &[(&str, &str)] = &[
     ("SHA1", "x-amz-checksum-sha1"),
 ];
 
-/// Validate checksum headers on PutObject. If a checksum header is present,
-/// compute the actual checksum and compare. Returns `BadDigest` on mismatch.
+/// Map a checksum header name (e.g. `x-amz-checksum-crc32`) to its
+/// `ChecksumAlgorithm`. Returns `None` for unrecognized headers.
+fn checksum_algo_from_header(header: &str) -> Option<ChecksumAlgorithm> {
+    let lower = header.to_ascii_lowercase();
+    for &(algo_name, h) in CHECKSUM_HEADERS {
+        if h == lower {
+            return ChecksumAlgorithm::parse(algo_name);
+        }
+    }
+    None
+}
+
+/// Validate checksum headers on PutObject.
 ///
-/// Enforces that at most one checksum header is present, and if
-/// `x-amz-checksum-algorithm` is set it must match the provided checksum header.
-fn validate_checksum_headers(req: &S3Request) -> Result<(), ServerError> {
+/// Enforces that at most one checksum header is present, validates base64
+/// format/length, and if `x-amz-checksum-algorithm` is set it must match
+/// the provided checksum header.
+///
+/// When `verify_body` is true, also computes the actual checksum from
+/// `req.body` and returns `BadDigest` on mismatch. Pass `false` for
+/// streaming paths where the body is not yet available.
+fn validate_checksum_headers(req: &S3Request, verify_body: bool) -> Result<(), ServerError> {
     use base64::Engine;
 
     let algo_header = req.header("x-amz-checksum-algorithm");
@@ -1861,36 +2084,34 @@ fn validate_checksum_headers(req: &S3Request) -> Result<(), ServerError> {
                 }
             }
 
-            let actual_b64 = match algo {
-                "SHA256" => {
-                    let digest = ring::digest::digest(&ring::digest::SHA256, &req.body);
-                    base64::engine::general_purpose::STANDARD.encode(digest.as_ref())
+            if verify_body {
+                let actual_b64 = match algo {
+                    "SHA256" => {
+                        let digest = ring::digest::digest(&ring::digest::SHA256, &req.body);
+                        base64::engine::general_purpose::STANDARD.encode(digest.as_ref())
+                    }
+                    "SHA1" => {
+                        let digest =
+                            ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, &req.body);
+                        base64::engine::general_purpose::STANDARD.encode(digest.as_ref())
+                    }
+                    "CRC32" => {
+                        let crc = checksum::crc32::checksum(&req.body);
+                        base64::engine::general_purpose::STANDARD.encode(crc.to_be_bytes())
+                    }
+                    "CRC32C" => {
+                        let crc = checksum::crc32c::checksum(&req.body);
+                        base64::engine::general_purpose::STANDARD.encode(crc.to_be_bytes())
+                    }
+                    "CRC64NVME" => {
+                        let crc = crc64::checksum(&req.body);
+                        base64::engine::general_purpose::STANDARD.encode(crc.to_be_bytes())
+                    }
+                    _ => continue,
+                };
+                if claimed != actual_b64 {
+                    return Err(ServerError::BadDigest);
                 }
-                "SHA1" => {
-                    let digest =
-                        ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, &req.body);
-                    base64::engine::general_purpose::STANDARD.encode(digest.as_ref())
-                }
-                "CRC32" => {
-                    let crc = unsafe {
-                        ec_sys::crc32_gzip_refl(0, req.body.as_ptr(), req.body.len() as u64)
-                    };
-                    base64::engine::general_purpose::STANDARD.encode(crc.to_be_bytes())
-                }
-                "CRC32C" => {
-                    let crc = unsafe {
-                        ec_sys::crc32_iscsi(req.body.as_ptr() as *mut _, req.body.len() as i32, 0)
-                    };
-                    base64::engine::general_purpose::STANDARD.encode(crc.to_be_bytes())
-                }
-                "CRC64NVME" => {
-                    let crc = crc64::checksum(&req.body);
-                    base64::engine::general_purpose::STANDARD.encode(crc.to_be_bytes())
-                }
-                _ => continue,
-            };
-            if claimed != actual_b64 {
-                return Err(ServerError::BadDigest);
             }
         }
     }

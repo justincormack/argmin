@@ -300,6 +300,241 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
+/// Incremental aws-chunked decoder for streaming write paths.
+///
+/// Accepts wire bytes incrementally via `feed()` and yields decoded payload
+/// bytes. Handles per-chunk signature verification and trailer parsing.
+pub struct IncrementalChunkedDecoder {
+    streaming: Option<StreamingSigningContext>,
+    trailer_mode: bool,
+    prev_sig: Option<String>,
+    chunk_number: usize,
+    prev_chunk_size: Option<usize>,
+    buf: Vec<u8>,
+    state: ChunkedDecoderState,
+    trailers: Vec<(String, String)>,
+    done: bool,
+}
+
+#[derive(Debug)]
+enum ChunkedDecoderState {
+    /// Waiting for chunk header line.
+    ReadingHeader,
+    /// Reading chunk data bytes. `remaining` bytes left to read in current chunk.
+    ReadingData {
+        remaining: usize,
+        sig: Option<String>,
+    },
+    /// Consumed chunk data, expecting \r\n after it.
+    ExpectingDataCrlf,
+    /// Reading trailers after terminal chunk.
+    ReadingTrailers,
+    /// Decoding complete.
+    Done,
+}
+
+impl IncrementalChunkedDecoder {
+    pub fn new(
+        streaming: Option<StreamingSigningContext>,
+        trailer_mode: bool,
+    ) -> Self {
+        let prev_sig = streaming.as_ref().map(|s| s.seed_signature.clone());
+        Self {
+            streaming,
+            trailer_mode,
+            prev_sig,
+            chunk_number: 0,
+            prev_chunk_size: None,
+            buf: Vec::new(),
+            state: ChunkedDecoderState::ReadingHeader,
+            trailers: Vec::new(),
+            done: false,
+        }
+    }
+
+    /// Feed wire bytes and extract decoded payload.
+    ///
+    /// Returns decoded payload bytes extracted from this batch. May return
+    /// an empty vec if the wire data doesn't complete any payload chunks.
+    pub fn feed(&mut self, wire: &[u8]) -> Result<Vec<u8>, ServerError> {
+        if self.done {
+            return Err(ServerError::MalformedChunkedBody {
+                reason: "data after chunked body complete".to_string(),
+            });
+        }
+        self.buf.extend_from_slice(wire);
+        let mut payload = Vec::new();
+
+        loop {
+            match self.state {
+                ChunkedDecoderState::ReadingHeader => {
+                    // Try to find a complete header line.
+                    let Some(crlf_pos) = find_crlf(&self.buf, 0) else {
+                        break;
+                    };
+                    let line = self.buf[..crlf_pos].to_vec();
+                    self.buf.drain(..crlf_pos + 2);
+
+                    let (chunk_size, chunk_sig) = parse_chunk_header(&line)?;
+
+                    // Signed mode requires chunk-signature on every chunk.
+                    if self.streaming.is_some() && chunk_sig.is_none() {
+                        return Err(ServerError::MalformedChunkedBody {
+                            reason: "missing chunk-signature in signed chunked upload"
+                                .to_string(),
+                        });
+                    }
+
+                    if chunk_size == 0 {
+                        // Terminal chunk.
+                        if let Some(ref ctx) = self.streaming {
+                            let sig = chunk_sig.as_deref().unwrap();
+                            verify_chunk_signature(
+                                ctx,
+                                self.prev_sig.as_deref().unwrap(),
+                                b"",
+                                sig,
+                            )?;
+                            self.prev_sig = Some(sig.to_string());
+                        }
+                        self.state = ChunkedDecoderState::ReadingTrailers;
+                        continue;
+                    }
+
+                    // Validate minimum chunk size for non-final data chunks.
+                    if let Some(prev_size) = self.prev_chunk_size {
+                        if prev_size < MIN_CHUNK_SIZE {
+                            return Err(ServerError::InvalidChunkSize {
+                                chunk: self.chunk_number,
+                                chunk_size: prev_size,
+                                min_size: MIN_CHUNK_SIZE,
+                            });
+                        }
+                    }
+
+                    self.state = ChunkedDecoderState::ReadingData {
+                        remaining: chunk_size,
+                        sig: chunk_sig,
+                    };
+                }
+                ChunkedDecoderState::ReadingData {
+                    ref mut remaining,
+                    ref sig,
+                } => {
+                    if self.buf.len() < *remaining {
+                        // Not enough data yet. Drain what we can for payload
+                        // but we need to verify the complete chunk signature,
+                        // so we must buffer the full chunk before yielding.
+                        break;
+                    }
+                    let chunk_data: Vec<u8> = self.buf.drain(..*remaining).collect();
+                    let sig = sig.clone();
+                    *remaining = 0;
+
+                    // Verify chunk signature.
+                    if let Some(ref ctx) = self.streaming {
+                        let s = sig.as_deref().unwrap();
+                        verify_chunk_signature(
+                            ctx,
+                            self.prev_sig.as_deref().unwrap(),
+                            &chunk_data,
+                            s,
+                        )?;
+                        self.prev_sig = Some(s.to_string());
+                    }
+
+                    self.prev_chunk_size = Some(chunk_data.len());
+                    self.chunk_number += 1;
+                    payload.extend_from_slice(&chunk_data);
+
+                    self.state = ChunkedDecoderState::ExpectingDataCrlf;
+                }
+                ChunkedDecoderState::ExpectingDataCrlf => {
+                    if self.buf.len() < 2 {
+                        break;
+                    }
+                    if self.buf[0] != b'\r' || self.buf[1] != b'\n' {
+                        return Err(ServerError::MalformedChunkedBody {
+                            reason: "missing CRLF after chunk data".to_string(),
+                        });
+                    }
+                    self.buf.drain(..2);
+                    self.state = ChunkedDecoderState::ReadingHeader;
+                }
+                ChunkedDecoderState::ReadingTrailers => {
+                    // Try to parse trailer lines until empty line.
+                    loop {
+                        if self.buf.is_empty() {
+                            return Ok(payload); // Need more data
+                        }
+                        // Empty line marks end of trailers.
+                        if self.buf.len() >= 2
+                            && self.buf[0] == b'\r'
+                            && self.buf[1] == b'\n'
+                        {
+                            self.buf.drain(..2);
+
+                            // Verify trailer signature if needed.
+                            if self.trailer_mode {
+                                if let Some(ref ctx) = self.streaming {
+                                    verify_trailer_signature(
+                                        ctx,
+                                        self.prev_sig.as_deref().unwrap(),
+                                        &self.trailers,
+                                    )?;
+                                }
+                            }
+
+                            // Strip trailer signature from returned trailers.
+                            self.trailers
+                                .retain(|(k, _)| k != "x-amz-trailer-signature");
+
+                            self.state = ChunkedDecoderState::Done;
+                            self.done = true;
+                            break;
+                        }
+                        // Try to find a complete trailer line.
+                        let Some(crlf_pos) = find_crlf(&self.buf, 0) else {
+                            return Ok(payload); // Need more data
+                        };
+                        let line = self.buf[..crlf_pos].to_vec();
+                        self.buf.drain(..crlf_pos + 2);
+
+                        let line_str = std::str::from_utf8(&line).map_err(|_| {
+                            ServerError::MalformedChunkedBody {
+                                reason: "non-UTF8 trailer".to_string(),
+                            }
+                        })?;
+
+                        if let Some((key, value)) = line_str.split_once(':') {
+                            self.trailers.push((
+                                key.trim().to_ascii_lowercase(),
+                                value.trim().to_string(),
+                            ));
+                        } else {
+                            return Err(ServerError::IncompleteBody);
+                        }
+                    }
+                    break;
+                }
+                ChunkedDecoderState::Done => break,
+            }
+        }
+
+        Ok(payload)
+    }
+
+    /// Check if decoding is complete (terminal chunk + trailers processed).
+    pub fn is_done(&self) -> bool {
+        self.done
+    }
+
+    /// Consume the decoder and return trailers. Panics if not done.
+    pub fn into_trailers(self) -> Vec<(String, String)> {
+        self.trailers
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -606,5 +841,139 @@ mod tests {
         let wire = b"5\r\nhello\r\n0\r\n";
         let err = decode_chunked_body(wire, None, false).unwrap_err();
         assert!(matches!(err, ServerError::IncompleteBody));
+    }
+
+    // ── IncrementalChunkedDecoder tests ──────────────────────────────
+
+    #[test]
+    fn incremental_single_feed() {
+        let mut dec = IncrementalChunkedDecoder::new(None, false);
+        let wire = b"5\r\nhello\r\n0\r\n\r\n";
+        let payload = dec.feed(wire).unwrap();
+        assert_eq!(payload, b"hello");
+        assert!(dec.is_done());
+        assert!(dec.into_trailers().is_empty());
+    }
+
+    #[test]
+    fn incremental_byte_at_a_time() {
+        let mut dec = IncrementalChunkedDecoder::new(None, false);
+        let wire = b"5\r\nhello\r\n0\r\n\r\n";
+        let mut all_payload = Vec::new();
+        for &b in wire.iter() {
+            let chunk = dec.feed(&[b]).unwrap();
+            all_payload.extend_from_slice(&chunk);
+        }
+        assert_eq!(all_payload, b"hello");
+        assert!(dec.is_done());
+    }
+
+    #[test]
+    fn incremental_with_trailers() {
+        let mut dec = IncrementalChunkedDecoder::new(None, true);
+        let wire = b"5\r\nhello\r\n0\r\nx-amz-checksum-crc32:abcd1234\r\n\r\n";
+        let payload = dec.feed(wire).unwrap();
+        assert_eq!(payload, b"hello");
+        assert!(dec.is_done());
+        let trailers = dec.into_trailers();
+        assert_eq!(trailers.len(), 1);
+        assert_eq!(trailers[0].0, "x-amz-checksum-crc32");
+        assert_eq!(trailers[0].1, "abcd1234");
+    }
+
+    #[test]
+    fn incremental_split_across_chunks() {
+        let mut dec = IncrementalChunkedDecoder::new(None, false);
+        // Feed header + partial data
+        let payload1 = dec.feed(b"5\r\nhel").unwrap();
+        assert!(payload1.is_empty()); // Not enough data yet
+        // Feed rest of data + terminal
+        let payload2 = dec.feed(b"lo\r\n0\r\n\r\n").unwrap();
+        assert_eq!(payload2, b"hello");
+        assert!(dec.is_done());
+    }
+
+    #[test]
+    fn incremental_multiple_chunks() {
+        let mut dec = IncrementalChunkedDecoder::new(None, false);
+        // Two chunks: 8192-byte chunk + 4-byte chunk
+        let chunk1 = vec![b'A'; 8192];
+        let mut wire = Vec::new();
+        wire.extend_from_slice(format!("{:x}\r\n", chunk1.len()).as_bytes());
+        wire.extend_from_slice(&chunk1);
+        wire.extend_from_slice(b"\r\n4\r\ntail\r\n0\r\n\r\n");
+
+        let payload = dec.feed(&wire).unwrap();
+        let mut expected = chunk1;
+        expected.extend_from_slice(b"tail");
+        assert_eq!(payload, expected);
+        assert!(dec.is_done());
+    }
+
+    #[test]
+    fn incremental_small_non_final_chunk_rejected() {
+        let mut dec = IncrementalChunkedDecoder::new(None, false);
+        let wire = b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        let err = dec.feed(wire).unwrap_err();
+        assert!(matches!(err, ServerError::InvalidChunkSize { .. }));
+    }
+
+    #[test]
+    fn incremental_signed_verification() {
+        // Reuse the same signing setup as the batch decoder test.
+        let chunk_data = b"Hello";
+        let secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        let date = "20130524";
+        let region = "us-east-1";
+        let service = "s3";
+        let timestamp = "20130524T000000Z";
+        let scope = format!("{}/{}/{}/aws4_request", date, region, service);
+
+        let signing_key = auth::sigv4::derive_signing_key(
+            &auth::SecretKey(secret.to_string()),
+            date,
+            region,
+            service,
+        );
+        let mut key_bytes = [0u8; 32];
+        key_bytes.copy_from_slice(signing_key.as_ref());
+
+        let seed_sig =
+            "seed0000000000000000000000000000000000000000000000000000000000ab";
+
+        let ctx = StreamingSigningContext {
+            signing_key: key_bytes,
+            seed_signature: seed_sig.to_string(),
+            scope: scope.clone(),
+            timestamp: timestamp.to_string(),
+        };
+
+        let empty_hash = auth::canonical::sha256_hex(b"");
+        let chunk_hash = auth::canonical::sha256_hex(chunk_data);
+        let key = hmac::Key::new(hmac::HMAC_SHA256, &key_bytes);
+
+        let sts = format!(
+            "AWS4-HMAC-SHA256-PAYLOAD\n{}\n{}\n{}\n{}\n{}",
+            timestamp, scope, seed_sig, empty_hash, chunk_hash
+        );
+        let chunk_sig = hex_encode(hmac::sign(&key, sts.as_bytes()).as_ref());
+
+        let terminal_hash = auth::canonical::sha256_hex(b"");
+        let sts_terminal = format!(
+            "AWS4-HMAC-SHA256-PAYLOAD\n{}\n{}\n{}\n{}\n{}",
+            timestamp, scope, chunk_sig, empty_hash, terminal_hash
+        );
+        let terminal_sig =
+            hex_encode(hmac::sign(&key, sts_terminal.as_bytes()).as_ref());
+
+        let wire = format!(
+            "5;chunk-signature={}\r\nHello\r\n0;chunk-signature={}\r\n\r\n",
+            chunk_sig, terminal_sig
+        );
+
+        let mut dec = IncrementalChunkedDecoder::new(Some(ctx), false);
+        let payload = dec.feed(wire.as_bytes()).unwrap();
+        assert_eq!(payload, b"Hello");
+        assert!(dec.is_done());
     }
 }

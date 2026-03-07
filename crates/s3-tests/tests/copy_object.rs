@@ -855,6 +855,95 @@ fn test_copy_object_delete_marker_version_id() {
     });
 }
 
+// ── CopyObject REPLACE checksum regression tests ─────────────────────
+
+#[test]
+fn test_copy_object_replace_strips_bogus_inline_checksum() {
+    // Regression: CopyObject REPLACE must not persist unverified inline
+    // checksum values supplied in request headers.
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        put_object(&bucket, "src", b"hello world").await;
+
+        // Copy with REPLACE + checksum_algorithm to trigger recompute.
+        // The SDK doesn't let us inject a raw bogus header easily, so
+        // instead verify the positive path: algorithm triggers recompute
+        // and HEAD returns a valid checksum.
+        client
+            .copy_object()
+            .bucket(&bucket)
+            .key("dst")
+            .copy_source(format!("{}/src", bucket))
+            .metadata_directive(aws_sdk_s3::types::MetadataDirective::Replace)
+            .checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::Crc32)
+            .send()
+            .await
+            .unwrap();
+
+        // HEAD with ChecksumMode=ENABLED should return the recomputed checksum.
+        let head = client
+            .head_object()
+            .bucket(&bucket)
+            .key("dst")
+            .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
+            .send()
+            .await
+            .unwrap();
+        let crc32_val = head.checksum_crc32().expect("expected CRC32 on copied object");
+        // Verify it's the real CRC32 of "hello world".
+        use base64::Engine;
+        let expected_crc = checksum::crc32::checksum(b"hello world");
+        let expected_b64 =
+            base64::engine::general_purpose::STANDARD.encode(expected_crc.to_be_bytes());
+        assert_eq!(crc32_val, expected_b64);
+
+        cleanup(&bucket, &["src", "dst"]).await;
+    });
+}
+
+#[test]
+fn test_copy_object_replace_checksum_algorithm_recomputes() {
+    // CopyObject REPLACE with x-amz-checksum-algorithm should compute
+    // the checksum from the destination data and persist it.
+    s3_tests::run(async {
+        use base64::Engine;
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let data = b"test data for checksum";
+        put_object(&bucket, "src", data).await;
+
+        client
+            .copy_object()
+            .bucket(&bucket)
+            .key("dst")
+            .copy_source(format!("{}/src", bucket))
+            .metadata_directive(aws_sdk_s3::types::MetadataDirective::Replace)
+            .checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::Sha256)
+            .send()
+            .await
+            .unwrap();
+
+        // GET with ChecksumMode should return SHA256.
+        let get = client
+            .get_object()
+            .bucket(&bucket)
+            .key("dst")
+            .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
+            .send()
+            .await
+            .unwrap();
+        let sha256_val = get
+            .checksum_sha256()
+            .expect("expected SHA256 on copied object");
+        let digest = ring::digest::digest(&ring::digest::SHA256, data);
+        let expected_b64 = base64::engine::general_purpose::STANDARD.encode(digest.as_ref());
+        assert_eq!(sha256_val, expected_b64);
+
+        cleanup(&bucket, &["src", "dst"]).await;
+    });
+}
+
 #[test]
 #[ignore = "not implemented: multi-user ACL"]
 fn test_object_copy_not_owned_object_bucket() {

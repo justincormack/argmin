@@ -113,6 +113,65 @@ fn gf2_matrix_square(square: &mut [u32; 32], mat: &[u32; 32]) {
     }
 }
 
+/// Streaming CRC-32C hasher.
+///
+/// Handles the init=0xFFFFFFFF and final XOR=0xFFFFFFFF internally,
+/// matching [`checksum()`]. Feed data in chunks via [`update`](Hasher::update),
+/// then call [`finalize`](Hasher::finalize) to get the checksum.
+///
+/// # Examples
+///
+/// ```
+/// let mut hasher = checksum::crc32c::Hasher::new();
+/// hasher.update(b"12345");
+/// hasher.update(b"6789");
+/// assert_eq!(hasher.finalize(), 0xE3069283);
+/// ```
+#[derive(Clone, Debug)]
+pub struct Hasher {
+    crc: u32,
+}
+
+impl Hasher {
+    /// Create a new hasher with initial state.
+    #[inline]
+    pub fn new() -> Self {
+        Self { crc: !0u32 }
+    }
+
+    /// Feed more data into the hasher.
+    #[inline]
+    pub fn update(&mut self, data: &[u8]) {
+        const CHUNK: usize = std::ffi::c_int::MAX as usize;
+        let mut remaining = data;
+        while !remaining.is_empty() {
+            let n = remaining.len().min(CHUNK);
+            self.crc = unsafe {
+                ec_sys::crc32_iscsi(remaining.as_ptr() as *mut _, n as std::ffi::c_int, self.crc)
+            };
+            remaining = &remaining[n..];
+        }
+    }
+
+    /// Return the CRC-32C checksum of all data fed so far.
+    #[inline]
+    pub fn finalize(&self) -> u32 {
+        self.crc ^ !0u32
+    }
+
+    /// Reset the hasher to its initial state.
+    #[inline]
+    pub fn reset(&mut self) {
+        self.crc = !0u32;
+    }
+}
+
+impl Default for Hasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,9 +245,76 @@ mod tests {
         assert_eq!(combine(crc_h1, crc_h2, half as u64), crc_full);
     }
 
+    // ── Streaming hasher ─────────────────────────────────────────────
+
+    #[test]
+    fn streaming_matches_oneshot() {
+        let mut hasher = Hasher::new();
+        hasher.update(b"12345");
+        hasher.update(b"6789");
+        assert_eq!(hasher.finalize(), checksum(b"123456789"));
+    }
+
+    #[test]
+    fn streaming_byte_at_a_time() {
+        let data = b"hello world!";
+        let mut hasher = Hasher::new();
+        for &byte in data {
+            hasher.update(std::slice::from_ref(&byte));
+        }
+        assert_eq!(hasher.finalize(), checksum(data));
+    }
+
+    #[test]
+    fn streaming_empty() {
+        let hasher = Hasher::new();
+        assert_eq!(hasher.finalize(), checksum(b""));
+    }
+
+    #[test]
+    fn streaming_reset() {
+        let mut hasher = Hasher::new();
+        hasher.update(b"garbage");
+        hasher.reset();
+        hasher.update(b"123456789");
+        assert_eq!(hasher.finalize(), 0xE3069283);
+    }
+
+    #[test]
+    fn streaming_finalize_is_idempotent() {
+        let mut hasher = Hasher::new();
+        hasher.update(b"123456789");
+        let first = hasher.finalize();
+        let second = hasher.finalize();
+        assert_eq!(first, second);
+    }
+
     // ── Property-based tests ────────────────────────────────────────
 
     proptest! {
+        #[test]
+        fn prop_streaming_matches_oneshot(
+            data in proptest::collection::vec(any::<u8>(), 0..=2048),
+            mut splits in proptest::collection::vec(0usize..=2048, 0..=32),
+        ) {
+            let len = data.len();
+            splits.retain(|&i| i <= len);
+            splits.sort_unstable();
+            splits.dedup();
+            if splits.first().copied() != Some(0) {
+                splits.insert(0, 0);
+            }
+            if splits.last().copied() != Some(len) {
+                splits.push(len);
+            }
+
+            let mut hasher = Hasher::new();
+            for w in splits.windows(2) {
+                hasher.update(&data[w[0]..w[1]]);
+            }
+            prop_assert_eq!(hasher.finalize(), checksum(&data));
+        }
+
         #[test]
         fn prop_combine_matches_concat(
             data in proptest::collection::vec(any::<u8>(), 0..=2048),

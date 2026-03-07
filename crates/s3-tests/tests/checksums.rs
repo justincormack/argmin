@@ -99,6 +99,147 @@ fn test_object_checksum_sha256() {
     });
 }
 
+// ── test_object_checksum_crc32 ──────────────────────────────────────
+
+/// CRC-32 of 1024 × 'A', base64-encoded.
+const CRC32_1K_A: &str = "tzf7Gg==";
+
+#[test]
+fn test_object_checksum_crc32() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "myobj";
+
+        // PUT with valid CRC-32 checksum
+        let resp = client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from(body_1k()))
+            .checksum_algorithm(ChecksumAlgorithm::Crc32)
+            .checksum_crc32(CRC32_1K_A)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.checksum_crc32(), Some(CRC32_1K_A));
+
+        // GET with ChecksumMode should return the checksum
+        let resp = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .checksum_mode(ChecksumMode::Enabled)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.checksum_crc32(), Some(CRC32_1K_A));
+
+        // PUT with bad checksum should fail
+        let result = client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from(body_1k()))
+            .checksum_algorithm(ChecksumAlgorithm::Crc32)
+            .checksum_crc32("AAAA/w==")
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+// ── test_object_checksum_crc32c ─────────────────────────────────────
+
+#[test]
+fn test_object_checksum_crc32c() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "myobj";
+
+        // PUT with SDK-computed CRC-32C checksum (SDK computes when only
+        // checksum_algorithm is set without an explicit value).
+        let resp = client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from(body_1k()))
+            .checksum_algorithm(ChecksumAlgorithm::Crc32C)
+            .send()
+            .await
+            .unwrap();
+        let crc32c_val = resp.checksum_crc32_c().unwrap();
+
+        // GET with ChecksumMode should return the same checksum
+        let resp = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .checksum_mode(ChecksumMode::Enabled)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.checksum_crc32_c(), Some(crc32c_val.as_ref()));
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+// ── test_object_checksum_sha1 ───────────────────────────────────────
+
+/// SHA-1 of 1024 × 'A', base64-encoded.
+const SHA1_1K_A: &str = "dGw/TShsUx4GXor3bgrAhogxxrQ=";
+
+#[test]
+fn test_object_checksum_sha1() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "myobj";
+
+        // PUT with valid SHA-1 checksum
+        let resp = client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from(body_1k()))
+            .checksum_algorithm(ChecksumAlgorithm::Sha1)
+            .checksum_sha1(SHA1_1K_A)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.checksum_sha1(), Some(SHA1_1K_A));
+
+        // GET with ChecksumMode should return the checksum
+        let resp = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .checksum_mode(ChecksumMode::Enabled)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.checksum_sha1(), Some(SHA1_1K_A));
+
+        // PUT with bad checksum should fail
+        let result = client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from(body_1k()))
+            .checksum_algorithm(ChecksumAlgorithm::Sha1)
+            .checksum_sha1("bad")
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
 // ── test_object_checksum_crc64nvme ──────────────────────────────────
 
 #[test]
