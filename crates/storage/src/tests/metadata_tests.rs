@@ -453,6 +453,145 @@ fn file_metadata_zero_size() {
     metadata_zero_size_object(&store);
 }
 
+#[test]
+fn file_bucket_metadata_create_head_list_delete() {
+    let (_dir, store) = make_pg_store();
+
+    store.create_bucket("alpha", "owner-1", false).unwrap();
+    store.create_bucket("beta", "owner-1", true).unwrap();
+    store.create_bucket("gamma", "owner-2", false).unwrap();
+
+    let err = store.create_bucket("alpha", "owner-1", false).unwrap_err();
+    assert!(matches!(
+        err,
+        crate::error::MetadataError::BucketAlreadyExists
+    ));
+
+    let beta = store.head_bucket("beta").unwrap();
+    assert_eq!(beta.name, "beta");
+    assert_eq!(beta.owner_principal, "owner-1");
+    assert!(beta.public_read);
+
+    let owner1 = store.list_buckets("owner-1").unwrap();
+    assert_eq!(owner1.len(), 2);
+    assert_eq!(owner1[0].name, "alpha");
+    assert_eq!(owner1[1].name, "beta");
+
+    store.delete_bucket("alpha").unwrap();
+    let err = store.head_bucket("alpha").unwrap_err();
+    assert!(matches!(
+        err,
+        crate::error::MetadataError::BucketNotFound { .. }
+    ));
+}
+
+#[test]
+fn file_bucket_metadata_delete_nonexistent() {
+    let (_dir, store) = make_pg_store();
+    let err = store.delete_bucket("no-such-bucket").unwrap_err();
+    assert!(matches!(
+        err,
+        crate::error::MetadataError::BucketNotFound { .. }
+    ));
+}
+
+#[test]
+fn file_bucket_metadata_versioning_transitions() {
+    let (_dir, store) = make_pg_store();
+    store.create_bucket("bucket", "owner", false).unwrap();
+
+    store.put_bucket_versioning("bucket", 1).unwrap();
+    store.put_bucket_versioning("bucket", 2).unwrap();
+    store.put_bucket_versioning("bucket", 1).unwrap();
+
+    let err = store.put_bucket_versioning("bucket", 0).unwrap_err();
+    assert!(matches!(
+        err,
+        crate::error::MetadataError::InvalidVersioningTransition { .. }
+    ));
+}
+
+#[test]
+fn file_bucket_metadata_versioning_disabled_noop() {
+    let (_dir, store) = make_pg_store();
+    store.create_bucket("bucket", "owner", false).unwrap();
+    store.put_bucket_versioning("bucket", 0).unwrap();
+    assert_eq!(store.head_bucket("bucket").unwrap().versioning, 0);
+}
+
+#[test]
+fn file_bucket_metadata_config_roundtrip() {
+    let (_dir, store) = make_pg_store();
+    store.create_bucket("bucket", "owner", false).unwrap();
+
+    store.put_bucket_cors("bucket", "<Cors/>").unwrap();
+    assert_eq!(
+        store.get_bucket_cors("bucket").unwrap(),
+        Some("<Cors/>".to_string())
+    );
+    store.delete_bucket_cors("bucket").unwrap();
+    assert_eq!(store.get_bucket_cors("bucket").unwrap(), None);
+
+    store.put_bucket_tags("bucket", "<Tagging/>").unwrap();
+    assert_eq!(
+        store.get_bucket_tags("bucket").unwrap(),
+        Some("<Tagging/>".to_string())
+    );
+    store.delete_bucket_tags("bucket").unwrap();
+    assert_eq!(store.get_bucket_tags("bucket").unwrap(), None);
+
+    store
+        .put_bucket_public_access_block("bucket", "<PublicAccessBlock/>")
+        .unwrap();
+    assert_eq!(
+        store.get_bucket_public_access_block("bucket").unwrap(),
+        Some("<PublicAccessBlock/>".to_string())
+    );
+    store.delete_bucket_public_access_block("bucket").unwrap();
+    assert_eq!(
+        store.get_bucket_public_access_block("bucket").unwrap(),
+        None
+    );
+
+    store
+        .put_bucket_ownership_controls("bucket", "<OwnershipControls/>")
+        .unwrap();
+    assert_eq!(
+        store.get_bucket_ownership_controls("bucket").unwrap(),
+        Some("<OwnershipControls/>".to_string())
+    );
+    store.delete_bucket_ownership_controls("bucket").unwrap();
+    assert_eq!(store.get_bucket_ownership_controls("bucket").unwrap(), None);
+
+    store.put_bucket_acl("bucket", true).unwrap();
+    assert!(store.head_bucket("bucket").unwrap().public_read);
+    store.put_bucket_acl("bucket", false).unwrap();
+    assert!(!store.head_bucket("bucket").unwrap().public_read);
+}
+
+#[test]
+fn file_bucket_metadata_config_on_nonexistent_bucket() {
+    let (_dir, store) = make_pg_store();
+
+    let err = store.put_bucket_cors("nope", "<Cors/>").unwrap_err();
+    assert!(matches!(
+        err,
+        crate::error::MetadataError::BucketNotFound { .. }
+    ));
+
+    let err = store.get_bucket_tags("nope").unwrap_err();
+    assert!(matches!(
+        err,
+        crate::error::MetadataError::BucketNotFound { .. }
+    ));
+
+    let err = store.delete_bucket_public_access_block("nope").unwrap_err();
+    assert!(matches!(
+        err,
+        crate::error::MetadataError::BucketNotFound { .. }
+    ));
+}
+
 // --- DataLayout decode tests ---
 
 #[test]
@@ -2880,7 +3019,9 @@ fn commit_stream_part_replaces_prior_chunks_on_reupload() {
         .commit_stream_part("sp-1", &make_part(3000), &chunks_v1)
         .unwrap();
 
-    let chunks = store.get_multipart_part_chunks("b", "k", u64::MAX, 1).unwrap();
+    let chunks = store
+        .get_multipart_part_chunks("b", "k", u64::MAX, 1)
+        .unwrap();
     assert_eq!(chunks.len(), 3);
 
     // Re-upload same part: only 1 chunk (fewer than before)
@@ -2915,7 +3056,9 @@ fn commit_stream_part_replaces_prior_chunks_on_reupload() {
         .unwrap();
 
     // Verify: only 1 chunk (stale rows deleted)
-    let chunks = store.get_multipart_part_chunks("b", "k", u64::MAX, 1).unwrap();
+    let chunks = store
+        .get_multipart_part_chunks("b", "k", u64::MAX, 1)
+        .unwrap();
     assert_eq!(chunks.len(), 1);
     assert_eq!(chunks[0].size, 5000);
     assert_eq!(chunks[0].chunk_okh, [0x22; 16]);
@@ -3188,7 +3331,9 @@ fn commit_stream_part_zero_chunks_clears_prior() {
         )
         .unwrap();
 
-    let chunks = store.get_multipart_part_chunks("b", "k", u64::MAX, 1).unwrap();
+    let chunks = store
+        .get_multipart_part_chunks("b", "k", u64::MAX, 1)
+        .unwrap();
     assert!(
         chunks.is_empty(),
         "stale chunks should be deleted on zero-chunk re-upload"

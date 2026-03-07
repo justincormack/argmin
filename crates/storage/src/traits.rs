@@ -34,6 +34,73 @@ pub trait ShardStore {
 /// The coordinator fans out across all PGs for operations like
 /// ListObjectsV2.
 pub trait PgMetadataStore {
+    // ── Bucket metadata methods ─────────────────────────────────────
+
+    /// Create a new bucket.
+    fn create_bucket(
+        &self,
+        name: &str,
+        owner_principal: &str,
+        public_read: bool,
+    ) -> Result<(), MetadataError>;
+
+    /// Delete a bucket row.
+    ///
+    /// Emptiness checks are handled at coordinator level.
+    fn delete_bucket(&self, name: &str) -> Result<(), MetadataError>;
+
+    /// Get bucket metadata.
+    fn head_bucket(&self, name: &str) -> Result<BucketInfo, MetadataError>;
+
+    /// List all buckets owned by the given owner within this PG.
+    fn list_buckets(&self, owner_principal: &str) -> Result<Vec<BucketInfo>, MetadataError>;
+
+    /// Set bucket versioning state.
+    ///
+    /// Validates transitions: Disabled→Enabled and Enabled↔Suspended are allowed.
+    /// Enabled→Disabled is rejected.
+    fn put_bucket_versioning(&self, name: &str, state: u8) -> Result<(), MetadataError>;
+
+    /// Store a CORS configuration for a bucket (serialized XML string).
+    fn put_bucket_cors(&self, name: &str, config: &str) -> Result<(), MetadataError>;
+
+    /// Retrieve a bucket's CORS configuration. Returns None if not set.
+    fn get_bucket_cors(&self, name: &str) -> Result<Option<String>, MetadataError>;
+
+    /// Delete a bucket's CORS configuration. Idempotent.
+    fn delete_bucket_cors(&self, name: &str) -> Result<(), MetadataError>;
+
+    /// Store tags for a bucket (serialized XML string).
+    fn put_bucket_tags(&self, name: &str, tags: &str) -> Result<(), MetadataError>;
+
+    /// Retrieve a bucket's tags. Returns None if not set.
+    fn get_bucket_tags(&self, name: &str) -> Result<Option<String>, MetadataError>;
+
+    /// Delete a bucket's tags. Idempotent.
+    fn delete_bucket_tags(&self, name: &str) -> Result<(), MetadataError>;
+
+    /// Store a public access block configuration for a bucket (serialized XML string).
+    fn put_bucket_public_access_block(&self, name: &str, config: &str)
+        -> Result<(), MetadataError>;
+
+    /// Retrieve a bucket's public access block configuration. Returns None if not set.
+    fn get_bucket_public_access_block(&self, name: &str) -> Result<Option<String>, MetadataError>;
+
+    /// Delete a bucket's public access block configuration. Idempotent.
+    fn delete_bucket_public_access_block(&self, name: &str) -> Result<(), MetadataError>;
+
+    /// Update a bucket's public_read ACL flag.
+    fn put_bucket_acl(&self, name: &str, public_read: bool) -> Result<(), MetadataError>;
+
+    /// Store ownership controls for a bucket.
+    fn put_bucket_ownership_controls(&self, name: &str, config: &str) -> Result<(), MetadataError>;
+
+    /// Retrieve a bucket's ownership controls. Returns None if not set.
+    fn get_bucket_ownership_controls(&self, name: &str) -> Result<Option<String>, MetadataError>;
+
+    /// Delete a bucket's ownership controls. Idempotent.
+    fn delete_bucket_ownership_controls(&self, name: &str) -> Result<(), MetadataError>;
+
     /// Insert or replace an object record.
     ///
     /// For version_id=0 (unversioned): INSERT OR REPLACE (overwrite).

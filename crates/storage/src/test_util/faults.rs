@@ -224,6 +224,87 @@ impl ShardStore for FaultyPgStore {
 }
 
 impl PgMetadataStore for FaultyPgStore {
+    fn create_bucket(
+        &self,
+        name: &str,
+        owner_principal: &str,
+        public_read: bool,
+    ) -> Result<(), MetadataError> {
+        self.inner.create_bucket(name, owner_principal, public_read)
+    }
+
+    fn delete_bucket(&self, name: &str) -> Result<(), MetadataError> {
+        self.inner.delete_bucket(name)
+    }
+
+    fn head_bucket(&self, name: &str) -> Result<BucketInfo, MetadataError> {
+        self.inner.head_bucket(name)
+    }
+
+    fn list_buckets(&self, owner_principal: &str) -> Result<Vec<BucketInfo>, MetadataError> {
+        self.inner.list_buckets(owner_principal)
+    }
+
+    fn put_bucket_versioning(&self, name: &str, state: u8) -> Result<(), MetadataError> {
+        self.inner.put_bucket_versioning(name, state)
+    }
+
+    fn put_bucket_cors(&self, name: &str, config: &str) -> Result<(), MetadataError> {
+        self.inner.put_bucket_cors(name, config)
+    }
+
+    fn get_bucket_cors(&self, name: &str) -> Result<Option<String>, MetadataError> {
+        self.inner.get_bucket_cors(name)
+    }
+
+    fn delete_bucket_cors(&self, name: &str) -> Result<(), MetadataError> {
+        self.inner.delete_bucket_cors(name)
+    }
+
+    fn put_bucket_tags(&self, name: &str, tags: &str) -> Result<(), MetadataError> {
+        self.inner.put_bucket_tags(name, tags)
+    }
+
+    fn get_bucket_tags(&self, name: &str) -> Result<Option<String>, MetadataError> {
+        self.inner.get_bucket_tags(name)
+    }
+
+    fn delete_bucket_tags(&self, name: &str) -> Result<(), MetadataError> {
+        self.inner.delete_bucket_tags(name)
+    }
+
+    fn put_bucket_public_access_block(
+        &self,
+        name: &str,
+        config: &str,
+    ) -> Result<(), MetadataError> {
+        self.inner.put_bucket_public_access_block(name, config)
+    }
+
+    fn get_bucket_public_access_block(&self, name: &str) -> Result<Option<String>, MetadataError> {
+        self.inner.get_bucket_public_access_block(name)
+    }
+
+    fn delete_bucket_public_access_block(&self, name: &str) -> Result<(), MetadataError> {
+        self.inner.delete_bucket_public_access_block(name)
+    }
+
+    fn put_bucket_acl(&self, name: &str, public_read: bool) -> Result<(), MetadataError> {
+        self.inner.put_bucket_acl(name, public_read)
+    }
+
+    fn put_bucket_ownership_controls(&self, name: &str, config: &str) -> Result<(), MetadataError> {
+        self.inner.put_bucket_ownership_controls(name, config)
+    }
+
+    fn get_bucket_ownership_controls(&self, name: &str) -> Result<Option<String>, MetadataError> {
+        self.inner.get_bucket_ownership_controls(name)
+    }
+
+    fn delete_bucket_ownership_controls(&self, name: &str) -> Result<(), MetadataError> {
+        self.inner.delete_bucket_ownership_controls(name)
+    }
+
     fn put_object_meta(&self, req: &PutObjectMetaReq) -> Result<(), MetadataError> {
         self.inner.put_object_meta(req)
     }

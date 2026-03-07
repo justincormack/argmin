@@ -143,6 +143,127 @@ impl ShardStore for MemoryPgStore {
 }
 
 impl PgMetadataStore for MemoryPgStore {
+    fn create_bucket(
+        &self,
+        _name: &str,
+        _owner_principal: &str,
+        _public_read: bool,
+    ) -> Result<(), MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "bucket metadata in memory store",
+        })
+    }
+
+    fn delete_bucket(&self, _name: &str) -> Result<(), MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "bucket metadata in memory store",
+        })
+    }
+
+    fn head_bucket(&self, _name: &str) -> Result<BucketInfo, MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "bucket metadata in memory store",
+        })
+    }
+
+    fn list_buckets(&self, _owner_principal: &str) -> Result<Vec<BucketInfo>, MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "bucket metadata in memory store",
+        })
+    }
+
+    fn put_bucket_versioning(&self, _name: &str, _state: u8) -> Result<(), MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "bucket metadata in memory store",
+        })
+    }
+
+    fn put_bucket_cors(&self, _name: &str, _config: &str) -> Result<(), MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "bucket metadata in memory store",
+        })
+    }
+
+    fn get_bucket_cors(&self, _name: &str) -> Result<Option<String>, MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "bucket metadata in memory store",
+        })
+    }
+
+    fn delete_bucket_cors(&self, _name: &str) -> Result<(), MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "bucket metadata in memory store",
+        })
+    }
+
+    fn put_bucket_tags(&self, _name: &str, _tags: &str) -> Result<(), MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "bucket metadata in memory store",
+        })
+    }
+
+    fn get_bucket_tags(&self, _name: &str) -> Result<Option<String>, MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "bucket metadata in memory store",
+        })
+    }
+
+    fn delete_bucket_tags(&self, _name: &str) -> Result<(), MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "bucket metadata in memory store",
+        })
+    }
+
+    fn put_bucket_public_access_block(
+        &self,
+        _name: &str,
+        _config: &str,
+    ) -> Result<(), MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "bucket metadata in memory store",
+        })
+    }
+
+    fn get_bucket_public_access_block(&self, _name: &str) -> Result<Option<String>, MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "bucket metadata in memory store",
+        })
+    }
+
+    fn delete_bucket_public_access_block(&self, _name: &str) -> Result<(), MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "bucket metadata in memory store",
+        })
+    }
+
+    fn put_bucket_acl(&self, _name: &str, _public_read: bool) -> Result<(), MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "bucket metadata in memory store",
+        })
+    }
+
+    fn put_bucket_ownership_controls(
+        &self,
+        _name: &str,
+        _config: &str,
+    ) -> Result<(), MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "bucket metadata in memory store",
+        })
+    }
+
+    fn get_bucket_ownership_controls(&self, _name: &str) -> Result<Option<String>, MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "bucket metadata in memory store",
+        })
+    }
+
+    fn delete_bucket_ownership_controls(&self, _name: &str) -> Result<(), MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "bucket metadata in memory store",
+        })
+    }
+
     fn put_object_meta(&self, req: &PutObjectMetaReq) -> Result<(), MetadataError> {
         let now = Self::now_millis();
         let record = ObjectRecord {

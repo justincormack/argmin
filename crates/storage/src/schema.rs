@@ -162,7 +162,7 @@ CREATE INDEX IF NOT EXISTS idx_objects_list ON objects (bucket, key)";
 const CREATE_OBJECTS_VERSIONS_INDEX: &str = "\
 CREATE INDEX IF NOT EXISTS idx_objects_versions ON objects (bucket, key, version_id DESC)";
 
-/// Global bucket metadata table.
+/// Bucket metadata table.
 const CREATE_BUCKETS_TABLE: &str = "\
 CREATE TABLE IF NOT EXISTS buckets (
     name             TEXT PRIMARY KEY,
@@ -177,15 +177,12 @@ CREATE TABLE IF NOT EXISTS buckets (
     ownership_controls TEXT
 )";
 
+/// Index for bucket listing by owner and bucket name.
+const CREATE_BUCKETS_OWNER_LIST_INDEX: &str = "\
+CREATE INDEX IF NOT EXISTS idx_buckets_owner_list ON buckets (owner_principal, name)";
+
 /// SQLite pragmas for per-PG databases: WAL mode, NORMAL synchronous.
 const PG_PRAGMAS: &str = "\
-PRAGMA journal_mode=WAL;
-PRAGMA synchronous=NORMAL;
-PRAGMA foreign_keys=ON;
-";
-
-/// SQLite pragmas for the bucket database.
-const BUCKET_PRAGMAS: &str = "\
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
 PRAGMA foreign_keys=ON;
@@ -209,6 +206,8 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(CREATE_STREAM_OBJECT_CHUNKS_TABLE, [])?;
     conn.execute(CREATE_MULTIPART_PART_CHUNKS_TABLE, [])?;
     conn.execute(CREATE_MULTIPART_PART_CHUNKS_VERSION_INDEX, [])?;
+    conn.execute(CREATE_BUCKETS_TABLE, [])?;
+    conn.execute(CREATE_BUCKETS_OWNER_LIST_INDEX, [])?;
     migrate_checksum_columns(conn)?;
     Ok(())
 }
@@ -241,7 +240,8 @@ fn migrate_checksum_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
 ///
 /// Idempotent — uses `CREATE TABLE IF NOT EXISTS`.
 pub fn init_bucket_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
-    conn.execute_batch(BUCKET_PRAGMAS)?;
+    conn.execute_batch(PG_PRAGMAS)?;
     conn.execute(CREATE_BUCKETS_TABLE, [])?;
+    conn.execute(CREATE_BUCKETS_OWNER_LIST_INDEX, [])?;
     Ok(())
 }

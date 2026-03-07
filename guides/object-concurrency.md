@@ -16,7 +16,8 @@ Applies to object data/metadata operations:
 - `get_object_range`
 - `delete_object`
 
-Bucket-only operations are out of scope.
+Bucket metadata operations are in scope when they coordinate with object
+metadata paths (for example, `DeleteBucket` emptiness checks).
 
 ## Required Invariants
 
@@ -29,6 +30,8 @@ Bucket-only operations are out of scope.
 7. Version ID allocation for versioned writes must be derived while holding the metadata PG lock and revalidated when relocking is required.
 8. Full-object reads (`GET` and copy-source full reads) must verify reconstructed data CRC against stored ETag.
 9. Streaming must not change external ETag/checksum semantics (headers/XML/validation).
+10. Mixed bucket+object metadata operations must lock PGs in global ascending PG
+    ID order when more than one PG is held.
 
 ## Required Coordinator APIs
 
@@ -78,7 +81,8 @@ Do not open-code this pattern in object paths:
    transaction?
 6. Are CRC checks preserved for full-object reads?
 7. Are external ETag/checksum semantics unchanged?
-8. Did you run:
+8. For bucket+object mixed operations, is lock order explicit and ascending by PG ID?
+9. Did you run:
    - `cargo clippy --workspace -- -D warnings`
    - `cargo test -p server --lib`
    - `cargo test -p s3-tests`

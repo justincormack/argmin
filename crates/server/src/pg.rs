@@ -8,6 +8,15 @@ pub fn derive_pg(bucket: &str, key: &str, pg_count: u32) -> u32 {
     (hash % pg_count as u64) as u32
 }
 
+/// Derive the PG ID for bucket metadata placement.
+///
+/// pg_id = rapidhash("bucket/" + bucket_name) % pg_count
+pub fn derive_bucket_pg(bucket: &str, pg_count: u32) -> u32 {
+    let full_key = format!("bucket/{bucket}");
+    let hash = rapidhash::rapidhash(full_key.as_bytes());
+    (hash % pg_count as u64) as u32
+}
+
 /// Derive the PG ID for shard data placement.
 ///
 /// Includes the version_id so different versions of the same key
@@ -65,6 +74,38 @@ mod tests {
         let a = derive_pg("mybucket", "mykey", 16);
         let b = derive_pg("mybucket", "mykey", 16);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn derive_bucket_pg_deterministic() {
+        let a = derive_bucket_pg("mybucket", 16);
+        let b = derive_bucket_pg("mybucket", 16);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn derive_bucket_pg_within_range() {
+        for pg_count in [1, 4, 16, 256] {
+            for i in 0..100 {
+                let bucket = format!("bucket-{}", i);
+                let pg = derive_bucket_pg(&bucket, pg_count);
+                assert!(pg < pg_count);
+            }
+        }
+    }
+
+    #[test]
+    fn derive_bucket_pg_distributes() {
+        let pg_count = 16u32;
+        let mut counts = vec![0u32; pg_count as usize];
+        for i in 0..1000 {
+            let bucket = format!("bucket-{i}");
+            let pg = derive_bucket_pg(&bucket, pg_count);
+            counts[pg as usize] += 1;
+        }
+        for count in &counts {
+            assert!(*count > 0, "at least one PG got no buckets: {:?}", counts);
+        }
     }
 
     #[test]

@@ -414,6 +414,397 @@ impl ShardStore for PgStore {
 }
 
 impl PgMetadataStore for PgStore {
+    fn create_bucket(
+        &self,
+        name: &str,
+        owner_principal: &str,
+        public_read: bool,
+    ) -> Result<(), MetadataError> {
+        let now = PgStore::now_millis() as i64;
+        let result = self.conn.execute(
+            "INSERT INTO buckets (name, owner_principal, created_at, public_read) VALUES (?1, ?2, ?3, ?4)",
+            params![name, owner_principal, now, if public_read { 1 } else { 0 }],
+        );
+        match result {
+            Ok(_) => Ok(()),
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.code == rusqlite::ffi::ErrorCode::ConstraintViolation =>
+            {
+                Err(MetadataError::BucketAlreadyExists)
+            }
+            Err(e) => Err(MetadataError::Db {
+                context: "create bucket",
+                source: e,
+            }),
+        }
+    }
+
+    fn delete_bucket(&self, name: &str) -> Result<(), MetadataError> {
+        let deleted = self
+            .conn
+            .execute("DELETE FROM buckets WHERE name = ?1", params![name])
+            .map_err(|e| MetadataError::Db {
+                context: "delete bucket",
+                source: e,
+            })?;
+        if deleted == 0 {
+            return Err(MetadataError::BucketNotFound {
+                name: name.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn head_bucket(&self, name: &str) -> Result<BucketInfo, MetadataError> {
+        self.conn
+            .query_row(
+                "SELECT name, owner_principal, created_at, region, versioning, public_read, cors_config, tags, public_access_block, ownership_controls \
+                 FROM buckets WHERE name = ?1",
+                params![name],
+                |row| {
+                    Ok(BucketInfo {
+                        name: row.get(0)?,
+                        owner_principal: row.get(1)?,
+                        created_at: row.get::<_, i64>(2)? as u64,
+                        region: row.get::<_, i64>(3)? as u16,
+                        versioning: row.get::<_, i64>(4)? as u8,
+                        public_read: row.get::<_, i64>(5)? != 0,
+                        cors_config: row.get(6)?,
+                        tags: row.get(7)?,
+                        public_access_block: row.get(8)?,
+                        ownership_controls: row.get(9)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| MetadataError::Db {
+                context: "head bucket",
+                source: e,
+            })?
+            .ok_or(MetadataError::BucketNotFound {
+                name: name.to_string(),
+            })
+    }
+
+    fn list_buckets(&self, owner_principal: &str) -> Result<Vec<BucketInfo>, MetadataError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT name, owner_principal, created_at, region, versioning, public_read, cors_config, tags, public_access_block, ownership_controls \
+                 FROM buckets WHERE owner_principal = ?1 ORDER BY name ASC",
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "prepare list buckets",
+                source: e,
+            })?;
+        let rows = stmt
+            .query_map(params![owner_principal], |row| {
+                Ok(BucketInfo {
+                    name: row.get(0)?,
+                    owner_principal: row.get(1)?,
+                    created_at: row.get::<_, i64>(2)? as u64,
+                    region: row.get::<_, i64>(3)? as u16,
+                    versioning: row.get::<_, i64>(4)? as u8,
+                    public_read: row.get::<_, i64>(5)? != 0,
+                    cors_config: row.get(6)?,
+                    tags: row.get(7)?,
+                    public_access_block: row.get(8)?,
+                    ownership_controls: row.get(9)?,
+                })
+            })
+            .map_err(|e| MetadataError::Db {
+                context: "list buckets query",
+                source: e,
+            })?;
+
+        let mut buckets = Vec::new();
+        for row in rows {
+            buckets.push(row.map_err(|e| MetadataError::Db {
+                context: "list buckets row",
+                source: e,
+            })?);
+        }
+        Ok(buckets)
+    }
+
+    fn put_bucket_versioning(&self, name: &str, state: u8) -> Result<(), MetadataError> {
+        let current: u8 = self
+            .conn
+            .query_row(
+                "SELECT versioning FROM buckets WHERE name = ?1",
+                params![name],
+                |row| row.get::<_, i64>(0).map(|v| v as u8),
+            )
+            .optional()
+            .map_err(|e| MetadataError::Db {
+                context: "get bucket versioning",
+                source: e,
+            })?
+            .ok_or(MetadataError::BucketNotFound {
+                name: name.to_string(),
+            })?;
+        if state == 0 && current != 0 {
+            return Err(MetadataError::InvalidVersioningTransition {
+                from: current,
+                to: state,
+            });
+        }
+
+        self.conn
+            .execute(
+                "UPDATE buckets SET versioning = ?1 WHERE name = ?2",
+                params![state as i64, name],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "put bucket versioning",
+                source: e,
+            })?;
+        Ok(())
+    }
+
+    fn put_bucket_cors(&self, name: &str, config: &str) -> Result<(), MetadataError> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE buckets SET cors_config = ?1 WHERE name = ?2",
+                params![config, name],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "put bucket cors",
+                source: e,
+            })?;
+        if updated == 0 {
+            return Err(MetadataError::BucketNotFound {
+                name: name.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn get_bucket_cors(&self, name: &str) -> Result<Option<String>, MetadataError> {
+        self.conn
+            .query_row(
+                "SELECT cors_config FROM buckets WHERE name = ?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| MetadataError::Db {
+                context: "get bucket cors",
+                source: e,
+            })?
+            .ok_or(MetadataError::BucketNotFound {
+                name: name.to_string(),
+            })
+    }
+
+    fn delete_bucket_cors(&self, name: &str) -> Result<(), MetadataError> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE buckets SET cors_config = NULL WHERE name = ?1",
+                params![name],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "delete bucket cors",
+                source: e,
+            })?;
+        if updated == 0 {
+            return Err(MetadataError::BucketNotFound {
+                name: name.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn put_bucket_tags(&self, name: &str, tags: &str) -> Result<(), MetadataError> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE buckets SET tags = ?1 WHERE name = ?2",
+                params![tags, name],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "put bucket tags",
+                source: e,
+            })?;
+        if updated == 0 {
+            return Err(MetadataError::BucketNotFound {
+                name: name.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn get_bucket_tags(&self, name: &str) -> Result<Option<String>, MetadataError> {
+        self.conn
+            .query_row(
+                "SELECT tags FROM buckets WHERE name = ?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| MetadataError::Db {
+                context: "get bucket tags",
+                source: e,
+            })?
+            .ok_or(MetadataError::BucketNotFound {
+                name: name.to_string(),
+            })
+    }
+
+    fn delete_bucket_tags(&self, name: &str) -> Result<(), MetadataError> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE buckets SET tags = NULL WHERE name = ?1",
+                params![name],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "delete bucket tags",
+                source: e,
+            })?;
+        if updated == 0 {
+            return Err(MetadataError::BucketNotFound {
+                name: name.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn put_bucket_public_access_block(
+        &self,
+        name: &str,
+        config: &str,
+    ) -> Result<(), MetadataError> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE buckets SET public_access_block = ?1 WHERE name = ?2",
+                params![config, name],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "put bucket public access block",
+                source: e,
+            })?;
+        if updated == 0 {
+            return Err(MetadataError::BucketNotFound {
+                name: name.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn get_bucket_public_access_block(&self, name: &str) -> Result<Option<String>, MetadataError> {
+        self.conn
+            .query_row(
+                "SELECT public_access_block FROM buckets WHERE name = ?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| MetadataError::Db {
+                context: "get bucket public access block",
+                source: e,
+            })?
+            .ok_or(MetadataError::BucketNotFound {
+                name: name.to_string(),
+            })
+    }
+
+    fn delete_bucket_public_access_block(&self, name: &str) -> Result<(), MetadataError> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE buckets SET public_access_block = NULL WHERE name = ?1",
+                params![name],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "delete bucket public access block",
+                source: e,
+            })?;
+        if updated == 0 {
+            return Err(MetadataError::BucketNotFound {
+                name: name.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn put_bucket_acl(&self, name: &str, public_read: bool) -> Result<(), MetadataError> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE buckets SET public_read = ?1 WHERE name = ?2",
+                params![if public_read { 1 } else { 0 }, name],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "put bucket acl",
+                source: e,
+            })?;
+        if updated == 0 {
+            return Err(MetadataError::BucketNotFound {
+                name: name.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn put_bucket_ownership_controls(&self, name: &str, config: &str) -> Result<(), MetadataError> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE buckets SET ownership_controls = ?1 WHERE name = ?2",
+                params![config, name],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "put bucket ownership controls",
+                source: e,
+            })?;
+        if updated == 0 {
+            return Err(MetadataError::BucketNotFound {
+                name: name.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn get_bucket_ownership_controls(&self, name: &str) -> Result<Option<String>, MetadataError> {
+        self.conn
+            .query_row(
+                "SELECT ownership_controls FROM buckets WHERE name = ?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| MetadataError::Db {
+                context: "get bucket ownership controls",
+                source: e,
+            })?
+            .ok_or(MetadataError::BucketNotFound {
+                name: name.to_string(),
+            })
+    }
+
+    fn delete_bucket_ownership_controls(&self, name: &str) -> Result<(), MetadataError> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE buckets SET ownership_controls = NULL WHERE name = ?1",
+                params![name],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "delete bucket ownership controls",
+                source: e,
+            })?;
+        if updated == 0 {
+            return Err(MetadataError::BucketNotFound {
+                name: name.to_string(),
+            });
+        }
+        Ok(())
+    }
+
     fn put_object_meta(&self, req: &PutObjectMetaReq) -> Result<(), MetadataError> {
         let now = PgStore::now_millis();
         let data_layout = req.data_layout.map(|dl| dl as u8).unwrap_or(0);
@@ -1798,10 +2189,11 @@ impl PgMetadataStore for PgStore {
                 context: "list all stream uploads (query)",
                 source: e,
             })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(|e| MetadataError::Db {
-            context: "list all stream uploads (collect)",
-            source: e,
-        })
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| MetadataError::Db {
+                context: "list all stream uploads (collect)",
+                source: e,
+            })
     }
 
     fn append_stream_chunk(&self, chunk: &StreamUploadChunkRecord) -> Result<(), MetadataError> {
@@ -2193,12 +2585,7 @@ impl PgMetadataStore for PgStore {
                     "DELETE FROM multipart_part_chunks \
                      WHERE bucket = ?1 AND key = ?2 AND upload_id = ?3 \
                      AND part_number = ?4",
-                    params![
-                        sess_bucket,
-                        sess_key,
-                        part.upload_id,
-                        part.part_number
-                    ],
+                    params![sess_bucket, sess_key, part.upload_id, part.part_number],
                 )
                 .map_err(|e| MetadataError::Db {
                     context: "commit stream part (delete prior chunks)",
