@@ -386,24 +386,33 @@ fn test_object_anon_put_write_access() {
 }
 
 // ── Anonymous ListBuckets ────────────────────────────────────────────
+//
+// Unauthenticated GET / behavior varies across implementations:
+//   - Ceph/RGW: returns 200 with an empty bucket list (no owner → no buckets).
+//   - AWS S3:   returns 307 redirect to https://aws.amazon.com/s3/ (not an API response).
+//   - argmin:   returns 403 AccessDenied (ListBuckets requires authentication).
+//
+// We return 403 because ListBuckets is an authenticated-only operation.
 
 #[test]
-#[ignore = "server returns 403 for anonymous ListBuckets (Ceph marks this fails_on_aws)"]
 fn test_list_buckets_anonymous() {
+    if std::env::var("S3_TEST_ENDPOINT").is_ok() {
+        // AWS returns 307 redirect to marketing page for anonymous GET /
+        return;
+    }
     s3_tests::run(async {
         let url = format!("{}/", CTX.endpoint());
         let mut resp = agent().get(&url).call().expect("transport error");
         let status = resp.status().as_u16();
         let body = resp.body_mut().read_to_string().unwrap();
-        // Anonymous ListBuckets should return 200 with empty bucket list
         assert_eq!(
-            status, 200,
-            "expected 200 for anon ListBuckets, got {}",
+            status, 403,
+            "expected 403 for anon ListBuckets, got {}",
             status
         );
         assert!(
-            body.contains("<Buckets"),
-            "expected Buckets element in response: {}",
+            body.contains("<Code>AccessDenied</Code>"),
+            "expected AccessDenied in body: {}",
             body
         );
     });
