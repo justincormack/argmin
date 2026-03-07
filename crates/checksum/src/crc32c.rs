@@ -272,6 +272,12 @@ mod tests {
     }
 
     #[test]
+    fn streaming_default() {
+        let hasher = Hasher::default();
+        assert_eq!(hasher.finalize(), checksum(b""));
+    }
+
+    #[test]
     fn streaming_reset() {
         let mut hasher = Hasher::new();
         hasher.update(b"garbage");

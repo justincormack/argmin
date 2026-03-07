@@ -251,6 +251,12 @@ mod tests {
     }
 
     #[test]
+    fn streaming_default() {
+        let hasher = Hasher::default();
+        assert_eq!(hasher.finalize(), 0);
+    }
+
+    #[test]
     fn streaming_finalize_is_idempotent() {
         let mut hasher = Hasher::new();
         hasher.update(b"123456789");
