@@ -83,7 +83,10 @@ pub struct SharedStorageNode {
     stores: HashMap<u32, Mutex<PgStore>>,
     pg_id_list: Vec<u32>,
     data_dir: PathBuf,
+    bucket_locks: Vec<Mutex<()>>,
 }
+
+const BUCKET_LOCK_STRIPES: usize = 256;
 
 impl SharedStorageNode {
     /// Open a shared storage node, creating PG directories as needed.
@@ -105,10 +108,16 @@ impl SharedStorageNode {
 
         pg_id_list.sort_unstable();
 
+        let mut bucket_locks = Vec::with_capacity(BUCKET_LOCK_STRIPES);
+        for _ in 0..BUCKET_LOCK_STRIPES {
+            bucket_locks.push(Mutex::new(()));
+        }
+
         Ok(Self {
             stores,
             pg_id_list,
             data_dir: data_dir.to_path_buf(),
+            bucket_locks,
         })
     }
 
@@ -120,6 +129,23 @@ impl SharedStorageNode {
     /// Return the sorted list of PG IDs.
     pub fn pg_ids(&self) -> &[u32] {
         &self.pg_id_list
+    }
+
+    fn bucket_lock_index(&self, bucket: &str) -> usize {
+        (rapidhash::rapidhash(bucket.as_bytes()) as usize) % self.bucket_locks.len()
+    }
+
+    /// Lock a bucket-scoped stripe mutex.
+    ///
+    /// Coordinator bucket-mutating operations use this as a coarse per-bucket
+    /// gate so multi-step flows (for example, delete-bucket emptiness check
+    /// followed by delete) cannot interleave with concurrent writes that would
+    /// make the bucket non-empty.
+    pub fn lock_bucket(&self, bucket: &str) -> MutexGuard<'_, ()> {
+        let idx = self.bucket_lock_index(bucket);
+        self.bucket_locks[idx]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// Lock and return a guard for the given PG.
@@ -252,5 +278,39 @@ mod tests {
         assert_eq!(guard_a.pg_id(), 1);
         let guard_b = opt_b.unwrap();
         assert_eq!(guard_b.pg_id(), 0);
+    }
+
+    #[test]
+    fn shared_node_bucket_lock_same_bucket_blocks() {
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+
+        let tmp = test_util::tempdir();
+        let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();
+
+        let (tx, rx) = channel();
+        std::thread::scope(|s| {
+            let guard = node.lock_bucket("bucket-a");
+            s.spawn(|| {
+                let _g2 = node.lock_bucket("bucket-a");
+                tx.send(()).unwrap();
+            });
+
+            // Second lock on same bucket should block while first guard is held.
+            assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+            drop(guard);
+            rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        });
+    }
+
+    #[test]
+    fn shared_node_bucket_lock_different_buckets_do_not_deadlock() {
+        let tmp = test_util::tempdir();
+        let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();
+        let a_guard = node.lock_bucket("bucket-a");
+        // Different bucket may map to the same stripe, but this must never deadlock.
+        // We only assert that taking locks in sequence is safe.
+        drop(a_guard);
+        let _b_guard = node.lock_bucket("bucket-b");
     }
 }

@@ -2171,6 +2171,7 @@ version = "0.1.0"
 dependencies = [
  "checksum",
  "proptest",
+ "rapidhash 1.4.0",
  "rusqlite",
  "test-util",
  "thiserror",

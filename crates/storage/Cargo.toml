@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 checksum = { path = "../checksum" }
+rapidhash = "1"
 rusqlite = { version = "0.33", features = ["bundled"] }
 thiserror = "2"
 

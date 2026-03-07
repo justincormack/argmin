@@ -413,6 +413,7 @@ impl Coordinator {
         name: &str,
         public_read: bool,
     ) -> Result<(), ServerError> {
+        let _bucket_guard = self.storage_node.lock_bucket(name);
         let bucket_pg = self.get_bucket_pg(name)?;
         match bucket_pg.create_bucket(name, owner_principal, public_read) {
             Ok(()) => Ok(()),
@@ -434,6 +435,8 @@ impl Coordinator {
     }
 
     pub fn delete_bucket(&self, name: &str) -> Result<(), ServerError> {
+        let _bucket_guard = self.storage_node.lock_bucket(name);
+
         // Check emptiness: list all object versions (including delete markers)
         // and multipart uploads across all PGs.
         for &pg_id in self.storage_node.pg_ids() {
@@ -878,6 +881,8 @@ impl Coordinator {
         headers: &[(&str, &str)],
         cond: &WriteCondition,
     ) -> Result<PutObjectResult, ServerError> {
+        let _bucket_guard = self.storage_node.lock_bucket(bucket);
+
         if data.len() as u64 > MAX_OBJECT_SIZE {
             return Err(ServerError::ObjectTooLarge {
                 size: data.len() as u64,
@@ -940,6 +945,8 @@ impl Coordinator {
     /// feeds chunks via `append_stream_chunk` and commits via
     /// `finalize_stream_put`.
     pub fn begin_stream_put(&self, bucket: &str, key: &str) -> Result<String, ServerError> {
+        let _bucket_guard = self.storage_node.lock_bucket(bucket);
+
         // Verify bucket exists.
         let _bucket_info = self.head_bucket(bucket)?;
 
@@ -1178,6 +1185,8 @@ impl Coordinator {
         metadata_blob: &MetadataBlob,
         cond: &WriteCondition,
     ) -> Result<PutObjectResult, ServerError> {
+        let _bucket_guard = self.storage_node.lock_bucket(bucket);
+
         let bucket_info = self.head_bucket(bucket)?;
         let blob_bytes = metadata_blob.serialize()?;
 
@@ -1606,6 +1615,8 @@ impl Coordinator {
         directive: MetadataDirective,
         new_headers: &[(&str, &str)],
     ) -> Result<CopyObjectResult, ServerError> {
+        let _bucket_guard = self.storage_node.lock_bucket(dst_bucket);
+
         // Phase 1: Read source object
         let (src_metadata, user_data) = {
             let LockedReadObject {
@@ -3753,6 +3764,7 @@ impl Coordinator {
         checksum_algorithm: Option<ChecksumAlgorithm>,
         checksum_type: Option<ChecksumType>,
     ) -> Result<CreateMultipartUploadResult, ServerError> {
+        let _bucket_guard = self.storage_node.lock_bucket(bucket);
         let bucket_info = self.head_bucket(bucket)?;
 
         // Generate 16 random bytes → 32-char hex upload ID.
@@ -4210,6 +4222,8 @@ impl Coordinator {
         parts: &[CompletePart],
         claimed_checksum: Option<(ChecksumAlgorithm, &str)>,
     ) -> Result<CompleteMultipartUploadResult, ServerError> {
+        let _bucket_guard = self.storage_node.lock_bucket(bucket);
+
         // 1. Validate bucket exists and get versioning state.
         let bucket_info = self.head_bucket(bucket)?;
 
@@ -4817,8 +4831,10 @@ mod tests {
     use super::*;
     use crate::conditional::{DeleteCondition, ReadCondition, WriteCondition};
     use std::path::{Path, PathBuf};
+    use std::sync::mpsc;
     use std::sync::Barrier;
     use std::thread;
+    use std::time::Duration;
 
     const NO_READ: &ReadCondition = &ReadCondition {
         if_match: None,
@@ -5029,6 +5045,90 @@ mod tests {
 
         let err = coord.delete_bucket("bucket").unwrap_err();
         assert!(matches!(err, ServerError::BucketNotEmpty));
+    }
+
+    #[test]
+    fn put_object_waits_for_bucket_lock() {
+        let tmp = test_util::tempdir();
+        let pg_ids: Vec<u32> = (0..4).collect();
+        let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
+        let ec_config = EcConfig::new(4, 2).unwrap();
+
+        let admin = Coordinator::new(
+            Arc::clone(&storage_node),
+            ec_config,
+            4,
+            "us-east-1".to_string(),
+        )
+        .unwrap();
+        let writer = Coordinator::new(
+            Arc::clone(&storage_node),
+            ec_config,
+            4,
+            "us-east-1".to_string(),
+        )
+        .unwrap();
+        admin.create_bucket("bucket").unwrap();
+
+        let guard = storage_node.lock_bucket("bucket");
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let res = writer.put_object("bucket", "key", b"data", &[], NO_WRITE);
+            tx.send(res).unwrap();
+        });
+
+        // Writer should block while bucket lock is held.
+        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(guard);
+
+        let res = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(
+            res.is_ok(),
+            "put_object should succeed after lock release: {res:?}"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn delete_bucket_waits_for_bucket_lock() {
+        let tmp = test_util::tempdir();
+        let pg_ids: Vec<u32> = (0..4).collect();
+        let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
+        let ec_config = EcConfig::new(4, 2).unwrap();
+
+        let admin = Coordinator::new(
+            Arc::clone(&storage_node),
+            ec_config,
+            4,
+            "us-east-1".to_string(),
+        )
+        .unwrap();
+        let deleter = Coordinator::new(
+            Arc::clone(&storage_node),
+            ec_config,
+            4,
+            "us-east-1".to_string(),
+        )
+        .unwrap();
+        admin.create_bucket("bucket").unwrap();
+
+        let guard = storage_node.lock_bucket("bucket");
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let res = deleter.delete_bucket("bucket");
+            tx.send(res).unwrap();
+        });
+
+        // Delete should block while bucket lock is held.
+        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(guard);
+
+        let res = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(
+            res.is_ok(),
+            "delete_bucket should succeed after lock release: {res:?}"
+        );
+        handle.join().unwrap();
     }
 
     #[test]
