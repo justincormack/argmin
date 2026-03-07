@@ -136,6 +136,7 @@ const CREATE_MULTIPART_PART_CHUNKS_TABLE: &str = "\
 CREATE TABLE IF NOT EXISTS multipart_part_chunks (
     bucket        TEXT NOT NULL,
     key           TEXT NOT NULL,
+    upload_id     TEXT NOT NULL,
     version_id    INTEGER NOT NULL,
     part_number   INTEGER NOT NULL,
     chunk_index   INTEGER NOT NULL,
@@ -145,8 +146,13 @@ CREATE TABLE IF NOT EXISTS multipart_part_chunks (
     shard_pg_id   INTEGER NOT NULL,
     ec_k          INTEGER NOT NULL,
     ec_m          INTEGER NOT NULL,
-    PRIMARY KEY (bucket, key, version_id, part_number, chunk_index)
+    PRIMARY KEY (bucket, key, upload_id, part_number, chunk_index)
 )";
+
+/// Index for reading multipart part chunks by version_id after completion.
+const CREATE_MULTIPART_PART_CHUNKS_VERSION_INDEX: &str = "\
+CREATE INDEX IF NOT EXISTS idx_mpc_version \
+ON multipart_part_chunks (bucket, key, version_id, part_number)";
 
 /// Index for list operations: bucket + key ordering.
 const CREATE_OBJECTS_LIST_INDEX: &str = "\
@@ -202,6 +208,7 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(CREATE_STREAM_UPLOAD_CHUNKS_TABLE, [])?;
     conn.execute(CREATE_STREAM_OBJECT_CHUNKS_TABLE, [])?;
     conn.execute(CREATE_MULTIPART_PART_CHUNKS_TABLE, [])?;
+    conn.execute(CREATE_MULTIPART_PART_CHUNKS_VERSION_INDEX, [])?;
     migrate_checksum_columns(conn)?;
     Ok(())
 }

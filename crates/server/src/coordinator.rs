@@ -25,8 +25,8 @@ use crate::metadata_blob::MetadataBlob;
 use crate::pg::{chunk_key_hash, derive_pg, derive_pg_shards, object_key_hash, part_key_hash};
 use crate::range::ByteRange;
 
-/// Maximum object size for single PUT (256 MB).
-pub const MAX_OBJECT_SIZE: u64 = 256 * 1024 * 1024;
+/// Maximum object size for single PUT or upload part (5 GiB, matches AWS S3).
+pub const MAX_OBJECT_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 
 /// Hard cap on total records fetched across all PGs for a single list query.
 /// Prevents unbounded memory when delimiter causes u32::MAX per-PG limits.
@@ -284,6 +284,9 @@ pub struct CompleteMultipartUploadResult {
 
 /// Minimum part size for non-final parts (5 MiB).
 const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
+
+/// Maximum number of parts in a multipart upload (matches AWS S3).
+const MAX_PARTS: usize = 10_000;
 
 /// Entry in a ListParts result.
 #[derive(Debug, Clone)]
@@ -1407,7 +1410,8 @@ impl Coordinator {
             .map(|c| MultipartPartChunkRecord {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
-                version_id: 0, // placeholder — set at CompleteMultipartUpload time
+                upload_id: upload_id.to_string(),
+                version_id: u64::MAX, // staging sentinel — reparented at CompleteMultipartUpload time
                 part_number,
                 chunk_index: c.chunk_index,
                 size: c.size,
@@ -2296,6 +2300,36 @@ impl Coordinator {
         Ok(result)
     }
 
+    /// Read a streaming part's data via its chunk manifest.
+    ///
+    /// Converts `MultipartPartChunkRecord`s to `StreamObjectChunkRecord`s
+    /// and delegates to `read_chunk_manifest_range`.
+    fn read_streaming_part_data(
+        &self,
+        bucket: &str,
+        key: &str,
+        chunks: &[storage::MultipartPartChunkRecord],
+        start: usize,
+        end: usize,
+    ) -> Result<Vec<u8>, ServerError> {
+        let stream_chunks: Vec<storage::StreamObjectChunkRecord> = chunks
+            .iter()
+            .map(|c| storage::StreamObjectChunkRecord {
+                bucket: c.bucket.clone(),
+                key: c.key.clone(),
+                version_id: c.version_id,
+                chunk_index: c.chunk_index,
+                size: c.size,
+                chunk_okh: c.chunk_okh,
+                chunk_vid: c.chunk_vid,
+                shard_pg_id: c.shard_pg_id,
+                ec_k: c.ec_k,
+                ec_m: c.ec_m,
+            })
+            .collect();
+        self.read_chunk_manifest_range(bucket, key, &stream_chunks, start, end)
+    }
+
     /// Delete all shards for a list of object parts.
     fn delete_part_shards(&self, parts: &[ObjectPartRecord]) -> Result<(), ServerError> {
         for part in parts {
@@ -2468,6 +2502,9 @@ impl Coordinator {
         let mut result = Vec::with_capacity(total_len);
         let mut offset: usize = 0;
 
+        // Metadata PG for looking up chunk manifests of streaming parts.
+        let meta_pg_id = derive_pg(bucket, key, self.pg_count);
+
         for part in parts {
             let part_start = offset;
             let part_end = offset + part.size as usize; // exclusive
@@ -2488,7 +2525,23 @@ impl Coordinator {
                 part.size as usize - 1
             };
 
-            let data = self.read_part_data(part)?;
+            let data = if part.part_okh == [0u8; 16] {
+                // Streaming part: read via chunk manifest from metadata PG.
+                let chunks = {
+                    let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
+                    meta_pg
+                        .get_multipart_part_chunks(
+                            bucket,
+                            key,
+                            part.version_id,
+                            part.part_number,
+                        )
+                        .map_err(ServerError::Metadata)?
+                };
+                self.read_streaming_part_data(bucket, key, &chunks, 0, part.size as usize - 1)?
+            } else {
+                self.read_part_data(part)?
+            };
             result.extend_from_slice(&data[slice_start..=slice_end]);
             offset = part_end;
         }
@@ -2682,7 +2735,22 @@ impl Coordinator {
                 .find(|p| p.part_number == part_number)
                 .ok_or(ServerError::InvalidPart { part_number })?;
 
-            let data = self.read_part_data(part).map_err(|e| match e {
+            let data = if part.size == 0 {
+                Ok(vec![])
+            } else if part.part_okh == [0u8; 16] {
+                // Streaming part: read via chunk manifest from metadata PG.
+                let meta_pg_id = derive_pg(bucket, key, self.pg_count);
+                let chunks = {
+                    let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
+                    meta_pg
+                        .get_multipart_part_chunks(bucket, key, record.version_id, part.part_number)
+                        .map_err(ServerError::Metadata)?
+                };
+                self.read_streaming_part_data(bucket, key, &chunks, 0, part.size as usize - 1)
+            } else {
+                self.read_part_data(part)
+            }
+            .map_err(|e| match e {
                 ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
                     bucket: bucket.to_string(),
                     key: key.to_string(),
@@ -3230,10 +3298,33 @@ impl Coordinator {
                     let obj_parts = meta_pg
                         .get_object_parts(bucket, key, record.version_id)
                         .map_err(ServerError::Metadata)?;
+                    // Collect chunk manifests for streaming parts before deleting metadata.
+                    let mut streaming_chunks: Vec<MultipartPartChunkRecord> = Vec::new();
+                    for part in &obj_parts {
+                        if part.part_okh == [0u8; 16] {
+                            let chunks = meta_pg
+                                .get_multipart_part_chunks(
+                                    bucket,
+                                    key,
+                                    record.version_id,
+                                    part.part_number,
+                                )
+                                .map_err(ServerError::Metadata)?;
+                            streaming_chunks.extend(chunks);
+                        }
+                    }
+                    if !streaming_chunks.is_empty() {
+                        meta_pg
+                            .delete_multipart_part_chunks(bucket, key, record.version_id)
+                            .map_err(ServerError::Metadata)?;
+                    }
                     meta_pg.delete_object_parts(bucket, key, record.version_id)?;
                     meta_pg.delete_object_meta(bucket, key)?;
                     drop(pgs);
                     self.delete_part_shards(&obj_parts)?;
+                    if !streaming_chunks.is_empty() {
+                        self.delete_chunk_shards_generic(&streaming_chunks)?;
+                    }
                 } else {
                     let vid = record.version_id;
 
@@ -3291,10 +3382,28 @@ impl Coordinator {
                         let obj_parts = meta_pg
                             .get_object_parts(bucket, key, vid)
                             .map_err(ServerError::Metadata)?;
+                        // Collect chunk manifests for streaming parts.
+                        let mut streaming_chunks: Vec<MultipartPartChunkRecord> = Vec::new();
+                        for part in &obj_parts {
+                            if part.part_okh == [0u8; 16] {
+                                let chunks = meta_pg
+                                    .get_multipart_part_chunks(bucket, key, vid, part.part_number)
+                                    .map_err(ServerError::Metadata)?;
+                                streaming_chunks.extend(chunks);
+                            }
+                        }
+                        if !streaming_chunks.is_empty() {
+                            meta_pg
+                                .delete_multipart_part_chunks(bucket, key, vid)
+                                .map_err(ServerError::Metadata)?;
+                        }
                         meta_pg.delete_object_parts(bucket, key, vid)?;
                         meta_pg.delete_object_version(bucket, key, vid)?;
                         drop(pgs);
                         self.delete_part_shards(&obj_parts)?;
+                        if !streaming_chunks.is_empty() {
+                            self.delete_chunk_shards_generic(&streaming_chunks)?;
+                        }
 
                         return Ok(DeleteObjectResult {
                             version_id: vid,
@@ -4121,10 +4230,18 @@ impl Coordinator {
         // 1. Validate bucket exists and get versioning state.
         let bucket_info = self.head_bucket(bucket)?;
 
-        // 2. Validate part list: non-empty and strictly increasing part numbers.
+        // 2. Validate part list: non-empty, within max count, and strictly increasing.
         if parts.is_empty() {
             return Err(ServerError::InvalidRequest {
                 reason: "part list must not be empty".to_string(),
+            });
+        }
+        if parts.len() > MAX_PARTS {
+            return Err(ServerError::InvalidRequest {
+                reason: format!(
+                    "part list exceeds maximum of {MAX_PARTS} parts, got {}",
+                    parts.len()
+                ),
             });
         }
         for window in parts.windows(2) {
@@ -4495,11 +4612,19 @@ impl Coordinator {
             })
             .map_err(ServerError::Metadata)?;
 
+        // 3b. Collect streaming chunk manifests for shard cleanup.
+        let streaming_chunks = meta_pg
+            .get_all_multipart_part_chunks_for_upload(upload_id)
+            .map_err(ServerError::Metadata)?;
+
         // 4. Drop meta PG lock before shard cleanup to avoid deadlocks.
         drop(meta_pg);
 
-        // 5. Best-effort delete all shard sets for each part.
+        // 5. Best-effort delete all shard sets for each non-streaming part.
         for part in &all_parts.parts {
+            if part.part_okh == [0u8; 16] {
+                continue; // streaming part — handled below
+            }
             let shard_pg_id = derive_pg_shards(
                 &format!("mpu/{upload_id}"),
                 &format!("{}/{}", part.part_number, part.generation),
@@ -4516,8 +4641,21 @@ impl Coordinator {
             }
         }
 
-        // 6. Re-acquire meta PG and delete upload + parts (CASCADE).
+        // 5b. Delete shard data for streaming part chunks first, then
+        //     delete the manifest rows. This order ensures that if shard
+        //     deletion fails, the chunk refs survive for retry.
+        if !streaming_chunks.is_empty() {
+            self.delete_chunk_shards_generic(&streaming_chunks)?;
+        }
+
+        // 6. Re-acquire meta PG and delete upload + parts (CASCADE)
+        //    and chunk manifest rows.
         let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
+        if !streaming_chunks.is_empty() {
+            meta_pg
+                .delete_multipart_part_chunks_by_upload_id(upload_id)
+                .map_err(ServerError::Metadata)?;
+        }
         meta_pg
             .delete_multipart_upload(upload_id)
             .map_err(ServerError::Metadata)?;
@@ -5736,28 +5874,38 @@ mod tests {
 
     #[test]
     fn max_object_size_constant() {
-        // Verify the size guard exists and the constant is 256 MB.
-        // The actual rejection is tested by large_object_rejected (ignored
-        // by default due to 256 MB allocation).
-        assert_eq!(MAX_OBJECT_SIZE, 256 * 1024 * 1024);
+        // Verify the constant matches AWS S3 single PUT limit (5 GiB).
+        assert_eq!(MAX_OBJECT_SIZE, 5 * 1024 * 1024 * 1024);
     }
 
     #[test]
-    #[ignore] // allocates 256 MB+1 — run explicitly with `cargo test -- --ignored`
-    fn large_object_rejected() {
+    fn max_parts_constant() {
+        assert_eq!(MAX_PARTS, 10_000);
+    }
+
+    #[test]
+    fn complete_multipart_too_many_parts() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-
         coord.create_bucket("bucket").unwrap();
 
-        let err = coord.put_object(
-            "bucket",
-            "key",
-            &vec![0u8; 256 * 1024 * 1024 + 1],
-            &[],
-            NO_WRITE,
-        );
-        assert!(matches!(err, Err(ServerError::ObjectTooLarge { .. })));
+        let create = coord
+            .create_multipart_upload("bucket", "key", &MetadataBlob::new(), None, None)
+            .unwrap();
+
+        // Build a part list with MAX_PARTS + 1 entries.
+        let parts: Vec<_> = (1..=MAX_PARTS as u32 + 1)
+            .map(|n| CompletePart {
+                part_number: n,
+                etag: "dummy".to_string(),
+                checksum: None,
+            })
+            .collect();
+
+        let err = coord
+            .complete_multipart_upload("bucket", "key", &create.upload_id, &parts, None)
+            .unwrap_err();
+        assert!(matches!(err, ServerError::InvalidRequest { .. }));
     }
 
     // ── shard planning unit tests ──────────────────────────────────────
@@ -9962,6 +10110,171 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidRequest { .. }));
+    }
+
+    #[test]
+    fn concurrent_streamed_mpu_isolation_on_unversioned_key() {
+        // Regression: two streamed MPUs on the same unversioned key must not
+        // corrupt each other's chunk data. Upload A completes first; upload B
+        // completes second (overwriting A). Each must read back its own data.
+        let dir = test_util::tempdir();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let metadata = MetadataBlob::new();
+
+        // Create two MPUs for the same key.
+        let mpu_a = coord
+            .create_multipart_upload("bucket", "key", &metadata, None, None)
+            .unwrap();
+        let mpu_b = coord
+            .create_multipart_upload("bucket", "key", &metadata, None, None)
+            .unwrap();
+
+        // Helper: stream a single part with given data.
+        let stream_part = |upload_id: &str, data: &[u8]| -> CompletePart {
+            let sess = coord
+                .begin_stream_part("bucket", "key", upload_id, 1)
+                .unwrap();
+            coord
+                .append_stream_chunk("bucket", "key", &sess, 0, data)
+                .unwrap();
+            let crc = checksum::crc64::checksum(data);
+            let result = coord
+                .finalize_stream_part(
+                    "bucket", "key", &sess, upload_id, 1, crc,
+                    data.len() as u64, None, None,
+                )
+                .unwrap();
+            CompletePart {
+                part_number: 1,
+                etag: result.etag,
+                checksum: None,
+            }
+        };
+
+        let data_a = b"AAAA-data-for-upload-A";
+        let data_b = b"BBBB-data-for-upload-B";
+
+        // Both uploads stage their parts concurrently (interleaved).
+        let part_a = stream_part(&mpu_a.upload_id, data_a);
+        let part_b = stream_part(&mpu_b.upload_id, data_b);
+
+        // Complete A first.
+        let result_a = coord
+            .complete_multipart_upload("bucket", "key", &mpu_a.upload_id, &[part_a], None)
+            .unwrap();
+
+        // Read back A's data — should be A's content.
+        let obj_a = coord
+            .get_object_part("bucket", "key", None, 1, &ReadCondition::default())
+            .unwrap();
+        assert_eq!(
+            obj_a.data, data_a,
+            "after completing A, reading part 1 should return A's data"
+        );
+
+        // Complete B — overwrites A on unversioned bucket.
+        let result_b = coord
+            .complete_multipart_upload("bucket", "key", &mpu_b.upload_id, &[part_b], None)
+            .unwrap();
+
+        // Read back B's data — should be B's content, not A's.
+        let obj_b = coord
+            .get_object_part("bucket", "key", None, 1, &ReadCondition::default())
+            .unwrap();
+        assert_eq!(
+            obj_b.data, data_b,
+            "after completing B, reading part 1 should return B's data"
+        );
+
+        // Sanity: version IDs should both be 0 (unversioned).
+        assert_eq!(result_a.version_id, 0);
+        assert_eq!(result_b.version_id, 0);
+    }
+
+    #[test]
+    fn abort_streamed_mpu_cleans_chunk_manifest_and_shards() {
+        // Regression: aborting an MPU with streamed parts must delete
+        // multipart_part_chunks rows and their shard data.
+        let dir = test_util::tempdir();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let metadata = MetadataBlob::new();
+        let mpu = coord
+            .create_multipart_upload("bucket", "key", &metadata, None, None)
+            .unwrap();
+
+        // Upload a streaming part.
+        let sess = coord
+            .begin_stream_part("bucket", "key", &mpu.upload_id, 1)
+            .unwrap();
+        let data = b"streamed-part-data-for-abort-test";
+        coord
+            .append_stream_chunk("bucket", "key", &sess, 0, data)
+            .unwrap();
+        let crc = checksum::crc64::checksum(data);
+        coord
+            .finalize_stream_part(
+                "bucket", "key", &sess, &mpu.upload_id, 1, crc,
+                data.len() as u64, None, None,
+            )
+            .unwrap();
+
+        // Capture chunk records before abort for shard verification.
+        let meta_pg_id = derive_pg("bucket", "key", coord.pg_count);
+        let chunks_before = {
+            let meta_pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
+            let chunks = meta_pg
+                .get_all_multipart_part_chunks_for_upload(&mpu.upload_id)
+                .unwrap();
+            assert!(!chunks.is_empty(), "chunks should exist before abort");
+            chunks
+        };
+
+        // Verify shard data exists before abort.
+        for chunk in &chunks_before {
+            let shard_pg = coord.storage_node.get_pg(chunk.shard_pg_id).unwrap();
+            let total = chunk.ec_k as usize + chunk.ec_m as usize;
+            for i in 0..total {
+                let shard_key = ShardKey::new(&chunk.chunk_okh, chunk.chunk_vid, i as u8);
+                assert!(
+                    shard_pg.read_shard(&shard_key).is_ok(),
+                    "shard {i} should exist before abort"
+                );
+            }
+        }
+
+        // Abort the MPU.
+        coord
+            .abort_multipart_upload("bucket", "key", &mpu.upload_id)
+            .unwrap();
+
+        // Verify chunk manifest rows are gone.
+        {
+            let meta_pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
+            let chunks = meta_pg
+                .get_all_multipart_part_chunks_for_upload(&mpu.upload_id)
+                .unwrap();
+            assert!(
+                chunks.is_empty(),
+                "chunk manifest rows should be deleted after abort"
+            );
+        }
+
+        // Verify shard data is gone.
+        for chunk in &chunks_before {
+            let shard_pg = coord.storage_node.get_pg(chunk.shard_pg_id).unwrap();
+            let total = chunk.ec_k as usize + chunk.ec_m as usize;
+            for i in 0..total {
+                let shard_key = ShardKey::new(&chunk.chunk_okh, chunk.chunk_vid, i as u8);
+                assert!(
+                    shard_pg.read_shard(&shard_key).is_err(),
+                    "shard {i} should be deleted after abort"
+                );
+            }
+        }
     }
 
     // ── Phase 5: Cleanup hardening tests ────────────────────────────

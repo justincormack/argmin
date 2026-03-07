@@ -133,7 +133,6 @@ impl ChunkedMode {
 
 /// Identifies which streaming write operation a request maps to.
 #[derive(Debug, PartialEq)]
-#[allow(dead_code)] // UploadPart variant reserved for Phase 4
 enum StreamingWriteOp {
     PutObject {
         bucket: String,
@@ -356,8 +355,7 @@ async fn handle(
 ///
 /// Returns a `StreamingWriteOp` for PutObject and UploadPart requests that:
 /// - Are not CopyObject (no `x-amz-copy-source` header)
-/// - Use UNSIGNED-PAYLOAD (body not needed for auth verification)
-/// - Are not aws-chunked (no STREAMING-* content hash)
+/// - Use UNSIGNED-PAYLOAD or a STREAMING-* aws-chunked content hash
 ///
 fn is_streaming_write(parts: &http::request::Parts) -> Option<StreamingWriteOp> {
     if parts.method != http::Method::PUT {
@@ -430,17 +428,24 @@ fn is_streaming_write(parts: &http::request::Parts) -> Option<StreamingWriteOp> 
                 chunked: chunked.clone(),
             })
         }
-        // UploadPart streaming is not yet routed: complete_multipart_upload
-        // and the GetObject read path don't handle chunk-manifested parts.
-        // TODO: Phase 4 — enable once read path supports part chunk manifests.
-        S3Operation::UploadPart { .. } => None,
+        S3Operation::UploadPart { bucket, key } => {
+            let upload_id = extract_query_param(query, "uploadId")?;
+            let part_number: u32 = extract_query_param(query, "partNumber")
+                .and_then(|s| s.parse().ok())?;
+            Some(StreamingWriteOp::UploadPart {
+                bucket,
+                key,
+                upload_id,
+                part_number,
+                chunked: chunked.clone(),
+            })
+        }
         _ => None,
     }
 }
 
 /// Extract a query parameter value from a query string.
-#[allow(dead_code)] // Reserved for Phase 4 UploadPart streaming
-fn extract_query_param<'a>(query: &'a str, name: &str) -> Option<String> {
+fn extract_query_param(query: &str, name: &str) -> Option<String> {
     for pair in query.split('&') {
         if let Some((k, v)) = pair.split_once('=') {
             if k == name {
@@ -743,7 +748,16 @@ async fn handle_streaming_part(
     let mut decoder = make_chunked_decoder(&chunked, ctx.streaming_signing.as_ref());
 
     // If a trailing checksum is declared, prepare an incremental hasher for validation.
+    // Otherwise, if an inline checksum header is present, prepare a hasher for that
+    // so we can verify the claimed value against the actual streamed body.
     let mut trailing_hasher = trailing_hasher_from_parts(&parts);
+    let mut inline_checksum_claim: Option<String> = None;
+    if trailing_hasher.is_none() {
+        if let Some((h, claimed)) = inline_checksum_hasher_from_parts(&parts) {
+            trailing_hasher = Some(h);
+            inline_checksum_claim = Some(claimed);
+        }
+    }
 
     // 2. Stream body frames, accumulating into STREAM_CHUNK_SIZE buffers.
     let ctx = Arc::new(ctx);
@@ -850,25 +864,34 @@ async fn handle_streaming_part(
         }
     }
 
-    // Validate trailing checksum against incrementally computed value.
+    // Validate checksum against incrementally computed value.
     // Keep the computed (algo, bytes) for passing to finalization.
     let computed_checksum = if let Some(th) = trailing_hasher {
         use base64::Engine;
         let (algo, bytes) = th.finalize_algo_bytes();
         let actual_b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-        match trailer_checksums.len() {
-            1 => {
-                if trailer_checksums[0].1 != actual_b64 {
-                    abort_streaming_part_ctx(&state, &ctx).await;
-                    return error_response(&ServerError::BadDigest);
-                }
-            }
-            0 => {}
-            _ => {
+        if let Some(ref claimed) = inline_checksum_claim {
+            // Inline checksum header: verify against streamed body.
+            if *claimed != actual_b64 {
                 abort_streaming_part_ctx(&state, &ctx).await;
-                return error_response(&ServerError::InvalidRequest {
-                    reason: "multiple checksum trailers not supported".to_string(),
-                });
+                return error_response(&ServerError::BadDigest);
+            }
+        } else {
+            // Trailing checksum: validate if present.
+            match trailer_checksums.len() {
+                1 => {
+                    if trailer_checksums[0].1 != actual_b64 {
+                        abort_streaming_part_ctx(&state, &ctx).await;
+                        return error_response(&ServerError::BadDigest);
+                    }
+                }
+                0 => {}
+                _ => {
+                    abort_streaming_part_ctx(&state, &ctx).await;
+                    return error_response(&ServerError::InvalidRequest {
+                        reason: "multiple checksum trailers not supported".to_string(),
+                    });
+                }
             }
         }
         Some((algo, bytes))
@@ -1394,14 +1417,23 @@ mod tests {
     }
 
     #[test]
-    fn streaming_upload_part_not_routed_yet() {
-        // UploadPart streaming is not yet enabled (Phase 4).
+    fn streaming_upload_part_routed() {
         let parts = make_parts(
             "PUT",
             "/mybucket/mykey?partNumber=3&uploadId=abc123",
             &[("x-amz-content-sha256", "UNSIGNED-PAYLOAD")],
         );
-        assert_eq!(is_streaming_write(&parts), None);
+        let result = is_streaming_write(&parts);
+        assert!(matches!(
+            result,
+            Some(StreamingWriteOp::UploadPart {
+                ref bucket,
+                ref key,
+                ref upload_id,
+                part_number: 3,
+                ..
+            }) if bucket == "mybucket" && key == "mykey" && upload_id == "abc123"
+        ));
     }
 
     #[test]

@@ -280,6 +280,19 @@ pub trait PgMetadataStore {
         key: &str,
         version_id: u64,
     ) -> Result<(), MetadataError>;
+
+    /// Get all chunk records for a given upload_id (any version_id / part_number).
+    /// Used during abort to collect shard refs before deletion.
+    fn get_all_multipart_part_chunks_for_upload(
+        &self,
+        upload_id: &str,
+    ) -> Result<Vec<MultipartPartChunkRecord>, MetadataError>;
+
+    /// Delete all chunk records for a given upload_id.
+    fn delete_multipart_part_chunks_by_upload_id(
+        &self,
+        upload_id: &str,
+    ) -> Result<(), MetadataError>;
 }
 
 /// Global metadata service (bucket table).

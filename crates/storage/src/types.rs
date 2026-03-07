@@ -577,6 +577,7 @@ pub struct StreamObjectChunkRecord {
 pub struct MultipartPartChunkRecord {
     pub bucket: String,
     pub key: String,
+    pub upload_id: String,
     pub version_id: u64,
     pub part_number: u32,
     pub chunk_index: u32,

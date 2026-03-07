@@ -2786,17 +2786,17 @@ fn multipart_part_chunks_crud() {
     let conn = store.connection();
     conn.execute(
         "INSERT INTO multipart_part_chunks \
-         (bucket, key, version_id, part_number, chunk_index, size, chunk_okh, \
+         (bucket, key, upload_id, version_id, part_number, chunk_index, size, chunk_okh, \
           chunk_vid, shard_pg_id, ec_k, ec_m) \
-         VALUES ('b', 'k', 1, 1, 0, 4000000, X'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', 10, 0, 4, 2)",
+         VALUES ('b', 'k', 'uid-1', 1, 1, 0, 4000000, X'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', 10, 0, 4, 2)",
         [],
     )
     .unwrap();
     conn.execute(
         "INSERT INTO multipart_part_chunks \
-         (bucket, key, version_id, part_number, chunk_index, size, chunk_okh, \
+         (bucket, key, upload_id, version_id, part_number, chunk_index, size, chunk_okh, \
           chunk_vid, shard_pg_id, ec_k, ec_m) \
-         VALUES ('b', 'k', 1, 1, 1, 2000000, X'BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB', 10, 1, 4, 2)",
+         VALUES ('b', 'k', 'uid-1', 1, 1, 1, 2000000, X'BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB', 10, 1, 4, 2)",
         [],
     )
     .unwrap();
@@ -2863,7 +2863,8 @@ fn commit_stream_part_replaces_prior_chunks_on_reupload() {
         .map(|i| MultipartPartChunkRecord {
             bucket: "b".to_string(),
             key: "k".to_string(),
-            version_id: 0,
+            upload_id: "mpu-1".to_string(),
+            version_id: u64::MAX,
             part_number: 1,
             chunk_index: i,
             size: 1000,
@@ -2879,7 +2880,7 @@ fn commit_stream_part_replaces_prior_chunks_on_reupload() {
         .commit_stream_part("sp-1", &make_part(3000), &chunks_v1)
         .unwrap();
 
-    let chunks = store.get_multipart_part_chunks("b", "k", 0, 1).unwrap();
+    let chunks = store.get_multipart_part_chunks("b", "k", u64::MAX, 1).unwrap();
     assert_eq!(chunks.len(), 3);
 
     // Re-upload same part: only 1 chunk (fewer than before)
@@ -2897,7 +2898,8 @@ fn commit_stream_part_replaces_prior_chunks_on_reupload() {
     let chunks_v2 = vec![MultipartPartChunkRecord {
         bucket: "b".to_string(),
         key: "k".to_string(),
-        version_id: 0,
+        upload_id: "mpu-1".to_string(),
+        version_id: u64::MAX,
         part_number: 1,
         chunk_index: 0,
         size: 5000,
@@ -2913,7 +2915,7 @@ fn commit_stream_part_replaces_prior_chunks_on_reupload() {
         .unwrap();
 
     // Verify: only 1 chunk (stale rows deleted)
-    let chunks = store.get_multipart_part_chunks("b", "k", 0, 1).unwrap();
+    let chunks = store.get_multipart_part_chunks("b", "k", u64::MAX, 1).unwrap();
     assert_eq!(chunks.len(), 1);
     assert_eq!(chunks[0].size, 5000);
     assert_eq!(chunks[0].chunk_okh, [0x22; 16]);
@@ -3117,7 +3119,8 @@ fn commit_stream_part_zero_chunks_clears_prior() {
                 MultipartPartChunkRecord {
                     bucket: "b".to_string(),
                     key: "k".to_string(),
-                    version_id: 0,
+                    upload_id: "mpu-zc".to_string(),
+                    version_id: u64::MAX,
                     part_number: 1,
                     chunk_index: 0,
                     size: 1000,
@@ -3130,7 +3133,8 @@ fn commit_stream_part_zero_chunks_clears_prior() {
                 MultipartPartChunkRecord {
                     bucket: "b".to_string(),
                     key: "k".to_string(),
-                    version_id: 0,
+                    upload_id: "mpu-zc".to_string(),
+                    version_id: u64::MAX,
                     part_number: 1,
                     chunk_index: 1,
                     size: 1000,
@@ -3146,7 +3150,7 @@ fn commit_stream_part_zero_chunks_clears_prior() {
 
     assert_eq!(
         store
-            .get_multipart_part_chunks("b", "k", 0, 1)
+            .get_multipart_part_chunks("b", "k", u64::MAX, 1)
             .unwrap()
             .len(),
         2
@@ -3184,7 +3188,7 @@ fn commit_stream_part_zero_chunks_clears_prior() {
         )
         .unwrap();
 
-    let chunks = store.get_multipart_part_chunks("b", "k", 0, 1).unwrap();
+    let chunks = store.get_multipart_part_chunks("b", "k", u64::MAX, 1).unwrap();
     assert!(
         chunks.is_empty(),
         "stale chunks should be deleted on zero-chunk re-upload"
@@ -3296,7 +3300,8 @@ fn commit_stream_part_rejects_mismatched_chunk_part_number() {
             &[MultipartPartChunkRecord {
                 bucket: "b".to_string(),
                 key: "k".to_string(),
-                version_id: 0,
+                upload_id: "mpu-cpc".to_string(),
+                version_id: u64::MAX,
                 part_number: 99, // wrong!
                 chunk_index: 0,
                 size: 100,
@@ -3318,7 +3323,7 @@ fn commit_stream_part_rejects_mismatched_chunk_part_number() {
 }
 
 #[test]
-fn commit_stream_part_rejects_nonzero_chunk_version_id() {
+fn commit_stream_part_rejects_non_staging_chunk_version_id() {
     let (_dir, store) = make_pg_store();
 
     store
@@ -3344,7 +3349,7 @@ fn commit_stream_part_rejects_nonzero_chunk_version_id() {
         })
         .unwrap();
 
-    // Chunk has version_id=42 — must be 0 pre-CompleteMultipartUpload
+    // Chunk has version_id=42 — must be PART_CHUNK_STAGING_VERSION_ID (u64::MAX) pre-CompleteMultipartUpload
     let err = store
         .commit_stream_part(
             "sp-vid",
@@ -3365,7 +3370,8 @@ fn commit_stream_part_rejects_nonzero_chunk_version_id() {
             &[MultipartPartChunkRecord {
                 bucket: "b".to_string(),
                 key: "k".to_string(),
-                version_id: 42, // wrong — must be 0
+                upload_id: "mpu-vid".to_string(),
+                version_id: 42, // wrong — must be u64::MAX (staging sentinel)
                 part_number: 1,
                 chunk_index: 0,
                 size: 100,
@@ -3382,7 +3388,7 @@ fn commit_stream_part_rejects_nonzero_chunk_version_id() {
             err,
             crate::error::MetadataError::StreamSessionNotFound { .. }
         ),
-        "expected rejection for nonzero chunk version_id, got: {err:?}"
+        "expected rejection for non-staging chunk version_id, got: {err:?}"
     );
 }
 
@@ -3405,5 +3411,29 @@ fn malformed_chunk_okh_returns_db_error() {
     assert!(
         matches!(err, crate::error::MetadataError::Db { .. }),
         "expected Db error for malformed okh, got: {err:?}"
+    );
+}
+
+#[test]
+fn malformed_multipart_chunk_okh_returns_db_error() {
+    let (_dir, store) = make_pg_store();
+
+    // Insert a multipart part chunk with wrong-length okh directly via SQL
+    let conn = store.connection();
+    conn.execute(
+        "INSERT INTO multipart_part_chunks \
+         (bucket, key, upload_id, version_id, part_number, chunk_index, size, chunk_okh, \
+          chunk_vid, shard_pg_id, ec_k, ec_m) \
+         VALUES ('b', 'k', 'mpu-bad', 0, 1, 0, 100, X'AABB', 1, 0, 4, 2)",
+        [],
+    )
+    .unwrap();
+
+    let err = store
+        .get_all_multipart_part_chunks_for_upload("mpu-bad")
+        .unwrap_err();
+    assert!(
+        matches!(err, crate::error::MetadataError::Db { .. }),
+        "expected Db error for malformed multipart chunk okh, got: {err:?}"
     );
 }

@@ -22,9 +22,10 @@ use crate::schema::init_pg_schema;
 use crate::traits::{PgMetadataStore, ShardStore};
 use crate::types::*;
 
-/// Part chunk rows use version_id = 0 during staging (pre-CompleteMultipartUpload).
-/// The real version_id is assigned at finalization time.
-const PART_CHUNK_STAGING_VERSION_ID: u64 = 0;
+/// Part chunk rows use a sentinel version_id during staging (pre-CompleteMultipartUpload).
+/// Must differ from any real version_id (0 for unversioned, 1+ for versioned) so that
+/// in-progress staging rows are invisible to reads of completed objects.
+const PART_CHUNK_STAGING_VERSION_ID: u64 = u64::MAX;
 
 /// Per-PG store combining shard file I/O with SQLite metadata.
 pub struct PgStore {
@@ -1583,7 +1584,31 @@ impl PgMetadataStore for PgStore {
                 }
             }
 
-            // 5. Delete in-progress upload + parts (CASCADE).
+            // 5. Clean up stale multipart_part_chunks from prior uploads to
+            //    the same key+version_id (e.g. overwriting in unversioned mode).
+            self.conn.execute(
+                "DELETE FROM multipart_part_chunks \
+                 WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 AND upload_id != ?4",
+                params![obj.bucket, obj.key, obj.version_id as i64, upload_id],
+            )?;
+
+            // 6. Reparent this upload's chunks from staging version_id to
+            //    the real object version_id so reads can find them.
+            self.conn.execute(
+                "UPDATE multipart_part_chunks \
+                 SET version_id = ?1 \
+                 WHERE bucket = ?2 AND key = ?3 AND upload_id = ?4 \
+                 AND version_id = ?5",
+                params![
+                    obj.version_id as i64,
+                    obj.bucket,
+                    obj.key,
+                    upload_id,
+                    PART_CHUNK_STAGING_VERSION_ID as i64,
+                ],
+            )?;
+
+            // 7. Delete in-progress upload + parts (CASCADE).
             self.conn.execute(
                 "DELETE FROM multipart_uploads WHERE upload_id = ?1",
                 params![upload_id],
@@ -2161,18 +2186,17 @@ impl PgMetadataStore for PgStore {
                     source: e,
                 })?;
 
-            // 3. Delete prior part chunks for this part number (re-upload support).
-            //    Uses session binding (already validated) so this runs even with
-            //    zero committed chunks.
+            // 3. Delete prior part chunks for this upload+part (re-upload support).
+            //    Scoped by upload_id to avoid clobbering concurrent uploads for the same key.
             self.conn
                 .execute(
                     "DELETE FROM multipart_part_chunks \
-                     WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 \
+                     WHERE bucket = ?1 AND key = ?2 AND upload_id = ?3 \
                      AND part_number = ?4",
                     params![
                         sess_bucket,
                         sess_key,
-                        PART_CHUNK_STAGING_VERSION_ID as i64,
+                        part.upload_id,
                         part.part_number
                     ],
                 )
@@ -2187,9 +2211,9 @@ impl PgMetadataStore for PgStore {
                     .conn
                     .prepare(
                         "INSERT INTO multipart_part_chunks \
-                         (bucket, key, version_id, part_number, chunk_index, size, chunk_okh, \
+                         (bucket, key, upload_id, version_id, part_number, chunk_index, size, chunk_okh, \
                           chunk_vid, shard_pg_id, ec_k, ec_m) \
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                     )
                     .map_err(|e| MetadataError::Db {
                         context: "commit stream part (prepare insert chunks)",
@@ -2198,6 +2222,7 @@ impl PgMetadataStore for PgStore {
                 for chunk in chunks {
                     if chunk.bucket != sess_bucket
                         || chunk.key != sess_key
+                        || chunk.upload_id != part.upload_id
                         || chunk.version_id != PART_CHUNK_STAGING_VERSION_ID
                         || chunk.part_number != part.part_number
                     {
@@ -2208,6 +2233,7 @@ impl PgMetadataStore for PgStore {
                     stmt.execute(params![
                         chunk.bucket,
                         chunk.key,
+                        chunk.upload_id,
                         chunk.version_id as i64,
                         chunk.part_number,
                         chunk.chunk_index,
@@ -2337,7 +2363,7 @@ impl PgMetadataStore for PgStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT bucket, key, version_id, part_number, chunk_index, size, chunk_okh, \
+                "SELECT bucket, key, upload_id, version_id, part_number, chunk_index, size, chunk_okh, \
                  chunk_vid, shard_pg_id, ec_k, ec_m FROM multipart_part_chunks \
                  WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 AND part_number = ?4 \
                  ORDER BY chunk_index ASC",
@@ -2351,20 +2377,21 @@ impl PgMetadataStore for PgStore {
             .query_map(
                 params![bucket, key, version_id as i64, part_number],
                 |row| {
-                    let okh_blob: Vec<u8> = row.get(6)?;
-                    let okh = PgStore::parse_okh_blob(&okh_blob, 6)?;
+                    let okh_blob: Vec<u8> = row.get(7)?;
+                    let okh = PgStore::parse_okh_blob(&okh_blob, 7)?;
                     Ok(MultipartPartChunkRecord {
                         bucket: row.get(0)?,
                         key: row.get(1)?,
-                        version_id: row.get::<_, i64>(2)? as u64,
-                        part_number: row.get(3)?,
-                        chunk_index: row.get(4)?,
-                        size: row.get::<_, i64>(5)? as u64,
+                        upload_id: row.get(2)?,
+                        version_id: row.get::<_, i64>(3)? as u64,
+                        part_number: row.get(4)?,
+                        chunk_index: row.get(5)?,
+                        size: row.get::<_, i64>(6)? as u64,
                         chunk_okh: okh,
-                        chunk_vid: row.get::<_, i64>(7)? as u64,
-                        shard_pg_id: row.get(8)?,
-                        ec_k: row.get(9)?,
-                        ec_m: row.get(10)?,
+                        chunk_vid: row.get::<_, i64>(8)? as u64,
+                        shard_pg_id: row.get(9)?,
+                        ec_k: row.get(10)?,
+                        ec_m: row.get(11)?,
                     })
                 },
             )
@@ -2397,6 +2424,69 @@ impl PgMetadataStore for PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "delete multipart part chunks",
+                source: e,
+            })?;
+        Ok(())
+    }
+
+    fn get_all_multipart_part_chunks_for_upload(
+        &self,
+        upload_id: &str,
+    ) -> Result<Vec<MultipartPartChunkRecord>, MetadataError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT bucket, key, upload_id, version_id, part_number, chunk_index, \
+                 size, chunk_okh, chunk_vid, shard_pg_id, ec_k, ec_m \
+                 FROM multipart_part_chunks \
+                 WHERE upload_id = ?1 \
+                 ORDER BY part_number, chunk_index",
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "get all multipart part chunks for upload (prepare)",
+                source: e,
+            })?;
+        let rows = stmt
+            .query_map(params![upload_id], |row| {
+                let okh_blob: Vec<u8> = row.get(7)?;
+                let chunk_okh = PgStore::parse_okh_blob(&okh_blob, 7)?;
+                Ok(MultipartPartChunkRecord {
+                    bucket: row.get(0)?,
+                    key: row.get(1)?,
+                    upload_id: row.get(2)?,
+                    version_id: row.get::<_, i64>(3)? as u64,
+                    part_number: row.get(4)?,
+                    chunk_index: row.get(5)?,
+                    size: row.get::<_, i64>(6)? as u64,
+                    chunk_okh,
+                    chunk_vid: row.get::<_, i64>(8)? as u64,
+                    shard_pg_id: row.get(9)?,
+                    ec_k: row.get(10)?,
+                    ec_m: row.get(11)?,
+                })
+            })
+            .map_err(|e| MetadataError::Db {
+                context: "get all multipart part chunks for upload (query)",
+                source: e,
+            })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| MetadataError::Db {
+                context: "get all multipart part chunks for upload (collect)",
+                source: e,
+            })
+    }
+
+    fn delete_multipart_part_chunks_by_upload_id(
+        &self,
+        upload_id: &str,
+    ) -> Result<(), MetadataError> {
+        self.conn
+            .execute(
+                "DELETE FROM multipart_part_chunks WHERE upload_id = ?1",
+                params![upload_id],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "delete multipart part chunks by upload_id",
                 source: e,
             })?;
         Ok(())

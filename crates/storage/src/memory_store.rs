@@ -616,4 +616,22 @@ impl PgMetadataStore for MemoryPgStore {
             context: "streaming uploads (pending Phase 2)",
         })
     }
+
+    fn get_all_multipart_part_chunks_for_upload(
+        &self,
+        _upload_id: &str,
+    ) -> Result<Vec<MultipartPartChunkRecord>, MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "streaming uploads (pending Phase 2)",
+        })
+    }
+
+    fn delete_multipart_part_chunks_by_upload_id(
+        &self,
+        _upload_id: &str,
+    ) -> Result<(), MetadataError> {
+        Err(MetadataError::NotImplemented {
+            context: "streaming uploads (pending Phase 2)",
+        })
+    }
 }

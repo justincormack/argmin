@@ -469,6 +469,22 @@ impl PgMetadataStore for FaultyPgStore {
         self.inner
             .delete_multipart_part_chunks(bucket, key, version_id)
     }
+
+    fn get_all_multipart_part_chunks_for_upload(
+        &self,
+        upload_id: &str,
+    ) -> Result<Vec<MultipartPartChunkRecord>, MetadataError> {
+        self.inner
+            .get_all_multipart_part_chunks_for_upload(upload_id)
+    }
+
+    fn delete_multipart_part_chunks_by_upload_id(
+        &self,
+        upload_id: &str,
+    ) -> Result<(), MetadataError> {
+        self.inner
+            .delete_multipart_part_chunks_by_upload_id(upload_id)
+    }
 }
 
 #[cfg(test)]
