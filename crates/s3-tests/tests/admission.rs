@@ -57,7 +57,7 @@ async fn start_server(
             let mut credentials = auth::CredentialStore::new();
             credentials.add(
                 s3_tests::server::TEST_ACCESS_KEY.to_string(),
-                auth::SecretKey(s3_tests::server::TEST_SECRET_KEY.to_string()),
+                auth::SecretKey::new(s3_tests::server::TEST_SECRET_KEY.to_string()),
             );
 
             server::http::HttpFrontend {

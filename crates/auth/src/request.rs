@@ -301,7 +301,9 @@ fn authenticate_presigned(
         &hmac::Key::new(hmac::HMAC_SHA256, signing_key.as_ref()),
         sts.as_bytes(),
     );
-    if hex_encode_lower(expected_sig.as_ref()) != signature {
+    // Constant-time comparison to prevent timing attacks on signature values.
+    let expected_hex = hex_encode_lower(expected_sig.as_ref());
+    if !crate::constant_time_eq(expected_hex.as_bytes(), signature.as_bytes()) {
         return Err(AuthError::SignatureMismatch);
     }
 
@@ -373,7 +375,12 @@ fn validate_record_token_and_expiry(
     }
 
     if let Some(expected_token) = record.session_token.as_deref() {
-        if request_token != Some(expected_token) {
+        // Constant-time comparison to prevent timing attacks on session tokens.
+        let matches = match request_token {
+            Some(t) => crate::constant_time_eq(t.as_bytes(), expected_token.as_bytes()),
+            None => false,
+        };
+        if !matches {
             return Err(AuthError::InvalidToken);
         }
     }
@@ -452,7 +459,7 @@ mod tests {
         let mut store = CredentialStore::new();
         store.add(
             "AKIAIOSFODNN7EXAMPLE".to_string(),
-            SecretKey("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
+            SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
         );
         store
     }
@@ -524,7 +531,7 @@ mod tests {
         let scope = "20240201/us-east-1/s3/aws4_request";
         let sts = string_to_sign("20240201T120000Z", scope, &canonical_hash);
         let key = derive_signing_key(
-            &SecretKey("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
+            &SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
             "20240201",
             "us-east-1",
             "s3",
@@ -572,7 +579,7 @@ mod tests {
         let scope = "20240201/us-east-1/s3/aws4_request";
         let sts = string_to_sign("20240201T120000Z", scope, &canonical_hash);
         let key = derive_signing_key(
-            &SecretKey("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
+            &SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
             "20240201",
             "us-east-1",
             "s3",
@@ -631,7 +638,7 @@ mod tests {
         let mut store = example_store();
         store.add_record(CredentialRecord {
             access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
-            secret_key: SecretKey("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
+            secret_key: SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
             principal: "u1".to_string(),
             session_token: Some("expected".to_string()),
             expires_at_epoch_secs: None,
@@ -665,7 +672,7 @@ mod tests {
         let mut store = example_store();
         store.add_record(CredentialRecord {
             access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
-            secret_key: SecretKey("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
+            secret_key: SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
             principal: "u1".to_string(),
             session_token: None,
             expires_at_epoch_secs: Some(5),

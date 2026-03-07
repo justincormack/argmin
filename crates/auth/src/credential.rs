@@ -2,7 +2,20 @@
 use std::collections::HashMap;
 
 /// A secret access key. Deliberately does not implement Debug to avoid leaking secrets.
-pub struct SecretKey(pub String);
+/// Field is private — use [`SecretKey::as_str()`] to access the value.
+pub struct SecretKey(String);
+
+impl SecretKey {
+    /// Create a new secret key.
+    pub fn new(s: String) -> Self {
+        Self(s)
+    }
+
+    /// Access the secret key value.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
 /// Full credential record used by authentication.
 pub struct CredentialRecord {
@@ -86,9 +99,9 @@ mod tests {
     #[test]
     fn add_then_get() {
         let mut store = CredentialStore::new();
-        store.add("AKID".into(), SecretKey("secret123".into()));
+        store.add("AKID".into(), SecretKey::new("secret123".into()));
         let key = store.get("AKID").unwrap();
-        assert_eq!(key.0, "secret123");
+        assert_eq!(key.as_str(), "secret123");
         let record = store.get_record("AKID").unwrap();
         assert_eq!(record.principal, "AKID");
         assert!(record.enabled);
@@ -97,10 +110,10 @@ mod tests {
     #[test]
     fn overwrite_key() {
         let mut store = CredentialStore::new();
-        store.add("AKID".into(), SecretKey("first".into()));
-        store.add("AKID".into(), SecretKey("second".into()));
+        store.add("AKID".into(), SecretKey::new("first".into()));
+        store.add("AKID".into(), SecretKey::new("second".into()));
         let key = store.get("AKID").unwrap();
-        assert_eq!(key.0, "second");
+        assert_eq!(key.as_str(), "second");
     }
 
     #[test]
@@ -108,7 +121,7 @@ mod tests {
         let mut store = CredentialStore::new();
         store.add_record(CredentialRecord {
             access_key_id: "AKID".into(),
-            secret_key: SecretKey("secret".into()),
+            secret_key: SecretKey::new("secret".into()),
             principal: "user-123".into(),
             session_token: Some("token".into()),
             expires_at_epoch_secs: Some(1234),

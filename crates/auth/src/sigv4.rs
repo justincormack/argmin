@@ -89,7 +89,7 @@ pub fn derive_signing_key(
     region: &str,
     service: &str,
 ) -> hmac::Tag {
-    let k_secret = format!("AWS4{}", secret.0);
+    let k_secret = format!("AWS4{}", secret.as_str());
     let k_date = hmac_sha256(k_secret.as_bytes(), date.as_bytes());
     let k_region = hmac_sha256(k_date.as_ref(), region.as_bytes());
     let k_service = hmac_sha256(k_region.as_ref(), service.as_bytes());
@@ -214,7 +214,8 @@ pub fn verify_request(
     let expected_sig = hmac_sha256(signing_key.as_ref(), sts.as_bytes());
     let expected_hex = hex_encode(expected_sig.as_ref());
 
-    if expected_hex != auth.signature {
+    // Constant-time comparison to prevent timing attacks on signature values.
+    if !crate::constant_time_eq(expected_hex.as_bytes(), auth.signature.as_bytes()) {
         return Err(AuthError::SignatureMismatch);
     }
 
@@ -245,7 +246,7 @@ mod tests {
         let mut store = CredentialStore::new();
         store.add(
             "AKIAIOSFODNN7EXAMPLE".to_string(),
-            SecretKey("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
+            SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
         );
         store
     }
@@ -293,7 +294,7 @@ mod tests {
     fn derive_signing_key_aws_example() {
         // Verified correct via the full SigV4 e2e tests (GET/PUT object examples).
         // The signing key for s3 differs from the iam example in the AWS general docs.
-        let secret = SecretKey("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string());
+        let secret = SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string());
         let tag = derive_signing_key(&secret, "20130524", "us-east-1", "s3");
         let hex = hex_encode(tag.as_ref());
         assert_eq!(

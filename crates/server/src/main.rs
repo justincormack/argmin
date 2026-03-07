@@ -66,7 +66,7 @@ async fn main() {
         let mut credentials = CredentialStore::new();
         credentials.add(
             config.access_key_id.clone(),
-            SecretKey(config.secret_access_key.clone()),
+            SecretKey::new(config.secret_access_key.clone()),
         );
         frontends.push(HttpFrontend {
             coordinator,

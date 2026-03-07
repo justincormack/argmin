@@ -607,7 +607,7 @@ mod tests {
 
         // Derive signing key.
         let signing_key = auth::sigv4::derive_signing_key(
-            &auth::SecretKey(secret.to_string()),
+            &auth::SecretKey::new(secret.to_string()),
             date,
             region,
             service,
@@ -701,7 +701,7 @@ mod tests {
         let scope = format!("{}/{}/{}/aws4_request", date, region, service);
 
         let signing_key = auth::sigv4::derive_signing_key(
-            &auth::SecretKey(secret.to_string()),
+            &auth::SecretKey::new(secret.to_string()),
             date,
             region,
             service,
@@ -769,7 +769,7 @@ mod tests {
         let scope = format!("{}/{}/{}/aws4_request", date, region, service);
 
         let signing_key = auth::sigv4::derive_signing_key(
-            &auth::SecretKey(secret.to_string()),
+            &auth::SecretKey::new(secret.to_string()),
             date,
             region,
             service,
@@ -921,7 +921,7 @@ mod tests {
         let scope = format!("{}/{}/{}/aws4_request", date, region, service);
 
         let signing_key = auth::sigv4::derive_signing_key(
-            &auth::SecretKey(secret.to_string()),
+            &auth::SecretKey::new(secret.to_string()),
             date,
             region,
             service,

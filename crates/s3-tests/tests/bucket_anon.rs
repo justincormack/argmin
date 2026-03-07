@@ -394,6 +394,95 @@ fn test_object_anon_put_write_access() {
 //
 // We return 403 because ListBuckets is an authenticated-only operation.
 
+// ── Anonymous access to non-existent buckets ─────────────────────────
+//
+// AWS returns 404 NoSuchBucket for anonymous requests to non-existent
+// buckets. This matches AWS behavior — bucket name secrecy is not relied
+// upon for access control.
+
+#[test]
+fn test_anon_get_nonexistent_bucket_returns_404() {
+    s3_tests::run(async {
+        let url = format!(
+            "{}/nonexistent-{}-{}/obj",
+            CTX.endpoint(),
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let mut resp = agent().get(&url).call().expect("transport error");
+        let status = resp.status().as_u16();
+        let body = resp.body_mut().read_to_string().unwrap();
+        assert_eq!(
+            status, 404,
+            "expected 404 for anon GET on nonexistent bucket, got {}",
+            status
+        );
+        assert!(
+            body.contains("<Code>NoSuchBucket</Code>"),
+            "expected NoSuchBucket in body: {}",
+            body
+        );
+    });
+}
+
+#[test]
+fn test_anon_head_nonexistent_bucket_returns_404() {
+    s3_tests::run(async {
+        let url = format!(
+            "{}/nonexistent-{}-{}",
+            CTX.endpoint(),
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let resp = agent().head(&url).call().expect("transport error");
+        assert_eq!(
+            resp.status().as_u16(),
+            404,
+            "expected 404 for anon HEAD on nonexistent bucket, got {}",
+            resp.status().as_u16()
+        );
+    });
+}
+
+#[test]
+fn test_anon_put_nonexistent_bucket_returns_404() {
+    s3_tests::run(async {
+        let url = format!(
+            "{}/nonexistent-{}-{}/obj",
+            CTX.endpoint(),
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let mut resp = agent()
+            .put(&url)
+            .send(b"data" as &[u8])
+            .expect("transport error");
+        let status = resp.status().as_u16();
+        let body = resp.body_mut().read_to_string().unwrap();
+        assert_eq!(
+            status, 404,
+            "expected 404 for anon PUT on nonexistent bucket, got {}",
+            status
+        );
+        assert!(
+            body.contains("<Code>NoSuchBucket</Code>"),
+            "expected NoSuchBucket in body: {}",
+            body
+        );
+    });
+}
+
+// ── Anonymous ListBuckets ────────────────────────────────────────────
+
 #[test]
 fn test_list_buckets_anonymous() {
     if std::env::var("S3_TEST_ENDPOINT").is_ok() {

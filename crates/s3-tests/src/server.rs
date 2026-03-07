@@ -69,11 +69,11 @@ impl TestServer {
                 let mut credentials = auth::CredentialStore::new();
                 credentials.add(
                     TEST_ACCESS_KEY.to_string(),
-                    auth::SecretKey(TEST_SECRET_KEY.to_string()),
+                    auth::SecretKey::new(TEST_SECRET_KEY.to_string()),
                 );
                 credentials.add(
                     ALT_ACCESS_KEY.to_string(),
-                    auth::SecretKey(ALT_SECRET_KEY.to_string()),
+                    auth::SecretKey::new(ALT_SECRET_KEY.to_string()),
                 );
 
                 server::http::HttpFrontend {

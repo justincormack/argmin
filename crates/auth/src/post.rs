@@ -48,7 +48,7 @@ pub fn authenticate_post(
     let expected_mac = hmac::sign(
         &hmac::Key::new(
             hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY,
-            record.secret_key.0.as_bytes(),
+            record.secret_key.as_str().as_bytes(),
         ),
         policy.as_bytes(),
     );
@@ -119,7 +119,8 @@ pub fn authenticate_post_sigv4(
     let expected_sig = sigv4::hmac_sha256(signing_key.as_ref(), policy_b64.as_bytes());
     let expected_hex = sigv4::hex_encode(expected_sig.as_ref());
 
-    if expected_hex != signature_hex {
+    // Constant-time comparison to prevent timing attacks on signature values.
+    if !crate::constant_time_eq(expected_hex.as_bytes(), signature_hex.as_bytes()) {
         return Err(AuthError::SignatureMismatch);
     }
 
@@ -385,7 +386,7 @@ mod tests {
         let mut store = CredentialStore::new();
         store.add(
             "testAccessKey123".to_string(),
-            SecretKey("testSecretKey456".to_string()),
+            SecretKey::new("testSecretKey456".to_string()),
         );
         store
     }
@@ -476,7 +477,7 @@ mod tests {
 
         // Compute expected signature
         let signing_key = crate::sigv4::derive_signing_key(
-            &SecretKey("testSecretKey456".to_string()),
+            &SecretKey::new("testSecretKey456".to_string()),
             "20250101",
             "us-east-1",
             "s3",
