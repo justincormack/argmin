@@ -24,7 +24,7 @@ const POOL_SIZE: usize = 4;
 /// is aborted when the TestServer is dropped.
 pub struct TestServer {
     endpoint: String,
-    _temp_dir: tempfile::TempDir,
+    _temp_dir: test_util::TempDir,
     _server_task: tokio::task::JoinHandle<()>,
 }
 
@@ -42,7 +42,7 @@ impl TestServer {
         let listener = tokio::net::TcpListener::from_std(std_listener).expect("tokio listener");
 
         // Create temp directory for storage
-        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let temp_dir = test_util::tempdir();
         let data_path = temp_dir.path().join("data");
 
         // Run EC self-test once

@@ -1924,6 +1924,7 @@ dependencies = [
  "server",
  "storage",
  "tempfile",
+ "test-util",
  "tokio",
  "ureq",
  "url",
@@ -2051,7 +2052,7 @@ dependencies = [
  "rapidhash 1.4.0",
  "ring",
  "storage",
- "tempfile",
+ "test-util",
  "thiserror",
  "tokio",
 ]
@@ -2171,7 +2172,7 @@ dependencies = [
  "checksum",
  "proptest",
  "rusqlite",
- "tempfile",
+ "test-util",
  "thiserror",
 ]
 
@@ -2214,6 +2215,14 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "test-util"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tempfile",
 ]
 
 [[package]]

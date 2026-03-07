@@ -172,8 +172,8 @@ fn test_shard_key_hex() {
 
 // --- PgStore (filesystem) tests ---
 
-fn make_pg_store() -> (tempfile::TempDir, crate::PgStore) {
-    let dir = tempfile::tempdir().unwrap();
+fn make_pg_store() -> (test_util::TempDir, crate::PgStore) {
+    let dir = test_util::tempdir();
     let pg_dir = dir.path().join("pg-0000");
     let store = crate::PgStore::open(&pg_dir, 0).unwrap();
     (dir, store)
@@ -217,7 +217,7 @@ fn file_shard_multiple_keys() {
 
 #[test]
 fn file_shard_integrity_error() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_util::tempdir();
     let pg_dir = dir.path().join("pg-0000");
     let store = crate::PgStore::open(&pg_dir, 0).unwrap();
 
@@ -241,7 +241,7 @@ fn file_shard_integrity_error() {
 
 #[test]
 fn file_shard_orphan_cleanup() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_util::tempdir();
     let pg_dir = dir.path().join("pg-0000");
 
     // Create the PG structure and add an orphan file in tmp/.

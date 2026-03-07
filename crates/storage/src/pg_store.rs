@@ -2470,7 +2470,7 @@ mod tests {
 
     #[test]
     fn pg_id_accessor() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let store = PgStore::open(tmp.path(), 42).unwrap();
         assert_eq!(store.pg_id(), 42);
     }
@@ -2479,7 +2479,7 @@ mod tests {
 
     #[test]
     fn list_objects_prefix_and_start_after() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let store = PgStore::open(tmp.path(), 0).unwrap();
 
         // Insert several objects
@@ -2523,7 +2523,7 @@ mod tests {
 
     #[test]
     fn stat_shard_after_quarantine() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let store = PgStore::open(tmp.path(), 0).unwrap();
 
         let key = ShardKey::new(&[0xAA; 16], 0, 0);
@@ -2546,7 +2546,7 @@ mod tests {
 
     #[test]
     fn stat_shard_live() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let store = PgStore::open(tmp.path(), 0).unwrap();
 
         let key = ShardKey::new(&[0xBB; 16], 1, 0);
@@ -2561,7 +2561,7 @@ mod tests {
 
     #[test]
     fn connection_accessor() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let store = PgStore::open(tmp.path(), 0).unwrap();
         // Just verify we can call it without panicking
         let _conn = store.connection();
@@ -2571,7 +2571,7 @@ mod tests {
 
     #[test]
     fn list_objects_pagination() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let store = PgStore::open(tmp.path(), 0).unwrap();
 
         for i in 0..5 {

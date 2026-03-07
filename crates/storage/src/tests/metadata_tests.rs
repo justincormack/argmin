@@ -386,8 +386,8 @@ fn memory_metadata_zero_size() {
 
 // --- PgStore (filesystem) tests ---
 
-fn make_pg_store() -> (tempfile::TempDir, crate::PgStore) {
-    let dir = tempfile::tempdir().unwrap();
+fn make_pg_store() -> (test_util::TempDir, crate::PgStore) {
+    let dir = test_util::tempdir();
     let pg_dir = dir.path().join("pg-0000");
     let store = crate::PgStore::open(&pg_dir, 0).unwrap();
     (dir, store)
@@ -1701,7 +1701,7 @@ fn mpu_upsert_rapid_generation_overwrites() {
 #[test]
 fn mpu_concurrent_upserts_different_parts() {
     // Two connections to the same DB, upserting different parts of the same upload.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_util::tempdir();
     let pg_dir = dir.path().join("pg-0000");
     let store1 = crate::PgStore::open(&pg_dir, 0).unwrap();
     let store2 = crate::PgStore::open(&pg_dir, 0).unwrap();
@@ -1732,7 +1732,7 @@ fn mpu_concurrent_upserts_different_parts() {
 fn mpu_concurrent_upserts_same_part() {
     // Two connections racing to overwrite the same part — both should succeed
     // (serialized by SQLite's IMMEDIATE lock) and the last writer wins.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_util::tempdir();
     let pg_dir = dir.path().join("pg-0000");
     let store1 = crate::PgStore::open(&pg_dir, 0).unwrap();
     let store2 = crate::PgStore::open(&pg_dir, 0).unwrap();
@@ -1761,7 +1761,7 @@ fn mpu_concurrent_upserts_same_part() {
 fn mpu_concurrent_state_transition_one_wins() {
     // Two connections try to transition the same upload from InProgress.
     // Both target different states — only one can succeed on the WHERE state=0 predicate.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_util::tempdir();
     let pg_dir = dir.path().join("pg-0000");
     let store1 = crate::PgStore::open(&pg_dir, 0).unwrap();
     let store2 = crate::PgStore::open(&pg_dir, 0).unwrap();
@@ -1930,7 +1930,7 @@ fn mpu_upsert_commit_failure_preserves_prior_state() {
 fn mpu_commit_object_parts_commit_failure_via_lock_contention() {
     // Switch to DELETE journal mode so a reader holding SHARED lock prevents
     // COMMIT from acquiring EXCLUSIVE lock, forcing the COMMIT failure path.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_util::tempdir();
     let pg_dir = dir.path().join("pg-0000");
     let store = crate::PgStore::open(&pg_dir, 0).unwrap();
 
@@ -1999,7 +1999,7 @@ fn mpu_commit_object_parts_commit_failure_via_lock_contention() {
 fn mpu_threaded_upserts_different_parts() {
     use std::sync::{Arc, Barrier};
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_util::tempdir();
     let pg_dir = dir.path().join("pg-0000");
 
     let setup = crate::PgStore::open(&pg_dir, 0).unwrap();
@@ -2050,7 +2050,7 @@ fn mpu_threaded_upserts_different_parts() {
 fn mpu_threaded_state_transition_race() {
     use std::sync::{Arc, Barrier};
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_util::tempdir();
     let pg_dir = dir.path().join("pg-0000");
 
     let setup = crate::PgStore::open(&pg_dir, 0).unwrap();
@@ -2106,7 +2106,7 @@ fn mpu_threaded_upsert_same_part_stress() {
     use std::sync::{Arc, Barrier};
 
     let n_threads: usize = 8;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_util::tempdir();
     let pg_dir = dir.path().join("pg-0000");
 
     let setup = crate::PgStore::open(&pg_dir, 0).unwrap();

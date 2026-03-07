@@ -25,4 +25,4 @@ bytes = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "time"] }
 
 [dev-dependencies]
-tempfile = "3"
+test-util = { path = "../test-util" }

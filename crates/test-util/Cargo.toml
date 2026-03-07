@@ -1,0 +1,10 @@
+[package]
+name = "test-util"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tempfile = "3"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

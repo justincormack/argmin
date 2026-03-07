@@ -167,14 +167,14 @@ mod tests {
 
     #[test]
     fn data_dir_accessor() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let node = LocalStorageNode::open(tmp.path(), &[0, 1]).unwrap();
         assert_eq!(node.data_dir(), tmp.path());
     }
 
     #[test]
     fn get_pg_store_not_found() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let node = LocalStorageNode::open(tmp.path(), &[0, 1]).unwrap();
         let result = node.get_pg_store(999);
         assert!(result.is_err());
@@ -182,7 +182,7 @@ mod tests {
 
     #[test]
     fn get_pg_valid() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let node = LocalStorageNode::open(tmp.path(), &[0, 1, 2]).unwrap();
         assert!(node.get_pg(0).is_ok());
         assert!(node.get_pg(1).is_ok());
@@ -192,7 +192,7 @@ mod tests {
 
     #[test]
     fn pg_ids_sorted() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let node = LocalStorageNode::open(tmp.path(), &[5, 2, 8, 1]).unwrap();
         assert_eq!(node.pg_ids(), &[1, 2, 5, 8]);
     }
@@ -201,7 +201,7 @@ mod tests {
 
     #[test]
     fn shared_node_open_and_get_pg() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let node = SharedStorageNode::open(tmp.path(), &[0, 1, 2]).unwrap();
         assert!(node.get_pg(0).is_ok());
         assert!(node.get_pg(1).is_ok());
@@ -211,21 +211,21 @@ mod tests {
 
     #[test]
     fn shared_node_pg_ids_sorted() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let node = SharedStorageNode::open(tmp.path(), &[5, 2, 8, 1]).unwrap();
         assert_eq!(node.pg_ids(), &[1, 2, 5, 8]);
     }
 
     #[test]
     fn shared_node_data_dir() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();
         assert_eq!(node.data_dir(), tmp.path());
     }
 
     #[test]
     fn shared_node_lock_two_pgs_same() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let node = SharedStorageNode::open(tmp.path(), &[0, 1]).unwrap();
         let (guard, opt) = node.lock_two_pgs(0, 0).unwrap();
         assert!(opt.is_none());
@@ -234,7 +234,7 @@ mod tests {
 
     #[test]
     fn shared_node_lock_two_pgs_different() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let node = SharedStorageNode::open(tmp.path(), &[0, 1]).unwrap();
         let (guard_a, opt_b) = node.lock_two_pgs(0, 1).unwrap();
         assert_eq!(guard_a.pg_id(), 0);
@@ -244,7 +244,7 @@ mod tests {
 
     #[test]
     fn shared_node_lock_two_pgs_reversed_order() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let node = SharedStorageNode::open(tmp.path(), &[0, 1]).unwrap();
         // Request pg_b=0, pg_a=1 — should still lock 0 first internally,
         // but return guards in the requested order.

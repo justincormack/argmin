@@ -2273,7 +2273,7 @@ mod tests {
 
     #[test]
     fn upload_part_missing_upload_id() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         fe.coordinator
             .create_bucket_for_owner("testuser", "mybucket", false)
@@ -2293,7 +2293,7 @@ mod tests {
 
     #[test]
     fn upload_part_invalid_part_number() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         fe.coordinator
             .create_bucket_for_owner("testuser", "mybucket", false)
@@ -2315,7 +2315,7 @@ mod tests {
 
     #[test]
     fn complete_multipart_missing_upload_id() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         fe.coordinator
             .create_bucket_for_owner("testuser", "mybucket", false)
@@ -2335,7 +2335,7 @@ mod tests {
 
     #[test]
     fn complete_multipart_multiple_checksum_headers_rejected() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         fe.coordinator
             .create_bucket_for_owner("testuser", "mybucket", false)
@@ -2370,7 +2370,7 @@ mod tests {
 
     #[test]
     fn complete_multipart_algorithm_header_contradicts_value_header() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         fe.coordinator
             .create_bucket_for_owner("testuser", "mybucket", false)
@@ -2406,7 +2406,7 @@ mod tests {
 
     #[test]
     fn complete_multipart_duplicate_same_checksum_header_rejected() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         fe.coordinator
             .create_bucket_for_owner("testuser", "mybucket", false)
@@ -2441,7 +2441,7 @@ mod tests {
 
     #[test]
     fn complete_multipart_duplicate_checksum_algorithm_header_rejected() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         fe.coordinator
             .create_bucket_for_owner("testuser", "mybucket", false)
@@ -2478,7 +2478,7 @@ mod tests {
     #[test]
     fn complete_multipart_checksum_algo_mismatch_upload_rejected() {
         // Upload created with CRC32 but complete sends SHA256 checksum header.
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         fe.coordinator
             .create_bucket_for_owner("testuser", "mybucket", false)
@@ -2532,7 +2532,7 @@ mod tests {
 
     #[test]
     fn abort_multipart_missing_upload_id() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         fe.coordinator
             .create_bucket_for_owner("testuser", "mybucket", false)
@@ -2554,7 +2554,7 @@ mod tests {
 
     #[test]
     fn list_parts_missing_upload_id() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         fe.coordinator
             .create_bucket_for_owner("testuser", "mybucket", false)
@@ -2574,7 +2574,7 @@ mod tests {
 
     #[test]
     fn list_parts_invalid_part_number_marker() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         fe.coordinator
             .create_bucket_for_owner("testuser", "mybucket", false)
@@ -2594,7 +2594,7 @@ mod tests {
 
     #[test]
     fn list_parts_invalid_max_parts() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         fe.coordinator
             .create_bucket_for_owner("testuser", "mybucket", false)
@@ -2616,7 +2616,7 @@ mod tests {
 
     #[test]
     fn get_object_attributes_invalid_max_parts() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         fe.coordinator
             .create_bucket_for_owner("testuser", "mybucket", false)
@@ -2648,7 +2648,7 @@ mod tests {
 
     #[test]
     fn get_object_attributes_invalid_part_number_marker() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         fe.coordinator
             .create_bucket_for_owner("testuser", "mybucket", false)
@@ -2682,7 +2682,7 @@ mod tests {
 
     #[test]
     fn multipart_upload_e2e_quoted_etags() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         fe.coordinator
             .create_bucket_for_owner("testuser", "mybucket", false)
@@ -2762,7 +2762,7 @@ mod tests {
 
     #[test]
     fn list_multipart_uploads_invalid_max_uploads() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         fe.coordinator
             .create_bucket_for_owner("testuser", "mybucket", false)
@@ -2783,7 +2783,7 @@ mod tests {
 
     #[test]
     fn create_multipart_invalid_checksum_algorithm() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         fe.coordinator
             .create_bucket_for_owner("testuser", "mybucket", false)
@@ -2809,7 +2809,7 @@ mod tests {
 
     #[test]
     fn create_multipart_invalid_checksum_type() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         fe.coordinator
             .create_bucket_for_owner("testuser", "mybucket", false)
@@ -2838,7 +2838,7 @@ mod tests {
 
     #[test]
     fn create_multipart_checksum_type_without_algorithm() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         fe.coordinator
             .create_bucket_for_owner("testuser", "mybucket", false)
@@ -2864,7 +2864,7 @@ mod tests {
 
     #[test]
     fn create_multipart_sha_full_object_rejected() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         fe.coordinator
             .create_bucket_for_owner("testuser", "mybucket", false)
@@ -2893,7 +2893,7 @@ mod tests {
 
     #[test]
     fn create_multipart_with_checksum_returns_fields_in_xml() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         fe.coordinator
             .create_bucket_for_owner("testuser", "mybucket", false)
@@ -2928,7 +2928,7 @@ mod tests {
 
     #[test]
     fn create_multipart_crc32_composite_accepted() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         fe.coordinator
             .create_bucket_for_owner("testuser", "mybucket", false)
@@ -2963,7 +2963,7 @@ mod tests {
 
     #[test]
     fn create_multipart_algorithm_only_defaults_type() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         fe.coordinator
             .create_bucket_for_owner("testuser", "mybucket", false)
@@ -3027,7 +3027,7 @@ mod tests {
 
     #[test]
     fn upload_part_bad_digest() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         fe.coordinator
             .create_bucket_for_owner("testuser", "mybucket", false)
@@ -3057,7 +3057,7 @@ mod tests {
 
     #[test]
     fn upload_part_multiple_checksum_headers_rejected() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         fe.coordinator
             .create_bucket_for_owner("testuser", "mybucket", false)
@@ -3087,7 +3087,7 @@ mod tests {
 
     #[test]
     fn upload_part_algorithm_mismatch_rejected() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         fe.coordinator
             .create_bucket_for_owner("testuser", "mybucket", false)
@@ -3117,7 +3117,7 @@ mod tests {
     fn upload_part_correct_checksum_returns_header() {
         use base64::Engine;
 
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         fe.coordinator
             .create_bucket_for_owner("testuser", "mybucket", false)
@@ -3155,7 +3155,7 @@ mod tests {
     fn upload_part_no_header_upload_algo_computes_checksum() {
         // Upload has checksum algorithm but part doesn't send a header.
         // Coordinator should compute the checksum from data.
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         fe.coordinator
             .create_bucket_for_owner("testuser", "mybucket", false)
@@ -3190,7 +3190,7 @@ mod tests {
     fn upload_part_reupload_preserves_latest_checksum() {
         use base64::Engine;
 
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         fe.coordinator
             .create_bucket_for_owner("testuser", "mybucket", false)
@@ -3246,7 +3246,7 @@ mod tests {
     #[test]
     fn upload_part_checksum_accepted_when_upload_has_no_algorithm() {
         use base64::Engine;
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         fe.coordinator
             .create_bucket_for_owner("testuser", "mybucket", false)
@@ -3275,7 +3275,7 @@ mod tests {
 
     #[test]
     fn upload_part_algorithm_header_contradicts_value_header() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         fe.coordinator
             .create_bucket_for_owner("testuser", "mybucket", false)
@@ -3308,7 +3308,7 @@ mod tests {
     fn upload_part_algorithm_header_only_no_value_header() {
         // x-amz-checksum-algorithm without a value header is fine —
         // treated as no claimed checksum; coordinator computes from upload config.
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         fe.coordinator
             .create_bucket_for_owner("testuser", "mybucket", false)
@@ -3339,7 +3339,7 @@ mod tests {
 
     #[test]
     fn upload_part_duplicate_checksum_algorithm_header_rejected() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         fe.coordinator
             .create_bucket_for_owner("testuser", "mybucket", false)
@@ -3451,7 +3451,7 @@ mod tests {
 
     #[test]
     fn get_object_part_multipart() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         fe.coordinator
             .create_bucket_for_owner("testuser", "mybucket", false)
@@ -3505,7 +3505,7 @@ mod tests {
 
     #[test]
     fn get_object_part_invalid_zero() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         fe.coordinator
             .create_bucket_for_owner("testuser", "mybucket", false)
@@ -3540,7 +3540,7 @@ mod tests {
 
     #[test]
     fn get_object_part_out_of_range() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         fe.coordinator
             .create_bucket_for_owner("testuser", "mybucket", false)
@@ -3572,7 +3572,7 @@ mod tests {
 
     #[test]
     fn get_object_part_non_multipart() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         fe.coordinator
             .create_bucket_for_owner("testuser", "mybucket", false)
@@ -3624,7 +3624,7 @@ mod tests {
 
     #[test]
     fn get_object_part_non_multipart_out_of_range() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         fe.coordinator
             .create_bucket_for_owner("testuser", "mybucket", false)
@@ -3658,7 +3658,7 @@ mod tests {
 
     #[test]
     fn get_object_part_with_checksum() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         fe.coordinator
             .create_bucket_for_owner("testuser", "mybucket", false)
@@ -3699,7 +3699,7 @@ mod tests {
 
     #[test]
     fn signed_streaming_without_context_returns_signature_mismatch() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
 
         // Auth context claims signed streaming but has no streaming context.
@@ -3734,7 +3734,7 @@ mod tests {
 
     #[test]
     fn non_numeric_decoded_content_length_returns_400() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
 
         let req = S3Request {
@@ -3767,7 +3767,7 @@ mod tests {
 
     #[test]
     fn ecdsa_streaming_token_rejected() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
 
         let req = S3Request {

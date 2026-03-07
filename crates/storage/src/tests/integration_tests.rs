@@ -4,7 +4,7 @@ use crate::types::*;
 /// Integration test: write shard data + object metadata, read both back.
 #[test]
 fn shard_and_metadata_roundtrip() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_util::tempdir();
     let pg_dir = dir.path().join("pg-0000");
     let store = crate::PgStore::open(&pg_dir, 0).unwrap();
 
@@ -48,7 +48,7 @@ fn shard_and_metadata_roundtrip() {
 /// Integration test: LocalStorageNode with multiple PGs.
 #[test]
 fn local_storage_node_multi_pg() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_util::tempdir();
     let node = crate::LocalStorageNode::open(dir.path(), &[0, 1, 2]).unwrap();
 
     assert_eq!(node.pg_ids(), &[0, 1, 2]);
@@ -80,7 +80,7 @@ fn local_storage_node_multi_pg() {
 /// Integration test: StorageNode trait (dyn dispatch).
 #[test]
 fn storage_node_trait() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_util::tempdir();
     let node = crate::LocalStorageNode::open(dir.path(), &[5, 10]).unwrap();
     let node: &dyn StorageNode = &node;
 
@@ -97,7 +97,7 @@ fn storage_node_trait() {
 /// Integration test: bucket + PG metadata lifecycle.
 #[test]
 fn full_lifecycle() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_util::tempdir();
 
     // Create bucket DB.
     let bucket_db = crate::SqliteBucketDb::open(&dir.path().join("buckets.db")).unwrap();
@@ -158,7 +158,7 @@ fn full_lifecycle() {
 /// Test PgStore reopening with data persistence.
 #[test]
 fn pg_store_persistence() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_util::tempdir();
     let pg_dir = dir.path().join("pg-0000");
 
     let key = ShardKey::new(&[0xBB; 16], 1, 0);

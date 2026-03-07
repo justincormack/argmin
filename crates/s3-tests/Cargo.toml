@@ -22,6 +22,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs"] }
 
 # Test infrastructure
 tempfile = "3"
+test-util = { path = "../test-util" }
 
 # POST Object tests (raw HTTP, SigV4 signing)
 ureq = "3"

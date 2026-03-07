@@ -4728,7 +4728,7 @@ mod tests {
 
     #[test]
     fn bucket_crud() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         // Create
@@ -4749,7 +4749,7 @@ mod tests {
 
     #[test]
     fn create_bucket_idempotent() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
@@ -4763,7 +4763,7 @@ mod tests {
 
     #[test]
     fn create_bucket_different_owner_conflicts() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         coord
@@ -4777,7 +4777,7 @@ mod tests {
 
     #[test]
     fn list_buckets_scoped_by_owner() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         coord
@@ -4800,7 +4800,7 @@ mod tests {
 
     #[test]
     fn delete_nonempty_bucket_fails() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
@@ -4814,7 +4814,7 @@ mod tests {
 
     #[test]
     fn put_get_object() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
@@ -4835,7 +4835,7 @@ mod tests {
 
     #[test]
     fn put_get_with_metadata() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
@@ -4858,7 +4858,7 @@ mod tests {
 
     #[test]
     fn head_object() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
@@ -4879,7 +4879,7 @@ mod tests {
 
     #[test]
     fn overwrite_object() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
@@ -4896,7 +4896,7 @@ mod tests {
 
     #[test]
     fn empty_object() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
@@ -4911,7 +4911,7 @@ mod tests {
 
     #[test]
     fn delete_object_then_get_fails() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
@@ -4930,7 +4930,7 @@ mod tests {
 
     #[test]
     fn delete_nonexistent_object_is_ok() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
@@ -4942,7 +4942,7 @@ mod tests {
 
     #[test]
     fn list_objects() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
@@ -4968,7 +4968,7 @@ mod tests {
 
     #[test]
     fn list_objects_with_prefix() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
@@ -4990,7 +4990,7 @@ mod tests {
 
     #[test]
     fn list_objects_with_delimiter() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
@@ -5018,7 +5018,7 @@ mod tests {
 
     #[test]
     fn put_get_object_trailing_slash_key() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
@@ -5096,7 +5096,7 @@ mod tests {
 
     #[test]
     fn ec_reconstruction_after_shard_loss() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
@@ -5117,7 +5117,7 @@ mod tests {
 
     #[test]
     fn ec_drop_one_data_shard_get() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
@@ -5135,7 +5135,7 @@ mod tests {
     #[test]
     fn ec_drop_m_shards_at_limit() {
         // Config: k=4, m=2. Dropping exactly m=2 shards should still recover.
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
@@ -5155,7 +5155,7 @@ mod tests {
     #[test]
     fn ec_drop_m_plus_one_shards_fails() {
         // Config: k=4, m=2. Dropping m+1=3 shards should fail.
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
@@ -5178,7 +5178,7 @@ mod tests {
     #[test]
     fn ec_corrupt_one_data_shard_recovery() {
         // Corrupt shard 0 on disk. PgStore detects CRC mismatch, EC reconstructs.
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
@@ -5195,7 +5195,7 @@ mod tests {
 
     #[test]
     fn ec_range_get_with_missing_shard() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
@@ -5223,7 +5223,7 @@ mod tests {
     #[test]
     fn ec_drop_parity_shard_data_still_works() {
         // Delete parity shard (index k=4). Only data shards needed for normal read.
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
@@ -5241,7 +5241,7 @@ mod tests {
 
     #[test]
     fn put_to_nonexistent_bucket_fails() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         let err = coord
@@ -5252,7 +5252,7 @@ mod tests {
 
     #[test]
     fn get_nonexistent_object_fails() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
@@ -5264,7 +5264,7 @@ mod tests {
 
     #[test]
     fn etag_consistency() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
@@ -5281,7 +5281,7 @@ mod tests {
 
     #[test]
     fn list_objects_delimiter_with_continuation() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
@@ -5326,7 +5326,7 @@ mod tests {
 
     #[test]
     fn list_objects_max_keys_counts_prefixes() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
@@ -5348,7 +5348,7 @@ mod tests {
 
     #[test]
     fn put_object_to_nonexistent_bucket_no_orphaned_shards() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         // Don't create bucket — put should fail at bucket check before writing shards
@@ -5360,7 +5360,7 @@ mod tests {
 
     #[test]
     fn delete_nonexistent_bucket_fails() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         let err = coord.delete_bucket("no-such-bucket").unwrap_err();
@@ -5369,7 +5369,7 @@ mod tests {
 
     #[test]
     fn list_objects_no_delimiter_truncated() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
@@ -5391,7 +5391,7 @@ mod tests {
 
     #[test]
     fn list_objects_no_delimiter_with_continuation() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
@@ -5429,7 +5429,7 @@ mod tests {
 
     #[test]
     fn list_objects_prefix_with_delimiter() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
@@ -5461,7 +5461,7 @@ mod tests {
 
     #[test]
     fn list_objects_not_truncated_no_token() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
@@ -5479,7 +5479,7 @@ mod tests {
 
     #[test]
     fn list_objects_max_keys_zero() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
@@ -5498,7 +5498,7 @@ mod tests {
 
     #[test]
     fn list_objects_max_keys_zero_with_delimiter() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
@@ -5516,7 +5516,7 @@ mod tests {
 
     #[test]
     fn list_objects_nonexistent_bucket_fails() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         let err = coord
@@ -5527,7 +5527,7 @@ mod tests {
 
     #[test]
     fn delete_objects_batch() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
@@ -5565,7 +5565,7 @@ mod tests {
 
     #[test]
     fn delete_objects_nonexistent_bucket() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         let entries = vec![crate::http::xml::DeleteObjectEntry {
@@ -5588,7 +5588,7 @@ mod tests {
     /// 6. Verify bucket is empty and can be deleted
     #[test]
     fn ceph_cleanup_workflow() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("test-bucket").unwrap();
@@ -5662,7 +5662,7 @@ mod tests {
     /// Same workflow but with paginated listing and quiet-mode delete.
     #[test]
     fn ceph_cleanup_workflow_paginated() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
@@ -5745,7 +5745,7 @@ mod tests {
     #[test]
     #[ignore] // allocates 256 MB+1 — run explicitly with `cargo test -- --ignored`
     fn large_object_rejected() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
@@ -5832,7 +5832,7 @@ mod tests {
 
     #[test]
     fn get_object_range_basic() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
@@ -5858,7 +5858,7 @@ mod tests {
 
     #[test]
     fn get_object_range_suffix() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
@@ -5883,7 +5883,7 @@ mod tests {
 
     #[test]
     fn get_object_range_from_start() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
@@ -5906,7 +5906,7 @@ mod tests {
 
     #[test]
     fn get_object_range_unsatisfiable() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
@@ -5929,7 +5929,7 @@ mod tests {
 
     #[test]
     fn get_object_range_clamps_end() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
@@ -5959,7 +5959,7 @@ mod tests {
 
     #[test]
     fn put_if_none_match_star_creates() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -5975,7 +5975,7 @@ mod tests {
 
     #[test]
     fn put_if_none_match_star_rejects_overwrite() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
         coord
@@ -5994,7 +5994,7 @@ mod tests {
 
     #[test]
     fn put_if_match_updates() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -6016,7 +6016,7 @@ mod tests {
 
     #[test]
     fn put_if_match_stale_etag_rejected() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -6040,7 +6040,7 @@ mod tests {
 
     #[test]
     fn get_if_match_returns_object() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -6057,7 +6057,7 @@ mod tests {
 
     #[test]
     fn get_if_match_wrong_etag_returns_412() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
         coord
@@ -6074,7 +6074,7 @@ mod tests {
 
     #[test]
     fn get_if_none_match_returns_304() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -6091,7 +6091,7 @@ mod tests {
 
     #[test]
     fn head_if_none_match_returns_304() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -6108,7 +6108,7 @@ mod tests {
 
     #[test]
     fn delete_if_match_succeeds() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -6125,7 +6125,7 @@ mod tests {
 
     #[test]
     fn delete_if_match_wrong_etag_returns_412() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
         coord
@@ -6144,7 +6144,7 @@ mod tests {
 
     #[test]
     fn delete_objects_if_match_per_entry() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -6179,7 +6179,7 @@ mod tests {
 
     #[test]
     fn range_get_if_match_returns_data() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -6206,7 +6206,7 @@ mod tests {
 
     #[test]
     fn copy_object_basic() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -6236,7 +6236,7 @@ mod tests {
 
     #[test]
     fn copy_object_metadata_copy_directive() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -6269,7 +6269,7 @@ mod tests {
 
     #[test]
     fn copy_object_metadata_replace_directive() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -6306,7 +6306,7 @@ mod tests {
 
     #[test]
     fn copy_object_same_key_replace_metadata() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -6339,7 +6339,7 @@ mod tests {
     fn copy_object_replace_strips_unverified_inline_checksum() {
         // Regression: CopyObject with REPLACE must not persist client-supplied
         // checksum value headers, since there is no body to verify them against.
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -6377,7 +6377,7 @@ mod tests {
         // When x-amz-checksum-algorithm is specified on CopyObject REPLACE,
         // the checksum should be computed from the copied data.
         use base64::Engine;
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -6418,7 +6418,7 @@ mod tests {
 
     #[test]
     fn copy_object_replace_rejects_invalid_checksum_algorithm() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -6448,7 +6448,7 @@ mod tests {
 
     #[test]
     fn copy_object_source_not_found() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -6470,7 +6470,7 @@ mod tests {
 
     #[test]
     fn copy_object_dest_bucket_not_found() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
         coord
@@ -6495,7 +6495,7 @@ mod tests {
 
     #[test]
     fn copy_object_source_if_match_fails() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
         coord
@@ -6524,7 +6524,7 @@ mod tests {
 
     #[test]
     fn copy_object_dest_if_none_match_prevents_overwrite() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -6557,7 +6557,7 @@ mod tests {
 
     #[test]
     fn copy_object_dest_if_match_allows_update() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -6593,7 +6593,7 @@ mod tests {
 
     #[test]
     fn copy_object_cross_bucket() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("src-bucket").unwrap();
         coord.create_bucket("dst-bucket").unwrap();
@@ -6640,7 +6640,7 @@ mod tests {
 
     #[test]
     fn bucket_versioning_default_disabled() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -6650,7 +6650,7 @@ mod tests {
 
     #[test]
     fn bucket_versioning_enable() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -6660,7 +6660,7 @@ mod tests {
 
     #[test]
     fn bucket_versioning_enable_then_suspend() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -6671,7 +6671,7 @@ mod tests {
 
     #[test]
     fn bucket_versioning_suspend_then_enable() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -6683,7 +6683,7 @@ mod tests {
 
     #[test]
     fn bucket_versioning_cannot_disable_from_enabled() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -6694,7 +6694,7 @@ mod tests {
 
     #[test]
     fn bucket_versioning_nonexistent_bucket() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         let err = coord.put_bucket_versioning("no-bucket", 1).unwrap_err();
@@ -6703,7 +6703,7 @@ mod tests {
 
     #[test]
     fn put_object_returns_version_id_zero() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -6715,7 +6715,7 @@ mod tests {
 
     #[test]
     fn get_object_returns_version_id() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -6728,7 +6728,7 @@ mod tests {
 
     #[test]
     fn head_object_returns_version_id() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -6741,7 +6741,7 @@ mod tests {
 
     #[test]
     fn versioned_put_is_safe_across_concurrent_frontends() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let pg_ids: Vec<u32> = (0..4).collect();
         let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
         let bucket_db_path = tmp.path().join("buckets.db");
@@ -6800,7 +6800,7 @@ mod tests {
 
     #[test]
     fn get_object_is_consistent_during_concurrent_overwrite() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let pg_ids: Vec<u32> = (0..4).collect();
         let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
         let bucket_db_path = tmp.path().join("buckets.db");
@@ -6870,7 +6870,7 @@ mod tests {
 
     #[test]
     fn delete_object_is_consistent_during_concurrent_overwrite() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let pg_ids: Vec<u32> = (0..4).collect();
         let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
         let bucket_db_path = tmp.path().join("buckets.db");
@@ -6946,7 +6946,7 @@ mod tests {
 
     #[test]
     fn delete_object_returns_result() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -6964,7 +6964,7 @@ mod tests {
 
     #[test]
     fn create_multipart_upload_returns_upload_id() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -6980,7 +6980,7 @@ mod tests {
 
     #[test]
     fn create_multipart_upload_unique_ids() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -6996,7 +6996,7 @@ mod tests {
 
     #[test]
     fn create_multipart_upload_requires_bucket() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         let metadata = MetadataBlob::new();
@@ -7008,7 +7008,7 @@ mod tests {
 
     #[test]
     fn list_multipart_uploads_empty() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -7021,7 +7021,7 @@ mod tests {
 
     #[test]
     fn list_multipart_uploads_returns_created() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -7048,7 +7048,7 @@ mod tests {
 
     #[test]
     fn list_multipart_uploads_sorted_by_key_then_initiated() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -7080,7 +7080,7 @@ mod tests {
 
     #[test]
     fn list_multipart_uploads_pagination() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -7124,7 +7124,7 @@ mod tests {
 
     #[test]
     fn list_multipart_uploads_prefix_filter() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -7148,7 +7148,7 @@ mod tests {
 
     #[test]
     fn list_multipart_uploads_max_zero() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -7166,7 +7166,7 @@ mod tests {
 
     #[test]
     fn list_multipart_uploads_requires_bucket() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         let err = coord
@@ -7177,7 +7177,7 @@ mod tests {
 
     #[test]
     fn create_multipart_upload_preserves_metadata() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -7206,7 +7206,7 @@ mod tests {
 
     #[test]
     fn delete_bucket_blocked_by_multipart_uploads() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -7222,7 +7222,7 @@ mod tests {
 
     #[test]
     fn no_such_upload_from_storage() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -7237,7 +7237,7 @@ mod tests {
 
     #[test]
     fn list_multipart_uploads_same_key_pagination() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -7293,7 +7293,7 @@ mod tests {
 
     #[test]
     fn upload_part_first_upload() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -7321,7 +7321,7 @@ mod tests {
 
     #[test]
     fn upload_part_reupload_increments_generation() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -7353,7 +7353,7 @@ mod tests {
 
     #[test]
     fn upload_part_invalid_part_number_zero() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -7370,7 +7370,7 @@ mod tests {
 
     #[test]
     fn upload_part_invalid_part_number_exceeds_max() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -7387,7 +7387,7 @@ mod tests {
 
     #[test]
     fn upload_part_nonexistent_upload() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -7399,7 +7399,7 @@ mod tests {
 
     #[test]
     fn upload_part_multiple_parts() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -7437,7 +7437,7 @@ mod tests {
 
     #[test]
     fn upload_part_repeated_reupload_generations() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -7463,7 +7463,7 @@ mod tests {
 
     #[test]
     fn upload_part_boundary_part_numbers() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -7489,7 +7489,7 @@ mod tests {
 
     #[test]
     fn upload_part_wrong_bucket_key_rejected() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -7514,7 +7514,7 @@ mod tests {
 
     #[test]
     fn upload_part_same_part_last_writer_wins() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -7580,7 +7580,7 @@ mod tests {
 
     #[test]
     fn complete_multipart_upload_happy_path() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -7621,7 +7621,7 @@ mod tests {
 
     #[test]
     fn complete_multipart_upload_missing_part() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -7646,7 +7646,7 @@ mod tests {
 
     #[test]
     fn complete_multipart_upload_wrong_etag() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -7664,7 +7664,7 @@ mod tests {
 
     #[test]
     fn complete_multipart_upload_invalid_order() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -7681,7 +7681,7 @@ mod tests {
 
     #[test]
     fn complete_multipart_upload_too_small_non_final_part() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -7704,7 +7704,7 @@ mod tests {
 
     #[test]
     fn complete_multipart_upload_single_part_any_size() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -7719,7 +7719,7 @@ mod tests {
 
     #[test]
     fn complete_multipart_upload_empty_part_list() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -7736,7 +7736,7 @@ mod tests {
 
     #[test]
     fn complete_multipart_upload_retry_after_validation_failure() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -7772,7 +7772,7 @@ mod tests {
 
     #[test]
     fn complete_multipart_upload_duplicate_part_numbers() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -7789,7 +7789,7 @@ mod tests {
 
     #[test]
     fn complete_multipart_upload_overwrite_unversioned() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -7828,7 +7828,7 @@ mod tests {
 
     #[test]
     fn complete_multipart_upload_list_shows_composite_etag() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -7853,7 +7853,7 @@ mod tests {
 
     #[test]
     fn complete_multipart_upload_list_versions_shows_composite_etag() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
         coord.put_bucket_versioning("bucket", 1).unwrap();
@@ -7880,7 +7880,7 @@ mod tests {
 
     #[test]
     fn abort_multipart_upload_success() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -7909,7 +7909,7 @@ mod tests {
 
     #[test]
     fn abort_multipart_upload_nonexistent() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -7924,7 +7924,7 @@ mod tests {
 
     #[test]
     fn abort_multipart_upload_idempotent() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -7950,7 +7950,7 @@ mod tests {
 
     #[test]
     fn abort_multipart_upload_wrong_bucket_key() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
         coord.create_bucket("other").unwrap();
@@ -7971,7 +7971,7 @@ mod tests {
 
     #[test]
     fn abort_does_not_affect_completed_object() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -8001,7 +8001,7 @@ mod tests {
 
     #[test]
     fn upload_part_after_abort_rejected() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -8030,7 +8030,7 @@ mod tests {
 
     #[test]
     fn list_parts_basic() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -8055,7 +8055,7 @@ mod tests {
 
     #[test]
     fn list_parts_pagination() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -8094,7 +8094,7 @@ mod tests {
 
     #[test]
     fn list_parts_etag_format() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -8111,7 +8111,7 @@ mod tests {
 
     #[test]
     fn list_parts_wrong_bucket_key() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
         coord.create_bucket("other").unwrap();
@@ -8132,7 +8132,7 @@ mod tests {
 
     #[test]
     fn list_parts_nonexistent_upload() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -8147,7 +8147,7 @@ mod tests {
 
     #[test]
     fn list_parts_after_reupload_shows_latest() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -8174,7 +8174,7 @@ mod tests {
 
     #[test]
     fn list_parts_rejected_when_aborting() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -8204,7 +8204,7 @@ mod tests {
 
     #[test]
     fn abort_completing_upload_returns_no_such_upload() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -8268,7 +8268,7 @@ mod tests {
 
     #[test]
     fn get_multipart_object_full() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -8290,7 +8290,7 @@ mod tests {
 
     #[test]
     fn get_multipart_object_single_part() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -8304,7 +8304,7 @@ mod tests {
 
     #[test]
     fn head_multipart_object() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -8325,7 +8325,7 @@ mod tests {
 
     #[test]
     fn get_multipart_object_range_within_part() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -8351,7 +8351,7 @@ mod tests {
 
     #[test]
     fn get_multipart_object_range_spanning_parts() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -8387,7 +8387,7 @@ mod tests {
 
     #[test]
     fn get_multipart_object_range_suffix() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -8411,7 +8411,7 @@ mod tests {
 
     #[test]
     fn copy_multipart_source() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("src-bucket").unwrap();
         coord.create_bucket("dst-bucket").unwrap();
@@ -8446,7 +8446,7 @@ mod tests {
 
     #[test]
     fn get_multipart_object_zero_byte_single_part() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -8461,7 +8461,7 @@ mod tests {
 
     #[test]
     fn get_multipart_object_zero_byte_final_part() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -8479,7 +8479,7 @@ mod tests {
 
     #[test]
     fn get_object_part_zero_byte_single_part() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -8497,7 +8497,7 @@ mod tests {
 
     #[test]
     fn get_object_part_zero_byte_final_part() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -8524,7 +8524,7 @@ mod tests {
 
     #[test]
     fn head_object_part_non_multipart() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -8556,7 +8556,7 @@ mod tests {
 
     #[test]
     fn head_object_part_non_multipart_zero_byte() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -8574,7 +8574,7 @@ mod tests {
 
     #[test]
     fn head_multipart_object_zero_byte() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -8588,7 +8588,7 @@ mod tests {
 
     #[test]
     fn copy_multipart_source_zero_byte() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("src").unwrap();
         coord.create_bucket("dst").unwrap();
@@ -8617,7 +8617,7 @@ mod tests {
 
     #[test]
     fn read_multipart_range_detects_incomplete_manifest() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -8696,7 +8696,7 @@ mod tests {
     fn complete_multipart_sha256_composite_checksum() {
         use base64::Engine;
         let b64 = base64::engine::general_purpose::STANDARD;
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -8736,7 +8736,7 @@ mod tests {
     fn complete_multipart_crc32_full_object_checksum() {
         use base64::Engine;
         let b64 = base64::engine::general_purpose::STANDARD;
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -8770,7 +8770,7 @@ mod tests {
     fn complete_multipart_crc32c_full_object_checksum() {
         use base64::Engine;
         let b64 = base64::engine::general_purpose::STANDARD;
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -8803,7 +8803,7 @@ mod tests {
     fn complete_multipart_crc64nvme_full_object_checksum() {
         use base64::Engine;
         let b64 = base64::engine::general_purpose::STANDARD;
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -8839,7 +8839,7 @@ mod tests {
     fn complete_multipart_crc32_composite_checksum() {
         use base64::Engine;
         let b64 = base64::engine::general_purpose::STANDARD;
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -8877,7 +8877,7 @@ mod tests {
 
     #[test]
     fn complete_multipart_bad_part_checksum_rejected() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -8906,7 +8906,7 @@ mod tests {
 
     #[test]
     fn complete_multipart_no_checksum_returns_none() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -8926,7 +8926,7 @@ mod tests {
 
     #[test]
     fn complete_multipart_wrong_checksum_element_type_rejected() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -8959,7 +8959,7 @@ mod tests {
 
     #[test]
     fn stream_put_happy_path() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -9007,7 +9007,7 @@ mod tests {
 
     #[test]
     fn stream_put_zero_byte_object() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -9036,7 +9036,7 @@ mod tests {
 
     #[test]
     fn stream_put_abort() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -9057,7 +9057,7 @@ mod tests {
 
     #[test]
     fn stream_put_append_after_finalize_fails() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -9091,7 +9091,7 @@ mod tests {
 
     #[test]
     fn stream_put_finalize_after_abort_fails() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -9124,7 +9124,7 @@ mod tests {
 
     #[test]
     fn stream_put_bucket_key_mismatch_append() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -9148,7 +9148,7 @@ mod tests {
 
     #[test]
     fn stream_put_bucket_key_mismatch_finalize() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -9179,7 +9179,7 @@ mod tests {
 
     #[test]
     fn stream_put_nonexistent_bucket() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
 
         let err = coord.begin_stream_put("nonexistent", "key").unwrap_err();
@@ -9188,7 +9188,7 @@ mod tests {
 
     #[test]
     fn stream_put_overwrite_existing_object() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -9226,7 +9226,7 @@ mod tests {
 
     #[test]
     fn stream_put_with_write_condition() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -9278,7 +9278,7 @@ mod tests {
 
     #[test]
     fn stream_put_multiple_chunks_correct_manifest() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -9326,7 +9326,7 @@ mod tests {
 
     #[test]
     fn stream_put_abort_cleans_up_shards() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -9362,7 +9362,7 @@ mod tests {
     fn stream_put_get_object_readable() {
         // Stream-finalized objects use chunk manifests for shard data.
         // GET reads from stream_object_chunks to reconstruct the object.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -9397,7 +9397,7 @@ mod tests {
     #[test]
     fn stream_put_get_multi_chunk() {
         // Stream-put with multiple chunks: GET reconstructs all chunks.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -9434,7 +9434,7 @@ mod tests {
     #[test]
     fn stream_put_range_read() {
         // Range reads on stream-put objects work correctly.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -9506,7 +9506,7 @@ mod tests {
     #[test]
     fn stream_put_copy_object() {
         // CopyObject from a stream-put source works correctly.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -9550,7 +9550,7 @@ mod tests {
     #[test]
     fn stream_put_zero_byte_get() {
         // Zero-byte stream-put objects are readable.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -9578,7 +9578,7 @@ mod tests {
     #[test]
     fn stream_put_get_object_part() {
         // partNumber=1 on stream-put objects returns the full body.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -9608,7 +9608,7 @@ mod tests {
     #[test]
     fn stream_put_overwrite_with_normal_put_cleans_chunks() {
         // P0 fix: normal PUT after stream-write must clear stale chunk rows.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -9647,7 +9647,7 @@ mod tests {
     #[test]
     fn stream_put_delete_cleans_chunks() {
         // P1 fix: delete must clean up stream_object_chunks and their shards.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -9681,7 +9681,7 @@ mod tests {
     #[test]
     fn stream_put_upload_part_copy_from_stream_source() {
         // P2 fix: UploadPartCopy must be able to read stream-written source objects.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -9727,7 +9727,7 @@ mod tests {
 
     #[test]
     fn stream_put_duplicate_chunk_index_rejected() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -9763,7 +9763,7 @@ mod tests {
 
     #[test]
     fn stream_put_total_size_mismatch_rejected() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -9795,7 +9795,7 @@ mod tests {
     #[test]
     fn stream_append_accepts_upload_part_session() {
         // append_stream_chunk accepts both PutObject and UploadPart sessions.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -9821,7 +9821,7 @@ mod tests {
 
     #[test]
     fn stream_part_happy_path() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -9861,7 +9861,7 @@ mod tests {
 
     #[test]
     fn stream_part_no_upload_rejected() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -9873,7 +9873,7 @@ mod tests {
 
     #[test]
     fn stream_part_invalid_part_number_rejected() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -9898,7 +9898,7 @@ mod tests {
     fn finalize_stream_part_invalid_base64_rejected() {
         // P2: Malformed base64 in claimed checksum must return an error,
         // not silently accept a None checksum.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -9935,7 +9935,7 @@ mod tests {
     #[test]
     fn finalize_stream_part_wrong_op_kind_rejected() {
         // A PutObject session cannot be finalized as UploadPart.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -9968,7 +9968,7 @@ mod tests {
 
     #[test]
     fn scavenge_stale_sessions_cleans_old() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -10003,7 +10003,7 @@ mod tests {
     fn scavenge_does_not_affect_committed_objects() {
         // A committed (finalized) session should have no staging rows, so
         // scavenge should not affect the object or its chunk manifest.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -10036,7 +10036,7 @@ mod tests {
     #[test]
     fn object_not_visible_before_finalize() {
         // Atomic visibility: object is not readable before finalize.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -10062,7 +10062,7 @@ mod tests {
     fn chunk_manifest_integrity_readback() {
         // Storage-level verification: committed chunk manifest rows match
         // what was written, and shard data is intact.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -10116,7 +10116,7 @@ mod tests {
     #[test]
     fn stream_put_delete_then_reput() {
         // Overwrite cycle: stream-put → delete → normal put → GET succeeds.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
@@ -10169,7 +10169,7 @@ mod tests {
     #[test]
     fn stream_put_overwrite_with_stream_put() {
         // Stream-write → stream-write overwrite: second write's chunks replace first.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 

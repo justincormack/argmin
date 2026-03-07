@@ -9,5 +9,6 @@ members = [
     "crates/auth",
     "crates/server",
     "crates/debug-cli",
+    "crates/test-util",
     "crates/s3-tests",
 ]

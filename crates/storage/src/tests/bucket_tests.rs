@@ -76,7 +76,7 @@ fn bucket_list_empty() {
 
 #[test]
 fn bucket_on_disk() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_util::tempdir();
     let db_path = dir.path().join("buckets.db");
 
     {

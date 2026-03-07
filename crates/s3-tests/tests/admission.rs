@@ -27,13 +27,13 @@ impl Drop for ServerGuard {
 async fn start_server(
     pool_size: usize,
     max_connections: u32,
-) -> (String, ServerGuard, tempfile::TempDir) {
+) -> (String, ServerGuard, test_util::TempDir) {
     let std_listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = std_listener.local_addr().unwrap().to_string();
     std_listener.set_nonblocking(true).unwrap();
     let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
 
-    let temp_dir = tempfile::tempdir().unwrap();
+    let temp_dir = test_util::tempdir();
     let data_path = temp_dir.path().join("data");
     ec::self_test().unwrap();
 
