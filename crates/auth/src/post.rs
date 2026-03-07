@@ -183,6 +183,11 @@ pub fn validate_post_policy(
         .and_then(|v| v.as_array())
         .ok_or(PostPolicyError::Malformed("missing conditions"))?;
 
+    // Empty conditions array is invalid — bucket/key must be constrained
+    if conditions.is_empty() {
+        return Err(PostPolicyError::Malformed("empty conditions"));
+    }
+
     // Track which field names are covered by policy conditions
     let mut covered_fields = std::collections::HashSet::new();
 
@@ -197,13 +202,16 @@ pub fn validate_post_policy(
                 let expected = val
                     .as_str()
                     .ok_or(PostPolicyError::Malformed("condition value must be string"))?;
-                let field_name = key.to_ascii_lowercase();
-                if field_name == "bucket" {
+                // "bucket" is a special virtual condition key (not a form field)
+                // and must be lowercase — "Bucket" is treated as a regular field.
+                if key == "bucket" {
                     covered_fields.insert("bucket".to_string());
                     if bucket != expected {
                         return Err(PostPolicyError::ConditionFailed("bucket"));
                     }
                 } else {
+                    // Form field condition keys are case-insensitive
+                    let field_name = key.to_ascii_lowercase();
                     covered_fields.insert(field_name.clone());
                     let form_val = find_field(form_fields, &field_name);
                     if form_val != Some(expected) {

@@ -1007,7 +1007,6 @@ fn test_post_object_expires_is_case_sensitive() {
 // ── Policy: conditions ──────────────────────────────────────────────────
 
 #[test]
-#[ignore = "not implemented: POST policy empty conditions rejection"]
 fn test_post_object_empty_conditions() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;
@@ -1107,7 +1106,6 @@ fn test_post_object_missing_conditions_list() {
 }
 
 #[test]
-#[ignore = "not implemented: POST policy condition key case sensitivity"]
 fn test_post_object_condition_is_case_sensitive() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;
@@ -1119,8 +1117,10 @@ fn test_post_object_condition_is_case_sensitive() {
         let region = CTX.region();
         let credential = format!("{}/{}/{}/s3/aws4_request", access_key, short_date, region);
 
-        // "Bucket" (capital B) in condition — S3 condition keys are case-sensitive,
-        // so "Bucket" does not match "bucket" and should be rejected.
+        // "Bucket" (capital B) in condition — the special "bucket" condition key
+        // is case-sensitive (must be lowercase). "Bucket" is treated as an unknown
+        // form-field condition, so the actual "bucket" is unconstrained. AWS returns
+        // 403 for this.
         let policy_b64 = make_policy_raw(
             &epoch_to_iso8601(
                 SystemTime::now()
@@ -1146,7 +1146,7 @@ fn test_post_object_condition_is_case_sensitive() {
         ];
 
         let (status, _) = post_object(&bucket, &fields, b"data", "test.txt");
-        assert_eq!(status, 400, "expected 400, got {}", status);
+        assert_eq!(status, 403, "expected 403, got {}", status);
 
         let _ = CTX
             .client()
@@ -2098,11 +2098,5 @@ fn test_post_object_tags_anonymous_request() {
 #[test]
 #[ignore = "not implemented: tagging"]
 fn test_post_object_tags_authenticated_request() {
-    s3_tests::run(async {});
-}
-
-#[test]
-#[ignore = "not implemented: RGW-specific bug"]
-fn test_post_object_upload_size_rgw_chunk_size_bug() {
     s3_tests::run(async {});
 }

@@ -791,7 +791,6 @@ fn test_object_raw_get_x_amz_expires_not_expired() {
 }
 
 #[test]
-#[ignore = "not implemented: X-Amz-Expires max range enforcement"]
 fn test_object_raw_get_x_amz_expires_out_max_range() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -806,8 +805,10 @@ fn test_object_raw_get_x_amz_expires_out_max_range() {
             .await
             .unwrap();
 
-        // 604801 seconds = 7 days + 1 second, exceeds the max allowed
-        let presign_config = PresigningConfig::expires_in(Duration::from_secs(604801)).unwrap();
+        // Generate a valid presigned URL, then tamper X-Amz-Expires to exceed the
+        // 604800-second (7-day) maximum. The SDK rejects >604800 client-side, so
+        // we create a legal URL and replace the value.
+        let presign_config = PresigningConfig::expires_in(Duration::from_secs(600)).unwrap();
         let presigned = client
             .get_object()
             .bucket(&bucket)
@@ -816,16 +817,17 @@ fn test_object_raw_get_x_amz_expires_out_max_range() {
             .await
             .unwrap();
 
-        let mut resp = agent()
-            .get(presigned.uri())
-            .call()
-            .expect("transport error");
+        let tampered_url = presigned
+            .uri()
+            .replace("X-Amz-Expires=600", "X-Amz-Expires=604801");
+
+        let mut resp = agent().get(&tampered_url).call().expect("transport error");
         let status = resp.status().as_u16();
         let _ = resp.body_mut().read_to_string();
-        // Presigned URL validation: expires > 604800 is an auth parameter error
+        // Presigned URL validation: expires > 604800 is an auth parameter error → 400
         assert_eq!(
-            status, 403,
-            "expected 403 for out-of-range expires, got {}",
+            status, 400,
+            "expected 400 for out-of-range expires, got {}",
             status
         );
 
