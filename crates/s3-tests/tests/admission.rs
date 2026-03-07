@@ -39,18 +39,15 @@ async fn start_server(
 
     let pg_count: u32 = 4;
     let pg_ids: Vec<u32> = (0..pg_count).collect();
-    let bucket_db_path = data_path.join("buckets.db");
 
     let storage_node =
         Arc::new(storage::SharedStorageNode::open(&data_path, &pg_ids).expect("open storage"));
 
     let frontends: Vec<server::http::HttpFrontend> = (0..pool_size)
         .map(|_| {
-            let bucket_db = storage::SqliteBucketDb::open(&bucket_db_path).expect("open bucket db");
             let ec_config = ec::EcConfig::new(4, 2).unwrap();
             let coordinator = server::coordinator::Coordinator::new(
                 Arc::clone(&storage_node),
-                bucket_db,
                 ec_config,
                 pg_count,
                 "us-east-1".to_string(),

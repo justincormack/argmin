@@ -291,45 +291,64 @@ fn print_table(headers: &[&str], rows: &[Vec<String>]) {
 // --- Subcommands ---
 
 fn cmd_buckets(data_dir: &Path) {
-    let db_path = data_dir.join("buckets.db");
-    let conn = match open_readonly(&db_path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("error: cannot open {}: {e}", db_path.display());
-            process::exit(1);
-        }
-    };
+    let pgs = discover_pgs(data_dir);
+    if pgs.is_empty() {
+        println!("(no PG databases found)");
+        return;
+    }
 
-    let mut stmt = conn
-        .prepare("SELECT name, owner_id, created_at, region, versioning FROM buckets ORDER BY name")
-        .unwrap_or_else(|e| {
-            eprintln!("error: query failed: {e}");
-            process::exit(1);
-        });
+    let mut rows: Vec<Vec<String>> = Vec::new();
 
-    let rows: Vec<Vec<String>> = stmt
-        .query_map([], |row| {
+    for (pg_id, meta_path) in pgs {
+        let conn = match open_readonly(&meta_path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("warning: cannot open {}: {e}", meta_path.display());
+                continue;
+            }
+        };
+
+        let mut stmt = match conn.prepare(
+            "SELECT name, owner_principal, created_at, region, versioning \
+             FROM buckets ORDER BY name",
+        ) {
+            Ok(stmt) => stmt,
+            Err(e) => {
+                eprintln!("warning: query failed on pg-{pg_id}: {e}");
+                continue;
+            }
+        };
+
+        let pg_rows = match stmt.query_map([], |row| {
             let name: String = row.get(0)?;
-            let owner_id: u64 = row.get(1)?;
+            let owner_principal: String = row.get(1)?;
             let created_at: u64 = row.get(2)?;
             let region: i32 = row.get(3)?;
             let versioning: i32 = row.get(4)?;
             Ok(vec![
+                pg_id.to_string(),
                 name,
-                owner_id.to_string(),
+                owner_principal,
                 format_timestamp_millis(created_at),
                 region.to_string(),
                 format_versioning(versioning).to_string(),
             ])
-        })
-        .unwrap_or_else(|e| {
-            eprintln!("error: query failed: {e}");
-            process::exit(1);
-        })
-        .filter_map(|r| r.ok())
-        .collect();
+        }) {
+            Ok(rows) => rows,
+            Err(e) => {
+                eprintln!("warning: query failed on pg-{pg_id}: {e}");
+                continue;
+            }
+        };
 
-    print_table(&["NAME", "OWNER", "CREATED", "REGION", "VERSIONING"], &rows);
+        rows.extend(pg_rows.flatten());
+    }
+
+    rows.sort_by(|a, b| a[1].cmp(&b[1]).then_with(|| a[0].cmp(&b[0])));
+    print_table(
+        &["PG", "NAME", "OWNER", "CREATED", "REGION", "VERSIONING"],
+        &rows,
+    );
 }
 
 fn cmd_objects(
@@ -541,31 +560,16 @@ fn cmd_shards(data_dir: &Path, pg_filter: Option<u32>) {
 }
 
 fn cmd_summary(data_dir: &Path) {
-    // Bucket count
-    let bucket_db = data_dir.join("buckets.db");
-    let bucket_count = if bucket_db.exists() {
-        let conn = open_readonly(&bucket_db).unwrap_or_else(|e| {
-            eprintln!("error: cannot open {}: {e}", bucket_db.display());
-            process::exit(1);
-        });
-        let count: u64 = conn
-            .query_row("SELECT COUNT(*) FROM buckets", [], |row| row.get(0))
-            .unwrap_or(0);
-        count
-    } else {
-        0
-    };
-
-    println!("Buckets: {bucket_count}");
-    println!();
-
     // Per-PG stats
     let pgs = discover_pgs(data_dir);
     if pgs.is_empty() {
+        println!("Buckets: 0");
+        println!();
         println!("(no PG databases found)");
         return;
     }
 
+    let mut total_buckets: u64 = 0;
     let mut total_objects: u64 = 0;
     let mut total_shards: u64 = 0;
     let mut total_data_size: u64 = 0;
@@ -583,6 +587,9 @@ fn cmd_summary(data_dir: &Path) {
         let obj_count: u64 = conn
             .query_row("SELECT COUNT(*) FROM objects", [], |row| row.get(0))
             .unwrap_or(0);
+        let bucket_count: u64 = conn
+            .query_row("SELECT COUNT(*) FROM buckets", [], |row| row.get(0))
+            .unwrap_or(0);
         let shard_count: u64 = conn
             .query_row("SELECT COUNT(*) FROM shards", [], |row| row.get(0))
             .unwrap_or(0);
@@ -594,6 +601,7 @@ fn cmd_summary(data_dir: &Path) {
             )
             .unwrap_or(0);
 
+        total_buckets += bucket_count;
         total_objects += obj_count;
         total_shards += shard_count;
         total_data_size += data_size;
@@ -605,6 +613,9 @@ fn cmd_summary(data_dir: &Path) {
             format_size(data_size),
         ]);
     }
+
+    println!("Buckets: {total_buckets}");
+    println!();
 
     print_table(&["PG", "OBJECTS", "SHARDS", "DATA_SIZE"], &pg_rows);
 

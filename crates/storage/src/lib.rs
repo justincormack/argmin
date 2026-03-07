@@ -1,10 +1,9 @@
 /// Storage layer for argmin2.
 ///
 /// Provides per-PG shard I/O with CRC64-NVME integrity checksums,
-/// per-PG object metadata in SQLite, and a global bucket table.
+/// and per-PG object/bucket metadata in SQLite.
 ///
 /// All IO is synchronous. Single-node, single-process for v1-minimal.
-pub mod bucket_db;
 pub mod error;
 pub mod memory_store;
 pub mod node;
@@ -13,12 +12,11 @@ pub mod schema;
 pub mod traits;
 pub mod types;
 
-pub use bucket_db::SqliteBucketDb;
 pub use error::{MetadataError, StoreError};
 pub use memory_store::MemoryPgStore;
 pub use node::{LocalStorageNode, SharedStorageNode};
 pub use pg_store::PgStore;
-pub use traits::{GlobalService, PgMetadataStore, ShardStore, StorageNode};
+pub use traits::{PgMetadataStore, ShardStore, StorageNode};
 pub use types::*;
 
 #[cfg(test)]

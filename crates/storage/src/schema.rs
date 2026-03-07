@@ -235,13 +235,3 @@ fn migrate_checksum_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
     }
     Ok(())
 }
-
-/// Initialize the global bucket database schema.
-///
-/// Idempotent — uses `CREATE TABLE IF NOT EXISTS`.
-pub fn init_bucket_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
-    conn.execute_batch(PG_PRAGMAS)?;
-    conn.execute(CREATE_BUCKETS_TABLE, [])?;
-    conn.execute(CREATE_BUCKETS_OWNER_LIST_INDEX, [])?;
-    Ok(())
-}

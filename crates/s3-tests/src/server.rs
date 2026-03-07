@@ -12,9 +12,8 @@ pub const ALT_SECRET_KEY: &str = "je7MtGbClwBF/2Zp9Utk/h3yCo8nvbEXAMPLEKEY";
 
 /// Number of frontend instances in the pool.
 ///
-/// Each frontend opens its own bucket DB connection. All frontends share one
-/// `SharedStorageNode` (PG access serialized by mutex). This controls the
-/// parallelism level for request processing.
+/// All frontends share one `SharedStorageNode` (PG access serialized by mutex).
+/// This controls the parallelism level for request processing.
 const POOL_SIZE: usize = 4;
 
 /// A local S3 server running as a tokio task for integration testing.
@@ -56,15 +55,11 @@ impl TestServer {
             storage::SharedStorageNode::open(&data_path, &pg_ids).expect("open storage node"),
         );
 
-        let bucket_db_path = data_path.join("buckets.db");
         let frontends: Vec<server::http::HttpFrontend> = (0..POOL_SIZE)
             .map(|_| {
-                let bucket_db =
-                    storage::SqliteBucketDb::open(&bucket_db_path).expect("open bucket db");
                 let ec_config = ec::EcConfig::new(4, 2).expect("EC config");
                 let coordinator = server::coordinator::Coordinator::new(
                     Arc::clone(&storage_node),
-                    bucket_db,
                     ec_config,
                     pg_count,
                     TEST_REGION.to_string(),

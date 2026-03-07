@@ -1,4 +1,4 @@
-use crate::traits::{GlobalService, PgMetadataStore, ShardStore, StorageNode};
+use crate::traits::{PgMetadataStore, ShardStore, StorageNode};
 use crate::types::*;
 
 /// Integration test: write shard data + object metadata, read both back.
@@ -94,20 +94,15 @@ fn storage_node_trait() {
     assert_eq!(read.data, b"trait test");
 }
 
-/// Integration test: bucket + PG metadata lifecycle.
+/// Integration test: bucket + object metadata lifecycle on a single PG.
 #[test]
 fn full_lifecycle() {
     let dir = test_util::tempdir();
 
-    // Create bucket DB.
-    let bucket_db = crate::SqliteBucketDb::open(&dir.path().join("buckets.db")).unwrap();
-    bucket_db
-        .create_bucket("my-bucket", "owner-1", false)
-        .unwrap();
-
     // Create storage node.
     let node = crate::LocalStorageNode::open(&dir.path().join("data"), &[0]).unwrap();
     let pg = node.get_pg(0).unwrap();
+    pg.create_bucket("my-bucket", "owner-1", false).unwrap();
 
     // PutObject: write shard + metadata.
     let hash = [0xAA; 16];
@@ -133,7 +128,7 @@ fn full_lifecycle() {
     .unwrap();
 
     // HeadBucket.
-    let info = bucket_db.head_bucket("my-bucket").unwrap();
+    let info = pg.head_bucket("my-bucket").unwrap();
     assert_eq!(info.name, "my-bucket");
 
     // GetObject: read metadata + shard.

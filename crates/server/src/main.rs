@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use auth::{CredentialStore, SecretKey};
 use ec::EcConfig;
-use storage::{SharedStorageNode, SqliteBucketDb};
+use storage::SharedStorageNode;
 use tokio::net::TcpListener;
 
 use server::config::ServerConfig;
@@ -37,7 +37,6 @@ async fn main() {
 
     let pg_ids: Vec<u32> = (0..config.pg_count).collect();
     let data_dir = Path::new(&config.data_dir);
-    let bucket_db_path = data_dir.join("buckets.db");
 
     // Create one shared storage node for all workers.
     let storage_node = match SharedStorageNode::open(data_dir, &pg_ids) {
@@ -48,20 +47,12 @@ async fn main() {
         }
     };
 
-    // Build frontend pool — each frontend gets its own bucket DB connection,
-    // but all share the same storage node (PG access serialized by mutex).
+    // Build frontend pool sharing the same storage node
+    // (PG access serialized by mutex).
     let mut frontends = Vec::with_capacity(config.workers as usize);
     for _ in 0..config.workers {
-        let bucket_db = match SqliteBucketDb::open(&bucket_db_path) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("failed to open bucket database: {}", e);
-                std::process::exit(1);
-            }
-        };
         let coordinator = match Coordinator::new(
             Arc::clone(&storage_node),
-            bucket_db,
             ec_config,
             config.pg_count,
             config.region.clone(),

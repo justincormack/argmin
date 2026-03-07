@@ -2237,21 +2237,14 @@ mod tests {
     use crate::coordinator::Coordinator;
     use ec::EcConfig;
     use std::sync::Arc;
-    use storage::{SharedStorageNode, SqliteBucketDb};
+    use storage::SharedStorageNode;
 
     fn setup_frontend(dir: &std::path::Path) -> HttpFrontend {
         let pg_ids: Vec<u32> = (0..4).collect();
         let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
-        let bucket_db = SqliteBucketDb::open_in_memory().unwrap();
         let ec_config = EcConfig::new(4, 2).unwrap();
-        let coordinator = Coordinator::new(
-            storage_node,
-            bucket_db,
-            ec_config,
-            4,
-            "us-east-1".to_string(),
-        )
-        .unwrap();
+        let coordinator =
+            Coordinator::new(storage_node, ec_config, 4, "us-east-1".to_string()).unwrap();
         let credentials = auth::CredentialStore::new();
         HttpFrontend {
             coordinator,

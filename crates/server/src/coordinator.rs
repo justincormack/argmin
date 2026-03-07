@@ -2,14 +2,13 @@
 use std::sync::{Arc, MutexGuard};
 
 use ec::{EcConfig, ErasureCodec};
-use storage::traits::{GlobalService, PgMetadataStore, ShardStore};
+use storage::traits::{PgMetadataStore, ShardStore};
 use storage::{
     BucketInfo, ChecksumAlgorithm, ChecksumType, CreateMultipartUploadReq, CreateStreamUploadReq,
     DataLayout, ListMultipartUploadsReq, ListObjectVersionsReq, ListObjectsReq, ListPartsReq,
     MultipartPartChunkRecord, MultipartPartRecord, MultipartUploadRecord, ObjectPartRecord,
-    ObjectRecord, PutObjectMetaReq, ShardKey, SharedStorageNode, SqliteBucketDb,
-    StreamObjectChunkRecord, StreamUploadChunkRecord, StreamUploadKind, StreamUploadState,
-    UploadState,
+    ObjectRecord, PutObjectMetaReq, ShardKey, SharedStorageNode, StreamObjectChunkRecord,
+    StreamUploadChunkRecord, StreamUploadKind, StreamUploadState, UploadState,
 };
 
 use crate::conditional::{
@@ -22,7 +21,9 @@ use crate::etag::{
     format_object_etag,
 };
 use crate::metadata_blob::MetadataBlob;
-use crate::pg::{chunk_key_hash, derive_pg, derive_pg_shards, object_key_hash, part_key_hash};
+use crate::pg::{
+    chunk_key_hash, derive_bucket_pg, derive_pg, derive_pg_shards, object_key_hash, part_key_hash,
+};
 use crate::range::ByteRange;
 
 /// Maximum object size for single PUT or upload part (5 GiB, matches AWS S3).
@@ -367,7 +368,6 @@ struct LockedWriteObject<'a> {
 /// The coordinator ties together EC, storage, and metadata.
 pub struct Coordinator {
     storage_node: Arc<SharedStorageNode>,
-    bucket_db: SqliteBucketDb,
     ec_codec: ErasureCodec,
     ec_config: EcConfig,
     pg_count: u32,
@@ -378,7 +378,6 @@ impl Coordinator {
     /// Create a new coordinator.
     pub fn new(
         storage_node: Arc<SharedStorageNode>,
-        bucket_db: SqliteBucketDb,
         ec_config: EcConfig,
         pg_count: u32,
         region: String,
@@ -386,7 +385,6 @@ impl Coordinator {
         let ec_codec = ErasureCodec::new(ec_config)?;
         Ok(Self {
             storage_node,
-            bucket_db,
             ec_codec,
             ec_config,
             pg_count,
@@ -396,6 +394,11 @@ impl Coordinator {
 
     pub fn region(&self) -> &str {
         &self.region
+    }
+
+    fn get_bucket_pg(&self, bucket: &str) -> Result<MutexGuard<'_, storage::PgStore>, ServerError> {
+        let pg_id = derive_bucket_pg(bucket, self.pg_count);
+        Ok(self.storage_node.get_pg(pg_id)?)
     }
 
     // ── Bucket operations ─────────────────────────────────────────────
@@ -410,19 +413,24 @@ impl Coordinator {
         name: &str,
         public_read: bool,
     ) -> Result<(), ServerError> {
-        self.bucket_db
-            .create_bucket(name, owner_principal, public_read)
-            .or_else(|e| match e {
-                storage::MetadataError::BucketAlreadyExists => {
-                    let existing = self.head_bucket(name)?;
-                    if existing.owner_principal == owner_principal {
-                        Ok(())
-                    } else {
-                        Err(ServerError::BucketAlreadyExists)
+        let bucket_pg = self.get_bucket_pg(name)?;
+        match bucket_pg.create_bucket(name, owner_principal, public_read) {
+            Ok(()) => Ok(()),
+            Err(storage::MetadataError::BucketAlreadyExists) => {
+                let existing = bucket_pg.head_bucket(name).map_err(|e| match e {
+                    storage::MetadataError::BucketNotFound { name } => {
+                        ServerError::BucketNotFound { name }
                     }
+                    other => ServerError::Metadata(other),
+                })?;
+                if existing.owner_principal == owner_principal {
+                    Ok(())
+                } else {
+                    Err(ServerError::BucketAlreadyExists)
                 }
-                other => Err(ServerError::Metadata(other)),
-            })
+            }
+            Err(other) => Err(ServerError::Metadata(other)),
+        }
     }
 
     pub fn delete_bucket(&self, name: &str) -> Result<(), ServerError> {
@@ -452,7 +460,8 @@ impl Coordinator {
             }
         }
 
-        self.bucket_db.delete_bucket(name).map_err(|e| match e {
+        let bucket_pg = self.get_bucket_pg(name)?;
+        bucket_pg.delete_bucket(name).map_err(|e| match e {
             storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound { name },
             storage::MetadataError::BucketNotEmpty => ServerError::BucketNotEmpty,
             other => ServerError::Metadata(other),
@@ -460,7 +469,8 @@ impl Coordinator {
     }
 
     pub fn head_bucket(&self, name: &str) -> Result<BucketInfo, ServerError> {
-        self.bucket_db.head_bucket(name).map_err(|e| match e {
+        let bucket_pg = self.get_bucket_pg(name)?;
+        bucket_pg.head_bucket(name).map_err(|e| match e {
             storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound { name },
             other => ServerError::Metadata(other),
         })
@@ -474,13 +484,19 @@ impl Coordinator {
         &self,
         owner_principal: &str,
     ) -> Result<Vec<BucketInfo>, ServerError> {
-        Ok(self.bucket_db.list_buckets(owner_principal)?)
+        let mut out = Vec::new();
+        for &pg_id in self.storage_node.pg_ids() {
+            let pg = self.storage_node.get_pg(pg_id)?;
+            let mut buckets = pg.list_buckets(owner_principal)?;
+            out.append(&mut buckets);
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
     }
 
     pub fn put_bucket_versioning(&self, name: &str, state: u8) -> Result<(), ServerError> {
-        // Verify bucket exists
-        self.head_bucket(name)?;
-        self.bucket_db
+        let bucket_pg = self.get_bucket_pg(name)?;
+        bucket_pg
             .put_bucket_versioning(name, state)
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => {
@@ -501,8 +517,8 @@ impl Coordinator {
     }
 
     pub fn put_bucket_cors(&self, name: &str, config: &str) -> Result<(), ServerError> {
-        self.head_bucket(name)?;
-        self.bucket_db
+        let bucket_pg = self.get_bucket_pg(name)?;
+        bucket_pg
             .put_bucket_cors(name, config)
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => {
@@ -513,57 +529,45 @@ impl Coordinator {
     }
 
     pub fn get_bucket_cors(&self, name: &str) -> Result<Option<String>, ServerError> {
-        self.head_bucket(name)?;
-        self.bucket_db.get_bucket_cors(name).map_err(|e| match e {
+        let bucket_pg = self.get_bucket_pg(name)?;
+        bucket_pg.get_bucket_cors(name).map_err(|e| match e {
             storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound { name },
             other => ServerError::Metadata(other),
         })
     }
 
     pub fn delete_bucket_cors(&self, name: &str) -> Result<(), ServerError> {
-        self.head_bucket(name)?;
-        self.bucket_db
-            .delete_bucket_cors(name)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => {
-                    ServerError::BucketNotFound { name }
-                }
-                other => ServerError::Metadata(other),
-            })
+        let bucket_pg = self.get_bucket_pg(name)?;
+        bucket_pg.delete_bucket_cors(name).map_err(|e| match e {
+            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound { name },
+            other => ServerError::Metadata(other),
+        })
     }
 
     // ── Bucket tagging ────────────────────────────────────────────────
 
     pub fn put_bucket_tags(&self, name: &str, tags: &str) -> Result<(), ServerError> {
-        self.head_bucket(name)?;
-        self.bucket_db
-            .put_bucket_tags(name, tags)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => {
-                    ServerError::BucketNotFound { name }
-                }
-                other => ServerError::Metadata(other),
-            })
+        let bucket_pg = self.get_bucket_pg(name)?;
+        bucket_pg.put_bucket_tags(name, tags).map_err(|e| match e {
+            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound { name },
+            other => ServerError::Metadata(other),
+        })
     }
 
     pub fn get_bucket_tags(&self, name: &str) -> Result<Option<String>, ServerError> {
-        self.head_bucket(name)?;
-        self.bucket_db.get_bucket_tags(name).map_err(|e| match e {
+        let bucket_pg = self.get_bucket_pg(name)?;
+        bucket_pg.get_bucket_tags(name).map_err(|e| match e {
             storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound { name },
             other => ServerError::Metadata(other),
         })
     }
 
     pub fn delete_bucket_tags(&self, name: &str) -> Result<(), ServerError> {
-        self.head_bucket(name)?;
-        self.bucket_db
-            .delete_bucket_tags(name)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => {
-                    ServerError::BucketNotFound { name }
-                }
-                other => ServerError::Metadata(other),
-            })
+        let bucket_pg = self.get_bucket_pg(name)?;
+        bucket_pg.delete_bucket_tags(name).map_err(|e| match e {
+            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound { name },
+            other => ServerError::Metadata(other),
+        })
     }
 
     // ── Public access block ───────────────────────────────────────────
@@ -573,8 +577,8 @@ impl Coordinator {
         name: &str,
         config: &str,
     ) -> Result<(), ServerError> {
-        self.head_bucket(name)?;
-        self.bucket_db
+        let bucket_pg = self.get_bucket_pg(name)?;
+        bucket_pg
             .put_bucket_public_access_block(name, config)
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => {
@@ -588,8 +592,8 @@ impl Coordinator {
         &self,
         name: &str,
     ) -> Result<Option<String>, ServerError> {
-        self.head_bucket(name)?;
-        self.bucket_db
+        let bucket_pg = self.get_bucket_pg(name)?;
+        bucket_pg
             .get_bucket_public_access_block(name)
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => {
@@ -600,8 +604,8 @@ impl Coordinator {
     }
 
     pub fn delete_bucket_public_access_block(&self, name: &str) -> Result<(), ServerError> {
-        self.head_bucket(name)?;
-        self.bucket_db
+        let bucket_pg = self.get_bucket_pg(name)?;
+        bucket_pg
             .delete_bucket_public_access_block(name)
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => {
@@ -614,8 +618,8 @@ impl Coordinator {
     // ── Bucket ACL ───────────────────────────────────────────────────
 
     pub fn put_bucket_acl(&self, name: &str, public_read: bool) -> Result<(), ServerError> {
-        self.head_bucket(name)?;
-        self.bucket_db
+        let bucket_pg = self.get_bucket_pg(name)?;
+        bucket_pg
             .put_bucket_acl(name, public_read)
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => {
@@ -632,8 +636,8 @@ impl Coordinator {
         name: &str,
         config: &str,
     ) -> Result<(), ServerError> {
-        self.head_bucket(name)?;
-        self.bucket_db
+        let bucket_pg = self.get_bucket_pg(name)?;
+        bucket_pg
             .put_bucket_ownership_controls(name, config)
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => {
@@ -644,8 +648,8 @@ impl Coordinator {
     }
 
     pub fn get_bucket_ownership_controls(&self, name: &str) -> Result<Option<String>, ServerError> {
-        self.head_bucket(name)?;
-        self.bucket_db
+        let bucket_pg = self.get_bucket_pg(name)?;
+        bucket_pg
             .get_bucket_ownership_controls(name)
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => {
@@ -656,8 +660,8 @@ impl Coordinator {
     }
 
     pub fn delete_bucket_ownership_controls(&self, name: &str) -> Result<(), ServerError> {
-        self.head_bucket(name)?;
-        self.bucket_db
+        let bucket_pg = self.get_bucket_pg(name)?;
+        bucket_pg
             .delete_bucket_ownership_controls(name)
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => {
@@ -4831,16 +4835,8 @@ mod tests {
     fn setup_coordinator(dir: &Path) -> Coordinator {
         let pg_ids: Vec<u32> = (0..4).collect();
         let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
-        let bucket_db = SqliteBucketDb::open_in_memory().unwrap();
         let ec_config = EcConfig::new(4, 2).unwrap();
-        Coordinator::new(
-            storage_node,
-            bucket_db,
-            ec_config,
-            4,
-            "us-east-1".to_string(),
-        )
-        .unwrap()
+        Coordinator::new(storage_node, ec_config, 4, "us-east-1".to_string()).unwrap()
     }
 
     #[test]
@@ -4913,6 +4909,24 @@ mod tests {
         assert_eq!(b.len(), 1);
         assert_eq!(b[0].name, "bucket-b");
         assert_eq!(b[0].owner_principal, "owner-b");
+    }
+
+    #[test]
+    fn list_buckets_globally_sorted() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("zz-top").unwrap();
+        coord.create_bucket("alpha").unwrap();
+        coord.create_bucket("mango").unwrap();
+        coord.create_bucket("beta").unwrap();
+
+        let names: Vec<String> = coord
+            .list_buckets()
+            .unwrap()
+            .into_iter()
+            .map(|b| b.name)
+            .collect();
+        assert_eq!(names, vec!["alpha", "beta", "mango", "zz-top"]);
     }
 
     #[test]
@@ -6871,14 +6885,11 @@ mod tests {
         let tmp = test_util::tempdir();
         let pg_ids: Vec<u32> = (0..4).collect();
         let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
-        let bucket_db_path = tmp.path().join("buckets.db");
         let ec_config = EcConfig::new(4, 2).unwrap();
 
         let make_coord = || {
-            let bucket_db = SqliteBucketDb::open(&bucket_db_path).unwrap();
             Coordinator::new(
                 Arc::clone(&storage_node),
-                bucket_db,
                 ec_config,
                 4,
                 "us-east-1".to_string(),
@@ -6930,14 +6941,11 @@ mod tests {
         let tmp = test_util::tempdir();
         let pg_ids: Vec<u32> = (0..4).collect();
         let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
-        let bucket_db_path = tmp.path().join("buckets.db");
         let ec_config = EcConfig::new(4, 2).unwrap();
 
         let make_coord = || {
-            let bucket_db = SqliteBucketDb::open(&bucket_db_path).unwrap();
             Coordinator::new(
                 Arc::clone(&storage_node),
-                bucket_db,
                 ec_config,
                 4,
                 "us-east-1".to_string(),
@@ -7000,14 +7008,11 @@ mod tests {
         let tmp = test_util::tempdir();
         let pg_ids: Vec<u32> = (0..4).collect();
         let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
-        let bucket_db_path = tmp.path().join("buckets.db");
         let ec_config = EcConfig::new(4, 2).unwrap();
 
         let make_coord = || {
-            let bucket_db = SqliteBucketDb::open(&bucket_db_path).unwrap();
             Coordinator::new(
                 Arc::clone(&storage_node),
-                bucket_db,
                 ec_config,
                 4,
                 "us-east-1".to_string(),
