@@ -1,74 +1,11 @@
-/// S3 POST Object authentication (SigV2 and SigV4 form-based).
+/// S3 POST Object authentication (SigV4 form-based).
 ///
-/// SigV2 uses form fields: `AWSAccessKeyId`, `policy`, `signature`
 /// SigV4 uses form fields: `x-amz-algorithm`, `x-amz-credential`, `x-amz-date`,
-///   `policy`, `x-amz-signature`
-use ring::hmac;
-
+/// `policy`, `x-amz-signature`
 use crate::credential::CredentialStore;
 use crate::error::AuthError;
 use crate::request::{AuthContext, AuthMode};
 use crate::sigv4;
-
-/// Authenticate a POST Object request using form fields.
-///
-/// Returns `Ok(AuthContext)` on success. If no auth fields are present,
-/// returns anonymous context.
-pub fn authenticate_post(
-    access_key_id: Option<&str>,
-    policy_b64: Option<&str>,
-    signature_b64: Option<&str>,
-    store: &CredentialStore,
-) -> Result<AuthContext, AuthError> {
-    // If no auth fields, treat as anonymous
-    let (akid, policy, sig) = match (access_key_id, policy_b64, signature_b64) {
-        (None, None, None) => {
-            return Ok(AuthContext {
-                mode: AuthMode::Anonymous,
-                access_key_id: None,
-                principal: None,
-                request_epoch_secs: None,
-                streaming: None,
-            });
-        }
-        (Some(akid), Some(policy), Some(sig)) => (akid, policy, sig),
-        // Partial auth fields → missing signature/policy
-        _ => {
-            return Err(AuthError::MissingAuth);
-        }
-    };
-
-    // Look up the secret key
-    let record = store.get_record(akid).ok_or(AuthError::UnknownAccessKey)?;
-    if !record.enabled {
-        return Err(AuthError::UnknownAccessKey);
-    }
-
-    // Verify SigV2: signature = base64(HMAC-SHA1(secret_key, base64_policy))
-    let expected_mac = hmac::sign(
-        &hmac::Key::new(
-            hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY,
-            record.secret_key.as_str().as_bytes(),
-        ),
-        policy.as_bytes(),
-    );
-
-    use base64::Engine;
-    let expected_b64 = base64::engine::general_purpose::STANDARD.encode(expected_mac.as_ref());
-
-    let sig_decoded = sig.trim();
-    if sig_decoded != expected_b64 {
-        return Err(AuthError::SignatureMismatch);
-    }
-
-    Ok(AuthContext {
-        mode: AuthMode::HeaderSigV4, // Reuse existing mode; could add PostSigV2 later
-        access_key_id: Some(akid.to_string()),
-        principal: Some(record.principal.clone()),
-        request_epoch_secs: None,
-        streaming: None,
-    })
-}
 
 /// Authenticate a POST Object request using SigV4 form fields.
 ///
@@ -389,57 +326,6 @@ mod tests {
             SecretKey::new("testSecretKey456".to_string()),
         );
         store
-    }
-
-    #[test]
-    fn anonymous_when_no_fields() {
-        let store = test_store();
-        let ctx = authenticate_post(None, None, None, &store).unwrap();
-        assert_eq!(ctx.mode, AuthMode::Anonymous);
-    }
-
-    #[test]
-    fn valid_sigv2_auth() {
-        use base64::Engine;
-        let store = test_store();
-        let policy_b64 = "eyJleHBpcmF0aW9uIjoiMjAzMC0wMS0wMVQwMDowMDowMFoiLCJjb25kaXRpb25zIjpbXX0=";
-
-        // Compute expected signature
-        let mac = hmac::sign(
-            &hmac::Key::new(hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, b"testSecretKey456"),
-            policy_b64.as_bytes(),
-        );
-        let sig = base64::engine::general_purpose::STANDARD.encode(mac.as_ref());
-
-        let ctx = authenticate_post(
-            Some("testAccessKey123"),
-            Some(policy_b64),
-            Some(&sig),
-            &store,
-        )
-        .unwrap();
-        assert_eq!(ctx.access_key_id.as_deref(), Some("testAccessKey123"));
-    }
-
-    #[test]
-    fn bad_access_key() {
-        let store = test_store();
-        let err =
-            authenticate_post(Some("badkey"), Some("policy"), Some("sig"), &store).unwrap_err();
-        assert!(matches!(err, AuthError::UnknownAccessKey));
-    }
-
-    #[test]
-    fn bad_signature() {
-        let store = test_store();
-        let err = authenticate_post(
-            Some("testAccessKey123"),
-            Some("policy"),
-            Some("badsig=="),
-            &store,
-        )
-        .unwrap_err();
-        assert!(matches!(err, AuthError::SignatureMismatch));
     }
 
     #[test]

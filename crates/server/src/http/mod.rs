@@ -1492,38 +1492,32 @@ impl HttpFrontend {
         // Parse the multipart form
         let form = multipart::parse_multipart(&req.body, boundary)?;
 
-        // Authenticate using form fields: auto-detect SigV4 vs SigV2
-        let post_auth = if let Some(algo) = form.field("x-amz-algorithm") {
-            // SigV4 POST
-            auth::authenticate_post_sigv4(
-                algo,
-                form.field("x-amz-credential")
-                    .ok_or_else(|| ServerError::InvalidRequest {
-                        reason: "missing x-amz-credential".to_string(),
-                    })?,
-                form.field("x-amz-date")
-                    .ok_or_else(|| ServerError::InvalidRequest {
-                        reason: "missing x-amz-date".to_string(),
-                    })?,
-                form.field("policy")
-                    .ok_or_else(|| ServerError::InvalidRequest {
-                        reason: "missing policy".to_string(),
-                    })?,
-                form.field("x-amz-signature")
-                    .ok_or_else(|| ServerError::InvalidRequest {
-                        reason: "missing x-amz-signature".to_string(),
-                    })?,
-                &self.credentials,
-            )
-        } else {
-            // SigV2 POST (legacy) or anonymous
-            auth::authenticate_post(
-                form.field("AWSAccessKeyId"),
-                form.field("policy"),
-                form.field("signature"),
-                &self.credentials,
-            )
-        }
+        // Authenticate using SigV4 POST form fields only.
+        let algo = form
+            .field("x-amz-algorithm")
+            .ok_or_else(|| ServerError::InvalidRequest {
+                reason: "missing x-amz-algorithm".to_string(),
+            })?;
+        let post_auth = auth::authenticate_post_sigv4(
+            algo,
+            form.field("x-amz-credential")
+                .ok_or_else(|| ServerError::InvalidRequest {
+                    reason: "missing x-amz-credential".to_string(),
+                })?,
+            form.field("x-amz-date")
+                .ok_or_else(|| ServerError::InvalidRequest {
+                    reason: "missing x-amz-date".to_string(),
+                })?,
+            form.field("policy")
+                .ok_or_else(|| ServerError::InvalidRequest {
+                    reason: "missing policy".to_string(),
+                })?,
+            form.field("x-amz-signature")
+                .ok_or_else(|| ServerError::InvalidRequest {
+                    reason: "missing x-amz-signature".to_string(),
+                })?,
+            &self.credentials,
+        )
         .map_err(|e| match e {
             auth::AuthError::MissingAuth => ServerError::InvalidRequest {
                 reason: "missing required POST authentication fields".to_string(),

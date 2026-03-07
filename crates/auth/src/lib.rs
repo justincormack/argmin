@@ -26,6 +26,6 @@ pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 pub use canonical::parse_amz_date;
 pub use credential::{CredentialRecord, CredentialScope, CredentialStore, SecretKey};
 pub use error::AuthError;
-pub use post::{authenticate_post, authenticate_post_sigv4, validate_post_policy, PostPolicyError};
+pub use post::{authenticate_post_sigv4, validate_post_policy, PostPolicyError};
 pub use request::{authenticate_request, AuthContext, AuthMode, StreamingSigningContext};
 pub use sigv4::{parse_auth_header, verify_request, SigV4Auth};
