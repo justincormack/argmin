@@ -190,7 +190,7 @@ impl PgStore {
 
 impl ShardStore for PgStore {
     fn write_shard(&self, key: &ShardKey, data: &[u8]) -> Result<WriteAck, StoreError> {
-        let crc = crc64::checksum(data);
+        let crc = checksum::crc64::checksum(data);
         let stored_size = data.len() as u64;
 
         // Write to temp file with O_EXCL (unique name via pid + timestamp).
@@ -313,7 +313,7 @@ impl ShardStore for PgStore {
         })?;
 
         // Verify CRC.
-        let actual_crc = crc64::checksum(&data);
+        let actual_crc = checksum::crc64::checksum(&data);
         if actual_crc != expected_crc {
             // Quarantine the shard.
             let _ = self.conn.execute(
@@ -2554,7 +2554,7 @@ mod tests {
 
         let stat = store.stat_shard(&key).unwrap();
         assert_eq!(stat.size, 4);
-        assert_eq!(stat.crc64, crc64::checksum(b"data"));
+        assert_eq!(stat.crc64, checksum::crc64::checksum(b"data"));
     }
 
     // ── connection accessor ───────────────────────────────────────────

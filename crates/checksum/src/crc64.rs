@@ -7,13 +7,13 @@
 //!
 //! One-shot:
 //! ```
-//! let checksum = crc64::checksum(b"123456789");
+//! let checksum = checksum::crc64::checksum(b"123456789");
 //! assert_eq!(checksum, 0xAE8B14860A799888);
 //! ```
 //!
 //! Streaming:
 //! ```
-//! let mut hasher = crc64::Hasher::new();
+//! let mut hasher = checksum::crc64::Hasher::new();
 //! hasher.update(b"12345");
 //! hasher.update(b"6789");
 //! assert_eq!(hasher.finalize(), 0xAE8B14860A799888);
@@ -21,10 +21,10 @@
 //!
 //! Combining independently computed checksums:
 //! ```
-//! let crc_a = crc64::checksum(b"hello ");
-//! let crc_b = crc64::checksum(b"world!");
-//! let combined = crc64::combine(crc_a, crc_b, 6);
-//! assert_eq!(combined, crc64::checksum(b"hello world!"));
+//! let crc_a = checksum::crc64::checksum(b"hello ");
+//! let crc_b = checksum::crc64::checksum(b"world!");
+//! let combined = checksum::crc64::combine(crc_a, crc_b, 6);
+//! assert_eq!(combined, checksum::crc64::checksum(b"hello world!"));
 //! ```
 
 /// CRC-64/NVME reflected polynomial (bit-reversal of 0xAD93D23594C93659).

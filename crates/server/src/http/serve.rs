@@ -30,7 +30,7 @@ use crate::error::ServerError;
 enum TrailingChecksumHasher {
     Crc32(u32),
     Crc32c(checksum::crc32c::Hasher),
-    Crc64(crc64::Hasher),
+    Crc64(checksum::crc64::Hasher),
     Sha256(ring::digest::Context),
     Sha1(ring::digest::Context),
 }
@@ -43,7 +43,7 @@ impl TrailingChecksumHasher {
         match header.to_ascii_lowercase().as_str() {
             "x-amz-checksum-crc32" => Some(Self::Crc32(0)),
             "x-amz-checksum-crc32c" => Some(Self::Crc32c(checksum::crc32c::Hasher::new())),
-            "x-amz-checksum-crc64nvme" => Some(Self::Crc64(crc64::Hasher::new())),
+            "x-amz-checksum-crc64nvme" => Some(Self::Crc64(checksum::crc64::Hasher::new())),
             "x-amz-checksum-sha256" => {
                 Some(Self::Sha256(ring::digest::Context::new(&ring::digest::SHA256)))
             }
@@ -503,7 +503,7 @@ async fn handle_streaming_put(
 
     // 2. Stream body frames, accumulating into STREAM_CHUNK_SIZE buffers.
     let ctx = Arc::new(ctx);
-    let mut hasher = crc64::Hasher::new();
+    let mut hasher = checksum::crc64::Hasher::new();
     let mut chunk_index: u32 = 0;
     let mut buf = Vec::with_capacity(STREAM_CHUNK_SIZE);
     let mut total_size: u64 = 0;
@@ -747,7 +747,7 @@ async fn handle_streaming_part(
 
     // 2. Stream body frames, accumulating into STREAM_CHUNK_SIZE buffers.
     let ctx = Arc::new(ctx);
-    let mut hasher = crc64::Hasher::new();
+    let mut hasher = checksum::crc64::Hasher::new();
     let mut chunk_index: u32 = 0;
     let mut buf = Vec::with_capacity(STREAM_CHUNK_SIZE);
     let mut total_size: u64 = 0;
@@ -1558,7 +1558,7 @@ mod tests {
     #[test]
     fn crc64_streaming_matches_canonical() {
         let data = b"123456789";
-        let expected = crc64::checksum(data);
+        let expected = checksum::crc64::checksum(data);
 
         let mut hasher = TrailingChecksumHasher::from_trailer_header("x-amz-checksum-crc64nvme").unwrap();
         hasher.update(data);

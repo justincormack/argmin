@@ -46,7 +46,7 @@ pub fn compute_multipart_etag(part_etag_bytes: &[&[u8]]) -> (Vec<u8>, String) {
     for bytes in part_etag_bytes {
         concat.extend_from_slice(bytes);
     }
-    let composite_crc = crc64::checksum(&concat);
+    let composite_crc = checksum::crc64::checksum(&concat);
     let etag_bytes = crc64_to_etag_bytes(composite_crc);
     let etag_str = format!("\"{:016x}-{}\"", composite_crc, part_etag_bytes.len());
     (etag_bytes, etag_str)
@@ -116,8 +116,8 @@ mod tests {
 
     #[test]
     fn compute_multipart_etag_format() {
-        let part1 = crc64_to_etag_bytes(crc64::checksum(b"part1"));
-        let part2 = crc64_to_etag_bytes(crc64::checksum(b"part2"));
+        let part1 = crc64_to_etag_bytes(checksum::crc64::checksum(b"part1"));
+        let part2 = crc64_to_etag_bytes(checksum::crc64::checksum(b"part2"));
         let (bytes, etag_str) = compute_multipart_etag(&[&part1, &part2]);
         assert_eq!(bytes.len(), 8);
         assert!(etag_str.starts_with('"'));

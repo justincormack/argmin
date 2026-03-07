@@ -2104,7 +2104,7 @@ fn validate_checksum_headers(req: &S3Request, verify_body: bool) -> Result<(), S
                         base64::engine::general_purpose::STANDARD.encode(crc.to_be_bytes())
                     }
                     "CRC64NVME" => {
-                        let crc = crc64::checksum(&req.body);
+                        let crc = checksum::crc64::checksum(&req.body);
                         base64::engine::general_purpose::STANDARD.encode(crc.to_be_bytes())
                     }
                     _ => continue,

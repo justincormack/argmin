@@ -761,7 +761,7 @@ impl Coordinator {
         let blob_bytes = metadata_blob.serialize()?;
 
         // 2. Compute ETag (CRC64 of user data only).
-        let etag_crc = crc64::checksum(user_data);
+        let etag_crc = checksum::crc64::checksum(user_data);
 
         // 3. Pad user data to multiple of k for equal shard sizes.
         let k = self.ec_config.data_shards as usize;
@@ -1713,7 +1713,7 @@ impl Coordinator {
                 };
 
                 // Verify CRC against stored etag (user data only).
-                let actual_crc = crc64::checksum(&user_data);
+                let actual_crc = checksum::crc64::checksum(&user_data);
                 if actual_crc != src_etag_crc {
                     return Err(ServerError::IntegrityError {
                         bucket: src_bucket.to_string(),
@@ -2614,7 +2614,7 @@ impl Coordinator {
             };
 
             // Verify CRC against stored etag (user data only).
-            let actual_crc = crc64::checksum(&user_data);
+            let actual_crc = checksum::crc64::checksum(&user_data);
             if actual_crc != etag_crc {
                 return Err(ServerError::IntegrityError {
                     bucket: bucket.to_string(),
@@ -2781,7 +2781,7 @@ impl Coordinator {
                 data
             };
 
-            let actual_crc = crc64::checksum(&user_data);
+            let actual_crc = checksum::crc64::checksum(&user_data);
             if actual_crc != etag_crc {
                 return Err(ServerError::IntegrityError {
                     bucket: bucket.to_string(),
@@ -4000,7 +4000,7 @@ impl Coordinator {
         let part_vid = generation as u64;
 
         // 5. EC-encode part data (no metadata blob for parts — raw data only).
-        let etag_crc = crc64::checksum(data);
+        let etag_crc = checksum::crc64::checksum(data);
 
         let k = self.ec_config.data_shards as usize;
         let m = self.ec_config.parity_shards as usize;
@@ -4326,7 +4326,7 @@ impl Coordinator {
                                             reason: "invalid CRC64NVME checksum length".to_string(),
                                         },
                                     )?);
-                                combined = crc64::combine(combined, part_crc, part.size);
+                                combined = checksum::crc64::combine(combined, part_crc, part.size);
                             }
                             Some(b64.encode(combined.to_be_bytes()))
                         }
@@ -4679,7 +4679,7 @@ fn compute_checksum(algo: ChecksumAlgorithm, data: &[u8]) -> Vec<u8> {
     match algo {
         ChecksumAlgorithm::Crc32 => checksum::crc32::checksum(data).to_be_bytes().to_vec(),
         ChecksumAlgorithm::Crc32c => checksum::crc32c::checksum(data).to_be_bytes().to_vec(),
-        ChecksumAlgorithm::Crc64nvme => crc64::checksum(data).to_be_bytes().to_vec(),
+        ChecksumAlgorithm::Crc64nvme => checksum::crc64::checksum(data).to_be_bytes().to_vec(),
         ChecksumAlgorithm::Sha256 => ring::digest::digest(&ring::digest::SHA256, data)
             .as_ref()
             .to_vec(),
@@ -7347,7 +7347,7 @@ mod tests {
         assert_eq!(part.size, 6); // "second".len()
 
         // ETag should reflect the new data.
-        let expected_crc = crc64::checksum(b"second");
+        let expected_crc = checksum::crc64::checksum(b"second");
         assert_eq!(result.etag, format_etag(expected_crc));
     }
 
@@ -7548,7 +7548,7 @@ mod tests {
         let part = pg.get_multipart_part(&create.upload_id, 1).unwrap();
         assert_eq!(part.generation, 2); // 0, 1, 2
         assert_eq!(part.size, "writer-C".len() as u64);
-        assert_eq!(format_etag(crc64::checksum(b"writer-C")), etag3);
+        assert_eq!(format_etag(checksum::crc64::checksum(b"writer-C")), etag3);
     }
 
     // --- CompleteMultipartUpload tests ---
@@ -8830,7 +8830,7 @@ mod tests {
 
         let mut full_data = big.clone();
         full_data.extend_from_slice(small);
-        let expected_crc = crc64::checksum(&full_data);
+        let expected_crc = checksum::crc64::checksum(&full_data);
         let expected = b64.encode(expected_crc.to_be_bytes());
         assert_eq!(result.checksum_value.unwrap(), expected);
     }
@@ -8981,7 +8981,7 @@ mod tests {
         let mut full_data = Vec::new();
         full_data.extend_from_slice(chunk0);
         full_data.extend_from_slice(chunk1);
-        let crc = crc64::checksum(&full_data);
+        let crc = checksum::crc64::checksum(&full_data);
         let metadata = MetadataBlob::from_headers(&[("x-amz-meta-foo", "bar")]).unwrap();
         let result = coord
             .finalize_stream_put(
@@ -9014,7 +9014,7 @@ mod tests {
         let session_id = coord.begin_stream_put("bucket", "mykey").unwrap();
 
         // Finalize with no chunks appended — zero-byte object.
-        let crc = crc64::checksum(&[]);
+        let crc = checksum::crc64::checksum(&[]);
         let metadata = MetadataBlob::new();
         let result = coord
             .finalize_stream_put(
@@ -9062,7 +9062,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let session_id = coord.begin_stream_put("bucket", "mykey").unwrap();
-        let crc = crc64::checksum(&[]);
+        let crc = checksum::crc64::checksum(&[]);
         let metadata = MetadataBlob::new();
         coord
             .finalize_stream_put(
@@ -9100,7 +9100,7 @@ mod tests {
             .abort_stream_put("bucket", "mykey", &session_id)
             .unwrap();
 
-        let crc = crc64::checksum(&[]);
+        let crc = checksum::crc64::checksum(&[]);
         let metadata = MetadataBlob::new();
         let err = coord
             .finalize_stream_put(
@@ -9154,7 +9154,7 @@ mod tests {
 
         let session_id = coord.begin_stream_put("bucket", "key1").unwrap();
 
-        let crc = crc64::checksum(&[]);
+        let crc = checksum::crc64::checksum(&[]);
         let metadata = MetadataBlob::new();
         let err = coord
             .finalize_stream_put(
@@ -9204,7 +9204,7 @@ mod tests {
             .append_stream_chunk("bucket", "key", &session_id, 0, new_data)
             .unwrap();
 
-        let crc = crc64::checksum(new_data.as_slice());
+        let crc = checksum::crc64::checksum(new_data.as_slice());
         let metadata = MetadataBlob::new();
         let result = coord
             .finalize_stream_put(
@@ -9240,7 +9240,7 @@ mod tests {
         coord
             .append_stream_chunk("bucket", "key", &session_id, 0, b"updated")
             .unwrap();
-        let crc = crc64::checksum(b"updated");
+        let crc = checksum::crc64::checksum(b"updated");
         let metadata = MetadataBlob::new();
         let cond = WriteCondition {
             if_match: Some(initial.etag.clone()),
@@ -9264,7 +9264,7 @@ mod tests {
                 "bucket",
                 "key",
                 &session_id2,
-                crc64::checksum(b"third"),
+                checksum::crc64::checksum(b"third"),
                 5,
                 &metadata,
                 &bad_cond,
@@ -9296,7 +9296,7 @@ mod tests {
         for chunk in &chunks {
             full_data.extend_from_slice(chunk);
         }
-        let crc = crc64::checksum(&full_data);
+        let crc = checksum::crc64::checksum(&full_data);
         let metadata = MetadataBlob::new();
         let result = coord
             .finalize_stream_put(
@@ -9370,7 +9370,7 @@ mod tests {
         coord
             .append_stream_chunk("bucket", "key", &session_id, 0, b"hello")
             .unwrap();
-        let crc = crc64::checksum(b"hello");
+        let crc = checksum::crc64::checksum(b"hello");
         let metadata = MetadataBlob::new();
         coord
             .finalize_stream_put(
@@ -9413,7 +9413,7 @@ mod tests {
             .unwrap();
 
         let full_data = b"aaaabbbbcc";
-        let crc = crc64::checksum(full_data);
+        let crc = checksum::crc64::checksum(full_data);
         coord
             .finalize_stream_put(
                 "bucket",
@@ -9447,7 +9447,7 @@ mod tests {
             .unwrap();
 
         let full_data = b"AAAABBBB";
-        let crc = crc64::checksum(full_data);
+        let crc = checksum::crc64::checksum(full_data);
         coord
             .finalize_stream_put(
                 "bucket",
@@ -9514,7 +9514,7 @@ mod tests {
         coord
             .append_stream_chunk("bucket", "src", &session_id, 0, b"copy-me")
             .unwrap();
-        let crc = crc64::checksum(b"copy-me");
+        let crc = checksum::crc64::checksum(b"copy-me");
         coord
             .finalize_stream_put(
                 "bucket",
@@ -9555,7 +9555,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let session_id = coord.begin_stream_put("bucket", "empty").unwrap();
-        let crc = crc64::checksum(b"");
+        let crc = checksum::crc64::checksum(b"");
         coord
             .finalize_stream_put(
                 "bucket",
@@ -9586,7 +9586,7 @@ mod tests {
         coord
             .append_stream_chunk("bucket", "key", &session_id, 0, b"partdata")
             .unwrap();
-        let crc = crc64::checksum(b"partdata");
+        let crc = checksum::crc64::checksum(b"partdata");
         coord
             .finalize_stream_put(
                 "bucket",
@@ -9617,7 +9617,7 @@ mod tests {
         coord
             .append_stream_chunk("bucket", "key", &session_id, 0, b"stream-data")
             .unwrap();
-        let crc = crc64::checksum(b"stream-data");
+        let crc = checksum::crc64::checksum(b"stream-data");
         coord
             .finalize_stream_put(
                 "bucket",
@@ -9655,7 +9655,7 @@ mod tests {
         coord
             .append_stream_chunk("bucket", "key", &session_id, 0, b"delete-me")
             .unwrap();
-        let crc = crc64::checksum(b"delete-me");
+        let crc = checksum::crc64::checksum(b"delete-me");
         coord
             .finalize_stream_put(
                 "bucket",
@@ -9690,7 +9690,7 @@ mod tests {
         coord
             .append_stream_chunk("bucket", "src", &session_id, 0, b"source-data")
             .unwrap();
-        let crc = crc64::checksum(b"source-data");
+        let crc = checksum::crc64::checksum(b"source-data");
         coord
             .finalize_stream_put(
                 "bucket",
@@ -9746,7 +9746,7 @@ mod tests {
         );
 
         // Original chunk should still be intact — verify by finalizing.
-        let crc = crc64::checksum(b"first");
+        let crc = checksum::crc64::checksum(b"first");
         let metadata = MetadataBlob::new();
         coord
             .finalize_stream_put(
@@ -9773,7 +9773,7 @@ mod tests {
             .unwrap();
 
         // Finalize with wrong total_size.
-        let crc = crc64::checksum(b"hello");
+        let crc = checksum::crc64::checksum(b"hello");
         let metadata = MetadataBlob::new();
         let err = coord
             .finalize_stream_put(
@@ -9842,7 +9842,7 @@ mod tests {
             .unwrap();
 
         // Finalize.
-        let crc = crc64::checksum(data);
+        let crc = checksum::crc64::checksum(data);
         let result = coord
             .finalize_stream_part(
                 "bucket",
@@ -9920,7 +9920,7 @@ mod tests {
                 &session_id,
                 &mpu.upload_id,
                 1,
-                crc64::checksum(b"data"),
+                checksum::crc64::checksum(b"data"),
                 4,
                 Some((storage::ChecksumAlgorithm::Crc32, "not-valid-base64!!!")),
                 None,
@@ -9955,7 +9955,7 @@ mod tests {
                 &session_id,
                 &mpu.upload_id,
                 1,
-                crc64::checksum(b"data"),
+                checksum::crc64::checksum(b"data"),
                 4,
                 None,
                 None,
@@ -10011,7 +10011,7 @@ mod tests {
         coord
             .append_stream_chunk("bucket", "key", &session_id, 0, b"safe-data")
             .unwrap();
-        let crc = crc64::checksum(b"safe-data");
+        let crc = checksum::crc64::checksum(b"safe-data");
         coord
             .finalize_stream_put(
                 "bucket",
@@ -10074,7 +10074,7 @@ mod tests {
             .append_stream_chunk("bucket", "verify", &session_id, 1, b"chunk-1-")
             .unwrap();
         let full = b"chunk-0-chunk-1-";
-        let crc = crc64::checksum(full);
+        let crc = checksum::crc64::checksum(full);
         coord
             .finalize_stream_put(
                 "bucket",
@@ -10110,7 +10110,7 @@ mod tests {
         assert_eq!(result.data, full);
 
         // Verify CRC matches.
-        assert_eq!(crc64::checksum(&result.data), crc);
+        assert_eq!(checksum::crc64::checksum(&result.data), crc);
     }
 
     #[test]
@@ -10125,7 +10125,7 @@ mod tests {
         coord
             .append_stream_chunk("bucket", "cycle", &session_id, 0, b"v1")
             .unwrap();
-        let crc = crc64::checksum(b"v1");
+        let crc = checksum::crc64::checksum(b"v1");
         coord
             .finalize_stream_put(
                 "bucket",
@@ -10183,7 +10183,7 @@ mod tests {
                 "bucket",
                 "key",
                 &s1,
-                crc64::checksum(b"old-data"),
+                checksum::crc64::checksum(b"old-data"),
                 8,
                 &MetadataBlob::new(),
                 &WriteCondition::default(),
@@ -10200,7 +10200,7 @@ mod tests {
                 "bucket",
                 "key",
                 &s2,
-                crc64::checksum(b"new-data"),
+                checksum::crc64::checksum(b"new-data"),
                 8,
                 &MetadataBlob::new(),
                 &WriteCondition::default(),

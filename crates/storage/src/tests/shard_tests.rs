@@ -15,7 +15,7 @@ fn shard_roundtrip(store: &dyn ShardStore) {
     // Write
     let ack = store.write_shard(&key, data).unwrap();
     assert_eq!(ack.stored_size, data.len() as u64);
-    assert_eq!(ack.crc64, crc64::checksum(data));
+    assert_eq!(ack.crc64, checksum::crc64::checksum(data));
 
     // Read back
     let read = store.read_shard(&key).unwrap();
@@ -76,7 +76,7 @@ fn shard_empty_data(store: &dyn ShardStore) {
 
     let ack = store.write_shard(&key, data).unwrap();
     assert_eq!(ack.stored_size, 0);
-    assert_eq!(ack.crc64, crc64::checksum(b""));
+    assert_eq!(ack.crc64, checksum::crc64::checksum(b""));
 
     let read = store.read_shard(&key).unwrap();
     assert!(read.data.is_empty());

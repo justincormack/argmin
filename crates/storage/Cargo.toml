@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-crc64 = { path = "../crc64" }
+checksum = { path = "../checksum" }
 rusqlite = { version = "0.33", features = ["bundled"] }
 thiserror = "2"
 

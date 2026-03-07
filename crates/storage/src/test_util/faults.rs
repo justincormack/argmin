@@ -155,7 +155,7 @@ impl ShardStore for FaultyPgStore {
             ShardFaultAction::DropWrite => {
                 // Return a fake WriteAck without writing anything.
                 Ok(WriteAck {
-                    crc64: crc64::checksum(data),
+                    crc64: checksum::crc64::checksum(data),
                     stored_size: data.len() as u64,
                 })
             }

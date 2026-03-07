@@ -86,7 +86,7 @@ impl Default for MemoryPgStore {
 
 impl ShardStore for MemoryPgStore {
     fn write_shard(&self, key: &ShardKey, data: &[u8]) -> Result<WriteAck, StoreError> {
-        let crc = crc64::checksum(data);
+        let crc = checksum::crc64::checksum(data);
         let stored_size = data.len() as u64;
 
         self.shards.borrow_mut().insert(
@@ -110,7 +110,7 @@ impl ShardStore for MemoryPgStore {
         let record = shards.get(key).ok_or(StoreError::NotFound)?;
 
         // Verify CRC even in memory (catches logic errors in tests).
-        let actual_crc = crc64::checksum(&record.data);
+        let actual_crc = checksum::crc64::checksum(&record.data);
         if actual_crc != record.crc64 {
             return Err(StoreError::IntegrityError {
                 expected: record.crc64,
