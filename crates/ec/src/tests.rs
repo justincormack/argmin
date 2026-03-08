@@ -1,4 +1,5 @@
 use crate::codec::check_shard_size;
+use crate::reconstruct::reconstruct_shards;
 use crate::self_test;
 use crate::{EcConfig, EcError, ErasureCodec, VerifyResult, MAX_TOTAL_SHARDS};
 
@@ -144,6 +145,19 @@ fn encode_mismatched_shard_sizes() {
     assert!(matches!(
         codec.encode(&data_refs, &mut parity_refs),
         Err(EcError::ShardSizeMismatch { index: 2, .. })
+    ));
+}
+
+#[test]
+fn encode_mismatched_parity_shard_sizes() {
+    let codec = ErasureCodec::new(EcConfig::new(4, 2).unwrap()).unwrap();
+    let data = make_data(4, 64);
+    let data_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+    let mut parity: Vec<Vec<u8>> = vec![vec![0u8; 64], vec![0u8; 32]]; // second parity wrong size
+    let mut parity_refs: Vec<&mut [u8]> = parity.iter_mut().map(|v| v.as_mut_slice()).collect();
+    assert!(matches!(
+        codec.encode(&data_refs, &mut parity_refs),
+        Err(EcError::ShardSizeMismatch { index: 5, .. })
     ));
 }
 
@@ -294,6 +308,69 @@ fn verify_scratch_too_small() {
             required: 512,
             provided: 511
         })
+    ));
+}
+
+#[test]
+fn verify_wrong_data_shard_count() {
+    let codec = ErasureCodec::new(EcConfig::new(4, 2).unwrap()).unwrap();
+    let data = make_data(3, 64); // should be 4
+    let parity: Vec<Vec<u8>> = (0..2).map(|_| vec![0u8; 64]).collect();
+    let data_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+    let parity_refs: Vec<&[u8]> = parity.iter().map(|v| v.as_slice()).collect();
+    let mut scratch = vec![0u8; codec.verify_scratch_size(64)];
+    assert_eq!(
+        codec.verify(&data_refs, &parity_refs, &mut scratch),
+        Err(EcError::ShardCount {
+            expected: 4,
+            got: 3
+        })
+    );
+}
+
+#[test]
+fn verify_wrong_parity_shard_count() {
+    let codec = ErasureCodec::new(EcConfig::new(4, 2).unwrap()).unwrap();
+    let data = make_data(4, 64);
+    let parity: Vec<Vec<u8>> = (0..1).map(|_| vec![0u8; 64]).collect(); // should be 2
+    let data_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+    let parity_refs: Vec<&[u8]> = parity.iter().map(|v| v.as_slice()).collect();
+    let mut scratch = vec![0u8; codec.verify_scratch_size(64)];
+    assert_eq!(
+        codec.verify(&data_refs, &parity_refs, &mut scratch),
+        Err(EcError::ShardCount {
+            expected: 2,
+            got: 1
+        })
+    );
+}
+
+#[test]
+fn verify_mismatched_data_shard_sizes() {
+    let codec = ErasureCodec::new(EcConfig::new(4, 2).unwrap()).unwrap();
+    let mut data = make_data(4, 64);
+    data[2] = vec![0u8; 32]; // wrong size
+    let parity: Vec<Vec<u8>> = (0..2).map(|_| vec![0u8; 64]).collect();
+    let data_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+    let parity_refs: Vec<&[u8]> = parity.iter().map(|v| v.as_slice()).collect();
+    let mut scratch = vec![0u8; codec.verify_scratch_size(64)];
+    assert!(matches!(
+        codec.verify(&data_refs, &parity_refs, &mut scratch),
+        Err(EcError::ShardSizeMismatch { index: 2, .. })
+    ));
+}
+
+#[test]
+fn verify_mismatched_parity_shard_sizes() {
+    let codec = ErasureCodec::new(EcConfig::new(4, 2).unwrap()).unwrap();
+    let data = make_data(4, 64);
+    let parity: Vec<Vec<u8>> = vec![vec![0u8; 64], vec![0u8; 32]]; // second parity wrong size
+    let data_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+    let parity_refs: Vec<&[u8]> = parity.iter().map(|v| v.as_slice()).collect();
+    let mut scratch = vec![0u8; codec.verify_scratch_size(64)];
+    assert!(matches!(
+        codec.verify(&data_refs, &parity_refs, &mut scratch),
+        Err(EcError::ShardSizeMismatch { index: 5, .. })
     ));
 }
 
@@ -500,6 +577,19 @@ fn reconstruct_index_out_of_range() {
 }
 
 #[test]
+fn reconstruct_present_index_out_of_range() {
+    let codec = ErasureCodec::new(EcConfig::new(4, 2).unwrap()).unwrap();
+    let data = make_data(4, 64);
+    let data_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+    let mut outputs: Vec<&mut [u8]> = vec![];
+    // present index 6 is out of range for (4,2), valid indices are 0..5.
+    assert!(matches!(
+        codec.reconstruct(&[0, 1, 2, 6], &data_refs, &[], &mut outputs),
+        Err(EcError::ShardIndexOutOfRange { index: 6, total: 6 })
+    ));
+}
+
+#[test]
 fn reconstruct_duplicate_present_index() {
     let codec = ErasureCodec::new(EcConfig::new(4, 2).unwrap()).unwrap();
     let data = make_data(4, 64);
@@ -553,6 +643,20 @@ fn reconstruct_present_data_length_mismatch() {
 }
 
 #[test]
+fn reconstruct_present_data_shard_size_mismatch() {
+    let codec = ErasureCodec::new(EcConfig::new(4, 2).unwrap()).unwrap();
+    let mut data = make_data(4, 64);
+    data[2] = vec![0u8; 32]; // wrong size
+    let data_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+    let mut out = vec![0u8; 64];
+    let mut outputs: Vec<&mut [u8]> = vec![out.as_mut_slice()];
+    assert!(matches!(
+        codec.reconstruct(&[0, 1, 2, 3], &data_refs, &[4], &mut outputs),
+        Err(EcError::ShardSizeMismatch { index: 2, .. })
+    ));
+}
+
+#[test]
 fn reconstruct_outputs_length_mismatch() {
     let codec = ErasureCodec::new(EcConfig::new(4, 2).unwrap()).unwrap();
     let data = make_data(4, 64);
@@ -565,6 +669,20 @@ fn reconstruct_outputs_length_mismatch() {
             expected: 2,
             got: 1
         })
+    ));
+}
+
+#[test]
+fn reconstruct_output_shard_size_mismatch() {
+    let codec = ErasureCodec::new(EcConfig::new(4, 2).unwrap()).unwrap();
+    let data = make_data(4, 64);
+    let data_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+    let mut out0 = vec![0u8; 64];
+    let mut out1 = vec![0u8; 32]; // wrong size for shard_size=64
+    let mut outputs: Vec<&mut [u8]> = vec![out0.as_mut_slice(), out1.as_mut_slice()];
+    assert!(matches!(
+        codec.reconstruct(&[0, 1, 2, 3], &data_refs, &[4, 5], &mut outputs),
+        Err(EcError::ShardSizeMismatch { index: 5, .. })
     ));
 }
 
@@ -602,6 +720,38 @@ fn reconstruct_duplicate_recover_index() {
         codec.reconstruct(&[0, 1, 2, 3], &data_refs, &[4, 4], &mut outputs),
         Err(EcError::DuplicateRecoverIndex { index: 4 })
     ));
+}
+
+#[test]
+fn reconstruct_singular_matrix_internal() {
+    // Directly exercise reconstruct_shards singular-matrix handling.
+    let k = 2;
+    let m = 1;
+    let encode_matrix = vec![
+        1u8, 0u8, // row 0
+        1u8, 0u8, // row 1 (duplicate of row 0 -> singular when rows 0,1 selected)
+        0u8, 1u8, // row 2
+    ];
+    let s0 = [1u8; 8];
+    let s1 = [2u8; 8];
+    let present_indices = [0usize, 1usize];
+    let present_data: Vec<&[u8]> = vec![&s0, &s1];
+    let recover_indices = [2usize];
+    let mut out = [0u8; 8];
+    let mut outputs: Vec<&mut [u8]> = vec![&mut out];
+
+    let err = reconstruct_shards(
+        k,
+        m,
+        &encode_matrix,
+        &present_indices,
+        &present_data,
+        &recover_indices,
+        &mut outputs,
+        8,
+    )
+    .unwrap_err();
+    assert_eq!(err, EcError::SingularMatrix);
 }
 
 // ── Single-byte shards (minimum non-zero size) ────────────────────────────────
