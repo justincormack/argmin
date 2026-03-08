@@ -416,6 +416,8 @@ mod tests {
         assert!(parse_amz_date("2013-05-24T00:00:00Z").is_none());
         assert!(parse_amz_date("not-a-timestamp").is_none());
         assert!(parse_amz_date("20130524T000000").is_none()); // missing Z
+        assert!(parse_amz_date("20130524X000000Z").is_none()); // bad separator
+        assert!(parse_amz_date("20130524T000000X").is_none()); // bad suffix
     }
 
     #[test]

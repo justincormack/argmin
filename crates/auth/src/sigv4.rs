@@ -65,6 +65,7 @@ pub fn parse_auth_header(value: &str) -> Result<SigV4Auth, AuthError> {
 
     let signed_headers: Vec<String> = signed_headers_str
         .split(';')
+        .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .collect();
 
@@ -463,10 +464,24 @@ mod tests {
     #[test]
     fn parse_auth_header_missing_signature() {
         let header = "AWS4-HMAC-SHA256 Credential=AKID/20130524/us-east-1/s3/aws4_request, SignedHeaders=host";
-        assert!(matches!(
-            parse_auth_header(header),
-            Err(AuthError::MalformedAuth)
-        ));
+        let err = parse_auth_header(header).unwrap_err();
+        assert_eq!(err.to_string(), AuthError::MalformedAuth.to_string());
+    }
+
+    #[test]
+    fn parse_auth_header_empty_signed_headers() {
+        let header = "AWS4-HMAC-SHA256 Credential=AKID/20130524/us-east-1/s3/aws4_request, SignedHeaders=, Signature=abc";
+        let err = parse_auth_header(header).unwrap_err();
+        assert_eq!(err.to_string(), AuthError::MalformedAuth.to_string());
+    }
+
+    #[test]
+    fn parse_auth_header_ignores_unknown_components() {
+        let header = "AWS4-HMAC-SHA256 Credential=AKID/20130524/us-east-1/s3/aws4_request, Foo=bar, SignedHeaders=host, Signature=abc";
+        let auth = parse_auth_header(header).unwrap();
+        assert_eq!(auth.credential.access_key_id, "AKID");
+        assert_eq!(auth.signed_headers, vec!["host"]);
+        assert_eq!(auth.signature, "abc");
     }
 
     #[test]
@@ -590,7 +605,8 @@ mod tests {
         );
         // Should NOT fail with MissingSignedHeader — it'll fail with SignatureMismatch
         // because the signature "abc" is wrong, but it should get past the header check.
-        assert!(matches!(result, Err(AuthError::SignatureMismatch)));
+        let err = result.unwrap_err();
+        assert_eq!(err.to_string(), AuthError::SignatureMismatch.to_string());
     }
 
     #[test]
@@ -610,8 +626,17 @@ mod tests {
             Signature=abc";
         let auth = parse_auth_header(auth_header).unwrap();
         let headers = [("host", "example.com"), ("x-amz-date", "20130524T000000Z")];
-        let result = verify_request("GET", "/", "", &headers, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", &auth, &store);
-        assert!(matches!(result, Err(AuthError::UnknownAccessKey)));
+        let result = verify_request(
+            "GET",
+            "/",
+            "",
+            &headers,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            &auth,
+            &store,
+        );
+        let err = result.unwrap_err();
+        assert_eq!(err.to_string(), AuthError::UnknownAccessKey.to_string());
     }
 
     #[test]
@@ -625,11 +650,22 @@ mod tests {
         // x-amz-meta-custom is present but not in SignedHeaders
         let headers = [
             ("host", "example.com"),
-            ("x-amz-content-sha256", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+            (
+                "x-amz-content-sha256",
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            ),
             ("x-amz-date", "20130524T000000Z"),
             ("x-amz-meta-custom", "value"),
         ];
-        let result = verify_request("GET", "/", "", &headers, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", &auth, &store);
+        let result = verify_request(
+            "GET",
+            "/",
+            "",
+            &headers,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            &auth,
+            &store,
+        );
         assert!(matches!(result, Err(AuthError::UnsignedHeaders { .. })));
     }
 
@@ -644,19 +680,28 @@ mod tests {
         // Two instances of the same unsigned x-amz header — should only appear once in error
         let headers = [
             ("host", "example.com"),
-            ("x-amz-content-sha256", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+            (
+                "x-amz-content-sha256",
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            ),
             ("x-amz-date", "20130524T000000Z"),
             ("x-amz-meta-custom", "val1"),
             ("x-amz-meta-custom", "val2"),
         ];
-        let result = verify_request("GET", "/", "", &headers, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", &auth, &store);
-        match result {
-            Err(AuthError::UnsignedHeaders { headers }) => {
-                assert_eq!(headers.len(), 1, "duplicate should be deduplicated");
-                assert_eq!(headers[0], "x-amz-meta-custom");
-            }
-            other => panic!("expected UnsignedHeaders, got {:?}", other),
-        }
+        let result = verify_request(
+            "GET",
+            "/",
+            "",
+            &headers,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            &auth,
+            &store,
+        );
+        let err = result.unwrap_err();
+        let debug = format!("{err:?}");
+        // The duplicated header should only be reported once.
+        assert!(debug.contains("x-amz-meta-custom"));
+        assert_eq!(debug.matches("x-amz-meta-custom").count(), 1);
     }
 
     #[test]

@@ -526,7 +526,7 @@ mod tests {
     #[test]
     fn policy_invalid_utf8() {
         use base64::Engine;
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&[0xFF, 0xFE]);
+        let b64 = base64::engine::general_purpose::STANDARD.encode([0xFF, 0xFE]);
         let err = validate_post_policy(&b64, &[], 0, "b", 0).unwrap_err();
         assert!(matches!(err, PostPolicyError::Malformed("invalid UTF-8")));
     }
@@ -702,6 +702,16 @@ mod tests {
             serde_json::json!(["starts-with", "$key", ""]),
         ]);
         // Empty prefix matches anything including empty string
+        validate_post_policy(&b64, &[], 0, "b", 0).unwrap();
+    }
+
+    #[test]
+    fn policy_non_three_element_array_condition_ignored() {
+        // Non content-length-range array conditions with len != 3 are ignored.
+        let b64 = future_policy_b64(&[
+            serde_json::json!({"bucket": "b"}),
+            serde_json::json!(["starts-with", "$key"]),
+        ]);
         validate_post_policy(&b64, &[], 0, "b", 0).unwrap();
     }
 
@@ -906,8 +916,7 @@ mod tests {
     fn policy_expired() {
         let b64 = future_policy_b64(&[serde_json::json!({"bucket": "b"})]);
         // future_policy_b64 uses 2099 expiration, so use a huge now value
-        let err =
-            validate_post_policy(&b64, &[], 0, "b", 99_999_999_999).unwrap_err();
+        let err = validate_post_policy(&b64, &[], 0, "b", 99_999_999_999).unwrap_err();
         assert!(matches!(err, PostPolicyError::Expired));
     }
 
