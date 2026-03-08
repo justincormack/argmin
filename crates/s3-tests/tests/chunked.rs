@@ -282,6 +282,90 @@ fn sign_streaming_request_custom(
     }
 }
 
+/// Same as `sign_streaming_request_custom`, but includes a query string in
+/// the canonical request (needed for operations such as UploadPart).
+fn sign_streaming_request_custom_with_query(
+    method: &str,
+    path: &str,
+    query: &str,
+    content_sha256: &str,
+    decoded_content_length: usize,
+    extra_signed_headers: &[(&str, &str)],
+    skip_content_encoding: bool,
+    skip_decoded_content_length: bool,
+) -> SignResult {
+    let (date_long, date_short) = now_parts();
+    let region = CTX.region();
+    let access_key = CTX.access_key();
+    let secret_key = CTX.secret_key();
+    let service = "s3";
+
+    let host_val = host();
+
+    let mut all_headers: Vec<(&str, String)> = Vec::new();
+    if !skip_content_encoding {
+        all_headers.push(("content-encoding", "aws-chunked".to_string()));
+    }
+    all_headers.push(("host", host_val.to_string()));
+    all_headers.push(("x-amz-content-sha256", content_sha256.to_string()));
+    all_headers.push(("x-amz-date", date_long.clone()));
+    if !skip_decoded_content_length {
+        all_headers.push((
+            "x-amz-decoded-content-length",
+            decoded_content_length.to_string(),
+        ));
+    }
+
+    for (k, v) in extra_signed_headers {
+        all_headers.push((k, v.to_string()));
+    }
+    all_headers.sort_by_key(|(k, _)| *k);
+    all_headers.dedup_by_key(|(k, _)| *k);
+
+    let signed_headers_list: Vec<&str> = all_headers.iter().map(|(k, _)| *k).collect();
+    let signed_headers = signed_headers_list.join(";");
+
+    let canonical_headers_str: String = all_headers
+        .iter()
+        .map(|(k, v)| format!("{}:{}\n", k, v))
+        .collect();
+    let canonical_query = auth::canonical::canonical_query_string(query);
+
+    let canonical_request = format!(
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        method, path, canonical_query, canonical_headers_str, signed_headers, content_sha256
+    );
+
+    let canonical_hash = sha256_hex(canonical_request.as_bytes());
+    let scope = format!("{}/{}/{}/aws4_request", date_short, region, service);
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{}\n{}\n{}",
+        date_long, scope, canonical_hash
+    );
+
+    let signing_key = derive_signing_key(secret_key, &date_short, region, service);
+    let signature = hmac_sha256(signing_key.as_ref(), string_to_sign.as_bytes());
+    let sig_hex = hex_encode(signature.as_ref());
+
+    let credential = format!(
+        "{}/{}/{}/{}/aws4_request",
+        access_key, date_short, region, service
+    );
+    let authorization = format!(
+        "AWS4-HMAC-SHA256 Credential={}, SignedHeaders={}, Signature={}",
+        credential, signed_headers, sig_hex
+    );
+
+    SignResult {
+        authorization,
+        amz_date: date_long.clone(),
+        seed_signature: sig_hex,
+        signing_key: signing_key.as_ref().to_vec(),
+        scope,
+        timestamp: date_long,
+    }
+}
+
 /// Build an unsigned chunked wire body.
 fn build_unsigned_chunked_body(data: &[u8]) -> Vec<u8> {
     let mut wire = Vec::new();
@@ -2293,6 +2377,85 @@ fn test_inline_plus_trailing_checksum_rejected_mixed_case() {
         assert_eq!(status, 400, "expected 400, got {}: {}", status, body_str);
         assert_error_code(&body_str, "InvalidRequest");
 
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_streaming_upload_part_fallback_checksum_from_upload_algorithm() {
+    s3_tests::run(async {
+        use aws_sdk_s3::types::ChecksumAlgorithm;
+        use base64::Engine;
+
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "streaming-upload-part-fallback";
+
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .checksum_algorithm(ChecksumAlgorithm::Crc32)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+
+        // No x-amz-checksum-* headers and no x-amz-trailer: this must still
+        // compute/store part checksum from the MPU checksum algorithm.
+        let data = b"streaming upload part fallback path";
+        let path = format!("/{}/{}", bucket, key);
+        let encoded_upload_id: String =
+            url::form_urlencoded::byte_serialize(upload_id.as_bytes()).collect();
+        let query = format!("partNumber=1&uploadId={encoded_upload_id}");
+
+        let sign = sign_streaming_request_custom_with_query(
+            "PUT",
+            &path,
+            &query,
+            "UNSIGNED-PAYLOAD",
+            data.len(),
+            &[],
+            true, // not aws-chunked
+            true, // not aws-chunked
+        );
+
+        let url = format!("{}{}?{}", CTX.endpoint(), path, query);
+        let mut resp = agent()
+            .put(&url)
+            .header("Authorization", &sign.authorization)
+            .header("x-amz-date", &sign.amz_date)
+            .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+            .send(&data[..])
+            .expect("transport error");
+        let status = resp.status().as_u16();
+        let body_str = resp.body_mut().read_to_string().unwrap_or_default();
+        assert_eq!(status, 200, "expected 200, got {}: {}", status, body_str);
+
+        let expected_crc = base64::engine::general_purpose::STANDARD
+            .encode(checksum::crc32::checksum(data).to_be_bytes());
+        let listed = client
+            .list_parts()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(listed.checksum_algorithm(), Some(&ChecksumAlgorithm::Crc32));
+        let parts = listed.parts();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].part_number(), Some(1));
+        assert_eq!(parts[0].checksum_crc32(), Some(expected_crc.as_str()));
+
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .unwrap();
         cleanup(&bucket, &[]).await;
     });
 }

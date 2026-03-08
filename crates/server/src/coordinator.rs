@@ -8,7 +8,7 @@ use storage::{
     DataLayout, ListMultipartUploadsReq, ListObjectVersionsReq, ListObjectsReq, ListPartsReq,
     MultipartPartChunkRecord, MultipartPartRecord, MultipartUploadRecord, ObjectPartRecord,
     ObjectRecord, PutObjectMetaReq, ShardKey, SharedStorageNode, StreamObjectChunkRecord,
-    StreamUploadChunkRecord, StreamUploadKind, StreamUploadState, UploadState,
+    StreamUploadChunkRecord, StreamUploadState, StreamUploadTarget, UploadState,
 };
 
 use crate::conditional::{
@@ -38,6 +38,13 @@ const MAX_LIST_RECORDS: usize = 100_000;
 pub struct PutObjectResult {
     pub etag: String,
     pub version_id: u64,
+}
+
+/// Result of beginning a streaming UploadPart session.
+#[derive(Debug)]
+pub struct BeginStreamPartResult {
+    pub session_id: String,
+    pub checksum_algorithm: Option<ChecksumAlgorithm>,
 }
 
 /// Result of a GetObject operation.
@@ -920,10 +927,11 @@ impl Coordinator {
         // 2. Check write conditions if any are set
         if !cond.is_empty() {
             let existing_etag = match meta_pg.get_object_meta(bucket, key) {
-                Ok(record) => {
-                    let crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
-                    Some(format_etag(crc))
-                }
+                Ok(record) => Some(format_object_etag(
+                    &record.etag,
+                    record.etag_kind,
+                    record.parts_count,
+                )),
                 Err(storage::MetadataError::ObjectNotFound) => None,
                 Err(e) => return Err(ServerError::Metadata(e)),
             };
@@ -989,9 +997,7 @@ impl Coordinator {
             session_id: session_id.clone(),
             bucket: bucket.to_string(),
             key: key.to_string(),
-            op_kind: StreamUploadKind::PutObject,
-            upload_id: None,
-            part_number: None,
+            target: StreamUploadTarget::PutObject,
         })?;
 
         Ok(session_id)
@@ -1007,7 +1013,7 @@ impl Coordinator {
         key: &str,
         upload_id: &str,
         part_number: u32,
-    ) -> Result<String, ServerError> {
+    ) -> Result<BeginStreamPartResult, ServerError> {
         // Validate part number range.
         if part_number == 0 || part_number > 10_000 {
             return Err(ServerError::InvalidArgument {
@@ -1049,12 +1055,16 @@ impl Coordinator {
             session_id: session_id.clone(),
             bucket: bucket.to_string(),
             key: key.to_string(),
-            op_kind: StreamUploadKind::UploadPart,
-            upload_id: Some(upload_id.to_string()),
-            part_number: Some(part_number),
+            target: StreamUploadTarget::UploadPart {
+                upload_id: upload_id.to_string(),
+                part_number,
+            },
         })?;
 
-        Ok(session_id)
+        Ok(BeginStreamPartResult {
+            session_id,
+            checksum_algorithm: upload.checksum_algorithm,
+        })
     }
 
     /// Append a chunk of data to an in-progress streaming session.
@@ -1219,7 +1229,7 @@ impl Coordinator {
                 reason: "session bucket/key mismatch".to_string(),
             });
         }
-        if session.op_kind != StreamUploadKind::PutObject {
+        if session.target != StreamUploadTarget::PutObject {
             return Err(ServerError::InvalidRequest {
                 reason: "session is not a PutObject session".to_string(),
             });
@@ -1228,10 +1238,11 @@ impl Coordinator {
         // Check write conditions.
         if !cond.is_empty() {
             let existing_etag = match meta_guard.get_object_meta(bucket, key) {
-                Ok(record) => {
-                    let crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
-                    Some(format_etag(crc))
-                }
+                Ok(record) => Some(format_object_etag(
+                    &record.etag,
+                    record.etag_kind,
+                    record.parts_count,
+                )),
                 Err(storage::MetadataError::ObjectNotFound) => None,
                 Err(e) => return Err(ServerError::Metadata(e)),
             };
@@ -1342,10 +1353,21 @@ impl Coordinator {
                 reason: "session bucket/key mismatch".to_string(),
             });
         }
-        if session.op_kind != StreamUploadKind::UploadPart {
-            return Err(ServerError::InvalidRequest {
-                reason: "session is not an UploadPart session".to_string(),
-            });
+        match &session.target {
+            StreamUploadTarget::UploadPart {
+                upload_id: sess_upload_id,
+                part_number: sess_part_number,
+            } if sess_upload_id == upload_id && *sess_part_number == part_number => {}
+            StreamUploadTarget::UploadPart { .. } => {
+                return Err(ServerError::InvalidRequest {
+                    reason: "session upload_id/part_number mismatch".to_string(),
+                });
+            }
+            StreamUploadTarget::PutObject => {
+                return Err(ServerError::InvalidRequest {
+                    reason: "session is not an UploadPart session".to_string(),
+                });
+            }
         }
 
         // Validate upload still exists and is InProgress.
@@ -1378,8 +1400,8 @@ impl Coordinator {
             (None, None) => None,
         };
 
-        // Use pre-computed checksum from incremental streaming if available,
-        // otherwise decode from claimed checksum header value.
+        // Use only a computed checksum from the streaming loop. This prevents
+        // persisting unverified checksum claims from request headers.
         let checksum_bytes = if let Some((algo, bytes)) = computed_checksum {
             if let Some(ea) = effective_algo {
                 if ea != algo {
@@ -1392,18 +1414,31 @@ impl Coordinator {
                     });
                 }
             }
-            Some(bytes)
-        } else if let Some((_, claimed_b64)) = &claimed_checksum {
-            // Decode claimed checksum from base64. Trust the value since we
-            // can't re-read streamed data to verify.
-            use base64::Engine;
-            Some(
-                base64::engine::general_purpose::STANDARD
+            if let Some((claimed_algo, claimed_b64)) = &claimed_checksum {
+                if *claimed_algo != algo {
+                    return Err(ServerError::InvalidRequest {
+                        reason: format!(
+                            "claimed checksum algorithm {} doesn't match computed {}",
+                            claimed_algo.as_str(),
+                            algo.as_str()
+                        ),
+                    });
+                }
+                use base64::Engine;
+                let claimed_bytes = base64::engine::general_purpose::STANDARD
                     .decode(claimed_b64)
                     .map_err(|_| ServerError::InvalidRequest {
                         reason: "invalid base64 in checksum value".to_string(),
-                    })?,
-            )
+                    })?;
+                if claimed_bytes != bytes {
+                    return Err(ServerError::BadDigest);
+                }
+            }
+            Some(bytes)
+        } else if effective_algo.is_some() || claimed_checksum.is_some() {
+            return Err(ServerError::InvalidRequest {
+                reason: "missing computed checksum for streaming upload part".to_string(),
+            });
         } else {
             None
         };
@@ -1813,10 +1848,11 @@ impl Coordinator {
         // Check dest write conditions
         if !dst_cond.is_empty() {
             let existing_etag = match dst_meta_pg.get_object_meta(dst_bucket, dst_key) {
-                Ok(record) => {
-                    let crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
-                    Some(format_etag(crc))
-                }
+                Ok(record) => Some(format_object_etag(
+                    &record.etag,
+                    record.etag_kind,
+                    record.parts_count,
+                )),
                 Err(storage::MetadataError::ObjectNotFound) => None,
                 Err(e) => return Err(ServerError::Metadata(e)),
             };
@@ -10133,9 +10169,10 @@ mod tests {
             session_id: "upload-part-session".to_string(),
             bucket: "bucket".to_string(),
             key: "key".to_string(),
-            op_kind: StreamUploadKind::UploadPart,
-            upload_id: Some("mpu-123".to_string()),
-            part_number: Some(1),
+            target: StreamUploadTarget::UploadPart {
+                upload_id: "mpu-123".to_string(),
+                part_number: 1,
+            },
         })
         .unwrap();
         drop(pg);
@@ -10159,9 +10196,10 @@ mod tests {
             .unwrap();
 
         // Begin a streaming part session.
-        let session_id = coord
+        let session = coord
             .begin_stream_part("bucket", "key", &mpu.upload_id, 1)
             .unwrap();
+        let session_id = session.session_id;
 
         // Append chunks.
         let data = b"hello streaming part";
@@ -10234,9 +10272,10 @@ mod tests {
             .create_multipart_upload("bucket", "key", &MetadataBlob::new(), None, None)
             .unwrap();
 
-        let session_id = coord
+        let session = coord
             .begin_stream_part("bucket", "key", &mpu.upload_id, 1)
             .unwrap();
+        let session_id = session.session_id;
         coord
             .append_stream_chunk("bucket", "key", &session_id, 0, b"data")
             .unwrap();
@@ -10315,7 +10354,8 @@ mod tests {
         let stream_part = |upload_id: &str, data: &[u8]| -> CompletePart {
             let sess = coord
                 .begin_stream_part("bucket", "key", upload_id, 1)
-                .unwrap();
+                .unwrap()
+                .session_id;
             coord
                 .append_stream_chunk("bucket", "key", &sess, 0, data)
                 .unwrap();
@@ -10396,7 +10436,8 @@ mod tests {
         // Upload a streaming part.
         let sess = coord
             .begin_stream_part("bucket", "key", &mpu.upload_id, 1)
-            .unwrap();
+            .unwrap()
+            .session_id;
         let data = b"streamed-part-data-for-abort-test";
         coord
             .append_stream_chunk("bucket", "key", &sess, 0, data)

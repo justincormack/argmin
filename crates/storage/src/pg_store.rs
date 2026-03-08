@@ -26,6 +26,7 @@ use crate::types::*;
 /// Must differ from any real version_id (0 for unversioned, 1+ for versioned) so that
 /// in-progress staging rows are invisible to reads of completed objects.
 const PART_CHUNK_STAGING_VERSION_ID: u64 = u64::MAX;
+type StreamSessionRow = (u8, u8, String, String, Option<String>, Option<i64>);
 
 /// Per-PG store combining shard file I/O with SQLite metadata.
 pub struct PgStore {
@@ -155,10 +156,129 @@ impl PgStore {
         })
     }
 
+    fn parse_stream_target(
+        op_kind_raw: u8,
+        upload_id: Option<String>,
+        part_number: Option<i64>,
+        op_kind_col: usize,
+    ) -> Result<StreamUploadTarget, rusqlite::Error> {
+        let op_kind = StreamUploadKind::from_u8(op_kind_raw).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                op_kind_col,
+                rusqlite::types::Type::Integer,
+                Box::from(format!("invalid op_kind: {op_kind_raw}")),
+            )
+        })?;
+
+        match op_kind {
+            StreamUploadKind::PutObject => {
+                if upload_id.is_some() || part_number.is_some() {
+                    return Err(rusqlite::Error::FromSqlConversionFailure(
+                        op_kind_col,
+                        rusqlite::types::Type::Integer,
+                        Box::from("PutObject stream session must not carry upload_id/part_number"),
+                    ));
+                }
+                Ok(StreamUploadTarget::PutObject)
+            }
+            StreamUploadKind::UploadPart => {
+                let upload_id = upload_id.ok_or_else(|| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        op_kind_col,
+                        rusqlite::types::Type::Integer,
+                        Box::from("UploadPart stream session missing upload_id"),
+                    )
+                })?;
+                let pn_i64 = part_number.ok_or_else(|| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        op_kind_col,
+                        rusqlite::types::Type::Integer,
+                        Box::from("UploadPart stream session missing part_number"),
+                    )
+                })?;
+                if !(1..=10_000).contains(&pn_i64) {
+                    return Err(rusqlite::Error::FromSqlConversionFailure(
+                        op_kind_col,
+                        rusqlite::types::Type::Integer,
+                        Box::from(format!("invalid UploadPart part_number: {pn_i64}")),
+                    ));
+                }
+                Ok(StreamUploadTarget::UploadPart {
+                    upload_id,
+                    part_number: pn_i64 as u32,
+                })
+            }
+        }
+    }
+
+    fn validate_object_layout(
+        status: u8,
+        data_layout: DataLayout,
+        parts_count: Option<u32>,
+    ) -> Result<(), rusqlite::Error> {
+        let valid = match status {
+            // Live object: ChunkManifest has no parts_count, MultipartManifest requires >0 parts.
+            0 => match data_layout {
+                DataLayout::ChunkManifestInternal => parts_count.is_none(),
+                DataLayout::MultipartManifest => parts_count.is_some_and(|n| n > 0),
+            },
+            // Delete markers / non-live records must be non-multipart.
+            _ => data_layout == DataLayout::ChunkManifestInternal && parts_count.is_none(),
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(rusqlite::Error::FromSqlConversionFailure(
+                13,
+                rusqlite::types::Type::Integer,
+                Box::from(format!(
+                    "invalid object layout combination: status={status}, layout={:?}, parts_count={parts_count:?}",
+                    data_layout
+                )),
+            ))
+        }
+    }
+
+    fn parse_optional_u32(
+        value: Option<i64>,
+        col: usize,
+        field: &str,
+    ) -> Result<Option<u32>, rusqlite::Error> {
+        value
+            .map(|v| {
+                u32::try_from(v).map_err(|_| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        col,
+                        rusqlite::types::Type::Integer,
+                        Box::from(format!(
+                            "invalid {field}: {v} (expected integer in 0..={})",
+                            u32::MAX
+                        )),
+                    )
+                })
+            })
+            .transpose()
+    }
+
     /// Map a row with columns (bucket, key, version_id, size, total_size, etag,
     /// etag_kind, last_modified, storage_class, ec_k, ec_m, status, tags,
     /// data_layout, parts_count, metadata_blob) to an ObjectRecord.
     fn row_to_object_record(row: &rusqlite::Row<'_>) -> Result<ObjectRecord, rusqlite::Error> {
+        let status = row.get::<_, u8>(11)?;
+        let data_layout = {
+            let raw = row.get::<_, u8>(13)?;
+            DataLayout::from_u8(raw).ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    13,
+                    rusqlite::types::Type::Integer,
+                    Box::from(format!("invalid data_layout: {raw}")),
+                )
+            })?
+        };
+        let parts_count =
+            Self::parse_optional_u32(row.get::<_, Option<i64>>(14)?, 14, "parts_count")?;
+        Self::validate_object_layout(status, data_layout, parts_count)?;
+
         Ok(ObjectRecord {
             bucket: row.get(0)?,
             key: row.get(1)?,
@@ -171,19 +291,10 @@ impl PgStore {
             storage_class: row.get::<_, u8>(8)?,
             ec_k: row.get::<_, u8>(9)?,
             ec_m: row.get::<_, u8>(10)?,
-            status: row.get::<_, u8>(11)?,
+            status,
             tags: row.get(12)?,
-            data_layout: {
-                let raw = row.get::<_, u8>(13)?;
-                DataLayout::from_u8(raw).ok_or_else(|| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        13,
-                        rusqlite::types::Type::Integer,
-                        Box::from(format!("invalid data_layout: {raw}")),
-                    )
-                })?
-            },
-            parts_count: row.get::<_, Option<i64>>(14)?.map(|v| v as u32),
+            data_layout,
+            parts_count,
             metadata_blob: row.get(15)?,
         })
     }
@@ -807,7 +918,14 @@ impl PgMetadataStore for PgStore {
 
     fn put_object_meta(&self, req: &PutObjectMetaReq) -> Result<(), MetadataError> {
         let now = PgStore::now_millis();
-        let data_layout = req.data_layout.map(|dl| dl as u8).unwrap_or(0);
+        let data_layout = req.data_layout.unwrap_or(DataLayout::ChunkManifestInternal);
+        Self::validate_object_layout(req.status, data_layout, req.parts_count).map_err(|e| {
+            MetadataError::Db {
+                context: "put object meta (validate layout)",
+                source: e,
+            }
+        })?;
+        let data_layout = data_layout as u8;
         let parts_count = req.parts_count.map(|n| n as i64);
         let metadata_blob: Option<&[u8]> = req.metadata_blob.as_deref();
         if req.version_id == 0 {
@@ -1856,7 +1974,14 @@ impl PgMetadataStore for PgStore {
         parts: &[ObjectPartRecord],
     ) -> Result<(), MetadataError> {
         let now = PgStore::now_millis();
-        let data_layout = obj.data_layout.map(|dl| dl as u8).unwrap_or(0);
+        let data_layout = obj.data_layout.unwrap_or(DataLayout::ChunkManifestInternal);
+        Self::validate_object_layout(obj.status, data_layout, obj.parts_count).map_err(|e| {
+            MetadataError::Db {
+                context: "complete multipart commit (validate layout)",
+                source: e,
+            }
+        })?;
+        let data_layout = data_layout as u8;
         let parts_count = obj.parts_count.map(|n| n as i64);
         let metadata_blob: Option<&[u8]> = obj.metadata_blob.as_deref();
 
@@ -2032,6 +2157,9 @@ impl PgMetadataStore for PgStore {
 
     fn create_stream_upload(&self, req: &CreateStreamUploadReq) -> Result<(), MetadataError> {
         let now = PgStore::now_millis();
+        let op_kind = req.target.op_kind() as u8;
+        let upload_id = req.target.upload_id();
+        let part_number = req.target.part_number().map(|n| n as i64);
         self.conn
             .execute(
                 "INSERT INTO stream_uploads \
@@ -2041,9 +2169,9 @@ impl PgMetadataStore for PgStore {
                     req.session_id,
                     req.bucket,
                     req.key,
-                    req.op_kind as u8,
-                    req.upload_id,
-                    req.part_number.map(|n| n as i64),
+                    op_kind,
+                    upload_id,
+                    part_number,
                     now as i64,
                 ],
             )
@@ -2063,19 +2191,18 @@ impl PgMetadataStore for PgStore {
                 |row| {
                     let op_kind_raw: u8 = row.get(3)?;
                     let state_raw: u8 = row.get(6)?;
+                    let upload_id: Option<String> = row.get(4)?;
+                    let part_number: Option<i64> = row.get(5)?;
                     Ok(StreamUploadRecord {
                         session_id: row.get(0)?,
                         bucket: row.get(1)?,
                         key: row.get(2)?,
-                        op_kind: StreamUploadKind::from_u8(op_kind_raw).ok_or_else(|| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                3,
-                                rusqlite::types::Type::Integer,
-                                Box::from(format!("invalid op_kind: {op_kind_raw}")),
-                            )
-                        })?,
-                        upload_id: row.get(4)?,
-                        part_number: row.get::<_, Option<i64>>(5)?.map(|n| n as u32),
+                        target: PgStore::parse_stream_target(
+                            op_kind_raw,
+                            upload_id,
+                            part_number,
+                            3,
+                        )?,
                         state: StreamUploadState::from_u8(state_raw).ok_or_else(|| {
                             rusqlite::Error::FromSqlConversionFailure(
                                 6,
@@ -2162,19 +2289,13 @@ impl PgMetadataStore for PgStore {
             .query_map([], |row| {
                 let op_kind_raw: u8 = row.get(3)?;
                 let state_raw: u8 = row.get(6)?;
+                let upload_id: Option<String> = row.get(4)?;
+                let part_number: Option<i64> = row.get(5)?;
                 Ok(StreamUploadRecord {
                     session_id: row.get(0)?,
                     bucket: row.get(1)?,
                     key: row.get(2)?,
-                    op_kind: StreamUploadKind::from_u8(op_kind_raw).ok_or_else(|| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            3,
-                            rusqlite::types::Type::Integer,
-                            Box::from(format!("invalid op_kind: {op_kind_raw}")),
-                        )
-                    })?,
-                    upload_id: row.get(4)?,
-                    part_number: row.get::<_, Option<i64>>(5)?.map(|n| n as u32),
+                    target: PgStore::parse_stream_target(op_kind_raw, upload_id, part_number, 3)?,
                     state: StreamUploadState::from_u8(state_raw).ok_or_else(|| {
                         rusqlite::Error::FromSqlConversionFailure(
                             6,
@@ -2282,13 +2403,23 @@ impl PgMetadataStore for PgStore {
         let result: Result<(), MetadataError> = (|| {
             // 1. Verify session exists, is InProgress, is PutObject kind, and matches
             //    the target bucket/key. Then transition to Completing.
-            let row: Option<(u8, u8, String, String)> = self
+            let row: Option<StreamSessionRow> = self
                 .conn
                 .query_row(
-                    "SELECT state, op_kind, bucket, key FROM stream_uploads \
+                    "SELECT state, op_kind, bucket, key, upload_id, part_number \
+                     FROM stream_uploads \
                      WHERE session_id = ?1",
                     params![session_id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                        ))
+                    },
                 )
                 .optional()
                 .map_err(|e| MetadataError::Db {
@@ -2296,15 +2427,20 @@ impl PgMetadataStore for PgStore {
                     source: e,
                 })?;
 
-            let (current, op_kind, sess_bucket, sess_key) =
-                row.ok_or_else(|| MetadataError::StreamSessionNotFound {
+            let (current, op_kind_raw, sess_bucket, sess_key, upload_id, part_number) = row
+                .ok_or_else(|| MetadataError::StreamSessionNotFound {
                     session_id: session_id.to_string(),
+                })?;
+            let target = PgStore::parse_stream_target(op_kind_raw, upload_id, part_number, 1)
+                .map_err(|e| MetadataError::Db {
+                    context: "commit stream put (parse session target)",
+                    source: e,
                 })?;
 
             if current != StreamUploadState::InProgress as u8 {
                 return Err(MetadataError::StreamSessionNotInProgress { state: current });
             }
-            if op_kind != StreamUploadKind::PutObject as u8
+            if target != StreamUploadTarget::PutObject
                 || sess_bucket != obj.bucket
                 || sess_key != obj.key
             {
@@ -2325,7 +2461,14 @@ impl PgMetadataStore for PgStore {
 
             // 2. Write/overwrite object metadata row.
             let now = PgStore::now_millis();
-            let data_layout = obj.data_layout.map(|dl| dl as u8).unwrap_or(0);
+            let data_layout = obj.data_layout.unwrap_or(DataLayout::ChunkManifestInternal);
+            Self::validate_object_layout(obj.status, data_layout, obj.parts_count).map_err(
+                |e| MetadataError::Db {
+                    context: "commit stream put (validate layout)",
+                    source: e,
+                },
+            )?;
+            let data_layout = data_layout as u8;
             let parts_count = obj.parts_count.map(|n| n as i64);
 
             let obj_sql = if obj.version_id == 0 {
@@ -2473,6 +2616,9 @@ impl PgMetadataStore for PgStore {
                      FROM stream_uploads WHERE session_id = ?1",
                         params![session_id],
                         |row| {
+                            let op_kind_raw: u8 = row.get(1)?;
+                            let upload_id: Option<String> = row.get(4)?;
+                            let part_number: Option<i64> = row.get(5)?;
                             Ok(StreamUploadRecord {
                                 session_id: session_id.to_string(),
                                 state: StreamUploadState::from_u8(row.get::<_, u8>(0)?)
@@ -2483,18 +2629,14 @@ impl PgMetadataStore for PgStore {
                                             Box::from("invalid stream state"),
                                         )
                                     })?,
-                                op_kind: StreamUploadKind::from_u8(row.get::<_, u8>(1)?)
-                                    .ok_or_else(|| {
-                                        rusqlite::Error::FromSqlConversionFailure(
-                                            1,
-                                            rusqlite::types::Type::Integer,
-                                            Box::from("invalid op_kind"),
-                                        )
-                                    })?,
+                                target: PgStore::parse_stream_target(
+                                    op_kind_raw,
+                                    upload_id,
+                                    part_number,
+                                    1,
+                                )?,
                                 bucket: row.get(2)?,
                                 key: row.get(3)?,
-                                upload_id: row.get(4)?,
-                                part_number: row.get::<_, Option<i64>>(5)?.map(|n| n as u32),
                                 created_at: 0,
                             })
                         },
@@ -2514,13 +2656,16 @@ impl PgMetadataStore for PgStore {
                 });
             }
             // Validate session binding matches commit target.
-            if sess_row.op_kind != StreamUploadKind::UploadPart
-                || sess_row.upload_id.as_deref() != Some(&part.upload_id)
-                || sess_row.part_number != Some(part.part_number)
-            {
-                return Err(MetadataError::StreamSessionNotFound {
-                    session_id: session_id.to_string(),
-                });
+            match &sess_row.target {
+                StreamUploadTarget::UploadPart {
+                    upload_id,
+                    part_number,
+                } if upload_id == &part.upload_id && *part_number == part.part_number => {}
+                _ => {
+                    return Err(MetadataError::StreamSessionNotFound {
+                        session_id: session_id.to_string(),
+                    })
+                }
             }
             let sess_bucket = sess_row.bucket;
             let sess_key = sess_row.key;
@@ -3042,6 +3187,40 @@ mod tests {
         let store = PgStore::open(tmp.path(), 0).unwrap();
         // Just verify we can call it without panicking
         let _conn = store.connection();
+    }
+
+    #[test]
+    fn row_to_object_record_rejects_negative_parts_count() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 0).unwrap();
+        let err = store
+            .connection()
+            .query_row(
+                "SELECT \
+                    'b' AS bucket, \
+                    'k' AS key, \
+                    0 AS version_id, \
+                    1 AS size, \
+                    1 AS total_size, \
+                    zeroblob(8) AS etag, \
+                    1 AS etag_kind, \
+                    0 AS last_modified, \
+                    0 AS storage_class, \
+                    4 AS ec_k, \
+                    2 AS ec_m, \
+                    0 AS status, \
+                    NULL AS tags, \
+                    1 AS data_layout, \
+                    -1 AS parts_count, \
+                    NULL AS metadata_blob",
+                [],
+                PgStore::row_to_object_record,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            rusqlite::Error::FromSqlConversionFailure(14, rusqlite::types::Type::Integer, _)
+        ));
     }
 
     // ── list_objects pagination ──────────────────────────────────────

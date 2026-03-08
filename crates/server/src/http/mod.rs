@@ -1846,16 +1846,17 @@ impl HttpFrontend {
             }
         }
 
-        let session_id = self
+        let begin = self
             .coordinator
             .begin_stream_part(bucket, key, upload_id, part_number)?;
 
         Ok(StreamingPartContext {
-            session_id,
+            session_id: begin.session_id,
             bucket: bucket.to_string(),
             key: key.to_string(),
             upload_id: upload_id.to_string(),
             part_number,
+            upload_checksum_algorithm: begin.checksum_algorithm,
             claimed_checksum,
             checksum_response,
             streaming_signing: auth.streaming,
@@ -1979,6 +1980,7 @@ pub struct StreamingPartContext {
     pub key: String,
     pub upload_id: String,
     pub part_number: u32,
+    pub upload_checksum_algorithm: Option<ChecksumAlgorithm>,
     pub claimed_checksum: Option<(ChecksumAlgorithm, String)>,
     pub checksum_response: Vec<(String, String)>,
     /// Signing context for aws-chunked modes, None for unsigned/plain.

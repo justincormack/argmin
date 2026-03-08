@@ -582,21 +582,22 @@ fn file_metadata_invalid_data_layout_returns_error() {
         })
         .unwrap();
 
-    // Corrupt the data_layout via raw SQL
-    store
+    // Corrupting data_layout is blocked by DB CHECK constraints.
+    let err = store
         .connection()
         .execute(
             "UPDATE objects SET data_layout = 99 WHERE bucket = 'b' AND key = 'k'",
             [],
         )
-        .unwrap();
-
-    // Reading should fail, not silently default to ChunkManifestInternal
-    let err = store.get_object_meta("b", "k").unwrap_err();
+        .unwrap_err();
     assert!(
-        matches!(err, crate::error::MetadataError::Db { .. }),
-        "expected Db error for invalid data_layout, got: {err:?}"
+        matches!(err, rusqlite::Error::SqliteFailure(_, _)),
+        "expected sqlite constraint failure, got: {err:?}"
     );
+
+    // Record remains readable and unchanged.
+    let obj = store.get_object_meta("b", "k").unwrap();
+    assert_eq!(obj.data_layout, DataLayout::ChunkManifestInternal);
 }
 
 // --- Multipart metadata tests (PgStore only — needs SQL) ---
@@ -2355,9 +2356,7 @@ fn stream_upload_create_get_delete() {
             session_id: "sess-1".to_string(),
             bucket: "b".to_string(),
             key: "k".to_string(),
-            op_kind: StreamUploadKind::PutObject,
-            upload_id: None,
-            part_number: None,
+            target: StreamUploadTarget::PutObject,
         })
         .unwrap();
 
@@ -2365,10 +2364,8 @@ fn stream_upload_create_get_delete() {
     assert_eq!(rec.session_id, "sess-1");
     assert_eq!(rec.bucket, "b");
     assert_eq!(rec.key, "k");
-    assert_eq!(rec.op_kind, StreamUploadKind::PutObject);
+    assert_eq!(rec.target, StreamUploadTarget::PutObject);
     assert_eq!(rec.state, StreamUploadState::InProgress);
-    assert!(rec.upload_id.is_none());
-    assert!(rec.part_number.is_none());
 
     store.delete_stream_upload("sess-1").unwrap();
 
@@ -2388,9 +2385,7 @@ fn stream_upload_state_transitions() {
             session_id: "sess-2".to_string(),
             bucket: "b".to_string(),
             key: "k".to_string(),
-            op_kind: StreamUploadKind::PutObject,
-            upload_id: None,
-            part_number: None,
+            target: StreamUploadTarget::PutObject,
         })
         .unwrap();
 
@@ -2440,16 +2435,21 @@ fn stream_upload_upload_part_kind() {
             session_id: "sess-part".to_string(),
             bucket: "b".to_string(),
             key: "k".to_string(),
-            op_kind: StreamUploadKind::UploadPart,
-            upload_id: Some("mpu-123".to_string()),
-            part_number: Some(3),
+            target: StreamUploadTarget::UploadPart {
+                upload_id: "mpu-123".to_string(),
+                part_number: 3,
+            },
         })
         .unwrap();
 
     let rec = store.get_stream_upload("sess-part").unwrap();
-    assert_eq!(rec.op_kind, StreamUploadKind::UploadPart);
-    assert_eq!(rec.upload_id.as_deref(), Some("mpu-123"));
-    assert_eq!(rec.part_number, Some(3));
+    assert_eq!(
+        rec.target,
+        StreamUploadTarget::UploadPart {
+            upload_id: "mpu-123".to_string(),
+            part_number: 3
+        }
+    );
 }
 
 #[test]
@@ -2461,9 +2461,7 @@ fn stream_chunk_append_and_list() {
             session_id: "sess-chunks".to_string(),
             bucket: "b".to_string(),
             key: "k".to_string(),
-            op_kind: StreamUploadKind::PutObject,
-            upload_id: None,
-            part_number: None,
+            target: StreamUploadTarget::PutObject,
         })
         .unwrap();
 
@@ -2503,9 +2501,7 @@ fn stream_chunk_cascade_delete() {
             session_id: "sess-cascade".to_string(),
             bucket: "b".to_string(),
             key: "k".to_string(),
-            op_kind: StreamUploadKind::PutObject,
-            upload_id: None,
-            part_number: None,
+            target: StreamUploadTarget::PutObject,
         })
         .unwrap();
 
@@ -2539,9 +2535,7 @@ fn commit_stream_put_atomic() {
             session_id: "sess-commit".to_string(),
             bucket: "b".to_string(),
             key: "k".to_string(),
-            op_kind: StreamUploadKind::PutObject,
-            upload_id: None,
-            part_number: None,
+            target: StreamUploadTarget::PutObject,
         })
         .unwrap();
 
@@ -2655,9 +2649,7 @@ fn commit_stream_put_overwrite_unversioned() {
             session_id: "s1".to_string(),
             bucket: "b".to_string(),
             key: "k".to_string(),
-            op_kind: StreamUploadKind::PutObject,
-            upload_id: None,
-            part_number: None,
+            target: StreamUploadTarget::PutObject,
         })
         .unwrap();
     store
@@ -2699,9 +2691,7 @@ fn commit_stream_put_overwrite_unversioned() {
             session_id: "s2".to_string(),
             bucket: "b".to_string(),
             key: "k".to_string(),
-            op_kind: StreamUploadKind::PutObject,
-            upload_id: None,
-            part_number: None,
+            target: StreamUploadTarget::PutObject,
         })
         .unwrap();
     store
@@ -2757,9 +2747,7 @@ fn delete_stream_object_chunks_cleanup() {
             session_id: "s-del".to_string(),
             bucket: "b".to_string(),
             key: "k".to_string(),
-            op_kind: StreamUploadKind::PutObject,
-            upload_id: None,
-            part_number: None,
+            target: StreamUploadTarget::PutObject,
         })
         .unwrap();
     store
@@ -2813,9 +2801,7 @@ fn commit_stream_put_rejects_non_in_progress() {
             session_id: "sess-bad".to_string(),
             bucket: "b".to_string(),
             key: "k".to_string(),
-            op_kind: StreamUploadKind::PutObject,
-            upload_id: None,
-            part_number: None,
+            target: StreamUploadTarget::PutObject,
         })
         .unwrap();
 
@@ -2930,9 +2916,10 @@ fn commit_stream_part_replaces_prior_chunks_on_reupload() {
             session_id: "sp-1".to_string(),
             bucket: "b".to_string(),
             key: "k".to_string(),
-            op_kind: StreamUploadKind::UploadPart,
-            upload_id: Some("mpu-1".to_string()),
-            part_number: Some(1),
+            target: StreamUploadTarget::UploadPart {
+                upload_id: "mpu-1".to_string(),
+                part_number: 1,
+            },
         })
         .unwrap();
 
@@ -2968,9 +2955,10 @@ fn commit_stream_part_replaces_prior_chunks_on_reupload() {
             session_id: "sp-2".to_string(),
             bucket: "b".to_string(),
             key: "k".to_string(),
-            op_kind: StreamUploadKind::UploadPart,
-            upload_id: Some("mpu-1".to_string()),
-            part_number: Some(1),
+            target: StreamUploadTarget::UploadPart {
+                upload_id: "mpu-1".to_string(),
+                part_number: 1,
+            },
         })
         .unwrap();
 
@@ -3012,9 +3000,10 @@ fn commit_stream_put_rejects_wrong_kind() {
             session_id: "sess-wrong-kind".to_string(),
             bucket: "b".to_string(),
             key: "k".to_string(),
-            op_kind: StreamUploadKind::UploadPart,
-            upload_id: Some("mpu-x".to_string()),
-            part_number: Some(1),
+            target: StreamUploadTarget::UploadPart {
+                upload_id: "mpu-x".to_string(),
+                part_number: 1,
+            },
         })
         .unwrap();
 
@@ -3058,9 +3047,7 @@ fn commit_stream_put_rejects_wrong_bucket_key() {
             session_id: "sess-mismatch".to_string(),
             bucket: "b1".to_string(),
             key: "k1".to_string(),
-            op_kind: StreamUploadKind::PutObject,
-            upload_id: None,
-            part_number: None,
+            target: StreamUploadTarget::PutObject,
         })
         .unwrap();
 
@@ -3116,9 +3103,10 @@ fn commit_stream_part_rejects_wrong_upload_id() {
             session_id: "sp-mismatch".to_string(),
             bucket: "b".to_string(),
             key: "k".to_string(),
-            op_kind: StreamUploadKind::UploadPart,
-            upload_id: Some("mpu-correct".to_string()),
-            part_number: Some(1),
+            target: StreamUploadTarget::UploadPart {
+                upload_id: "mpu-correct".to_string(),
+                part_number: 1,
+            },
         })
         .unwrap();
 
@@ -3174,9 +3162,10 @@ fn commit_stream_part_zero_chunks_clears_prior() {
             session_id: "sp-zc1".to_string(),
             bucket: "b".to_string(),
             key: "k".to_string(),
-            op_kind: StreamUploadKind::UploadPart,
-            upload_id: Some("mpu-zc".to_string()),
-            part_number: Some(1),
+            target: StreamUploadTarget::UploadPart {
+                upload_id: "mpu-zc".to_string(),
+                part_number: 1,
+            },
         })
         .unwrap();
     store
@@ -3243,9 +3232,10 @@ fn commit_stream_part_zero_chunks_clears_prior() {
             session_id: "sp-zc2".to_string(),
             bucket: "b".to_string(),
             key: "k".to_string(),
-            op_kind: StreamUploadKind::UploadPart,
-            upload_id: Some("mpu-zc".to_string()),
-            part_number: Some(1),
+            target: StreamUploadTarget::UploadPart {
+                upload_id: "mpu-zc".to_string(),
+                part_number: 1,
+            },
         })
         .unwrap();
     store
@@ -3287,9 +3277,7 @@ fn commit_stream_put_rejects_mismatched_chunk_target() {
             session_id: "sp-ct".to_string(),
             bucket: "b".to_string(),
             key: "k".to_string(),
-            op_kind: StreamUploadKind::PutObject,
-            upload_id: None,
-            part_number: None,
+            target: StreamUploadTarget::PutObject,
         })
         .unwrap();
 
@@ -3356,9 +3344,10 @@ fn commit_stream_part_rejects_mismatched_chunk_part_number() {
             session_id: "sp-cpc".to_string(),
             bucket: "b".to_string(),
             key: "k".to_string(),
-            op_kind: StreamUploadKind::UploadPart,
-            upload_id: Some("mpu-cpc".to_string()),
-            part_number: Some(1),
+            target: StreamUploadTarget::UploadPart {
+                upload_id: "mpu-cpc".to_string(),
+                part_number: 1,
+            },
         })
         .unwrap();
 
@@ -3426,9 +3415,10 @@ fn commit_stream_part_rejects_non_staging_chunk_version_id() {
             session_id: "sp-vid".to_string(),
             bucket: "b".to_string(),
             key: "k".to_string(),
-            op_kind: StreamUploadKind::UploadPart,
-            upload_id: Some("mpu-vid".to_string()),
-            part_number: Some(1),
+            target: StreamUploadTarget::UploadPart {
+                upload_id: "mpu-vid".to_string(),
+                part_number: 1,
+            },
         })
         .unwrap();
 

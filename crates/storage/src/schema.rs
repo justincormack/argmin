@@ -31,6 +31,16 @@ CREATE TABLE IF NOT EXISTS objects (
     data_layout   INTEGER NOT NULL DEFAULT 0,
     parts_count   INTEGER,
     metadata_blob BLOB,
+    CHECK (status IN (0, 1, 2)),
+    CHECK (etag_kind IN (0, 1)),
+    CHECK (data_layout IN (0, 1)),
+    CHECK (
+        (status = 0 AND (
+            (data_layout = 0 AND parts_count IS NULL) OR
+            (data_layout = 1 AND parts_count IS NOT NULL AND parts_count > 0)
+        )) OR
+        (status != 0 AND data_layout = 0 AND parts_count IS NULL)
+    ),
     PRIMARY KEY (bucket, key, version_id)
 )";
 
@@ -97,7 +107,13 @@ CREATE TABLE IF NOT EXISTS stream_uploads (
     upload_id     TEXT,
     part_number   INTEGER,
     state         INTEGER NOT NULL DEFAULT 0,
-    created_at    INTEGER NOT NULL
+    created_at    INTEGER NOT NULL,
+    CHECK (op_kind IN (0, 1)),
+    CHECK (state IN (0, 1, 2, 3)),
+    CHECK (
+        (op_kind = 0 AND upload_id IS NULL AND part_number IS NULL) OR
+        (op_kind = 1 AND upload_id IS NOT NULL AND part_number BETWEEN 1 AND 10000)
+    )
 )";
 
 /// Staging chunk records for in-progress streaming sessions.

@@ -494,6 +494,39 @@ impl StreamUploadKind {
     }
 }
 
+/// Strongly-typed stream upload target.
+///
+/// This makes invalid combinations (such as `UploadPart` without upload ID)
+/// unrepresentable at the type level.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamUploadTarget {
+    PutObject,
+    UploadPart { upload_id: String, part_number: u32 },
+}
+
+impl StreamUploadTarget {
+    pub fn op_kind(&self) -> StreamUploadKind {
+        match self {
+            Self::PutObject => StreamUploadKind::PutObject,
+            Self::UploadPart { .. } => StreamUploadKind::UploadPart,
+        }
+    }
+
+    pub fn upload_id(&self) -> Option<&str> {
+        match self {
+            Self::PutObject => None,
+            Self::UploadPart { upload_id, .. } => Some(upload_id.as_str()),
+        }
+    }
+
+    pub fn part_number(&self) -> Option<u32> {
+        match self {
+            Self::PutObject => None,
+            Self::UploadPart { part_number, .. } => Some(*part_number),
+        }
+    }
+}
+
 /// Streaming upload session state machine.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -522,11 +555,7 @@ pub struct StreamUploadRecord {
     pub session_id: String,
     pub bucket: String,
     pub key: String,
-    pub op_kind: StreamUploadKind,
-    /// For UploadPart: the multipart upload_id.
-    pub upload_id: Option<String>,
-    /// For UploadPart: the part number.
-    pub part_number: Option<u32>,
+    pub target: StreamUploadTarget,
     pub state: StreamUploadState,
     pub created_at: u64,
 }
@@ -536,9 +565,7 @@ pub struct CreateStreamUploadReq {
     pub session_id: String,
     pub bucket: String,
     pub key: String,
-    pub op_kind: StreamUploadKind,
-    pub upload_id: Option<String>,
-    pub part_number: Option<u32>,
+    pub target: StreamUploadTarget,
 }
 
 /// Staging chunk record for an in-progress streaming session.
