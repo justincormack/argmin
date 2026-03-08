@@ -48,9 +48,10 @@ instead to read the values without exporting them.
 
 ## Cleanliness
 
-Make sure `cargo clippy` is clean, even if it is pedantic. Always run tests after making changes and make sure
-they still pass. Review your code to make sure it is clear, correct and secure. Always run `cargo fmt` after
-making any edits.
+Make sure `cargo clippy --all-targets --all-features -- -D warnings` is clean, even if it is pedantic.
+Always run tests after making changes and make sure they still pass. Review your code to make sure it
+is clear, correct and secure. Always run `cargo fmt` after making any edits. Aim to make illegal states
+unrepresnetable versus having checks.
 
 ## Diary
 
