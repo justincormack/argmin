@@ -322,68 +322,6 @@ fn metadata_zero_size_object(store: &dyn PgMetadataStore) {
     assert_eq!(obj.size, 0);
 }
 
-// --- MemoryPgStore tests ---
-
-#[test]
-fn memory_metadata_put_get_delete() {
-    let store = crate::MemoryPgStore::new();
-    metadata_put_get_delete(&store);
-}
-
-#[test]
-fn memory_metadata_put_overwrites() {
-    let store = crate::MemoryPgStore::new();
-    metadata_put_overwrites(&store);
-}
-
-#[test]
-fn memory_metadata_get_nonexistent() {
-    let store = crate::MemoryPgStore::new();
-    metadata_get_nonexistent(&store);
-}
-
-#[test]
-fn memory_metadata_list_basic() {
-    let store = crate::MemoryPgStore::new();
-    metadata_list_basic(&store);
-}
-
-#[test]
-fn memory_metadata_list_with_prefix() {
-    let store = crate::MemoryPgStore::new();
-    metadata_list_with_prefix(&store);
-}
-
-#[test]
-fn memory_metadata_list_pagination() {
-    let store = crate::MemoryPgStore::new();
-    metadata_list_pagination(&store);
-}
-
-#[test]
-fn memory_metadata_list_empty_bucket() {
-    let store = crate::MemoryPgStore::new();
-    metadata_list_empty_bucket(&store);
-}
-
-#[test]
-fn memory_metadata_empty_key() {
-    let store = crate::MemoryPgStore::new();
-    metadata_empty_key(&store);
-}
-
-#[test]
-fn memory_metadata_long_key() {
-    let store = crate::MemoryPgStore::new();
-    metadata_long_key(&store);
-}
-
-#[test]
-fn memory_metadata_zero_size() {
-    let store = crate::MemoryPgStore::new();
-    metadata_zero_size_object(&store);
-}
-
 // --- PgStore (filesystem) tests ---
 
 fn make_pg_store() -> (test_util::TempDir, crate::PgStore) {
@@ -2369,7 +2307,7 @@ mod prop_tests {
             ),
             max_keys in 1u32..=10,
         ) {
-            let store = crate::MemoryPgStore::new();
+            let (_dir, store) = super::make_pg_store();
             insert_keys(&store, "bucket", &keys);
 
             let mut expected = keys.clone();
@@ -2389,7 +2327,7 @@ mod prop_tests {
             prefix in proptest::string::string_regex(r"[A-Za-z0-9._/-]{0,8}").unwrap(),
             max_keys in 1u32..=10,
         ) {
-            let store = crate::MemoryPgStore::new();
+            let (_dir, store) = super::make_pg_store();
             insert_keys(&store, "bucket", &keys);
 
             let mut expected: Vec<String> = keys

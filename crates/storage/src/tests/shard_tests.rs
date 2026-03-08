@@ -122,44 +122,6 @@ fn shard_multiple_keys(store: &dyn ShardStore) {
     }
 }
 
-// --- MemoryPgStore tests ---
-
-#[test]
-fn memory_shard_roundtrip() {
-    let store = crate::MemoryPgStore::new();
-    shard_roundtrip(&store);
-}
-
-#[test]
-fn memory_shard_delete_idempotent() {
-    let store = crate::MemoryPgStore::new();
-    shard_delete_idempotent(&store);
-}
-
-#[test]
-fn memory_shard_not_found() {
-    let store = crate::MemoryPgStore::new();
-    shard_not_found(&store);
-}
-
-#[test]
-fn memory_shard_overwrite() {
-    let store = crate::MemoryPgStore::new();
-    shard_overwrite(&store);
-}
-
-#[test]
-fn memory_shard_empty_data() {
-    let store = crate::MemoryPgStore::new();
-    shard_empty_data(&store);
-}
-
-#[test]
-fn memory_shard_multiple_keys() {
-    let store = crate::MemoryPgStore::new();
-    shard_multiple_keys(&store);
-}
-
 #[test]
 fn test_shard_key_validation() {
     shard_key_validation();
