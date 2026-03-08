@@ -699,4 +699,664 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, AuthError::ExpiredToken));
     }
+
+    // ── Empty authorization header ────────────────────────────────────
+
+    #[test]
+    fn authenticate_empty_auth_header() {
+        let store = example_store();
+        let headers = [
+            ("authorization", "   "),
+            ("host", "example.com"),
+        ];
+        let err = authenticate_request("GET", "/", "", &headers, b"", &store, "us-east-1", "s3", 0)
+            .unwrap_err();
+        assert!(matches!(err, AuthError::AccessDenied));
+    }
+
+    // ── Presigned: invalid algorithm ──────────────────────────────────
+
+    #[test]
+    fn presigned_invalid_algorithm() {
+        let store = example_store();
+        let query = "X-Amz-Algorithm=AWS4-HMAC-SHA1&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240201%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240201T120000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Signature=abc";
+        let headers = [("host", "example.com")];
+        let err = authenticate_request("GET", "/", query, &headers, b"", &store, "us-east-1", "s3", 0)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AuthError::InvalidQueryParam { param: "X-Amz-Algorithm" }
+        ));
+    }
+
+    // ── Presigned: bad credential scope ───────────────────────────────
+
+    #[test]
+    fn presigned_bad_credential_scope() {
+        let store = example_store();
+        let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKID%2Fbad&X-Amz-Date=20240201T120000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Signature=abc";
+        let headers = [("host", "example.com")];
+        let err = authenticate_request("GET", "/", query, &headers, b"", &store, "us-east-1", "s3", 0)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AuthError::InvalidQueryParam { param: "X-Amz-Credential" }
+        ));
+    }
+
+    // ── Presigned: region mismatch ────────────────────────────────────
+
+    #[test]
+    fn presigned_region_mismatch() {
+        let store = example_store();
+        let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240201%2Feu-west-1%2Fs3%2Faws4_request&X-Amz-Date=20240201T120000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Signature=abc";
+        let headers = [("host", "example.com")];
+        let err = authenticate_request("GET", "/", query, &headers, b"", &store, "us-east-1", "s3", 0)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AuthError::InvalidQueryParam { param: "X-Amz-Credential" }
+        ));
+    }
+
+    // ── Presigned: service mismatch ───────────────────────────────────
+
+    #[test]
+    fn presigned_service_mismatch() {
+        let store = example_store();
+        let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240201%2Fus-east-1%2Fiam%2Faws4_request&X-Amz-Date=20240201T120000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Signature=abc";
+        let headers = [("host", "example.com")];
+        let err = authenticate_request("GET", "/", query, &headers, b"", &store, "us-east-1", "s3", 0)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AuthError::InvalidQueryParam { param: "X-Amz-Credential" }
+        ));
+    }
+
+    // ── Presigned: empty signed headers ───────────────────────────────
+
+    #[test]
+    fn presigned_empty_signed_headers() {
+        let store = example_store();
+        let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240201%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240201T120000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=&X-Amz-Signature=abc";
+        let headers = [("host", "example.com")];
+        let err = authenticate_request("GET", "/", query, &headers, b"", &store, "us-east-1", "s3", 0)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AuthError::InvalidQueryParam { param: "X-Amz-SignedHeaders" }
+        ));
+    }
+
+    // ── Presigned: invalid date format ────────────────────────────────
+
+    #[test]
+    fn presigned_invalid_date() {
+        let store = example_store();
+        let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240201%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=not-a-date&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Signature=abc";
+        let headers = [("host", "example.com")];
+        let err = authenticate_request("GET", "/", query, &headers, b"", &store, "us-east-1", "s3", 0)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AuthError::InvalidQueryParam { param: "X-Amz-Date" }
+        ));
+    }
+
+    // ── Presigned: non-numeric expires ─────────────────────────────────
+
+    #[test]
+    fn presigned_non_numeric_expires() {
+        let store = example_store();
+        let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240201%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240201T120000Z&X-Amz-Expires=abc&X-Amz-SignedHeaders=host&X-Amz-Signature=abc";
+        let headers = [("host", "example.com")];
+        let err = authenticate_request("GET", "/", query, &headers, b"", &store, "us-east-1", "s3", 0)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AuthError::InvalidQueryParam { param: "X-Amz-Expires" }
+        ));
+    }
+
+    // ── Presigned: expires > 604800 ───────────────────────────────────
+
+    #[test]
+    fn presigned_expires_too_large() {
+        let store = example_store();
+        let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240201%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240201T120000Z&X-Amz-Expires=604801&X-Amz-SignedHeaders=host&X-Amz-Signature=abc";
+        let headers = [("host", "example.com")];
+        let err = authenticate_request("GET", "/", query, &headers, b"", &store, "us-east-1", "s3", 0)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AuthError::InvalidQueryParam { param: "X-Amz-Expires" }
+        ));
+    }
+
+    // ── Presigned: expires = 0 ────────────────────────────────────────
+
+    #[test]
+    fn presigned_expires_zero() {
+        let store = example_store();
+        let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240201%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240201T120000Z&X-Amz-Expires=0&X-Amz-SignedHeaders=host&X-Amz-Signature=abc";
+        let headers = [("host", "example.com")];
+        let err = authenticate_request("GET", "/", query, &headers, b"", &store, "us-east-1", "s3", 0)
+            .unwrap_err();
+        assert!(matches!(err, AuthError::RequestExpired));
+    }
+
+    // ── Presigned: missing individual params ──────────────────────────
+
+    #[test]
+    fn presigned_missing_signed_headers() {
+        let store = example_store();
+        let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240201%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240201T120000Z&X-Amz-Expires=900&X-Amz-Signature=abc";
+        let headers = [("host", "example.com")];
+        let err = authenticate_request("GET", "/", query, &headers, b"", &store, "us-east-1", "s3", 0)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AuthError::MissingQueryParam { param: "X-Amz-SignedHeaders" }
+        ));
+    }
+
+    #[test]
+    fn presigned_missing_date() {
+        let store = example_store();
+        let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240201%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Signature=abc";
+        let headers = [("host", "example.com")];
+        let err = authenticate_request("GET", "/", query, &headers, b"", &store, "us-east-1", "s3", 0)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AuthError::MissingQueryParam { param: "X-Amz-Date" }
+        ));
+    }
+
+    #[test]
+    fn presigned_missing_expires() {
+        let store = example_store();
+        let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240201%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240201T120000Z&X-Amz-SignedHeaders=host&X-Amz-Signature=abc";
+        let headers = [("host", "example.com")];
+        let err = authenticate_request("GET", "/", query, &headers, b"", &store, "us-east-1", "s3", 0)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AuthError::MissingQueryParam { param: "X-Amz-Expires" }
+        ));
+    }
+
+    #[test]
+    fn presigned_missing_signature() {
+        let store = example_store();
+        let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240201%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240201T120000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host";
+        let headers = [("host", "example.com")];
+        let err = authenticate_request("GET", "/", query, &headers, b"", &store, "us-east-1", "s3", 0)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AuthError::MissingQueryParam { param: "X-Amz-Signature" }
+        ));
+    }
+
+    // ── Presigned: disabled key ───────────────────────────────────────
+
+    #[test]
+    fn presigned_disabled_key() {
+        let mut store = CredentialStore::new();
+        store.add_record(CredentialRecord {
+            access_key_id: "AKID".to_string(),
+            secret_key: SecretKey::new("secret".to_string()),
+            principal: "p".to_string(),
+            session_token: None,
+            expires_at_epoch_secs: None,
+            enabled: false,
+        });
+        let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKID%2F20240201%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240201T120000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Signature=abc";
+        let headers = [("host", "example.com")];
+        let err = authenticate_request("GET", "/", query, &headers, b"", &store, "us-east-1", "s3", 0)
+            .unwrap_err();
+        assert!(matches!(err, AuthError::UnknownAccessKey));
+    }
+
+    // ── Presigned: unknown key ────────────────────────────────────────
+
+    #[test]
+    fn presigned_unknown_key() {
+        let store = example_store();
+        let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=BADKEY%2F20240201%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240201T120000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Signature=abc";
+        let headers = [("host", "example.com")];
+        let err = authenticate_request("GET", "/", query, &headers, b"", &store, "us-east-1", "s3", 0)
+            .unwrap_err();
+        assert!(matches!(err, AuthError::UnknownAccessKey));
+    }
+
+    // ── validate_record_token_and_expiry ──────────────────────────────
+
+    #[test]
+    fn token_valid_match() {
+        let record = CredentialRecord {
+            access_key_id: "AKID".to_string(),
+            secret_key: SecretKey::new("s".to_string()),
+            principal: "p".to_string(),
+            session_token: Some("tok123".to_string()),
+            expires_at_epoch_secs: None,
+            enabled: true,
+        };
+        validate_record_token_and_expiry(&record, Some("tok123"), 0).unwrap();
+    }
+
+    #[test]
+    fn token_mismatch() {
+        let record = CredentialRecord {
+            access_key_id: "AKID".to_string(),
+            secret_key: SecretKey::new("s".to_string()),
+            principal: "p".to_string(),
+            session_token: Some("expected".to_string()),
+            expires_at_epoch_secs: None,
+            enabled: true,
+        };
+        let err = validate_record_token_and_expiry(&record, Some("wrong"), 0).unwrap_err();
+        assert!(matches!(err, AuthError::InvalidToken));
+    }
+
+    #[test]
+    fn token_missing_when_required() {
+        let record = CredentialRecord {
+            access_key_id: "AKID".to_string(),
+            secret_key: SecretKey::new("s".to_string()),
+            principal: "p".to_string(),
+            session_token: Some("expected".to_string()),
+            expires_at_epoch_secs: None,
+            enabled: true,
+        };
+        let err = validate_record_token_and_expiry(&record, None, 0).unwrap_err();
+        assert!(matches!(err, AuthError::InvalidToken));
+    }
+
+    #[test]
+    fn expiry_not_checked_when_now_zero() {
+        let record = CredentialRecord {
+            access_key_id: "AKID".to_string(),
+            secret_key: SecretKey::new("s".to_string()),
+            principal: "p".to_string(),
+            session_token: None,
+            expires_at_epoch_secs: Some(5),
+            enabled: true,
+        };
+        // now_epoch_secs == 0 skips expiry check
+        validate_record_token_and_expiry(&record, None, 0).unwrap();
+    }
+
+    #[test]
+    fn no_token_no_expiry_ok() {
+        let record = CredentialRecord {
+            access_key_id: "AKID".to_string(),
+            secret_key: SecretKey::new("s".to_string()),
+            principal: "p".to_string(),
+            session_token: None,
+            expires_at_epoch_secs: None,
+            enabled: true,
+        };
+        validate_record_token_and_expiry(&record, None, 100).unwrap();
+    }
+
+    // ── Helper function unit tests ────────────────────────────────────
+
+    #[test]
+    fn query_param_basic() {
+        assert_eq!(query_param("a=1&b=2", "b"), Some("2".to_string()));
+        assert_eq!(query_param("a=1&b=2", "c"), None);
+        assert_eq!(query_param("", "a"), None);
+    }
+
+    #[test]
+    fn query_param_percent_encoded() {
+        assert_eq!(
+            query_param("key=hello%20world", "key"),
+            Some("hello world".to_string())
+        );
+    }
+
+    #[test]
+    fn query_param_no_value() {
+        assert_eq!(query_param("key", "key"), Some("".to_string()));
+    }
+
+    #[test]
+    fn query_without_signature_removes_sig() {
+        assert_eq!(
+            query_without_signature("a=1&X-Amz-Signature=abc&b=2"),
+            "a=1&b=2"
+        );
+    }
+
+    #[test]
+    fn query_without_signature_no_sig() {
+        assert_eq!(query_without_signature("a=1&b=2"), "a=1&b=2");
+    }
+
+    #[test]
+    fn percent_decode_basic() {
+        assert_eq!(percent_decode("hello%20world"), "hello world");
+        assert_eq!(percent_decode("no-encoding"), "no-encoding");
+        assert_eq!(percent_decode("%2F"), "/");
+    }
+
+    #[test]
+    fn percent_decode_invalid_hex() {
+        // %ZZ is not valid hex — should be passed through literally
+        assert_eq!(percent_decode("%ZZ"), "%ZZ");
+    }
+
+    #[test]
+    fn percent_decode_truncated() {
+        // % at end of string — not enough chars for hex pair
+        assert_eq!(percent_decode("abc%"), "abc%");
+        assert_eq!(percent_decode("abc%2"), "abc%2");
+    }
+
+    #[test]
+    fn hex_val_coverage() {
+        assert_eq!(hex_val(b'0'), Some(0));
+        assert_eq!(hex_val(b'9'), Some(9));
+        assert_eq!(hex_val(b'a'), Some(10));
+        assert_eq!(hex_val(b'f'), Some(15));
+        assert_eq!(hex_val(b'A'), Some(10));
+        assert_eq!(hex_val(b'F'), Some(15));
+        assert_eq!(hex_val(b'g'), None);
+        assert_eq!(hex_val(b'G'), None);
+        assert_eq!(hex_val(b' '), None);
+    }
+
+    #[test]
+    fn hex_encode_lower_empty() {
+        assert_eq!(hex_encode_lower(&[]), "");
+    }
+
+    #[test]
+    fn hex_encode_lower_bytes() {
+        assert_eq!(hex_encode_lower(&[0x00, 0xff, 0xab]), "00ffab");
+    }
+
+    #[test]
+    fn header_value_found() {
+        let headers = [("host", "example.com"), ("x-amz-date", "20130524T000000Z")];
+        assert_eq!(header_value(&headers, "host"), Some("example.com"));
+        assert_eq!(header_value(&headers, "missing"), None);
+    }
+
+    // ── Streaming signing context ─────────────────────────────────────
+
+    #[test]
+    fn header_auth_streaming_body_hash() {
+        let store = example_store();
+        // Use STREAMING-AWS4-HMAC-SHA256-PAYLOAD body hash
+        let body_hash = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
+        let headers = [
+            ("host", "examplebucket.s3.amazonaws.com"),
+            ("x-amz-content-sha256", body_hash),
+            ("x-amz-date", "20130524T000000Z"),
+        ];
+        // Build a valid signature for this request
+        let signed_headers_str = "host;x-amz-content-sha256;x-amz-date";
+        let canonical_hdrs = canonical_headers(
+            &headers.iter().map(|&(k, v)| (k, v)).collect::<Vec<_>>(),
+        );
+        let canonical_qs = canonical_query_string("");
+        let creq = crate::canonical::canonical_request(
+            "PUT",
+            "/test.txt",
+            &canonical_qs,
+            &canonical_hdrs,
+            signed_headers_str,
+            body_hash,
+        );
+        let creq_hash = sha256_hex(creq.as_bytes());
+        let scope = "20130524/us-east-1/s3/aws4_request";
+        let sts = crate::canonical::string_to_sign("20130524T000000Z", scope, &creq_hash);
+        let key = crate::sigv4::derive_signing_key(
+            &SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
+            "20130524",
+            "us-east-1",
+            "s3",
+        );
+        let sig = hex_encode_lower(
+            hmac::sign(
+                &hmac::Key::new(hmac::HMAC_SHA256, key.as_ref()),
+                sts.as_bytes(),
+            )
+            .as_ref(),
+        );
+
+        let auth_header = format!(
+            "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders={}, Signature={}",
+            signed_headers_str, sig
+        );
+        let headers_with_auth: Vec<(&str, &str)> = vec![
+            ("authorization", &auth_header),
+            ("host", "examplebucket.s3.amazonaws.com"),
+            ("x-amz-content-sha256", body_hash),
+            ("x-amz-date", "20130524T000000Z"),
+        ];
+        let ctx = authenticate_request(
+            "PUT",
+            "/test.txt",
+            "",
+            &headers_with_auth,
+            b"",
+            &store,
+            "us-east-1",
+            "s3",
+            0,
+        )
+        .unwrap();
+        assert!(ctx.streaming.is_some());
+        let streaming = ctx.streaming.unwrap();
+        assert_eq!(streaming.timestamp, "20130524T000000Z");
+        assert_eq!(streaming.scope, "20130524/us-east-1/s3/aws4_request");
+        assert_eq!(streaming.seed_signature, sig);
+    }
+
+    // ── Header auth: body hash from header vs computed ────────────────
+
+    #[test]
+    fn header_auth_no_content_sha256_computes_hash() {
+        // When x-amz-content-sha256 is absent, body hash is computed from body
+        let store = example_store();
+        let body = b"test body";
+        let body_hash = sha256_hex(body);
+        let headers_for_sig = [
+            ("host", "examplebucket.s3.amazonaws.com"),
+            ("x-amz-date", "20130524T000000Z"),
+        ];
+        let signed_headers_str = "host;x-amz-date";
+        let canonical_hdrs = canonical_headers(&headers_for_sig);
+        let creq = crate::canonical::canonical_request(
+            "PUT",
+            "/test.txt",
+            "",
+            &canonical_hdrs,
+            signed_headers_str,
+            &body_hash,
+        );
+        let creq_hash = sha256_hex(creq.as_bytes());
+        let scope = "20130524/us-east-1/s3/aws4_request";
+        let sts = crate::canonical::string_to_sign("20130524T000000Z", scope, &creq_hash);
+        let key = crate::sigv4::derive_signing_key(
+            &SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
+            "20130524",
+            "us-east-1",
+            "s3",
+        );
+        let sig = hex_encode_lower(
+            hmac::sign(
+                &hmac::Key::new(hmac::HMAC_SHA256, key.as_ref()),
+                sts.as_bytes(),
+            )
+            .as_ref(),
+        );
+        let auth_header = format!(
+            "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders={}, Signature={}",
+            signed_headers_str, sig
+        );
+        let headers_with_auth: Vec<(&str, &str)> = vec![
+            ("authorization", &auth_header),
+            ("host", "examplebucket.s3.amazonaws.com"),
+            ("x-amz-date", "20130524T000000Z"),
+        ];
+        let ctx = authenticate_request(
+            "PUT",
+            "/test.txt",
+            "",
+            &headers_with_auth,
+            body,
+            &store,
+            "us-east-1",
+            "s3",
+            0,
+        )
+        .unwrap();
+        assert!(ctx.streaming.is_none());
+        assert_eq!(ctx.mode, AuthMode::HeaderSigV4);
+    }
+
+    // ── Presigned: security token in query string ─────────────────────
+
+    #[test]
+    fn presigned_security_token_in_query() {
+        let mut store = CredentialStore::new();
+        store.add_record(CredentialRecord {
+            access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            secret_key: SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
+            principal: "u1".to_string(),
+            session_token: Some("session-token-123".to_string()),
+            expires_at_epoch_secs: None,
+            enabled: true,
+        });
+        let base_query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240201%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240201T120000Z&X-Amz-Expires=900&X-Amz-Security-Token=session-token-123&X-Amz-SignedHeaders=host";
+        let headers = [("host", "examplebucket.s3.amazonaws.com")];
+        let query_for_sig = canonical_query_string(base_query);
+        let canonical_req = canonical_request(
+            "GET",
+            "/hello.txt",
+            &query_for_sig,
+            "host:examplebucket.s3.amazonaws.com\n",
+            "host",
+            "UNSIGNED-PAYLOAD",
+        );
+        let canonical_hash = sha256_hex(canonical_req.as_bytes());
+        let scope = "20240201/us-east-1/s3/aws4_request";
+        let sts = string_to_sign("20240201T120000Z", scope, &canonical_hash);
+        let key = crate::sigv4::derive_signing_key(
+            &SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
+            "20240201",
+            "us-east-1",
+            "s3",
+        );
+        let sig = hex_encode_lower(
+            hmac::sign(
+                &hmac::Key::new(hmac::HMAC_SHA256, key.as_ref()),
+                sts.as_bytes(),
+            )
+            .as_ref(),
+        );
+        let full_query = format!("{base_query}&X-Amz-Signature={sig}");
+        let ctx = authenticate_request(
+            "GET",
+            "/hello.txt",
+            &full_query,
+            &headers,
+            b"",
+            &store,
+            "us-east-1",
+            "s3",
+            parse_amz_date("20240201T120500Z").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(ctx.mode, AuthMode::PresignedSigV4);
+    }
+
+    // ── Presigned: token mismatch via query ───────────────────────────
+
+    #[test]
+    fn presigned_token_mismatch_in_query() {
+        let mut store = CredentialStore::new();
+        store.add_record(CredentialRecord {
+            access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            secret_key: SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
+            principal: "u1".to_string(),
+            session_token: Some("expected-token".to_string()),
+            expires_at_epoch_secs: None,
+            enabled: true,
+        });
+        let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240201%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240201T120000Z&X-Amz-Expires=900&X-Amz-Security-Token=wrong-token&X-Amz-SignedHeaders=host&X-Amz-Signature=abc";
+        let headers = [("host", "example.com")];
+        let err = authenticate_request("GET", "/", query, &headers, b"", &store, "us-east-1", "s3", 0)
+            .unwrap_err();
+        assert!(matches!(err, AuthError::InvalidToken));
+    }
+
+    // ── Presigned: expired token ──────────────────────────────────────
+
+    #[test]
+    fn presigned_expired_token() {
+        let mut store = CredentialStore::new();
+        store.add_record(CredentialRecord {
+            access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            secret_key: SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
+            principal: "u1".to_string(),
+            session_token: None,
+            expires_at_epoch_secs: Some(100),
+            enabled: true,
+        });
+        let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240201%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240201T120000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Signature=abc";
+        let headers = [("host", "example.com")];
+        let err = authenticate_request("GET", "/", query, &headers, b"", &store, "us-east-1", "s3", 200)
+            .unwrap_err();
+        assert!(matches!(err, AuthError::ExpiredToken));
+    }
+
+    // ── Presigned: collect_signed_headers missing host ─────────────────
+
+    #[test]
+    fn presigned_signed_header_host_missing() {
+        let store = example_store();
+        // host is in SignedHeaders but not in actual headers
+        let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240201%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240201T120000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Signature=abc";
+        let headers: [(&str, &str); 0] = [];
+        let err = authenticate_request("GET", "/", query, &headers, b"", &store, "us-east-1", "s3", 0)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AuthError::MissingSignedHeader { header: "host" }
+        ));
+    }
+
+    #[test]
+    fn presigned_signed_header_amz_date_missing() {
+        let store = example_store();
+        let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240201%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240201T120000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host;x-amz-date&X-Amz-Signature=abc";
+        let headers = [("host", "example.com")]; // x-amz-date missing from actual headers
+        let err = authenticate_request("GET", "/", query, &headers, b"", &store, "us-east-1", "s3", 0)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AuthError::MissingSignedHeader { header: "x-amz-date" }
+        ));
+    }
+
+    #[test]
+    fn presigned_signed_header_content_sha256_missing() {
+        let store = example_store();
+        let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240201%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240201T120000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host;x-amz-content-sha256&X-Amz-Signature=abc";
+        let headers = [("host", "example.com")]; // x-amz-content-sha256 missing
+        let err = authenticate_request("GET", "/", query, &headers, b"", &store, "us-east-1", "s3", 0)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AuthError::MissingSignedHeader { header: "x-amz-content-sha256" }
+        ));
+    }
 }

@@ -594,6 +594,72 @@ mod tests {
     }
 
     #[test]
+    fn verify_request_disabled_key() {
+        let mut store = CredentialStore::new();
+        store.add_record(crate::credential::CredentialRecord {
+            access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            secret_key: SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
+            principal: "u1".to_string(),
+            session_token: None,
+            expires_at_epoch_secs: None,
+            enabled: false,
+        });
+        let auth_header = "AWS4-HMAC-SHA256 \
+            Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, \
+            SignedHeaders=host;x-amz-date, \
+            Signature=abc";
+        let auth = parse_auth_header(auth_header).unwrap();
+        let headers = [("host", "example.com"), ("x-amz-date", "20130524T000000Z")];
+        let result = verify_request("GET", "/", "", &headers, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", &auth, &store);
+        assert!(matches!(result, Err(AuthError::UnknownAccessKey)));
+    }
+
+    #[test]
+    fn verify_request_unsigned_amz_header() {
+        let store = example_store();
+        let auth_header = "AWS4-HMAC-SHA256 \
+            Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, \
+            SignedHeaders=host;x-amz-content-sha256;x-amz-date, \
+            Signature=abc";
+        let auth = parse_auth_header(auth_header).unwrap();
+        // x-amz-meta-custom is present but not in SignedHeaders
+        let headers = [
+            ("host", "example.com"),
+            ("x-amz-content-sha256", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+            ("x-amz-date", "20130524T000000Z"),
+            ("x-amz-meta-custom", "value"),
+        ];
+        let result = verify_request("GET", "/", "", &headers, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", &auth, &store);
+        assert!(matches!(result, Err(AuthError::UnsignedHeaders { .. })));
+    }
+
+    #[test]
+    fn verify_request_duplicate_unsigned_amz_header() {
+        let store = example_store();
+        let auth_header = "AWS4-HMAC-SHA256 \
+            Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, \
+            SignedHeaders=host;x-amz-content-sha256;x-amz-date, \
+            Signature=abc";
+        let auth = parse_auth_header(auth_header).unwrap();
+        // Two instances of the same unsigned x-amz header — should only appear once in error
+        let headers = [
+            ("host", "example.com"),
+            ("x-amz-content-sha256", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+            ("x-amz-date", "20130524T000000Z"),
+            ("x-amz-meta-custom", "val1"),
+            ("x-amz-meta-custom", "val2"),
+        ];
+        let result = verify_request("GET", "/", "", &headers, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", &auth, &store);
+        match result {
+            Err(AuthError::UnsignedHeaders { headers }) => {
+                assert_eq!(headers.len(), 1, "duplicate should be deduplicated");
+                assert_eq!(headers[0], "x-amz-meta-custom");
+            }
+            other => panic!("expected UnsignedHeaders, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn unknown_access_key_fails() {
         let store = example_store();
 

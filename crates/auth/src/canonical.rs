@@ -460,6 +460,117 @@ mod tests {
         out
     }
 
+    #[test]
+    fn parse_amz_date_boundary_valid() {
+        // Month 1, day 1, time 00:00:00
+        assert!(parse_amz_date("19700101T000000Z").is_some());
+        // Month 12, day 31, time 23:59:59
+        assert!(parse_amz_date("20251231T235959Z").is_some());
+    }
+
+    #[test]
+    fn parse_amz_date_month_zero() {
+        assert!(parse_amz_date("20250024T000000Z").is_none());
+    }
+
+    #[test]
+    fn parse_amz_date_day_zero() {
+        assert!(parse_amz_date("20250100T000000Z").is_none());
+    }
+
+    #[test]
+    fn parse_amz_date_hour_24() {
+        assert!(parse_amz_date("20250101T240000Z").is_none());
+    }
+
+    #[test]
+    fn parse_amz_date_min_60() {
+        assert!(parse_amz_date("20250101T006000Z").is_none());
+    }
+
+    #[test]
+    fn parse_amz_date_sec_60() {
+        assert!(parse_amz_date("20250101T000060Z").is_none());
+    }
+
+    #[test]
+    fn parse_amz_date_before_1970() {
+        assert!(parse_amz_date("19690101T000000Z").is_none());
+    }
+
+    #[test]
+    fn uri_encode_path_percent_at_end() {
+        // % at end of string without enough following chars
+        assert_eq!(uri_encode_path("/a%"), "/a%25");
+        assert_eq!(uri_encode_path("/a%2"), "/a%252");
+    }
+
+    #[test]
+    fn uri_encode_path_invalid_percent_hex() {
+        // %ZZ is not valid hex — should be re-encoded
+        assert_eq!(uri_encode_path("/a%ZZ"), "/a%25ZZ");
+    }
+
+    #[test]
+    fn uri_encode_path_non_ascii_byte() {
+        // Non-unreserved ASCII byte that's not % or /
+        assert_eq!(uri_encode_path("/hello world"), "/hello%20world");
+        assert_eq!(uri_encode_path("/a+b"), "/a%2Bb");
+    }
+
+    #[test]
+    fn percent_decode_upper_and_lower_hex() {
+        assert_eq!(percent_decode("%2f"), "/");
+        assert_eq!(percent_decode("%2F"), "/");
+    }
+
+    #[test]
+    fn percent_decode_percent_at_end() {
+        assert_eq!(percent_decode("abc%"), "abc%");
+        assert_eq!(percent_decode("abc%2"), "abc%2");
+    }
+
+    #[test]
+    fn percent_decode_invalid_hex() {
+        assert_eq!(percent_decode("%GG"), "%GG");
+    }
+
+    #[test]
+    fn hex_val_boundaries() {
+        assert_eq!(hex_val(b'/'), None); // just before '0'
+        assert_eq!(hex_val(b':'), None); // just after '9'
+        assert_eq!(hex_val(b'`'), None); // just before 'a'
+        assert_eq!(hex_val(b'g'), None); // just after 'f'
+        assert_eq!(hex_val(b'@'), None); // just before 'A'
+        assert_eq!(hex_val(b'G'), None); // just after 'F'
+    }
+
+    #[test]
+    fn is_leap_coverage() {
+        assert!(is_leap(2000)); // divisible by 400
+        assert!(!is_leap(1900)); // divisible by 100 but not 400
+        assert!(is_leap(2024)); // divisible by 4 but not 100
+        assert!(!is_leap(2023)); // not divisible by 4
+    }
+
+    #[test]
+    fn days_since_epoch_leap_year_feb() {
+        // 2024-03-01 should include the leap day
+        let days_mar1 = days_since_epoch(2024, 3, 1).unwrap();
+        let days_feb28 = days_since_epoch(2024, 2, 28).unwrap();
+        assert_eq!(days_mar1 - days_feb28, 2); // Feb 29 + Mar 1
+    }
+
+    #[test]
+    fn canonical_headers_empty() {
+        assert_eq!(canonical_headers(&[]), "");
+    }
+
+    #[test]
+    fn canonical_query_string_key_only_no_equals() {
+        assert_eq!(canonical_query_string("lifecycle"), "lifecycle=");
+    }
+
     proptest! {
         #[test]
         fn prop_canonical_query_order_independent(

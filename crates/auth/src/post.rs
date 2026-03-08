@@ -514,4 +514,594 @@ mod tests {
         ];
         validate_post_policy(&policy_b64, &form_fields, 0, "my-bucket", 0).unwrap();
     }
+
+    // ── validate_post_policy error paths ──────────────────────────────
+
+    #[test]
+    fn policy_invalid_base64() {
+        let err = validate_post_policy("!!!not-base64!!!", &[], 0, "b", 0).unwrap_err();
+        assert!(matches!(err, PostPolicyError::Malformed("invalid base64")));
+    }
+
+    #[test]
+    fn policy_invalid_utf8() {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&[0xFF, 0xFE]);
+        let err = validate_post_policy(&b64, &[], 0, "b", 0).unwrap_err();
+        assert!(matches!(err, PostPolicyError::Malformed("invalid UTF-8")));
+    }
+
+    #[test]
+    fn policy_invalid_json() {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(b"not json");
+        let err = validate_post_policy(&b64, &[], 0, "b", 0).unwrap_err();
+        assert!(matches!(err, PostPolicyError::Malformed("invalid JSON")));
+    }
+
+    #[test]
+    fn policy_missing_expiration() {
+        use base64::Engine;
+        let json = serde_json::json!({"conditions": [{"bucket": "b"}]});
+        let b64 = base64::engine::general_purpose::STANDARD.encode(json.to_string().as_bytes());
+        let err = validate_post_policy(&b64, &[], 0, "b", 0).unwrap_err();
+        assert!(matches!(
+            err,
+            PostPolicyError::Malformed("missing expiration")
+        ));
+    }
+
+    #[test]
+    fn policy_missing_conditions() {
+        use base64::Engine;
+        let json = serde_json::json!({"expiration": "2099-12-31T23:59:59Z"});
+        let b64 = base64::engine::general_purpose::STANDARD.encode(json.to_string().as_bytes());
+        let err = validate_post_policy(&b64, &[], 0, "b", 0).unwrap_err();
+        assert!(matches!(
+            err,
+            PostPolicyError::Malformed("missing conditions")
+        ));
+    }
+
+    #[test]
+    fn policy_empty_conditions() {
+        let b64 = future_policy_b64(&[]);
+        let err = validate_post_policy(&b64, &[], 0, "b", 0).unwrap_err();
+        assert!(matches!(
+            err,
+            PostPolicyError::Malformed("empty conditions")
+        ));
+    }
+
+    #[test]
+    fn policy_empty_condition_object() {
+        let b64 = future_policy_b64(&[serde_json::json!({})]);
+        let err = validate_post_policy(&b64, &[], 0, "b", 0).unwrap_err();
+        assert!(matches!(
+            err,
+            PostPolicyError::Malformed("empty condition object")
+        ));
+    }
+
+    #[test]
+    fn policy_condition_value_not_string() {
+        let b64 = future_policy_b64(&[serde_json::json!({"bucket": 42})]);
+        let err = validate_post_policy(&b64, &[], 0, "b", 0).unwrap_err();
+        assert!(matches!(
+            err,
+            PostPolicyError::Malformed("condition value must be string")
+        ));
+    }
+
+    #[test]
+    fn policy_bucket_mismatch() {
+        let b64 = future_policy_b64(&[serde_json::json!({"bucket": "other"})]);
+        let err = validate_post_policy(&b64, &[], 0, "my-bucket", 0).unwrap_err();
+        assert!(matches!(err, PostPolicyError::ConditionFailed("bucket")));
+    }
+
+    #[test]
+    fn policy_exact_match_field_mismatch() {
+        let b64 = future_policy_b64(&[
+            serde_json::json!({"bucket": "b"}),
+            serde_json::json!({"key": "expected"}),
+        ]);
+        let form_fields = vec![("key", "wrong")];
+        let err = validate_post_policy(&b64, &form_fields, 0, "b", 0).unwrap_err();
+        assert!(matches!(
+            err,
+            PostPolicyError::ConditionFailed("exact match")
+        ));
+    }
+
+    #[test]
+    fn policy_exact_match_field_missing() {
+        let b64 = future_policy_b64(&[
+            serde_json::json!({"bucket": "b"}),
+            serde_json::json!({"key": "expected"}),
+        ]);
+        let form_fields: Vec<(&str, &str)> = vec![];
+        let err = validate_post_policy(&b64, &form_fields, 0, "b", 0).unwrap_err();
+        assert!(matches!(
+            err,
+            PostPolicyError::ConditionFailed("exact match")
+        ));
+    }
+
+    // ── Array-form conditions ─────────────────────────────────────────
+
+    #[test]
+    fn policy_starts_with_success() {
+        let b64 = future_policy_b64(&[
+            serde_json::json!({"bucket": "b"}),
+            serde_json::json!(["starts-with", "$key", "uploads/"]),
+        ]);
+        let form_fields = vec![("key", "uploads/photo.jpg")];
+        validate_post_policy(&b64, &form_fields, 0, "b", 0).unwrap();
+    }
+
+    #[test]
+    fn policy_starts_with_failure() {
+        let b64 = future_policy_b64(&[
+            serde_json::json!({"bucket": "b"}),
+            serde_json::json!(["starts-with", "$key", "uploads/"]),
+        ]);
+        let form_fields = vec![("key", "other/photo.jpg")];
+        let err = validate_post_policy(&b64, &form_fields, 0, "b", 0).unwrap_err();
+        assert!(matches!(
+            err,
+            PostPolicyError::ConditionFailed("starts-with")
+        ));
+    }
+
+    #[test]
+    fn policy_starts_with_missing_dollar() {
+        let b64 = future_policy_b64(&[
+            serde_json::json!({"bucket": "b"}),
+            serde_json::json!(["starts-with", "key", "uploads/"]),
+        ]);
+        let form_fields = vec![("key", "uploads/x")];
+        let err = validate_post_policy(&b64, &form_fields, 0, "b", 0).unwrap_err();
+        assert!(matches!(
+            err,
+            PostPolicyError::Malformed("field reference must start with $")
+        ));
+    }
+
+    #[test]
+    fn policy_starts_with_field_not_string() {
+        let b64 = future_policy_b64(&[
+            serde_json::json!({"bucket": "b"}),
+            serde_json::json!(["starts-with", 42, "prefix"]),
+        ]);
+        let err = validate_post_policy(&b64, &[], 0, "b", 0).unwrap_err();
+        assert!(matches!(
+            err,
+            PostPolicyError::Malformed("starts-with field must be string")
+        ));
+    }
+
+    #[test]
+    fn policy_starts_with_prefix_not_string() {
+        let b64 = future_policy_b64(&[
+            serde_json::json!({"bucket": "b"}),
+            serde_json::json!(["starts-with", "$key", 42]),
+        ]);
+        let err = validate_post_policy(&b64, &[], 0, "b", 0).unwrap_err();
+        assert!(matches!(
+            err,
+            PostPolicyError::Malformed("starts-with prefix must be string")
+        ));
+    }
+
+    #[test]
+    fn policy_starts_with_missing_field() {
+        // starts-with on a field not in the form — form_val defaults to ""
+        let b64 = future_policy_b64(&[
+            serde_json::json!({"bucket": "b"}),
+            serde_json::json!(["starts-with", "$key", ""]),
+        ]);
+        // Empty prefix matches anything including empty string
+        validate_post_policy(&b64, &[], 0, "b", 0).unwrap();
+    }
+
+    #[test]
+    fn policy_eq_success() {
+        let b64 = future_policy_b64(&[
+            serde_json::json!({"bucket": "b"}),
+            serde_json::json!(["eq", "$key", "exact-value"]),
+        ]);
+        let form_fields = vec![("key", "exact-value")];
+        validate_post_policy(&b64, &form_fields, 0, "b", 0).unwrap();
+    }
+
+    #[test]
+    fn policy_eq_failure() {
+        let b64 = future_policy_b64(&[
+            serde_json::json!({"bucket": "b"}),
+            serde_json::json!(["eq", "$key", "expected"]),
+        ]);
+        let form_fields = vec![("key", "wrong")];
+        let err = validate_post_policy(&b64, &form_fields, 0, "b", 0).unwrap_err();
+        assert!(matches!(err, PostPolicyError::ConditionFailed("eq")));
+    }
+
+    #[test]
+    fn policy_eq_field_not_string() {
+        let b64 = future_policy_b64(&[
+            serde_json::json!({"bucket": "b"}),
+            serde_json::json!(["eq", 42, "val"]),
+        ]);
+        let err = validate_post_policy(&b64, &[], 0, "b", 0).unwrap_err();
+        assert!(matches!(
+            err,
+            PostPolicyError::Malformed("eq field must be string")
+        ));
+    }
+
+    #[test]
+    fn policy_eq_value_not_string() {
+        let b64 = future_policy_b64(&[
+            serde_json::json!({"bucket": "b"}),
+            serde_json::json!(["eq", "$key", 42]),
+        ]);
+        let err = validate_post_policy(&b64, &[], 0, "b", 0).unwrap_err();
+        assert!(matches!(
+            err,
+            PostPolicyError::Malformed("eq value must be string")
+        ));
+    }
+
+    #[test]
+    fn policy_eq_missing_dollar() {
+        let b64 = future_policy_b64(&[
+            serde_json::json!({"bucket": "b"}),
+            serde_json::json!(["eq", "key", "val"]),
+        ]);
+        let err = validate_post_policy(&b64, &[], 0, "b", 0).unwrap_err();
+        assert!(matches!(
+            err,
+            PostPolicyError::Malformed("field reference must start with $")
+        ));
+    }
+
+    // ── content-length-range ──────────────────────────────────────────
+
+    #[test]
+    fn policy_content_length_range_success() {
+        let b64 = future_policy_b64(&[
+            serde_json::json!({"bucket": "b"}),
+            serde_json::json!(["content-length-range", 0, 1024]),
+        ]);
+        validate_post_policy(&b64, &[], 512, "b", 0).unwrap();
+    }
+
+    #[test]
+    fn policy_content_length_range_too_small() {
+        let b64 = future_policy_b64(&[
+            serde_json::json!({"bucket": "b"}),
+            serde_json::json!(["content-length-range", 100, 1024]),
+        ]);
+        let err = validate_post_policy(&b64, &[], 50, "b", 0).unwrap_err();
+        assert!(matches!(
+            err,
+            PostPolicyError::ConditionFailed("content-length-range")
+        ));
+    }
+
+    #[test]
+    fn policy_content_length_range_too_large() {
+        let b64 = future_policy_b64(&[
+            serde_json::json!({"bucket": "b"}),
+            serde_json::json!(["content-length-range", 0, 100]),
+        ]);
+        let err = validate_post_policy(&b64, &[], 200, "b", 0).unwrap_err();
+        assert!(matches!(
+            err,
+            PostPolicyError::ConditionFailed("content-length-range")
+        ));
+    }
+
+    #[test]
+    fn policy_content_length_range_negative_min() {
+        let b64 = future_policy_b64(&[
+            serde_json::json!({"bucket": "b"}),
+            serde_json::json!(["content-length-range", -1, 100]),
+        ]);
+        let err = validate_post_policy(&b64, &[], 0, "b", 0).unwrap_err();
+        assert!(matches!(
+            err,
+            PostPolicyError::Malformed("content-length-range values must be non-negative")
+        ));
+    }
+
+    #[test]
+    fn policy_content_length_range_negative_max() {
+        let b64 = future_policy_b64(&[
+            serde_json::json!({"bucket": "b"}),
+            serde_json::json!(["content-length-range", 0, -1]),
+        ]);
+        let err = validate_post_policy(&b64, &[], 0, "b", 0).unwrap_err();
+        assert!(matches!(
+            err,
+            PostPolicyError::Malformed("content-length-range values must be non-negative")
+        ));
+    }
+
+    #[test]
+    fn policy_content_length_range_non_integer_min() {
+        let b64 = future_policy_b64(&[
+            serde_json::json!({"bucket": "b"}),
+            serde_json::json!(["content-length-range", "abc", 100]),
+        ]);
+        let err = validate_post_policy(&b64, &[], 0, "b", 0).unwrap_err();
+        assert!(matches!(
+            err,
+            PostPolicyError::Malformed("content-length-range min must be integer")
+        ));
+    }
+
+    #[test]
+    fn policy_content_length_range_non_integer_max() {
+        let b64 = future_policy_b64(&[
+            serde_json::json!({"bucket": "b"}),
+            serde_json::json!(["content-length-range", 0, "abc"]),
+        ]);
+        let err = validate_post_policy(&b64, &[], 0, "b", 0).unwrap_err();
+        assert!(matches!(
+            err,
+            PostPolicyError::Malformed("content-length-range max must be integer")
+        ));
+    }
+
+    #[test]
+    fn policy_content_length_range_wrong_arg_count() {
+        let b64 = future_policy_b64(&[
+            serde_json::json!({"bucket": "b"}),
+            serde_json::json!(["content-length-range", 0]),
+        ]);
+        let err = validate_post_policy(&b64, &[], 0, "b", 0).unwrap_err();
+        assert!(matches!(
+            err,
+            PostPolicyError::Malformed("content-length-range requires exactly 2 arguments")
+        ));
+    }
+
+    #[test]
+    fn policy_array_operator_not_string() {
+        let b64 = future_policy_b64(&[
+            serde_json::json!({"bucket": "b"}),
+            serde_json::json!([42, "$key", "val"]),
+        ]);
+        let err = validate_post_policy(&b64, &[], 0, "b", 0).unwrap_err();
+        assert!(matches!(
+            err,
+            PostPolicyError::Malformed("condition operator must be string")
+        ));
+    }
+
+    #[test]
+    fn policy_case_insensitive_starts_with() {
+        // "Starts-With" should match case-insensitively
+        let b64 = future_policy_b64(&[
+            serde_json::json!({"bucket": "b"}),
+            serde_json::json!(["Starts-With", "$key", ""]),
+        ]);
+        let form_fields = vec![("key", "anything")];
+        validate_post_policy(&b64, &form_fields, 0, "b", 0).unwrap();
+    }
+
+    #[test]
+    fn policy_case_insensitive_eq() {
+        // "EQ" should match case-insensitively
+        let b64 = future_policy_b64(&[
+            serde_json::json!({"bucket": "b"}),
+            serde_json::json!(["EQ", "$key", "val"]),
+        ]);
+        let form_fields = vec![("key", "val")];
+        validate_post_policy(&b64, &form_fields, 0, "b", 0).unwrap();
+    }
+
+    #[test]
+    fn policy_expired() {
+        let b64 = future_policy_b64(&[serde_json::json!({"bucket": "b"})]);
+        // future_policy_b64 uses 2099 expiration, so use a huge now value
+        let err =
+            validate_post_policy(&b64, &[], 0, "b", 99_999_999_999).unwrap_err();
+        assert!(matches!(err, PostPolicyError::Expired));
+    }
+
+    #[test]
+    fn policy_expiration_invalid_format() {
+        use base64::Engine;
+        let json = serde_json::json!({
+            "expiration": "not-a-date",
+            "conditions": [{"bucket": "b"}],
+        });
+        let b64 = base64::engine::general_purpose::STANDARD.encode(json.to_string().as_bytes());
+        let err = validate_post_policy(&b64, &[], 0, "b", 0).unwrap_err();
+        assert!(matches!(
+            err,
+            PostPolicyError::Malformed("invalid expiration date format")
+        ));
+    }
+
+    // ── authenticate_post_sigv4 edge cases ────────────────────────────
+
+    #[test]
+    fn sigv4_post_credential_wrong_suffix() {
+        let store = test_store();
+        let err = authenticate_post_sigv4(
+            "AWS4-HMAC-SHA256",
+            "testAccessKey123/20250101/us-east-1/s3/wrong",
+            "20250101T000000Z",
+            "policy",
+            "sig",
+            &store,
+        )
+        .unwrap_err();
+        assert!(matches!(err, AuthError::MalformedAuth));
+    }
+
+    #[test]
+    fn sigv4_post_empty_access_key() {
+        let store = test_store();
+        let err = authenticate_post_sigv4(
+            "AWS4-HMAC-SHA256",
+            "/20250101/us-east-1/s3/aws4_request",
+            "20250101T000000Z",
+            "policy",
+            "sig",
+            &store,
+        )
+        .unwrap_err();
+        assert!(matches!(err, AuthError::MalformedAuth));
+    }
+
+    #[test]
+    fn sigv4_post_date_too_short() {
+        let store = test_store();
+        let err = authenticate_post_sigv4(
+            "AWS4-HMAC-SHA256",
+            "testAccessKey123/20250101/us-east-1/s3/aws4_request",
+            "short",
+            "policy",
+            "sig",
+            &store,
+        )
+        .unwrap_err();
+        assert!(matches!(err, AuthError::MalformedAuth));
+    }
+
+    #[test]
+    fn sigv4_post_disabled_key() {
+        let mut store = CredentialStore::new();
+        store.add_record(crate::credential::CredentialRecord {
+            access_key_id: "AKID".to_string(),
+            secret_key: SecretKey::new("secret".to_string()),
+            principal: "p".to_string(),
+            session_token: None,
+            expires_at_epoch_secs: None,
+            enabled: false,
+        });
+        let err = authenticate_post_sigv4(
+            "AWS4-HMAC-SHA256",
+            "AKID/20250101/us-east-1/s3/aws4_request",
+            "20250101T000000Z",
+            "policy",
+            "sig",
+            &store,
+        )
+        .unwrap_err();
+        assert!(matches!(err, AuthError::UnknownAccessKey));
+    }
+
+    // ── parse_iso8601 edge cases ──────────────────────────────────────
+
+    #[test]
+    fn parse_iso8601_no_z_suffix() {
+        assert!(parse_iso8601("2025-01-01T00:00:00").is_none());
+    }
+
+    #[test]
+    fn parse_iso8601_no_t_separator() {
+        assert!(parse_iso8601("2025-01-01 00:00:00Z").is_none());
+    }
+
+    #[test]
+    fn parse_iso8601_bad_date_parts() {
+        assert!(parse_iso8601("2025-01T00:00:00Z").is_none());
+    }
+
+    #[test]
+    fn parse_iso8601_bad_time_parts() {
+        assert!(parse_iso8601("2025-01-01T00:00Z").is_none());
+    }
+
+    #[test]
+    fn parse_iso8601_non_numeric() {
+        assert!(parse_iso8601("abcd-ef-ghTij:kl:mnZ").is_none());
+    }
+
+    // ── find_field ────────────────────────────────────────────────────
+
+    #[test]
+    fn find_field_case_insensitive() {
+        let fields = vec![("Content-Type", "text/plain")];
+        assert_eq!(find_field(&fields, "content-type"), Some("text/plain"));
+    }
+
+    #[test]
+    fn find_field_missing() {
+        let fields: Vec<(&str, &str)> = vec![];
+        assert_eq!(find_field(&fields, "key"), None);
+    }
+
+    // ── Exempt form fields ────────────────────────────────────────────
+
+    #[test]
+    fn policy_allows_signature_field() {
+        let b64 = future_policy_b64(&[serde_json::json!({"bucket": "b"})]);
+        let form_fields = vec![("signature", "old-sig")];
+        validate_post_policy(&b64, &form_fields, 0, "b", 0).unwrap();
+    }
+
+    #[test]
+    fn policy_allows_awsaccesskeyid_field() {
+        let b64 = future_policy_b64(&[serde_json::json!({"bucket": "b"})]);
+        let form_fields = vec![("AWSAccessKeyId", "AKID")];
+        validate_post_policy(&b64, &form_fields, 0, "b", 0).unwrap();
+    }
+
+    #[test]
+    fn policy_allows_file_field() {
+        let b64 = future_policy_b64(&[serde_json::json!({"bucket": "b"})]);
+        let form_fields = vec![("file", "data")];
+        validate_post_policy(&b64, &form_fields, 0, "b", 0).unwrap();
+    }
+
+    // ── Unknown operator in 3-element array is silently ignored ───────
+
+    #[test]
+    fn policy_unknown_operator_ignored() {
+        let b64 = future_policy_b64(&[
+            serde_json::json!({"bucket": "b"}),
+            serde_json::json!(["unknown-op", "$key", "val"]),
+        ]);
+        // The unknown op is skipped, but "key" form field has no covering condition
+        // so it should fail if present
+        validate_post_policy(&b64, &[], 0, "b", 0).unwrap();
+    }
+
+    // ── Condition that is neither object nor array is silently ignored ─
+
+    #[test]
+    fn policy_scalar_condition_ignored() {
+        let b64 = future_policy_b64(&[
+            serde_json::json!({"bucket": "b"}),
+            serde_json::json!("just a string"),
+        ]);
+        validate_post_policy(&b64, &[], 0, "b", 0).unwrap();
+    }
+
+    // ── date_to_epoch and is_leap coverage ────────────────────────────
+
+    #[test]
+    fn date_to_epoch_leap_year() {
+        // 2000-03-01 (2000 is a leap year divisible by 400)
+        let epoch = date_to_epoch(2000, 3, 1, 0, 0, 0);
+        // 2000-01-01 = day 10957 from 1970-01-01
+        // Jan: 31, Feb: 29 (leap), so Mar 1 = 10957 + 31 + 29 = 11017
+        assert_eq!(epoch, 11017 * 86400);
+    }
+
+    #[test]
+    fn date_to_epoch_non_leap_century() {
+        // 1900 is divisible by 100 but not 400, so not a leap year
+        // Test via is_leap directly
+        assert!(!is_leap(1900));
+        assert!(is_leap(2000));
+        assert!(is_leap(2024));
+        assert!(!is_leap(2023));
+    }
 }
