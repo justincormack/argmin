@@ -51,18 +51,14 @@ async fn main() {
     // (PG access serialized by mutex).
     let mut frontends = Vec::with_capacity(config.workers as usize);
     for _ in 0..config.workers {
-        let coordinator = match Coordinator::new(
-            Arc::clone(&storage_node),
-            ec_config,
-            config.pg_count,
-            config.region.clone(),
-        ) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("failed to create coordinator: {}", e);
-                std::process::exit(1);
-            }
-        };
+        let coordinator =
+            match Coordinator::new(Arc::clone(&storage_node), ec_config, config.region.clone()) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("failed to create coordinator: {}", e);
+                    std::process::exit(1);
+                }
+            };
         let mut credentials = CredentialStore::new();
         credentials.add(
             config.access_key_id.clone(),

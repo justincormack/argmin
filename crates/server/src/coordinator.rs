@@ -21,9 +21,9 @@ use crate::etag::{
     format_object_etag,
 };
 use crate::metadata_blob::MetadataBlob;
-use crate::pg::{
-    chunk_key_hash, derive_bucket_pg, derive_pg, derive_pg_shards, object_key_hash, part_key_hash,
-};
+#[cfg(test)]
+use crate::pg::derive_pg_shards;
+use crate::pg::{chunk_key_hash, object_key_hash, part_key_hash, PgTopology};
 use crate::range::ByteRange;
 
 /// Maximum object size for single PUT or upload part (5 GiB, matches AWS S3).
@@ -368,9 +368,9 @@ struct LockedWriteObject<'a> {
 /// The coordinator ties together EC, storage, and metadata.
 pub struct Coordinator {
     storage_node: Arc<SharedStorageNode>,
+    pg_topology: PgTopology,
     ec_codec: ErasureCodec,
     ec_config: EcConfig,
-    pg_count: u32,
     region: String,
 }
 
@@ -379,15 +379,19 @@ impl Coordinator {
     pub fn new(
         storage_node: Arc<SharedStorageNode>,
         ec_config: EcConfig,
-        pg_count: u32,
         region: String,
     ) -> Result<Self, ServerError> {
         let ec_codec = ErasureCodec::new(ec_config)?;
+        let pg_topology = PgTopology::new(storage_node.pg_ids()).map_err(|reason| {
+            ServerError::InternalError {
+                reason: reason.to_string(),
+            }
+        })?;
         Ok(Self {
             storage_node,
+            pg_topology,
             ec_codec,
             ec_config,
-            pg_count,
             region,
         })
     }
@@ -396,8 +400,20 @@ impl Coordinator {
         &self.region
     }
 
+    fn bucket_pg_id(&self, bucket: &str) -> u32 {
+        self.pg_topology.bucket_pg(bucket)
+    }
+
+    fn object_pg_id(&self, bucket: &str, key: &str) -> u32 {
+        self.pg_topology.object_pg(bucket, key)
+    }
+
+    fn shard_pg_id(&self, bucket: &str, key: &str, version_id: u64) -> u32 {
+        self.pg_topology.shard_pg(bucket, key, version_id)
+    }
+
     fn get_bucket_pg(&self, bucket: &str) -> Result<MutexGuard<'_, storage::PgStore>, ServerError> {
-        let pg_id = derive_bucket_pg(bucket, self.pg_count);
+        let pg_id = self.bucket_pg_id(bucket);
         Ok(self.storage_node.get_pg(pg_id)?)
     }
 
@@ -439,7 +455,7 @@ impl Coordinator {
 
         // Check emptiness: list all object versions (including delete markers)
         // and multipart uploads across all PGs.
-        for &pg_id in self.storage_node.pg_ids() {
+        self.pg_topology.for_each_pg(|pg_id| {
             let pg = self.storage_node.get_pg(pg_id)?;
             let resp = pg.list_object_versions(&ListObjectVersionsReq {
                 bucket: name.to_string(),
@@ -461,7 +477,8 @@ impl Coordinator {
             if !mpu_resp.uploads.is_empty() {
                 return Err(ServerError::BucketNotEmpty);
             }
-        }
+            Ok::<(), ServerError>(())
+        })?;
 
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg.delete_bucket(name).map_err(|e| match e {
@@ -488,11 +505,12 @@ impl Coordinator {
         owner_principal: &str,
     ) -> Result<Vec<BucketInfo>, ServerError> {
         let mut out = Vec::new();
-        for &pg_id in self.storage_node.pg_ids() {
+        self.pg_topology.for_each_pg(|pg_id| {
             let pg = self.storage_node.get_pg(pg_id)?;
             let mut buckets = pg.list_buckets(owner_principal)?;
             out.append(&mut buckets);
-        }
+            Ok::<(), ServerError>(())
+        })?;
         out.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(out)
     }
@@ -684,7 +702,7 @@ impl Coordinator {
         tags: &str,
     ) -> Result<(), ServerError> {
         self.head_bucket(bucket)?;
-        let pg_id = derive_pg(bucket, key, self.pg_count);
+        let pg_id = self.object_pg_id(bucket, key);
         let pg = self.storage_node.get_pg(pg_id)?;
         let record = match version_id {
             Some(vid) => pg.get_object_version(bucket, key, vid),
@@ -708,7 +726,7 @@ impl Coordinator {
         version_id: Option<u64>,
     ) -> Result<Option<String>, ServerError> {
         self.head_bucket(bucket)?;
-        let pg_id = derive_pg(bucket, key, self.pg_count);
+        let pg_id = self.object_pg_id(bucket, key);
         let pg = self.storage_node.get_pg(pg_id)?;
         let record = match version_id {
             Some(vid) => pg.get_object_version(bucket, key, vid),
@@ -732,7 +750,7 @@ impl Coordinator {
         version_id: Option<u64>,
     ) -> Result<(), ServerError> {
         self.head_bucket(bucket)?;
-        let pg_id = derive_pg(bucket, key, self.pg_count);
+        let pg_id = self.object_pg_id(bucket, key);
         let pg = self.storage_node.get_pg(pg_id)?;
         let record = match version_id {
             Some(vid) => pg.get_object_version(bucket, key, vid),
@@ -965,7 +983,7 @@ impl Coordinator {
         });
 
         // Lock metadata PG and create session.
-        let meta_pg_id = derive_pg(bucket, key, self.pg_count);
+        let meta_pg_id = self.object_pg_id(bucket, key);
         let pg = self.storage_node.get_pg(meta_pg_id)?;
         pg.create_stream_upload(&CreateStreamUploadReq {
             session_id: session_id.clone(),
@@ -998,7 +1016,7 @@ impl Coordinator {
         }
 
         // Lock metadata PG and validate upload exists.
-        let meta_pg_id = derive_pg(bucket, key, self.pg_count);
+        let meta_pg_id = self.object_pg_id(bucket, key);
         let pg = self.storage_node.get_pg(meta_pg_id)?;
 
         let upload = pg.get_multipart_upload(upload_id)?;
@@ -1054,17 +1072,13 @@ impl Coordinator {
         chunk_index: u32,
         data: &[u8],
     ) -> Result<(), ServerError> {
-        let meta_pg_id = derive_pg(bucket, key, self.pg_count);
+        let meta_pg_id = self.object_pg_id(bucket, key);
 
         // Derive chunk shard placement.
         let chunk_okh = chunk_key_hash(session_id, chunk_index);
         let chunk_vid: u64 = 0;
-        let shard_pg_id = derive_pg_shards(
-            &format!("chunk/{session_id}"),
-            &chunk_index.to_string(),
-            0,
-            self.pg_count,
-        );
+        let shard_pg_id =
+            self.shard_pg_id(&format!("chunk/{session_id}"), &chunk_index.to_string(), 0);
 
         // Lock metadata PG + shard PG in global ascending order.
         let (meta_guard, shard_guard) = if shard_pg_id == meta_pg_id {
@@ -1190,7 +1204,7 @@ impl Coordinator {
         let bucket_info = self.head_bucket(bucket)?;
         let blob_bytes = metadata_blob.serialize()?;
 
-        let meta_pg_id = derive_pg(bucket, key, self.pg_count);
+        let meta_pg_id = self.object_pg_id(bucket, key);
         let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
 
         // Validate session is InProgress and matches bucket/key.
@@ -1313,7 +1327,7 @@ impl Coordinator {
         claimed_checksum: Option<(ChecksumAlgorithm, &str)>,
         computed_checksum: Option<(ChecksumAlgorithm, Vec<u8>)>,
     ) -> Result<UploadPartResult, ServerError> {
-        let meta_pg_id = derive_pg(bucket, key, self.pg_count);
+        let meta_pg_id = self.object_pg_id(bucket, key);
         let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
 
         // Validate session.
@@ -1466,11 +1480,10 @@ impl Coordinator {
             // Clean old non-streaming shards.
             let old_okh = part_key_hash(upload_id, part_number, old_gen);
             let old_vid = old_gen as u64;
-            let old_shard_pg_id = derive_pg_shards(
+            let old_shard_pg_id = self.shard_pg_id(
                 &format!("mpu/{upload_id}"),
                 &format!("{part_number}/{old_gen}"),
                 old_vid,
-                self.pg_count,
             );
             if let Ok(old_pg) = self.storage_node.get_pg(old_shard_pg_id) {
                 let k = self.ec_config.data_shards as usize;
@@ -1510,7 +1523,7 @@ impl Coordinator {
         key: &str,
         session_id: &str,
     ) -> Result<(), ServerError> {
-        let meta_pg_id = derive_pg(bucket, key, self.pg_count);
+        let meta_pg_id = self.object_pg_id(bucket, key);
         let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
 
         // Validate session exists and matches bucket/key.
@@ -1568,15 +1581,15 @@ impl Coordinator {
         let cutoff = now.saturating_sub(max_age_ms);
         let mut count = 0;
 
-        for pg_id in 0..self.pg_count {
+        let _ = self.pg_topology.for_each_pg(|pg_id| {
             let pg = match self.storage_node.get_pg(pg_id) {
                 Ok(pg) => pg,
-                Err(_) => continue,
+                Err(_) => return Ok::<(), ()>(()),
             };
 
             let sessions = match pg.list_all_stream_uploads() {
                 Ok(s) => s,
-                Err(_) => continue,
+                Err(_) => return Ok::<(), ()>(()),
             };
 
             // Drop the PG lock before aborting — abort_stream_put acquires
@@ -1592,7 +1605,8 @@ impl Coordinator {
                     count += 1;
                 }
             }
-        }
+            Ok::<(), ()>(())
+        });
 
         count
     }
@@ -1866,12 +1880,12 @@ impl Coordinator {
         key: &str,
         version_id: Option<u64>,
     ) -> Result<LockedReadObject<'a>, ServerError> {
-        let meta_pg_id = derive_pg(bucket, key, self.pg_count);
+        let meta_pg_id = self.object_pg_id(bucket, key);
 
         loop {
             let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
             let record = Self::lookup_object_record(&meta_guard, bucket, key, version_id)?;
-            let shard_pg_id = derive_pg_shards(bucket, key, record.version_id, self.pg_count);
+            let shard_pg_id = self.shard_pg_id(bucket, key, record.version_id);
 
             if shard_pg_id == meta_pg_id {
                 return Ok(LockedReadObject {
@@ -1894,8 +1908,7 @@ impl Coordinator {
             let (meta_guard, shard_guard) =
                 self.storage_node.lock_two_pgs(meta_pg_id, shard_pg_id)?;
             let record = Self::lookup_object_record(&meta_guard, bucket, key, version_id)?;
-            let verify_shard_pg_id =
-                derive_pg_shards(bucket, key, record.version_id, self.pg_count);
+            let verify_shard_pg_id = self.shard_pg_id(bucket, key, record.version_id);
 
             // Latest-version target changed while relocking; try again with new mapping.
             if verify_shard_pg_id != shard_pg_id {
@@ -1919,7 +1932,7 @@ impl Coordinator {
         key: &str,
         versioning_state: u8,
     ) -> Result<LockedWriteObject<'a>, ServerError> {
-        let meta_pg_id = derive_pg(bucket, key, self.pg_count);
+        let meta_pg_id = self.object_pg_id(bucket, key);
 
         loop {
             let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
@@ -1928,7 +1941,7 @@ impl Coordinator {
             } else {
                 0
             };
-            let shard_pg_id = derive_pg_shards(bucket, key, version_id, self.pg_count);
+            let shard_pg_id = self.shard_pg_id(bucket, key, version_id);
 
             if shard_pg_id == meta_pg_id {
                 return Ok(LockedWriteObject {
@@ -1961,7 +1974,7 @@ impl Coordinator {
             } else {
                 0
             };
-            let verify_shard_pg_id = derive_pg_shards(bucket, key, version_id, self.pg_count);
+            let verify_shard_pg_id = self.shard_pg_id(bucket, key, version_id);
             if verify_shard_pg_id != shard_pg_id {
                 continue;
             }
@@ -2502,7 +2515,7 @@ impl Coordinator {
         let mut offset: usize = 0;
 
         // Metadata PG for looking up chunk manifests of streaming parts.
-        let meta_pg_id = derive_pg(bucket, key, self.pg_count);
+        let meta_pg_id = self.object_pg_id(bucket, key);
 
         for part in parts {
             let part_start = offset;
@@ -2733,7 +2746,7 @@ impl Coordinator {
                 Ok(vec![])
             } else if part.part_okh == [0u8; 16] {
                 // Streaming part: read via chunk manifest from metadata PG.
-                let meta_pg_id = derive_pg(bucket, key, self.pg_count);
+                let meta_pg_id = self.object_pg_id(bucket, key);
                 let chunks = {
                     let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
                     meta_pg
@@ -3445,7 +3458,7 @@ impl Coordinator {
 
             // Versioned/Suspended + no versionId: insert delete marker
             (_, None) => {
-                let meta_pg_id = derive_pg(bucket, key, self.pg_count);
+                let meta_pg_id = self.object_pg_id(bucket, key);
                 let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
                 let marker_vid = meta_pg.next_version_id(bucket, key)?;
                 meta_pg.put_object_meta(&PutObjectMetaReq {
@@ -3509,7 +3522,10 @@ impl Coordinator {
         // Fan out to all PGs and collect results, with a hard memory cap.
         let mut all_objects: Vec<ObjectRecord> = Vec::new();
         let mut hit_record_cap = false;
-        for &pg_id in self.storage_node.pg_ids() {
+        self.pg_topology.for_each_pg(|pg_id| {
+            if hit_record_cap {
+                return Ok::<(), ServerError>(());
+            }
             let pg = self.storage_node.get_pg(pg_id)?;
             let resp = pg.list_objects(&ListObjectsReq {
                 bucket: bucket.to_string(),
@@ -3521,9 +3537,9 @@ impl Coordinator {
             if all_objects.len() >= MAX_LIST_RECORDS {
                 all_objects.truncate(MAX_LIST_RECORDS);
                 hit_record_cap = true;
-                break;
             }
-        }
+            Ok::<(), ServerError>(())
+        })?;
 
         // Sort by key
         all_objects.sort_by(|a, b| a.key.cmp(&b.key));
@@ -3650,7 +3666,7 @@ impl Coordinator {
 
         // Fan out to all PGs and collect version records
         let mut all_versions: Vec<ObjectRecord> = Vec::new();
-        for &pg_id in self.storage_node.pg_ids() {
+        self.pg_topology.for_each_pg(|pg_id| {
             let pg = self.storage_node.get_pg(pg_id)?;
             let resp = pg.list_object_versions(&ListObjectVersionsReq {
                 bucket: bucket.to_string(),
@@ -3660,7 +3676,8 @@ impl Coordinator {
                 max_keys: max_keys.saturating_add(1),
             })?;
             all_versions.extend(resp.versions);
-        }
+            Ok::<(), ServerError>(())
+        })?;
 
         // Sort by (key ASC, version_id DESC)
         all_versions.sort_by(|a, b| a.key.cmp(&b.key).then(b.version_id.cmp(&a.version_id)));
@@ -3784,7 +3801,7 @@ impl Coordinator {
         let metadata_blob = metadata.serialize()?;
 
         // Lock metadata PG and insert upload record.
-        let meta_pg_id = derive_pg(bucket, key, self.pg_count);
+        let meta_pg_id = self.object_pg_id(bucket, key);
         let pg = self.storage_node.get_pg(meta_pg_id)?;
         pg.create_multipart_upload(&CreateMultipartUploadReq {
             upload_id: upload_id.clone(),
@@ -3976,7 +3993,7 @@ impl Coordinator {
         //    The shard PG depends on the generation, which is read from metadata.
         //    We use the same loop-and-revalidate pattern as lock_object_pgs_for_write:
         //    if meta_pg_id > shard_pg_id, drop, relock in order, and re-read.
-        let meta_pg_id = derive_pg(bucket, key, self.pg_count);
+        let meta_pg_id = self.object_pg_id(bucket, key);
 
         let (meta_pg, shard_guard, generation, _shard_pg_id, upload_checksum_algo) = loop {
             let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
@@ -4002,11 +4019,10 @@ impl Coordinator {
                 Err(e) => return Err(ServerError::Metadata(e)),
             };
 
-            let shard_pg_id = derive_pg_shards(
+            let shard_pg_id = self.shard_pg_id(
                 &format!("mpu/{upload_id}"),
                 &format!("{part_number}/{generation}"),
                 generation as u64,
-                self.pg_count,
             );
 
             if shard_pg_id == meta_pg_id {
@@ -4048,11 +4064,10 @@ impl Coordinator {
                 Err(e) => return Err(ServerError::Metadata(e)),
             };
 
-            let verify_shard_pg_id = derive_pg_shards(
+            let verify_shard_pg_id = self.shard_pg_id(
                 &format!("mpu/{upload_id}"),
                 &format!("{part_number}/{generation}"),
                 generation as u64,
-                self.pg_count,
             );
 
             // Generation changed while relocking — shard PG may differ. Retry.
@@ -4187,11 +4202,10 @@ impl Coordinator {
         if let Some(old_gen) = prev_gen {
             let old_okh = part_key_hash(upload_id, part_number, old_gen);
             let old_vid = old_gen as u64;
-            let old_shard_pg_id = derive_pg_shards(
+            let old_shard_pg_id = self.shard_pg_id(
                 &format!("mpu/{upload_id}"),
                 &format!("{part_number}/{old_gen}"),
                 old_vid,
-                self.pg_count,
             );
             if let Ok(old_pg) = self.storage_node.get_pg(old_shard_pg_id) {
                 for i in 0..(k + m) {
@@ -4248,7 +4262,7 @@ impl Coordinator {
         }
 
         // 3. Lock meta PG and validate upload.
-        let meta_pg_id = derive_pg(bucket, key, self.pg_count);
+        let meta_pg_id = self.object_pg_id(bucket, key);
         let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
 
         let upload = meta_pg.get_multipart_upload(upload_id)?;
@@ -4523,11 +4537,10 @@ impl Coordinator {
         let object_parts: Vec<ObjectPartRecord> = part_records
             .iter()
             .map(|p| {
-                let shard_pg_id = derive_pg_shards(
+                let shard_pg_id = self.shard_pg_id(
                     &format!("mpu/{}", p.upload_id),
                     &format!("{}/{}", p.part_number, p.generation),
                     p.part_vid,
-                    self.pg_count,
                 );
                 ObjectPartRecord {
                     bucket: bucket.to_string(),
@@ -4573,7 +4586,7 @@ impl Coordinator {
         upload_id: &str,
     ) -> Result<(), ServerError> {
         // 1. Lock meta PG and validate upload.
-        let meta_pg_id = derive_pg(bucket, key, self.pg_count);
+        let meta_pg_id = self.object_pg_id(bucket, key);
         let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
 
         let upload = meta_pg.get_multipart_upload(upload_id)?;
@@ -4622,11 +4635,10 @@ impl Coordinator {
             if part.part_okh == [0u8; 16] {
                 continue; // streaming part — handled below
             }
-            let shard_pg_id = derive_pg_shards(
+            let shard_pg_id = self.shard_pg_id(
                 &format!("mpu/{upload_id}"),
                 &format!("{}/{}", part.part_number, part.generation),
                 part.part_vid,
-                self.pg_count,
             );
             if let Ok(shard_pg) = self.storage_node.get_pg(shard_pg_id) {
                 let k = part.ec_k as usize;
@@ -4670,7 +4682,7 @@ impl Coordinator {
         max_parts: u32,
     ) -> Result<ListPartsResult, ServerError> {
         // 1. Lock meta PG and validate upload.
-        let meta_pg_id = derive_pg(bucket, key, self.pg_count);
+        let meta_pg_id = self.object_pg_id(bucket, key);
         let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
 
         let upload = meta_pg.get_multipart_upload(upload_id)?;
@@ -4750,7 +4762,10 @@ impl Coordinator {
         // Fan out to all PGs and collect results, with a hard memory cap.
         let mut all_uploads: Vec<MultipartUploadRecord> = Vec::new();
         let mut hit_record_cap = false;
-        for &pg_id in self.storage_node.pg_ids() {
+        self.pg_topology.for_each_pg(|pg_id| {
+            if hit_record_cap {
+                return Ok::<(), ServerError>(());
+            }
             let pg = self.storage_node.get_pg(pg_id)?;
             let resp = pg.list_multipart_uploads(&ListMultipartUploadsReq {
                 bucket: bucket.to_string(),
@@ -4763,9 +4778,9 @@ impl Coordinator {
             if all_uploads.len() >= MAX_LIST_RECORDS {
                 all_uploads.truncate(MAX_LIST_RECORDS);
                 hit_record_cap = true;
-                break;
             }
-        }
+            Ok::<(), ServerError>(())
+        })?;
 
         // Sort by (key ASC, initiated_at ASC) per S3 spec, with upload_id
         // as tiebreaker for identical timestamps.
@@ -4852,27 +4867,7 @@ mod tests {
         let pg_ids: Vec<u32> = (0..4).collect();
         let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
         let ec_config = EcConfig::new(4, 2).unwrap();
-        Coordinator::new(storage_node, ec_config, 4, "us-east-1".to_string()).unwrap()
-    }
-
-    fn bucket_name_not_on_pg(excluded_pg: u32, pg_count: u32) -> String {
-        for i in 0..2048 {
-            let name = format!("bucket-{i}");
-            if derive_bucket_pg(&name, pg_count) != excluded_pg {
-                return name;
-            }
-        }
-        panic!("failed to find bucket name outside pg {excluded_pg}");
-    }
-
-    fn key_name_not_on_pg(bucket: &str, excluded_pg: u32, pg_count: u32) -> String {
-        for i in 0..2048 {
-            let key = format!("key-{i}");
-            if derive_pg(bucket, &key, pg_count) != excluded_pg {
-                return key;
-            }
-        }
-        panic!("failed to find key name outside pg {excluded_pg}");
+        Coordinator::new(storage_node, ec_config, "us-east-1".to_string()).unwrap()
     }
 
     #[test]
@@ -4966,12 +4961,12 @@ mod tests {
     }
 
     #[test]
-    fn list_buckets_uses_available_pgs_when_pg_count_is_larger() {
+    fn list_buckets_with_sparse_pg_topology() {
         let tmp = test_util::tempdir();
-        let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &[0, 1, 2]).unwrap());
+        let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &[0, 2, 5]).unwrap());
         let ec_config = EcConfig::new(4, 2).unwrap();
-        let coord = Coordinator::new(storage_node, ec_config, 4, "us-east-1".to_string()).unwrap();
-        let bucket = bucket_name_not_on_pg(3, 4);
+        let coord = Coordinator::new(storage_node, ec_config, "us-east-1".to_string()).unwrap();
+        let bucket = "bucket-sparse";
         coord.create_bucket(&bucket).unwrap();
 
         let names: Vec<String> = coord
@@ -4984,12 +4979,12 @@ mod tests {
     }
 
     #[test]
-    fn list_objects_uses_available_pgs_when_pg_count_is_larger() {
+    fn list_objects_with_sparse_pg_topology() {
         let tmp = test_util::tempdir();
-        let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &[0, 1, 2]).unwrap());
+        let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &[0, 2, 5]).unwrap());
         let ec_config = EcConfig::new(4, 2).unwrap();
-        let coord = Coordinator::new(storage_node, ec_config, 4, "us-east-1".to_string()).unwrap();
-        let bucket = bucket_name_not_on_pg(3, 4);
+        let coord = Coordinator::new(storage_node, ec_config, "us-east-1".to_string()).unwrap();
+        let bucket = "bucket-sparse";
         coord.create_bucket(&bucket).unwrap();
 
         let resp = coord
@@ -4999,12 +4994,12 @@ mod tests {
     }
 
     #[test]
-    fn list_object_versions_uses_available_pgs_when_pg_count_is_larger() {
+    fn list_object_versions_with_sparse_pg_topology() {
         let tmp = test_util::tempdir();
-        let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &[0, 1, 2]).unwrap());
+        let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &[0, 2, 5]).unwrap());
         let ec_config = EcConfig::new(4, 2).unwrap();
-        let coord = Coordinator::new(storage_node, ec_config, 4, "us-east-1".to_string()).unwrap();
-        let bucket = bucket_name_not_on_pg(3, 4);
+        let coord = Coordinator::new(storage_node, ec_config, "us-east-1".to_string()).unwrap();
+        let bucket = "bucket-sparse";
         coord.create_bucket(&bucket).unwrap();
 
         let resp = coord
@@ -5014,13 +5009,13 @@ mod tests {
     }
 
     #[test]
-    fn list_multipart_uploads_uses_available_pgs_when_pg_count_is_larger() {
+    fn list_multipart_uploads_with_sparse_pg_topology() {
         let tmp = test_util::tempdir();
-        let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &[0, 1, 2]).unwrap());
+        let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &[0, 2, 5]).unwrap());
         let ec_config = EcConfig::new(4, 2).unwrap();
-        let coord = Coordinator::new(storage_node, ec_config, 4, "us-east-1".to_string()).unwrap();
-        let bucket = bucket_name_not_on_pg(3, 4);
-        let key = key_name_not_on_pg(&bucket, 3, 4);
+        let coord = Coordinator::new(storage_node, ec_config, "us-east-1".to_string()).unwrap();
+        let bucket = "bucket-sparse";
+        let key = "key-sparse";
         coord.create_bucket(&bucket).unwrap();
         coord
             .create_multipart_upload(&bucket, &key, &MetadataBlob::new(), None, None)
@@ -5057,14 +5052,12 @@ mod tests {
         let admin = Coordinator::new(
             Arc::clone(&storage_node),
             ec_config,
-            4,
             "us-east-1".to_string(),
         )
         .unwrap();
         let writer = Coordinator::new(
             Arc::clone(&storage_node),
             ec_config,
-            4,
             "us-east-1".to_string(),
         )
         .unwrap();
@@ -5099,14 +5092,12 @@ mod tests {
         let admin = Coordinator::new(
             Arc::clone(&storage_node),
             ec_config,
-            4,
             "us-east-1".to_string(),
         )
         .unwrap();
         let deleter = Coordinator::new(
             Arc::clone(&storage_node),
             ec_config,
-            4,
             "us-east-1".to_string(),
         )
         .unwrap();
@@ -7079,7 +7070,6 @@ mod tests {
             Coordinator::new(
                 Arc::clone(&storage_node),
                 ec_config,
-                4,
                 "us-east-1".to_string(),
             )
             .unwrap()
@@ -7135,7 +7125,6 @@ mod tests {
             Coordinator::new(
                 Arc::clone(&storage_node),
                 ec_config,
-                4,
                 "us-east-1".to_string(),
             )
             .unwrap()
@@ -7202,7 +7191,6 @@ mod tests {
             Coordinator::new(
                 Arc::clone(&storage_node),
                 ec_config,
-                4,
                 "us-east-1".to_string(),
             )
             .unwrap()
@@ -7512,7 +7500,7 @@ mod tests {
             .unwrap();
 
         // Verify we can retrieve the upload and its metadata blob is stored.
-        let meta_pg_id = derive_pg("bucket", "photo.png", coord.pg_count);
+        let meta_pg_id = coord.object_pg_id("bucket", "photo.png");
         let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
         let record = pg.get_multipart_upload(&result.upload_id).unwrap();
         assert_eq!(record.bucket, "bucket");
@@ -7547,7 +7535,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         // Directly call get_multipart_upload on a PG with a bogus upload ID.
-        let meta_pg_id = derive_pg("bucket", "key", coord.pg_count);
+        let meta_pg_id = coord.object_pg_id("bucket", "key");
         let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
         let err: ServerError = pg.get_multipart_upload("nonexistent").unwrap_err().into();
         assert!(matches!(err, ServerError::NoSuchUpload { .. }));
@@ -7631,7 +7619,7 @@ mod tests {
         assert!(result.etag.ends_with('"'));
 
         // Verify part metadata was recorded.
-        let meta_pg_id = derive_pg("bucket", "key", coord.pg_count);
+        let meta_pg_id = coord.object_pg_id("bucket", "key");
         let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
         let part = pg.get_multipart_part(&create.upload_id, 1).unwrap();
         assert_eq!(part.part_number, 1);
@@ -7660,7 +7648,7 @@ mod tests {
             .upload_part("bucket", "key", &create.upload_id, 1, b"second", None)
             .unwrap();
 
-        let meta_pg_id = derive_pg("bucket", "key", coord.pg_count);
+        let meta_pg_id = coord.object_pg_id("bucket", "key");
         let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
         let part = pg.get_multipart_part(&create.upload_id, 1).unwrap();
         assert_eq!(part.generation, 1);
@@ -7739,7 +7727,7 @@ mod tests {
             .unwrap();
 
         // Verify all three parts exist.
-        let meta_pg_id = derive_pg("bucket", "key", coord.pg_count);
+        let meta_pg_id = coord.object_pg_id("bucket", "key");
         let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
 
         let parts_resp = pg
@@ -7774,7 +7762,7 @@ mod tests {
                 .unwrap();
         }
 
-        let meta_pg_id = derive_pg("bucket", "key", coord.pg_count);
+        let meta_pg_id = coord.object_pg_id("bucket", "key");
         let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
         let part = pg.get_multipart_part(&create.upload_id, 1).unwrap();
         assert_eq!(part.generation, 3);
@@ -7801,7 +7789,7 @@ mod tests {
             .upload_part("bucket", "key", &create.upload_id, 10_000, b"z", None)
             .unwrap();
 
-        let meta_pg_id = derive_pg("bucket", "key", coord.pg_count);
+        let meta_pg_id = coord.object_pg_id("bucket", "key");
         let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
         pg.get_multipart_part(&create.upload_id, 1).unwrap();
         pg.get_multipart_part(&create.upload_id, 10_000).unwrap();
@@ -7863,7 +7851,7 @@ mod tests {
         assert_ne!(etag2, etag3);
 
         // Final state should reflect the last writer.
-        let meta_pg_id = derive_pg("bucket", "key", coord.pg_count);
+        let meta_pg_id = coord.object_pg_id("bucket", "key");
         let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
         let part = pg.get_multipart_part(&create.upload_id, 1).unwrap();
         assert_eq!(part.generation, 2); // 0, 1, 2
@@ -7919,7 +7907,7 @@ mod tests {
         assert!(result.etag.ends_with("-2\""), "etag = {}", result.etag);
 
         // Object should be visible via get_object metadata.
-        let meta_pg_id = derive_pg("bucket", "key", coord.pg_count);
+        let meta_pg_id = coord.object_pg_id("bucket", "key");
         let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
         let obj = pg.get_object_meta("bucket", "key").unwrap();
         assert_eq!(obj.data_layout, DataLayout::MultipartManifest);
@@ -8136,7 +8124,7 @@ mod tests {
         assert_ne!(result1.etag, result2.etag);
 
         // Verify the object was overwritten — should have 2 parts now.
-        let meta_pg_id = derive_pg("bucket", "key", coord.pg_count);
+        let meta_pg_id = coord.object_pg_id("bucket", "key");
         let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
         let obj = pg.get_object_meta("bucket", "key").unwrap();
         assert_eq!(obj.parts_count, Some(2));
@@ -8507,7 +8495,7 @@ mod tests {
             .unwrap();
 
         // Manually transition to Aborting (simulates the window during abort).
-        let meta_pg_id = derive_pg("bucket", "key", coord.pg_count);
+        let meta_pg_id = coord.object_pg_id("bucket", "key");
         let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
         pg.set_upload_state(&create.upload_id, UploadState::Aborting)
             .unwrap();
@@ -8534,7 +8522,7 @@ mod tests {
             .unwrap();
 
         // Manually transition to Completing (simulates concurrent complete).
-        let meta_pg_id = derive_pg("bucket", "key", coord.pg_count);
+        let meta_pg_id = coord.object_pg_id("bucket", "key");
         let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
         pg.set_upload_state(&create.upload_id, UploadState::Completing)
             .unwrap();
@@ -8949,7 +8937,7 @@ mod tests {
             create_completed_multipart_vec(&coord, "bucket", "key", &[(1, part1), (2, part2)]);
 
         // Get the real manifest, then replace with only part 2 (gap: part 1 missing).
-        let meta_pg_id = derive_pg("bucket", "key", coord.pg_count);
+        let meta_pg_id = coord.object_pg_id("bucket", "key");
         let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
         let real_parts = pg
             .get_object_parts("bucket", "key", result.version_id)
@@ -9640,7 +9628,7 @@ mod tests {
         assert_eq!(result.etag, format_etag(crc));
 
         // Verify the committed chunk manifest exists in the metadata PG.
-        let meta_pg_id = crate::pg::derive_pg("bucket", "key", 4);
+        let meta_pg_id = coord.object_pg_id("bucket", "key");
         let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
         let committed = pg
             .get_stream_object_chunks("bucket", "key", result.version_id)
@@ -9665,7 +9653,7 @@ mod tests {
 
         // Record shard keys before abort for verification.
         let chunk_okh = crate::pg::chunk_key_hash(&session_id, 0);
-        let shard_pg_id = crate::pg::derive_pg_shards(&format!("chunk/{session_id}"), "0", 0, 4);
+        let shard_pg_id = coord.shard_pg_id(&format!("chunk/{session_id}"), "0", 0);
 
         coord
             .abort_stream_put("bucket", "key", &session_id)
@@ -10139,7 +10127,7 @@ mod tests {
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
-        let meta_pg_id = crate::pg::derive_pg("bucket", "key", 4);
+        let meta_pg_id = coord.object_pg_id("bucket", "key");
         let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
         pg.create_stream_upload(&CreateStreamUploadReq {
             session_id: "upload-part-session".to_string(),
@@ -10429,7 +10417,7 @@ mod tests {
             .unwrap();
 
         // Capture chunk records before abort for shard verification.
-        let meta_pg_id = derive_pg("bucket", "key", coord.pg_count);
+        let meta_pg_id = coord.object_pg_id("bucket", "key");
         let chunks_before = {
             let meta_pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
             let chunks = meta_pg
@@ -10607,7 +10595,7 @@ mod tests {
             .unwrap();
 
         // Read back via storage layer directly.
-        let meta_pg_id = crate::pg::derive_pg("bucket", "verify", coord.pg_count);
+        let meta_pg_id = coord.object_pg_id("bucket", "verify");
         {
             let meta_pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
             let record = meta_pg.get_object_meta("bucket", "verify").unwrap();

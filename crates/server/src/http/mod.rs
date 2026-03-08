@@ -2238,7 +2238,7 @@ mod tests {
         let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
         let ec_config = EcConfig::new(4, 2).unwrap();
         let coordinator =
-            Coordinator::new(storage_node, ec_config, 4, "us-east-1".to_string()).unwrap();
+            Coordinator::new(storage_node, ec_config, "us-east-1".to_string()).unwrap();
         let credentials = auth::CredentialStore::new();
         HttpFrontend {
             coordinator,

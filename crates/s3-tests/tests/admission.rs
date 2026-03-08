@@ -49,7 +49,6 @@ async fn start_server(
             let coordinator = server::coordinator::Coordinator::new(
                 Arc::clone(&storage_node),
                 ec_config,
-                pg_count,
                 "us-east-1".to_string(),
             )
             .expect("create coordinator");

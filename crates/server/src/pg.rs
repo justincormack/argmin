@@ -1,8 +1,74 @@
-/// PG derivation: maps (bucket, key) to a placement group ID.
+/// PG derivation: maps keys to placement group IDs.
+///
+/// `PgTopology` is the coordinator-facing API and should be preferred over
+/// direct modulo/count arithmetic so fanout and routing use the same PG set.
+
+#[derive(Debug, Clone)]
+pub struct PgTopology {
+    pg_ids: Box<[u32]>,
+}
+
+impl PgTopology {
+    /// Build canonical topology from raw PG IDs.
+    ///
+    /// IDs are sorted and de-duplicated so hash routing is deterministic.
+    pub fn new(pg_ids: &[u32]) -> Result<Self, &'static str> {
+        if pg_ids.is_empty() {
+            return Err("pg topology cannot be empty");
+        }
+        let mut canonical = pg_ids.to_vec();
+        canonical.sort_unstable();
+        canonical.dedup();
+        Ok(Self {
+            pg_ids: canonical.into_boxed_slice(),
+        })
+    }
+
+    /// Number of PGs in this topology.
+    pub fn pg_count(&self) -> u32 {
+        self.pg_ids.len() as u32
+    }
+
+    /// Derive the PG ID for a given bucket and key.
+    pub fn object_pg(&self, bucket: &str, key: &str) -> u32 {
+        let full_key = format!("{bucket}/{key}");
+        let hash = rapidhash::rapidhash(full_key.as_bytes());
+        pick_pg(&self.pg_ids, hash)
+    }
+
+    /// Derive the PG ID for bucket metadata placement.
+    pub fn bucket_pg(&self, bucket: &str) -> u32 {
+        let full_key = format!("bucket/{bucket}");
+        let hash = rapidhash::rapidhash(full_key.as_bytes());
+        pick_pg(&self.pg_ids, hash)
+    }
+
+    /// Derive the shard PG ID.
+    pub fn shard_pg(&self, bucket: &str, key: &str, version_id: u64) -> u32 {
+        let full_key = format!("{bucket}/{key}/{version_id}");
+        let hash = rapidhash::rapidhash(full_key.as_bytes());
+        pick_pg(&self.pg_ids, hash)
+    }
+
+    /// Execute a closure once for every PG in topology order.
+    pub fn for_each_pg<E>(&self, mut f: impl FnMut(u32) -> Result<(), E>) -> Result<(), E> {
+        for &pg_id in &*self.pg_ids {
+            f(pg_id)?;
+        }
+        Ok(())
+    }
+}
+
+fn pick_pg(pg_ids: &[u32], hash: u64) -> u32 {
+    let idx = (hash % pg_ids.len() as u64) as usize;
+    pg_ids[idx]
+}
+
 /// Derive the PG ID for a given bucket and key.
 ///
 /// pg_id = rapidhash(bucket + "/" + key) % pg_count
-pub fn derive_pg(bucket: &str, key: &str, pg_count: u32) -> u32 {
+#[cfg(test)]
+pub(crate) fn derive_pg(bucket: &str, key: &str, pg_count: u32) -> u32 {
     let full_key = format!("{}/{}", bucket, key);
     let hash = rapidhash::rapidhash(full_key.as_bytes());
     (hash % pg_count as u64) as u32
@@ -11,7 +77,8 @@ pub fn derive_pg(bucket: &str, key: &str, pg_count: u32) -> u32 {
 /// Derive the PG ID for bucket metadata placement.
 ///
 /// pg_id = rapidhash("bucket/" + bucket_name) % pg_count
-pub fn derive_bucket_pg(bucket: &str, pg_count: u32) -> u32 {
+#[cfg(test)]
+pub(crate) fn derive_bucket_pg(bucket: &str, pg_count: u32) -> u32 {
     let full_key = format!("bucket/{bucket}");
     let hash = rapidhash::rapidhash(full_key.as_bytes());
     (hash % pg_count as u64) as u32
@@ -23,7 +90,8 @@ pub fn derive_bucket_pg(bucket: &str, pg_count: u32) -> u32 {
 /// can have their shards distributed across different PGs.
 ///
 /// pg_id = rapidhash(bucket + "/" + key + "/" + version_id) % pg_count
-pub fn derive_pg_shards(bucket: &str, key: &str, version_id: u64, pg_count: u32) -> u32 {
+#[cfg(test)]
+pub(crate) fn derive_pg_shards(bucket: &str, key: &str, version_id: u64, pg_count: u32) -> u32 {
     let full_key = format!("{}/{}/{}", bucket, key, version_id);
     let hash = rapidhash::rapidhash(full_key.as_bytes());
     (hash % pg_count as u64) as u32
@@ -74,6 +142,27 @@ mod tests {
         let a = derive_pg("mybucket", "mykey", 16);
         let b = derive_pg("mybucket", "mykey", 16);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn topology_rejects_empty() {
+        assert!(PgTopology::new(&[]).is_err());
+    }
+
+    #[test]
+    fn topology_canonicalizes_ids() {
+        let topo = PgTopology::new(&[8, 2, 8, 1]).unwrap();
+        assert_eq!(topo.pg_ids.as_ref(), &[1, 2, 8]);
+    }
+
+    #[test]
+    fn topology_maps_to_actual_pg_ids() {
+        let topo = PgTopology::new(&[1, 2, 8]).unwrap();
+        for i in 0..100 {
+            let key = format!("k-{i}");
+            let pg = topo.object_pg("bucket", &key);
+            assert!(matches!(pg, 1 | 2 | 8));
+        }
     }
 
     #[test]
