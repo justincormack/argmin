@@ -264,7 +264,7 @@ pub struct ObjectRecord {
     pub storage_class: u8,
     pub ec_k: u8,
     pub ec_m: u8,
-    /// 0 = Live, 1 = DeleteMarker, 2 = PendingDelete.
+    /// 0 = Live, 1 = DeleteMarker.
     pub status: u8,
     /// Serialized tagging XML (None = no tags).
     pub tags: Option<String>,

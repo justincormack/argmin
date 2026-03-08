@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS objects (
     data_layout   INTEGER NOT NULL DEFAULT 0,
     parts_count   INTEGER,
     metadata_blob BLOB,
-    CHECK (status IN (0, 1, 2)),
+    CHECK (status IN (0, 1)),
     CHECK (etag_kind IN (0, 1)),
     CHECK (data_layout IN (0, 1)),
     CHECK (
@@ -39,7 +39,7 @@ CREATE TABLE IF NOT EXISTS objects (
             (data_layout = 0 AND parts_count IS NULL) OR
             (data_layout = 1 AND parts_count IS NOT NULL AND parts_count > 0)
         )) OR
-        (status != 0 AND data_layout = 0 AND parts_count IS NULL)
+        (status = 1 AND data_layout = 0 AND parts_count IS NULL)
     ),
     PRIMARY KEY (bucket, key, version_id)
 )";

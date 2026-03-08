@@ -222,8 +222,9 @@ impl PgStore {
                 DataLayout::ChunkManifestInternal => parts_count.is_none(),
                 DataLayout::MultipartManifest => parts_count.is_some_and(|n| n > 0),
             },
-            // Delete markers / non-live records must be non-multipart.
-            _ => data_layout == DataLayout::ChunkManifestInternal && parts_count.is_none(),
+            // Delete marker records must be non-multipart.
+            1 => data_layout == DataLayout::ChunkManifestInternal && parts_count.is_none(),
+            _ => false,
         };
         if valid {
             Ok(())
@@ -3220,6 +3221,40 @@ mod tests {
         assert!(matches!(
             err,
             rusqlite::Error::FromSqlConversionFailure(14, rusqlite::types::Type::Integer, _)
+        ));
+    }
+
+    #[test]
+    fn row_to_object_record_rejects_pending_delete_status() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 0).unwrap();
+        let err = store
+            .connection()
+            .query_row(
+                "SELECT \
+                    'b' AS bucket, \
+                    'k' AS key, \
+                    0 AS version_id, \
+                    1 AS size, \
+                    1 AS total_size, \
+                    zeroblob(8) AS etag, \
+                    1 AS etag_kind, \
+                    0 AS last_modified, \
+                    0 AS storage_class, \
+                    4 AS ec_k, \
+                    2 AS ec_m, \
+                    2 AS status, \
+                    NULL AS tags, \
+                    0 AS data_layout, \
+                    NULL AS parts_count, \
+                    NULL AS metadata_blob",
+                [],
+                PgStore::row_to_object_record,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            rusqlite::Error::FromSqlConversionFailure(13, rusqlite::types::Type::Integer, _)
         ));
     }
 
