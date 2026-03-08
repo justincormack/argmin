@@ -38,9 +38,6 @@ fn assert_error_code(body: &str, code: &str) {
     );
 }
 
-/// Assert body contains one of the given error codes.
-/// Used where our server and AWS return different error codes for the same scenario.
-
 // ── Crypto helpers ──────────────────────────────────────────────────────
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -286,14 +283,15 @@ fn sign_streaming_request_custom(
 /// the canonical request (needed for operations such as UploadPart).
 fn sign_streaming_request_custom_with_query(
     method: &str,
-    path: &str,
-    query: &str,
+    request_uri: &str,
     content_sha256: &str,
     decoded_content_length: usize,
     extra_signed_headers: &[(&str, &str)],
     skip_content_encoding: bool,
     skip_decoded_content_length: bool,
 ) -> SignResult {
+    let (path, query) = request_uri.split_once('?').unwrap_or((request_uri, ""));
+
     let (date_long, date_short) = now_parts();
     let region = CTX.region();
     let access_key = CTX.access_key();
@@ -2408,11 +2406,11 @@ fn test_streaming_upload_part_fallback_checksum_from_upload_algorithm() {
         let encoded_upload_id: String =
             url::form_urlencoded::byte_serialize(upload_id.as_bytes()).collect();
         let query = format!("partNumber=1&uploadId={encoded_upload_id}");
+        let request_uri = format!("{path}?{query}");
 
         let sign = sign_streaming_request_custom_with_query(
             "PUT",
-            &path,
-            &query,
+            &request_uri,
             "UNSIGNED-PAYLOAD",
             data.len(),
             &[],

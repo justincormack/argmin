@@ -2341,11 +2341,10 @@ mod tests {
             .unwrap();
 
         let upload_id = create_upload_with_checksum(&fe, "mybucket", "k", Some("CRC32"));
-        let xml = format!(
-            "<CompleteMultipartUpload>\
+        let xml = "<CompleteMultipartUpload>\
                <Part><PartNumber>1</PartNumber><ETag>\"x\"</ETag></Part>\
              </CompleteMultipartUpload>"
-        );
+            .to_string();
         let req = S3Request {
             method: String::new(),
             path: String::new(),
@@ -2376,11 +2375,10 @@ mod tests {
             .unwrap();
 
         let upload_id = create_upload_with_checksum(&fe, "mybucket", "k", Some("CRC32"));
-        let xml = format!(
-            "<CompleteMultipartUpload>\
+        let xml = "<CompleteMultipartUpload>\
                <Part><PartNumber>1</PartNumber><ETag>\"x\"</ETag></Part>\
              </CompleteMultipartUpload>"
-        );
+            .to_string();
         let req = S3Request {
             method: String::new(),
             path: String::new(),
@@ -2412,11 +2410,10 @@ mod tests {
             .unwrap();
 
         let upload_id = create_upload_with_checksum(&fe, "mybucket", "k", Some("CRC32"));
-        let xml = format!(
-            "<CompleteMultipartUpload>\
+        let xml = "<CompleteMultipartUpload>\
                <Part><PartNumber>1</PartNumber><ETag>\"x\"</ETag></Part>\
              </CompleteMultipartUpload>"
-        );
+            .to_string();
         let req = S3Request {
             method: String::new(),
             path: String::new(),
@@ -2447,11 +2444,10 @@ mod tests {
             .unwrap();
 
         let upload_id = create_upload_with_checksum(&fe, "mybucket", "k", Some("CRC32"));
-        let xml = format!(
-            "<CompleteMultipartUpload>\
+        let xml = "<CompleteMultipartUpload>\
                <Part><PartNumber>1</PartNumber><ETag>\"x\"</ETag></Part>\
              </CompleteMultipartUpload>"
-        );
+            .to_string();
         let req = S3Request {
             method: String::new(),
             path: String::new(),

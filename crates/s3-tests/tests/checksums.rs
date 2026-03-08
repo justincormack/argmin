@@ -182,7 +182,7 @@ fn test_object_checksum_crc32c() {
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.checksum_crc32_c(), Some(crc32c_val.as_ref()));
+        assert_eq!(resp.checksum_crc32_c(), Some(crc32c_val));
 
         cleanup(&bucket, &[key]).await;
     });

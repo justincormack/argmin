@@ -117,7 +117,7 @@ fn test_multipart_upload_single_part() {
 
         // Single part (last part exempt from min size)
         let part = vec![b'x'; 256];
-        do_multipart_upload(&bucket, key, &[part.clone()]).await;
+        do_multipart_upload(&bucket, key, std::slice::from_ref(&part)).await;
 
         let resp = client
             .get_object()
@@ -547,7 +547,7 @@ fn test_multipart_overwrites_existing_object() {
 
         // Overwrite with multipart
         let new_data = vec![b'z'; 512];
-        do_multipart_upload(&bucket, key, &[new_data.clone()]).await;
+        do_multipart_upload(&bucket, key, std::slice::from_ref(&new_data)).await;
 
         let resp = client
             .get_object()
@@ -1886,7 +1886,7 @@ fn test_multipart_copy_versioned() {
         let body = get.body.collect().await.unwrap().into_bytes();
         assert_eq!(body.as_ref(), &data_v1[..]);
 
-        s3_tests::cleanup_versioned_bucket(&client, &bucket).await;
+        s3_tests::cleanup_versioned_bucket(client, &bucket).await;
     });
 }
 
@@ -1963,7 +1963,7 @@ fn test_multipart_copy_delete_marker_source() {
             .send()
             .await
             .unwrap();
-        s3_tests::cleanup_versioned_bucket(&client, &bucket).await;
+        s3_tests::cleanup_versioned_bucket(client, &bucket).await;
     });
 }
 
@@ -2043,7 +2043,7 @@ fn test_multipart_copy_delete_marker_version_id() {
             .send()
             .await
             .unwrap();
-        s3_tests::cleanup_versioned_bucket(&client, &bucket).await;
+        s3_tests::cleanup_versioned_bucket(client, &bucket).await;
     });
 }
 

@@ -239,7 +239,7 @@ fn test_ignore_public_acls() {
             .unwrap();
 
         // Verify anonymous user can list objects on public-read bucket
-        let list_url = format!("{}/?list-type=2", format!("{}/{}", CTX.endpoint(), bucket));
+        let list_url = format!("{}/{bucket}/?list-type=2", CTX.endpoint());
         let mut list_resp = agent().get(&list_url).call().expect("transport error");
         assert_eq!(
             list_resp.status().as_u16(),
@@ -253,7 +253,7 @@ fn test_ignore_public_acls() {
         );
 
         // Verify anonymous user can GET object on public-read bucket
-        let get_url = format!("{}/key1", format!("{}/{}", CTX.endpoint(), bucket));
+        let get_url = format!("{}/{bucket}/key1", CTX.endpoint());
         let mut get_resp = agent().get(&get_url).call().expect("transport error");
         assert_eq!(get_resp.status().as_u16(), 200);
         let data = get_resp.body_mut().read_to_vec().unwrap();

@@ -5003,7 +5003,7 @@ mod tests {
         let ec_config = EcConfig::new(4, 2).unwrap();
         let coord = Coordinator::new(storage_node, ec_config, "us-east-1".to_string()).unwrap();
         let bucket = "bucket-sparse";
-        coord.create_bucket(&bucket).unwrap();
+        coord.create_bucket(bucket).unwrap();
 
         let names: Vec<String> = coord
             .list_buckets()
@@ -5021,10 +5021,10 @@ mod tests {
         let ec_config = EcConfig::new(4, 2).unwrap();
         let coord = Coordinator::new(storage_node, ec_config, "us-east-1".to_string()).unwrap();
         let bucket = "bucket-sparse";
-        coord.create_bucket(&bucket).unwrap();
+        coord.create_bucket(bucket).unwrap();
 
         let resp = coord
-            .list_objects_v2(&bucket, None, None, None, 1000)
+            .list_objects_v2(bucket, None, None, None, 1000)
             .unwrap();
         assert!(resp.objects.is_empty());
     }
@@ -5036,10 +5036,10 @@ mod tests {
         let ec_config = EcConfig::new(4, 2).unwrap();
         let coord = Coordinator::new(storage_node, ec_config, "us-east-1".to_string()).unwrap();
         let bucket = "bucket-sparse";
-        coord.create_bucket(&bucket).unwrap();
+        coord.create_bucket(bucket).unwrap();
 
         let resp = coord
-            .list_object_versions(&bucket, None, None, None, 1000)
+            .list_object_versions(bucket, None, None, None, 1000)
             .unwrap();
         assert!(resp.versions.is_empty());
     }
@@ -5052,13 +5052,13 @@ mod tests {
         let coord = Coordinator::new(storage_node, ec_config, "us-east-1".to_string()).unwrap();
         let bucket = "bucket-sparse";
         let key = "key-sparse";
-        coord.create_bucket(&bucket).unwrap();
+        coord.create_bucket(bucket).unwrap();
         coord
-            .create_multipart_upload(&bucket, &key, &MetadataBlob::new(), None, None)
+            .create_multipart_upload(bucket, key, &MetadataBlob::new(), None, None)
             .unwrap();
 
         let resp = coord
-            .list_multipart_uploads(&bucket, None, None, None, 1000)
+            .list_multipart_uploads(bucket, None, None, None, 1000)
             .unwrap();
         assert_eq!(resp.uploads.len(), 1);
         assert_eq!(resp.uploads[0].key, key);
@@ -6473,7 +6473,6 @@ mod tests {
             .unwrap();
         let cond = DeleteCondition {
             if_match: Some(put.etag),
-            ..Default::default()
         };
         coord.delete_object("bucket", "key", None, &cond).unwrap();
         assert!(coord.get_object("bucket", "key", None, NO_READ).is_err());
@@ -6490,7 +6489,6 @@ mod tests {
 
         let cond = DeleteCondition {
             if_match: Some("\"0000000000000000\"".to_string()),
-            ..Default::default()
         };
         let err = coord
             .delete_object("bucket", "key", None, &cond)
@@ -6514,7 +6512,6 @@ mod tests {
         // Use key1's etag for both entries; key2 will fail the condition
         let cond = DeleteCondition {
             if_match: Some(p1.etag),
-            ..Default::default()
         };
         let entries = vec![
             crate::http::xml::DeleteObjectEntry {
@@ -9623,7 +9620,7 @@ mod tests {
             )
             .unwrap_err();
         assert!(
-            matches!(err, ServerError::PreconditionFailed { .. }),
+            matches!(err, ServerError::PreconditionFailed),
             "expected PreconditionFailed, got {err:?}"
         );
     }

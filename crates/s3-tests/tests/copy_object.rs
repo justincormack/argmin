@@ -785,7 +785,7 @@ fn test_copy_object_delete_marker_source() {
         assert_eq!(status, 404);
         assert_s3_err_code(&result, "NoSuchKey");
 
-        cleanup_versioned_bucket(&client, &bucket).await;
+        cleanup_versioned_bucket(client, &bucket).await;
     });
 }
 
@@ -851,7 +851,7 @@ fn test_copy_object_delete_marker_version_id() {
         assert_eq!(status, 400);
         assert_s3_err_code(&result, "InvalidRequest");
 
-        cleanup_versioned_bucket(&client, &bucket).await;
+        cleanup_versioned_bucket(client, &bucket).await;
     });
 }
 

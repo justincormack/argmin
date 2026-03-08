@@ -586,7 +586,6 @@ mod tests {
     fn delete_if_match_passes() {
         let cond = DeleteCondition {
             if_match: Some(test_etag()),
-            ..Default::default()
         };
         assert!(check_delete_conditions(&cond, &test_etag()).is_ok());
     }
@@ -595,7 +594,6 @@ mod tests {
     fn delete_if_match_fails() {
         let cond = DeleteCondition {
             if_match: Some(other_etag()),
-            ..Default::default()
         };
         let err = check_delete_conditions(&cond, &test_etag()).unwrap_err();
         assert!(matches!(err, ServerError::PreconditionFailed));
@@ -605,7 +603,6 @@ mod tests {
     fn delete_if_match_wildcard_passes() {
         let cond = DeleteCondition {
             if_match: Some("*".to_string()),
-            ..Default::default()
         };
         assert!(check_delete_conditions(&cond, &test_etag()).is_ok());
     }
@@ -649,8 +646,7 @@ mod tests {
     fn delete_condition_is_empty() {
         assert!(DeleteCondition::default().is_empty());
         assert!(!DeleteCondition {
-            if_match: Some("x".into()),
-            ..Default::default()
+            if_match: Some("x".into())
         }
         .is_empty());
     }
