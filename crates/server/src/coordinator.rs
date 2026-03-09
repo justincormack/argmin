@@ -522,7 +522,7 @@ impl Coordinator {
         Ok(out)
     }
 
-    pub fn put_bucket_versioning(&self, name: &str, state: u8) -> Result<(), ServerError> {
+    pub fn put_bucket_versioning(&self, name: &str, state: storage::BucketVersioningState) -> Result<(), ServerError> {
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg
             .put_bucket_versioning(name, state)
@@ -532,14 +532,14 @@ impl Coordinator {
                 }
                 storage::MetadataError::InvalidVersioningTransition { from, to } => {
                     ServerError::InvalidRequest {
-                        reason: format!("invalid versioning transition from {} to {}", from, to),
+                        reason: format!("invalid versioning transition from {:?} to {:?}", from, to),
                     }
                 }
                 other => ServerError::Metadata(other),
             })
     }
 
-    pub fn get_bucket_versioning(&self, name: &str) -> Result<u8, ServerError> {
+    pub fn get_bucket_versioning(&self, name: &str) -> Result<storage::BucketVersioningState, ServerError> {
         let info = self.head_bucket(name)?;
         Ok(info.versioning)
     }
@@ -722,7 +722,7 @@ impl Coordinator {
             },
             other => ServerError::Metadata(other),
         })?;
-        if record.status == 1 {
+        if record.status.is_delete_marker() {
             return Err(ServerError::MethodNotAllowed);
         }
         pg.put_object_tags(bucket, key, record.version_id, tags)
@@ -749,7 +749,7 @@ impl Coordinator {
             },
             other => ServerError::Metadata(other),
         })?;
-        if record.status == 1 {
+        if record.status.is_delete_marker() {
             return Err(ServerError::MethodNotAllowed);
         }
         pg.get_object_tags(bucket, key, record.version_id)
@@ -776,7 +776,7 @@ impl Coordinator {
             },
             other => ServerError::Metadata(other),
         })?;
-        if record.status == 1 {
+        if record.status.is_delete_marker() {
             return Err(ServerError::MethodNotAllowed);
         }
         pg.delete_object_tags(bucket, key, record.version_id)
@@ -863,10 +863,10 @@ impl Coordinator {
             bucket: bucket.to_string(),
             key: key.to_string(),
             version_id,
-            status: 0,
+            status: storage::ObjectState::Live,
             size: user_size,
             etag: crc64_to_etag_bytes(etag_crc),
-            etag_kind: 0,
+            etag_kind: storage::EtagKind::Crc64,
             ec_k: self.ec_config.data_shards,
             ec_m: self.ec_config.parity_shards,
             data_layout: None,
@@ -1264,7 +1264,7 @@ impl Coordinator {
         }
 
         // Allocate version_id.
-        let version_id = if bucket_info.versioning == 1 {
+        let version_id = if bucket_info.versioning == storage::BucketVersioningState::Enabled {
             meta_guard.next_version_id(bucket, key)?
         } else {
             0
@@ -1306,10 +1306,10 @@ impl Coordinator {
                     bucket: bucket.to_string(),
                     key: key.to_string(),
                     version_id,
-                    status: 0,
+                    status: storage::ObjectState::Live,
                     size: total_size,
                     etag: crc64_to_etag_bytes(crc64),
-                    etag_kind: 0,
+                    etag_kind: storage::EtagKind::Crc64,
                     ec_k: self.ec_config.data_shards,
                     ec_m: self.ec_config.parity_shards,
                     data_layout: None,
@@ -1499,7 +1499,7 @@ impl Coordinator {
             generation,
             size: total_size,
             etag: crc64_to_etag_bytes(crc64),
-            etag_kind: 0,
+            etag_kind: storage::EtagKind::Crc64,
             part_okh: [0u8; 16], // no single-shard placement for streamed parts
             part_vid: generation as u64,
             ec_k: self.ec_config.data_shards,
@@ -1683,7 +1683,7 @@ impl Coordinator {
             // Reject delete markers — they are not copyable objects.
             // AWS returns 400/InvalidRequest when an explicit versionId targets a
             // delete marker, and 404/NoSuchKey when current version is a delete marker.
-            if src_record.status == 1 {
+            if src_record.status.is_delete_marker() {
                 return if src_version_id.is_some() {
                     Err(ServerError::InvalidRequest {
                         reason: "The source of a copy request may not specifically refer to a delete marker by version id.".to_string(),
@@ -1973,13 +1973,13 @@ impl Coordinator {
         &'a self,
         bucket: &str,
         key: &str,
-        versioning_state: u8,
+        versioning_state: storage::BucketVersioningState,
     ) -> Result<LockedWriteObject<'a>, ServerError> {
         let meta_pg_id = self.object_pg_id(bucket, key);
 
         loop {
             let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
-            let version_id = if versioning_state == 1 {
+            let version_id = if versioning_state == storage::BucketVersioningState::Enabled {
                 meta_guard.next_version_id(bucket, key)?
             } else {
                 0
@@ -1995,7 +1995,7 @@ impl Coordinator {
 
             if meta_pg_id < shard_pg_id {
                 let shard_guard = self.storage_node.get_pg(shard_pg_id)?;
-                if versioning_state == 1 {
+                if versioning_state == storage::BucketVersioningState::Enabled {
                     let current = meta_guard.next_version_id(bucket, key)?;
                     if current != version_id {
                         continue;
@@ -2012,7 +2012,7 @@ impl Coordinator {
 
             let (meta_guard, shard_guard) =
                 self.storage_node.lock_two_pgs(meta_pg_id, shard_pg_id)?;
-            let version_id = if versioning_state == 1 {
+            let version_id = if versioning_state == storage::BucketVersioningState::Enabled {
                 meta_guard.next_version_id(bucket, key)?
             } else {
                 0
@@ -2621,7 +2621,7 @@ impl Coordinator {
             self.lock_object_pgs_for_read(bucket, key, version_id)?;
 
         // If latest version is a delete marker, return 404 with x-amz-delete-marker
-        if record.status == 1 {
+        if record.status.is_delete_marker() {
             return Err(ServerError::DeleteMarkerHit {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
@@ -2762,7 +2762,7 @@ impl Coordinator {
         let LockedReadObject { record, pgs } =
             self.lock_object_pgs_for_read(bucket, key, version_id)?;
 
-        if record.status == 1 {
+        if record.status.is_delete_marker() {
             return Err(ServerError::DeleteMarkerHit {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
@@ -2944,7 +2944,7 @@ impl Coordinator {
         let LockedReadObject { record, pgs } =
             self.lock_object_pgs_for_read(bucket, key, version_id)?;
 
-        if record.status == 1 {
+        if record.status.is_delete_marker() {
             return Err(ServerError::DeleteMarkerHit {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
@@ -3037,7 +3037,7 @@ impl Coordinator {
             self.lock_object_pgs_for_read(bucket, key, version_id)?;
 
         // If latest version is a delete marker, return 404 with x-amz-delete-marker
-        if record.status == 1 {
+        if record.status.is_delete_marker() {
             return Err(ServerError::DeleteMarkerHit {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
@@ -3081,7 +3081,7 @@ impl Coordinator {
         let LockedReadObject { record, pgs } =
             self.lock_object_pgs_for_read(bucket, key, version_id)?;
 
-        if record.status == 1 {
+        if record.status.is_delete_marker() {
             return Err(ServerError::DeleteMarkerHit {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
@@ -3194,7 +3194,7 @@ impl Coordinator {
             self.lock_object_pgs_for_read(bucket, key, version_id)?;
 
         // If latest version is a delete marker, return 404 with x-amz-delete-marker
-        if record.status == 1 {
+        if record.status.is_delete_marker() {
             return Err(ServerError::DeleteMarkerHit {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
@@ -3316,7 +3316,7 @@ impl Coordinator {
 
         match (bucket_info.versioning, request_version_id) {
             // Unversioned bucket: physical delete (current behavior)
-            (0, _) => {
+            (storage::BucketVersioningState::Disabled, _) => {
                 let LockedReadObject { record, pgs } =
                     match self.lock_object_pgs_for_read(bucket, key, None) {
                         Ok(locked) => locked,
@@ -3427,7 +3427,7 @@ impl Coordinator {
                 let shard_pg = pgs.shard();
 
                 // Delete shards if it's a live object (not a delete marker)
-                if record.status == 0 {
+                if record.status == storage::ObjectState::Live {
                     if record.data_layout == DataLayout::MultipartManifest {
                         let obj_parts = meta_pg
                             .get_object_parts(bucket, key, vid)
@@ -3491,7 +3491,7 @@ impl Coordinator {
 
                 meta_pg.delete_object_version(bucket, key, vid)?;
 
-                let is_delete_marker = record.status == 1;
+                let is_delete_marker = record.status.is_delete_marker();
 
                 Ok(DeleteObjectResult {
                     version_id: vid,
@@ -3508,10 +3508,10 @@ impl Coordinator {
                     bucket: bucket.to_string(),
                     key: key.to_string(),
                     version_id: marker_vid,
-                    status: 1,
+                    status: storage::ObjectState::DeleteMarker,
                     size: 0,
                     etag: vec![],
-                    etag_kind: 0,
+                    etag_kind: storage::EtagKind::Crc64,
                     ec_k: 0,
                     ec_m: 0,
                     data_layout: None,
@@ -3745,7 +3745,7 @@ impl Coordinator {
                 size: record.size,
                 etag: format_object_etag(&record.etag, record.etag_kind, record.parts_count),
                 last_modified: record.last_modified,
-                is_delete_marker: record.status == 1,
+                is_delete_marker: record.status.is_delete_marker(),
             });
         }
 
@@ -3903,7 +3903,7 @@ impl Coordinator {
             } = self.lock_object_pgs_for_read(src_bucket, src_key, src_version_id)?;
 
             // Reject delete markers — they are not copyable objects.
-            if src_record.status == 1 {
+            if src_record.status.is_delete_marker() {
                 return if src_version_id.is_some() {
                     Err(ServerError::InvalidRequest {
                         reason: "The source of a copy request may not specifically refer to a delete marker by version id.".to_string(),
@@ -4216,7 +4216,7 @@ impl Coordinator {
             generation,
             size: data.len() as u64,
             etag: crc64_to_etag_bytes(etag_crc),
-            etag_kind: 0,
+            etag_kind: storage::EtagKind::Crc64,
             part_okh,
             part_vid,
             ec_k: self.ec_config.data_shards,
@@ -4407,7 +4407,7 @@ impl Coordinator {
         }
 
         // 6. Allocate version_id using existing versioning rules.
-        let version_id = if bucket_info.versioning == 1 {
+        let version_id = if bucket_info.versioning == storage::BucketVersioningState::Enabled {
             meta_pg.next_version_id(bucket, key)?
         } else {
             0
@@ -4564,10 +4564,10 @@ impl Coordinator {
             bucket: bucket.to_string(),
             key: key.to_string(),
             version_id,
-            status: 0,
+            status: storage::ObjectState::Live,
             size: total_size,
             etag: etag_bytes,
-            etag_kind: 1, // multipart-composite CRC64
+            etag_kind: storage::EtagKind::MultipartComposite,
             ec_k: 0,      // per-part, not per-object
             ec_m: 0,
             data_layout: Some(DataLayout::MultipartManifest),
@@ -7003,7 +7003,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let state = coord.get_bucket_versioning("bucket").unwrap();
-        assert_eq!(state, 0);
+        assert_eq!(state, storage::BucketVersioningState::Disabled);
     }
 
     #[test]
@@ -7012,8 +7012,8 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
-        coord.put_bucket_versioning("bucket", 1).unwrap();
-        assert_eq!(coord.get_bucket_versioning("bucket").unwrap(), 1);
+        coord.put_bucket_versioning("bucket", storage::BucketVersioningState::Enabled).unwrap();
+        assert_eq!(coord.get_bucket_versioning("bucket").unwrap(), storage::BucketVersioningState::Enabled);
     }
 
     #[test]
@@ -7022,9 +7022,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
-        coord.put_bucket_versioning("bucket", 1).unwrap();
-        coord.put_bucket_versioning("bucket", 2).unwrap();
-        assert_eq!(coord.get_bucket_versioning("bucket").unwrap(), 2);
+        coord.put_bucket_versioning("bucket", storage::BucketVersioningState::Enabled).unwrap();
+        coord.put_bucket_versioning("bucket", storage::BucketVersioningState::Suspended).unwrap();
+        assert_eq!(coord.get_bucket_versioning("bucket").unwrap(), storage::BucketVersioningState::Suspended);
     }
 
     #[test]
@@ -7033,10 +7033,10 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
-        coord.put_bucket_versioning("bucket", 1).unwrap();
-        coord.put_bucket_versioning("bucket", 2).unwrap();
-        coord.put_bucket_versioning("bucket", 1).unwrap();
-        assert_eq!(coord.get_bucket_versioning("bucket").unwrap(), 1);
+        coord.put_bucket_versioning("bucket", storage::BucketVersioningState::Enabled).unwrap();
+        coord.put_bucket_versioning("bucket", storage::BucketVersioningState::Suspended).unwrap();
+        coord.put_bucket_versioning("bucket", storage::BucketVersioningState::Enabled).unwrap();
+        assert_eq!(coord.get_bucket_versioning("bucket").unwrap(), storage::BucketVersioningState::Enabled);
     }
 
     #[test]
@@ -7045,8 +7045,8 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
-        coord.put_bucket_versioning("bucket", 1).unwrap();
-        let err = coord.put_bucket_versioning("bucket", 0).unwrap_err();
+        coord.put_bucket_versioning("bucket", storage::BucketVersioningState::Enabled).unwrap();
+        let err = coord.put_bucket_versioning("bucket", storage::BucketVersioningState::Disabled).unwrap_err();
         assert!(matches!(err, ServerError::InvalidRequest { .. }));
     }
 
@@ -7055,7 +7055,7 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        let err = coord.put_bucket_versioning("no-bucket", 1).unwrap_err();
+        let err = coord.put_bucket_versioning("no-bucket", storage::BucketVersioningState::Enabled).unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
     }
 
@@ -7115,7 +7115,7 @@ mod tests {
 
         let admin = make_coord();
         admin.create_bucket("bucket").unwrap();
-        admin.put_bucket_versioning("bucket", 1).unwrap();
+        admin.put_bucket_versioning("bucket", storage::BucketVersioningState::Enabled).unwrap();
 
         // Repeat to increase the chance of exposing races.
         for i in 0..20 {
@@ -8202,7 +8202,7 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
-        coord.put_bucket_versioning("bucket", 1).unwrap();
+        coord.put_bucket_versioning("bucket", storage::BucketVersioningState::Enabled).unwrap();
 
         let (upload_id, parts) =
             create_upload_with_parts(&coord, "bucket", "key", &[(1, b"data1")]);

@@ -469,7 +469,7 @@ impl S3Response {
     }
 
     /// Build a response for GetBucketVersioning.
-    pub fn get_bucket_versioning(state: u8) -> Self {
+    pub fn get_bucket_versioning(state: storage::BucketVersioningState) -> Self {
         let body = xml::get_bucket_versioning_xml(state);
         Self::new(200).xml_body(body)
     }
@@ -1386,7 +1386,7 @@ mod tests {
             owner_principal: "owner".into(),
             created_at: 0,
             region: 0,
-            versioning: 0,
+            versioning: storage::BucketVersioningState::Disabled,
             public_read: false,
             cors_config: None,
             tags: None,
@@ -1406,7 +1406,7 @@ mod tests {
             owner_principal: "owner".into(),
             created_at: 1000,
             region: 0,
-            versioning: 0,
+            versioning: storage::BucketVersioningState::Disabled,
             public_read: false,
             cors_config: None,
             tags: None,

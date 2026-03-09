@@ -5,7 +5,7 @@ use crate::coordinator::{
 };
 use crate::error::ServerError;
 use auth::canonical::uri_encode_path;
-use storage::{BucketInfo, ChecksumAlgorithm};
+use storage::{BucketInfo, BucketVersioningState, ChecksumAlgorithm};
 
 use super::response::format_version_id;
 
@@ -399,16 +399,16 @@ pub fn delete_objects_result_xml(
 
 /// Parse a PutBucketVersioning XML request body.
 ///
-/// Returns the versioning state: 1 = Enabled, 2 = Suspended.
-pub fn parse_versioning_config_xml(data: &[u8]) -> Result<u8, ServerError> {
+/// Returns the versioning state as a `BucketVersioningState` enum.
+pub fn parse_versioning_config_xml(data: &[u8]) -> Result<BucketVersioningState, ServerError> {
     let text = std::str::from_utf8(data).map_err(|_| ServerError::InvalidRequest {
         reason: "invalid UTF-8 in versioning XML body".to_string(),
     })?;
 
     if let Some(status) = extract_tag_content(text, "Status") {
         match status {
-            "Enabled" => Ok(1),
-            "Suspended" => Ok(2),
+            "Enabled" => Ok(BucketVersioningState::Enabled),
+            "Suspended" => Ok(BucketVersioningState::Suspended),
             other => Err(ServerError::InvalidRequest {
                 reason: format!("invalid versioning status: {}", other),
             }),
@@ -421,16 +421,16 @@ pub fn parse_versioning_config_xml(data: &[u8]) -> Result<u8, ServerError> {
 }
 
 /// Format a GetBucketVersioning XML response.
-pub fn get_bucket_versioning_xml(state: u8) -> String {
+pub fn get_bucket_versioning_xml(state: BucketVersioningState) -> String {
     let mut xml = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
     );
 
     match state {
-        1 => xml.push_str("<Status>Enabled</Status>"),
-        2 => xml.push_str("<Status>Suspended</Status>"),
-        _ => {} // Disabled (0): empty element per S3 spec
+        BucketVersioningState::Enabled => xml.push_str("<Status>Enabled</Status>"),
+        BucketVersioningState::Suspended => xml.push_str("<Status>Suspended</Status>"),
+        BucketVersioningState::Disabled => {} // empty element per S3 spec
     }
 
     xml.push_str("</VersioningConfiguration>");
@@ -1667,7 +1667,7 @@ mod tests {
             owner_principal: "owner".to_string(),
             created_at: 1685000000000,
             region: 0,
-            versioning: 0,
+            versioning: BucketVersioningState::Disabled,
             public_read: false,
             cors_config: None,
             tags: None,
@@ -2071,13 +2071,13 @@ mod tests {
     #[test]
     fn parse_versioning_enabled() {
         let xml = b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>";
-        assert_eq!(parse_versioning_config_xml(xml).unwrap(), 1);
+        assert_eq!(parse_versioning_config_xml(xml).unwrap(), BucketVersioningState::Enabled);
     }
 
     #[test]
     fn parse_versioning_suspended() {
         let xml = b"<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>";
-        assert_eq!(parse_versioning_config_xml(xml).unwrap(), 2);
+        assert_eq!(parse_versioning_config_xml(xml).unwrap(), BucketVersioningState::Suspended);
     }
 
     #[test]
@@ -2094,20 +2094,20 @@ mod tests {
 
     #[test]
     fn get_bucket_versioning_disabled() {
-        let xml = get_bucket_versioning_xml(0);
+        let xml = get_bucket_versioning_xml(BucketVersioningState::Disabled);
         assert!(xml.contains("VersioningConfiguration"));
         assert!(!xml.contains("<Status>"));
     }
 
     #[test]
     fn get_bucket_versioning_enabled() {
-        let xml = get_bucket_versioning_xml(1);
+        let xml = get_bucket_versioning_xml(BucketVersioningState::Enabled);
         assert!(xml.contains("<Status>Enabled</Status>"));
     }
 
     #[test]
     fn get_bucket_versioning_suspended() {
-        let xml = get_bucket_versioning_xml(2);
+        let xml = get_bucket_versioning_xml(BucketVersioningState::Suspended);
         assert!(xml.contains("<Status>Suspended</Status>"));
     }
 

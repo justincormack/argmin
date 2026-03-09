@@ -59,7 +59,11 @@ pub trait PgMetadataStore {
     ///
     /// Validates transitions: Disabled→Enabled and Enabled↔Suspended are allowed.
     /// Enabled→Disabled is rejected.
-    fn put_bucket_versioning(&self, name: &str, state: u8) -> Result<(), MetadataError>;
+    fn put_bucket_versioning(
+        &self,
+        name: &str,
+        state: BucketVersioningState,
+    ) -> Result<(), MetadataError>;
 
     /// Store a CORS configuration for a bucket (serialized XML string).
     fn put_bucket_cors(&self, name: &str, config: &str) -> Result<(), MetadataError>;

@@ -226,6 +226,93 @@ impl ChecksumType {
     }
 }
 
+/// Object lifecycle state.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectState {
+    Live = 0,
+    DeleteMarker = 1,
+}
+
+impl ObjectState {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Live),
+            1 => Some(Self::DeleteMarker),
+            _ => None,
+        }
+    }
+
+    pub fn is_delete_marker(self) -> bool {
+        matches!(self, Self::DeleteMarker)
+    }
+}
+
+impl std::fmt::Display for ObjectState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Live => write!(f, "Live"),
+            Self::DeleteMarker => write!(f, "DeleteMarker"),
+        }
+    }
+}
+
+/// Bucket versioning state.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BucketVersioningState {
+    Disabled = 0,
+    Enabled = 1,
+    Suspended = 2,
+}
+
+impl BucketVersioningState {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Disabled),
+            1 => Some(Self::Enabled),
+            2 => Some(Self::Suspended),
+            _ => None,
+        }
+    }
+}
+
+/// ETag kind discriminator.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EtagKind {
+    /// CRC64-NVME single-part ETag.
+    Crc64 = 0,
+    /// Multipart composite ETag (CRC64-NVME with part count suffix).
+    MultipartComposite = 1,
+}
+
+impl EtagKind {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Crc64),
+            1 => Some(Self::MultipartComposite),
+            _ => None,
+        }
+    }
+}
+
+/// Storage class for objects.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageClass {
+    Standard = 0,
+}
+
+impl StorageClass {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Standard),
+            _ => None,
+        }
+    }
+}
+
 /// Object data layout discriminator.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -255,15 +342,13 @@ pub struct ObjectRecord {
     pub size: u64,
     /// Binary etag (e.g. CRC64-NVME bytes), max 64 bytes.
     pub etag: Vec<u8>,
-    /// 0 = CRC64-NVME.
-    pub etag_kind: u8,
+    pub etag_kind: EtagKind,
     /// Last modified timestamp (unix milliseconds).
     pub last_modified: u64,
-    pub storage_class: u8,
+    pub storage_class: StorageClass,
     pub ec_k: u8,
     pub ec_m: u8,
-    /// 0 = Live, 1 = DeleteMarker.
-    pub status: u8,
+    pub status: ObjectState,
     /// Serialized tagging XML (None = no tags).
     pub tags: Option<String>,
     /// Object data layout (ChunkManifestInternal or MultipartManifest).
@@ -282,8 +367,7 @@ pub struct BucketInfo {
     /// Creation timestamp (unix milliseconds).
     pub created_at: u64,
     pub region: u16,
-    /// 0 = Disabled, 1 = Enabled, 2 = Suspended.
-    pub versioning: u8,
+    pub versioning: BucketVersioningState,
     pub public_read: bool,
     /// Serialized CORS configuration XML (None = no CORS config).
     pub cors_config: Option<String>,
@@ -302,11 +386,10 @@ pub struct PutObjectMetaReq {
     pub version_id: u64,
     pub size: u64,
     pub etag: Vec<u8>,
-    pub etag_kind: u8,
+    pub etag_kind: EtagKind,
     pub ec_k: u8,
     pub ec_m: u8,
-    /// 0 = Live, 1 = DeleteMarker.
-    pub status: u8,
+    pub status: ObjectState,
     /// Object data layout. None defaults to ChunkManifestInternal (0).
     pub data_layout: Option<DataLayout>,
     /// Number of parts (set for MultipartManifest objects).
@@ -395,7 +478,7 @@ pub struct MultipartPartRecord {
     pub generation: u32,
     pub size: u64,
     pub etag: Vec<u8>,
-    pub etag_kind: u8,
+    pub etag_kind: EtagKind,
     /// 16-byte object key hash for shard keys.
     pub part_okh: [u8; 16],
     /// Per-part shard key version field.
@@ -417,7 +500,7 @@ pub struct ObjectPartRecord {
     pub part_number: u32,
     pub size: u64,
     pub etag: Vec<u8>,
-    pub etag_kind: u8,
+    pub etag_kind: EtagKind,
     pub part_okh: [u8; 16],
     pub part_vid: u64,
     pub ec_k: u8,

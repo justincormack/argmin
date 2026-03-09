@@ -44,8 +44,11 @@ pub enum MetadataError {
     #[error("object not found")]
     ObjectNotFound,
 
-    #[error("invalid versioning transition from {from} to {to}")]
-    InvalidVersioningTransition { from: u8, to: u8 },
+    #[error("invalid versioning transition from {from:?} to {to:?}")]
+    InvalidVersioningTransition {
+        from: crate::types::BucketVersioningState,
+        to: crate::types::BucketVersioningState,
+    },
 
     #[error("multipart upload not found: {upload_id}")]
     NoSuchUpload { upload_id: String },

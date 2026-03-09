@@ -10,9 +10,9 @@ pub fn format_etag(crc64: u64) -> String {
 ///
 /// Regular objects (etag_kind=0): `"abcdef1234567890"`
 /// Multipart objects (etag_kind=1): `"abcdef1234567890-3"` (with parts_count suffix)
-pub fn format_object_etag(etag: &[u8], etag_kind: u8, parts_count: Option<u32>) -> String {
+pub fn format_object_etag(etag: &[u8], etag_kind: storage::EtagKind, parts_count: Option<u32>) -> String {
     let crc = etag_bytes_to_crc64(etag).unwrap_or(0);
-    if etag_kind == 1 {
+    if etag_kind == storage::EtagKind::MultipartComposite {
         if let Some(count) = parts_count {
             return format!("\"{:016x}-{count}\"", crc);
         }

@@ -134,7 +134,7 @@ impl PgStore {
             generation: row.get::<_, i64>(2)? as u32,
             size: row.get::<_, i64>(3)? as u64,
             etag: row.get(4)?,
-            etag_kind: row.get::<_, u8>(5)?,
+            etag_kind: Self::parse_enum(row.get::<_, u8>(5)?, 5, "etag_kind", EtagKind::from_u8)?,
             part_okh,
             part_vid: row.get::<_, i64>(7)? as u64,
             ec_k: row.get::<_, u8>(8)?,
@@ -212,19 +212,20 @@ impl PgStore {
     }
 
     fn validate_object_layout(
-        status: u8,
+        status: ObjectState,
         data_layout: DataLayout,
         parts_count: Option<u32>,
     ) -> Result<(), rusqlite::Error> {
         let valid = match status {
             // Live object: ChunkManifest has no parts_count, MultipartManifest requires >0 parts.
-            0 => match data_layout {
+            ObjectState::Live => match data_layout {
                 DataLayout::ChunkManifestInternal => parts_count.is_none(),
                 DataLayout::MultipartManifest => parts_count.is_some_and(|n| n > 0),
             },
             // Delete marker records must be non-multipart.
-            1 => data_layout == DataLayout::ChunkManifestInternal && parts_count.is_none(),
-            _ => false,
+            ObjectState::DeleteMarker => {
+                data_layout == DataLayout::ChunkManifestInternal && parts_count.is_none()
+            }
         };
         if valid {
             Ok(())
@@ -264,18 +265,30 @@ impl PgStore {
     /// Map a row with columns (bucket, key, version_id, size, etag, etag_kind,
     /// last_modified, storage_class, ec_k, ec_m, status, tags, data_layout,
     /// parts_count, metadata_blob) to an ObjectRecord.
+    /// Parse a u8-backed enum from a row column.
+    fn parse_enum<T>(
+        raw: u8,
+        col_idx: usize,
+        name: &str,
+        from_u8: fn(u8) -> Option<T>,
+    ) -> Result<T, rusqlite::Error> {
+        from_u8(raw).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                col_idx,
+                rusqlite::types::Type::Integer,
+                Box::from(format!("invalid {name}: {raw}")),
+            )
+        })
+    }
+
     fn row_to_object_record(row: &rusqlite::Row<'_>) -> Result<ObjectRecord, rusqlite::Error> {
-        let status = row.get::<_, u8>(10)?;
-        let data_layout = {
-            let raw = row.get::<_, u8>(12)?;
-            DataLayout::from_u8(raw).ok_or_else(|| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    12,
-                    rusqlite::types::Type::Integer,
-                    Box::from(format!("invalid data_layout: {raw}")),
-                )
-            })?
-        };
+        let status = Self::parse_enum(row.get::<_, u8>(10)?, 10, "status", ObjectState::from_u8)?;
+        let etag_kind =
+            Self::parse_enum(row.get::<_, u8>(5)?, 5, "etag_kind", EtagKind::from_u8)?;
+        let storage_class =
+            Self::parse_enum(row.get::<_, u8>(7)?, 7, "storage_class", StorageClass::from_u8)?;
+        let data_layout =
+            Self::parse_enum(row.get::<_, u8>(12)?, 12, "data_layout", DataLayout::from_u8)?;
         let parts_count =
             Self::parse_optional_u32(row.get::<_, Option<i64>>(13)?, 13, "parts_count")?;
         Self::validate_object_layout(status, data_layout, parts_count)?;
@@ -286,9 +299,9 @@ impl PgStore {
             version_id: row.get::<_, i64>(2)? as u64,
             size: row.get::<_, i64>(3)? as u64,
             etag: row.get(4)?,
-            etag_kind: row.get::<_, u8>(5)?,
+            etag_kind,
             last_modified: row.get::<_, i64>(6)? as u64,
-            storage_class: row.get::<_, u8>(7)?,
+            storage_class,
             ec_k: row.get::<_, u8>(8)?,
             ec_m: row.get::<_, u8>(9)?,
             status,
@@ -578,7 +591,7 @@ impl PgMetadataStore for PgStore {
                         owner_principal: row.get(1)?,
                         created_at: row.get::<_, i64>(2)? as u64,
                         region: row.get::<_, i64>(3)? as u16,
-                        versioning: row.get::<_, i64>(4)? as u8,
+                        versioning: PgStore::parse_enum(row.get::<_, u8>(4)?, 4, "versioning", BucketVersioningState::from_u8)?,
                         public_read: row.get::<_, i64>(5)? != 0,
                         cors_config: row.get(6)?,
                         tags: row.get(7)?,
@@ -615,7 +628,7 @@ impl PgMetadataStore for PgStore {
                     owner_principal: row.get(1)?,
                     created_at: row.get::<_, i64>(2)? as u64,
                     region: row.get::<_, i64>(3)? as u16,
-                    versioning: row.get::<_, i64>(4)? as u8,
+                    versioning: PgStore::parse_enum(row.get::<_, u8>(4)?, 4, "versioning", BucketVersioningState::from_u8)?,
                     public_read: row.get::<_, i64>(5)? != 0,
                     cors_config: row.get(6)?,
                     tags: row.get(7)?,
@@ -638,13 +651,17 @@ impl PgMetadataStore for PgStore {
         Ok(buckets)
     }
 
-    fn put_bucket_versioning(&self, name: &str, state: u8) -> Result<(), MetadataError> {
-        let current: u8 = self
+    fn put_bucket_versioning(
+        &self,
+        name: &str,
+        state: BucketVersioningState,
+    ) -> Result<(), MetadataError> {
+        let current: BucketVersioningState = self
             .conn
             .query_row(
                 "SELECT versioning FROM buckets WHERE name = ?1",
                 params![name],
-                |row| row.get::<_, i64>(0).map(|v| v as u8),
+                |row| row.get::<_, u8>(0),
             )
             .optional()
             .map_err(|e| MetadataError::Db {
@@ -653,8 +670,18 @@ impl PgMetadataStore for PgStore {
             })?
             .ok_or(MetadataError::BucketNotFound {
                 name: name.to_string(),
+            })
+            .and_then(|raw| {
+                BucketVersioningState::from_u8(raw).ok_or_else(|| MetadataError::Db {
+                    context: "invalid versioning state in database",
+                    source: rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Integer,
+                        Box::from(format!("invalid versioning: {raw}")),
+                    ),
+                })
             })?;
-        if state == 0 && current != 0 {
+        if state == BucketVersioningState::Disabled && current != BucketVersioningState::Disabled {
             return Err(MetadataError::InvalidVersioningTransition {
                 from: current,
                 to: state,
@@ -664,7 +691,7 @@ impl PgMetadataStore for PgStore {
         self.conn
             .execute(
                 "UPDATE buckets SET versioning = ?1 WHERE name = ?2",
-                params![state as i64, name],
+                params![state as u8 as i64, name],
             )
             .map_err(|e| MetadataError::Db {
                 context: "put bucket versioning",
@@ -925,7 +952,9 @@ impl PgMetadataStore for PgStore {
                 source: e,
             }
         })?;
-        let data_layout = data_layout as u8;
+        let data_layout_u8 = data_layout as u8;
+        let etag_kind_u8 = req.etag_kind as u8;
+        let status_u8 = req.status as u8;
         let parts_count = req.parts_count.map(|n| n as i64);
         let metadata_blob: Option<&[u8]> = req.metadata_blob.as_deref();
         if req.version_id == 0 {
@@ -942,12 +971,12 @@ impl PgMetadataStore for PgStore {
                         req.version_id as i64,
                         req.size as i64,
                         req.etag,
-                        req.etag_kind,
+                        etag_kind_u8,
                         now as i64,
                         req.ec_k,
                         req.ec_m,
-                        req.status,
-                        data_layout,
+                        status_u8,
+                        data_layout_u8,
                         parts_count,
                         metadata_blob,
                     ],
@@ -970,12 +999,12 @@ impl PgMetadataStore for PgStore {
                         req.version_id as i64,
                         req.size as i64,
                         req.etag,
-                        req.etag_kind,
+                        etag_kind_u8,
                         now as i64,
                         req.ec_k,
                         req.ec_m,
-                        req.status,
-                        data_layout,
+                        status_u8,
+                        data_layout_u8,
                         parts_count,
                         metadata_blob,
                     ],
@@ -1686,7 +1715,7 @@ impl PgMetadataStore for PgStore {
                     part.generation,
                     part.size as i64,
                     part.etag,
-                    part.etag_kind,
+                    part.etag_kind as u8,
                     part.part_okh.as_slice(),
                     part.part_vid as i64,
                     part.ec_k,
@@ -1859,7 +1888,7 @@ impl PgMetadataStore for PgStore {
                     part.part_number,
                     part.size as i64,
                     part.etag,
-                    part.etag_kind,
+                    part.etag_kind as u8,
                     part.part_okh.as_slice(),
                     part.part_vid as i64,
                     part.ec_k,
@@ -1922,7 +1951,7 @@ impl PgMetadataStore for PgStore {
                     part_number: row.get::<_, i64>(3)? as u32,
                     size: row.get::<_, i64>(4)? as u64,
                     etag: row.get(5)?,
-                    etag_kind: row.get::<_, u8>(6)?,
+                    etag_kind: Self::parse_enum(row.get::<_, u8>(6)?, 6, "etag_kind", EtagKind::from_u8)?,
                     part_okh,
                     part_vid: row.get::<_, i64>(8)? as u64,
                     ec_k: row.get::<_, u8>(9)?,
@@ -2028,11 +2057,11 @@ impl PgMetadataStore for PgStore {
                         obj.version_id as i64,
                         obj.size as i64,
                         obj.etag,
-                        obj.etag_kind,
+                        obj.etag_kind as u8,
                         now as i64,
                         obj.ec_k,
                         obj.ec_m,
-                        obj.status,
+                        obj.status as u8,
                         data_layout,
                         parts_count,
                         metadata_blob,
@@ -2050,11 +2079,11 @@ impl PgMetadataStore for PgStore {
                         obj.version_id as i64,
                         obj.size as i64,
                         obj.etag,
-                        obj.etag_kind,
+                        obj.etag_kind as u8,
                         now as i64,
                         obj.ec_k,
                         obj.ec_m,
-                        obj.status,
+                        obj.status as u8,
                         data_layout,
                         parts_count,
                         metadata_blob,
@@ -2085,7 +2114,7 @@ impl PgMetadataStore for PgStore {
                         part.part_number,
                         part.size as i64,
                         part.etag,
-                        part.etag_kind,
+                        part.etag_kind as u8,
                         part.part_okh.as_slice(),
                         part.part_vid as i64,
                         part.ec_k,
@@ -2487,11 +2516,11 @@ impl PgMetadataStore for PgStore {
                         obj.version_id as i64,
                         obj.size as i64,
                         obj.etag,
-                        obj.etag_kind,
+                        obj.etag_kind as u8,
                         now as i64,
                         obj.ec_k,
                         obj.ec_m,
-                        obj.status,
+                        obj.status as u8,
                         data_layout,
                         parts_count,
                         obj.metadata_blob,
@@ -2704,7 +2733,7 @@ impl PgMetadataStore for PgStore {
                         new_gen,
                         part.size as i64,
                         part.etag,
-                        part.etag_kind,
+                        part.etag_kind as u8,
                         part.part_okh.as_slice(),
                         part.part_vid as i64,
                         part.ec_k,
@@ -3106,10 +3135,10 @@ mod tests {
                     bucket: "bucket".into(),
                     key: key.to_string(),
                     version_id: 0,
-                    status: 0,
+                    status: ObjectState::Live,
                     size: 10,
                     etag: vec![0; 8],
-                    etag_kind: 0,
+                    etag_kind: EtagKind::Crc64,
                     ec_k: 4,
                     ec_m: 2,
                     data_layout: None,
@@ -3245,7 +3274,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            rusqlite::Error::FromSqlConversionFailure(13, rusqlite::types::Type::Integer, _)
+            rusqlite::Error::FromSqlConversionFailure(10, rusqlite::types::Type::Integer, _)
         ));
     }
 
@@ -3262,10 +3291,10 @@ mod tests {
                     bucket: "b".into(),
                     key: format!("key-{:02}", i),
                     version_id: 0,
-                    status: 0,
+                    status: ObjectState::Live,
                     size: 0,
                     etag: vec![0; 8],
-                    etag_kind: 0,
+                    etag_kind: EtagKind::Crc64,
                     ec_k: 4,
                     ec_m: 2,
                     data_layout: None,
