@@ -722,6 +722,9 @@ impl Coordinator {
             },
             other => ServerError::Metadata(other),
         })?;
+        if record.status == 1 {
+            return Err(ServerError::MethodNotAllowed);
+        }
         pg.put_object_tags(bucket, key, record.version_id, tags)
             .map_err(ServerError::Metadata)
     }
@@ -746,6 +749,9 @@ impl Coordinator {
             },
             other => ServerError::Metadata(other),
         })?;
+        if record.status == 1 {
+            return Err(ServerError::MethodNotAllowed);
+        }
         pg.get_object_tags(bucket, key, record.version_id)
             .map_err(ServerError::Metadata)
     }
@@ -770,6 +776,9 @@ impl Coordinator {
             },
             other => ServerError::Metadata(other),
         })?;
+        if record.status == 1 {
+            return Err(ServerError::MethodNotAllowed);
+        }
         pg.delete_object_tags(bucket, key, record.version_id)
             .map_err(ServerError::Metadata)
     }

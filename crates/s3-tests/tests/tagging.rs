@@ -1,7 +1,6 @@
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::Tag;
-use aws_sdk_s3::types::Tagging;
-use s3_tests::{unique_bucket, CTX};
+use aws_sdk_s3::types::{BucketVersioningStatus, Tag, Tagging, VersioningConfiguration};
+use s3_tests::{assert_s3_err_code, cleanup_versioned_bucket, err_status, unique_bucket, CTX};
 
 /// Cleanup helper.
 async fn cleanup(bucket: &str, keys: &[&str]) {
@@ -1222,6 +1221,254 @@ fn test_copy_object_replace_clears_tags() {
         assert!(result.tag_set().is_empty());
 
         cleanup(&bucket, &["src", "dst"]).await;
+    });
+}
+
+// ── Delete marker tagging ─────────────────────────────────────────────
+
+/// Helper: create a versioned bucket, put an object, delete it to create a
+/// delete marker, and return (bucket, key, delete_marker_version_id).
+async fn create_delete_marker() -> (String, String, String) {
+    let client = CTX.client();
+    let bucket = unique_bucket();
+    client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+    // Enable versioning
+    client
+        .put_bucket_versioning()
+        .bucket(&bucket)
+        .versioning_configuration(
+            VersioningConfiguration::builder()
+                .status(BucketVersioningStatus::Enabled)
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    let key = "dm-test-obj";
+
+    // Put an object
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from_static(b"hello"))
+        .send()
+        .await
+        .unwrap();
+
+    // Delete the object (creates a delete marker)
+    let delete_resp = client
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await
+        .unwrap();
+
+    assert!(delete_resp.delete_marker().unwrap_or(false));
+    let dm_version_id = delete_resp.version_id().unwrap().to_string();
+
+    (bucket, key.to_string(), dm_version_id)
+}
+
+/// PutObjectTagging on a delete marker (by versionId) should return 405.
+#[test]
+fn test_put_tagging_on_delete_marker() {
+    s3_tests::run(async {
+        let (bucket, key, dm_version_id) = create_delete_marker().await;
+        let client = CTX.client();
+
+        let result = client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key(&key)
+            .version_id(&dm_version_id)
+            .tagging(tagging(vec![tag("foo", "bar")]))
+            .send()
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(err_status(&result), 405);
+        assert_s3_err_code(&result, "MethodNotAllowed");
+
+        cleanup_versioned_bucket(CTX.client(), &bucket).await;
+    });
+}
+
+/// GetObjectTagging on a delete marker (by versionId) should return 405.
+#[test]
+fn test_get_tagging_on_delete_marker() {
+    s3_tests::run(async {
+        let (bucket, key, dm_version_id) = create_delete_marker().await;
+        let client = CTX.client();
+
+        let result = client
+            .get_object_tagging()
+            .bucket(&bucket)
+            .key(&key)
+            .version_id(&dm_version_id)
+            .send()
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(err_status(&result), 405);
+        assert_s3_err_code(&result, "MethodNotAllowed");
+
+        cleanup_versioned_bucket(CTX.client(), &bucket).await;
+    });
+}
+
+/// DeleteObjectTagging on a delete marker (by versionId) should return 405.
+#[test]
+fn test_delete_tagging_on_delete_marker() {
+    s3_tests::run(async {
+        let (bucket, key, dm_version_id) = create_delete_marker().await;
+        let client = CTX.client();
+
+        let result = client
+            .delete_object_tagging()
+            .bucket(&bucket)
+            .key(&key)
+            .version_id(&dm_version_id)
+            .send()
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(err_status(&result), 405);
+        assert_s3_err_code(&result, "MethodNotAllowed");
+
+        cleanup_versioned_bucket(CTX.client(), &bucket).await;
+    });
+}
+
+/// Tagging on a deleted object (no versionId, current version is delete marker)
+/// should return 405 MethodNotAllowed, not succeed silently.
+/// AWS returns 405 even without an explicit versionId when the current version
+/// is a delete marker.
+#[test]
+fn test_tagging_on_deleted_object_without_version_id() {
+    s3_tests::run(async {
+        let (bucket, key, _dm_version_id) = create_delete_marker().await;
+        let client = CTX.client();
+
+        // PutObjectTagging without versionId on deleted object → 405
+        let result = client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key(&key)
+            .tagging(tagging(vec![tag("foo", "bar")]))
+            .send()
+            .await;
+        assert!(result.is_err());
+        assert_eq!(err_status(&result), 405);
+        assert_s3_err_code(&result, "MethodNotAllowed");
+
+        // GetObjectTagging without versionId on deleted object → 405
+        let result = client
+            .get_object_tagging()
+            .bucket(&bucket)
+            .key(&key)
+            .send()
+            .await;
+        assert!(result.is_err());
+        assert_eq!(err_status(&result), 405);
+        assert_s3_err_code(&result, "MethodNotAllowed");
+
+        // DeleteObjectTagging without versionId on deleted object → 405
+        let result = client
+            .delete_object_tagging()
+            .bucket(&bucket)
+            .key(&key)
+            .send()
+            .await;
+        assert!(result.is_err());
+        assert_eq!(err_status(&result), 405);
+        assert_s3_err_code(&result, "MethodNotAllowed");
+
+        cleanup_versioned_bucket(CTX.client(), &bucket).await;
+    });
+}
+
+/// Deleting a tagged object should not leave tags on the delete marker.
+/// The delete marker is a separate version with only a last-modified time — no data, metadata, or tags.
+#[test]
+fn test_delete_tagged_object_no_tags_on_delete_marker() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        // Enable versioning
+        client
+            .put_bucket_versioning()
+            .bucket(&bucket)
+            .versioning_configuration(
+                VersioningConfiguration::builder()
+                    .status(BucketVersioningStatus::Enabled)
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let key = "tagged-then-deleted";
+
+        // Put an object with tags
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"hello"))
+            .tagging("env=prod&team=platform")
+            .send()
+            .await
+            .unwrap();
+
+        // Verify tags are set
+        let result = client
+            .get_object_tagging()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(result.tag_set().len(), 2);
+
+        // Delete the object (creates delete marker)
+        let delete_resp = client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert!(delete_resp.delete_marker().unwrap_or(false));
+        let dm_version_id = delete_resp.version_id().unwrap().to_string();
+
+        // GetObjectTagging on the delete marker by versionId → 405
+        let result = client
+            .get_object_tagging()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&dm_version_id)
+            .send()
+            .await;
+        assert!(result.is_err());
+        assert_eq!(err_status(&result), 405);
+
+        // GetObjectTagging without versionId (current = delete marker) → 405
+        let result = client
+            .get_object_tagging()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await;
+        assert!(result.is_err());
+        assert_eq!(err_status(&result), 405);
+
+        cleanup_versioned_bucket(CTX.client(), &bucket).await;
     });
 }
 
