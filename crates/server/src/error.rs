@@ -253,7 +253,9 @@ impl ServerError {
 impl From<MetadataError> for ServerError {
     fn from(e: MetadataError) -> Self {
         match e {
-            MetadataError::NoSuchUpload { upload_id } => ServerError::NoSuchUpload { upload_id: upload_id.into_string() },
+            MetadataError::NoSuchUpload { upload_id } => ServerError::NoSuchUpload {
+                upload_id: upload_id.into_string(),
+            },
             other => ServerError::Metadata(other),
         }
     }

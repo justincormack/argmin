@@ -18,6 +18,7 @@ use crate::conditional::{
     copy_source_condition_from_headers, delete_condition_from_headers, read_condition_from_headers,
     write_condition_from_headers,
 };
+use crate::coordinator::ChecksumClaim;
 use crate::coordinator::Coordinator;
 use crate::coordinator::MetadataDirective;
 use crate::error::ServerError;
@@ -1057,9 +1058,6 @@ impl HttpFrontend {
 
                     // Extract claimed checksum from request headers (at most one).
                     let claimed_checksum = extract_checksum_header(req)?;
-                    let claimed_ref = claimed_checksum
-                        .as_ref()
-                        .map(|(algo, val)| (*algo, val.as_str()));
 
                     let result = self.coordinator.upload_part(
                         &bucket,
@@ -1067,7 +1065,7 @@ impl HttpFrontend {
                         &upload_id,
                         part_number,
                         &req.body,
-                        claimed_ref,
+                        claimed_checksum.as_ref(),
                     )?;
                     Ok(S3Response::upload_part(
                         &result.etag,
@@ -1083,9 +1081,10 @@ impl HttpFrontend {
                             reason: "missing uploadId query parameter".to_string(),
                         })?;
                 let parts = xml::parse_complete_multipart_upload_xml(&req.body)?;
-                // Extract object-level checksum claim from request headers.
-                // Reject multiple checksum headers, same as UploadPart.
-                let claimed_checksum = extract_checksum_header(req)?;
+                // Extract object-level checksum claim from request headers as a raw
+                // string. CompleteMultipartUpload checksums may be composite ("base64-N"),
+                // so we cannot decode them as plain base64.
+                let claimed_checksum = extract_checksum_header_raw(req)?;
                 let claimed_ref = claimed_checksum
                     .as_ref()
                     .map(|(algo, val)| (*algo, val.as_str()));
@@ -1901,15 +1900,14 @@ impl HttpFrontend {
         // checksum (overriding any from request headers). Trailing checksums
         // take precedence since they are computed after the body is sent.
         let trailer_claim = if let Some((k, v)) = trailer_checksums.first() {
-            checksum_algo_from_header(k).map(|algo| (algo, v.as_str()))
+            match checksum_algo_from_header(k) {
+                Some(algo) => Some(ChecksumClaim::from_base64(algo, v)?),
+                None => None,
+            }
         } else {
             None
         };
-        let claimed_ref = trailer_claim.or_else(|| {
-            ctx.claimed_checksum
-                .as_ref()
-                .map(|(algo, val)| (*algo, val.as_str()))
-        });
+        let effective_claim = trailer_claim.as_ref().or(ctx.claimed_checksum.as_ref());
 
         let result = self.coordinator.finalize_stream_part(
             &ctx.bucket,
@@ -1919,7 +1917,7 @@ impl HttpFrontend {
             ctx.part_number,
             crc64,
             total_size,
-            claimed_ref,
+            effective_claim,
             computed_checksum,
         )?;
 
@@ -1985,7 +1983,7 @@ pub struct StreamingPartContext {
     pub upload_id: String,
     pub part_number: u32,
     pub upload_checksum_algorithm: Option<ChecksumAlgorithm>,
-    pub claimed_checksum: Option<(ChecksumAlgorithm, String)>,
+    pub claimed_checksum: Option<ChecksumClaim>,
     pub checksum_response: Vec<(String, String)>,
     /// Signing context for aws-chunked modes, None for unsigned/plain.
     pub streaming_signing: Option<auth::StreamingSigningContext>,
@@ -2133,15 +2131,13 @@ fn header_count(req: &S3Request, name: &str) -> usize {
     req.headers.iter().filter(|(k, _)| k == name).count()
 }
 
-/// Extract a claimed checksum from request headers (shared by UploadPart and
-/// CompleteMultipartUpload).
+/// Extract a checksum header as a raw `(algorithm, value_string)` pair.
 ///
-/// Returns `(ChecksumAlgorithm, base64_value)` if exactly one checksum value
-/// header is present. Rejects if:
+/// Shared validation for all checksum-header consumers. Rejects if:
 /// - multiple distinct checksum value headers are present (e.g. crc32 + sha256)
 /// - the same checksum header appears more than once
 /// - `x-amz-checksum-algorithm` contradicts the value header's algorithm
-fn extract_checksum_header(
+fn extract_checksum_header_raw(
     req: &S3Request,
 ) -> Result<Option<(ChecksumAlgorithm, String)>, ServerError> {
     if header_count(req, "x-amz-checksum-algorithm") > 1 {
@@ -2182,6 +2178,18 @@ fn extract_checksum_header(
         }
     }
     Ok(found)
+}
+
+/// Extract a claimed checksum from request headers, decoded and validated.
+///
+/// Used by UploadPart and streaming paths where the value is always plain base64.
+fn extract_checksum_header(
+    req: &S3Request,
+) -> Result<Option<ChecksumClaim>, ServerError> {
+    match extract_checksum_header_raw(req)? {
+        Some((algo, value)) => Ok(Some(ChecksumClaim::from_base64(algo, &value)?)),
+        None => Ok(None),
+    }
 }
 
 /// Append any checksum headers that were sent on PutObject to the response.

@@ -24,7 +24,10 @@ fn metadata_put_get_delete(store: &dyn PgMetadataStore) {
     assert_eq!(obj.version_id(), VersionId::Null);
     let live = obj.as_live().unwrap();
     assert_eq!(live.size, 1024);
-    assert_eq!(live.etag, ObjectEtag::SinglePart([0xAB, 0xCD, 0, 0, 0, 0, 0, 0]));
+    assert_eq!(
+        live.etag,
+        ObjectEtag::SinglePart([0xAB, 0xCD, 0, 0, 0, 0, 0, 0])
+    );
     assert_eq!(live.etag.etag_kind(), EtagKind::Crc64);
     assert_eq!(live.ec.k, 4);
     assert_eq!(live.ec.m, 2);
@@ -118,8 +121,8 @@ fn metadata_list_with_prefix(store: &dyn PgMetadataStore) {
             size: 100,
             etag: ObjectEtag::SinglePart([0; 8]),
             layout: ObjectLayout::ChunkManifest,
-        metadata_blob: None,
-    });
+            metadata_blob: None,
+        });
         store.put_object_meta(&req).unwrap();
     }
 
@@ -395,11 +398,19 @@ fn file_bucket_metadata_versioning_transitions() {
     let (_dir, store) = make_pg_store();
     store.create_bucket("bucket", "owner", false).unwrap();
 
-    store.put_bucket_versioning("bucket", BucketVersioningState::Enabled).unwrap();
-    store.put_bucket_versioning("bucket", BucketVersioningState::Suspended).unwrap();
-    store.put_bucket_versioning("bucket", BucketVersioningState::Enabled).unwrap();
+    store
+        .put_bucket_versioning("bucket", BucketVersioningState::Enabled)
+        .unwrap();
+    store
+        .put_bucket_versioning("bucket", BucketVersioningState::Suspended)
+        .unwrap();
+    store
+        .put_bucket_versioning("bucket", BucketVersioningState::Enabled)
+        .unwrap();
 
-    let err = store.put_bucket_versioning("bucket", BucketVersioningState::Disabled).unwrap_err();
+    let err = store
+        .put_bucket_versioning("bucket", BucketVersioningState::Disabled)
+        .unwrap_err();
     assert!(matches!(
         err,
         crate::error::MetadataError::InvalidVersioningTransition { .. }
@@ -410,8 +421,13 @@ fn file_bucket_metadata_versioning_transitions() {
 fn file_bucket_metadata_versioning_disabled_noop() {
     let (_dir, store) = make_pg_store();
     store.create_bucket("bucket", "owner", false).unwrap();
-    store.put_bucket_versioning("bucket", BucketVersioningState::Disabled).unwrap();
-    assert_eq!(store.head_bucket("bucket").unwrap().versioning, BucketVersioningState::Disabled);
+    store
+        .put_bucket_versioning("bucket", BucketVersioningState::Disabled)
+        .unwrap();
+    assert_eq!(
+        store.head_bucket("bucket").unwrap().versioning,
+        BucketVersioningState::Disabled
+    );
 }
 
 #[test]
@@ -501,8 +517,8 @@ fn file_metadata_object_has_inline_legacy_layout() {
             size: 100,
             etag: ObjectEtag::SinglePart([1, 2, 3, 0, 0, 0, 0, 0]),
             layout: ObjectLayout::ChunkManifest,
-        metadata_blob: None,
-    }))
+            metadata_blob: None,
+        }))
         .unwrap();
 
     let obj = store.get_object_meta("b", "k").unwrap();
@@ -525,8 +541,8 @@ fn file_metadata_invalid_data_layout_returns_error() {
             size: 100,
             etag: ObjectEtag::SinglePart([1, 2, 3, 0, 0, 0, 0, 0]),
             layout: ObjectLayout::ChunkManifest,
-        metadata_blob: None,
-    }))
+            metadata_blob: None,
+        }))
         .unwrap();
 
     // Corrupting data_layout is blocked by DB CHECK constraints.
@@ -708,7 +724,9 @@ fn mpu_object_part_checksum_round_trip() {
         ])
         .unwrap();
 
-    let committed = store.get_object_parts("b", "k", VersionId::from_u64(1)).unwrap();
+    let committed = store
+        .get_object_parts("b", "k", VersionId::from_u64(1))
+        .unwrap();
     assert_eq!(committed.len(), 2);
     assert_eq!(committed[0].checksum, Some(checksum_bytes));
     assert_eq!(committed[1].checksum, None);
@@ -1292,7 +1310,9 @@ fn mpu_corrupted_object_part_okh_returns_error() {
         )
         .unwrap();
 
-    let err = store.get_object_parts("b", "k", VersionId::from_u64(1)).unwrap_err();
+    let err = store
+        .get_object_parts("b", "k", VersionId::from_u64(1))
+        .unwrap_err();
     assert!(
         matches!(err, crate::error::MetadataError::Db { .. }),
         "expected Db error for corrupted object part_okh, got: {err:?}"
@@ -1460,7 +1480,9 @@ fn mpu_commit_object_parts_rollback_on_duplicate() {
     );
 
     // The connection should still be usable (no poisoned transaction)
-    let parts = store.get_object_parts("b", "k", VersionId::from_u64(1)).unwrap();
+    let parts = store
+        .get_object_parts("b", "k", VersionId::from_u64(1))
+        .unwrap();
     assert_eq!(parts.len(), 1, "original commit should still be intact");
 }
 
@@ -1503,7 +1525,9 @@ fn mpu_commit_and_get_object_parts() {
 
     store.commit_object_parts(&parts).unwrap();
 
-    let committed = store.get_object_parts("b", "k", VersionId::from_u64(1)).unwrap();
+    let committed = store
+        .get_object_parts("b", "k", VersionId::from_u64(1))
+        .unwrap();
     assert_eq!(committed.len(), 2);
     assert_eq!(committed[0].part_number, 1);
     assert_eq!(committed[0].size, 5 * 1024 * 1024);
@@ -1512,7 +1536,9 @@ fn mpu_commit_and_get_object_parts() {
     assert_eq!(committed[1].size, 3 * 1024 * 1024);
 
     // Get for non-existent version returns empty
-    let empty = store.get_object_parts("b", "k", VersionId::from_u64(999)).unwrap();
+    let empty = store
+        .get_object_parts("b", "k", VersionId::from_u64(999))
+        .unwrap();
     assert!(empty.is_empty());
 }
 
@@ -1538,12 +1564,18 @@ fn mpu_delete_object_parts() {
         }])
         .unwrap();
 
-    store.delete_object_parts("b", "k", VersionId::from_u64(1)).unwrap();
-    let parts = store.get_object_parts("b", "k", VersionId::from_u64(1)).unwrap();
+    store
+        .delete_object_parts("b", "k", VersionId::from_u64(1))
+        .unwrap();
+    let parts = store
+        .get_object_parts("b", "k", VersionId::from_u64(1))
+        .unwrap();
     assert!(parts.is_empty());
 
     // Delete again is idempotent (no error)
-    store.delete_object_parts("b", "k", VersionId::from_u64(1)).unwrap();
+    store
+        .delete_object_parts("b", "k", VersionId::from_u64(1))
+        .unwrap();
 }
 
 // --- Step 3b: Transaction rollback and concurrency hardening tests ---
@@ -1672,7 +1704,9 @@ fn mpu_commit_partial_batch_failure_rolls_back_all() {
     );
 
     // Only part 1 from the original commit should exist — parts 2 and 3 were rolled back.
-    let parts = store.get_object_parts("b", "k", VersionId::from_u64(1)).unwrap();
+    let parts = store
+        .get_object_parts("b", "k", VersionId::from_u64(1))
+        .unwrap();
     assert_eq!(parts.len(), 1, "batch should have been fully rolled back");
     assert_eq!(parts[0].part_number, 1);
 }
@@ -1838,7 +1872,9 @@ fn mpu_commit_object_parts_connection_usable_after_multiple_failures() {
     }
 
     // Connection should still work fine after repeated failures.
-    let parts = store.get_object_parts("b", "k", VersionId::from_u64(1)).unwrap();
+    let parts = store
+        .get_object_parts("b", "k", VersionId::from_u64(1))
+        .unwrap();
     assert_eq!(parts.len(), 1);
 
     // And a non-conflicting commit should succeed.
@@ -1849,7 +1885,9 @@ fn mpu_commit_object_parts_connection_usable_after_multiple_failures() {
     store
         .commit_object_parts(std::slice::from_ref(&part2))
         .unwrap();
-    let parts = store.get_object_parts("b", "k", VersionId::from_u64(1)).unwrap();
+    let parts = store
+        .get_object_parts("b", "k", VersionId::from_u64(1))
+        .unwrap();
     assert_eq!(parts.len(), 2);
 }
 
@@ -2001,14 +2039,18 @@ fn mpu_commit_object_parts_commit_failure_via_lock_contention() {
     drop(blocker);
 
     // Rolled-back parts should not be visible.
-    let parts = store.get_object_parts("b", "k", VersionId::from_u64(1)).unwrap();
+    let parts = store
+        .get_object_parts("b", "k", VersionId::from_u64(1))
+        .unwrap();
     assert!(parts.is_empty(), "rolled-back parts should not be visible");
 
     // Connection should be usable — retry the same commit.
     store
         .commit_object_parts(std::slice::from_ref(&part))
         .unwrap();
-    let parts = store.get_object_parts("b", "k", VersionId::from_u64(1)).unwrap();
+    let parts = store
+        .get_object_parts("b", "k", VersionId::from_u64(1))
+        .unwrap();
     assert_eq!(parts.len(), 1);
 }
 
@@ -2197,8 +2239,8 @@ mod prop_tests {
                 size: 0,
                 etag: ObjectEtag::SinglePart([0; 8]),
                 layout: ObjectLayout::ChunkManifest,
-        metadata_blob: None,
-    });
+                metadata_blob: None,
+            });
             store.put_object_meta(&req).unwrap();
         }
     }
@@ -2550,7 +2592,9 @@ fn commit_stream_put_atomic() {
     assert_eq!(live.layout, ObjectLayout::ChunkManifest);
 
     // Committed chunks are readable
-    let chunks = store.get_stream_object_chunks("b", "k", VersionId::Null).unwrap();
+    let chunks = store
+        .get_stream_object_chunks("b", "k", VersionId::Null)
+        .unwrap();
     assert_eq!(chunks.len(), 2);
     assert_eq!(chunks[0].chunk_index, 0);
     assert_eq!(chunks[0].size, 4_000_000);
@@ -2587,14 +2631,14 @@ fn commit_stream_put_overwrite_unversioned() {
         .commit_stream_put(
             "s1",
             &CommitStreamPutReq {
-        bucket: "b".into(),
-        key: "k".into(),
-        version_id: VersionId::Null,
-        size: 100,
-        etag_crc64: 1u64,
-        ec: EcShape { k: 4, m: 2 },
-        metadata_blob: None,
-    },
+                bucket: "b".into(),
+                key: "k".into(),
+                version_id: VersionId::Null,
+                size: 100,
+                etag_crc64: 1u64,
+                ec: EcShape { k: 4, m: 2 },
+                metadata_blob: None,
+            },
             &[StreamObjectChunkRecord {
                 bucket: "b".into(),
                 key: "k".into(),
@@ -2623,14 +2667,14 @@ fn commit_stream_put_overwrite_unversioned() {
         .commit_stream_put(
             "s2",
             &CommitStreamPutReq {
-        bucket: "b".into(),
-        key: "k".into(),
-        version_id: VersionId::Null,
-        size: 200,
-        etag_crc64: 2u64,
-        ec: EcShape { k: 4, m: 2 },
-        metadata_blob: None,
-    },
+                bucket: "b".into(),
+                key: "k".into(),
+                version_id: VersionId::Null,
+                size: 200,
+                etag_crc64: 2u64,
+                ec: EcShape { k: 4, m: 2 },
+                metadata_blob: None,
+            },
             &[StreamObjectChunkRecord {
                 bucket: "b".into(),
                 key: "k".into(),
@@ -2651,7 +2695,9 @@ fn commit_stream_put_overwrite_unversioned() {
     assert_eq!(record.as_live().unwrap().size, 200);
 
     // Chunks replaced
-    let chunks = store.get_stream_object_chunks("b", "k", VersionId::Null).unwrap();
+    let chunks = store
+        .get_stream_object_chunks("b", "k", VersionId::Null)
+        .unwrap();
     assert_eq!(chunks.len(), 1);
     assert_eq!(chunks[0].size, 200);
     assert_eq!(chunks[0].chunk_okh, [2; 16]);
@@ -2673,14 +2719,14 @@ fn delete_stream_object_chunks_cleanup() {
         .commit_stream_put(
             "s-del",
             &CommitStreamPutReq {
-        bucket: "b".into(),
-        key: "k".into(),
-        version_id: VersionId::Null,
-        size: 100,
-        etag_crc64: 1u64,
-        ec: EcShape { k: 4, m: 2 },
-        metadata_blob: None,
-    },
+                bucket: "b".into(),
+                key: "k".into(),
+                version_id: VersionId::Null,
+                size: 100,
+                etag_crc64: 1u64,
+                ec: EcShape { k: 4, m: 2 },
+                metadata_blob: None,
+            },
             &[StreamObjectChunkRecord {
                 bucket: "b".into(),
                 key: "k".into(),
@@ -2697,12 +2743,18 @@ fn delete_stream_object_chunks_cleanup() {
         .unwrap();
 
     // Delete committed chunks
-    store.delete_stream_object_chunks("b", "k", VersionId::Null).unwrap();
-    let chunks = store.get_stream_object_chunks("b", "k", VersionId::Null).unwrap();
+    store
+        .delete_stream_object_chunks("b", "k", VersionId::Null)
+        .unwrap();
+    let chunks = store
+        .get_stream_object_chunks("b", "k", VersionId::Null)
+        .unwrap();
     assert!(chunks.is_empty());
 
     // Idempotent
-    store.delete_stream_object_chunks("b", "k", VersionId::Null).unwrap();
+    store
+        .delete_stream_object_chunks("b", "k", VersionId::Null)
+        .unwrap();
 }
 
 #[test]
@@ -2728,14 +2780,14 @@ fn commit_stream_put_rejects_non_in_progress() {
         .commit_stream_put(
             "sess-bad",
             &CommitStreamPutReq {
-        bucket: "b".into(),
-        key: "k".into(),
-        version_id: VersionId::Null,
-        size: 0,
-        etag_crc64: 0u64,
-        ec: EcShape { k: 4, m: 2 },
-        metadata_blob: None,
-    },
+                bucket: "b".into(),
+                key: "k".into(),
+                version_id: VersionId::Null,
+                size: 0,
+                etag_crc64: 0u64,
+                ec: EcShape { k: 4, m: 2 },
+                metadata_blob: None,
+            },
             &[],
         )
         .unwrap_err();
@@ -2772,7 +2824,9 @@ fn multipart_part_chunks_crud() {
     .unwrap();
 
     // Read back
-    let chunks = store.get_multipart_part_chunks("b", "k", VersionId::from_u64(1), 1).unwrap();
+    let chunks = store
+        .get_multipart_part_chunks("b", "k", VersionId::from_u64(1), 1)
+        .unwrap();
     assert_eq!(chunks.len(), 2);
     assert_eq!(chunks[0].chunk_index, 0);
     assert_eq!(chunks[0].size, 4_000_000);
@@ -2780,8 +2834,12 @@ fn multipart_part_chunks_crud() {
     assert_eq!(chunks[1].size, 2_000_000);
 
     // Delete
-    store.delete_multipart_part_chunks("b", "k", VersionId::from_u64(1)).unwrap();
-    let chunks = store.get_multipart_part_chunks("b", "k", VersionId::from_u64(1), 1).unwrap();
+    store
+        .delete_multipart_part_chunks("b", "k", VersionId::from_u64(1))
+        .unwrap();
+    let chunks = store
+        .get_multipart_part_chunks("b", "k", VersionId::from_u64(1), 1)
+        .unwrap();
     assert!(chunks.is_empty());
 }
 
@@ -2919,14 +2977,14 @@ fn commit_stream_put_rejects_wrong_kind() {
         .commit_stream_put(
             "sess-wrong-kind",
             &CommitStreamPutReq {
-        bucket: "b".into(),
-        key: "k".into(),
-        version_id: VersionId::Null,
-        size: 0,
-        etag_crc64: 0u64,
-        ec: EcShape { k: 4, m: 2 },
-        metadata_blob: None,
-    },
+                bucket: "b".into(),
+                key: "k".into(),
+                version_id: VersionId::Null,
+                size: 0,
+                etag_crc64: 0u64,
+                ec: EcShape { k: 4, m: 2 },
+                metadata_blob: None,
+            },
             &[],
         )
         .unwrap_err();
@@ -2957,14 +3015,14 @@ fn commit_stream_put_rejects_wrong_bucket_key() {
         .commit_stream_put(
             "sess-mismatch",
             &CommitStreamPutReq {
-        bucket: "b2".into(),
-        key: "k2".into(),
-        version_id: VersionId::Null,
-        size: 0,
-        etag_crc64: 0u64,
-        ec: EcShape { k: 4, m: 2 },
-        metadata_blob: None,
-    },
+                bucket: "b2".into(),
+                key: "k2".into(),
+                version_id: VersionId::Null,
+                size: 0,
+                etag_crc64: 0u64,
+                ec: EcShape { k: 4, m: 2 },
+                metadata_blob: None,
+            },
             &[],
         )
         .unwrap_err();
@@ -3181,14 +3239,14 @@ fn commit_stream_put_rejects_mismatched_chunk_target() {
         .commit_stream_put(
             "sp-ct",
             &CommitStreamPutReq {
-        bucket: "b".into(),
-        key: "k".into(),
-        version_id: VersionId::Null,
-        size: 100,
-        etag_crc64: 1u64,
-        ec: EcShape { k: 4, m: 2 },
-        metadata_blob: None,
-    },
+                bucket: "b".into(),
+                key: "k".into(),
+                version_id: VersionId::Null,
+                size: 100,
+                etag_crc64: 1u64,
+                ec: EcShape { k: 4, m: 2 },
+                metadata_blob: None,
+            },
             &[StreamObjectChunkRecord {
                 bucket: "WRONG".into(),
                 key: "k".into(),
@@ -3369,7 +3427,9 @@ fn malformed_chunk_okh_returns_db_error() {
     )
     .unwrap();
 
-    let err = store.get_stream_object_chunks("b", "k", VersionId::Null).unwrap_err();
+    let err = store
+        .get_stream_object_chunks("b", "k", VersionId::Null)
+        .unwrap_err();
     assert!(
         matches!(err, crate::error::MetadataError::Db { .. }),
         "expected Db error for malformed okh, got: {err:?}"

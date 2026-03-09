@@ -318,19 +318,15 @@ impl PgStore {
                     "data_layout",
                     DataLayout::from_u8,
                 )?;
-                let parts_count = Self::parse_optional_u32(
-                    row.get::<_, Option<i64>>(13)?,
-                    13,
-                    "parts_count",
-                )?;
-                let layout =
-                    ObjectLayout::from_parts(data_layout, parts_count).map_err(|msg| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            13,
-                            rusqlite::types::Type::Integer,
-                            Box::from(msg),
-                        )
-                    })?;
+                let parts_count =
+                    Self::parse_optional_u32(row.get::<_, Option<i64>>(13)?, 13, "parts_count")?;
+                let layout = ObjectLayout::from_parts(data_layout, parts_count).map_err(|msg| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        13,
+                        rusqlite::types::Type::Integer,
+                        Box::from(msg),
+                    )
+                })?;
 
                 let etag_bytes: Vec<u8> = row.get(4)?;
                 let etag =
@@ -678,7 +674,12 @@ impl PgMetadataStore for PgStore {
                     owner_principal: row.get(1)?,
                     created_at: row.get::<_, i64>(2)? as u64,
                     region: row.get::<_, i64>(3)? as u16,
-                    versioning: PgStore::parse_enum(row.get::<_, u8>(4)?, 4, "versioning", BucketVersioningState::from_u8)?,
+                    versioning: PgStore::parse_enum(
+                        row.get::<_, u8>(4)?,
+                        4,
+                        "versioning",
+                        BucketVersioningState::from_u8,
+                    )?,
                     public_read: row.get::<_, i64>(5)? != 0,
                     cors_config: row.get(6)?,
                     tags: row.get(7)?,
@@ -1392,11 +1393,18 @@ impl PgMetadataStore for PgStore {
                 source: e,
             })?;
         if updated == 0 {
-            let status: Option<u8> = self.conn.query_row(
-                "SELECT status FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
-                params![bucket, key, version_id.to_u64() as i64],
-                |row| row.get(0),
-            ).optional().map_err(|e| MetadataError::Db { context: "put object tags (check status)", source: e })?;
+            let status: Option<u8> = self
+                .conn
+                .query_row(
+                    "SELECT status FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
+                    params![bucket, key, version_id.to_u64() as i64],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| MetadataError::Db {
+                    context: "put object tags (check status)",
+                    source: e,
+                })?;
             return match status {
                 Some(1) => Err(MetadataError::MethodNotAllowedOnDeleteMarker),
                 _ => Err(MetadataError::ObjectNotFound),
@@ -1455,11 +1463,18 @@ impl PgMetadataStore for PgStore {
                 source: e,
             })?;
         if updated == 0 {
-            let status: Option<u8> = self.conn.query_row(
-                "SELECT status FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
-                params![bucket, key, version_id.to_u64() as i64],
-                |row| row.get(0),
-            ).optional().map_err(|e| MetadataError::Db { context: "delete object tags (check status)", source: e })?;
+            let status: Option<u8> = self
+                .conn
+                .query_row(
+                    "SELECT status FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
+                    params![bucket, key, version_id.to_u64() as i64],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| MetadataError::Db {
+                    context: "delete object tags (check status)",
+                    source: e,
+                })?;
             return match status {
                 Some(1) => Err(MetadataError::MethodNotAllowedOnDeleteMarker),
                 _ => Err(MetadataError::ObjectNotFound),
@@ -2060,7 +2075,12 @@ impl PgMetadataStore for PgStore {
                     part_number: row.get::<_, i64>(3)? as u32,
                     size: row.get::<_, i64>(4)? as u64,
                     etag: row.get(5)?,
-                    etag_kind: Self::parse_enum(row.get::<_, u8>(6)?, 6, "etag_kind", EtagKind::from_u8)?,
+                    etag_kind: Self::parse_enum(
+                        row.get::<_, u8>(6)?,
+                        6,
+                        "etag_kind",
+                        EtagKind::from_u8,
+                    )?,
                     part_okh,
                     part_vid: row.get::<_, i64>(8)? as u64,
                     ec_k: row.get::<_, u8>(9)?,
@@ -2134,7 +2154,10 @@ impl PgMetadataStore for PgStore {
         let result = (|| -> Result<(), rusqlite::Error> {
             // Validate part identity matches object.
             for part in parts {
-                if part.bucket != obj.bucket || part.key != obj.key || part.version_id != obj.version_id {
+                if part.bucket != obj.bucket
+                    || part.key != obj.key
+                    || part.version_id != obj.version_id
+                {
                     return Err(rusqlite::Error::FromSqlConversionFailure(
                         0,
                         rusqlite::types::Type::Null,
@@ -2237,7 +2260,12 @@ impl PgMetadataStore for PgStore {
             self.conn.execute(
                 "DELETE FROM multipart_part_chunks \
                  WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 AND upload_id != ?4",
-                params![obj.bucket, obj.key, obj.version_id.to_u64() as i64, upload_id],
+                params![
+                    obj.bucket,
+                    obj.key,
+                    obj.version_id.to_u64() as i64,
+                    upload_id
+                ],
             )?;
 
             // 6. Reparent this upload's chunks from staging version_id to

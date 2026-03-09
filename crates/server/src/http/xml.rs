@@ -2071,13 +2071,19 @@ mod tests {
     #[test]
     fn parse_versioning_enabled() {
         let xml = b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>";
-        assert_eq!(parse_versioning_config_xml(xml).unwrap(), BucketVersioningState::Enabled);
+        assert_eq!(
+            parse_versioning_config_xml(xml).unwrap(),
+            BucketVersioningState::Enabled
+        );
     }
 
     #[test]
     fn parse_versioning_suspended() {
         let xml = b"<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>";
-        assert_eq!(parse_versioning_config_xml(xml).unwrap(), BucketVersioningState::Suspended);
+        assert_eq!(
+            parse_versioning_config_xml(xml).unwrap(),
+            BucketVersioningState::Suspended
+        );
     }
 
     #[test]

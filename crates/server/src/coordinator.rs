@@ -28,6 +28,56 @@ use crate::range::ByteRange;
 /// Maximum object size for single PUT or upload part (5 GiB, matches AWS S3).
 pub const MAX_OBJECT_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 
+/// A checksum claim parsed from HTTP headers or trailers.
+///
+/// Base64 decoding and length validation happen at construction time,
+/// so the coordinator receives already-decoded, validated bytes.
+#[derive(Debug, Clone)]
+pub struct ChecksumClaim {
+    algorithm: ChecksumAlgorithm,
+    expected_bytes: Vec<u8>,
+}
+
+impl ChecksumClaim {
+    /// Parse a base64-encoded checksum value, validating format and length.
+    pub fn from_base64(
+        algorithm: ChecksumAlgorithm,
+        b64: &str,
+    ) -> Result<Self, ServerError> {
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|_| ServerError::InvalidRequest {
+                reason: "invalid base64 in checksum value".to_string(),
+            })?;
+        let expected_len = algorithm.expected_byte_length();
+        if bytes.len() != expected_len {
+            return Err(ServerError::InvalidRequest {
+                reason: format!(
+                    "checksum length {} does not match {} (expected {})",
+                    bytes.len(),
+                    algorithm.as_str(),
+                    expected_len,
+                ),
+            });
+        }
+        Ok(Self {
+            algorithm,
+            expected_bytes: bytes,
+        })
+    }
+
+    /// The checksum algorithm.
+    pub fn algorithm(&self) -> ChecksumAlgorithm {
+        self.algorithm
+    }
+
+    /// The decoded checksum bytes.
+    pub fn expected_bytes(&self) -> &[u8] {
+        &self.expected_bytes
+    }
+}
+
 /// Hard cap on total records fetched across all PGs for a single list query.
 /// Prevents unbounded memory when delimiter causes u32::MAX per-PG limits.
 const MAX_LIST_RECORDS: usize = 100_000;
@@ -1356,7 +1406,7 @@ impl Coordinator {
         part_number: u32,
         crc64: u64,
         total_size: u64,
-        claimed_checksum: Option<(ChecksumAlgorithm, &str)>,
+        claimed_checksum: Option<&ChecksumClaim>,
         computed_checksum: Option<(ChecksumAlgorithm, Vec<u8>)>,
     ) -> Result<UploadPartResult, ServerError> {
         let meta_pg_id = self.object_pg_id(bucket, key);
@@ -1405,7 +1455,7 @@ impl Coordinator {
         }
 
         // Resolve checksum algorithm: upload-level takes precedence.
-        let claimed_algo = claimed_checksum.as_ref().map(|(a, _)| *a);
+        let claimed_algo = claimed_checksum.map(|c| c.algorithm());
         let effective_algo = match (upload.checksum_algorithm, claimed_algo) {
             (Some(upload_algo), Some(part_algo)) if upload_algo != part_algo => {
                 return Err(ServerError::InvalidRequest {
@@ -1435,23 +1485,17 @@ impl Coordinator {
                     });
                 }
             }
-            if let Some((claimed_algo, claimed_b64)) = &claimed_checksum {
-                if *claimed_algo != algo {
+            if let Some(claim) = &claimed_checksum {
+                if claim.algorithm() != algo {
                     return Err(ServerError::InvalidRequest {
                         reason: format!(
                             "claimed checksum algorithm {} doesn't match computed {}",
-                            claimed_algo.as_str(),
+                            claim.algorithm().as_str(),
                             algo.as_str()
                         ),
                     });
                 }
-                use base64::Engine;
-                let claimed_bytes = base64::engine::general_purpose::STANDARD
-                    .decode(claimed_b64)
-                    .map_err(|_| ServerError::InvalidRequest {
-                        reason: "invalid base64 in checksum value".to_string(),
-                    })?;
-                if claimed_bytes != bytes {
+                if claim.expected_bytes() != bytes.as_slice() {
                     return Err(ServerError::BadDigest);
                 }
             }
@@ -3955,7 +3999,7 @@ impl Coordinator {
         upload_id: &str,
         part_number: u32,
         data: &[u8],
-        claimed_checksum: Option<(ChecksumAlgorithm, &str)>,
+        claimed_checksum: Option<&ChecksumClaim>,
     ) -> Result<UploadPartResult, ServerError> {
         let inner =
             self.write_part_inner(bucket, key, upload_id, part_number, data, claimed_checksum)?;
@@ -4104,7 +4148,7 @@ impl Coordinator {
         upload_id: &str,
         part_number: u32,
         data: &[u8],
-        claimed_checksum: Option<(ChecksumAlgorithm, &str)>,
+        claimed_checksum: Option<&ChecksumClaim>,
     ) -> Result<WritePartInnerResult, ServerError> {
         // 1. Validate part number range [1, 10000].
         if part_number == 0 || part_number > 10_000 {
@@ -4207,7 +4251,7 @@ impl Coordinator {
         //    The upload's checksum_algorithm is the single source of truth.
         //    Parts may only carry a checksum if the upload was configured with one,
         //    and it must match. This prevents untagged raw bytes from being stored.
-        let claimed_algo = claimed_checksum.as_ref().map(|(a, _)| *a);
+        let claimed_algo = claimed_checksum.map(|c| c.algorithm());
         let effective_algo = match (upload_checksum_algo, claimed_algo) {
             (Some(upload_algo), Some(part_algo)) if upload_algo != part_algo => {
                 return Err(ServerError::InvalidRequest {
@@ -4229,10 +4273,8 @@ impl Coordinator {
         let checksum_bytes = effective_algo.map(|algo| compute_checksum(algo, data));
 
         // Verify claimed checksum value if present.
-        if let (Some((_, claimed_b64)), Some(ref actual)) = (&claimed_checksum, &checksum_bytes) {
-            use base64::Engine;
-            let actual_b64 = base64::engine::general_purpose::STANDARD.encode(actual);
-            if *claimed_b64 != actual_b64 {
+        if let (Some(claim), Some(ref actual)) = (&claimed_checksum, &checksum_bytes) {
+            if claim.expected_bytes() != actual.as_slice() {
                 return Err(ServerError::InvalidRequest {
                     reason: "checksum mismatch".to_string(),
                 });
@@ -4608,6 +4650,8 @@ impl Coordinator {
         };
 
         // 8b'. Validate claimed object-level checksum if provided.
+        // This uses a raw (algorithm, string) pair rather than ChecksumClaim because
+        // composite checksums are formatted as "base64-N", not plain base64.
         if let Some((claimed_algo, claimed_value)) = claimed_checksum {
             // Algorithm of the header must match the upload's algorithm.
             match checksum_algo {
@@ -9123,6 +9167,7 @@ mod tests {
         for (i, data) in part_data.iter().enumerate() {
             let part_number = (i + 1) as u32;
             let checksum_b64 = b64.encode(compute_checksum(algo, data));
+            let claim = ChecksumClaim::from_base64(algo, &checksum_b64).unwrap();
             let result = coord
                 .upload_part(
                     bucket,
@@ -9130,7 +9175,7 @@ mod tests {
                     &create.upload_id,
                     part_number,
                     data,
-                    Some((algo, &checksum_b64)),
+                    Some(&claim),
                 )
                 .unwrap();
             complete_parts.push(CompletePart {
@@ -10366,41 +10411,33 @@ mod tests {
     }
 
     #[test]
-    fn finalize_stream_part_invalid_base64_rejected() {
+    fn checksum_claim_invalid_base64_rejected() {
         // P2: Malformed base64 in claimed checksum must return an error,
         // not silently accept a None checksum.
-        let dir = test_util::tempdir();
-        let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
-
-        let mpu = coord
-            .create_multipart_upload("bucket", "key", &MetadataBlob::new(), None, None)
-            .unwrap();
-
-        let session = coord
-            .begin_stream_part("bucket", "key", &mpu.upload_id, 1)
-            .unwrap();
-        let session_id = session.session_id;
-        coord
-            .append_stream_chunk("bucket", "key", &session_id, 0, b"data")
-            .unwrap();
-
-        let err = coord
-            .finalize_stream_part(
-                "bucket",
-                "key",
-                &session_id,
-                &mpu.upload_id,
-                1,
-                checksum::crc64::checksum(b"data"),
-                4,
-                Some((storage::ChecksumAlgorithm::Crc32, "not-valid-base64!!!")),
-                None,
-            )
-            .unwrap_err();
+        let err = ChecksumClaim::from_base64(
+            storage::ChecksumAlgorithm::Crc32,
+            "not-valid-base64!!!",
+        )
+        .unwrap_err();
         assert!(
             matches!(err, ServerError::InvalidRequest { .. }),
             "expected InvalidRequest for bad base64, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn checksum_claim_wrong_length_rejected() {
+        // A valid base64 string with the wrong byte length for the algorithm.
+        use base64::Engine;
+        let too_long = base64::engine::general_purpose::STANDARD.encode([0u8; 8]); // CRC32 expects 4
+        let err = ChecksumClaim::from_base64(
+            storage::ChecksumAlgorithm::Crc32,
+            &too_long,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ServerError::InvalidRequest { .. }),
+            "expected InvalidRequest for wrong length, got {err:?}"
         );
     }
 
