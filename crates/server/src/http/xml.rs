@@ -1663,7 +1663,7 @@ mod tests {
     #[test]
     fn list_buckets_xml_format() {
         let buckets = vec![BucketInfo {
-            name: "test-bucket".to_string(),
+            name: storage::BucketName::from("test-bucket"),
             owner_principal: "owner".to_string(),
             created_at: 1685000000000,
             region: 0,

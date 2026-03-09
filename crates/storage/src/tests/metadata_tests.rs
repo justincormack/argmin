@@ -4,8 +4,8 @@ use crate::types::*;
 /// Run the common metadata test suite against any PgMetadataStore implementation.
 fn metadata_put_get_delete(store: &dyn PgMetadataStore) {
     let req = PutObjectMetaReq {
-        bucket: "test-bucket".to_string(),
-        key: "test-key".to_string(),
+        bucket: "test-bucket".into(),
+        key: "test-key".into(),
         version_id: VersionId::Null,
         status: ObjectState::Live,
         size: 1024,
@@ -45,8 +45,8 @@ fn metadata_put_get_delete(store: &dyn PgMetadataStore) {
 
 fn metadata_put_overwrites(store: &dyn PgMetadataStore) {
     let req1 = PutObjectMetaReq {
-        bucket: "b".to_string(),
-        key: "k".to_string(),
+        bucket: "b".into(),
+        key: "k".into(),
         version_id: VersionId::Null,
         status: ObjectState::Live,
         size: 100,
@@ -61,8 +61,8 @@ fn metadata_put_overwrites(store: &dyn PgMetadataStore) {
     store.put_object_meta(&req1).unwrap();
 
     let req2 = PutObjectMetaReq {
-        bucket: "b".to_string(),
-        key: "k".to_string(),
+        bucket: "b".into(),
+        key: "k".into(),
         version_id: VersionId::Null,
         status: ObjectState::Live,
         size: 200,
@@ -89,8 +89,8 @@ fn metadata_get_nonexistent(store: &dyn PgMetadataStore) {
 fn metadata_list_basic(store: &dyn PgMetadataStore) {
     for i in 0..5 {
         let req = PutObjectMetaReq {
-            bucket: "list-bucket".to_string(),
-            key: format!("obj-{i:02}"),
+            bucket: "list-bucket".into(),
+            key: format!("obj-{i:02}").into(),
             version_id: VersionId::Null,
             status: ObjectState::Live,
             size: i * 100,
@@ -107,7 +107,7 @@ fn metadata_list_basic(store: &dyn PgMetadataStore) {
 
     let resp = store
         .list_objects(&ListObjectsReq {
-            bucket: "list-bucket".to_string(),
+            bucket: "list-bucket".into(),
             prefix: None,
             start_after: None,
             max_keys: 100,
@@ -125,8 +125,8 @@ fn metadata_list_basic(store: &dyn PgMetadataStore) {
 fn metadata_list_with_prefix(store: &dyn PgMetadataStore) {
     for key in &["photos/a.jpg", "photos/b.jpg", "docs/c.txt", "photos/d.jpg"] {
         let req = PutObjectMetaReq {
-            bucket: "prefix-bucket".to_string(),
-            key: key.to_string(),
+            bucket: "prefix-bucket".into(),
+            key: (*key).into(),
             version_id: VersionId::Null,
             status: ObjectState::Live,
             size: 100,
@@ -143,8 +143,8 @@ fn metadata_list_with_prefix(store: &dyn PgMetadataStore) {
 
     let resp = store
         .list_objects(&ListObjectsReq {
-            bucket: "prefix-bucket".to_string(),
-            prefix: Some("photos/".to_string()),
+            bucket: "prefix-bucket".into(),
+            prefix: Some("photos/".into()),
             start_after: None,
             max_keys: 100,
         })
@@ -157,8 +157,8 @@ fn metadata_list_with_prefix(store: &dyn PgMetadataStore) {
 fn metadata_list_pagination(store: &dyn PgMetadataStore) {
     for i in 0..10 {
         let req = PutObjectMetaReq {
-            bucket: "page-bucket".to_string(),
-            key: format!("item-{i:02}"),
+            bucket: "page-bucket".into(),
+            key: format!("item-{i:02}").into(),
             version_id: VersionId::Null,
             status: ObjectState::Live,
             size: 0,
@@ -176,7 +176,7 @@ fn metadata_list_pagination(store: &dyn PgMetadataStore) {
     // First page: 3 items.
     let resp1 = store
         .list_objects(&ListObjectsReq {
-            bucket: "page-bucket".to_string(),
+            bucket: "page-bucket".into(),
             prefix: None,
             start_after: None,
             max_keys: 3,
@@ -187,12 +187,12 @@ fn metadata_list_pagination(store: &dyn PgMetadataStore) {
     assert!(resp1.is_truncated);
     assert_eq!(resp1.objects[0].key, "item-00");
     assert_eq!(resp1.objects[2].key, "item-02");
-    assert_eq!(resp1.next_start_after, Some("item-02".to_string()));
+    assert_eq!(resp1.next_start_after, Some("item-02".into()));
 
     // Second page.
     let resp2 = store
         .list_objects(&ListObjectsReq {
-            bucket: "page-bucket".to_string(),
+            bucket: "page-bucket".into(),
             prefix: None,
             start_after: resp1.next_start_after,
             max_keys: 3,
@@ -212,7 +212,7 @@ fn metadata_list_pagination(store: &dyn PgMetadataStore) {
     loop {
         let resp = store
             .list_objects(&ListObjectsReq {
-                bucket: "page-bucket".to_string(),
+                bucket: "page-bucket".into(),
                 prefix: None,
                 start_after: start_after.clone(),
                 max_keys: 3,
@@ -235,7 +235,7 @@ fn metadata_list_pagination(store: &dyn PgMetadataStore) {
 fn metadata_list_empty_bucket(store: &dyn PgMetadataStore) {
     let resp = store
         .list_objects(&ListObjectsReq {
-            bucket: "empty-bucket".to_string(),
+            bucket: "empty-bucket".into(),
             prefix: None,
             start_after: None,
             max_keys: 100,
@@ -250,8 +250,8 @@ fn metadata_list_empty_bucket(store: &dyn PgMetadataStore) {
 fn metadata_empty_key(store: &dyn PgMetadataStore) {
     // S3 allows empty keys (though unusual).
     let req = PutObjectMetaReq {
-        bucket: "b".to_string(),
-        key: "".to_string(),
+        bucket: "b".into(),
+        key: "".into(),
         version_id: VersionId::Null,
         status: ObjectState::Live,
         size: 0,
@@ -273,8 +273,8 @@ fn metadata_long_key(store: &dyn PgMetadataStore) {
     // S3 allows keys up to 1024 bytes.
     let long_key = "x".repeat(1024);
     let req = PutObjectMetaReq {
-        bucket: "b".to_string(),
-        key: long_key.clone(),
+        bucket: "b".into(),
+        key: long_key.clone().into(),
         version_id: VersionId::Null,
         status: ObjectState::Live,
         size: 0,
@@ -294,8 +294,8 @@ fn metadata_long_key(store: &dyn PgMetadataStore) {
 
 fn metadata_zero_size_object(store: &dyn PgMetadataStore) {
     let req = PutObjectMetaReq {
-        bucket: "b".to_string(),
-        key: "empty-obj".to_string(),
+        bucket: "b".into(),
+        key: "empty-obj".into(),
         version_id: VersionId::Null,
         status: ObjectState::Live,
         size: 0,
@@ -528,8 +528,8 @@ fn file_metadata_object_has_inline_legacy_layout() {
     let (_dir, store) = make_pg_store();
     store
         .put_object_meta(&PutObjectMetaReq {
-            bucket: "b".to_string(),
-            key: "k".to_string(),
+            bucket: "b".into(),
+            key: "k".into(),
             version_id: VersionId::Null,
             status: ObjectState::Live,
             size: 100,
@@ -556,8 +556,8 @@ fn file_metadata_invalid_data_layout_returns_error() {
     // Insert a valid object first
     store
         .put_object_meta(&PutObjectMetaReq {
-            bucket: "b".to_string(),
-            key: "k".to_string(),
+            bucket: "b".into(),
+            key: "k".into(),
             version_id: VersionId::Null,
             status: ObjectState::Live,
             size: 100,
@@ -596,9 +596,9 @@ fn mpu_create_and_get_upload() {
     let (_dir, store) = make_pg_store();
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: "uid-1".to_string(),
-            bucket: "b".to_string(),
-            key: "k".to_string(),
+            upload_id: "uid-1".into(),
+            bucket: "b".into(),
+            key: "k".into(),
             metadata_blob: vec![1, 2, 3],
             owner_principal: Some("alice".to_string()),
             checksum_algorithm: None,
@@ -621,9 +621,9 @@ fn mpu_create_upload_with_checksum_fields() {
     let (_dir, store) = make_pg_store();
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: "uid-cksum".to_string(),
-            bucket: "b".to_string(),
-            key: "k".to_string(),
+            upload_id: "uid-cksum".into(),
+            bucket: "b".into(),
+            key: "k".into(),
             metadata_blob: vec![],
             owner_principal: None,
             checksum_algorithm: Some(ChecksumAlgorithm::Sha256),
@@ -638,9 +638,9 @@ fn mpu_create_upload_with_checksum_fields() {
     // None case round-trips as well
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: "uid-no-cksum".to_string(),
-            bucket: "b".to_string(),
-            key: "k2".to_string(),
+            upload_id: "uid-no-cksum".into(),
+            bucket: "b".into(),
+            key: "k2".into(),
             metadata_blob: vec![],
             owner_principal: None,
             checksum_algorithm: None,
@@ -657,9 +657,9 @@ fn mpu_part_checksum_round_trip() {
     let (_dir, store) = make_pg_store();
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: "uid-pc".to_string(),
-            bucket: "b".to_string(),
-            key: "k".to_string(),
+            upload_id: "uid-pc".into(),
+            bucket: "b".into(),
+            key: "k".into(),
             metadata_blob: vec![],
             owner_principal: None,
             checksum_algorithm: Some(ChecksumAlgorithm::Crc32),
@@ -670,7 +670,7 @@ fn mpu_part_checksum_round_trip() {
     let checksum_bytes = vec![0xDE, 0xAD, 0xBE, 0xEF];
     store
         .upsert_multipart_part(&MultipartPartRecord {
-            upload_id: "uid-pc".to_string(),
+            upload_id: "uid-pc".into(),
             part_number: 1,
             generation: 0,
             size: 1024,
@@ -691,7 +691,7 @@ fn mpu_part_checksum_round_trip() {
     // None checksum round-trips
     store
         .upsert_multipart_part(&MultipartPartRecord {
-            upload_id: "uid-pc".to_string(),
+            upload_id: "uid-pc".into(),
             part_number: 2,
             generation: 0,
             size: 512,
@@ -718,8 +718,8 @@ fn mpu_object_part_checksum_round_trip() {
     store
         .commit_object_parts(&[
             ObjectPartRecord {
-                bucket: "b".to_string(),
-                key: "k".to_string(),
+                bucket: "b".into(),
+                key: "k".into(),
                 version_id: VersionId::from_u64(1),
                 part_number: 1,
                 size: 5 * 1024 * 1024,
@@ -733,8 +733,8 @@ fn mpu_object_part_checksum_round_trip() {
                 checksum: Some(checksum_bytes.clone()),
             },
             ObjectPartRecord {
-                bucket: "b".to_string(),
-                key: "k".to_string(),
+                bucket: "b".into(),
+                key: "k".into(),
                 version_id: VersionId::from_u64(1),
                 part_number: 2,
                 size: 1024,
@@ -763,9 +763,9 @@ fn mpu_complete_multipart_commit_preserves_checksums() {
     // Create upload and object row (needed for complete_multipart_commit).
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: "uid-cmc".to_string(),
-            bucket: "b".to_string(),
-            key: "k".to_string(),
+            upload_id: "uid-cmc".into(),
+            bucket: "b".into(),
+            key: "k".into(),
             metadata_blob: vec![],
             owner_principal: None,
             checksum_algorithm: Some(ChecksumAlgorithm::Sha256),
@@ -774,8 +774,8 @@ fn mpu_complete_multipart_commit_preserves_checksums() {
         .unwrap();
 
     let obj = PutObjectMetaReq {
-        bucket: "b".to_string(),
-        key: "k".to_string(),
+        bucket: "b".into(),
+        key: "k".into(),
         version_id: VersionId::Null,
         size: 6 * 1024 * 1024,
         etag: vec![0xCC],
@@ -791,8 +791,8 @@ fn mpu_complete_multipart_commit_preserves_checksums() {
     let cksum = vec![0xDE, 0xAD];
     let parts = vec![
         ObjectPartRecord {
-            bucket: "b".to_string(),
-            key: "k".to_string(),
+            bucket: "b".into(),
+            key: "k".into(),
             version_id: VersionId::Null,
             part_number: 1,
             size: 5 * 1024 * 1024,
@@ -806,8 +806,8 @@ fn mpu_complete_multipart_commit_preserves_checksums() {
             checksum: Some(cksum.clone()),
         },
         ObjectPartRecord {
-            bucket: "b".to_string(),
-            key: "k".to_string(),
+            bucket: "b".into(),
+            key: "k".into(),
             version_id: VersionId::Null,
             part_number: 2,
             size: 1024 * 1024,
@@ -847,9 +847,9 @@ fn mpu_set_upload_state_transition() {
     let (_dir, store) = make_pg_store();
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: "uid-2".to_string(),
-            bucket: "b".to_string(),
-            key: "k".to_string(),
+            upload_id: "uid-2".into(),
+            bucket: "b".into(),
+            key: "k".into(),
             metadata_blob: vec![],
             owner_principal: None,
             checksum_algorithm: None,
@@ -891,9 +891,9 @@ fn mpu_delete_upload_cascades_parts() {
     let (_dir, store) = make_pg_store();
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: "uid-3".to_string(),
-            bucket: "b".to_string(),
-            key: "k".to_string(),
+            upload_id: "uid-3".into(),
+            bucket: "b".into(),
+            key: "k".into(),
             metadata_blob: vec![],
             owner_principal: None,
             checksum_algorithm: None,
@@ -904,7 +904,7 @@ fn mpu_delete_upload_cascades_parts() {
     // Add a part
     store
         .upsert_multipart_part(&MultipartPartRecord {
-            upload_id: "uid-3".to_string(),
+            upload_id: "uid-3".into(),
             part_number: 1,
             generation: 0,
             size: 1024,
@@ -943,9 +943,9 @@ fn mpu_upsert_part_and_get() {
     let (_dir, store) = make_pg_store();
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: "uid-4".to_string(),
-            bucket: "b".to_string(),
-            key: "k".to_string(),
+            upload_id: "uid-4".into(),
+            bucket: "b".into(),
+            key: "k".into(),
             metadata_blob: vec![],
             owner_principal: None,
             checksum_algorithm: None,
@@ -956,7 +956,7 @@ fn mpu_upsert_part_and_get() {
     // First upload: no previous generation
     let prev = store
         .upsert_multipart_part(&MultipartPartRecord {
-            upload_id: "uid-4".to_string(),
+            upload_id: "uid-4".into(),
             part_number: 1,
             generation: 0,
             size: 5 * 1024 * 1024,
@@ -982,7 +982,7 @@ fn mpu_upsert_part_and_get() {
     // Re-upload same part: returns previous generation
     let prev = store
         .upsert_multipart_part(&MultipartPartRecord {
-            upload_id: "uid-4".to_string(),
+            upload_id: "uid-4".into(),
             part_number: 1,
             generation: 1,
             size: 6 * 1024 * 1024,
@@ -1009,9 +1009,9 @@ fn mpu_list_parts_pagination() {
     let (_dir, store) = make_pg_store();
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: "uid-5".to_string(),
-            bucket: "b".to_string(),
-            key: "k".to_string(),
+            upload_id: "uid-5".into(),
+            bucket: "b".into(),
+            key: "k".into(),
             metadata_blob: vec![],
             owner_principal: None,
             checksum_algorithm: None,
@@ -1023,7 +1023,7 @@ fn mpu_list_parts_pagination() {
     for i in 1..=5 {
         store
             .upsert_multipart_part(&MultipartPartRecord {
-                upload_id: "uid-5".to_string(),
+                upload_id: "uid-5".into(),
                 part_number: i,
                 generation: 0,
                 size: 1024 * i as u64,
@@ -1042,7 +1042,7 @@ fn mpu_list_parts_pagination() {
     // List first page (max 2)
     let resp = store
         .list_multipart_parts(&ListPartsReq {
-            upload_id: "uid-5".to_string(),
+            upload_id: "uid-5".into(),
             part_number_marker: None,
             max_parts: 2,
         })
@@ -1056,7 +1056,7 @@ fn mpu_list_parts_pagination() {
     // List second page
     let resp = store
         .list_multipart_parts(&ListPartsReq {
-            upload_id: "uid-5".to_string(),
+            upload_id: "uid-5".into(),
             part_number_marker: Some(2),
             max_parts: 2,
         })
@@ -1069,7 +1069,7 @@ fn mpu_list_parts_pagination() {
     // List last page
     let resp = store
         .list_multipart_parts(&ListPartsReq {
-            upload_id: "uid-5".to_string(),
+            upload_id: "uid-5".into(),
             part_number_marker: Some(4),
             max_parts: 2,
         })
@@ -1087,9 +1087,9 @@ fn mpu_list_uploads_pagination() {
     for (uid, key) in [("u1", "a"), ("u2", "b"), ("u3", "c")] {
         store
             .create_multipart_upload(&CreateMultipartUploadReq {
-                upload_id: uid.to_string(),
-                bucket: "bkt".to_string(),
-                key: key.to_string(),
+                upload_id: uid.into(),
+                bucket: "bkt".into(),
+                key: key.into(),
                 metadata_blob: vec![],
                 owner_principal: None,
                 checksum_algorithm: None,
@@ -1101,7 +1101,7 @@ fn mpu_list_uploads_pagination() {
     // List first page (max 2)
     let resp = store
         .list_multipart_uploads(&ListMultipartUploadsReq {
-            bucket: "bkt".to_string(),
+            bucket: "bkt".into(),
             prefix: None,
             key_marker: None,
             upload_id_marker: None,
@@ -1116,7 +1116,7 @@ fn mpu_list_uploads_pagination() {
     // List second page using markers
     let resp = store
         .list_multipart_uploads(&ListMultipartUploadsReq {
-            bucket: "bkt".to_string(),
+            bucket: "bkt".into(),
             prefix: None,
             key_marker: resp.next_key_marker,
             upload_id_marker: resp.next_upload_id_marker,
@@ -1139,9 +1139,9 @@ fn mpu_list_uploads_with_prefix() {
     ] {
         store
             .create_multipart_upload(&CreateMultipartUploadReq {
-                upload_id: uid.to_string(),
-                bucket: "bkt".to_string(),
-                key: key.to_string(),
+                upload_id: uid.into(),
+                bucket: "bkt".into(),
+                key: key.into(),
                 metadata_blob: vec![],
                 owner_principal: None,
                 checksum_algorithm: None,
@@ -1152,8 +1152,8 @@ fn mpu_list_uploads_with_prefix() {
 
     let resp = store
         .list_multipart_uploads(&ListMultipartUploadsReq {
-            bucket: "bkt".to_string(),
-            prefix: Some("photos/".to_string()),
+            bucket: "bkt".into(),
+            prefix: Some("photos/".into()),
             key_marker: None,
             upload_id_marker: None,
             max_uploads: 100,
@@ -1171,9 +1171,9 @@ fn mpu_list_uploads_same_key_multiple_upload_ids() {
     for uid in ["u-a", "u-b", "u-c"] {
         store
             .create_multipart_upload(&CreateMultipartUploadReq {
-                upload_id: uid.to_string(),
-                bucket: "bkt".to_string(),
-                key: "same-key".to_string(),
+                upload_id: uid.into(),
+                bucket: "bkt".into(),
+                key: "same-key".into(),
                 metadata_blob: vec![],
                 owner_principal: None,
                 checksum_algorithm: None,
@@ -1185,7 +1185,7 @@ fn mpu_list_uploads_same_key_multiple_upload_ids() {
     // Page 1: max_uploads=2
     let resp = store
         .list_multipart_uploads(&ListMultipartUploadsReq {
-            bucket: "bkt".to_string(),
+            bucket: "bkt".into(),
             prefix: None,
             key_marker: None,
             upload_id_marker: None,
@@ -1201,7 +1201,7 @@ fn mpu_list_uploads_same_key_multiple_upload_ids() {
     // Page 2: resume with markers
     let resp2 = store
         .list_multipart_uploads(&ListMultipartUploadsReq {
-            bucket: "bkt".to_string(),
+            bucket: "bkt".into(),
             prefix: None,
             key_marker: resp.next_key_marker,
             upload_id_marker: resp.next_upload_id_marker,
@@ -1221,9 +1221,9 @@ fn mpu_list_uploads_stale_marker_returns_remaining() {
     for uid in ["u-x", "u-y", "u-z"] {
         store
             .create_multipart_upload(&CreateMultipartUploadReq {
-                upload_id: uid.to_string(),
-                bucket: "bkt".to_string(),
-                key: "key".to_string(),
+                upload_id: uid.into(),
+                bucket: "bkt".into(),
+                key: "key".into(),
                 metadata_blob: vec![],
                 owner_principal: None,
                 checksum_algorithm: None,
@@ -1239,10 +1239,10 @@ fn mpu_list_uploads_stale_marker_returns_remaining() {
     // COALESCE to 0 means all remaining uploads for "key" are returned.
     let resp = store
         .list_multipart_uploads(&ListMultipartUploadsReq {
-            bucket: "bkt".to_string(),
+            bucket: "bkt".into(),
             prefix: None,
-            key_marker: Some("key".to_string()),
-            upload_id_marker: Some("u-y".to_string()),
+            key_marker: Some("key".into()),
+            upload_id_marker: Some("u-y".into()),
             max_uploads: 10,
         })
         .unwrap();
@@ -1261,9 +1261,9 @@ fn mpu_corrupted_part_okh_returns_error() {
     let (_dir, store) = make_pg_store();
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: "uid-okh".to_string(),
-            bucket: "b".to_string(),
-            key: "k".to_string(),
+            upload_id: "uid-okh".into(),
+            bucket: "b".into(),
+            key: "k".into(),
             metadata_blob: vec![],
             owner_principal: None,
             checksum_algorithm: None,
@@ -1274,7 +1274,7 @@ fn mpu_corrupted_part_okh_returns_error() {
     // Insert a part with valid okh
     store
         .upsert_multipart_part(&MultipartPartRecord {
-            upload_id: "uid-okh".to_string(),
+            upload_id: "uid-okh".into(),
             part_number: 1,
             generation: 0,
             size: 1024,
@@ -1313,8 +1313,8 @@ fn mpu_corrupted_object_part_okh_returns_error() {
 
     store
         .commit_object_parts(&[ObjectPartRecord {
-            bucket: "b".to_string(),
-            key: "k".to_string(),
+            bucket: "b".into(),
+            key: "k".into(),
             version_id: VersionId::from_u64(1),
             part_number: 1,
             size: 1024,
@@ -1351,9 +1351,9 @@ fn mpu_get_missing_part_returns_part_not_found() {
     let (_dir, store) = make_pg_store();
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: "uid-pnf".to_string(),
-            bucket: "b".to_string(),
-            key: "k".to_string(),
+            upload_id: "uid-pnf".into(),
+            bucket: "b".into(),
+            key: "k".into(),
             metadata_blob: vec![],
             owner_principal: None,
             checksum_algorithm: None,
@@ -1379,9 +1379,9 @@ fn mpu_set_upload_state_rejects_in_progress_target() {
     let (_dir, store) = make_pg_store();
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: "uid-ip".to_string(),
-            bucket: "b".to_string(),
-            key: "k".to_string(),
+            upload_id: "uid-ip".into(),
+            bucket: "b".into(),
+            key: "k".into(),
             metadata_blob: vec![],
             owner_principal: None,
             checksum_algorithm: None,
@@ -1438,7 +1438,7 @@ fn mpu_upsert_part_nonexistent_upload_returns_no_such_upload() {
     let (_dir, store) = make_pg_store();
     let err = store
         .upsert_multipart_part(&MultipartPartRecord {
-            upload_id: "nonexistent".to_string(),
+            upload_id: "nonexistent".into(),
             part_number: 1,
             generation: 0,
             size: 1024,
@@ -1463,7 +1463,7 @@ fn mpu_list_parts_nonexistent_upload_returns_no_such_upload() {
     let (_dir, store) = make_pg_store();
     let err = store
         .list_multipart_parts(&ListPartsReq {
-            upload_id: "nonexistent".to_string(),
+            upload_id: "nonexistent".into(),
             part_number_marker: None,
             max_parts: 10,
         })
@@ -1479,8 +1479,8 @@ fn mpu_commit_object_parts_rollback_on_duplicate() {
     let (_dir, store) = make_pg_store();
 
     let part = ObjectPartRecord {
-        bucket: "b".to_string(),
-        key: "k".to_string(),
+        bucket: "b".into(),
+        key: "k".into(),
         version_id: VersionId::from_u64(1),
         part_number: 1,
         size: 1024,
@@ -1517,8 +1517,8 @@ fn mpu_commit_and_get_object_parts() {
 
     let parts = vec![
         ObjectPartRecord {
-            bucket: "b".to_string(),
-            key: "k".to_string(),
+            bucket: "b".into(),
+            key: "k".into(),
             version_id: VersionId::from_u64(1),
             part_number: 1,
             size: 5 * 1024 * 1024,
@@ -1532,8 +1532,8 @@ fn mpu_commit_and_get_object_parts() {
             checksum: None,
         },
         ObjectPartRecord {
-            bucket: "b".to_string(),
-            key: "k".to_string(),
+            bucket: "b".into(),
+            key: "k".into(),
             version_id: VersionId::from_u64(1),
             part_number: 2,
             size: 3 * 1024 * 1024,
@@ -1569,8 +1569,8 @@ fn mpu_delete_object_parts() {
 
     store
         .commit_object_parts(&[ObjectPartRecord {
-            bucket: "b".to_string(),
-            key: "k".to_string(),
+            bucket: "b".into(),
+            key: "k".into(),
             version_id: VersionId::from_u64(1),
             part_number: 1,
             size: 1024,
@@ -1599,9 +1599,9 @@ fn mpu_delete_object_parts() {
 fn create_upload(store: &dyn PgMetadataStore, upload_id: &str) {
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: upload_id.to_string(),
-            bucket: "b".to_string(),
-            key: "k".to_string(),
+            upload_id: upload_id.into(),
+            bucket: "b".into(),
+            key: "k".into(),
             metadata_blob: vec![],
             owner_principal: None,
             checksum_algorithm: None,
@@ -1613,7 +1613,7 @@ fn create_upload(store: &dyn PgMetadataStore, upload_id: &str) {
 /// Helper: build a MultipartPartRecord for a given upload/part/generation.
 fn make_part(upload_id: &str, part_number: u32, generation: u32) -> MultipartPartRecord {
     MultipartPartRecord {
-        upload_id: upload_id.to_string(),
+        upload_id: upload_id.into(),
         part_number,
         generation,
         size: 1024,
@@ -1678,8 +1678,8 @@ fn mpu_commit_partial_batch_failure_rolls_back_all() {
 
     // Commit part 1 for version 1.
     let part1 = ObjectPartRecord {
-        bucket: "b".to_string(),
-        key: "k".to_string(),
+        bucket: "b".into(),
+        key: "k".into(),
         version_id: VersionId::from_u64(1),
         part_number: 1,
         size: 1024,
@@ -1755,7 +1755,7 @@ fn mpu_upsert_rapid_generation_overwrites() {
     // List should return exactly one part.
     let resp = store
         .list_multipart_parts(&ListPartsReq {
-            upload_id: "uid-rapid".to_string(),
+            upload_id: "uid-rapid".into(),
             part_number_marker: None,
             max_parts: 100,
         })
@@ -1857,8 +1857,8 @@ fn mpu_commit_object_parts_connection_usable_after_multiple_failures() {
     let (_dir, store) = make_pg_store();
 
     let part = ObjectPartRecord {
-        bucket: "b".to_string(),
-        key: "k".to_string(),
+        bucket: "b".into(),
+        key: "k".into(),
         version_id: VersionId::from_u64(1),
         part_number: 1,
         size: 1024,
@@ -2016,8 +2016,8 @@ fn mpu_commit_object_parts_commit_failure_via_lock_contention() {
     // commit_object_parts: BEGIN IMMEDIATE gets RESERVED (OK), INSERT succeeds,
     // COMMIT fails with SQLITE_BUSY (can't upgrade to EXCLUSIVE).
     let part = ObjectPartRecord {
-        bucket: "b".to_string(),
-        key: "k".to_string(),
+        bucket: "b".into(),
+        key: "k".into(),
         version_id: VersionId::from_u64(1),
         part_number: 1,
         size: 1024,
@@ -2215,7 +2215,7 @@ fn mpu_threaded_upsert_same_part_stress() {
 
     let resp = verify
         .list_multipart_parts(&ListPartsReq {
-            upload_id: "uid-stress".to_string(),
+            upload_id: "uid-stress".into(),
             part_number_marker: None,
             max_parts: 100,
         })
@@ -2237,8 +2237,8 @@ mod prop_tests {
     fn insert_keys(store: &dyn PgMetadataStore, bucket: &str, keys: &[String]) {
         for key in keys {
             let req = PutObjectMetaReq {
-                bucket: bucket.to_string(),
-                key: key.clone(),
+                bucket: bucket.into(),
+                key: key.clone().into(),
                 version_id: VersionId::Null,
                 status: ObjectState::Live,
                 size: 0,
@@ -2257,15 +2257,15 @@ mod prop_tests {
     fn list_all_keys(
         store: &dyn PgMetadataStore,
         bucket: &str,
-        prefix: Option<String>,
+        prefix: Option<ObjectKey>,
         max_keys: u32,
-    ) -> Vec<String> {
+    ) -> Vec<ObjectKey> {
         let mut all = Vec::new();
-        let mut start_after: Option<String> = None;
+        let mut start_after: Option<ObjectKey> = None;
         for _ in 0..1000 {
             let resp = store
                 .list_objects(&ListObjectsReq {
-                    bucket: bucket.to_string(),
+                    bucket: bucket.into(),
                     prefix: prefix.clone(),
                     start_after: start_after.clone(),
                     max_keys,
@@ -2298,7 +2298,7 @@ mod prop_tests {
             let (_dir, store) = super::make_pg_store();
             insert_keys(&store, "bucket", &keys);
 
-            let mut expected = keys.clone();
+            let mut expected: Vec<ObjectKey> = keys.iter().map(|k| ObjectKey::from(k.as_str())).collect();
             expected.sort();
             expected.dedup();
 
@@ -2318,15 +2318,15 @@ mod prop_tests {
             let (_dir, store) = super::make_pg_store();
             insert_keys(&store, "bucket", &keys);
 
-            let mut expected: Vec<String> = keys
+            let mut expected: Vec<ObjectKey> = keys
                 .iter()
                 .filter(|k| k.starts_with(&prefix))
-                .cloned()
+                .map(|k| ObjectKey::from(k.as_str()))
                 .collect();
             expected.sort();
             expected.dedup();
 
-            let got = list_all_keys(&store, "bucket", Some(prefix), max_keys);
+            let got = list_all_keys(&store, "bucket", Some(ObjectKey::from(prefix)), max_keys);
             prop_assert_eq!(got, expected);
         }
     }
@@ -2340,9 +2340,9 @@ fn stream_upload_create_get_delete() {
 
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "sess-1".to_string(),
-            bucket: "b".to_string(),
-            key: "k".to_string(),
+            session_id: "sess-1".into(),
+            bucket: "b".into(),
+            key: "k".into(),
             target: StreamUploadTarget::PutObject,
         })
         .unwrap();
@@ -2369,9 +2369,9 @@ fn stream_upload_state_transitions() {
 
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "sess-2".to_string(),
-            bucket: "b".to_string(),
-            key: "k".to_string(),
+            session_id: "sess-2".into(),
+            bucket: "b".into(),
+            key: "k".into(),
             target: StreamUploadTarget::PutObject,
         })
         .unwrap();
@@ -2419,11 +2419,11 @@ fn stream_upload_upload_part_kind() {
 
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "sess-part".to_string(),
-            bucket: "b".to_string(),
-            key: "k".to_string(),
+            session_id: "sess-part".into(),
+            bucket: "b".into(),
+            key: "k".into(),
             target: StreamUploadTarget::UploadPart {
-                upload_id: "mpu-123".to_string(),
+                upload_id: "mpu-123".into(),
                 part_number: 3,
             },
         })
@@ -2433,7 +2433,7 @@ fn stream_upload_upload_part_kind() {
     assert_eq!(
         rec.target,
         StreamUploadTarget::UploadPart {
-            upload_id: "mpu-123".to_string(),
+            upload_id: "mpu-123".into(),
             part_number: 3
         }
     );
@@ -2445,9 +2445,9 @@ fn stream_chunk_append_and_list() {
 
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "sess-chunks".to_string(),
-            bucket: "b".to_string(),
-            key: "k".to_string(),
+            session_id: "sess-chunks".into(),
+            bucket: "b".into(),
+            key: "k".into(),
             target: StreamUploadTarget::PutObject,
         })
         .unwrap();
@@ -2455,7 +2455,7 @@ fn stream_chunk_append_and_list() {
     for i in 0..3u32 {
         store
             .append_stream_chunk(&StreamUploadChunkRecord {
-                session_id: "sess-chunks".to_string(),
+                session_id: "sess-chunks".into(),
                 chunk_index: i,
                 size: (i as u64 + 1) * 1000,
                 chunk_okh: [i as u8; 16],
@@ -2485,16 +2485,16 @@ fn stream_chunk_cascade_delete() {
 
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "sess-cascade".to_string(),
-            bucket: "b".to_string(),
-            key: "k".to_string(),
+            session_id: "sess-cascade".into(),
+            bucket: "b".into(),
+            key: "k".into(),
             target: StreamUploadTarget::PutObject,
         })
         .unwrap();
 
     store
         .append_stream_chunk(&StreamUploadChunkRecord {
-            session_id: "sess-cascade".to_string(),
+            session_id: "sess-cascade".into(),
             chunk_index: 0,
             size: 4096,
             chunk_okh: [0xAA; 16],
@@ -2519,16 +2519,16 @@ fn commit_stream_put_atomic() {
     // Create session and append chunks
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "sess-commit".to_string(),
-            bucket: "b".to_string(),
-            key: "k".to_string(),
+            session_id: "sess-commit".into(),
+            bucket: "b".into(),
+            key: "k".into(),
             target: StreamUploadTarget::PutObject,
         })
         .unwrap();
 
     store
         .append_stream_chunk(&StreamUploadChunkRecord {
-            session_id: "sess-commit".to_string(),
+            session_id: "sess-commit".into(),
             chunk_index: 0,
             size: 4_000_000,
             chunk_okh: [0x11; 16],
@@ -2541,7 +2541,7 @@ fn commit_stream_put_atomic() {
 
     store
         .append_stream_chunk(&StreamUploadChunkRecord {
-            session_id: "sess-commit".to_string(),
+            session_id: "sess-commit".into(),
             chunk_index: 1,
             size: 2_000_000,
             chunk_okh: [0x22; 16],
@@ -2554,8 +2554,8 @@ fn commit_stream_put_atomic() {
 
     // Commit
     let obj = PutObjectMetaReq {
-        bucket: "b".to_string(),
-        key: "k".to_string(),
+        bucket: "b".into(),
+        key: "k".into(),
         version_id: VersionId::Null,
         size: 6_000_000,
         etag: vec![0xAB; 8],
@@ -2570,8 +2570,8 @@ fn commit_stream_put_atomic() {
 
     let committed_chunks = vec![
         StreamObjectChunkRecord {
-            bucket: "b".to_string(),
-            key: "k".to_string(),
+            bucket: "b".into(),
+            key: "k".into(),
             version_id: VersionId::Null,
             chunk_index: 0,
             size: 4_000_000,
@@ -2582,8 +2582,8 @@ fn commit_stream_put_atomic() {
             ec_m: 2,
         },
         StreamObjectChunkRecord {
-            bucket: "b".to_string(),
-            key: "k".to_string(),
+            bucket: "b".into(),
+            key: "k".into(),
             version_id: VersionId::Null,
             chunk_index: 1,
             size: 2_000_000,
@@ -2632,9 +2632,9 @@ fn commit_stream_put_overwrite_unversioned() {
     // First write
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "s1".to_string(),
-            bucket: "b".to_string(),
-            key: "k".to_string(),
+            session_id: "s1".into(),
+            bucket: "b".into(),
+            key: "k".into(),
             target: StreamUploadTarget::PutObject,
         })
         .unwrap();
@@ -2642,8 +2642,8 @@ fn commit_stream_put_overwrite_unversioned() {
         .commit_stream_put(
             "s1",
             &PutObjectMetaReq {
-                bucket: "b".to_string(),
-                key: "k".to_string(),
+                bucket: "b".into(),
+                key: "k".into(),
                 version_id: VersionId::Null,
                 size: 100,
                 etag: vec![1],
@@ -2656,8 +2656,8 @@ fn commit_stream_put_overwrite_unversioned() {
                 metadata_blob: None,
             },
             &[StreamObjectChunkRecord {
-                bucket: "b".to_string(),
-                key: "k".to_string(),
+                bucket: "b".into(),
+                key: "k".into(),
                 version_id: VersionId::Null,
                 chunk_index: 0,
                 size: 100,
@@ -2673,9 +2673,9 @@ fn commit_stream_put_overwrite_unversioned() {
     // Second write overwrites
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "s2".to_string(),
-            bucket: "b".to_string(),
-            key: "k".to_string(),
+            session_id: "s2".into(),
+            bucket: "b".into(),
+            key: "k".into(),
             target: StreamUploadTarget::PutObject,
         })
         .unwrap();
@@ -2683,8 +2683,8 @@ fn commit_stream_put_overwrite_unversioned() {
         .commit_stream_put(
             "s2",
             &PutObjectMetaReq {
-                bucket: "b".to_string(),
-                key: "k".to_string(),
+                bucket: "b".into(),
+                key: "k".into(),
                 version_id: VersionId::Null,
                 size: 200,
                 etag: vec![2],
@@ -2697,8 +2697,8 @@ fn commit_stream_put_overwrite_unversioned() {
                 metadata_blob: None,
             },
             &[StreamObjectChunkRecord {
-                bucket: "b".to_string(),
-                key: "k".to_string(),
+                bucket: "b".into(),
+                key: "k".into(),
                 version_id: VersionId::Null,
                 chunk_index: 0,
                 size: 200,
@@ -2728,9 +2728,9 @@ fn delete_stream_object_chunks_cleanup() {
 
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "s-del".to_string(),
-            bucket: "b".to_string(),
-            key: "k".to_string(),
+            session_id: "s-del".into(),
+            bucket: "b".into(),
+            key: "k".into(),
             target: StreamUploadTarget::PutObject,
         })
         .unwrap();
@@ -2738,8 +2738,8 @@ fn delete_stream_object_chunks_cleanup() {
         .commit_stream_put(
             "s-del",
             &PutObjectMetaReq {
-                bucket: "b".to_string(),
-                key: "k".to_string(),
+                bucket: "b".into(),
+                key: "k".into(),
                 version_id: VersionId::Null,
                 size: 100,
                 etag: vec![1],
@@ -2752,8 +2752,8 @@ fn delete_stream_object_chunks_cleanup() {
                 metadata_blob: None,
             },
             &[StreamObjectChunkRecord {
-                bucket: "b".to_string(),
-                key: "k".to_string(),
+                bucket: "b".into(),
+                key: "k".into(),
                 version_id: VersionId::Null,
                 chunk_index: 0,
                 size: 100,
@@ -2781,9 +2781,9 @@ fn commit_stream_put_rejects_non_in_progress() {
 
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "sess-bad".to_string(),
-            bucket: "b".to_string(),
-            key: "k".to_string(),
+            session_id: "sess-bad".into(),
+            bucket: "b".into(),
+            key: "k".into(),
             target: StreamUploadTarget::PutObject,
         })
         .unwrap();
@@ -2798,8 +2798,8 @@ fn commit_stream_put_rejects_non_in_progress() {
         .commit_stream_put(
             "sess-bad",
             &PutObjectMetaReq {
-                bucket: "b".to_string(),
-                key: "k".to_string(),
+                bucket: "b".into(),
+                key: "k".into(),
                 version_id: VersionId::Null,
                 size: 0,
                 etag: vec![],
@@ -2867,9 +2867,9 @@ fn commit_stream_part_replaces_prior_chunks_on_reupload() {
     // Create the multipart upload first
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: "mpu-1".to_string(),
-            bucket: "b".to_string(),
-            key: "k".to_string(),
+            upload_id: "mpu-1".into(),
+            bucket: "b".into(),
+            key: "k".into(),
             metadata_blob: vec![],
             owner_principal: None,
             checksum_algorithm: None,
@@ -2878,7 +2878,7 @@ fn commit_stream_part_replaces_prior_chunks_on_reupload() {
         .unwrap();
 
     let make_part = |size: u64| MultipartPartRecord {
-        upload_id: "mpu-1".to_string(),
+        upload_id: "mpu-1".into(),
         part_number: 1,
         generation: 0,
         size,
@@ -2895,11 +2895,11 @@ fn commit_stream_part_replaces_prior_chunks_on_reupload() {
     // First upload: 3 chunks
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "sp-1".to_string(),
-            bucket: "b".to_string(),
-            key: "k".to_string(),
+            session_id: "sp-1".into(),
+            bucket: "b".into(),
+            key: "k".into(),
             target: StreamUploadTarget::UploadPart {
-                upload_id: "mpu-1".to_string(),
+                upload_id: "mpu-1".into(),
                 part_number: 1,
             },
         })
@@ -2907,9 +2907,9 @@ fn commit_stream_part_replaces_prior_chunks_on_reupload() {
 
     let chunks_v1: Vec<MultipartPartChunkRecord> = (0..3)
         .map(|i| MultipartPartChunkRecord {
-            bucket: "b".to_string(),
-            key: "k".to_string(),
-            upload_id: "mpu-1".to_string(),
+            bucket: "b".into(),
+            key: "k".into(),
+            upload_id: "mpu-1".into(),
             version_id: u64::MAX,
             part_number: 1,
             chunk_index: i,
@@ -2934,20 +2934,20 @@ fn commit_stream_part_replaces_prior_chunks_on_reupload() {
     // Re-upload same part: only 1 chunk (fewer than before)
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "sp-2".to_string(),
-            bucket: "b".to_string(),
-            key: "k".to_string(),
+            session_id: "sp-2".into(),
+            bucket: "b".into(),
+            key: "k".into(),
             target: StreamUploadTarget::UploadPart {
-                upload_id: "mpu-1".to_string(),
+                upload_id: "mpu-1".into(),
                 part_number: 1,
             },
         })
         .unwrap();
 
     let chunks_v2 = vec![MultipartPartChunkRecord {
-        bucket: "b".to_string(),
-        key: "k".to_string(),
-        upload_id: "mpu-1".to_string(),
+        bucket: "b".into(),
+        key: "k".into(),
+        upload_id: "mpu-1".into(),
         version_id: u64::MAX,
         part_number: 1,
         chunk_index: 0,
@@ -2979,11 +2979,11 @@ fn commit_stream_put_rejects_wrong_kind() {
     // Create an UploadPart session
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "sess-wrong-kind".to_string(),
-            bucket: "b".to_string(),
-            key: "k".to_string(),
+            session_id: "sess-wrong-kind".into(),
+            bucket: "b".into(),
+            key: "k".into(),
             target: StreamUploadTarget::UploadPart {
-                upload_id: "mpu-x".to_string(),
+                upload_id: "mpu-x".into(),
                 part_number: 1,
             },
         })
@@ -2994,8 +2994,8 @@ fn commit_stream_put_rejects_wrong_kind() {
         .commit_stream_put(
             "sess-wrong-kind",
             &PutObjectMetaReq {
-                bucket: "b".to_string(),
-                key: "k".to_string(),
+                bucket: "b".into(),
+                key: "k".into(),
                 version_id: VersionId::Null,
                 size: 0,
                 etag: vec![],
@@ -3025,9 +3025,9 @@ fn commit_stream_put_rejects_wrong_bucket_key() {
 
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "sess-mismatch".to_string(),
-            bucket: "b1".to_string(),
-            key: "k1".to_string(),
+            session_id: "sess-mismatch".into(),
+            bucket: "b1".into(),
+            key: "k1".into(),
             target: StreamUploadTarget::PutObject,
         })
         .unwrap();
@@ -3037,8 +3037,8 @@ fn commit_stream_put_rejects_wrong_bucket_key() {
         .commit_stream_put(
             "sess-mismatch",
             &PutObjectMetaReq {
-                bucket: "b2".to_string(),
-                key: "k2".to_string(),
+                bucket: "b2".into(),
+                key: "k2".into(),
                 version_id: VersionId::Null,
                 size: 0,
                 etag: vec![],
@@ -3068,9 +3068,9 @@ fn commit_stream_part_rejects_wrong_upload_id() {
 
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: "mpu-correct".to_string(),
-            bucket: "b".to_string(),
-            key: "k".to_string(),
+            upload_id: "mpu-correct".into(),
+            bucket: "b".into(),
+            key: "k".into(),
             metadata_blob: vec![],
             owner_principal: None,
             checksum_algorithm: None,
@@ -3080,11 +3080,11 @@ fn commit_stream_part_rejects_wrong_upload_id() {
 
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "sp-mismatch".to_string(),
-            bucket: "b".to_string(),
-            key: "k".to_string(),
+            session_id: "sp-mismatch".into(),
+            bucket: "b".into(),
+            key: "k".into(),
             target: StreamUploadTarget::UploadPart {
-                upload_id: "mpu-correct".to_string(),
+                upload_id: "mpu-correct".into(),
                 part_number: 1,
             },
         })
@@ -3095,7 +3095,7 @@ fn commit_stream_part_rejects_wrong_upload_id() {
         .commit_stream_part(
             "sp-mismatch",
             &MultipartPartRecord {
-                upload_id: "mpu-WRONG".to_string(),
+                upload_id: "mpu-WRONG".into(),
                 part_number: 1,
                 generation: 0,
                 size: 100,
@@ -3126,9 +3126,9 @@ fn commit_stream_part_zero_chunks_clears_prior() {
 
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: "mpu-zc".to_string(),
-            bucket: "b".to_string(),
-            key: "k".to_string(),
+            upload_id: "mpu-zc".into(),
+            bucket: "b".into(),
+            key: "k".into(),
             metadata_blob: vec![],
             owner_principal: None,
             checksum_algorithm: None,
@@ -3139,11 +3139,11 @@ fn commit_stream_part_zero_chunks_clears_prior() {
     // First upload: 2 chunks
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "sp-zc1".to_string(),
-            bucket: "b".to_string(),
-            key: "k".to_string(),
+            session_id: "sp-zc1".into(),
+            bucket: "b".into(),
+            key: "k".into(),
             target: StreamUploadTarget::UploadPart {
-                upload_id: "mpu-zc".to_string(),
+                upload_id: "mpu-zc".into(),
                 part_number: 1,
             },
         })
@@ -3152,7 +3152,7 @@ fn commit_stream_part_zero_chunks_clears_prior() {
         .commit_stream_part(
             "sp-zc1",
             &MultipartPartRecord {
-                upload_id: "mpu-zc".to_string(),
+                upload_id: "mpu-zc".into(),
                 part_number: 1,
                 generation: 0,
                 size: 2000,
@@ -3167,9 +3167,9 @@ fn commit_stream_part_zero_chunks_clears_prior() {
             },
             &[
                 MultipartPartChunkRecord {
-                    bucket: "b".to_string(),
-                    key: "k".to_string(),
-                    upload_id: "mpu-zc".to_string(),
+                    bucket: "b".into(),
+                    key: "k".into(),
+                    upload_id: "mpu-zc".into(),
                     version_id: u64::MAX,
                     part_number: 1,
                     chunk_index: 0,
@@ -3181,9 +3181,9 @@ fn commit_stream_part_zero_chunks_clears_prior() {
                     ec_m: 2,
                 },
                 MultipartPartChunkRecord {
-                    bucket: "b".to_string(),
-                    key: "k".to_string(),
-                    upload_id: "mpu-zc".to_string(),
+                    bucket: "b".into(),
+                    key: "k".into(),
+                    upload_id: "mpu-zc".into(),
                     version_id: u64::MAX,
                     part_number: 1,
                     chunk_index: 1,
@@ -3209,11 +3209,11 @@ fn commit_stream_part_zero_chunks_clears_prior() {
     // Re-upload with zero chunks — must clear prior rows
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "sp-zc2".to_string(),
-            bucket: "b".to_string(),
-            key: "k".to_string(),
+            session_id: "sp-zc2".into(),
+            bucket: "b".into(),
+            key: "k".into(),
             target: StreamUploadTarget::UploadPart {
-                upload_id: "mpu-zc".to_string(),
+                upload_id: "mpu-zc".into(),
                 part_number: 1,
             },
         })
@@ -3222,7 +3222,7 @@ fn commit_stream_part_zero_chunks_clears_prior() {
         .commit_stream_part(
             "sp-zc2",
             &MultipartPartRecord {
-                upload_id: "mpu-zc".to_string(),
+                upload_id: "mpu-zc".into(),
                 part_number: 1,
                 generation: 0,
                 size: 0,
@@ -3254,9 +3254,9 @@ fn commit_stream_put_rejects_mismatched_chunk_target() {
 
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "sp-ct".to_string(),
-            bucket: "b".to_string(),
-            key: "k".to_string(),
+            session_id: "sp-ct".into(),
+            bucket: "b".into(),
+            key: "k".into(),
             target: StreamUploadTarget::PutObject,
         })
         .unwrap();
@@ -3266,8 +3266,8 @@ fn commit_stream_put_rejects_mismatched_chunk_target() {
         .commit_stream_put(
             "sp-ct",
             &PutObjectMetaReq {
-                bucket: "b".to_string(),
-                key: "k".to_string(),
+                bucket: "b".into(),
+                key: "k".into(),
                 version_id: VersionId::Null,
                 size: 100,
                 etag: vec![1],
@@ -3280,8 +3280,8 @@ fn commit_stream_put_rejects_mismatched_chunk_target() {
                 metadata_blob: None,
             },
             &[StreamObjectChunkRecord {
-                bucket: "WRONG".to_string(),
-                key: "k".to_string(),
+                bucket: "WRONG".into(),
+                key: "k".into(),
                 version_id: VersionId::Null,
                 chunk_index: 0,
                 size: 100,
@@ -3308,9 +3308,9 @@ fn commit_stream_part_rejects_mismatched_chunk_part_number() {
 
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: "mpu-cpc".to_string(),
-            bucket: "b".to_string(),
-            key: "k".to_string(),
+            upload_id: "mpu-cpc".into(),
+            bucket: "b".into(),
+            key: "k".into(),
             metadata_blob: vec![],
             owner_principal: None,
             checksum_algorithm: None,
@@ -3320,11 +3320,11 @@ fn commit_stream_part_rejects_mismatched_chunk_part_number() {
 
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "sp-cpc".to_string(),
-            bucket: "b".to_string(),
-            key: "k".to_string(),
+            session_id: "sp-cpc".into(),
+            bucket: "b".into(),
+            key: "k".into(),
             target: StreamUploadTarget::UploadPart {
-                upload_id: "mpu-cpc".to_string(),
+                upload_id: "mpu-cpc".into(),
                 part_number: 1,
             },
         })
@@ -3335,7 +3335,7 @@ fn commit_stream_part_rejects_mismatched_chunk_part_number() {
         .commit_stream_part(
             "sp-cpc",
             &MultipartPartRecord {
-                upload_id: "mpu-cpc".to_string(),
+                upload_id: "mpu-cpc".into(),
                 part_number: 1,
                 generation: 0,
                 size: 100,
@@ -3349,9 +3349,9 @@ fn commit_stream_part_rejects_mismatched_chunk_part_number() {
                 checksum: None,
             },
             &[MultipartPartChunkRecord {
-                bucket: "b".to_string(),
-                key: "k".to_string(),
-                upload_id: "mpu-cpc".to_string(),
+                bucket: "b".into(),
+                key: "k".into(),
+                upload_id: "mpu-cpc".into(),
                 version_id: u64::MAX,
                 part_number: 99, // wrong!
                 chunk_index: 0,
@@ -3379,9 +3379,9 @@ fn commit_stream_part_rejects_non_staging_chunk_version_id() {
 
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: "mpu-vid".to_string(),
-            bucket: "b".to_string(),
-            key: "k".to_string(),
+            upload_id: "mpu-vid".into(),
+            bucket: "b".into(),
+            key: "k".into(),
             metadata_blob: vec![],
             owner_principal: None,
             checksum_algorithm: None,
@@ -3391,11 +3391,11 @@ fn commit_stream_part_rejects_non_staging_chunk_version_id() {
 
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "sp-vid".to_string(),
-            bucket: "b".to_string(),
-            key: "k".to_string(),
+            session_id: "sp-vid".into(),
+            bucket: "b".into(),
+            key: "k".into(),
             target: StreamUploadTarget::UploadPart {
-                upload_id: "mpu-vid".to_string(),
+                upload_id: "mpu-vid".into(),
                 part_number: 1,
             },
         })
@@ -3406,7 +3406,7 @@ fn commit_stream_part_rejects_non_staging_chunk_version_id() {
         .commit_stream_part(
             "sp-vid",
             &MultipartPartRecord {
-                upload_id: "mpu-vid".to_string(),
+                upload_id: "mpu-vid".into(),
                 part_number: 1,
                 generation: 0,
                 size: 100,
@@ -3420,9 +3420,9 @@ fn commit_stream_part_rejects_non_staging_chunk_version_id() {
                 checksum: None,
             },
             &[MultipartPartChunkRecord {
-                bucket: "b".to_string(),
-                key: "k".to_string(),
-                upload_id: "mpu-vid".to_string(),
+                bucket: "b".into(),
+                key: "k".into(),
+                upload_id: "mpu-vid".into(),
                 version_id: 42, // wrong — must be u64::MAX (staging sentinel)
                 part_number: 1,
                 chunk_index: 0,

@@ -27,7 +27,7 @@ use crate::types::*;
 /// in-progress staging rows are invisible to reads of completed objects.
 const PART_CHUNK_STAGING_VERSION_ID: VersionId =
     VersionId::Versioned(std::num::NonZeroU64::new(u64::MAX).unwrap());
-type StreamSessionRow = (u8, u8, String, String, Option<String>, Option<i64>);
+type StreamSessionRow = (u8, u8, BucketName, ObjectKey, Option<UploadId>, Option<i64>);
 
 /// Per-PG store combining shard file I/O with SQLite metadata.
 pub struct PgStore {
@@ -159,7 +159,7 @@ impl PgStore {
 
     fn parse_stream_target(
         op_kind_raw: u8,
-        upload_id: Option<String>,
+        upload_id: Option<UploadId>,
         part_number: Option<i64>,
         op_kind_col: usize,
     ) -> Result<StreamUploadTarget, rusqlite::Error> {
@@ -586,7 +586,7 @@ impl PgMetadataStore for PgStore {
             })?;
         if deleted == 0 {
             return Err(MetadataError::BucketNotFound {
-                name: name.to_string(),
+                name: BucketName::from(name),
             });
         }
         Ok(())
@@ -619,7 +619,7 @@ impl PgMetadataStore for PgStore {
                 source: e,
             })?
             .ok_or(MetadataError::BucketNotFound {
-                name: name.to_string(),
+                name: BucketName::from(name),
             })
     }
 
@@ -682,7 +682,7 @@ impl PgMetadataStore for PgStore {
                 source: e,
             })?
             .ok_or(MetadataError::BucketNotFound {
-                name: name.to_string(),
+                name: BucketName::from(name),
             })
             .and_then(|raw| {
                 BucketVersioningState::from_u8(raw).ok_or_else(|| MetadataError::Db {
@@ -726,7 +726,7 @@ impl PgMetadataStore for PgStore {
             })?;
         if updated == 0 {
             return Err(MetadataError::BucketNotFound {
-                name: name.to_string(),
+                name: BucketName::from(name),
             });
         }
         Ok(())
@@ -745,7 +745,7 @@ impl PgMetadataStore for PgStore {
                 source: e,
             })?
             .ok_or(MetadataError::BucketNotFound {
-                name: name.to_string(),
+                name: BucketName::from(name),
             })
     }
 
@@ -762,7 +762,7 @@ impl PgMetadataStore for PgStore {
             })?;
         if updated == 0 {
             return Err(MetadataError::BucketNotFound {
-                name: name.to_string(),
+                name: BucketName::from(name),
             });
         }
         Ok(())
@@ -781,7 +781,7 @@ impl PgMetadataStore for PgStore {
             })?;
         if updated == 0 {
             return Err(MetadataError::BucketNotFound {
-                name: name.to_string(),
+                name: BucketName::from(name),
             });
         }
         Ok(())
@@ -800,7 +800,7 @@ impl PgMetadataStore for PgStore {
                 source: e,
             })?
             .ok_or(MetadataError::BucketNotFound {
-                name: name.to_string(),
+                name: BucketName::from(name),
             })
     }
 
@@ -817,7 +817,7 @@ impl PgMetadataStore for PgStore {
             })?;
         if updated == 0 {
             return Err(MetadataError::BucketNotFound {
-                name: name.to_string(),
+                name: BucketName::from(name),
             });
         }
         Ok(())
@@ -840,7 +840,7 @@ impl PgMetadataStore for PgStore {
             })?;
         if updated == 0 {
             return Err(MetadataError::BucketNotFound {
-                name: name.to_string(),
+                name: BucketName::from(name),
             });
         }
         Ok(())
@@ -859,7 +859,7 @@ impl PgMetadataStore for PgStore {
                 source: e,
             })?
             .ok_or(MetadataError::BucketNotFound {
-                name: name.to_string(),
+                name: BucketName::from(name),
             })
     }
 
@@ -876,7 +876,7 @@ impl PgMetadataStore for PgStore {
             })?;
         if updated == 0 {
             return Err(MetadataError::BucketNotFound {
-                name: name.to_string(),
+                name: BucketName::from(name),
             });
         }
         Ok(())
@@ -895,7 +895,7 @@ impl PgMetadataStore for PgStore {
             })?;
         if updated == 0 {
             return Err(MetadataError::BucketNotFound {
-                name: name.to_string(),
+                name: BucketName::from(name),
             });
         }
         Ok(())
@@ -914,7 +914,7 @@ impl PgMetadataStore for PgStore {
             })?;
         if updated == 0 {
             return Err(MetadataError::BucketNotFound {
-                name: name.to_string(),
+                name: BucketName::from(name),
             });
         }
         Ok(())
@@ -933,7 +933,7 @@ impl PgMetadataStore for PgStore {
                 source: e,
             })?
             .ok_or(MetadataError::BucketNotFound {
-                name: name.to_string(),
+                name: BucketName::from(name),
             })
     }
 
@@ -950,7 +950,7 @@ impl PgMetadataStore for PgStore {
             })?;
         if updated == 0 {
             return Err(MetadataError::BucketNotFound {
-                name: name.to_string(),
+                name: BucketName::from(name),
             });
         }
         Ok(())
@@ -1482,7 +1482,7 @@ impl PgMetadataStore for PgStore {
                 source: e,
             })?
             .ok_or_else(|| MetadataError::NoSuchUpload {
-                upload_id: upload_id.to_string(),
+                upload_id: UploadId::from(upload_id),
             })
     }
 
@@ -1509,7 +1509,7 @@ impl PgMetadataStore for PgStore {
             return match current {
                 Some(state) => Err(MetadataError::UploadNotInProgress { state }),
                 None => Err(MetadataError::NoSuchUpload {
-                    upload_id: upload_id.to_string(),
+                    upload_id: UploadId::from(upload_id),
                 }),
             };
         }
@@ -1540,7 +1540,7 @@ impl PgMetadataStore for PgStore {
                 })?;
             return match current {
                 None => Err(MetadataError::NoSuchUpload {
-                    upload_id: upload_id.to_string(),
+                    upload_id: UploadId::from(upload_id),
                 }),
                 Some(s) => Err(MetadataError::UploadNotInProgress { state: s }),
             };
@@ -1561,7 +1561,7 @@ impl PgMetadataStore for PgStore {
             })?;
         if deleted == 0 {
             return Err(MetadataError::NoSuchUpload {
-                upload_id: upload_id.to_string(),
+                upload_id: UploadId::from(upload_id),
             });
         }
         Ok(())
@@ -1810,7 +1810,7 @@ impl PgMetadataStore for PgStore {
                 source: e,
             })?
             .ok_or(MetadataError::PartNotFound {
-                upload_id: upload_id.to_string(),
+                upload_id: UploadId::from(upload_id),
                 part_number,
             })
     }
@@ -2250,7 +2250,7 @@ impl PgMetadataStore for PgStore {
                 |row| {
                     let op_kind_raw: u8 = row.get(3)?;
                     let state_raw: u8 = row.get(6)?;
-                    let upload_id: Option<String> = row.get(4)?;
+                    let upload_id: Option<UploadId> = row.get(4)?;
                     let part_number: Option<i64> = row.get(5)?;
                     Ok(StreamUploadRecord {
                         session_id: row.get(0)?,
@@ -2279,7 +2279,7 @@ impl PgMetadataStore for PgStore {
                 source: e,
             })?
             .ok_or_else(|| MetadataError::StreamSessionNotFound {
-                session_id: session_id.to_string(),
+                session_id: SessionId::from(session_id),
             })
     }
 
@@ -2301,7 +2301,7 @@ impl PgMetadataStore for PgStore {
                 source: e,
             })?
             .ok_or_else(|| MetadataError::StreamSessionNotFound {
-                session_id: session_id.to_string(),
+                session_id: SessionId::from(session_id),
             })?;
 
         if current != StreamUploadState::InProgress as u8 {
@@ -2348,7 +2348,7 @@ impl PgMetadataStore for PgStore {
             .query_map([], |row| {
                 let op_kind_raw: u8 = row.get(3)?;
                 let state_raw: u8 = row.get(6)?;
-                let upload_id: Option<String> = row.get(4)?;
+                let upload_id: Option<UploadId> = row.get(4)?;
                 let part_number: Option<i64> = row.get(5)?;
                 Ok(StreamUploadRecord {
                     session_id: row.get(0)?,
@@ -2488,7 +2488,7 @@ impl PgMetadataStore for PgStore {
 
             let (current, op_kind_raw, sess_bucket, sess_key, upload_id, part_number) = row
                 .ok_or_else(|| MetadataError::StreamSessionNotFound {
-                    session_id: session_id.to_string(),
+                    session_id: SessionId::from(session_id),
                 })?;
             let target = PgStore::parse_stream_target(op_kind_raw, upload_id, part_number, 1)
                 .map_err(|e| MetadataError::Db {
@@ -2504,7 +2504,7 @@ impl PgMetadataStore for PgStore {
                 || sess_key != obj.key
             {
                 return Err(MetadataError::StreamSessionNotFound {
-                    session_id: session_id.to_string(),
+                    session_id: SessionId::from(session_id),
                 });
             }
 
@@ -2597,7 +2597,7 @@ impl PgMetadataStore for PgStore {
                         || chunk.version_id != obj.version_id
                     {
                         return Err(MetadataError::StreamSessionNotFound {
-                            session_id: session_id.to_string(),
+                            session_id: SessionId::from(session_id),
                         });
                     }
                     stmt.execute(params![
@@ -2675,10 +2675,10 @@ impl PgMetadataStore for PgStore {
                         params![session_id],
                         |row| {
                             let op_kind_raw: u8 = row.get(1)?;
-                            let upload_id: Option<String> = row.get(4)?;
+                            let upload_id: Option<UploadId> = row.get(4)?;
                             let part_number: Option<i64> = row.get(5)?;
                             Ok(StreamUploadRecord {
-                                session_id: session_id.to_string(),
+                                session_id: SessionId::from(session_id),
                                 state: StreamUploadState::from_u8(row.get::<_, u8>(0)?)
                                     .ok_or_else(|| {
                                         rusqlite::Error::FromSqlConversionFailure(
@@ -2705,7 +2705,7 @@ impl PgMetadataStore for PgStore {
                         source: e,
                     })?
                     .ok_or_else(|| MetadataError::StreamSessionNotFound {
-                        session_id: session_id.to_string(),
+                        session_id: SessionId::from(session_id),
                     })?;
 
             if sess_row.state != StreamUploadState::InProgress {
@@ -2721,7 +2721,7 @@ impl PgMetadataStore for PgStore {
                 } if upload_id == &part.upload_id && *part_number == part.part_number => {}
                 _ => {
                     return Err(MetadataError::StreamSessionNotFound {
-                        session_id: session_id.to_string(),
+                        session_id: SessionId::from(session_id),
                     })
                 }
             }
@@ -2817,7 +2817,7 @@ impl PgMetadataStore for PgStore {
                         || chunk.part_number != part.part_number
                     {
                         return Err(MetadataError::StreamSessionNotFound {
-                            session_id: session_id.to_string(),
+                            session_id: SessionId::from(session_id),
                         });
                     }
                     stmt.execute(params![
@@ -3167,7 +3167,7 @@ mod tests {
             store
                 .put_object_meta(&PutObjectMetaReq {
                     bucket: "bucket".into(),
-                    key: key.to_string(),
+                    key: ObjectKey::from(*key),
                     version_id: VersionId::Null,
                     status: ObjectState::Live,
                     size: 10,
@@ -3323,7 +3323,7 @@ mod tests {
             store
                 .put_object_meta(&PutObjectMetaReq {
                     bucket: "b".into(),
-                    key: format!("key-{:02}", i),
+                    key: ObjectKey::from(format!("key-{:02}", i)),
                     version_id: VersionId::Null,
                     status: ObjectState::Live,
                     size: 0,

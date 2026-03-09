@@ -33,7 +33,7 @@ pub enum StoreError {
 #[derive(Debug, thiserror::Error)]
 pub enum MetadataError {
     #[error("bucket not found: {name}")]
-    BucketNotFound { name: String },
+    BucketNotFound { name: crate::types::BucketName },
 
     #[error("bucket already exists")]
     BucketAlreadyExists,
@@ -51,16 +51,16 @@ pub enum MetadataError {
     },
 
     #[error("multipart upload not found: {upload_id}")]
-    NoSuchUpload { upload_id: String },
+    NoSuchUpload { upload_id: crate::types::UploadId },
 
     #[error("upload not in InProgress state (current: {state})")]
     UploadNotInProgress { state: u8 },
 
     #[error("multipart part not found: upload={upload_id} part={part_number}")]
-    PartNotFound { upload_id: String, part_number: u32 },
+    PartNotFound { upload_id: crate::types::UploadId, part_number: u32 },
 
     #[error("stream session not found: {session_id}")]
-    StreamSessionNotFound { session_id: String },
+    StreamSessionNotFound { session_id: crate::types::SessionId },
 
     #[error("stream session not in InProgress state (current: {state})")]
     StreamSessionNotInProgress { state: u8 },

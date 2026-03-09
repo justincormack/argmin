@@ -4,11 +4,12 @@ use std::sync::{Arc, MutexGuard};
 use ec::{EcConfig, ErasureCodec};
 use storage::traits::{PgMetadataStore, ShardStore};
 use storage::{
-    BucketInfo, ChecksumAlgorithm, ChecksumType, CreateMultipartUploadReq, CreateStreamUploadReq,
-    DataLayout, ListMultipartUploadsReq, ListObjectVersionsReq, ListObjectsReq, ListPartsReq,
-    MultipartPartChunkRecord, MultipartPartRecord, MultipartUploadRecord, ObjectPartRecord,
-    ObjectRecord, PutObjectMetaReq, ShardKey, SharedStorageNode, StreamObjectChunkRecord,
-    StreamUploadChunkRecord, StreamUploadState, StreamUploadTarget, UploadState,
+    BucketInfo, BucketName, ChecksumAlgorithm, ChecksumType, CreateMultipartUploadReq,
+    CreateStreamUploadReq, DataLayout, ListMultipartUploadsReq, ListObjectVersionsReq,
+    ListObjectsReq, ListPartsReq, MultipartPartChunkRecord, MultipartPartRecord,
+    MultipartUploadRecord, ObjectKey, ObjectPartRecord, ObjectRecord, PutObjectMetaReq,
+    SessionId, ShardKey, SharedStorageNode, StreamObjectChunkRecord, StreamUploadChunkRecord,
+    StreamUploadState, StreamUploadTarget, UploadId, UploadState,
 };
 
 use crate::conditional::{
@@ -443,7 +444,7 @@ impl Coordinator {
             Err(storage::MetadataError::BucketAlreadyExists) => {
                 let existing = bucket_pg.head_bucket(name).map_err(|e| match e {
                     storage::MetadataError::BucketNotFound { name } => {
-                        ServerError::BucketNotFound { name }
+                        ServerError::BucketNotFound { name: name.to_string() }
                     }
                     other => ServerError::Metadata(other),
                 })?;
@@ -465,7 +466,7 @@ impl Coordinator {
         self.pg_topology.for_each_pg(|pg_id| {
             let pg = self.storage_node.get_pg(pg_id)?;
             let resp = pg.list_object_versions(&ListObjectVersionsReq {
-                bucket: name.to_string(),
+                bucket: BucketName::from(name),
                 prefix: None,
                 key_marker: None,
                 version_id_marker: None,
@@ -475,7 +476,7 @@ impl Coordinator {
                 return Err(ServerError::BucketNotEmpty);
             }
             let mpu_resp = pg.list_multipart_uploads(&ListMultipartUploadsReq {
-                bucket: name.to_string(),
+                bucket: BucketName::from(name),
                 prefix: None,
                 key_marker: None,
                 upload_id_marker: None,
@@ -489,7 +490,7 @@ impl Coordinator {
 
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg.delete_bucket(name).map_err(|e| match e {
-            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound { name },
+            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound { name: name.to_string() },
             storage::MetadataError::BucketNotEmpty => ServerError::BucketNotEmpty,
             other => ServerError::Metadata(other),
         })
@@ -498,7 +499,7 @@ impl Coordinator {
     pub fn head_bucket(&self, name: &str) -> Result<BucketInfo, ServerError> {
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg.head_bucket(name).map_err(|e| match e {
-            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound { name },
+            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound { name: name.to_string() },
             other => ServerError::Metadata(other),
         })
     }
@@ -528,7 +529,7 @@ impl Coordinator {
             .put_bucket_versioning(name, state)
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => {
-                    ServerError::BucketNotFound { name }
+                    ServerError::BucketNotFound { name: name.to_string() }
                 }
                 storage::MetadataError::InvalidVersioningTransition { from, to } => {
                     ServerError::InvalidRequest {
@@ -550,7 +551,7 @@ impl Coordinator {
             .put_bucket_cors(name, config)
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => {
-                    ServerError::BucketNotFound { name }
+                    ServerError::BucketNotFound { name: name.to_string() }
                 }
                 other => ServerError::Metadata(other),
             })
@@ -559,7 +560,7 @@ impl Coordinator {
     pub fn get_bucket_cors(&self, name: &str) -> Result<Option<String>, ServerError> {
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg.get_bucket_cors(name).map_err(|e| match e {
-            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound { name },
+            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound { name: name.to_string() },
             other => ServerError::Metadata(other),
         })
     }
@@ -567,7 +568,7 @@ impl Coordinator {
     pub fn delete_bucket_cors(&self, name: &str) -> Result<(), ServerError> {
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg.delete_bucket_cors(name).map_err(|e| match e {
-            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound { name },
+            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound { name: name.to_string() },
             other => ServerError::Metadata(other),
         })
     }
@@ -577,7 +578,7 @@ impl Coordinator {
     pub fn put_bucket_tags(&self, name: &str, tags: &str) -> Result<(), ServerError> {
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg.put_bucket_tags(name, tags).map_err(|e| match e {
-            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound { name },
+            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound { name: name.to_string() },
             other => ServerError::Metadata(other),
         })
     }
@@ -585,7 +586,7 @@ impl Coordinator {
     pub fn get_bucket_tags(&self, name: &str) -> Result<Option<String>, ServerError> {
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg.get_bucket_tags(name).map_err(|e| match e {
-            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound { name },
+            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound { name: name.to_string() },
             other => ServerError::Metadata(other),
         })
     }
@@ -593,7 +594,7 @@ impl Coordinator {
     pub fn delete_bucket_tags(&self, name: &str) -> Result<(), ServerError> {
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg.delete_bucket_tags(name).map_err(|e| match e {
-            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound { name },
+            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound { name: name.to_string() },
             other => ServerError::Metadata(other),
         })
     }
@@ -610,7 +611,7 @@ impl Coordinator {
             .put_bucket_public_access_block(name, config)
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => {
-                    ServerError::BucketNotFound { name }
+                    ServerError::BucketNotFound { name: name.to_string() }
                 }
                 other => ServerError::Metadata(other),
             })
@@ -625,7 +626,7 @@ impl Coordinator {
             .get_bucket_public_access_block(name)
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => {
-                    ServerError::BucketNotFound { name }
+                    ServerError::BucketNotFound { name: name.to_string() }
                 }
                 other => ServerError::Metadata(other),
             })
@@ -637,7 +638,7 @@ impl Coordinator {
             .delete_bucket_public_access_block(name)
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => {
-                    ServerError::BucketNotFound { name }
+                    ServerError::BucketNotFound { name: name.to_string() }
                 }
                 other => ServerError::Metadata(other),
             })
@@ -651,7 +652,7 @@ impl Coordinator {
             .put_bucket_acl(name, public_read)
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => {
-                    ServerError::BucketNotFound { name }
+                    ServerError::BucketNotFound { name: name.to_string() }
                 }
                 other => ServerError::Metadata(other),
             })
@@ -669,7 +670,7 @@ impl Coordinator {
             .put_bucket_ownership_controls(name, config)
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => {
-                    ServerError::BucketNotFound { name }
+                    ServerError::BucketNotFound { name: name.to_string() }
                 }
                 other => ServerError::Metadata(other),
             })
@@ -681,7 +682,7 @@ impl Coordinator {
             .get_bucket_ownership_controls(name)
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => {
-                    ServerError::BucketNotFound { name }
+                    ServerError::BucketNotFound { name: name.to_string() }
                 }
                 other => ServerError::Metadata(other),
             })
@@ -693,7 +694,7 @@ impl Coordinator {
             .delete_bucket_ownership_controls(name)
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => {
-                    ServerError::BucketNotFound { name }
+                    ServerError::BucketNotFound { name: name.to_string() }
                 }
                 other => ServerError::Metadata(other),
             })
@@ -860,8 +861,8 @@ impl Coordinator {
         //    Metadata blob stored in DB row; size == user data length.
         let user_size = user_data.len() as u64;
         let meta_result = meta_pg.put_object_meta(&PutObjectMetaReq {
-            bucket: bucket.to_string(),
-            key: key.to_string(),
+            bucket: BucketName::from(bucket),
+            key: ObjectKey::from(key),
             version_id,
             status: storage::ObjectState::Live,
             size: user_size,
@@ -1002,9 +1003,9 @@ impl Coordinator {
         let meta_pg_id = self.object_pg_id(bucket, key);
         let pg = self.storage_node.get_pg(meta_pg_id)?;
         pg.create_stream_upload(&CreateStreamUploadReq {
-            session_id: session_id.clone(),
-            bucket: bucket.to_string(),
-            key: key.to_string(),
+            session_id: SessionId::from(session_id.as_str()),
+            bucket: BucketName::from(bucket),
+            key: ObjectKey::from(key),
             target: StreamUploadTarget::PutObject,
         })?;
 
@@ -1060,11 +1061,11 @@ impl Coordinator {
         });
 
         pg.create_stream_upload(&CreateStreamUploadReq {
-            session_id: session_id.clone(),
-            bucket: bucket.to_string(),
-            key: key.to_string(),
+            session_id: SessionId::from(session_id.as_str()),
+            bucket: BucketName::from(bucket),
+            key: ObjectKey::from(key),
             target: StreamUploadTarget::UploadPart {
-                upload_id: upload_id.to_string(),
+                upload_id: UploadId::from(upload_id),
                 part_number,
             },
         })?;
@@ -1177,7 +1178,7 @@ impl Coordinator {
 
         // Record staging chunk row.
         let chunk_result = meta_guard.append_stream_chunk(&StreamUploadChunkRecord {
-            session_id: session_id.to_string(),
+            session_id: SessionId::from(session_id),
             chunk_index,
             size: data.len() as u64,
             chunk_okh,
@@ -1285,8 +1286,8 @@ impl Coordinator {
         let committed_chunks: Vec<StreamObjectChunkRecord> = staging_chunks
             .iter()
             .map(|c| StreamObjectChunkRecord {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
+                bucket: BucketName::from(bucket),
+                key: ObjectKey::from(key),
                 version_id,
                 chunk_index: c.chunk_index,
                 size: c.size,
@@ -1303,8 +1304,8 @@ impl Coordinator {
             .commit_stream_put(
                 session_id,
                 &PutObjectMetaReq {
-                    bucket: bucket.to_string(),
-                    key: key.to_string(),
+                    bucket: BucketName::from(bucket),
+                    key: ObjectKey::from(key),
                     version_id,
                     status: storage::ObjectState::Live,
                     size: total_size,
@@ -1473,9 +1474,9 @@ impl Coordinator {
         let committed_chunks: Vec<MultipartPartChunkRecord> = staging_chunks
             .iter()
             .map(|c| MultipartPartChunkRecord {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-                upload_id: upload_id.to_string(),
+                bucket: BucketName::from(bucket),
+                key: ObjectKey::from(key),
+                upload_id: UploadId::from(upload_id),
                 version_id: u64::MAX, // staging sentinel — reparented at CompleteMultipartUpload time
                 part_number,
                 chunk_index: c.chunk_index,
@@ -1494,7 +1495,7 @@ impl Coordinator {
             .as_millis() as u64;
 
         let part_record = MultipartPartRecord {
-            upload_id: upload_id.to_string(),
+            upload_id: UploadId::from(upload_id),
             part_number,
             generation,
             size: total_size,
@@ -3505,8 +3506,8 @@ impl Coordinator {
                 let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
                 let marker_vid = meta_pg.next_version_id(bucket, key)?;
                 meta_pg.put_object_meta(&PutObjectMetaReq {
-                    bucket: bucket.to_string(),
-                    key: key.to_string(),
+                    bucket: BucketName::from(bucket),
+                    key: ObjectKey::from(key),
                     version_id: marker_vid,
                     status: storage::ObjectState::DeleteMarker,
                     size: 0,
@@ -3570,9 +3571,9 @@ impl Coordinator {
             }
             let pg = self.storage_node.get_pg(pg_id)?;
             let resp = pg.list_objects(&ListObjectsReq {
-                bucket: bucket.to_string(),
-                prefix: prefix.map(|s| s.to_string()),
-                start_after: continuation_token.map(|s| s.to_string()),
+                bucket: BucketName::from(bucket),
+                prefix: prefix.map(ObjectKey::from),
+                start_after: continuation_token.map(ObjectKey::from),
                 max_keys: per_pg_limit,
             })?;
             all_objects.extend(resp.objects);
@@ -3627,7 +3628,7 @@ impl Coordinator {
                 } else {
                     if token.is_none_or(|t| record.key.as_str() > t) {
                         objects.push(ListEntry {
-                            key: record.key.clone(),
+                            key: record.key.to_string(),
                             size: record.size,
                             etag: format_object_etag(
                                 &record.etag,
@@ -3637,7 +3638,7 @@ impl Coordinator {
                             last_modified: record.last_modified,
                         });
                         entry_count += 1;
-                        last_entry = Some(record.key.clone());
+                        last_entry = Some(record.key.to_string());
                     }
                     i += 1;
                 }
@@ -3650,7 +3651,7 @@ impl Coordinator {
                 }
                 if token.is_none_or(|t| record.key.as_str() > t) {
                     objects.push(ListEntry {
-                        key: record.key.clone(),
+                        key: record.key.to_string(),
                         size: record.size,
                         etag: format_object_etag(
                             &record.etag,
@@ -3660,7 +3661,7 @@ impl Coordinator {
                         last_modified: record.last_modified,
                     });
                     entry_count += 1;
-                    last_entry = Some(record.key.clone());
+                    last_entry = Some(record.key.to_string());
                 }
             }
 
@@ -3711,9 +3712,9 @@ impl Coordinator {
         self.pg_topology.for_each_pg(|pg_id| {
             let pg = self.storage_node.get_pg(pg_id)?;
             let resp = pg.list_object_versions(&ListObjectVersionsReq {
-                bucket: bucket.to_string(),
-                prefix: prefix.map(|s| s.to_string()),
-                key_marker: key_marker.map(|s| s.to_string()),
+                bucket: BucketName::from(bucket),
+                prefix: prefix.map(ObjectKey::from),
+                key_marker: key_marker.map(ObjectKey::from),
                 version_id_marker,
                 max_keys: max_keys.saturating_add(1),
             })?;
@@ -3739,7 +3740,7 @@ impl Coordinator {
             }
 
             versions.push(VersionEntry {
-                key: record.key.clone(),
+                key: record.key.to_string(),
                 version_id: record.version_id,
                 is_latest,
                 size: record.size,
@@ -3846,9 +3847,9 @@ impl Coordinator {
         let meta_pg_id = self.object_pg_id(bucket, key);
         let pg = self.storage_node.get_pg(meta_pg_id)?;
         pg.create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: upload_id.clone(),
-            bucket: bucket.to_string(),
-            key: key.to_string(),
+            upload_id: UploadId::from(upload_id.as_str()),
+            bucket: BucketName::from(bucket),
+            key: ObjectKey::from(key),
             metadata_blob,
             owner_principal: Some(bucket_info.owner_principal),
             checksum_algorithm,
@@ -4211,7 +4212,7 @@ impl Coordinator {
             .as_millis() as u64;
 
         let upsert_result = meta_pg.upsert_multipart_part(&MultipartPartRecord {
-            upload_id: upload_id.to_string(),
+            upload_id: UploadId::from(upload_id),
             part_number,
             generation,
             size: data.len() as u64,
@@ -4561,8 +4562,8 @@ impl Coordinator {
 
         // 9. Build the object metadata and manifest parts.
         let obj_req = PutObjectMetaReq {
-            bucket: bucket.to_string(),
-            key: key.to_string(),
+            bucket: BucketName::from(bucket),
+            key: ObjectKey::from(key),
             version_id,
             status: storage::ObjectState::Live,
             size: total_size,
@@ -4584,8 +4585,8 @@ impl Coordinator {
                     storage::VersionId::from_u64(p.part_vid),
                 );
                 ObjectPartRecord {
-                    bucket: bucket.to_string(),
-                    key: key.to_string(),
+                    bucket: BucketName::from(bucket),
+                    key: ObjectKey::from(key),
                     version_id,
                     part_number: p.part_number,
                     size: p.size,
@@ -4657,7 +4658,7 @@ impl Coordinator {
         // 3. Collect all parts for shard cleanup.
         let all_parts = meta_pg
             .list_multipart_parts(&ListPartsReq {
-                upload_id: upload_id.to_string(),
+                upload_id: UploadId::from(upload_id),
                 part_number_marker: None,
                 max_parts: u32::MAX,
             })
@@ -4741,7 +4742,7 @@ impl Coordinator {
         // 2. Delegate to storage layer.
         let resp = meta_pg
             .list_multipart_parts(&ListPartsReq {
-                upload_id: upload_id.to_string(),
+                upload_id: UploadId::from(upload_id),
                 part_number_marker,
                 max_parts,
             })
@@ -4809,10 +4810,10 @@ impl Coordinator {
             }
             let pg = self.storage_node.get_pg(pg_id)?;
             let resp = pg.list_multipart_uploads(&ListMultipartUploadsReq {
-                bucket: bucket.to_string(),
-                prefix: prefix.map(|s| s.to_string()),
-                key_marker: key_marker.map(|s| s.to_string()),
-                upload_id_marker: upload_id_marker.map(|s| s.to_string()),
+                bucket: BucketName::from(bucket),
+                prefix: prefix.map(ObjectKey::from),
+                key_marker: key_marker.map(ObjectKey::from),
+                upload_id_marker: upload_id_marker.map(UploadId::from),
                 max_uploads: max_uploads.saturating_add(1),
             })?;
             all_uploads.extend(resp.uploads);
@@ -4839,7 +4840,7 @@ impl Coordinator {
 
         let (next_key_marker, next_upload_id_marker) = if is_truncated {
             if let Some(last) = all_uploads.last() {
-                (Some(last.key.clone()), Some(last.upload_id.clone()))
+                (Some(last.key.to_string()), Some(last.upload_id.to_string()))
             } else {
                 (None, None)
             }
@@ -4850,8 +4851,8 @@ impl Coordinator {
         let uploads = all_uploads
             .into_iter()
             .map(|u| MultipartUploadEntry {
-                key: u.key,
-                upload_id: u.upload_id,
+                key: u.key.to_string(),
+                upload_id: u.upload_id.to_string(),
                 initiated: u.initiated_at,
             })
             .collect();
@@ -4996,7 +4997,7 @@ mod tests {
             .list_buckets()
             .unwrap()
             .into_iter()
-            .map(|b| b.name)
+            .map(|b| b.name.to_string())
             .collect();
         assert_eq!(names, vec!["alpha", "beta", "mango", "zz-top"]);
     }
@@ -5014,7 +5015,7 @@ mod tests {
             .list_buckets()
             .unwrap()
             .into_iter()
-            .map(|b| b.name)
+            .map(|b| b.name.to_string())
             .collect();
         assert_eq!(names, vec![bucket]);
     }
@@ -7770,7 +7771,7 @@ mod tests {
 
         let parts_resp = pg
             .list_multipart_parts(&storage::ListPartsReq {
-                upload_id: create.upload_id.clone(),
+                upload_id: UploadId::from(create.upload_id.as_str()),
                 part_number_marker: None,
                 max_parts: 100,
             })
@@ -10168,11 +10169,11 @@ mod tests {
         let meta_pg_id = coord.object_pg_id("bucket", "key");
         let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
         pg.create_stream_upload(&CreateStreamUploadReq {
-            session_id: "upload-part-session".to_string(),
-            bucket: "bucket".to_string(),
-            key: "key".to_string(),
+            session_id: SessionId::from("upload-part-session"),
+            bucket: BucketName::from("bucket"),
+            key: ObjectKey::from("key"),
             target: StreamUploadTarget::UploadPart {
-                upload_id: "mpu-123".to_string(),
+                upload_id: UploadId::from("mpu-123"),
                 part_number: 1,
             },
         })

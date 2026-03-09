@@ -1,6 +1,123 @@
 /// Core types for the storage layer.
 use crate::error::StoreError;
 
+// ── String newtypes ───────────────────────────────────────────────
+
+macro_rules! string_newtype {
+    ($(#[$meta:meta])* $name:ident) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        pub struct $name(String);
+
+        impl $name {
+            pub fn new(s: impl Into<String>) -> Self {
+                Self(s.into())
+            }
+
+            pub fn into_string(self) -> String {
+                self.0
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl std::ops::Deref for $name {
+            type Target = str;
+            fn deref(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+
+        impl From<String> for $name {
+            fn from(s: String) -> Self {
+                Self(s)
+            }
+        }
+
+        impl From<&str> for $name {
+            fn from(s: &str) -> Self {
+                Self(s.to_string())
+            }
+        }
+
+        impl PartialEq<str> for $name {
+            fn eq(&self, other: &str) -> bool {
+                self.0 == other
+            }
+        }
+
+        impl PartialEq<&str> for $name {
+            fn eq(&self, other: &&str) -> bool {
+                self.0.as_str() == *other
+            }
+        }
+
+        impl PartialEq<$name> for str {
+            fn eq(&self, other: &$name) -> bool {
+                self == other.0
+            }
+        }
+
+        impl PartialEq<$name> for &str {
+            fn eq(&self, other: &$name) -> bool {
+                *self == other.0
+            }
+        }
+
+        impl PartialEq<String> for $name {
+            fn eq(&self, other: &String) -> bool {
+                self.0 == *other
+            }
+        }
+
+        impl PartialEq<$name> for String {
+            fn eq(&self, other: &$name) -> bool {
+                *self == other.0
+            }
+        }
+
+        impl rusqlite::types::ToSql for $name {
+            fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+                self.0.to_sql()
+            }
+        }
+
+        impl rusqlite::types::FromSql for $name {
+            fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+                String::column_result(value).map(Self)
+            }
+        }
+    };
+}
+
+string_newtype!(
+    /// S3 bucket name.
+    BucketName
+);
+
+string_newtype!(
+    /// S3 object key.
+    ObjectKey
+);
+
+string_newtype!(
+    /// Multipart upload identifier.
+    UploadId
+);
+
+string_newtype!(
+    /// Streaming upload session identifier.
+    SessionId
+);
+
 /// Length of a composite shard key in bytes.
 ///
 /// Layout: object_key_hash (16 bytes) || version_id (8 bytes) || shard_index (1 byte)
@@ -385,8 +502,8 @@ impl std::fmt::Display for VersionId {
 /// Object record stored in per-PG metadata.
 #[derive(Debug, Clone)]
 pub struct ObjectRecord {
-    pub bucket: String,
-    pub key: String,
+    pub bucket: BucketName,
+    pub key: ObjectKey,
     pub version_id: VersionId,
     pub size: u64,
     /// Binary etag (e.g. CRC64-NVME bytes), max 64 bytes.
@@ -411,7 +528,7 @@ pub struct ObjectRecord {
 /// Bucket metadata.
 #[derive(Debug, Clone)]
 pub struct BucketInfo {
-    pub name: String,
+    pub name: BucketName,
     pub owner_principal: String,
     /// Creation timestamp (unix milliseconds).
     pub created_at: u64,
@@ -430,8 +547,8 @@ pub struct BucketInfo {
 
 /// Request to store object metadata.
 pub struct PutObjectMetaReq {
-    pub bucket: String,
-    pub key: String,
+    pub bucket: BucketName,
+    pub key: ObjectKey,
     pub version_id: VersionId,
     pub size: u64,
     pub etag: Vec<u8>,
@@ -449,9 +566,9 @@ pub struct PutObjectMetaReq {
 
 /// Request to list objects in a PG.
 pub struct ListObjectsReq {
-    pub bucket: String,
-    pub prefix: Option<String>,
-    pub start_after: Option<String>,
+    pub bucket: BucketName,
+    pub prefix: Option<ObjectKey>,
+    pub start_after: Option<ObjectKey>,
     pub max_keys: u32,
 }
 
@@ -459,14 +576,14 @@ pub struct ListObjectsReq {
 pub struct ListObjectsResp {
     pub objects: Vec<ObjectRecord>,
     pub is_truncated: bool,
-    pub next_start_after: Option<String>,
+    pub next_start_after: Option<ObjectKey>,
 }
 
 /// Request to list all object versions in a PG.
 pub struct ListObjectVersionsReq {
-    pub bucket: String,
-    pub prefix: Option<String>,
-    pub key_marker: Option<String>,
+    pub bucket: BucketName,
+    pub prefix: Option<ObjectKey>,
+    pub key_marker: Option<ObjectKey>,
     pub version_id_marker: Option<VersionId>,
     pub max_keys: u32,
 }
@@ -475,7 +592,7 @@ pub struct ListObjectVersionsReq {
 pub struct ListObjectVersionsResp {
     pub versions: Vec<ObjectRecord>,
     pub is_truncated: bool,
-    pub next_key_marker: Option<String>,
+    pub next_key_marker: Option<ObjectKey>,
     pub next_version_id_marker: Option<VersionId>,
 }
 
@@ -504,9 +621,9 @@ impl UploadState {
 /// In-progress multipart upload record.
 #[derive(Debug, Clone)]
 pub struct MultipartUploadRecord {
-    pub upload_id: String,
-    pub bucket: String,
-    pub key: String,
+    pub upload_id: UploadId,
+    pub bucket: BucketName,
+    pub key: ObjectKey,
     /// Initiation timestamp (unix milliseconds).
     pub initiated_at: u64,
     pub state: UploadState,
@@ -522,7 +639,7 @@ pub struct MultipartUploadRecord {
 /// In-progress multipart part record.
 #[derive(Debug, Clone)]
 pub struct MultipartPartRecord {
-    pub upload_id: String,
+    pub upload_id: UploadId,
     pub part_number: u32,
     pub generation: u32,
     pub size: u64,
@@ -543,8 +660,8 @@ pub struct MultipartPartRecord {
 /// Committed part record in the object manifest.
 #[derive(Debug, Clone)]
 pub struct ObjectPartRecord {
-    pub bucket: String,
-    pub key: String,
+    pub bucket: BucketName,
+    pub key: ObjectKey,
     pub version_id: VersionId,
     pub part_number: u32,
     pub size: u64,
@@ -562,9 +679,9 @@ pub struct ObjectPartRecord {
 
 /// Request to create a multipart upload.
 pub struct CreateMultipartUploadReq {
-    pub upload_id: String,
-    pub bucket: String,
-    pub key: String,
+    pub upload_id: UploadId,
+    pub bucket: BucketName,
+    pub key: ObjectKey,
     pub metadata_blob: Vec<u8>,
     pub owner_principal: Option<String>,
     pub checksum_algorithm: Option<ChecksumAlgorithm>,
@@ -573,10 +690,10 @@ pub struct CreateMultipartUploadReq {
 
 /// Request to list multipart uploads.
 pub struct ListMultipartUploadsReq {
-    pub bucket: String,
-    pub prefix: Option<String>,
-    pub key_marker: Option<String>,
-    pub upload_id_marker: Option<String>,
+    pub bucket: BucketName,
+    pub prefix: Option<ObjectKey>,
+    pub key_marker: Option<ObjectKey>,
+    pub upload_id_marker: Option<UploadId>,
     pub max_uploads: u32,
 }
 
@@ -584,13 +701,13 @@ pub struct ListMultipartUploadsReq {
 pub struct ListMultipartUploadsResp {
     pub uploads: Vec<MultipartUploadRecord>,
     pub is_truncated: bool,
-    pub next_key_marker: Option<String>,
-    pub next_upload_id_marker: Option<String>,
+    pub next_key_marker: Option<ObjectKey>,
+    pub next_upload_id_marker: Option<UploadId>,
 }
 
 /// Request to list parts of a multipart upload.
 pub struct ListPartsReq {
-    pub upload_id: String,
+    pub upload_id: UploadId,
     pub part_number_marker: Option<u32>,
     pub max_parts: u32,
 }
@@ -630,7 +747,7 @@ impl StreamUploadKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamUploadTarget {
     PutObject,
-    UploadPart { upload_id: String, part_number: u32 },
+    UploadPart { upload_id: UploadId, part_number: u32 },
 }
 
 impl StreamUploadTarget {
@@ -681,9 +798,9 @@ impl StreamUploadState {
 /// In-progress streaming upload session record.
 #[derive(Debug, Clone)]
 pub struct StreamUploadRecord {
-    pub session_id: String,
-    pub bucket: String,
-    pub key: String,
+    pub session_id: SessionId,
+    pub bucket: BucketName,
+    pub key: ObjectKey,
     pub target: StreamUploadTarget,
     pub state: StreamUploadState,
     pub created_at: u64,
@@ -691,16 +808,16 @@ pub struct StreamUploadRecord {
 
 /// Request to create a streaming upload session.
 pub struct CreateStreamUploadReq {
-    pub session_id: String,
-    pub bucket: String,
-    pub key: String,
+    pub session_id: SessionId,
+    pub bucket: BucketName,
+    pub key: ObjectKey,
     pub target: StreamUploadTarget,
 }
 
 /// Staging chunk record for an in-progress streaming session.
 #[derive(Debug, Clone)]
 pub struct StreamUploadChunkRecord {
-    pub session_id: String,
+    pub session_id: SessionId,
     pub chunk_index: u32,
     pub size: u64,
     /// 16-byte object key hash for shard keys.
@@ -716,8 +833,8 @@ pub struct StreamUploadChunkRecord {
 /// Committed chunk record for a normal PutObject.
 #[derive(Debug, Clone)]
 pub struct StreamObjectChunkRecord {
-    pub bucket: String,
-    pub key: String,
+    pub bucket: BucketName,
+    pub key: ObjectKey,
     pub version_id: VersionId,
     pub chunk_index: u32,
     pub size: u64,
@@ -731,9 +848,9 @@ pub struct StreamObjectChunkRecord {
 /// Committed chunk record for a multipart part.
 #[derive(Debug, Clone)]
 pub struct MultipartPartChunkRecord {
-    pub bucket: String,
-    pub key: String,
-    pub upload_id: String,
+    pub bucket: BucketName,
+    pub key: ObjectKey,
+    pub upload_id: UploadId,
     pub version_id: u64,
     pub part_number: u32,
     pub chunk_index: u32,

@@ -17,8 +17,8 @@ fn shard_and_metadata_roundtrip() {
 
     // Write object metadata referencing the shard.
     let req = PutObjectMetaReq {
-        bucket: "test-bucket".to_string(),
-        key: "my/object.txt".to_string(),
+        bucket: "test-bucket".into(),
+        key: "my/object.txt".into(),
         version_id: VersionId::Null,
         status: ObjectState::Live,
         size: shard_data.len() as u64,
@@ -110,8 +110,8 @@ fn full_lifecycle() {
     let ack = pg.write_shard(&shard_key, data).unwrap();
 
     pg.put_object_meta(&PutObjectMetaReq {
-        bucket: "my-bucket".to_string(),
-        key: "greeting.txt".to_string(),
+        bucket: "my-bucket".into(),
+        key: "greeting.txt".into(),
         version_id: VersionId::Null,
         status: ObjectState::Live,
         size: data.len() as u64,
@@ -163,8 +163,8 @@ fn pg_store_persistence() {
         store.write_shard(&key, data).unwrap();
         store
             .put_object_meta(&PutObjectMetaReq {
-                bucket: "b".to_string(),
-                key: "k".to_string(),
+                bucket: "b".into(),
+                key: "k".into(),
                 version_id: VersionId::Null,
                 status: ObjectState::Live,
                 size: data.len() as u64,
