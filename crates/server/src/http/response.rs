@@ -643,7 +643,11 @@ impl S3Response {
     }
 
     /// Build a response for GetObjectAttributes (200 OK, XML body).
-    pub fn get_object_attributes(body_xml: &str, last_modified: u64, version_id: storage::VersionId) -> Self {
+    pub fn get_object_attributes(
+        body_xml: &str,
+        last_modified: u64,
+        version_id: storage::VersionId,
+    ) -> Self {
         let mut resp = Self::new(200)
             .xml_body(body_xml.to_string())
             .header("Last-Modified", &format_http_date(last_modified));

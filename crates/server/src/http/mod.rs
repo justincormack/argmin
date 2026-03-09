@@ -353,11 +353,11 @@ impl HttpFrontend {
                     let src_version_id = match src_version_id_str {
                         None => None,
                         Some(v) if v == "null" => Some(storage::VersionId::Null),
-                        Some(v) => {
-                            Some(storage::VersionId::from_u64(v.parse::<u64>().map_err(|_| ServerError::InvalidArgument {
+                        Some(v) => Some(storage::VersionId::from_u64(v.parse::<u64>().map_err(
+                            |_| ServerError::InvalidArgument {
                                 reason: format!("invalid versionId in copy source: {v}"),
-                            })?))
-                        }
+                            },
+                        )?)),
                     };
                     self.authorize_bucket_write(auth, &bucket)?;
                     self.authorize_bucket_read(auth, &src_bucket)?;
@@ -1021,11 +1021,11 @@ impl HttpFrontend {
                     let src_version_id = match src_version_id_str {
                         None => None,
                         Some(v) if v == "null" => Some(storage::VersionId::Null),
-                        Some(v) => {
-                            Some(storage::VersionId::from_u64(v.parse::<u64>().map_err(|_| ServerError::InvalidArgument {
+                        Some(v) => Some(storage::VersionId::from_u64(v.parse::<u64>().map_err(
+                            |_| ServerError::InvalidArgument {
                                 reason: format!("invalid versionId in copy source: {v}"),
-                            })?))
-                        }
+                            },
+                        )?)),
                     };
                     self.authorize_bucket_write(auth, &bucket)?;
                     self.authorize_bucket_read(auth, &src_bucket)?;
@@ -1192,11 +1192,11 @@ impl HttpFrontend {
                 let version_id_marker = match req.query_param("version-id-marker") {
                     None => None,
                     Some(v) if v == "null" => Some(storage::VersionId::Null),
-                    Some(v) => Some(storage::VersionId::from_u64(
-                        v.parse::<u64>().map_err(|_| ServerError::InvalidArgument {
+                    Some(v) => Some(storage::VersionId::from_u64(v.parse::<u64>().map_err(
+                        |_| ServerError::InvalidArgument {
                             reason: format!("invalid version-id-marker: {v}"),
-                        })?,
-                    )),
+                        },
+                    )?)),
                 };
                 let max_keys: u32 = req
                     .query_param("max-keys")
@@ -1923,14 +1923,14 @@ impl HttpFrontend {
             computed_checksum,
         )?;
 
-        let mut resp = S3Response::upload_part(
-            &result.etag,
-            result.checksum.as_ref(),
-        );
+        let mut resp = S3Response::upload_part(&result.etag, result.checksum.as_ref());
         // The coordinator's result already includes the checksum via
         // S3Response::upload_part. Only echo headers NOT already present
         // (e.g. x-amz-checksum-type). Trailer values take precedence.
-        let already_set: Option<&str> = result.checksum.as_ref().map(|c| c.algorithm().header_name());
+        let already_set: Option<&str> = result
+            .checksum
+            .as_ref()
+            .map(|c| c.algorithm().header_name());
         for (name, value) in &ctx.checksum_response {
             if already_set == Some(name.as_str()) {
                 continue; // Already set by S3Response::upload_part

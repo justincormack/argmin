@@ -679,9 +679,7 @@ impl ObjectLayout {
             (DataLayout::ChunkManifestInternal, Some(_)) => {
                 Err("chunk manifest must not have parts_count")
             }
-            (DataLayout::MultipartManifest, None) => {
-                Err("multipart manifest missing parts_count")
-            }
+            (DataLayout::MultipartManifest, None) => Err("multipart manifest missing parts_count"),
         }
     }
 
@@ -836,7 +834,10 @@ impl PutLiveObjectReq {
     pub fn validate(&self) -> Result<(), &'static str> {
         match (&self.etag, &self.layout) {
             (ObjectEtag::SinglePart(_), ObjectLayout::ChunkManifest) => Ok(()),
-            (ObjectEtag::MultipartComposite { parts, .. }, ObjectLayout::MultipartManifest { parts_count }) => {
+            (
+                ObjectEtag::MultipartComposite { parts, .. },
+                ObjectLayout::MultipartManifest { parts_count },
+            ) => {
                 if parts == parts_count {
                     Ok(())
                 } else {
@@ -1081,7 +1082,10 @@ impl StreamUploadKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamUploadTarget {
     PutObject,
-    UploadPart { upload_id: UploadId, part_number: u32 },
+    UploadPart {
+        upload_id: UploadId,
+        part_number: u32,
+    },
 }
 
 impl StreamUploadTarget {

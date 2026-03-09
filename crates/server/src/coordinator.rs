@@ -5,13 +5,12 @@ use ec::{EcConfig, ErasureCodec};
 use storage::traits::{PgMetadataStore, ShardStore};
 use storage::{
     BucketInfo, BucketName, ChecksumAlgorithm, ChecksumType, CommitMultipartReq,
-    CommitStreamPutReq, CreateMultipartUploadReq,
-    CreateStreamUploadReq, EcShape, ListMultipartUploadsReq, ListObjectVersionsReq,
-    ListObjectsReq, ListPartsReq, LiveObjectRecord, MultipartPartChunkRecord, MultipartPartRecord,
-    MultipartUploadRecord, ObjectKey, ObjectLayout, ObjectPartRecord, PutDeleteMarkerReq,
-    PutLiveObjectReq, PutObjectReq, SessionId, ShardKey, SharedStorageNode,
-    StoredObject, StreamObjectChunkRecord, StreamUploadChunkRecord, StreamUploadState,
-    StreamUploadTarget, UploadId, UploadState,
+    CommitStreamPutReq, CreateMultipartUploadReq, CreateStreamUploadReq, EcShape,
+    ListMultipartUploadsReq, ListObjectVersionsReq, ListObjectsReq, ListPartsReq, LiveObjectRecord,
+    MultipartPartChunkRecord, MultipartPartRecord, MultipartUploadRecord, ObjectKey, ObjectLayout,
+    ObjectPartRecord, PutDeleteMarkerReq, PutLiveObjectReq, PutObjectReq, SessionId, ShardKey,
+    SharedStorageNode, StoredObject, StreamObjectChunkRecord, StreamUploadChunkRecord,
+    StreamUploadState, StreamUploadTarget, UploadId, UploadState,
 };
 
 use crate::conditional::{
@@ -19,9 +18,7 @@ use crate::conditional::{
     check_write_conditions, DeleteCondition, ReadCondition, WriteCondition,
 };
 use crate::error::ServerError;
-use crate::etag::{
-    compute_multipart_etag, crc64_to_etag_bytes, etag_bytes_to_crc64, format_etag,
-};
+use crate::etag::{compute_multipart_etag, crc64_to_etag_bytes, etag_bytes_to_crc64, format_etag};
 use crate::metadata_blob::MetadataBlob;
 #[cfg(test)]
 use crate::pg::derive_pg_shards;
@@ -442,7 +439,9 @@ impl Coordinator {
             Err(storage::MetadataError::BucketAlreadyExists) => {
                 let existing = bucket_pg.head_bucket(name).map_err(|e| match e {
                     storage::MetadataError::BucketNotFound { name } => {
-                        ServerError::BucketNotFound { name: name.to_string() }
+                        ServerError::BucketNotFound {
+                            name: name.to_string(),
+                        }
                     }
                     other => ServerError::Metadata(other),
                 })?;
@@ -488,7 +487,9 @@ impl Coordinator {
 
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg.delete_bucket(name).map_err(|e| match e {
-            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound { name: name.to_string() },
+            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                name: name.to_string(),
+            },
             storage::MetadataError::BucketNotEmpty => ServerError::BucketNotEmpty,
             other => ServerError::Metadata(other),
         })
@@ -497,7 +498,9 @@ impl Coordinator {
     pub fn head_bucket(&self, name: &str) -> Result<BucketInfo, ServerError> {
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg.head_bucket(name).map_err(|e| match e {
-            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound { name: name.to_string() },
+            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                name: name.to_string(),
+            },
             other => ServerError::Metadata(other),
         })
     }
@@ -521,24 +524,34 @@ impl Coordinator {
         Ok(out)
     }
 
-    pub fn put_bucket_versioning(&self, name: &str, state: storage::BucketVersioningState) -> Result<(), ServerError> {
+    pub fn put_bucket_versioning(
+        &self,
+        name: &str,
+        state: storage::BucketVersioningState,
+    ) -> Result<(), ServerError> {
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg
             .put_bucket_versioning(name, state)
             .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => {
-                    ServerError::BucketNotFound { name: name.to_string() }
-                }
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
                 storage::MetadataError::InvalidVersioningTransition { from, to } => {
                     ServerError::InvalidRequest {
-                        reason: format!("invalid versioning transition from {:?} to {:?}", from, to),
+                        reason: format!(
+                            "invalid versioning transition from {:?} to {:?}",
+                            from, to
+                        ),
                     }
                 }
                 other => ServerError::Metadata(other),
             })
     }
 
-    pub fn get_bucket_versioning(&self, name: &str) -> Result<storage::BucketVersioningState, ServerError> {
+    pub fn get_bucket_versioning(
+        &self,
+        name: &str,
+    ) -> Result<storage::BucketVersioningState, ServerError> {
         let info = self.head_bucket(name)?;
         Ok(info.versioning)
     }
@@ -548,9 +561,9 @@ impl Coordinator {
         bucket_pg
             .put_bucket_cors(name, config)
             .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => {
-                    ServerError::BucketNotFound { name: name.to_string() }
-                }
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
                 other => ServerError::Metadata(other),
             })
     }
@@ -558,7 +571,9 @@ impl Coordinator {
     pub fn get_bucket_cors(&self, name: &str) -> Result<Option<String>, ServerError> {
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg.get_bucket_cors(name).map_err(|e| match e {
-            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound { name: name.to_string() },
+            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                name: name.to_string(),
+            },
             other => ServerError::Metadata(other),
         })
     }
@@ -566,7 +581,9 @@ impl Coordinator {
     pub fn delete_bucket_cors(&self, name: &str) -> Result<(), ServerError> {
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg.delete_bucket_cors(name).map_err(|e| match e {
-            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound { name: name.to_string() },
+            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                name: name.to_string(),
+            },
             other => ServerError::Metadata(other),
         })
     }
@@ -576,7 +593,9 @@ impl Coordinator {
     pub fn put_bucket_tags(&self, name: &str, tags: &str) -> Result<(), ServerError> {
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg.put_bucket_tags(name, tags).map_err(|e| match e {
-            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound { name: name.to_string() },
+            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                name: name.to_string(),
+            },
             other => ServerError::Metadata(other),
         })
     }
@@ -584,7 +603,9 @@ impl Coordinator {
     pub fn get_bucket_tags(&self, name: &str) -> Result<Option<String>, ServerError> {
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg.get_bucket_tags(name).map_err(|e| match e {
-            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound { name: name.to_string() },
+            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                name: name.to_string(),
+            },
             other => ServerError::Metadata(other),
         })
     }
@@ -592,7 +613,9 @@ impl Coordinator {
     pub fn delete_bucket_tags(&self, name: &str) -> Result<(), ServerError> {
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg.delete_bucket_tags(name).map_err(|e| match e {
-            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound { name: name.to_string() },
+            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                name: name.to_string(),
+            },
             other => ServerError::Metadata(other),
         })
     }
@@ -608,9 +631,9 @@ impl Coordinator {
         bucket_pg
             .put_bucket_public_access_block(name, config)
             .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => {
-                    ServerError::BucketNotFound { name: name.to_string() }
-                }
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
                 other => ServerError::Metadata(other),
             })
     }
@@ -623,9 +646,9 @@ impl Coordinator {
         bucket_pg
             .get_bucket_public_access_block(name)
             .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => {
-                    ServerError::BucketNotFound { name: name.to_string() }
-                }
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
                 other => ServerError::Metadata(other),
             })
     }
@@ -635,9 +658,9 @@ impl Coordinator {
         bucket_pg
             .delete_bucket_public_access_block(name)
             .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => {
-                    ServerError::BucketNotFound { name: name.to_string() }
-                }
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
                 other => ServerError::Metadata(other),
             })
     }
@@ -649,9 +672,9 @@ impl Coordinator {
         bucket_pg
             .put_bucket_acl(name, public_read)
             .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => {
-                    ServerError::BucketNotFound { name: name.to_string() }
-                }
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
                 other => ServerError::Metadata(other),
             })
     }
@@ -667,9 +690,9 @@ impl Coordinator {
         bucket_pg
             .put_bucket_ownership_controls(name, config)
             .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => {
-                    ServerError::BucketNotFound { name: name.to_string() }
-                }
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
                 other => ServerError::Metadata(other),
             })
     }
@@ -679,9 +702,9 @@ impl Coordinator {
         bucket_pg
             .get_bucket_ownership_controls(name)
             .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => {
-                    ServerError::BucketNotFound { name: name.to_string() }
-                }
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
                 other => ServerError::Metadata(other),
             })
     }
@@ -691,9 +714,9 @@ impl Coordinator {
         bucket_pg
             .delete_bucket_ownership_controls(name)
             .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => {
-                    ServerError::BucketNotFound { name: name.to_string() }
-                }
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
                 other => ServerError::Metadata(other),
             })
     }
@@ -864,7 +887,10 @@ impl Coordinator {
             version_id,
             size: user_size,
             etag: storage::ObjectEtag::single_part(etag_crc),
-            ec: EcShape { k: self.ec_config.data_shards, m: self.ec_config.parity_shards },
+            ec: EcShape {
+                k: self.ec_config.data_shards,
+                m: self.ec_config.parity_shards,
+            },
             layout: ObjectLayout::ChunkManifest,
             metadata_blob: Some(blob_bytes),
         }));
@@ -934,7 +960,7 @@ impl Coordinator {
                 Err(storage::MetadataError::ObjectNotFound) => None,
                 Err(e) => return Err(ServerError::Metadata(e)),
             };
-            if cond.if_match.is_some() && existing_etag.is_none() {
+            if matches!(cond, WriteCondition::IfMatch(_)) && existing_etag.is_none() {
                 return Err(ServerError::ObjectNotFound {
                     bucket: bucket.to_string(),
                     key: key.to_string(),
@@ -1086,8 +1112,11 @@ impl Coordinator {
         // Derive chunk shard placement.
         let chunk_okh = chunk_key_hash(session_id, chunk_index);
         let chunk_vid: u64 = 0;
-        let shard_pg_id =
-            self.shard_pg_id(&format!("chunk/{session_id}"), &chunk_index.to_string(), storage::VersionId::Null);
+        let shard_pg_id = self.shard_pg_id(
+            &format!("chunk/{session_id}"),
+            &chunk_index.to_string(),
+            storage::VersionId::Null,
+        );
 
         // Lock metadata PG + shard PG in global ascending order.
         let (meta_guard, shard_guard) = if shard_pg_id == meta_pg_id {
@@ -1241,7 +1270,7 @@ impl Coordinator {
                 Err(storage::MetadataError::ObjectNotFound) => None,
                 Err(e) => return Err(ServerError::Metadata(e)),
             };
-            if cond.if_match.is_some() && existing_etag.is_none() {
+            if matches!(cond, WriteCondition::IfMatch(_)) && existing_etag.is_none() {
                 return Err(ServerError::ObjectNotFound {
                     bucket: bucket.to_string(),
                     key: key.to_string(),
@@ -1295,7 +1324,10 @@ impl Coordinator {
                     version_id,
                     size: total_size,
                     etag_crc64: crc64,
-                    ec: EcShape { k: self.ec_config.data_shards, m: self.ec_config.parity_shards },
+                    ec: EcShape {
+                        k: self.ec_config.data_shards,
+                        m: self.ec_config.parity_shards,
+                    },
                     metadata_blob: Some(blob_bytes),
                 },
                 &committed_chunks,
@@ -1521,9 +1553,12 @@ impl Coordinator {
             // commit_stream_part already handles deleting prior multipart_part_chunks
             // in its transaction, but the shard data on disk needs cleanup.
             if let Ok(pg) = self.storage_node.get_pg(meta_pg_id) {
-                if let Ok(old_chunks) =
-                    pg.get_multipart_part_chunks(bucket, key, storage::VersionId::from_u64(old_vid), part_number)
-                {
+                if let Ok(old_chunks) = pg.get_multipart_part_chunks(
+                    bucket,
+                    key,
+                    storage::VersionId::from_u64(old_vid),
+                    part_number,
+                ) {
                     drop(pg);
                     let _ = self.delete_chunk_shards_generic(&old_chunks);
                 }
@@ -1531,11 +1566,13 @@ impl Coordinator {
         }
 
         let checksum = match (effective_algo, checksum_bytes) {
-            (Some(algo), Some(bytes)) => Some(
-                storage::RawChecksum::new(algo, bytes).map_err(|_| ServerError::InternalError {
-                    reason: "computed checksum length does not match algorithm".into(),
-                })?,
-            ),
+            (Some(algo), Some(bytes)) => {
+                Some(storage::RawChecksum::new(algo, bytes).map_err(|_| {
+                    ServerError::InternalError {
+                        reason: "computed checksum length does not match algorithm".into(),
+                    }
+                })?)
+            }
             _ => None,
         };
 
@@ -2602,8 +2639,10 @@ impl Coordinator {
         version_id: Option<storage::VersionId>,
         cond: &ReadCondition,
     ) -> Result<GetObjectResult, ServerError> {
-        let LockedReadObject { record: stored, pgs } =
-            self.lock_object_pgs_for_read(bucket, key, version_id)?;
+        let LockedReadObject {
+            record: stored,
+            pgs,
+        } = self.lock_object_pgs_for_read(bucket, key, version_id)?;
 
         // If latest version is a delete marker, return 404 with x-amz-delete-marker
         let record = match stored {
@@ -2747,8 +2786,10 @@ impl Coordinator {
         part_number: u32,
         cond: &ReadCondition,
     ) -> Result<GetObjectPartResult, ServerError> {
-        let LockedReadObject { record: stored, pgs } =
-            self.lock_object_pgs_for_read(bucket, key, version_id)?;
+        let LockedReadObject {
+            record: stored,
+            pgs,
+        } = self.lock_object_pgs_for_read(bucket, key, version_id)?;
 
         let record = match stored {
             StoredObject::Live(r) => r,
@@ -2821,8 +2862,8 @@ impl Coordinator {
                     .get("x-amz-checksum-algorithm")
                     .and_then(ChecksumAlgorithm::parse)
                 {
-                    Some(algo) => Some(
-                        storage::RawChecksum::new(algo, raw.clone()).map_err(|_| {
+                    Some(algo) => {
+                        Some(storage::RawChecksum::new(algo, raw.clone()).map_err(|_| {
                             ServerError::InternalError {
                                 reason: format!(
                                     "stored checksum length {} does not match {} (expected {})",
@@ -2831,8 +2872,8 @@ impl Coordinator {
                                     algo.expected_byte_length(),
                                 ),
                             }
-                        })?,
-                    ),
+                        })?)
+                    }
                     None => None,
                 }
             } else {
@@ -2942,8 +2983,10 @@ impl Coordinator {
         part_number: u32,
         cond: &ReadCondition,
     ) -> Result<HeadObjectPartResult, ServerError> {
-        let LockedReadObject { record: stored, pgs } =
-            self.lock_object_pgs_for_read(bucket, key, version_id)?;
+        let LockedReadObject {
+            record: stored,
+            pgs,
+        } = self.lock_object_pgs_for_read(bucket, key, version_id)?;
 
         let record = match stored {
             StoredObject::Live(r) => r,
@@ -2982,8 +3025,8 @@ impl Coordinator {
                     .get("x-amz-checksum-algorithm")
                     .and_then(ChecksumAlgorithm::parse)
                 {
-                    Some(algo) => Some(
-                        storage::RawChecksum::new(algo, raw.clone()).map_err(|_| {
+                    Some(algo) => {
+                        Some(storage::RawChecksum::new(algo, raw.clone()).map_err(|_| {
                             ServerError::InternalError {
                                 reason: format!(
                                     "stored checksum length {} does not match {} (expected {})",
@@ -2992,8 +3035,8 @@ impl Coordinator {
                                     algo.expected_byte_length(),
                                 ),
                             }
-                        })?,
-                    ),
+                        })?)
+                    }
                     None => None,
                 }
             } else {
@@ -3095,8 +3138,10 @@ impl Coordinator {
         part_number_marker: Option<u32>,
         max_parts: u32,
     ) -> Result<GetObjectAttributesResult, ServerError> {
-        let LockedReadObject { record: stored, pgs } =
-            self.lock_object_pgs_for_read(bucket, key, version_id)?;
+        let LockedReadObject {
+            record: stored,
+            pgs,
+        } = self.lock_object_pgs_for_read(bucket, key, version_id)?;
 
         let record = match stored {
             StoredObject::Live(r) => r,
@@ -3119,75 +3164,75 @@ impl Coordinator {
             .transpose()?
             .unwrap_or_default();
 
-        let object_parts = if want_parts && matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
-            // Check if this multipart upload used checksums
-            let has_checksum = metadata.get("x-amz-checksum-algorithm").is_some();
+        let object_parts =
+            if want_parts && matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
+                // Check if this multipart upload used checksums
+                let has_checksum = metadata.get("x-amz-checksum-algorithm").is_some();
 
-            if has_checksum {
-                // Checksummed multipart: full detail with parts, pagination
-                let meta_pg = pgs.meta();
-                let all_parts = meta_pg.get_object_parts(bucket, key, record.version_id)?;
-                let total_parts_count = all_parts.len() as u32;
-                let marker = part_number_marker.unwrap_or(0);
+                if has_checksum {
+                    // Checksummed multipart: full detail with parts, pagination
+                    let meta_pg = pgs.meta();
+                    let all_parts = meta_pg.get_object_parts(bucket, key, record.version_id)?;
+                    let total_parts_count = all_parts.len() as u32;
+                    let marker = part_number_marker.unwrap_or(0);
 
-                let filtered: Vec<_> = all_parts
-                    .into_iter()
-                    .filter(|p| p.part_number > marker)
-                    .collect();
+                    let filtered: Vec<_> = all_parts
+                        .into_iter()
+                        .filter(|p| p.part_number > marker)
+                        .collect();
 
-                let is_truncated = max_parts > 0 && filtered.len() > max_parts as usize;
-                let take_count = (max_parts as usize).min(filtered.len());
-                let page: Vec<ObjectPartEntry> = filtered
-                    .into_iter()
-                    .take(take_count)
-                    .map(|p| {
-                        use base64::Engine;
-                        let checksum = p
-                            .checksum
-                            .as_ref()
-                            .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes));
-                        ObjectPartEntry {
-                            part_number: p.part_number,
-                            size: p.size,
-                            checksum,
-                        }
+                    let is_truncated = max_parts > 0 && filtered.len() > max_parts as usize;
+                    let take_count = (max_parts as usize).min(filtered.len());
+                    let page: Vec<ObjectPartEntry> = filtered
+                        .into_iter()
+                        .take(take_count)
+                        .map(|p| {
+                            use base64::Engine;
+                            let checksum = p.checksum.as_ref().map(|bytes| {
+                                base64::engine::general_purpose::STANDARD.encode(bytes)
+                            });
+                            ObjectPartEntry {
+                                part_number: p.part_number,
+                                size: p.size,
+                                checksum,
+                            }
+                        })
+                        .collect();
+
+                    let next_part_number_marker = if !page.is_empty() {
+                        page.last().map(|p| p.part_number)
+                    } else {
+                        Some(marker)
+                    };
+
+                    Some(ObjectPartsInfo {
+                        total_parts_count,
+                        has_detail: true,
+                        parts: page,
+                        is_truncated,
+                        next_part_number_marker,
+                        max_parts,
+                        part_number_marker: marker,
                     })
-                    .collect();
-
-                let next_part_number_marker = if !page.is_empty() {
-                    page.last().map(|p| p.part_number)
                 } else {
-                    Some(marker)
-                };
+                    // Non-checksummed multipart: only PartsCount
+                    let meta_pg = pgs.meta();
+                    let all_parts = meta_pg.get_object_parts(bucket, key, record.version_id)?;
+                    let total_parts_count = all_parts.len() as u32;
 
-                Some(ObjectPartsInfo {
-                    total_parts_count,
-                    has_detail: true,
-                    parts: page,
-                    is_truncated,
-                    next_part_number_marker,
-                    max_parts,
-                    part_number_marker: marker,
-                })
+                    Some(ObjectPartsInfo {
+                        total_parts_count,
+                        has_detail: false,
+                        parts: Vec::new(),
+                        is_truncated: false,
+                        next_part_number_marker: None,
+                        max_parts,
+                        part_number_marker: part_number_marker.unwrap_or(0),
+                    })
+                }
             } else {
-                // Non-checksummed multipart: only PartsCount
-                let meta_pg = pgs.meta();
-                let all_parts = meta_pg.get_object_parts(bucket, key, record.version_id)?;
-                let total_parts_count = all_parts.len() as u32;
-
-                Some(ObjectPartsInfo {
-                    total_parts_count,
-                    has_detail: false,
-                    parts: Vec::new(),
-                    is_truncated: false,
-                    next_part_number_marker: None,
-                    max_parts,
-                    part_number_marker: part_number_marker.unwrap_or(0),
-                })
-            }
-        } else {
-            None
-        };
+                None
+            };
 
         Ok(GetObjectAttributesResult {
             metadata,
@@ -3210,8 +3255,10 @@ impl Coordinator {
         range: ByteRange,
         cond: &ReadCondition,
     ) -> Result<GetObjectRangeResult, ServerError> {
-        let LockedReadObject { record: stored, pgs } =
-            self.lock_object_pgs_for_read(bucket, key, version_id)?;
+        let LockedReadObject {
+            record: stored,
+            pgs,
+        } = self.lock_object_pgs_for_read(bucket, key, version_id)?;
 
         // If latest version is a delete marker, return 404 with x-amz-delete-marker
         let record = match stored {
@@ -3243,76 +3290,77 @@ impl Coordinator {
             other => other,
         };
 
-        let (metadata, user_data) = if matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
-            // Multipart: metadata from object row, data spans parts.
-            let meta_pg = pgs.meta();
-            let obj_parts = meta_pg
-                .get_object_parts(bucket, key, record.version_id)
-                .map_err(ServerError::Metadata)?;
-            drop(pgs);
-
-            let data = self
-                .read_multipart_range(
-                    bucket,
-                    key,
-                    &obj_parts,
-                    user_start as usize,
-                    user_end as usize,
-                )
-                .map_err(not_found)?;
-
-            let metadata = record
-                .metadata_blob
-                .as_ref()
-                .map(|b| MetadataBlob::deserialize(b).map(|(m, _)| m))
-                .transpose()?
-                .unwrap_or_default();
-
-            (metadata, data)
-        } else {
-            // Non-multipart: metadata from DB row, user data from shards.
-            let metadata = record
-                .metadata_blob
-                .as_ref()
-                .map(|b| MetadataBlob::deserialize(b).map(|(m, _)| m))
-                .transpose()?
-                .unwrap_or_default();
-
-            // Check for chunk manifest (stream-put objects).
-            let meta_pg = pgs.meta();
-            let chunks = meta_pg
-                .get_stream_object_chunks(bucket, key, record.version_id)
-                .map_err(ServerError::Metadata)?;
-
-            let data = if !chunks.is_empty() {
+        let (metadata, user_data) =
+            if matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
+                // Multipart: metadata from object row, data spans parts.
+                let meta_pg = pgs.meta();
+                let obj_parts = meta_pg
+                    .get_object_parts(bucket, key, record.version_id)
+                    .map_err(ServerError::Metadata)?;
                 drop(pgs);
-                self.read_chunk_manifest_range(
-                    bucket,
-                    key,
-                    &chunks,
-                    user_start as usize,
-                    user_end as usize,
-                )
-                .map_err(not_found)?
-            } else {
-                let okh = object_key_hash(bucket, key);
-                let shard_pg = pgs.shard();
-                let d = self
-                    .read_range(
-                        shard_pg,
-                        &okh,
-                        record.version_id,
-                        &record,
+
+                let data = self
+                    .read_multipart_range(
+                        bucket,
+                        key,
+                        &obj_parts,
                         user_start as usize,
                         user_end as usize,
                     )
                     .map_err(not_found)?;
-                drop(pgs);
-                d
-            };
 
-            (metadata, data)
-        };
+                let metadata = record
+                    .metadata_blob
+                    .as_ref()
+                    .map(|b| MetadataBlob::deserialize(b).map(|(m, _)| m))
+                    .transpose()?
+                    .unwrap_or_default();
+
+                (metadata, data)
+            } else {
+                // Non-multipart: metadata from DB row, user data from shards.
+                let metadata = record
+                    .metadata_blob
+                    .as_ref()
+                    .map(|b| MetadataBlob::deserialize(b).map(|(m, _)| m))
+                    .transpose()?
+                    .unwrap_or_default();
+
+                // Check for chunk manifest (stream-put objects).
+                let meta_pg = pgs.meta();
+                let chunks = meta_pg
+                    .get_stream_object_chunks(bucket, key, record.version_id)
+                    .map_err(ServerError::Metadata)?;
+
+                let data = if !chunks.is_empty() {
+                    drop(pgs);
+                    self.read_chunk_manifest_range(
+                        bucket,
+                        key,
+                        &chunks,
+                        user_start as usize,
+                        user_end as usize,
+                    )
+                    .map_err(not_found)?
+                } else {
+                    let okh = object_key_hash(bucket, key);
+                    let shard_pg = pgs.shard();
+                    let d = self
+                        .read_range(
+                            shard_pg,
+                            &okh,
+                            record.version_id,
+                            &record,
+                            user_start as usize,
+                            user_end as usize,
+                        )
+                        .map_err(not_found)?;
+                    drop(pgs);
+                    d
+                };
+
+                (metadata, data)
+            };
 
         Ok(GetObjectRangeResult {
             data: user_data,
@@ -3340,20 +3388,22 @@ impl Coordinator {
         match (bucket_info.versioning, request_version_id) {
             // Unversioned bucket: physical delete (current behavior)
             (storage::BucketVersioningState::Disabled, _) => {
-                let LockedReadObject { record: stored, pgs } =
-                    match self.lock_object_pgs_for_read(bucket, key, None) {
-                        Ok(locked) => locked,
-                        Err(ServerError::ObjectNotFound { .. }) => {
-                            if !cond.is_empty() {
-                                return Err(ServerError::PreconditionFailed);
-                            }
-                            return Ok(DeleteObjectResult {
-                                version_id: storage::VersionId::Null,
-                                delete_marker: false,
-                            });
+                let LockedReadObject {
+                    record: stored,
+                    pgs,
+                } = match self.lock_object_pgs_for_read(bucket, key, None) {
+                    Ok(locked) => locked,
+                    Err(ServerError::ObjectNotFound { .. }) => {
+                        if !cond.is_empty() {
+                            return Err(ServerError::PreconditionFailed);
                         }
-                        Err(other) => return Err(other),
-                    };
+                        return Ok(DeleteObjectResult {
+                            version_id: storage::VersionId::Null,
+                            delete_marker: false,
+                        });
+                    }
+                    Err(other) => return Err(other),
+                };
 
                 // Unversioned bucket objects are always live (no delete markers).
                 let record = match stored {
@@ -3371,8 +3421,7 @@ impl Coordinator {
 
                 // Check delete conditions
                 if !cond.is_empty() {
-                    let etag_str =
-                        record.etag.format();
+                    let etag_str = record.etag.format();
                     check_delete_conditions(cond, &etag_str)?;
                 }
 
@@ -3445,17 +3494,19 @@ impl Coordinator {
 
             // Versioned/Suspended + specific versionId: permanent delete that version
             (_, Some(vid)) => {
-                let LockedReadObject { record: stored, pgs } =
-                    match self.lock_object_pgs_for_read(bucket, key, Some(vid)) {
-                        Ok(locked) => locked,
-                        Err(ServerError::ObjectNotFound { .. }) => {
-                            return Ok(DeleteObjectResult {
-                                version_id: vid,
-                                delete_marker: false,
-                            });
-                        }
-                        Err(other) => return Err(other),
-                    };
+                let LockedReadObject {
+                    record: stored,
+                    pgs,
+                } = match self.lock_object_pgs_for_read(bucket, key, Some(vid)) {
+                    Ok(locked) => locked,
+                    Err(ServerError::ObjectNotFound { .. }) => {
+                        return Ok(DeleteObjectResult {
+                            version_id: vid,
+                            delete_marker: false,
+                        });
+                    }
+                    Err(other) => return Err(other),
+                };
 
                 let meta_pg = pgs.meta();
                 let shard_pg = pgs.shard();
@@ -3651,7 +3702,9 @@ impl Coordinator {
                     }
                 } else {
                     if token.is_none_or(|t| obj_key.as_str() > t) {
-                        let record = obj.as_live().expect("list_objects returns only live objects");
+                        let record = obj
+                            .as_live()
+                            .expect("list_objects returns only live objects");
                         objects.push(ListEntry {
                             key: obj_key.to_string(),
                             size: record.size,
@@ -3672,7 +3725,9 @@ impl Coordinator {
                 }
                 let obj_key = obj.key();
                 if token.is_none_or(|t| obj_key.as_str() > t) {
-                    let record = obj.as_live().expect("list_objects returns only live objects");
+                    let record = obj
+                        .as_live()
+                        .expect("list_objects returns only live objects");
                     objects.push(ListEntry {
                         key: obj_key.to_string(),
                         size: record.size,
@@ -3742,7 +3797,11 @@ impl Coordinator {
         })?;
 
         // Sort by (key ASC, version_id DESC)
-        all_versions.sort_by(|a, b| a.key().cmp(b.key()).then(b.version_id().to_u64().cmp(&a.version_id().to_u64())));
+        all_versions.sort_by(|a, b| {
+            a.key()
+                .cmp(b.key())
+                .then(b.version_id().to_u64().cmp(&a.version_id().to_u64()))
+        });
 
         // Build result entries, tracking is_latest per key
         let max = max_keys as usize;
@@ -4282,11 +4341,13 @@ impl Coordinator {
         }
 
         let checksum = match (effective_algo, checksum_bytes) {
-            (Some(algo), Some(bytes)) => Some(
-                storage::RawChecksum::new(algo, bytes).map_err(|_| ServerError::InternalError {
-                    reason: "computed checksum length does not match algorithm".into(),
-                })?,
-            ),
+            (Some(algo), Some(bytes)) => {
+                Some(storage::RawChecksum::new(algo, bytes).map_err(|_| {
+                    ServerError::InternalError {
+                        reason: "computed checksum length does not match algorithm".into(),
+                    }
+                })?)
+            }
             _ => None,
         };
 
@@ -4600,7 +4661,7 @@ impl Coordinator {
             version_id,
             size: total_size,
             etag_crc64,
-            ec: EcShape { k: 0, m: 0 },      // per-part, not per-object
+            ec: EcShape { k: 0, m: 0 }, // per-part, not per-object
             metadata_blob: Some(metadata_blob_bytes),
         };
 
@@ -4914,7 +4975,7 @@ fn compute_checksum(algo: ChecksumAlgorithm, data: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conditional::{DeleteCondition, ReadCondition, WriteCondition};
+    use crate::conditional::{DeleteCondition, ReadCondition, SpecificEtag, WriteCondition};
     use std::path::{Path, PathBuf};
     use std::sync::mpsc;
     use std::sync::Barrier;
@@ -4927,11 +4988,8 @@ mod tests {
         if_modified_since: None,
         if_unmodified_since: None,
     };
-    const NO_WRITE: &WriteCondition = &WriteCondition {
-        if_match: None,
-        if_none_match: None,
-    };
-    const NO_DELETE: &DeleteCondition = &DeleteCondition { if_match: None };
+    const NO_WRITE: &WriteCondition = &WriteCondition::None;
+    const NO_DELETE: &DeleteCondition = &DeleteCondition::None;
 
     fn setup_coordinator(dir: &Path) -> Coordinator {
         let pg_ids: Vec<u32> = (0..4).collect();
@@ -6353,10 +6411,7 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
-        let cond = WriteCondition {
-            if_none_match: Some("*".to_string()),
-            ..Default::default()
-        };
+        let cond = WriteCondition::IfNoneMatchStar;
         let result = coord
             .put_object("bucket", "new-key", b"data", &[], &cond)
             .unwrap();
@@ -6372,10 +6427,7 @@ mod tests {
             .put_object("bucket", "key", b"v1", &[], NO_WRITE)
             .unwrap();
 
-        let cond = WriteCondition {
-            if_none_match: Some("*".to_string()),
-            ..Default::default()
-        };
+        let cond = WriteCondition::IfNoneMatchStar;
         let err = coord
             .put_object("bucket", "key", b"v2", &[], &cond)
             .unwrap_err();
@@ -6391,10 +6443,7 @@ mod tests {
         let r1 = coord
             .put_object("bucket", "key", b"v1", &[], NO_WRITE)
             .unwrap();
-        let cond = WriteCondition {
-            if_match: Some(r1.etag.clone()),
-            ..Default::default()
-        };
+        let cond = WriteCondition::IfMatch(SpecificEtag::new(r1.etag.clone()).unwrap());
         let r2 = coord
             .put_object("bucket", "key", b"v2", &[], &cond)
             .unwrap();
@@ -6418,10 +6467,7 @@ mod tests {
             .put_object("bucket", "key", b"v2", &[], NO_WRITE)
             .unwrap();
 
-        let cond = WriteCondition {
-            if_match: Some(r1.etag),
-            ..Default::default()
-        };
+        let cond = WriteCondition::IfMatch(SpecificEtag::new(r1.etag).unwrap());
         let err = coord
             .put_object("bucket", "key", b"v3", &[], &cond)
             .unwrap_err();
@@ -6505,9 +6551,7 @@ mod tests {
         let put = coord
             .put_object("bucket", "key", b"data", &[], NO_WRITE)
             .unwrap();
-        let cond = DeleteCondition {
-            if_match: Some(put.etag),
-        };
+        let cond = DeleteCondition::IfMatch(put.etag);
         coord.delete_object("bucket", "key", None, &cond).unwrap();
         assert!(coord.get_object("bucket", "key", None, NO_READ).is_err());
     }
@@ -6521,9 +6565,7 @@ mod tests {
             .put_object("bucket", "key", b"data", &[], NO_WRITE)
             .unwrap();
 
-        let cond = DeleteCondition {
-            if_match: Some("\"0000000000000000\"".to_string()),
-        };
+        let cond = DeleteCondition::IfMatch("\"0000000000000000\"".to_string());
         let err = coord
             .delete_object("bucket", "key", None, &cond)
             .unwrap_err();
@@ -6544,9 +6586,7 @@ mod tests {
             .unwrap();
 
         // Use key1's etag for both entries; key2 will fail the condition
-        let cond = DeleteCondition {
-            if_match: Some(p1.etag),
-        };
+        let cond = DeleteCondition::IfMatch(p1.etag);
         let entries = vec![
             crate::http::xml::DeleteObjectEntry {
                 key: "key1".to_string(),
@@ -6922,10 +6962,7 @@ mod tests {
             .put_object("bucket", "dst", b"existing", &[], NO_WRITE)
             .unwrap();
 
-        let dst_cond = WriteCondition {
-            if_none_match: Some("*".to_string()),
-            ..Default::default()
-        };
+        let dst_cond = WriteCondition::IfNoneMatchStar;
         let err = coord
             .copy_object(
                 "bucket",
@@ -6955,10 +6992,7 @@ mod tests {
             .put_object("bucket", "dst", b"old data", &[], NO_WRITE)
             .unwrap();
 
-        let dst_cond = WriteCondition {
-            if_match: Some(existing.etag),
-            ..Default::default()
-        };
+        let dst_cond = WriteCondition::IfMatch(SpecificEtag::new(existing.etag).unwrap());
         let result = coord
             .copy_object(
                 "bucket",
@@ -7041,8 +7075,13 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
-        coord.put_bucket_versioning("bucket", storage::BucketVersioningState::Enabled).unwrap();
-        assert_eq!(coord.get_bucket_versioning("bucket").unwrap(), storage::BucketVersioningState::Enabled);
+        coord
+            .put_bucket_versioning("bucket", storage::BucketVersioningState::Enabled)
+            .unwrap();
+        assert_eq!(
+            coord.get_bucket_versioning("bucket").unwrap(),
+            storage::BucketVersioningState::Enabled
+        );
     }
 
     #[test]
@@ -7051,9 +7090,16 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
-        coord.put_bucket_versioning("bucket", storage::BucketVersioningState::Enabled).unwrap();
-        coord.put_bucket_versioning("bucket", storage::BucketVersioningState::Suspended).unwrap();
-        assert_eq!(coord.get_bucket_versioning("bucket").unwrap(), storage::BucketVersioningState::Suspended);
+        coord
+            .put_bucket_versioning("bucket", storage::BucketVersioningState::Enabled)
+            .unwrap();
+        coord
+            .put_bucket_versioning("bucket", storage::BucketVersioningState::Suspended)
+            .unwrap();
+        assert_eq!(
+            coord.get_bucket_versioning("bucket").unwrap(),
+            storage::BucketVersioningState::Suspended
+        );
     }
 
     #[test]
@@ -7062,10 +7108,19 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
-        coord.put_bucket_versioning("bucket", storage::BucketVersioningState::Enabled).unwrap();
-        coord.put_bucket_versioning("bucket", storage::BucketVersioningState::Suspended).unwrap();
-        coord.put_bucket_versioning("bucket", storage::BucketVersioningState::Enabled).unwrap();
-        assert_eq!(coord.get_bucket_versioning("bucket").unwrap(), storage::BucketVersioningState::Enabled);
+        coord
+            .put_bucket_versioning("bucket", storage::BucketVersioningState::Enabled)
+            .unwrap();
+        coord
+            .put_bucket_versioning("bucket", storage::BucketVersioningState::Suspended)
+            .unwrap();
+        coord
+            .put_bucket_versioning("bucket", storage::BucketVersioningState::Enabled)
+            .unwrap();
+        assert_eq!(
+            coord.get_bucket_versioning("bucket").unwrap(),
+            storage::BucketVersioningState::Enabled
+        );
     }
 
     #[test]
@@ -7074,8 +7129,12 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
-        coord.put_bucket_versioning("bucket", storage::BucketVersioningState::Enabled).unwrap();
-        let err = coord.put_bucket_versioning("bucket", storage::BucketVersioningState::Disabled).unwrap_err();
+        coord
+            .put_bucket_versioning("bucket", storage::BucketVersioningState::Enabled)
+            .unwrap();
+        let err = coord
+            .put_bucket_versioning("bucket", storage::BucketVersioningState::Disabled)
+            .unwrap_err();
         assert!(matches!(err, ServerError::InvalidRequest { .. }));
     }
 
@@ -7084,7 +7143,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        let err = coord.put_bucket_versioning("no-bucket", storage::BucketVersioningState::Enabled).unwrap_err();
+        let err = coord
+            .put_bucket_versioning("no-bucket", storage::BucketVersioningState::Enabled)
+            .unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
     }
 
@@ -7144,7 +7205,9 @@ mod tests {
 
         let admin = make_coord();
         admin.create_bucket("bucket").unwrap();
-        admin.put_bucket_versioning("bucket", storage::BucketVersioningState::Enabled).unwrap();
+        admin
+            .put_bucket_versioning("bucket", storage::BucketVersioningState::Enabled)
+            .unwrap();
 
         // Repeat to increase the chance of exposing races.
         for i in 0..20 {
@@ -7978,9 +8041,15 @@ mod tests {
         let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
         let obj = pg.get_object_meta("bucket", "key").unwrap();
         let live_obj = obj.as_live().expect("expected live object");
-        assert!(matches!(live_obj.layout, ObjectLayout::MultipartManifest { .. }));
+        assert!(matches!(
+            live_obj.layout,
+            ObjectLayout::MultipartManifest { .. }
+        ));
         assert_eq!(live_obj.layout.parts_count(), Some(2));
-        assert_eq!(live_obj.size, big_part.len() as u64 + small_last.len() as u64);
+        assert_eq!(
+            live_obj.size,
+            big_part.len() as u64 + small_last.len() as u64
+        );
 
         // object_parts should be committed.
         let committed = pg
@@ -8199,7 +8268,9 @@ mod tests {
         assert_eq!(live_obj.layout.parts_count(), Some(2));
 
         // Old manifest parts (from first upload) should be replaced.
-        let committed = pg.get_object_parts("bucket", "key", storage::VersionId::Null).unwrap();
+        let committed = pg
+            .get_object_parts("bucket", "key", storage::VersionId::Null)
+            .unwrap();
         assert_eq!(committed.len(), 2);
     }
 
@@ -8233,7 +8304,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
-        coord.put_bucket_versioning("bucket", storage::BucketVersioningState::Enabled).unwrap();
+        coord
+            .put_bucket_versioning("bucket", storage::BucketVersioningState::Enabled)
+            .unwrap();
 
         let (upload_id, parts) =
             create_upload_with_parts(&coord, "bucket", "key", &[(1, b"data1")]);
@@ -9627,10 +9700,7 @@ mod tests {
             .unwrap();
         let crc = checksum::crc64::checksum(b"updated");
         let metadata = MetadataBlob::new();
-        let cond = WriteCondition {
-            if_match: Some(initial.etag.clone()),
-            if_none_match: None,
-        };
+        let cond = WriteCondition::IfMatch(SpecificEtag::new(initial.etag.clone()).unwrap());
         coord
             .finalize_stream_put("bucket", "key", &session_id, crc, 7, &metadata, &cond)
             .unwrap();
@@ -9640,10 +9710,8 @@ mod tests {
         coord
             .append_stream_chunk("bucket", "key", &session_id2, 0, b"third")
             .unwrap();
-        let bad_cond = WriteCondition {
-            if_match: Some("\"0000000000000000\"".to_string()),
-            if_none_match: None,
-        };
+        let bad_cond =
+            WriteCondition::IfMatch(SpecificEtag::new("\"0000000000000000\"".to_string()).unwrap());
         let err = coord
             .finalize_stream_put(
                 "bucket",
@@ -9722,7 +9790,11 @@ mod tests {
 
         // Record shard keys before abort for verification.
         let chunk_okh = crate::pg::chunk_key_hash(&session_id, 0);
-        let shard_pg_id = coord.shard_pg_id(&format!("chunk/{session_id}"), "0", storage::VersionId::Null);
+        let shard_pg_id = coord.shard_pg_id(
+            &format!("chunk/{session_id}"),
+            "0",
+            storage::VersionId::Null,
+        );
 
         coord
             .abort_stream_put("bucket", "key", &session_id)

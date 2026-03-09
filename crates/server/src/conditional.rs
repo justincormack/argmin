@@ -26,17 +26,54 @@ pub struct ReadCondition {
     pub if_unmodified_since: Option<u64>,
 }
 
+/// A non-wildcard ETag value for conditional requests.
+///
+/// Rejects `*` at construction time so that unsupported wildcard forms
+/// cannot be represented in condition types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpecificEtag(String);
+
+impl SpecificEtag {
+    /// Construct a `SpecificEtag`, rejecting `*`.
+    pub fn new(value: String) -> Result<Self, &'static str> {
+        if value.trim() == "*" {
+            return Err("wildcard ETag not allowed in this context");
+        }
+        Ok(Self(value))
+    }
+
+    /// The underlying ETag string.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// Conditions for write operations (PUT).
-#[derive(Debug, Default)]
-pub struct WriteCondition {
-    pub if_match: Option<String>,
-    pub if_none_match: Option<String>,
+///
+/// AWS S3 only supports `If-Match: <etag>` and `If-None-Match: *` on writes.
+/// This enum makes invalid combinations (e.g. `If-None-Match: <specific-etag>`,
+/// `If-Match: *`) unrepresentable.
+#[derive(Debug, Clone, Default)]
+pub enum WriteCondition {
+    /// No condition — unconditional write.
+    #[default]
+    None,
+    /// `If-Match: <etag>` — only overwrite if the existing object matches.
+    IfMatch(SpecificEtag),
+    /// `If-None-Match: *` — create-only, fail if object already exists.
+    IfNoneMatchStar,
 }
 
 /// Conditions for delete operations (DELETE, `DeleteObjects`).
-#[derive(Debug, Default)]
-pub struct DeleteCondition {
-    pub if_match: Option<String>,
+///
+/// AWS S3 only supports `If-Match` on DeleteObject for general-purpose buckets.
+#[derive(Debug, Clone, Default)]
+pub enum DeleteCondition {
+    /// No condition — unconditional delete.
+    #[default]
+    None,
+    /// `If-Match: <etag-or-wildcard>` — only delete if the ETag matches.
+    IfMatch(String),
 }
 
 /// Extract read conditions from an S3 request's headers.
@@ -54,7 +91,11 @@ pub fn read_condition_from_headers(req: &S3Request) -> ReadCondition {
 /// AWS S3 only supports `If-Match: <etag>` and `If-None-Match: *` on writes.
 /// `If-Match: *` and `If-None-Match: <etag>` return 501 NotImplemented.
 pub fn write_condition_from_headers(req: &S3Request) -> Result<WriteCondition, ServerError> {
-    if let Some(val) = req.header("if-match") {
+    let if_match = req.header("if-match");
+    let if_none_match = req.header("if-none-match");
+
+    // Reject unsupported forms first.
+    if let Some(val) = if_match {
         if val.trim() == "*" {
             return Err(ServerError::NotImplemented {
                 feature: "A header you provided implies functionality that is not implemented"
@@ -62,7 +103,7 @@ pub fn write_condition_from_headers(req: &S3Request) -> Result<WriteCondition, S
             });
         }
     }
-    if let Some(val) = req.header("if-none-match") {
+    if let Some(val) = if_none_match {
         if val.trim() != "*" {
             return Err(ServerError::NotImplemented {
                 feature: "A header you provided implies functionality that is not implemented"
@@ -70,10 +111,24 @@ pub fn write_condition_from_headers(req: &S3Request) -> Result<WriteCondition, S
             });
         }
     }
-    Ok(WriteCondition {
-        if_match: req.header("if-match").map(str::to_string),
-        if_none_match: req.header("if-none-match").map(str::to_string),
-    })
+
+    // S3 does not support both If-Match and If-None-Match on the same write.
+    if if_match.is_some() && if_none_match.is_some() {
+        return Err(ServerError::NotImplemented {
+            feature: "A header you provided implies functionality that is not implemented"
+                .to_string(),
+        });
+    }
+
+    if let Some(val) = if_match {
+        // Wildcard already rejected above, so this cannot fail.
+        let etag = SpecificEtag::new(val.to_string()).expect("wildcard already rejected");
+        return Ok(WriteCondition::IfMatch(etag));
+    }
+    if if_none_match.is_some() {
+        return Ok(WriteCondition::IfNoneMatchStar);
+    }
+    Ok(WriteCondition::None)
 }
 
 /// Extract delete conditions from an S3 request's headers.
@@ -94,8 +149,9 @@ pub fn delete_condition_from_headers(req: &S3Request) -> Result<DeleteCondition,
                 .to_string(),
         });
     }
-    Ok(DeleteCondition {
-        if_match: req.header("if-match").map(str::to_string),
+    Ok(match req.header("if-match") {
+        Some(val) => DeleteCondition::IfMatch(val.to_string()),
+        None => DeleteCondition::None,
     })
 }
 
@@ -199,35 +255,26 @@ pub fn check_write_conditions(
     cond: &WriteCondition,
     existing_etag: Option<&str>,
 ) -> Result<(), ServerError> {
-    // If-None-Match: * → 412 if object exists (create-only)
-    // If-None-Match: <etag> → 412 if any etag in list matches existing object
-    if let Some(ref unwanted) = cond.if_none_match {
-        if unwanted.trim() == "*" {
+    match cond {
+        WriteCondition::None => Ok(()),
+        WriteCondition::IfNoneMatchStar => {
             if existing_etag.is_some() {
-                return Err(ServerError::PreconditionFailed);
-            }
-        } else if let Some(obj_etag) = existing_etag {
-            if etags_match(unwanted, obj_etag) {
-                return Err(ServerError::PreconditionFailed);
+                Err(ServerError::PreconditionFailed)
+            } else {
+                Ok(())
             }
         }
-    }
-
-    if let Some(ref required_etag) = cond.if_match {
-        match existing_etag {
-            None => {
-                // Object doesn't exist — precondition cannot be satisfied
-                return Err(ServerError::PreconditionFailed);
-            }
+        WriteCondition::IfMatch(required_etag) => match existing_etag {
+            None => Err(ServerError::PreconditionFailed),
             Some(obj_etag) => {
-                if !etags_match(required_etag, obj_etag) {
-                    return Err(ServerError::PreconditionFailed);
+                if !etags_match(required_etag.as_str(), obj_etag) {
+                    Err(ServerError::PreconditionFailed)
+                } else {
+                    Ok(())
                 }
             }
-        }
+        },
     }
-
-    Ok(())
 }
 
 /// Check delete conditions.
@@ -239,14 +286,19 @@ pub fn check_write_conditions(
 ///
 /// Returns `PreconditionFailed` (412) if any condition fails.
 pub fn check_delete_conditions(cond: &DeleteCondition, etag: &str) -> Result<(), ServerError> {
-    if let Some(ref required_etag) = cond.if_match {
-        if required_etag.trim() == "*" {
-            // Wildcard matches any existing object
-        } else if !etags_match(required_etag, etag) {
-            return Err(ServerError::PreconditionFailed);
+    match cond {
+        DeleteCondition::None => Ok(()),
+        DeleteCondition::IfMatch(required_etag) => {
+            if required_etag.trim() == "*" {
+                // Wildcard matches any existing object
+                Ok(())
+            } else if !etags_match(required_etag, etag) {
+                Err(ServerError::PreconditionFailed)
+            } else {
+                Ok(())
+            }
         }
     }
-    Ok(())
 }
 
 /// Extract copy-source conditions from an S3 request's `x-amz-copy-source-if-*` headers.
@@ -325,14 +377,14 @@ impl ReadCondition {
 impl WriteCondition {
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.if_match.is_none() && self.if_none_match.is_none()
+        matches!(self, Self::None)
     }
 }
 
 impl DeleteCondition {
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.if_match.is_none()
+        matches!(self, Self::None)
     }
 }
 
@@ -468,48 +520,33 @@ mod tests {
 
     #[test]
     fn write_if_none_match_star_prevents_overwrite() {
-        let cond = WriteCondition {
-            if_none_match: Some("*".to_string()),
-            ..Default::default()
-        };
+        let cond = WriteCondition::IfNoneMatchStar;
         let err = check_write_conditions(&cond, Some(&test_etag())).unwrap_err();
         assert!(matches!(err, ServerError::PreconditionFailed));
     }
 
     #[test]
     fn write_if_none_match_star_allows_create() {
-        let cond = WriteCondition {
-            if_none_match: Some("*".to_string()),
-            ..Default::default()
-        };
+        let cond = WriteCondition::IfNoneMatchStar;
         assert!(check_write_conditions(&cond, None).is_ok());
     }
 
     #[test]
     fn write_if_match_allows_matching_overwrite() {
-        let cond = WriteCondition {
-            if_match: Some(test_etag()),
-            ..Default::default()
-        };
+        let cond = WriteCondition::IfMatch(SpecificEtag::new(test_etag()).unwrap());
         assert!(check_write_conditions(&cond, Some(&test_etag())).is_ok());
     }
 
     #[test]
     fn write_if_match_prevents_stale_overwrite() {
-        let cond = WriteCondition {
-            if_match: Some(other_etag()),
-            ..Default::default()
-        };
+        let cond = WriteCondition::IfMatch(SpecificEtag::new(other_etag()).unwrap());
         let err = check_write_conditions(&cond, Some(&test_etag())).unwrap_err();
         assert!(matches!(err, ServerError::PreconditionFailed));
     }
 
     #[test]
     fn write_if_match_nonexistent_returns_412() {
-        let cond = WriteCondition {
-            if_match: Some(test_etag()),
-            ..Default::default()
-        };
+        let cond = WriteCondition::IfMatch(SpecificEtag::new(test_etag()).unwrap());
         let err = check_write_conditions(&cond, None).unwrap_err();
         assert!(matches!(err, ServerError::PreconditionFailed));
     }
@@ -555,6 +592,29 @@ mod tests {
         assert!(write_condition_from_headers(&req).is_ok());
     }
 
+    #[test]
+    fn write_both_if_match_and_if_none_match_rejected() {
+        let req = make_req_with_headers(vec![
+            ("if-match", "\"abcdef1234567890\""),
+            ("if-none-match", "*"),
+        ]);
+        let err = write_condition_from_headers(&req).unwrap_err();
+        assert!(matches!(err, ServerError::NotImplemented { .. }));
+    }
+
+    #[test]
+    fn write_if_match_masks_unsupported_if_none_match_rejected() {
+        // If-Match present alongside If-None-Match: <specific-etag> should still
+        // reject the unsupported If-None-Match form, not silently drop it.
+        let req = make_req_with_headers(vec![
+            ("if-match", "\"abcdef1234567890\""),
+            ("if-none-match", "\"1111111111111111\""),
+        ]);
+        let err = write_condition_from_headers(&req).unwrap_err();
+        // Should be NotImplemented (unsupported If-None-Match form), not InvalidRequest
+        assert!(matches!(err, ServerError::NotImplemented { .. }));
+    }
+
     // ── Delete condition validation (501 rejection) ────────────────────
 
     #[test]
@@ -584,26 +644,20 @@ mod tests {
 
     #[test]
     fn delete_if_match_passes() {
-        let cond = DeleteCondition {
-            if_match: Some(test_etag()),
-        };
+        let cond = DeleteCondition::IfMatch(test_etag());
         assert!(check_delete_conditions(&cond, &test_etag()).is_ok());
     }
 
     #[test]
     fn delete_if_match_fails() {
-        let cond = DeleteCondition {
-            if_match: Some(other_etag()),
-        };
+        let cond = DeleteCondition::IfMatch(other_etag());
         let err = check_delete_conditions(&cond, &test_etag()).unwrap_err();
         assert!(matches!(err, ServerError::PreconditionFailed));
     }
 
     #[test]
     fn delete_if_match_wildcard_passes() {
-        let cond = DeleteCondition {
-            if_match: Some("*".to_string()),
-        };
+        let cond = DeleteCondition::IfMatch("*".to_string());
         assert!(check_delete_conditions(&cond, &test_etag()).is_ok());
     }
 
@@ -635,20 +689,13 @@ mod tests {
     #[test]
     fn write_condition_is_empty() {
         assert!(WriteCondition::default().is_empty());
-        assert!(!WriteCondition {
-            if_none_match: Some("*".to_string()),
-            ..Default::default()
-        }
-        .is_empty());
+        assert!(!WriteCondition::IfNoneMatchStar.is_empty());
     }
 
     #[test]
     fn delete_condition_is_empty() {
         assert!(DeleteCondition::default().is_empty());
-        assert!(!DeleteCondition {
-            if_match: Some("x".into())
-        }
-        .is_empty());
+        assert!(!DeleteCondition::IfMatch("x".into()).is_empty());
     }
 
     // ── etags_match ──────────────────────────────────────────────────

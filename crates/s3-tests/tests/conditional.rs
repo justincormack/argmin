@@ -941,6 +941,43 @@ fn test_put_object_ifnonematch_specific_not_implemented() {
     });
 }
 
+// ── PUT both If-Match and If-None-Match → rejected ──────────────────────
+
+#[test]
+fn test_put_object_both_ifmatch_and_ifnonematch_rejected() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let etag = put_object(&bucket, "obj", b"data").await;
+
+        // Both If-Match: <etag> and If-None-Match: * on the same PUT → error
+        let result = CTX
+            .client()
+            .put_object()
+            .bucket(&bucket)
+            .key("obj")
+            .if_match(&etag)
+            .if_none_match("*")
+            .body(ByteStream::from_static(b"updated"))
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 501);
+
+        // Verify original content unchanged
+        let resp = CTX
+            .client()
+            .get_object()
+            .bucket(&bucket)
+            .key("obj")
+            .send()
+            .await
+            .unwrap();
+        let data = resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], b"data");
+
+        cleanup(&bucket, &["obj"]).await;
+    });
+}
+
 // ── Copy destination conditions ─────────────────────────────────────────
 
 #[test]
