@@ -1071,8 +1071,7 @@ impl HttpFrontend {
                     )?;
                     Ok(S3Response::upload_part(
                         &result.etag,
-                        result.checksum_algorithm,
-                        result.checksum_bytes.as_deref(),
+                        result.checksum.as_ref(),
                     ))
                 }
             }
@@ -1926,13 +1925,12 @@ impl HttpFrontend {
 
         let mut resp = S3Response::upload_part(
             &result.etag,
-            result.checksum_algorithm,
-            result.checksum_bytes.as_deref(),
+            result.checksum.as_ref(),
         );
         // The coordinator's result already includes the checksum via
         // S3Response::upload_part. Only echo headers NOT already present
         // (e.g. x-amz-checksum-type). Trailer values take precedence.
-        let already_set: Option<&str> = result.checksum_algorithm.map(|a| a.header_name());
+        let already_set: Option<&str> = result.checksum.as_ref().map(|c| c.algorithm.header_name());
         for (name, value) in &ctx.checksum_response {
             if already_set == Some(name.as_str()) {
                 continue; // Already set by S3Response::upload_part

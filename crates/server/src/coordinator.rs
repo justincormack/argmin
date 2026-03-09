@@ -83,8 +83,8 @@ pub struct HeadObjectPartResult {
     pub parts_count: u32,
     pub version_id: storage::VersionId,
     pub tags: Option<String>,
-    /// Per-part checksum: (header_name, base64_value).
-    pub checksum: Option<(String, String)>,
+    /// Per-part checksum (algorithm + raw bytes).
+    pub checksum: Option<storage::RawChecksum>,
 }
 
 /// A single part entry for GetObjectAttributes ObjectParts response.
@@ -148,8 +148,8 @@ pub struct GetObjectPartResult {
     pub parts_count: u32,
     pub version_id: storage::VersionId,
     pub tags: Option<String>,
-    /// Per-part checksum: (header_name, base64_value).
-    pub checksum: Option<(String, String)>,
+    /// Per-part checksum (algorithm + raw bytes).
+    pub checksum: Option<storage::RawChecksum>,
 }
 
 /// Metadata handling directive for `CopyObject`.
@@ -243,10 +243,8 @@ pub struct DeleteObjectsResult {
 #[derive(Debug)]
 pub struct UploadPartResult {
     pub etag: String,
-    /// Checksum algorithm used for this part (if any).
-    pub checksum_algorithm: Option<ChecksumAlgorithm>,
-    /// Raw checksum bytes for this part (if any).
-    pub checksum_bytes: Option<Vec<u8>>,
+    /// Verified checksum for this part (if any).
+    pub checksum: Option<storage::RawChecksum>,
 }
 
 /// Result of an UploadPartCopy operation.
@@ -259,8 +257,7 @@ pub struct UploadPartCopyResult {
 /// Internal result from the shared part-write path.
 struct WritePartInnerResult {
     etag: String,
-    checksum_algorithm: Option<ChecksumAlgorithm>,
-    checksum_bytes: Option<Vec<u8>>,
+    checksum: Option<storage::RawChecksum>,
     last_modified: u64,
 }
 
@@ -1533,10 +1530,17 @@ impl Coordinator {
             }
         }
 
+        let checksum = match (effective_algo, checksum_bytes) {
+            (Some(algo), Some(bytes)) => Some(storage::RawChecksum {
+                algorithm: algo,
+                bytes,
+            }),
+            _ => None,
+        };
+
         Ok(UploadPartResult {
             etag: format_etag(crc64),
-            checksum_algorithm: effective_algo,
-            checksum_bytes,
+            checksum,
         })
     }
 
@@ -2811,14 +2815,13 @@ impl Coordinator {
                 .unwrap_or_default();
 
             let checksum = if let Some(raw) = &part.checksum {
-                use base64::Engine;
                 // Look up algorithm from object metadata
                 metadata
                     .get("x-amz-checksum-algorithm")
                     .and_then(ChecksumAlgorithm::parse)
-                    .map(|algo| {
-                        let b64 = base64::engine::general_purpose::STANDARD.encode(raw);
-                        (algo.header_name().to_string(), b64)
+                    .map(|algo| storage::RawChecksum {
+                        algorithm: algo,
+                        bytes: raw.clone(),
                     })
             } else {
                 None
@@ -2963,13 +2966,12 @@ impl Coordinator {
                 .unwrap_or_default();
 
             let checksum = if let Some(raw) = &part.checksum {
-                use base64::Engine;
                 metadata
                     .get("x-amz-checksum-algorithm")
                     .and_then(ChecksumAlgorithm::parse)
-                    .map(|algo| {
-                        let b64 = base64::engine::general_purpose::STANDARD.encode(raw);
-                        (algo.header_name().to_string(), b64)
+                    .map(|algo| storage::RawChecksum {
+                        algorithm: algo,
+                        bytes: raw.clone(),
                     })
             } else {
                 None
@@ -3877,8 +3879,7 @@ impl Coordinator {
             self.write_part_inner(bucket, key, upload_id, part_number, data, claimed_checksum)?;
         Ok(UploadPartResult {
             etag: inner.etag,
-            checksum_algorithm: inner.checksum_algorithm,
-            checksum_bytes: inner.checksum_bytes,
+            checksum: inner.checksum,
         })
     }
 
@@ -4257,10 +4258,17 @@ impl Coordinator {
             }
         }
 
+        let checksum = match (effective_algo, checksum_bytes) {
+            (Some(algo), Some(bytes)) => Some(storage::RawChecksum {
+                algorithm: algo,
+                bytes,
+            }),
+            _ => None,
+        };
+
         Ok(WritePartInnerResult {
             etag: format_etag(etag_crc),
-            checksum_algorithm: effective_algo,
-            checksum_bytes,
+            checksum,
             last_modified: now,
         })
     }

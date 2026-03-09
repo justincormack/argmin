@@ -343,6 +343,14 @@ impl ChecksumType {
     }
 }
 
+/// A checksum with its algorithm — eliminates correlated `Option<algo>` +
+/// `Option<bytes>` pairs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawChecksum {
+    pub algorithm: ChecksumAlgorithm,
+    pub bytes: Vec<u8>,
+}
+
 /// Object lifecycle state.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

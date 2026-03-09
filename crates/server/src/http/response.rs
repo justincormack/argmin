@@ -298,8 +298,10 @@ impl S3Response {
         }
 
         // Per-part checksum (always emitted for part-level requests)
-        if let Some((header_name, b64_value)) = &result.checksum {
-            resp = resp.header(header_name, b64_value);
+        if let Some(ref cksum) = result.checksum {
+            use base64::Engine;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&cksum.bytes);
+            resp = resp.header(cksum.algorithm.header_name(), &b64);
         }
         if let Some(ct) = result.metadata.get("x-amz-checksum-type") {
             resp = resp.header("x-amz-checksum-type", ct);
@@ -405,8 +407,10 @@ impl S3Response {
         }
 
         // Per-part checksum (always emitted for part-level GETs)
-        if let Some((header_name, b64_value)) = &result.checksum {
-            resp = resp.header(header_name, b64_value);
+        if let Some(ref cksum) = result.checksum {
+            use base64::Engine;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&cksum.bytes);
+            resp = resp.header(cksum.algorithm.header_name(), &b64);
         }
         // Checksum type (e.g. COMPOSITE, FULL_OBJECT)
         if let Some(ct) = result.metadata.get("x-amz-checksum-type") {
@@ -673,16 +677,12 @@ impl S3Response {
     }
 
     /// Build a response for UploadPart (200 OK, ETag header, optional checksum).
-    pub fn upload_part(
-        etag: &str,
-        checksum_algorithm: Option<storage::ChecksumAlgorithm>,
-        checksum_bytes: Option<&[u8]>,
-    ) -> Self {
+    pub fn upload_part(etag: &str, checksum: Option<&storage::RawChecksum>) -> Self {
         let mut resp = Self::new(200).header("ETag", etag);
-        if let (Some(algo), Some(bytes)) = (checksum_algorithm, checksum_bytes) {
+        if let Some(cksum) = checksum {
             use base64::Engine;
-            let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
-            resp = resp.header(algo.header_name(), &b64);
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&cksum.bytes);
+            resp = resp.header(cksum.algorithm.header_name(), &b64);
         }
         resp
     }
