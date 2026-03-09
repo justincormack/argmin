@@ -200,12 +200,42 @@ pub struct GetObjectPartResult {
 }
 
 /// Metadata handling directive for `CopyObject`.
-#[derive(Debug, Clone, Copy)]
-pub enum MetadataDirective {
+#[derive(Debug)]
+pub enum MetadataDirective<'a> {
     /// Preserve source object's metadata.
     Copy,
     /// Replace metadata with values from request headers.
-    Replace,
+    Replace(&'a [(&'a str, &'a str)]),
+}
+
+/// Parsed copy-source reference, shared by CopyObject and UploadPartCopy.
+#[derive(Debug)]
+pub struct CopySource<'a> {
+    pub bucket: &'a str,
+    pub key: &'a str,
+    pub version_id: Option<storage::VersionId>,
+    pub condition: &'a ReadCondition,
+}
+
+/// Parsed CopyObject request from the HTTP layer.
+#[derive(Debug)]
+pub struct CopyObjectRequest<'a> {
+    pub source: CopySource<'a>,
+    pub dst_bucket: &'a str,
+    pub dst_key: &'a str,
+    pub dst_condition: &'a WriteCondition,
+    pub directive: MetadataDirective<'a>,
+}
+
+/// Parsed UploadPartCopy request from the HTTP layer.
+#[derive(Debug)]
+pub struct UploadPartCopyRequest<'a> {
+    pub source: CopySource<'a>,
+    pub dst_bucket: &'a str,
+    pub dst_key: &'a str,
+    pub upload_id: &'a str,
+    pub part_number: u32,
+    pub copy_source_range: Option<(u64, u64)>,
 }
 
 /// Result of a `CopyObject` operation.
@@ -1732,16 +1762,16 @@ impl Coordinator {
     #[allow(clippy::too_many_arguments)]
     pub fn copy_object(
         &self,
-        src_bucket: &str,
-        src_key: &str,
-        src_version_id: Option<storage::VersionId>,
-        dst_bucket: &str,
-        dst_key: &str,
-        src_cond: &ReadCondition,
-        dst_cond: &WriteCondition,
-        directive: MetadataDirective,
-        new_headers: &[(&str, &str)],
+        req: &CopyObjectRequest,
     ) -> Result<CopyObjectResult, ServerError> {
+        let src_bucket = req.source.bucket;
+        let src_key = req.source.key;
+        let src_version_id = req.source.version_id;
+        let dst_bucket = req.dst_bucket;
+        let dst_key = req.dst_key;
+        let src_cond = req.source.condition;
+        let dst_cond = req.dst_condition;
+        let directive = &req.directive;
         let _bucket_guard = self.storage_node.lock_bucket(dst_bucket);
 
         // Phase 1: Read source object
@@ -1870,7 +1900,7 @@ impl Coordinator {
         // Phase 2: Write destination object
         let metadata_blob = match directive {
             MetadataDirective::Copy => src_metadata,
-            MetadataDirective::Replace => {
+            MetadataDirective::Replace(new_headers) => {
                 let mut blob = MetadataBlob::from_headers(new_headers)?;
 
                 // Strip any client-supplied checksum VALUE headers — CopyObject
@@ -4013,16 +4043,17 @@ impl Coordinator {
     #[allow(clippy::too_many_arguments)]
     pub fn upload_part_copy(
         &self,
-        src_bucket: &str,
-        src_key: &str,
-        src_version_id: Option<storage::VersionId>,
-        dst_bucket: &str,
-        dst_key: &str,
-        upload_id: &str,
-        part_number: u32,
-        src_cond: &ReadCondition,
-        copy_source_range: Option<(u64, u64)>,
+        req: &UploadPartCopyRequest,
     ) -> Result<UploadPartCopyResult, ServerError> {
+        let src_bucket = req.source.bucket;
+        let src_key = req.source.key;
+        let src_version_id = req.source.version_id;
+        let dst_bucket = req.dst_bucket;
+        let dst_key = req.dst_key;
+        let upload_id = req.upload_id;
+        let part_number = req.part_number;
+        let src_cond = req.source.condition;
+        let copy_source_range = req.copy_source_range;
         // Phase 1: Read source object (only the needed range)
         let source_data = {
             let LockedReadObject {
@@ -6687,17 +6718,18 @@ mod tests {
             .unwrap();
 
         let result = coord
-            .copy_object(
-                "bucket",
-                "src",
-                None,
-                "bucket",
-                "dst",
-                NO_READ,
-                NO_WRITE,
-                MetadataDirective::Copy,
-                &[],
-            )
+            .copy_object(&CopyObjectRequest {
+                source: CopySource {
+                    bucket: "bucket",
+                    key: "src",
+                    version_id: None,
+                    condition: NO_READ,
+                },
+                dst_bucket: "bucket",
+                dst_key: "dst",
+                dst_condition: NO_WRITE,
+                directive: MetadataDirective::Copy,
+            })
             .unwrap();
         assert!(!result.etag.is_empty());
 
@@ -6720,17 +6752,18 @@ mod tests {
             .unwrap();
 
         coord
-            .copy_object(
-                "bucket",
-                "src",
-                None,
-                "bucket",
-                "dst",
-                NO_READ,
-                NO_WRITE,
-                MetadataDirective::Copy,
-                &[],
-            )
+            .copy_object(&CopyObjectRequest {
+                source: CopySource {
+                    bucket: "bucket",
+                    key: "src",
+                    version_id: None,
+                    condition: NO_READ,
+                },
+                dst_bucket: "bucket",
+                dst_key: "dst",
+                dst_condition: NO_WRITE,
+                directive: MetadataDirective::Copy,
+            })
             .unwrap();
 
         let obj = coord.get_object("bucket", "dst", None, NO_READ).unwrap();
@@ -6754,17 +6787,18 @@ mod tests {
 
         let new_headers = [("Content-Type", "text/html"), ("X-Amz-Meta-Version", "2")];
         coord
-            .copy_object(
-                "bucket",
-                "src",
-                None,
-                "bucket",
-                "dst",
-                NO_READ,
-                NO_WRITE,
-                MetadataDirective::Replace,
-                &new_headers,
-            )
+            .copy_object(&CopyObjectRequest {
+                source: CopySource {
+                    bucket: "bucket",
+                    key: "src",
+                    version_id: None,
+                    condition: NO_READ,
+                },
+                dst_bucket: "bucket",
+                dst_key: "dst",
+                dst_condition: NO_WRITE,
+                directive: MetadataDirective::Replace(&new_headers),
+            })
             .unwrap();
 
         let obj = coord.get_object("bucket", "dst", None, NO_READ).unwrap();
@@ -6788,17 +6822,18 @@ mod tests {
 
         let new_headers = [("Content-Type", "application/json")];
         coord
-            .copy_object(
-                "bucket",
-                "key",
-                None,
-                "bucket",
-                "key",
-                NO_READ,
-                NO_WRITE,
-                MetadataDirective::Replace,
-                &new_headers,
-            )
+            .copy_object(&CopyObjectRequest {
+                source: CopySource {
+                    bucket: "bucket",
+                    key: "key",
+                    version_id: None,
+                    condition: NO_READ,
+                },
+                dst_bucket: "bucket",
+                dst_key: "key",
+                dst_condition: NO_WRITE,
+                directive: MetadataDirective::Replace(&new_headers),
+            })
             .unwrap();
 
         let obj = coord.get_object("bucket", "key", None, NO_READ).unwrap();
@@ -6824,17 +6859,18 @@ mod tests {
             ("x-amz-checksum-crc32c", "AAAA=="),
         ];
         coord
-            .copy_object(
-                "bucket",
-                "src",
-                None,
-                "bucket",
-                "dst",
-                NO_READ,
-                NO_WRITE,
-                MetadataDirective::Replace,
-                &new_headers,
-            )
+            .copy_object(&CopyObjectRequest {
+                source: CopySource {
+                    bucket: "bucket",
+                    key: "src",
+                    version_id: None,
+                    condition: NO_READ,
+                },
+                dst_bucket: "bucket",
+                dst_key: "dst",
+                dst_condition: NO_WRITE,
+                directive: MetadataDirective::Replace(&new_headers),
+            })
             .unwrap();
 
         let obj = coord.get_object("bucket", "dst", None, NO_READ).unwrap();
@@ -6862,17 +6898,18 @@ mod tests {
             ("x-amz-checksum-algorithm", "CRC32C"),
         ];
         coord
-            .copy_object(
-                "bucket",
-                "src",
-                None,
-                "bucket",
-                "dst",
-                NO_READ,
-                NO_WRITE,
-                MetadataDirective::Replace,
-                &new_headers,
-            )
+            .copy_object(&CopyObjectRequest {
+                source: CopySource {
+                    bucket: "bucket",
+                    key: "src",
+                    version_id: None,
+                    condition: NO_READ,
+                },
+                dst_bucket: "bucket",
+                dst_key: "dst",
+                dst_condition: NO_WRITE,
+                directive: MetadataDirective::Replace(&new_headers),
+            })
             .unwrap();
 
         let obj = coord.get_object("bucket", "dst", None, NO_READ).unwrap();
@@ -6899,17 +6936,18 @@ mod tests {
 
         let new_headers = [("x-amz-checksum-algorithm", "BOGUS")];
         let err = coord
-            .copy_object(
-                "bucket",
-                "src",
-                None,
-                "bucket",
-                "dst",
-                NO_READ,
-                NO_WRITE,
-                MetadataDirective::Replace,
-                &new_headers,
-            )
+            .copy_object(&CopyObjectRequest {
+                source: CopySource {
+                    bucket: "bucket",
+                    key: "src",
+                    version_id: None,
+                    condition: NO_READ,
+                },
+                dst_bucket: "bucket",
+                dst_key: "dst",
+                dst_condition: NO_WRITE,
+                directive: MetadataDirective::Replace(&new_headers),
+            })
             .unwrap_err();
         assert!(
             matches!(err, ServerError::InvalidArgument { .. }),
@@ -6924,17 +6962,18 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let err = coord
-            .copy_object(
-                "bucket",
-                "no-such-key",
-                None,
-                "bucket",
-                "dst",
-                NO_READ,
-                NO_WRITE,
-                MetadataDirective::Copy,
-                &[],
-            )
+            .copy_object(&CopyObjectRequest {
+                source: CopySource {
+                    bucket: "bucket",
+                    key: "no-such-key",
+                    version_id: None,
+                    condition: NO_READ,
+                },
+                dst_bucket: "bucket",
+                dst_key: "dst",
+                dst_condition: NO_WRITE,
+                directive: MetadataDirective::Copy,
+            })
             .unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
     }
@@ -6949,17 +6988,18 @@ mod tests {
             .unwrap();
 
         let err = coord
-            .copy_object(
-                "bucket",
-                "src",
-                None,
-                "no-bucket",
-                "dst",
-                NO_READ,
-                NO_WRITE,
-                MetadataDirective::Copy,
-                &[],
-            )
+            .copy_object(&CopyObjectRequest {
+                source: CopySource {
+                    bucket: "bucket",
+                    key: "src",
+                    version_id: None,
+                    condition: NO_READ,
+                },
+                dst_bucket: "no-bucket",
+                dst_key: "dst",
+                dst_condition: NO_WRITE,
+                directive: MetadataDirective::Copy,
+            })
             .unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
     }
@@ -6978,17 +7018,18 @@ mod tests {
             ..Default::default()
         };
         let err = coord
-            .copy_object(
-                "bucket",
-                "src",
-                None,
-                "bucket",
-                "dst",
-                &src_cond,
-                NO_WRITE,
-                MetadataDirective::Copy,
-                &[],
-            )
+            .copy_object(&CopyObjectRequest {
+                source: CopySource {
+                    bucket: "bucket",
+                    key: "src",
+                    version_id: None,
+                    condition: &src_cond,
+                },
+                dst_bucket: "bucket",
+                dst_key: "dst",
+                dst_condition: NO_WRITE,
+                directive: MetadataDirective::Copy,
+            })
             .unwrap_err();
         assert!(matches!(err, ServerError::PreconditionFailed));
     }
@@ -7008,17 +7049,18 @@ mod tests {
 
         let dst_cond = WriteCondition::IfNoneMatchStar;
         let err = coord
-            .copy_object(
-                "bucket",
-                "src",
-                None,
-                "bucket",
-                "dst",
-                NO_READ,
-                &dst_cond,
-                MetadataDirective::Copy,
-                &[],
-            )
+            .copy_object(&CopyObjectRequest {
+                source: CopySource {
+                    bucket: "bucket",
+                    key: "src",
+                    version_id: None,
+                    condition: NO_READ,
+                },
+                dst_bucket: "bucket",
+                dst_key: "dst",
+                dst_condition: &dst_cond,
+                directive: MetadataDirective::Copy,
+            })
             .unwrap_err();
         assert!(matches!(err, ServerError::PreconditionFailed));
     }
@@ -7038,17 +7080,18 @@ mod tests {
 
         let dst_cond = WriteCondition::IfMatch(SpecificEtag::new(existing.etag).unwrap());
         let result = coord
-            .copy_object(
-                "bucket",
-                "src",
-                None,
-                "bucket",
-                "dst",
-                NO_READ,
-                &dst_cond,
-                MetadataDirective::Copy,
-                &[],
-            )
+            .copy_object(&CopyObjectRequest {
+                source: CopySource {
+                    bucket: "bucket",
+                    key: "src",
+                    version_id: None,
+                    condition: NO_READ,
+                },
+                dst_bucket: "bucket",
+                dst_key: "dst",
+                dst_condition: &dst_cond,
+                directive: MetadataDirective::Copy,
+            })
             .unwrap();
         assert!(!result.etag.is_empty());
 
@@ -7075,17 +7118,18 @@ mod tests {
             .unwrap();
 
         coord
-            .copy_object(
-                "src-bucket",
-                "key",
-                None,
-                "dst-bucket",
-                "key",
-                NO_READ,
-                NO_WRITE,
-                MetadataDirective::Copy,
-                &[],
-            )
+            .copy_object(&CopyObjectRequest {
+                source: CopySource {
+                    bucket: "src-bucket",
+                    key: "key",
+                    version_id: None,
+                    condition: NO_READ,
+                },
+                dst_bucket: "dst-bucket",
+                dst_key: "key",
+                dst_condition: NO_WRITE,
+                directive: MetadataDirective::Copy,
+            })
             .unwrap();
 
         let obj = coord
@@ -8918,17 +8962,18 @@ mod tests {
 
         // Copy multipart source to destination (creates inline object).
         coord
-            .copy_object(
-                "src-bucket",
-                "src-key",
-                None,
-                "dst-bucket",
-                "dst-key",
-                &ReadCondition::default(),
-                &WriteCondition::default(),
-                MetadataDirective::Copy,
-                &[],
-            )
+            .copy_object(&CopyObjectRequest {
+                source: CopySource {
+                    bucket: "src-bucket",
+                    key: "src-key",
+                    version_id: None,
+                    condition: &ReadCondition::default(),
+                },
+                dst_bucket: "dst-bucket",
+                dst_key: "dst-key",
+                dst_condition: &WriteCondition::default(),
+                directive: MetadataDirective::Copy,
+            })
             .unwrap();
 
         // Destination should have the concatenated data as inline object.
@@ -9090,17 +9135,18 @@ mod tests {
         create_completed_multipart_vec(&coord, "src", "key", &[(1, vec![])]);
 
         coord
-            .copy_object(
-                "src",
-                "key",
-                None,
-                "dst",
-                "key",
-                &ReadCondition::default(),
-                &WriteCondition::default(),
-                MetadataDirective::Copy,
-                &[],
-            )
+            .copy_object(&CopyObjectRequest {
+                source: CopySource {
+                    bucket: "src",
+                    key: "key",
+                    version_id: None,
+                    condition: &ReadCondition::default(),
+                },
+                dst_bucket: "dst",
+                dst_key: "key",
+                dst_condition: &WriteCondition::default(),
+                directive: MetadataDirective::Copy,
+            })
             .unwrap();
 
         let dst = coord
@@ -10032,17 +10078,18 @@ mod tests {
 
         // Copy to destination.
         coord
-            .copy_object(
-                "bucket",
-                "src",
-                None,
-                "bucket",
-                "dst",
-                NO_READ,
-                &WriteCondition::default(),
-                MetadataDirective::Copy,
-                &[],
-            )
+            .copy_object(&CopyObjectRequest {
+                source: CopySource {
+                    bucket: "bucket",
+                    key: "src",
+                    version_id: None,
+                    condition: NO_READ,
+                },
+                dst_bucket: "bucket",
+                dst_key: "dst",
+                dst_condition: &WriteCondition::default(),
+                directive: MetadataDirective::Copy,
+            })
             .unwrap();
 
         // Destination should be a normal (non-chunk-manifest) object.
@@ -10224,17 +10271,19 @@ mod tests {
 
         // UploadPartCopy from the stream-written source.
         let result = coord
-            .upload_part_copy(
-                "bucket",
-                "src",
-                None,
-                "bucket",
-                "dst",
-                &upload.upload_id,
-                1,
-                NO_READ,
-                None,
-            )
+            .upload_part_copy(&UploadPartCopyRequest {
+                source: CopySource {
+                    bucket: "bucket",
+                    key: "src",
+                    version_id: None,
+                    condition: NO_READ,
+                },
+                dst_bucket: "bucket",
+                dst_key: "dst",
+                upload_id: &upload.upload_id,
+                part_number: 1,
+                copy_source_range: None,
+            })
             .unwrap();
         assert!(!result.etag.is_empty());
     }

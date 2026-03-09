@@ -20,7 +20,10 @@ use crate::conditional::{
 };
 use crate::coordinator::ChecksumClaim;
 use crate::coordinator::Coordinator;
+use crate::coordinator::CopyObjectRequest;
+use crate::coordinator::CopySource;
 use crate::coordinator::MetadataDirective;
+use crate::coordinator::UploadPartCopyRequest;
 use crate::error::ServerError;
 use crate::metadata_blob::MetadataBlob;
 use request::S3Request;
@@ -379,8 +382,15 @@ impl HttpFrontend {
                     }
                     let src_cond = copy_source_condition_from_headers(req);
                     let dst_cond = write_condition_from_headers(req)?;
+                    let header_pairs: Vec<(&str, &str)> = req
+                        .headers
+                        .iter()
+                        .map(|(k, v)| (k.as_str(), v.as_str()))
+                        .collect();
                     let directive = match req.header("x-amz-metadata-directive") {
-                        Some(d) if d.eq_ignore_ascii_case("REPLACE") => MetadataDirective::Replace,
+                        Some(d) if d.eq_ignore_ascii_case("REPLACE") => {
+                            MetadataDirective::Replace(&header_pairs)
+                        }
                         _ => MetadataDirective::Copy,
                     };
                     // Copy-to-self without REPLACE is invalid (AWS returns 400)
@@ -411,22 +421,18 @@ impl HttpFrontend {
                     } else {
                         None
                     };
-                    let header_pairs: Vec<(&str, &str)> = req
-                        .headers
-                        .iter()
-                        .map(|(k, v)| (k.as_str(), v.as_str()))
-                        .collect();
-                    let result = self.coordinator.copy_object(
-                        &src_bucket,
-                        &src_key,
-                        src_version_id,
-                        &bucket,
-                        &key,
-                        &src_cond,
-                        &dst_cond,
+                    let result = self.coordinator.copy_object(&CopyObjectRequest {
+                        source: CopySource {
+                            bucket: &src_bucket,
+                            key: &src_key,
+                            version_id: src_version_id,
+                            condition: &src_cond,
+                        },
+                        dst_bucket: &bucket,
+                        dst_key: &key,
+                        dst_condition: &dst_cond,
                         directive,
-                        &header_pairs,
-                    )?;
+                    })?;
                     // Apply tagging based on directive
                     let dst_vid = Some(result.version_id);
                     if tagging_directive == "COPY" {
@@ -1037,17 +1043,19 @@ impl HttpFrontend {
                         } else {
                             None
                         };
-                    let result = self.coordinator.upload_part_copy(
-                        &src_bucket,
-                        &src_key,
-                        src_version_id,
-                        &bucket,
-                        &key,
-                        &upload_id,
+                    let result = self.coordinator.upload_part_copy(&UploadPartCopyRequest {
+                        source: CopySource {
+                            bucket: &src_bucket,
+                            key: &src_key,
+                            version_id: src_version_id,
+                            condition: &src_cond,
+                        },
+                        dst_bucket: &bucket,
+                        dst_key: &key,
+                        upload_id: &upload_id,
                         part_number,
-                        &src_cond,
                         copy_source_range,
-                    )?;
+                    })?;
                     Ok(S3Response::upload_part_copy(
                         &result.etag,
                         result.last_modified,
