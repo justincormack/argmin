@@ -1904,7 +1904,7 @@ impl HttpFrontend {
         crc64: u64,
         total_size: u64,
         trailer_checksums: &[(String, String)],
-        computed_checksum: Option<(ChecksumAlgorithm, Vec<u8>)>,
+        computed_checksum: Option<storage::RawChecksum>,
     ) -> Result<S3Response, ServerError> {
         // If trailer checksums are present, use the first one as the claimed
         // checksum (overriding any from request headers). Trailing checksums

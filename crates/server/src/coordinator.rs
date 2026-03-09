@@ -261,7 +261,7 @@ pub struct FinalizeStreamPartRequest<'a> {
     pub crc64: u64,
     pub total_size: u64,
     pub claimed_checksum: Option<&'a ChecksumClaim>,
-    pub computed_checksum: Option<(ChecksumAlgorithm, Vec<u8>)>,
+    pub computed_checksum: Option<storage::RawChecksum>,
 }
 
 /// Result of a `CopyObject` operation.
@@ -1529,7 +1529,9 @@ impl Coordinator {
 
         // Use only a computed checksum from the streaming loop. This prevents
         // persisting unverified checksum claims from request headers.
-        let checksum_bytes = if let Some((algo, bytes)) = computed_checksum {
+        let checksum_bytes = if let Some(cksum) = computed_checksum {
+            let algo = cksum.algorithm();
+            let bytes = cksum.bytes();
             if let Some(ea) = effective_algo {
                 if ea != algo {
                     return Err(ServerError::InvalidRequest {
@@ -1551,11 +1553,11 @@ impl Coordinator {
                         ),
                     });
                 }
-                if claim.expected_bytes() != bytes.as_slice() {
+                if claim.expected_bytes() != bytes {
                     return Err(ServerError::BadDigest);
                 }
             }
-            Some(bytes)
+            Some(bytes.to_vec())
         } else if effective_algo.is_some() || claimed_checksum.is_some() {
             return Err(ServerError::InvalidRequest {
                 reason: "missing computed checksum for streaming upload part".to_string(),
