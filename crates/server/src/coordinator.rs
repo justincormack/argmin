@@ -1531,10 +1531,11 @@ impl Coordinator {
         }
 
         let checksum = match (effective_algo, checksum_bytes) {
-            (Some(algo), Some(bytes)) => Some(storage::RawChecksum {
-                algorithm: algo,
-                bytes,
-            }),
+            (Some(algo), Some(bytes)) => Some(
+                storage::RawChecksum::new(algo, bytes).map_err(|_| ServerError::InternalError {
+                    reason: "computed checksum length does not match algorithm".into(),
+                })?,
+            ),
             _ => None,
         };
 
@@ -2815,14 +2816,25 @@ impl Coordinator {
                 .unwrap_or_default();
 
             let checksum = if let Some(raw) = &part.checksum {
-                // Look up algorithm from object metadata
-                metadata
+                // Look up algorithm from object metadata and validate byte length.
+                match metadata
                     .get("x-amz-checksum-algorithm")
                     .and_then(ChecksumAlgorithm::parse)
-                    .map(|algo| storage::RawChecksum {
-                        algorithm: algo,
-                        bytes: raw.clone(),
-                    })
+                {
+                    Some(algo) => Some(
+                        storage::RawChecksum::new(algo, raw.clone()).map_err(|_| {
+                            ServerError::InternalError {
+                                reason: format!(
+                                    "stored checksum length {} does not match {} (expected {})",
+                                    raw.len(),
+                                    algo.as_str(),
+                                    algo.expected_byte_length(),
+                                ),
+                            }
+                        })?,
+                    ),
+                    None => None,
+                }
             } else {
                 None
             };
@@ -2966,13 +2978,24 @@ impl Coordinator {
                 .unwrap_or_default();
 
             let checksum = if let Some(raw) = &part.checksum {
-                metadata
+                match metadata
                     .get("x-amz-checksum-algorithm")
                     .and_then(ChecksumAlgorithm::parse)
-                    .map(|algo| storage::RawChecksum {
-                        algorithm: algo,
-                        bytes: raw.clone(),
-                    })
+                {
+                    Some(algo) => Some(
+                        storage::RawChecksum::new(algo, raw.clone()).map_err(|_| {
+                            ServerError::InternalError {
+                                reason: format!(
+                                    "stored checksum length {} does not match {} (expected {})",
+                                    raw.len(),
+                                    algo.as_str(),
+                                    algo.expected_byte_length(),
+                                ),
+                            }
+                        })?,
+                    ),
+                    None => None,
+                }
             } else {
                 None
             };
@@ -4259,10 +4282,11 @@ impl Coordinator {
         }
 
         let checksum = match (effective_algo, checksum_bytes) {
-            (Some(algo), Some(bytes)) => Some(storage::RawChecksum {
-                algorithm: algo,
-                bytes,
-            }),
+            (Some(algo), Some(bytes)) => Some(
+                storage::RawChecksum::new(algo, bytes).map_err(|_| ServerError::InternalError {
+                    reason: "computed checksum length does not match algorithm".into(),
+                })?,
+            ),
             _ => None,
         };
 

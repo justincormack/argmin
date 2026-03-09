@@ -1930,7 +1930,7 @@ impl HttpFrontend {
         // The coordinator's result already includes the checksum via
         // S3Response::upload_part. Only echo headers NOT already present
         // (e.g. x-amz-checksum-type). Trailer values take precedence.
-        let already_set: Option<&str> = result.checksum.as_ref().map(|c| c.algorithm.header_name());
+        let already_set: Option<&str> = result.checksum.as_ref().map(|c| c.algorithm().header_name());
         for (name, value) in &ctx.checksum_response {
             if already_set == Some(name.as_str()) {
                 continue; // Already set by S3Response::upload_part

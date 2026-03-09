@@ -300,8 +300,8 @@ impl S3Response {
         // Per-part checksum (always emitted for part-level requests)
         if let Some(ref cksum) = result.checksum {
             use base64::Engine;
-            let b64 = base64::engine::general_purpose::STANDARD.encode(&cksum.bytes);
-            resp = resp.header(cksum.algorithm.header_name(), &b64);
+            let b64 = base64::engine::general_purpose::STANDARD.encode(cksum.bytes());
+            resp = resp.header(cksum.algorithm().header_name(), &b64);
         }
         if let Some(ct) = result.metadata.get("x-amz-checksum-type") {
             resp = resp.header("x-amz-checksum-type", ct);
@@ -409,8 +409,8 @@ impl S3Response {
         // Per-part checksum (always emitted for part-level GETs)
         if let Some(ref cksum) = result.checksum {
             use base64::Engine;
-            let b64 = base64::engine::general_purpose::STANDARD.encode(&cksum.bytes);
-            resp = resp.header(cksum.algorithm.header_name(), &b64);
+            let b64 = base64::engine::general_purpose::STANDARD.encode(cksum.bytes());
+            resp = resp.header(cksum.algorithm().header_name(), &b64);
         }
         // Checksum type (e.g. COMPOSITE, FULL_OBJECT)
         if let Some(ct) = result.metadata.get("x-amz-checksum-type") {
@@ -681,8 +681,8 @@ impl S3Response {
         let mut resp = Self::new(200).header("ETag", etag);
         if let Some(cksum) = checksum {
             use base64::Engine;
-            let b64 = base64::engine::general_purpose::STANDARD.encode(&cksum.bytes);
-            resp = resp.header(cksum.algorithm.header_name(), &b64);
+            let b64 = base64::engine::general_purpose::STANDARD.encode(cksum.bytes());
+            resp = resp.header(cksum.algorithm().header_name(), &b64);
         }
         resp
     }

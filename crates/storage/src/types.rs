@@ -296,6 +296,16 @@ impl ChecksumAlgorithm {
             Self::Crc64nvme => "ChecksumCRC64NVME",
         }
     }
+
+    /// Expected raw byte length for this algorithm's checksum value.
+    pub fn expected_byte_length(self) -> usize {
+        match self {
+            Self::Crc32 | Self::Crc32c => 4,
+            Self::Crc64nvme => 8,
+            Self::Sha1 => 20,
+            Self::Sha256 => 32,
+        }
+    }
 }
 
 /// Checksum type for multipart uploads: COMPOSITE (SHA) or FULL_OBJECT (CRC).
@@ -347,8 +357,29 @@ impl ChecksumType {
 /// `Option<bytes>` pairs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawChecksum {
-    pub algorithm: ChecksumAlgorithm,
-    pub bytes: Vec<u8>,
+    algorithm: ChecksumAlgorithm,
+    bytes: Vec<u8>,
+}
+
+impl RawChecksum {
+    /// Construct a `RawChecksum`, validating that the byte length matches the algorithm.
+    pub fn new(algorithm: ChecksumAlgorithm, bytes: Vec<u8>) -> Result<Self, &'static str> {
+        let expected = algorithm.expected_byte_length();
+        if bytes.len() != expected {
+            return Err("checksum byte length does not match algorithm");
+        }
+        Ok(Self { algorithm, bytes })
+    }
+
+    /// The checksum algorithm.
+    pub fn algorithm(&self) -> ChecksumAlgorithm {
+        self.algorithm
+    }
+
+    /// The raw checksum bytes.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 
 /// Object lifecycle state.
