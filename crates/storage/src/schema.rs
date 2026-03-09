@@ -17,7 +17,7 @@ const CREATE_OBJECTS_TABLE: &str = "\
 CREATE TABLE IF NOT EXISTS objects (
     bucket        TEXT NOT NULL,
     key           TEXT NOT NULL,
-    version_id    INTEGER NOT NULL,
+    version_id    INTEGER NOT NULL CHECK (version_id >= 0),
     size          INTEGER NOT NULL,
     etag          BLOB NOT NULL,
     etag_kind     INTEGER NOT NULL,
@@ -83,7 +83,7 @@ const CREATE_OBJECT_PARTS_TABLE: &str = "\
 CREATE TABLE IF NOT EXISTS object_parts (
     bucket           TEXT NOT NULL,
     key              TEXT NOT NULL,
-    version_id       INTEGER NOT NULL,
+    version_id       INTEGER NOT NULL CHECK (version_id >= 0),
     part_number      INTEGER NOT NULL,
     size             INTEGER NOT NULL,
     etag             BLOB NOT NULL,
@@ -135,7 +135,7 @@ const CREATE_STREAM_OBJECT_CHUNKS_TABLE: &str = "\
 CREATE TABLE IF NOT EXISTS stream_object_chunks (
     bucket        TEXT NOT NULL,
     key           TEXT NOT NULL,
-    version_id    INTEGER NOT NULL,
+    version_id    INTEGER NOT NULL CHECK (version_id >= 0),
     chunk_index   INTEGER NOT NULL,
     size          INTEGER NOT NULL,
     chunk_okh     BLOB NOT NULL,

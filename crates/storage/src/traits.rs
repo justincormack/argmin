@@ -107,8 +107,8 @@ pub trait PgMetadataStore {
 
     /// Insert or replace an object record.
     ///
-    /// For version_id=0 (unversioned): INSERT OR REPLACE (overwrite).
-    /// For version_id>0 (versioned): INSERT only (new version).
+    /// For VersionId::Null (unversioned): INSERT OR REPLACE (overwrite).
+    /// For VersionId::Versioned (versioned): INSERT only (new version).
     fn put_object_meta(&self, req: &PutObjectMetaReq) -> Result<(), MetadataError>;
 
     /// Get the latest object record (highest version_id).
@@ -122,7 +122,7 @@ pub trait PgMetadataStore {
         &self,
         bucket: &str,
         key: &str,
-        version_id: u64,
+        version_id: VersionId,
     ) -> Result<ObjectRecord, MetadataError>;
 
     /// Delete all versions of an object's metadata.
@@ -133,7 +133,7 @@ pub trait PgMetadataStore {
         &self,
         bucket: &str,
         key: &str,
-        version_id: u64,
+        version_id: VersionId,
     ) -> Result<(), MetadataError>;
 
     /// List objects within this PG matching the request filters.
@@ -153,14 +153,14 @@ pub trait PgMetadataStore {
     /// Get the next version_id for a key (MAX(version_id) + 1).
     ///
     /// Returns 1 if no versions exist.
-    fn next_version_id(&self, bucket: &str, key: &str) -> Result<u64, MetadataError>;
+    fn next_version_id(&self, bucket: &str, key: &str) -> Result<VersionId, MetadataError>;
 
     /// Store tags for an object version (serialized XML string).
     fn put_object_tags(
         &self,
         bucket: &str,
         key: &str,
-        version_id: u64,
+        version_id: VersionId,
         tags: &str,
     ) -> Result<(), MetadataError>;
 
@@ -169,7 +169,7 @@ pub trait PgMetadataStore {
         &self,
         bucket: &str,
         key: &str,
-        version_id: u64,
+        version_id: VersionId,
     ) -> Result<Option<String>, MetadataError>;
 
     /// Delete tags for an object version. Idempotent.
@@ -177,7 +177,7 @@ pub trait PgMetadataStore {
         &self,
         bucket: &str,
         key: &str,
-        version_id: u64,
+        version_id: VersionId,
     ) -> Result<(), MetadataError>;
 
     // ── Multipart upload methods ───────────────────────────────────
@@ -231,7 +231,7 @@ pub trait PgMetadataStore {
         &self,
         bucket: &str,
         key: &str,
-        version_id: u64,
+        version_id: VersionId,
     ) -> Result<Vec<ObjectPartRecord>, MetadataError>;
 
     /// Delete committed manifest parts for an object version.
@@ -239,7 +239,7 @@ pub trait PgMetadataStore {
         &self,
         bucket: &str,
         key: &str,
-        version_id: u64,
+        version_id: VersionId,
     ) -> Result<(), MetadataError>;
 
     /// Atomically finalize a multipart upload.
@@ -324,7 +324,7 @@ pub trait PgMetadataStore {
         &self,
         bucket: &str,
         key: &str,
-        version_id: u64,
+        version_id: VersionId,
     ) -> Result<Vec<StreamObjectChunkRecord>, MetadataError>;
 
     /// Delete committed chunk manifest for an object version.
@@ -332,7 +332,7 @@ pub trait PgMetadataStore {
         &self,
         bucket: &str,
         key: &str,
-        version_id: u64,
+        version_id: VersionId,
     ) -> Result<(), MetadataError>;
 
     /// Read committed chunk manifest for a multipart part.
@@ -340,7 +340,7 @@ pub trait PgMetadataStore {
         &self,
         bucket: &str,
         key: &str,
-        version_id: u64,
+        version_id: VersionId,
         part_number: u32,
     ) -> Result<Vec<MultipartPartChunkRecord>, MetadataError>;
 
@@ -349,7 +349,7 @@ pub trait PgMetadataStore {
         &self,
         bucket: &str,
         key: &str,
-        version_id: u64,
+        version_id: VersionId,
     ) -> Result<(), MetadataError>;
 
     /// Get all chunk records for a given upload_id (any version_id / part_number).

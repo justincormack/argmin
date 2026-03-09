@@ -333,12 +333,61 @@ impl DataLayout {
     }
 }
 
+/// Object version identifier.
+///
+/// `Null` represents the single unversioned copy (version_id=0 in the database).
+/// `Versioned` represents an explicit version (version_id≥1 in the database).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VersionId {
+    /// The null version (unversioned bucket).
+    Null,
+    /// An explicit version in a versioning-enabled bucket.
+    Versioned(std::num::NonZeroU64),
+}
+
+impl VersionId {
+    /// Convert from the raw u64 stored in the database.
+    pub fn from_u64(v: u64) -> Self {
+        match std::num::NonZeroU64::new(v) {
+            Some(nz) => Self::Versioned(nz),
+            None => Self::Null,
+        }
+    }
+
+    /// Convert to the raw u64 for database storage.
+    pub fn to_u64(self) -> u64 {
+        match self {
+            Self::Null => 0,
+            Self::Versioned(v) => v.get(),
+        }
+    }
+
+    /// Returns true if this is the null (unversioned) version.
+    pub fn is_null(self) -> bool {
+        matches!(self, Self::Null)
+    }
+
+    /// Returns true if this is an explicit versioned ID.
+    pub fn is_versioned(self) -> bool {
+        matches!(self, Self::Versioned(_))
+    }
+}
+
+impl std::fmt::Display for VersionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Null => f.write_str("null"),
+            Self::Versioned(v) => write!(f, "{v}"),
+        }
+    }
+}
+
 /// Object record stored in per-PG metadata.
 #[derive(Debug, Clone)]
 pub struct ObjectRecord {
     pub bucket: String,
     pub key: String,
-    pub version_id: u64,
+    pub version_id: VersionId,
     pub size: u64,
     /// Binary etag (e.g. CRC64-NVME bytes), max 64 bytes.
     pub etag: Vec<u8>,
@@ -383,7 +432,7 @@ pub struct BucketInfo {
 pub struct PutObjectMetaReq {
     pub bucket: String,
     pub key: String,
-    pub version_id: u64,
+    pub version_id: VersionId,
     pub size: u64,
     pub etag: Vec<u8>,
     pub etag_kind: EtagKind,
@@ -418,7 +467,7 @@ pub struct ListObjectVersionsReq {
     pub bucket: String,
     pub prefix: Option<String>,
     pub key_marker: Option<String>,
-    pub version_id_marker: Option<u64>,
+    pub version_id_marker: Option<VersionId>,
     pub max_keys: u32,
 }
 
@@ -427,7 +476,7 @@ pub struct ListObjectVersionsResp {
     pub versions: Vec<ObjectRecord>,
     pub is_truncated: bool,
     pub next_key_marker: Option<String>,
-    pub next_version_id_marker: Option<u64>,
+    pub next_version_id_marker: Option<VersionId>,
 }
 
 // ── Multipart upload types ─────────────────────────────────────────
@@ -496,7 +545,7 @@ pub struct MultipartPartRecord {
 pub struct ObjectPartRecord {
     pub bucket: String,
     pub key: String,
-    pub version_id: u64,
+    pub version_id: VersionId,
     pub part_number: u32,
     pub size: u64,
     pub etag: Vec<u8>,
@@ -669,7 +718,7 @@ pub struct StreamUploadChunkRecord {
 pub struct StreamObjectChunkRecord {
     pub bucket: String,
     pub key: String,
-    pub version_id: u64,
+    pub version_id: VersionId,
     pub chunk_index: u32,
     pub size: u64,
     pub chunk_okh: [u8; 16],

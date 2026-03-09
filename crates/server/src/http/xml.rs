@@ -1955,7 +1955,7 @@ mod tests {
         use crate::coordinator::{DeleteError, DeletedObject};
         let deleted = vec![DeletedObject {
             key: "key1".to_string(),
-            version_id: 0,
+            version_id: storage::VersionId::Null,
             delete_marker: false,
         }];
         let errors = vec![DeleteError {
@@ -1975,7 +1975,7 @@ mod tests {
         use crate::coordinator::DeletedObject;
         let deleted = vec![DeletedObject {
             key: "key1".to_string(),
-            version_id: 0,
+            version_id: storage::VersionId::Null,
             delete_marker: false,
         }];
         let xml = delete_objects_result_xml(&deleted, &[], true);
@@ -1991,7 +1991,7 @@ mod tests {
         let result = ListObjectVersionsResult {
             versions: vec![VersionEntry {
                 key: "my-key".to_string(),
-                version_id: 0,
+                version_id: storage::VersionId::Null,
                 is_latest: true,
                 size: 42,
                 etag: "\"abc123\"".to_string(),

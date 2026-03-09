@@ -30,13 +30,13 @@ use storage::{ChecksumAlgorithm, ChecksumType};
 /// Parse versionId query parameter from an S3 request.
 /// Returns `Ok(None)` if the parameter is absent, `Ok(Some(id))` if valid,
 /// or `Err` if the value is present but not a valid version ID.
-fn parse_version_id(req: &S3Request) -> Result<Option<u64>, ServerError> {
+fn parse_version_id(req: &S3Request) -> Result<Option<storage::VersionId>, ServerError> {
     match req.query_param("versionId") {
         None => Ok(None),
-        Some(v) if v == "null" => Ok(Some(0)),
+        Some(v) if v == "null" => Ok(Some(storage::VersionId::Null)),
         Some(v) => v
             .parse::<u64>()
-            .map(Some)
+            .map(|n| Some(storage::VersionId::from_u64(n)))
             .map_err(|_| ServerError::InvalidArgument {
                 reason: format!("invalid versionId: {v}"),
             }),
@@ -352,11 +352,11 @@ impl HttpFrontend {
                         request::parse_copy_source(copy_source)?;
                     let src_version_id = match src_version_id_str {
                         None => None,
-                        Some(v) if v == "null" => Some(0),
+                        Some(v) if v == "null" => Some(storage::VersionId::Null),
                         Some(v) => {
-                            Some(v.parse::<u64>().map_err(|_| ServerError::InvalidArgument {
+                            Some(storage::VersionId::from_u64(v.parse::<u64>().map_err(|_| ServerError::InvalidArgument {
                                 reason: format!("invalid versionId in copy source: {v}"),
-                            })?)
+                            })?))
                         }
                     };
                     self.authorize_bucket_write(auth, &bucket)?;
@@ -1020,11 +1020,11 @@ impl HttpFrontend {
                         request::parse_copy_source(copy_source)?;
                     let src_version_id = match src_version_id_str {
                         None => None,
-                        Some(v) if v == "null" => Some(0),
+                        Some(v) if v == "null" => Some(storage::VersionId::Null),
                         Some(v) => {
-                            Some(v.parse::<u64>().map_err(|_| ServerError::InvalidArgument {
+                            Some(storage::VersionId::from_u64(v.parse::<u64>().map_err(|_| ServerError::InvalidArgument {
                                 reason: format!("invalid versionId in copy source: {v}"),
-                            })?)
+                            })?))
                         }
                     };
                     self.authorize_bucket_write(auth, &bucket)?;
@@ -1190,9 +1190,15 @@ impl HttpFrontend {
                 self.authorize_bucket_read(auth, &bucket)?;
                 let prefix = req.query_param("prefix");
                 let key_marker = req.query_param("key-marker");
-                let version_id_marker = req
-                    .query_param("version-id-marker")
-                    .and_then(|s| s.parse::<u64>().ok());
+                let version_id_marker = match req.query_param("version-id-marker") {
+                    None => None,
+                    Some(v) if v == "null" => Some(storage::VersionId::Null),
+                    Some(v) => Some(storage::VersionId::from_u64(
+                        v.parse::<u64>().map_err(|_| ServerError::InvalidArgument {
+                            reason: format!("invalid version-id-marker: {v}"),
+                        })?,
+                    )),
+                };
                 let max_keys: u32 = req
                     .query_param("max-keys")
                     .and_then(|s| s.parse().ok())

@@ -11,14 +11,10 @@ use storage::{BucketInfo, ChecksumAlgorithm, ChecksumType};
 use super::xml;
 
 /// Format a version_id for S3 API responses.
-/// version_id 0 is the null version (displayed as "null").
-/// Non-zero version IDs are displayed as decimal strings.
-pub fn format_version_id(version_id: u64) -> String {
-    if version_id == 0 {
-        "null".to_string()
-    } else {
-        version_id.to_string()
-    }
+/// Null version is displayed as "null".
+/// Versioned IDs are displayed as decimal strings.
+pub fn format_version_id(version_id: storage::VersionId) -> String {
+    version_id.to_string()
 }
 
 /// RFC 2047 Q-encoding for non-ASCII header values.
@@ -101,7 +97,7 @@ impl S3Response {
     /// Build a response for a successful PutObject.
     pub fn put_object(result: &PutObjectResult) -> Self {
         let mut resp = Self::new(200).header("ETag", &result.etag);
-        if result.version_id != 0 {
+        if result.version_id.is_versioned() {
             let vid = format_version_id(result.version_id);
             resp = resp.header("x-amz-version-id", &vid);
         }
@@ -129,7 +125,7 @@ impl S3Response {
             Self::new(status)
         };
         resp = resp.header("ETag", &result.etag);
-        if result.version_id != 0 {
+        if result.version_id.is_versioned() {
             let vid = format_version_id(result.version_id);
             resp = resp.header("x-amz-version-id", &vid);
         }
@@ -140,7 +136,7 @@ impl S3Response {
     pub fn copy_object(result: &CopyObjectResult) -> Self {
         let body = xml::copy_object_result_xml(&result.etag, result.last_modified);
         let mut resp = Self::new(200).xml_body(body);
-        if result.version_id != 0 {
+        if result.version_id.is_versioned() {
             let vid = format_version_id(result.version_id);
             resp.headers.push(("x-amz-version-id".to_string(), vid));
         }
@@ -154,7 +150,7 @@ impl S3Response {
             .header("ETag", &result.etag)
             .header("Last-Modified", &format_http_date(result.last_modified))
             .header("Accept-Ranges", "bytes");
-        if result.version_id != 0 {
+        if result.version_id.is_versioned() {
             let vid = format_version_id(result.version_id);
             resp = resp.header("x-amz-version-id", &vid);
         }
@@ -212,7 +208,7 @@ impl S3Response {
             .header("Content-Length", &result.size.to_string())
             .header("Last-Modified", &format_http_date(result.last_modified))
             .header("Accept-Ranges", "bytes");
-        if result.version_id != 0 {
+        if result.version_id.is_versioned() {
             let vid = format_version_id(result.version_id);
             resp = resp.header("x-amz-version-id", &vid);
         }
@@ -269,7 +265,7 @@ impl S3Response {
             .header("Last-Modified", &format_http_date(result.last_modified))
             .header("Accept-Ranges", "bytes")
             .header("x-amz-mp-parts-count", &result.parts_count.to_string());
-        if result.version_id != 0 {
+        if result.version_id.is_versioned() {
             let vid = format_version_id(result.version_id);
             resp = resp.header("x-amz-version-id", &vid);
         }
@@ -323,7 +319,7 @@ impl S3Response {
             .header("Last-Modified", &format_http_date(result.last_modified))
             .header("Accept-Ranges", "bytes")
             .header("Content-Range", &content_range);
-        if result.version_id != 0 {
+        if result.version_id.is_versioned() {
             let vid = format_version_id(result.version_id);
             resp = resp.header("x-amz-version-id", &vid);
         }
@@ -376,7 +372,7 @@ impl S3Response {
             );
             resp = resp.header("Content-Range", &content_range);
         }
-        if result.version_id != 0 {
+        if result.version_id.is_versioned() {
             let vid = format_version_id(result.version_id);
             resp = resp.header("x-amz-version-id", &vid);
         }
@@ -437,7 +433,7 @@ impl S3Response {
     /// Build a response for DeleteObject (204 No Content).
     pub fn delete_object(result: &DeleteObjectResult) -> Self {
         let mut resp = Self::new(204);
-        if result.version_id != 0 {
+        if result.version_id.is_versioned() {
             let vid = format_version_id(result.version_id);
             resp = resp.header("x-amz-version-id", &vid);
         }
@@ -643,11 +639,11 @@ impl S3Response {
     }
 
     /// Build a response for GetObjectAttributes (200 OK, XML body).
-    pub fn get_object_attributes(body_xml: &str, last_modified: u64, version_id: u64) -> Self {
+    pub fn get_object_attributes(body_xml: &str, last_modified: u64, version_id: storage::VersionId) -> Self {
         let mut resp = Self::new(200)
             .xml_body(body_xml.to_string())
             .header("Last-Modified", &format_http_date(last_modified));
-        if version_id != 0 {
+        if version_id.is_versioned() {
             resp = resp.header("x-amz-version-id", &format_version_id(version_id));
         }
         resp
@@ -702,7 +698,7 @@ impl S3Response {
         bucket: &str,
         key: &str,
         etag: &str,
-        version_id: u64,
+        version_id: storage::VersionId,
         checksum_algorithm: Option<ChecksumAlgorithm>,
         checksum_type: Option<ChecksumType>,
         checksum_value: Option<&str>,
@@ -715,7 +711,7 @@ impl S3Response {
             checksum_value,
         );
         let mut resp = Self::new(200).xml_body(body);
-        if version_id != 0 {
+        if version_id.is_versioned() {
             resp = resp.header("x-amz-version-id", &format_version_id(version_id));
         }
         if let Some(algo) = checksum_algorithm {
@@ -999,7 +995,7 @@ mod tests {
     fn put_object_response() {
         let result = PutObjectResult {
             etag: "\"abc123\"".to_string(),
-            version_id: 0,
+            version_id: storage::VersionId::Null,
         };
         let resp = S3Response::put_object(&result);
         assert_eq!(resp.status_code, 200);
@@ -1012,7 +1008,7 @@ mod tests {
     fn put_object_response_versioned() {
         let result = PutObjectResult {
             etag: "\"abc123\"".to_string(),
-            version_id: 42,
+            version_id: storage::VersionId::from_u64(42),
         };
         let resp = S3Response::put_object(&result);
         assert_eq!(resp.status_code, 200);
@@ -1035,7 +1031,7 @@ mod tests {
             etag: "\"etag\"".into(),
             size: 5,
             last_modified: 0,
-            version_id: 0,
+            version_id: storage::VersionId::Null,
             tags: None,
         };
         let resp = S3Response::get_object(result, None);
@@ -1052,7 +1048,7 @@ mod tests {
             etag: "\"etag\"".into(),
             size: 4,
             last_modified: 0,
-            version_id: 0,
+            version_id: storage::VersionId::Null,
             tags: None,
         };
         let resp = S3Response::get_object(result, None);
@@ -1075,7 +1071,7 @@ mod tests {
             etag: "\"e\"".into(),
             size: 0,
             last_modified: 0,
-            version_id: 0,
+            version_id: storage::VersionId::Null,
             tags: None,
         };
         let resp = S3Response::get_object(result, None);
@@ -1117,7 +1113,7 @@ mod tests {
             etag: "\"e\"".into(),
             size: 0,
             last_modified: 0,
-            version_id: 0,
+            version_id: storage::VersionId::Null,
             tags: None,
         };
         let resp = S3Response::get_object(result, None);
@@ -1154,7 +1150,7 @@ mod tests {
             etag: "\"e\"".into(),
             size: 0,
             last_modified: 0,
-            version_id: 0,
+            version_id: storage::VersionId::Null,
             tags: None,
         };
         let resp = S3Response::get_object(result, Some("ENABLED"));
@@ -1184,7 +1180,7 @@ mod tests {
             etag: "\"e\"".into(),
             size: 0,
             last_modified: 0,
-            version_id: 0,
+            version_id: storage::VersionId::Null,
             tags: None,
         };
         let resp = S3Response::get_object(result, None);
@@ -1206,7 +1202,7 @@ mod tests {
             etag: "\"etag\"".into(),
             size: 1024,
             last_modified: 0,
-            version_id: 0,
+            version_id: storage::VersionId::Null,
             tags: None,
         };
         let resp = S3Response::head_object(&result, None);
@@ -1224,7 +1220,7 @@ mod tests {
             etag: "\"e\"".into(),
             size: 0,
             last_modified: 0,
-            version_id: 0,
+            version_id: storage::VersionId::Null,
             tags: None,
         };
         let resp = S3Response::head_object(&result, None);
@@ -1252,7 +1248,7 @@ mod tests {
             etag: "\"e\"".into(),
             size: 10,
             last_modified: 0,
-            version_id: 0,
+            version_id: storage::VersionId::Null,
             tags: None,
         };
         let resp = S3Response::head_object(&result, None);
@@ -1272,7 +1268,7 @@ mod tests {
             etag: "\"e\"".into(),
             size: 0,
             last_modified: 0,
-            version_id: 0,
+            version_id: storage::VersionId::Null,
             tags: None,
         };
         let resp = S3Response::head_object(&result, None);
@@ -1297,7 +1293,7 @@ mod tests {
             etag: "\"e\"".into(),
             size: 0,
             last_modified: 0,
-            version_id: 0,
+            version_id: storage::VersionId::Null,
             tags: None,
         };
         let resp = S3Response::head_object(&result, Some("ENABLED"));
@@ -1323,7 +1319,7 @@ mod tests {
             etag: "\"e\"".into(),
             size: 0,
             last_modified: 0,
-            version_id: 0,
+            version_id: storage::VersionId::Null,
             tags: None,
         };
         let resp = S3Response::head_object(&result, None);
@@ -1337,7 +1333,7 @@ mod tests {
     fn delete_object_response() {
         use crate::coordinator::DeleteObjectResult;
         let result = DeleteObjectResult {
-            version_id: 0,
+            version_id: storage::VersionId::Null,
             delete_marker: false,
         };
         let resp = S3Response::delete_object(&result);
@@ -1351,7 +1347,7 @@ mod tests {
     fn delete_object_versioned_with_marker() {
         use crate::coordinator::DeleteObjectResult;
         let result = DeleteObjectResult {
-            version_id: 5,
+            version_id: storage::VersionId::from_u64(5),
             delete_marker: true,
         };
         let resp = S3Response::delete_object(&result);
@@ -1526,7 +1522,7 @@ mod tests {
         let result = DeleteObjectsResult {
             deleted: vec![DeletedObject {
                 key: "key1".into(),
-                version_id: 0,
+                version_id: storage::VersionId::Null,
                 delete_marker: false,
             }],
             errors: vec![],
@@ -1547,7 +1543,7 @@ mod tests {
         let result = ListObjectVersionsResult {
             versions: vec![VersionEntry {
                 key: "key1".into(),
-                version_id: 0,
+                version_id: storage::VersionId::Null,
                 is_latest: true,
                 size: 42,
                 etag: "\"etag1\"".into(),

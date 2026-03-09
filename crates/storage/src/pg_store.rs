@@ -25,7 +25,8 @@ use crate::types::*;
 /// Part chunk rows use a sentinel version_id during staging (pre-CompleteMultipartUpload).
 /// Must differ from any real version_id (0 for unversioned, 1+ for versioned) so that
 /// in-progress staging rows are invisible to reads of completed objects.
-const PART_CHUNK_STAGING_VERSION_ID: u64 = u64::MAX;
+const PART_CHUNK_STAGING_VERSION_ID: VersionId =
+    VersionId::Versioned(std::num::NonZeroU64::new(u64::MAX).unwrap());
 type StreamSessionRow = (u8, u8, String, String, Option<String>, Option<i64>);
 
 /// Per-PG store combining shard file I/O with SQLite metadata.
@@ -281,6 +282,18 @@ impl PgStore {
         })
     }
 
+    /// Parse a version_id from a signed i64 column with checked conversion.
+    fn parse_version_id(raw: i64, col_idx: usize) -> Result<VersionId, rusqlite::Error> {
+        let v = u64::try_from(raw).map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                col_idx,
+                rusqlite::types::Type::Integer,
+                Box::from(format!("negative version_id: {raw}")),
+            )
+        })?;
+        Ok(VersionId::from_u64(v))
+    }
+
     fn row_to_object_record(row: &rusqlite::Row<'_>) -> Result<ObjectRecord, rusqlite::Error> {
         let status = Self::parse_enum(row.get::<_, u8>(10)?, 10, "status", ObjectState::from_u8)?;
         let etag_kind =
@@ -296,7 +309,7 @@ impl PgStore {
         Ok(ObjectRecord {
             bucket: row.get(0)?,
             key: row.get(1)?,
-            version_id: row.get::<_, i64>(2)? as u64,
+            version_id: Self::parse_version_id(row.get::<_, i64>(2)?, 2)?,
             size: row.get::<_, i64>(3)? as u64,
             etag: row.get(4)?,
             etag_kind,
@@ -957,7 +970,7 @@ impl PgMetadataStore for PgStore {
         let status_u8 = req.status as u8;
         let parts_count = req.parts_count.map(|n| n as i64);
         let metadata_blob: Option<&[u8]> = req.metadata_blob.as_deref();
-        if req.version_id == 0 {
+        if req.version_id.is_null() {
             // Unversioned: INSERT OR REPLACE (overwrite null version)
             self.conn
                 .execute(
@@ -968,7 +981,7 @@ impl PgMetadataStore for PgStore {
                     params![
                         req.bucket,
                         req.key,
-                        req.version_id as i64,
+                        req.version_id.to_u64() as i64,
                         req.size as i64,
                         req.etag,
                         etag_kind_u8,
@@ -996,7 +1009,7 @@ impl PgMetadataStore for PgStore {
                     params![
                         req.bucket,
                         req.key,
-                        req.version_id as i64,
+                        req.version_id.to_u64() as i64,
                         req.size as i64,
                         req.etag,
                         etag_kind_u8,
@@ -1040,7 +1053,7 @@ impl PgMetadataStore for PgStore {
         &self,
         bucket: &str,
         key: &str,
-        version_id: u64,
+        version_id: VersionId,
     ) -> Result<ObjectRecord, MetadataError> {
         self.conn
             .query_row(
@@ -1048,7 +1061,7 @@ impl PgMetadataStore for PgStore {
                  last_modified, storage_class, ec_k, ec_m, status, tags, \
                  data_layout, parts_count, metadata_blob \
                  FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
-                params![bucket, key, version_id as i64],
+                params![bucket, key, version_id.to_u64() as i64],
                 Self::row_to_object_record,
             )
             .optional()
@@ -1076,12 +1089,12 @@ impl PgMetadataStore for PgStore {
         &self,
         bucket: &str,
         key: &str,
-        version_id: u64,
+        version_id: VersionId,
     ) -> Result<(), MetadataError> {
         self.conn
             .execute(
                 "DELETE FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
-                params![bucket, key, version_id as i64],
+                params![bucket, key, version_id.to_u64() as i64],
             )
             .map_err(|e| MetadataError::Db {
                 context: "delete object version",
@@ -1199,7 +1212,7 @@ impl PgMetadataStore for PgStore {
                     param_idx + 1
                 ));
                 params_vec.push(Box::new(key_marker.clone()));
-                params_vec.push(Box::new(vid_marker as i64));
+                params_vec.push(Box::new(vid_marker.to_u64() as i64));
                 param_idx += 2;
             } else {
                 where_clauses.push(format!("key > ?{param_idx}"));
@@ -1276,7 +1289,7 @@ impl PgMetadataStore for PgStore {
         })
     }
 
-    fn next_version_id(&self, bucket: &str, key: &str) -> Result<u64, MetadataError> {
+    fn next_version_id(&self, bucket: &str, key: &str) -> Result<VersionId, MetadataError> {
         let max: Option<i64> = self
             .conn
             .query_row(
@@ -1291,21 +1304,42 @@ impl PgMetadataStore for PgStore {
             })?
             .flatten();
 
-        Ok(max.map(|v| v as u64 + 1).unwrap_or(1))
+        let next = match max {
+            None => 1u64,
+            Some(v) => {
+                let current = u64::try_from(v).map_err(|_| MetadataError::Db {
+                    context: "negative version_id in database",
+                    source: rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Integer,
+                        Box::from(format!("negative MAX(version_id): {v}")),
+                    ),
+                })?;
+                current.checked_add(1).ok_or_else(|| MetadataError::Db {
+                    context: "version_id overflow",
+                    source: rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Integer,
+                        Box::from("MAX(version_id) overflow"),
+                    ),
+                })?
+            }
+        };
+        Ok(VersionId::from_u64(next))
     }
 
     fn put_object_tags(
         &self,
         bucket: &str,
         key: &str,
-        version_id: u64,
+        version_id: VersionId,
         tags: &str,
     ) -> Result<(), MetadataError> {
         let updated = self
             .conn
             .execute(
                 "UPDATE objects SET tags = ?1 WHERE bucket = ?2 AND key = ?3 AND version_id = ?4",
-                params![tags, bucket, key, version_id as i64],
+                params![tags, bucket, key, version_id.to_u64() as i64],
             )
             .map_err(|e| MetadataError::Db {
                 context: "put object tags",
@@ -1321,12 +1355,12 @@ impl PgMetadataStore for PgStore {
         &self,
         bucket: &str,
         key: &str,
-        version_id: u64,
+        version_id: VersionId,
     ) -> Result<Option<String>, MetadataError> {
         self.conn
             .query_row(
                 "SELECT tags FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
-                params![bucket, key, version_id as i64],
+                params![bucket, key, version_id.to_u64() as i64],
                 |row| row.get(0),
             )
             .optional()
@@ -1341,13 +1375,13 @@ impl PgMetadataStore for PgStore {
         &self,
         bucket: &str,
         key: &str,
-        version_id: u64,
+        version_id: VersionId,
     ) -> Result<(), MetadataError> {
         let updated = self
             .conn
             .execute(
                 "UPDATE objects SET tags = NULL WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
-                params![bucket, key, version_id as i64],
+                params![bucket, key, version_id.to_u64() as i64],
             )
             .map_err(|e| MetadataError::Db {
                 context: "delete object tags",
@@ -1884,7 +1918,7 @@ impl PgMetadataStore for PgStore {
                 stmt.execute(params![
                     part.bucket,
                     part.key,
-                    part.version_id as i64,
+                    part.version_id.to_u64() as i64,
                     part.part_number,
                     part.size as i64,
                     part.etag,
@@ -1925,7 +1959,7 @@ impl PgMetadataStore for PgStore {
         &self,
         bucket: &str,
         key: &str,
-        version_id: u64,
+        version_id: VersionId,
     ) -> Result<Vec<ObjectPartRecord>, MetadataError> {
         let mut stmt = self
             .conn
@@ -1942,12 +1976,12 @@ impl PgMetadataStore for PgStore {
             })?;
 
         let rows = stmt
-            .query_map(params![bucket, key, version_id as i64], |row| {
+            .query_map(params![bucket, key, version_id.to_u64() as i64], |row| {
                 let part_okh = Self::blob_to_okh(row.get(7)?, 7)?;
                 Ok(ObjectPartRecord {
                     bucket: row.get(0)?,
                     key: row.get(1)?,
-                    version_id: row.get::<_, i64>(2)? as u64,
+                    version_id: PgStore::parse_version_id(row.get::<_, i64>(2)?, 2)?,
                     part_number: row.get::<_, i64>(3)? as u32,
                     size: row.get::<_, i64>(4)? as u64,
                     etag: row.get(5)?,
@@ -1979,13 +2013,13 @@ impl PgMetadataStore for PgStore {
         &self,
         bucket: &str,
         key: &str,
-        version_id: u64,
+        version_id: VersionId,
     ) -> Result<(), MetadataError> {
         self.conn
             .execute(
                 "DELETE FROM object_parts \
                  WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
-                params![bucket, key, version_id as i64],
+                params![bucket, key, version_id.to_u64() as i64],
             )
             .map_err(|e| MetadataError::Db {
                 context: "delete object parts",
@@ -2045,7 +2079,7 @@ impl PgMetadataStore for PgStore {
             }
 
             // 2. Write/overwrite object metadata row.
-            if obj.version_id == 0 {
+            if obj.version_id.is_null() {
                 self.conn.execute(
                     "INSERT OR REPLACE INTO objects \
                      (bucket, key, version_id, size, etag, etag_kind, last_modified, \
@@ -2054,7 +2088,7 @@ impl PgMetadataStore for PgStore {
                     params![
                         obj.bucket,
                         obj.key,
-                        obj.version_id as i64,
+                        obj.version_id.to_u64() as i64,
                         obj.size as i64,
                         obj.etag,
                         obj.etag_kind as u8,
@@ -2076,7 +2110,7 @@ impl PgMetadataStore for PgStore {
                     params![
                         obj.bucket,
                         obj.key,
-                        obj.version_id as i64,
+                        obj.version_id.to_u64() as i64,
                         obj.size as i64,
                         obj.etag,
                         obj.etag_kind as u8,
@@ -2095,7 +2129,7 @@ impl PgMetadataStore for PgStore {
             self.conn.execute(
                 "DELETE FROM object_parts \
                  WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
-                params![obj.bucket, obj.key, obj.version_id as i64],
+                params![obj.bucket, obj.key, obj.version_id.to_u64() as i64],
             )?;
 
             // 4. Insert new manifest rows.
@@ -2110,7 +2144,7 @@ impl PgMetadataStore for PgStore {
                     stmt.execute(params![
                         part.bucket,
                         part.key,
-                        part.version_id as i64,
+                        part.version_id.to_u64() as i64,
                         part.part_number,
                         part.size as i64,
                         part.etag,
@@ -2130,7 +2164,7 @@ impl PgMetadataStore for PgStore {
             self.conn.execute(
                 "DELETE FROM multipart_part_chunks \
                  WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 AND upload_id != ?4",
-                params![obj.bucket, obj.key, obj.version_id as i64, upload_id],
+                params![obj.bucket, obj.key, obj.version_id.to_u64() as i64, upload_id],
             )?;
 
             // 6. Reparent this upload's chunks from staging version_id to
@@ -2141,11 +2175,11 @@ impl PgMetadataStore for PgStore {
                  WHERE bucket = ?2 AND key = ?3 AND upload_id = ?4 \
                  AND version_id = ?5",
                 params![
-                    obj.version_id as i64,
+                    obj.version_id.to_u64() as i64,
                     obj.bucket,
                     obj.key,
                     upload_id,
-                    PART_CHUNK_STAGING_VERSION_ID as i64,
+                    PART_CHUNK_STAGING_VERSION_ID.to_u64() as i64,
                 ],
             )?;
 
@@ -2496,7 +2530,7 @@ impl PgMetadataStore for PgStore {
             let data_layout = data_layout as u8;
             let parts_count = obj.parts_count.map(|n| n as i64);
 
-            let obj_sql = if obj.version_id == 0 {
+            let obj_sql = if obj.version_id.is_null() {
                 "INSERT OR REPLACE INTO objects \
                  (bucket, key, version_id, size, etag, etag_kind, last_modified, \
                   storage_class, ec_k, ec_m, status, data_layout, parts_count, metadata_blob) \
@@ -2513,7 +2547,7 @@ impl PgMetadataStore for PgStore {
                     params![
                         obj.bucket,
                         obj.key,
-                        obj.version_id as i64,
+                        obj.version_id.to_u64() as i64,
                         obj.size as i64,
                         obj.etag,
                         obj.etag_kind as u8,
@@ -2536,7 +2570,7 @@ impl PgMetadataStore for PgStore {
                 .execute(
                     "DELETE FROM stream_object_chunks \
                      WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
-                    params![obj.bucket, obj.key, obj.version_id as i64],
+                    params![obj.bucket, obj.key, obj.version_id.to_u64() as i64],
                 )
                 .map_err(|e| MetadataError::Db {
                     context: "commit stream put (delete prior chunks)",
@@ -2569,7 +2603,7 @@ impl PgMetadataStore for PgStore {
                     stmt.execute(params![
                         chunk.bucket,
                         chunk.key,
-                        chunk.version_id as i64,
+                        chunk.version_id.to_u64() as i64,
                         chunk.chunk_index,
                         chunk.size as i64,
                         chunk.chunk_okh.as_slice(),
@@ -2779,7 +2813,7 @@ impl PgMetadataStore for PgStore {
                     if chunk.bucket != sess_bucket
                         || chunk.key != sess_key
                         || chunk.upload_id != part.upload_id
-                        || chunk.version_id != PART_CHUNK_STAGING_VERSION_ID
+                        || chunk.version_id != PART_CHUNK_STAGING_VERSION_ID.to_u64()
                         || chunk.part_number != part.part_number
                     {
                         return Err(MetadataError::StreamSessionNotFound {
@@ -2843,7 +2877,7 @@ impl PgMetadataStore for PgStore {
         &self,
         bucket: &str,
         key: &str,
-        version_id: u64,
+        version_id: VersionId,
     ) -> Result<Vec<StreamObjectChunkRecord>, MetadataError> {
         let mut stmt = self
             .conn
@@ -2859,13 +2893,13 @@ impl PgMetadataStore for PgStore {
             })?;
 
         let rows = stmt
-            .query_map(params![bucket, key, version_id as i64], |row| {
+            .query_map(params![bucket, key, version_id.to_u64() as i64], |row| {
                 let okh_blob: Vec<u8> = row.get(5)?;
                 let okh = PgStore::parse_okh_blob(&okh_blob, 5)?;
                 Ok(StreamObjectChunkRecord {
                     bucket: row.get(0)?,
                     key: row.get(1)?,
-                    version_id: row.get::<_, i64>(2)? as u64,
+                    version_id: PgStore::parse_version_id(row.get::<_, i64>(2)?, 2)?,
                     chunk_index: row.get(3)?,
                     size: row.get::<_, i64>(4)? as u64,
                     chunk_okh: okh,
@@ -2894,13 +2928,13 @@ impl PgMetadataStore for PgStore {
         &self,
         bucket: &str,
         key: &str,
-        version_id: u64,
+        version_id: VersionId,
     ) -> Result<(), MetadataError> {
         self.conn
             .execute(
                 "DELETE FROM stream_object_chunks \
                  WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
-                params![bucket, key, version_id as i64],
+                params![bucket, key, version_id.to_u64() as i64],
             )
             .map_err(|e| MetadataError::Db {
                 context: "delete stream object chunks",
@@ -2913,7 +2947,7 @@ impl PgMetadataStore for PgStore {
         &self,
         bucket: &str,
         key: &str,
-        version_id: u64,
+        version_id: VersionId,
         part_number: u32,
     ) -> Result<Vec<MultipartPartChunkRecord>, MetadataError> {
         let mut stmt = self
@@ -2931,7 +2965,7 @@ impl PgMetadataStore for PgStore {
 
         let rows = stmt
             .query_map(
-                params![bucket, key, version_id as i64, part_number],
+                params![bucket, key, version_id.to_u64() as i64, part_number],
                 |row| {
                     let okh_blob: Vec<u8> = row.get(7)?;
                     let okh = PgStore::parse_okh_blob(&okh_blob, 7)?;
@@ -2970,13 +3004,13 @@ impl PgMetadataStore for PgStore {
         &self,
         bucket: &str,
         key: &str,
-        version_id: u64,
+        version_id: VersionId,
     ) -> Result<(), MetadataError> {
         self.conn
             .execute(
                 "DELETE FROM multipart_part_chunks \
                  WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
-                params![bucket, key, version_id as i64],
+                params![bucket, key, version_id.to_u64() as i64],
             )
             .map_err(|e| MetadataError::Db {
                 context: "delete multipart part chunks",
@@ -3134,7 +3168,7 @@ mod tests {
                 .put_object_meta(&PutObjectMetaReq {
                     bucket: "bucket".into(),
                     key: key.to_string(),
-                    version_id: 0,
+                    version_id: VersionId::Null,
                     status: ObjectState::Live,
                     size: 10,
                     etag: vec![0; 8],
@@ -3290,7 +3324,7 @@ mod tests {
                 .put_object_meta(&PutObjectMetaReq {
                     bucket: "b".into(),
                     key: format!("key-{:02}", i),
-                    version_id: 0,
+                    version_id: VersionId::Null,
                     status: ObjectState::Live,
                     size: 0,
                     etag: vec![0; 8],
