@@ -22,6 +22,8 @@ use crate::coordinator::ChecksumClaim;
 use crate::coordinator::Coordinator;
 use crate::coordinator::CopyObjectRequest;
 use crate::coordinator::CopySource;
+use crate::coordinator::FinalizeStreamPartRequest;
+use crate::coordinator::FinalizeStreamPutRequest;
 use crate::coordinator::MetadataDirective;
 use crate::coordinator::UploadPartCopyRequest;
 use crate::error::ServerError;
@@ -1794,15 +1796,15 @@ impl HttpFrontend {
             blob
         };
 
-        let result = self.coordinator.finalize_stream_put(
-            &ctx.bucket,
-            &ctx.key,
-            &ctx.session_id,
+        let result = self.coordinator.finalize_stream_put(&FinalizeStreamPutRequest {
+            bucket: &ctx.bucket,
+            key: &ctx.key,
+            session_id: &ctx.session_id,
             crc64,
             total_size,
-            &metadata_blob,
-            &ctx.cond,
-        )?;
+            metadata_blob: &metadata_blob,
+            cond: &ctx.cond,
+        })?;
 
         if let Some(ref tags_xml) = ctx.inline_tags_xml {
             self.coordinator.put_object_tags(
@@ -1917,17 +1919,17 @@ impl HttpFrontend {
         };
         let effective_claim = trailer_claim.as_ref().or(ctx.claimed_checksum.as_ref());
 
-        let result = self.coordinator.finalize_stream_part(
-            &ctx.bucket,
-            &ctx.key,
-            &ctx.session_id,
-            &ctx.upload_id,
-            ctx.part_number,
+        let result = self.coordinator.finalize_stream_part(FinalizeStreamPartRequest {
+            bucket: &ctx.bucket,
+            key: &ctx.key,
+            session_id: &ctx.session_id,
+            upload_id: &ctx.upload_id,
+            part_number: ctx.part_number,
             crc64,
             total_size,
-            effective_claim,
+            claimed_checksum: effective_claim,
             computed_checksum,
-        )?;
+        })?;
 
         let mut resp = S3Response::upload_part(&result.etag, result.checksum.as_ref());
         // The coordinator's result already includes the checksum via

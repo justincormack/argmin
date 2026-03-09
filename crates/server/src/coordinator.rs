@@ -238,6 +238,32 @@ pub struct UploadPartCopyRequest<'a> {
     pub copy_source_range: Option<(u64, u64)>,
 }
 
+/// Parsed request for finalizing a streaming PutObject.
+#[derive(Debug)]
+pub struct FinalizeStreamPutRequest<'a> {
+    pub bucket: &'a str,
+    pub key: &'a str,
+    pub session_id: &'a str,
+    pub crc64: u64,
+    pub total_size: u64,
+    pub metadata_blob: &'a MetadataBlob,
+    pub cond: &'a WriteCondition,
+}
+
+/// Parsed request for finalizing a streaming UploadPart.
+#[derive(Debug)]
+pub struct FinalizeStreamPartRequest<'a> {
+    pub bucket: &'a str,
+    pub key: &'a str,
+    pub session_id: &'a str,
+    pub upload_id: &'a str,
+    pub part_number: u32,
+    pub crc64: u64,
+    pub total_size: u64,
+    pub claimed_checksum: Option<&'a ChecksumClaim>,
+    pub computed_checksum: Option<(ChecksumAlgorithm, Vec<u8>)>,
+}
+
 /// Result of a `CopyObject` operation.
 #[derive(Debug)]
 pub struct CopyObjectResult {
@@ -1306,17 +1332,17 @@ impl Coordinator {
     ///
     /// The caller passes the running CRC64 checksum, total size, and metadata
     /// blob computed during the append phase. No chunk data is re-read.
-    #[allow(clippy::too_many_arguments)]
     pub fn finalize_stream_put(
         &self,
-        bucket: &str,
-        key: &str,
-        session_id: &str,
-        crc64: u64,
-        total_size: u64,
-        metadata_blob: &MetadataBlob,
-        cond: &WriteCondition,
+        req: &FinalizeStreamPutRequest,
     ) -> Result<PutObjectResult, ServerError> {
+        let bucket = req.bucket;
+        let key = req.key;
+        let session_id = req.session_id;
+        let crc64 = req.crc64;
+        let total_size = req.total_size;
+        let metadata_blob = req.metadata_blob;
+        let cond = req.cond;
         let _bucket_guard = self.storage_node.lock_bucket(bucket);
 
         let bucket_info = self.head_bucket(bucket)?;
@@ -1426,19 +1452,19 @@ impl Coordinator {
     /// rows, and atomically commits the part via `commit_stream_part`.
     /// `computed_checksum` is the actual checksum bytes computed incrementally
     /// during streaming. If `None`, the checksum is derived from `claimed_checksum`.
-    #[allow(clippy::too_many_arguments)]
     pub fn finalize_stream_part(
         &self,
-        bucket: &str,
-        key: &str,
-        session_id: &str,
-        upload_id: &str,
-        part_number: u32,
-        crc64: u64,
-        total_size: u64,
-        claimed_checksum: Option<&ChecksumClaim>,
-        computed_checksum: Option<(ChecksumAlgorithm, Vec<u8>)>,
+        req: FinalizeStreamPartRequest,
     ) -> Result<UploadPartResult, ServerError> {
+        let bucket = req.bucket;
+        let key = req.key;
+        let session_id = req.session_id;
+        let upload_id = req.upload_id;
+        let part_number = req.part_number;
+        let crc64 = req.crc64;
+        let total_size = req.total_size;
+        let claimed_checksum = req.claimed_checksum;
+        let computed_checksum = req.computed_checksum;
         let meta_pg_id = self.object_pg_id(bucket, key);
         let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
 
@@ -1759,7 +1785,6 @@ impl Coordinator {
     /// Supports conditional headers on both source and destination,
     /// and metadata directive (COPY preserves source metadata, REPLACE
     /// uses new headers).
-    #[allow(clippy::too_many_arguments)]
     pub fn copy_object(
         &self,
         req: &CopyObjectRequest,
@@ -4040,7 +4065,6 @@ impl Coordinator {
     }
 
     /// Copy a byte range from an existing object as a multipart upload part.
-    #[allow(clippy::too_many_arguments)]
     pub fn upload_part_copy(
         &self,
         req: &UploadPartCopyRequest,
@@ -9525,15 +9549,15 @@ mod tests {
         let crc = checksum::crc64::checksum(&full_data);
         let metadata = MetadataBlob::from_headers(&[("x-amz-meta-foo", "bar")]).unwrap();
         let result = coord
-            .finalize_stream_put(
-                "bucket",
-                "mykey",
-                &session_id,
-                crc,
-                full_data.len() as u64,
-                &metadata,
-                &WriteCondition::default(),
-            )
+            .finalize_stream_put(&FinalizeStreamPutRequest {
+                bucket: "bucket",
+                key: "mykey",
+                session_id: &session_id,
+                crc64: crc,
+                total_size: full_data.len() as u64,
+                metadata_blob: &metadata,
+                cond: &WriteCondition::default(),
+            })
             .unwrap();
 
         assert_eq!(result.etag, format_etag(crc));
@@ -9558,15 +9582,15 @@ mod tests {
         let crc = checksum::crc64::checksum(&[]);
         let metadata = MetadataBlob::new();
         let result = coord
-            .finalize_stream_put(
-                "bucket",
-                "mykey",
-                &session_id,
-                crc,
-                0,
-                &metadata,
-                &WriteCondition::default(),
-            )
+            .finalize_stream_put(&FinalizeStreamPutRequest {
+                bucket: "bucket",
+                key: "mykey",
+                session_id: &session_id,
+                crc64: crc,
+                total_size: 0,
+                metadata_blob: &metadata,
+                cond: &WriteCondition::default(),
+            })
             .unwrap();
 
         assert_eq!(result.etag, format_etag(crc));
@@ -9608,15 +9632,15 @@ mod tests {
         let crc = checksum::crc64::checksum(&[]);
         let metadata = MetadataBlob::new();
         coord
-            .finalize_stream_put(
-                "bucket",
-                "mykey",
-                &session_id,
-                crc,
-                0,
-                &metadata,
-                &WriteCondition::default(),
-            )
+            .finalize_stream_put(&FinalizeStreamPutRequest {
+                bucket: "bucket",
+                key: "mykey",
+                session_id: &session_id,
+                crc64: crc,
+                total_size: 0,
+                metadata_blob: &metadata,
+                cond: &WriteCondition::default(),
+            })
             .unwrap();
 
         // Session is deleted after finalize — append should fail.
@@ -9646,15 +9670,15 @@ mod tests {
         let crc = checksum::crc64::checksum(&[]);
         let metadata = MetadataBlob::new();
         let err = coord
-            .finalize_stream_put(
-                "bucket",
-                "mykey",
-                &session_id,
-                crc,
-                0,
-                &metadata,
-                &WriteCondition::default(),
-            )
+            .finalize_stream_put(&FinalizeStreamPutRequest {
+                bucket: "bucket",
+                key: "mykey",
+                session_id: &session_id,
+                crc64: crc,
+                total_size: 0,
+                metadata_blob: &metadata,
+                cond: &WriteCondition::default(),
+            })
             .unwrap_err();
         assert!(
             matches!(
@@ -9700,15 +9724,15 @@ mod tests {
         let crc = checksum::crc64::checksum(&[]);
         let metadata = MetadataBlob::new();
         let err = coord
-            .finalize_stream_put(
-                "bucket",
-                "key2",
-                &session_id,
-                crc,
-                0,
-                &metadata,
-                &WriteCondition::default(),
-            )
+            .finalize_stream_put(&FinalizeStreamPutRequest {
+                bucket: "bucket",
+                key: "key2",
+                session_id: &session_id,
+                crc64: crc,
+                total_size: 0,
+                metadata_blob: &metadata,
+                cond: &WriteCondition::default(),
+            })
             .unwrap_err();
         assert!(
             matches!(
@@ -9756,15 +9780,15 @@ mod tests {
         let crc = checksum::crc64::checksum(new_data.as_slice());
         let metadata = MetadataBlob::new();
         let result = coord
-            .finalize_stream_put(
-                "bucket",
-                "key",
-                &session_id,
-                crc,
-                new_data.len() as u64,
-                &metadata,
-                &WriteCondition::default(),
-            )
+            .finalize_stream_put(&FinalizeStreamPutRequest {
+                bucket: "bucket",
+                key: "key",
+                session_id: &session_id,
+                crc64: crc,
+                total_size: new_data.len() as u64,
+                metadata_blob: &metadata,
+                cond: &WriteCondition::default(),
+            })
             .unwrap();
         assert_eq!(result.etag, format_etag(crc));
 
@@ -9793,7 +9817,15 @@ mod tests {
         let metadata = MetadataBlob::new();
         let cond = WriteCondition::IfMatch(SpecificEtag::new(initial.etag.clone()).unwrap());
         coord
-            .finalize_stream_put("bucket", "key", &session_id, crc, 7, &metadata, &cond)
+            .finalize_stream_put(&FinalizeStreamPutRequest {
+                bucket: "bucket",
+                key: "key",
+                session_id: &session_id,
+                crc64: crc,
+                total_size: 7,
+                metadata_blob: &metadata,
+                cond: &cond,
+            })
             .unwrap();
 
         // Stream put with if-match on a wrong etag fails.
@@ -9804,15 +9836,15 @@ mod tests {
         let bad_cond =
             WriteCondition::IfMatch(SpecificEtag::new("\"0000000000000000\"".to_string()).unwrap());
         let err = coord
-            .finalize_stream_put(
-                "bucket",
-                "key",
-                &session_id2,
-                checksum::crc64::checksum(b"third"),
-                5,
-                &metadata,
-                &bad_cond,
-            )
+            .finalize_stream_put(&FinalizeStreamPutRequest {
+                bucket: "bucket",
+                key: "key",
+                session_id: &session_id2,
+                crc64: checksum::crc64::checksum(b"third"),
+                total_size: 5,
+                metadata_blob: &metadata,
+                cond: &bad_cond,
+            })
             .unwrap_err();
         assert!(
             matches!(err, ServerError::PreconditionFailed),
@@ -9843,15 +9875,15 @@ mod tests {
         let crc = checksum::crc64::checksum(&full_data);
         let metadata = MetadataBlob::new();
         let result = coord
-            .finalize_stream_put(
-                "bucket",
-                "key",
-                &session_id,
-                crc,
-                full_data.len() as u64,
-                &metadata,
-                &WriteCondition::default(),
-            )
+            .finalize_stream_put(&FinalizeStreamPutRequest {
+                bucket: "bucket",
+                key: "key",
+                session_id: &session_id,
+                crc64: crc,
+                total_size: full_data.len() as u64,
+                metadata_blob: &metadata,
+                cond: &WriteCondition::default(),
+            })
             .unwrap();
         assert_eq!(result.etag, format_etag(crc));
 
@@ -9916,15 +9948,15 @@ mod tests {
         let crc = checksum::crc64::checksum(b"hello");
         let metadata = MetadataBlob::new();
         coord
-            .finalize_stream_put(
-                "bucket",
-                "key",
-                &session_id,
-                crc,
-                5,
-                &metadata,
-                &WriteCondition::default(),
-            )
+            .finalize_stream_put(&FinalizeStreamPutRequest {
+                bucket: "bucket",
+                key: "key",
+                session_id: &session_id,
+                crc64: crc,
+                total_size: 5,
+                metadata_blob: &metadata,
+                cond: &WriteCondition::default(),
+            })
             .unwrap();
 
         // HEAD works (metadata-only).
@@ -9958,15 +9990,15 @@ mod tests {
         let full_data = b"aaaabbbbcc";
         let crc = checksum::crc64::checksum(full_data);
         coord
-            .finalize_stream_put(
-                "bucket",
-                "key",
-                &session_id,
-                crc,
-                10,
-                &MetadataBlob::new(),
-                &WriteCondition::default(),
-            )
+            .finalize_stream_put(&FinalizeStreamPutRequest {
+                bucket: "bucket",
+                key: "key",
+                session_id: &session_id,
+                crc64: crc,
+                total_size: 10,
+                metadata_blob: &MetadataBlob::new(),
+                cond: &WriteCondition::default(),
+            })
             .unwrap();
 
         let result = coord.get_object("bucket", "key", None, NO_READ).unwrap();
@@ -9992,15 +10024,15 @@ mod tests {
         let full_data = b"AAAABBBB";
         let crc = checksum::crc64::checksum(full_data);
         coord
-            .finalize_stream_put(
-                "bucket",
-                "key",
-                &session_id,
-                crc,
-                8,
-                &MetadataBlob::new(),
-                &WriteCondition::default(),
-            )
+            .finalize_stream_put(&FinalizeStreamPutRequest {
+                bucket: "bucket",
+                key: "key",
+                session_id: &session_id,
+                crc64: crc,
+                total_size: 8,
+                metadata_blob: &MetadataBlob::new(),
+                cond: &WriteCondition::default(),
+            })
             .unwrap();
 
         // Range within first chunk.
@@ -10065,15 +10097,15 @@ mod tests {
             .unwrap();
         let crc = checksum::crc64::checksum(b"copy-me");
         coord
-            .finalize_stream_put(
-                "bucket",
-                "src",
-                &session_id,
-                crc,
-                7,
-                &MetadataBlob::new(),
-                &WriteCondition::default(),
-            )
+            .finalize_stream_put(&FinalizeStreamPutRequest {
+                bucket: "bucket",
+                key: "src",
+                session_id: &session_id,
+                crc64: crc,
+                total_size: 7,
+                metadata_blob: &MetadataBlob::new(),
+                cond: &WriteCondition::default(),
+            })
             .unwrap();
 
         // Copy to destination.
@@ -10107,15 +10139,15 @@ mod tests {
         let session_id = coord.begin_stream_put("bucket", "empty").unwrap();
         let crc = checksum::crc64::checksum(b"");
         coord
-            .finalize_stream_put(
-                "bucket",
-                "empty",
-                &session_id,
-                crc,
-                0,
-                &MetadataBlob::new(),
-                &WriteCondition::default(),
-            )
+            .finalize_stream_put(&FinalizeStreamPutRequest {
+                bucket: "bucket",
+                key: "empty",
+                session_id: &session_id,
+                crc64: crc,
+                total_size: 0,
+                metadata_blob: &MetadataBlob::new(),
+                cond: &WriteCondition::default(),
+            })
             .unwrap();
 
         let result = coord.get_object("bucket", "empty", None, NO_READ).unwrap();
@@ -10136,15 +10168,15 @@ mod tests {
             .unwrap();
         let crc = checksum::crc64::checksum(b"partdata");
         coord
-            .finalize_stream_put(
-                "bucket",
-                "key",
-                &session_id,
-                crc,
-                8,
-                &MetadataBlob::new(),
-                &WriteCondition::default(),
-            )
+            .finalize_stream_put(&FinalizeStreamPutRequest {
+                bucket: "bucket",
+                key: "key",
+                session_id: &session_id,
+                crc64: crc,
+                total_size: 8,
+                metadata_blob: &MetadataBlob::new(),
+                cond: &WriteCondition::default(),
+            })
             .unwrap();
 
         let result = coord
@@ -10167,15 +10199,15 @@ mod tests {
             .unwrap();
         let crc = checksum::crc64::checksum(b"stream-data");
         coord
-            .finalize_stream_put(
-                "bucket",
-                "key",
-                &session_id,
-                crc,
-                11,
-                &MetadataBlob::new(),
-                &WriteCondition::default(),
-            )
+            .finalize_stream_put(&FinalizeStreamPutRequest {
+                bucket: "bucket",
+                key: "key",
+                session_id: &session_id,
+                crc64: crc,
+                total_size: 11,
+                metadata_blob: &MetadataBlob::new(),
+                cond: &WriteCondition::default(),
+            })
             .unwrap();
 
         // Verify stream-put is readable.
@@ -10211,15 +10243,15 @@ mod tests {
             .unwrap();
         let crc = checksum::crc64::checksum(b"delete-me");
         coord
-            .finalize_stream_put(
-                "bucket",
-                "key",
-                &session_id,
-                crc,
-                9,
-                &MetadataBlob::new(),
-                &WriteCondition::default(),
-            )
+            .finalize_stream_put(&FinalizeStreamPutRequest {
+                bucket: "bucket",
+                key: "key",
+                session_id: &session_id,
+                crc64: crc,
+                total_size: 9,
+                metadata_blob: &MetadataBlob::new(),
+                cond: &WriteCondition::default(),
+            })
             .unwrap();
 
         // Delete the object.
@@ -10253,15 +10285,15 @@ mod tests {
             .unwrap();
         let crc = checksum::crc64::checksum(b"source-data");
         coord
-            .finalize_stream_put(
-                "bucket",
-                "src",
-                &session_id,
-                crc,
-                11,
-                &MetadataBlob::new(),
-                &WriteCondition::default(),
-            )
+            .finalize_stream_put(&FinalizeStreamPutRequest {
+                bucket: "bucket",
+                key: "src",
+                session_id: &session_id,
+                crc64: crc,
+                total_size: 11,
+                metadata_blob: &MetadataBlob::new(),
+                cond: &WriteCondition::default(),
+            })
             .unwrap();
 
         // Create a multipart upload for the destination.
@@ -10312,15 +10344,15 @@ mod tests {
         let crc = checksum::crc64::checksum(b"first");
         let metadata = MetadataBlob::new();
         coord
-            .finalize_stream_put(
-                "bucket",
-                "key",
-                &session_id,
-                crc,
-                5,
-                &metadata,
-                &WriteCondition::default(),
-            )
+            .finalize_stream_put(&FinalizeStreamPutRequest {
+                bucket: "bucket",
+                key: "key",
+                session_id: &session_id,
+                crc64: crc,
+                total_size: 5,
+                metadata_blob: &metadata,
+                cond: &WriteCondition::default(),
+            })
             .unwrap();
     }
 
@@ -10339,15 +10371,15 @@ mod tests {
         let crc = checksum::crc64::checksum(b"hello");
         let metadata = MetadataBlob::new();
         let err = coord
-            .finalize_stream_put(
-                "bucket",
-                "key",
-                &session_id,
-                crc,
-                999, // wrong — actual is 5
-                &metadata,
-                &WriteCondition::default(),
-            )
+            .finalize_stream_put(&FinalizeStreamPutRequest {
+                bucket: "bucket",
+                key: "key",
+                session_id: &session_id,
+                crc64: crc,
+                total_size: 999, // wrong — actual is 5
+                metadata_blob: &metadata,
+                cond: &WriteCondition::default(),
+            })
             .unwrap_err();
         assert!(
             matches!(err, ServerError::InvalidRequest { .. }),
@@ -10409,17 +10441,17 @@ mod tests {
         // Finalize.
         let crc = checksum::crc64::checksum(data);
         let result = coord
-            .finalize_stream_part(
-                "bucket",
-                "key",
-                &session_id,
-                &mpu.upload_id,
-                1,
-                crc,
-                data.len() as u64,
-                None,
-                None,
-            )
+            .finalize_stream_part(FinalizeStreamPartRequest {
+                bucket: "bucket",
+                key: "key",
+                session_id: &session_id,
+                upload_id: &mpu.upload_id,
+                part_number: 1,
+                crc64: crc,
+                total_size: data.len() as u64,
+                claimed_checksum: None,
+                computed_checksum: None,
+            })
             .unwrap();
         assert!(!result.etag.is_empty());
     }
@@ -10507,17 +10539,17 @@ mod tests {
             .unwrap();
 
         let err = coord
-            .finalize_stream_part(
-                "bucket",
-                "key",
-                &session_id,
-                &mpu.upload_id,
-                1,
-                checksum::crc64::checksum(b"data"),
-                4,
-                None,
-                None,
-            )
+            .finalize_stream_part(FinalizeStreamPartRequest {
+                bucket: "bucket",
+                key: "key",
+                session_id: &session_id,
+                upload_id: &mpu.upload_id,
+                part_number: 1,
+                crc64: checksum::crc64::checksum(b"data"),
+                total_size: 4,
+                claimed_checksum: None,
+                computed_checksum: None,
+            })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidRequest { .. }));
     }
@@ -10552,17 +10584,17 @@ mod tests {
                 .unwrap();
             let crc = checksum::crc64::checksum(data);
             let result = coord
-                .finalize_stream_part(
-                    "bucket",
-                    "key",
-                    &sess,
+                .finalize_stream_part(FinalizeStreamPartRequest {
+                    bucket: "bucket",
+                    key: "key",
+                    session_id: &sess,
                     upload_id,
-                    1,
-                    crc,
-                    data.len() as u64,
-                    None,
-                    None,
-                )
+                    part_number: 1,
+                    crc64: crc,
+                    total_size: data.len() as u64,
+                    claimed_checksum: None,
+                    computed_checksum: None,
+                })
                 .unwrap();
             CompletePart {
                 part_number: 1,
@@ -10635,17 +10667,17 @@ mod tests {
             .unwrap();
         let crc = checksum::crc64::checksum(data);
         coord
-            .finalize_stream_part(
-                "bucket",
-                "key",
-                &sess,
-                &mpu.upload_id,
-                1,
-                crc,
-                data.len() as u64,
-                None,
-                None,
-            )
+            .finalize_stream_part(FinalizeStreamPartRequest {
+                bucket: "bucket",
+                key: "key",
+                session_id: &sess,
+                upload_id: &mpu.upload_id,
+                part_number: 1,
+                crc64: crc,
+                total_size: data.len() as u64,
+                claimed_checksum: None,
+                computed_checksum: None,
+            })
             .unwrap();
 
         // Capture chunk records before abort for shard verification.
@@ -10752,15 +10784,15 @@ mod tests {
             .unwrap();
         let crc = checksum::crc64::checksum(b"safe-data");
         coord
-            .finalize_stream_put(
-                "bucket",
-                "key",
-                &session_id,
-                crc,
-                9,
-                &MetadataBlob::new(),
-                &WriteCondition::default(),
-            )
+            .finalize_stream_put(&FinalizeStreamPutRequest {
+                bucket: "bucket",
+                key: "key",
+                session_id: &session_id,
+                crc64: crc,
+                total_size: 9,
+                metadata_blob: &MetadataBlob::new(),
+                cond: &WriteCondition::default(),
+            })
             .unwrap();
 
         // Scavenge with max_age=0 — should find nothing to clean.
@@ -10815,15 +10847,15 @@ mod tests {
         let full = b"chunk-0-chunk-1-";
         let crc = checksum::crc64::checksum(full);
         coord
-            .finalize_stream_put(
-                "bucket",
-                "verify",
-                &session_id,
-                crc,
-                16,
-                &MetadataBlob::new(),
-                &WriteCondition::default(),
-            )
+            .finalize_stream_put(&FinalizeStreamPutRequest {
+                bucket: "bucket",
+                key: "verify",
+                session_id: &session_id,
+                crc64: crc,
+                total_size: 16,
+                metadata_blob: &MetadataBlob::new(),
+                cond: &WriteCondition::default(),
+            })
             .unwrap();
 
         // Read back via storage layer directly.
@@ -10864,15 +10896,15 @@ mod tests {
             .unwrap();
         let crc = checksum::crc64::checksum(b"v1");
         coord
-            .finalize_stream_put(
-                "bucket",
-                "cycle",
-                &session_id,
-                crc,
-                2,
-                &MetadataBlob::new(),
-                &WriteCondition::default(),
-            )
+            .finalize_stream_put(&FinalizeStreamPutRequest {
+                bucket: "bucket",
+                key: "cycle",
+                session_id: &session_id,
+                crc64: crc,
+                total_size: 2,
+                metadata_blob: &MetadataBlob::new(),
+                cond: &WriteCondition::default(),
+            })
             .unwrap();
 
         // 2. Delete.
@@ -10914,15 +10946,15 @@ mod tests {
             .append_stream_chunk("bucket", "key", &s1, 0, b"old-data")
             .unwrap();
         coord
-            .finalize_stream_put(
-                "bucket",
-                "key",
-                &s1,
-                checksum::crc64::checksum(b"old-data"),
-                8,
-                &MetadataBlob::new(),
-                &WriteCondition::default(),
-            )
+            .finalize_stream_put(&FinalizeStreamPutRequest {
+                bucket: "bucket",
+                key: "key",
+                session_id: &s1,
+                crc64: checksum::crc64::checksum(b"old-data"),
+                total_size: 8,
+                metadata_blob: &MetadataBlob::new(),
+                cond: &WriteCondition::default(),
+            })
             .unwrap();
 
         // Second stream-write (overwrite).
@@ -10931,15 +10963,15 @@ mod tests {
             .append_stream_chunk("bucket", "key", &s2, 0, b"new-data")
             .unwrap();
         coord
-            .finalize_stream_put(
-                "bucket",
-                "key",
-                &s2,
-                checksum::crc64::checksum(b"new-data"),
-                8,
-                &MetadataBlob::new(),
-                &WriteCondition::default(),
-            )
+            .finalize_stream_put(&FinalizeStreamPutRequest {
+                bucket: "bucket",
+                key: "key",
+                session_id: &s2,
+                crc64: checksum::crc64::checksum(b"new-data"),
+                total_size: 8,
+                metadata_blob: &MetadataBlob::new(),
+                cond: &WriteCondition::default(),
+            })
             .unwrap();
 
         let result = coord.get_object("bucket", "key", None, NO_READ).unwrap();
