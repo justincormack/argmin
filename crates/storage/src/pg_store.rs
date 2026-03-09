@@ -212,36 +212,6 @@ impl PgStore {
         }
     }
 
-    fn validate_object_layout(
-        status: ObjectState,
-        data_layout: DataLayout,
-        parts_count: Option<u32>,
-    ) -> Result<(), rusqlite::Error> {
-        let valid = match status {
-            // Live object: ChunkManifest has no parts_count, MultipartManifest requires >0 parts.
-            ObjectState::Live => match data_layout {
-                DataLayout::ChunkManifestInternal => parts_count.is_none(),
-                DataLayout::MultipartManifest => parts_count.is_some_and(|n| n > 0),
-            },
-            // Delete marker records must be non-multipart.
-            ObjectState::DeleteMarker => {
-                data_layout == DataLayout::ChunkManifestInternal && parts_count.is_none()
-            }
-        };
-        if valid {
-            Ok(())
-        } else {
-            Err(rusqlite::Error::FromSqlConversionFailure(
-                13,
-                rusqlite::types::Type::Integer,
-                Box::from(format!(
-                    "invalid object layout combination: status={status}, layout={:?}, parts_count={parts_count:?}",
-                    data_layout
-                )),
-            ))
-        }
-    }
-
     fn parse_optional_u32(
         value: Option<i64>,
         col: usize,
@@ -265,7 +235,7 @@ impl PgStore {
 
     /// Map a row with columns (bucket, key, version_id, size, etag, etag_kind,
     /// last_modified, storage_class, ec_k, ec_m, status, tags, data_layout,
-    /// parts_count, metadata_blob) to an ObjectRecord.
+    /// parts_count, metadata_blob) to a StoredObject.
     /// Parse a u8-backed enum from a row column.
     fn parse_enum<T>(
         raw: u8,
@@ -294,35 +264,93 @@ impl PgStore {
         Ok(VersionId::from_u64(v))
     }
 
-    fn row_to_object_record(row: &rusqlite::Row<'_>) -> Result<ObjectRecord, rusqlite::Error> {
+    fn row_to_object_record(row: &rusqlite::Row<'_>) -> Result<StoredObject, rusqlite::Error> {
         let status = Self::parse_enum(row.get::<_, u8>(10)?, 10, "status", ObjectState::from_u8)?;
-        let etag_kind =
-            Self::parse_enum(row.get::<_, u8>(5)?, 5, "etag_kind", EtagKind::from_u8)?;
-        let storage_class =
-            Self::parse_enum(row.get::<_, u8>(7)?, 7, "storage_class", StorageClass::from_u8)?;
-        let data_layout =
-            Self::parse_enum(row.get::<_, u8>(12)?, 12, "data_layout", DataLayout::from_u8)?;
-        let parts_count =
-            Self::parse_optional_u32(row.get::<_, Option<i64>>(13)?, 13, "parts_count")?;
-        Self::validate_object_layout(status, data_layout, parts_count)?;
+        let bucket: BucketName = row.get(0)?;
+        let key: ObjectKey = row.get(1)?;
+        let version_id = Self::parse_version_id(row.get::<_, i64>(2)?, 2)?;
+        let last_modified = row.get::<_, i64>(6)? as u64;
 
-        Ok(ObjectRecord {
-            bucket: row.get(0)?,
-            key: row.get(1)?,
-            version_id: Self::parse_version_id(row.get::<_, i64>(2)?, 2)?,
-            size: row.get::<_, i64>(3)? as u64,
-            etag: row.get(4)?,
-            etag_kind,
-            last_modified: row.get::<_, i64>(6)? as u64,
-            storage_class,
-            ec_k: row.get::<_, u8>(8)?,
-            ec_m: row.get::<_, u8>(9)?,
-            status,
-            tags: row.get(11)?,
-            data_layout,
-            parts_count,
-            metadata_blob: row.get(14)?,
-        })
+        match status {
+            ObjectState::DeleteMarker => {
+                let size = row.get::<_, i64>(3)?;
+                let etag: Vec<u8> = row.get(4)?;
+                let etag_kind = row.get::<_, u8>(5)?;
+                let storage_class = row.get::<_, u8>(7)?;
+                let ec_k = row.get::<_, u8>(8)?;
+                let ec_m = row.get::<_, u8>(9)?;
+                let tags: Option<String> = row.get(11)?;
+                let metadata_blob: Option<Vec<u8>> = row.get(14)?;
+                if size != 0
+                    || !etag.is_empty()
+                    || etag_kind != 0
+                    || storage_class != 0
+                    || ec_k != 0
+                    || ec_m != 0
+                    || tags.is_some()
+                    || metadata_blob.is_some()
+                {
+                    return Err(rusqlite::Error::FromSqlConversionFailure(
+                        10,
+                        rusqlite::types::Type::Integer,
+                        Box::from("delete marker has non-canonical field values"),
+                    ));
+                }
+                Ok(StoredObject::DeleteMarker(DeleteMarkerRecord {
+                    bucket,
+                    key,
+                    version_id,
+                    last_modified,
+                }))
+            }
+            ObjectState::Live => {
+                let etag_kind =
+                    Self::parse_enum(row.get::<_, u8>(5)?, 5, "etag_kind", EtagKind::from_u8)?;
+                let storage_class = Self::parse_enum(
+                    row.get::<_, u8>(7)?,
+                    7,
+                    "storage_class",
+                    StorageClass::from_u8,
+                )?;
+                let data_layout = Self::parse_enum(
+                    row.get::<_, u8>(12)?,
+                    12,
+                    "data_layout",
+                    DataLayout::from_u8,
+                )?;
+                let parts_count = Self::parse_optional_u32(
+                    row.get::<_, Option<i64>>(13)?,
+                    13,
+                    "parts_count",
+                )?;
+                let layout =
+                    ObjectLayout::from_parts(data_layout, parts_count).map_err(|msg| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            13,
+                            rusqlite::types::Type::Integer,
+                            Box::from(msg),
+                        )
+                    })?;
+
+                Ok(StoredObject::Live(LiveObjectRecord {
+                    bucket,
+                    key,
+                    version_id,
+                    size: row.get::<_, i64>(3)? as u64,
+                    etag: row.get(4)?,
+                    etag_kind,
+                    last_modified,
+                    storage_class,
+                    ec: EcShape {
+                        k: row.get::<_, u8>(8)?,
+                        m: row.get::<_, u8>(9)?,
+                    },
+                    layout,
+                    tags: row.get(11)?,
+                    metadata_blob: row.get(14)?,
+                }))
+            }
+        }
     }
 }
 
@@ -956,81 +984,82 @@ impl PgMetadataStore for PgStore {
         Ok(())
     }
 
-    fn put_object_meta(&self, req: &PutObjectMetaReq) -> Result<(), MetadataError> {
+    fn put_object_meta(&self, req: &PutObjectReq) -> Result<(), MetadataError> {
         let now = PgStore::now_millis();
-        let data_layout = req.data_layout.unwrap_or(DataLayout::ChunkManifestInternal);
-        Self::validate_object_layout(req.status, data_layout, req.parts_count).map_err(|e| {
-            MetadataError::Db {
-                context: "put object meta (validate layout)",
-                source: e,
-            }
-        })?;
-        let data_layout_u8 = data_layout as u8;
-        let etag_kind_u8 = req.etag_kind as u8;
-        let status_u8 = req.status as u8;
-        let parts_count = req.parts_count.map(|n| n as i64);
-        let metadata_blob: Option<&[u8]> = req.metadata_blob.as_deref();
-        if req.version_id.is_null() {
-            // Unversioned: INSERT OR REPLACE (overwrite null version)
-            self.conn
-                .execute(
+        match req {
+            PutObjectReq::Live(req) => {
+                let data_layout_u8 = req.layout.data_layout() as u8;
+                let etag_kind_u8 = req.etag_kind as u8;
+                let status_u8 = ObjectState::Live as u8;
+                let parts_count = req.layout.parts_count().map(|n| n as i64);
+                let metadata_blob: Option<&[u8]> = req.metadata_blob.as_deref();
+                let sql = if req.version_id.is_null() {
                     "INSERT OR REPLACE INTO objects \
                      (bucket, key, version_id, size, etag, etag_kind, last_modified, \
                       storage_class, ec_k, ec_m, status, data_layout, parts_count, metadata_blob) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12, ?13)",
-                    params![
-                        req.bucket,
-                        req.key,
-                        req.version_id.to_u64() as i64,
-                        req.size as i64,
-                        req.etag,
-                        etag_kind_u8,
-                        now as i64,
-                        req.ec_k,
-                        req.ec_m,
-                        status_u8,
-                        data_layout_u8,
-                        parts_count,
-                        metadata_blob,
-                    ],
-                )
-                .map_err(|e| MetadataError::Db {
-                    context: "put object meta",
-                    source: e,
-                })?;
-        } else {
-            // Versioned: INSERT only (new version)
-            self.conn
-                .execute(
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12, ?13)"
+                } else {
                     "INSERT INTO objects \
                      (bucket, key, version_id, size, etag, etag_kind, last_modified, \
                       storage_class, ec_k, ec_m, status, data_layout, parts_count, metadata_blob) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12, ?13)",
-                    params![
-                        req.bucket,
-                        req.key,
-                        req.version_id.to_u64() as i64,
-                        req.size as i64,
-                        req.etag,
-                        etag_kind_u8,
-                        now as i64,
-                        req.ec_k,
-                        req.ec_m,
-                        status_u8,
-                        data_layout_u8,
-                        parts_count,
-                        metadata_blob,
-                    ],
-                )
-                .map_err(|e| MetadataError::Db {
-                    context: "put object meta (versioned)",
-                    source: e,
-                })?;
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12, ?13)"
+                };
+                self.conn
+                    .execute(
+                        sql,
+                        params![
+                            req.bucket,
+                            req.key,
+                            req.version_id.to_u64() as i64,
+                            req.size as i64,
+                            req.etag,
+                            etag_kind_u8,
+                            now as i64,
+                            req.ec.k,
+                            req.ec.m,
+                            status_u8,
+                            data_layout_u8,
+                            parts_count,
+                            metadata_blob,
+                        ],
+                    )
+                    .map_err(|e| MetadataError::Db {
+                        context: "put object meta",
+                        source: e,
+                    })?;
+            }
+            PutObjectReq::DeleteMarker(req) => {
+                let sql = if req.version_id.is_null() {
+                    "INSERT OR REPLACE INTO objects \
+                     (bucket, key, version_id, size, etag, etag_kind, last_modified, \
+                      storage_class, ec_k, ec_m, status, data_layout, parts_count, metadata_blob) \
+                     VALUES (?1, ?2, ?3, 0, zeroblob(0), 0, ?4, 0, 0, 0, 1, 0, NULL, NULL)"
+                } else {
+                    "INSERT INTO objects \
+                     (bucket, key, version_id, size, etag, etag_kind, last_modified, \
+                      storage_class, ec_k, ec_m, status, data_layout, parts_count, metadata_blob) \
+                     VALUES (?1, ?2, ?3, 0, zeroblob(0), 0, ?4, 0, 0, 0, 1, 0, NULL, NULL)"
+                };
+                self.conn
+                    .execute(
+                        sql,
+                        params![
+                            req.bucket,
+                            req.key,
+                            req.version_id.to_u64() as i64,
+                            now as i64,
+                        ],
+                    )
+                    .map_err(|e| MetadataError::Db {
+                        context: "put object meta (delete marker)",
+                        source: e,
+                    })?;
+            }
         }
         Ok(())
     }
 
-    fn get_object_meta(&self, bucket: &str, key: &str) -> Result<ObjectRecord, MetadataError> {
+    fn get_object_meta(&self, bucket: &str, key: &str) -> Result<StoredObject, MetadataError> {
         self.conn
             .query_row(
                 "SELECT bucket, key, version_id, size, etag, etag_kind, \
@@ -1054,7 +1083,7 @@ impl PgMetadataStore for PgStore {
         bucket: &str,
         key: &str,
         version_id: VersionId,
-    ) -> Result<ObjectRecord, MetadataError> {
+    ) -> Result<StoredObject, MetadataError> {
         self.conn
             .query_row(
                 "SELECT bucket, key, version_id, size, etag, etag_kind, \
@@ -1165,7 +1194,7 @@ impl PgMetadataStore for PgStore {
                 source: e,
             })?;
 
-        let mut objects: Vec<ObjectRecord> = Vec::new();
+        let mut objects: Vec<StoredObject> = Vec::new();
         for row in rows {
             objects.push(row.map_err(|e| MetadataError::Db {
                 context: "list objects row",
@@ -1179,7 +1208,7 @@ impl PgMetadataStore for PgStore {
         }
 
         let next_start_after = if is_truncated {
-            objects.last().map(|o| o.key.clone())
+            objects.last().map(|o| o.key().clone())
         } else {
             None
         };
@@ -1259,7 +1288,7 @@ impl PgMetadataStore for PgStore {
                 source: e,
             })?;
 
-        let mut versions: Vec<ObjectRecord> = Vec::new();
+        let mut versions: Vec<StoredObject> = Vec::new();
         for row in rows {
             versions.push(row.map_err(|e| MetadataError::Db {
                 context: "list object versions row",
@@ -1275,7 +1304,7 @@ impl PgMetadataStore for PgStore {
         let (next_key_marker, next_version_id_marker) = if is_truncated {
             versions
                 .last()
-                .map(|o| (Some(o.key.clone()), Some(o.version_id)))
+                .map(|o| (Some(o.key().clone()), Some(o.version_id())))
                 .unwrap_or((None, None))
         } else {
             (None, None)
@@ -1338,7 +1367,7 @@ impl PgMetadataStore for PgStore {
         let updated = self
             .conn
             .execute(
-                "UPDATE objects SET tags = ?1 WHERE bucket = ?2 AND key = ?3 AND version_id = ?4",
+                "UPDATE objects SET tags = ?1 WHERE bucket = ?2 AND key = ?3 AND version_id = ?4 AND status = 0",
                 params![tags, bucket, key, version_id.to_u64() as i64],
             )
             .map_err(|e| MetadataError::Db {
@@ -1346,7 +1375,15 @@ impl PgMetadataStore for PgStore {
                 source: e,
             })?;
         if updated == 0 {
-            return Err(MetadataError::ObjectNotFound);
+            let status: Option<u8> = self.conn.query_row(
+                "SELECT status FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
+                params![bucket, key, version_id.to_u64() as i64],
+                |row| row.get(0),
+            ).optional().map_err(|e| MetadataError::Db { context: "put object tags (check status)", source: e })?;
+            return match status {
+                Some(1) => Err(MetadataError::MethodNotAllowedOnDeleteMarker),
+                _ => Err(MetadataError::ObjectNotFound),
+            };
         }
         Ok(())
     }
@@ -1357,9 +1394,9 @@ impl PgMetadataStore for PgStore {
         key: &str,
         version_id: VersionId,
     ) -> Result<Option<String>, MetadataError> {
-        self.conn
+        let result = self.conn
             .query_row(
-                "SELECT tags FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
+                "SELECT tags FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 AND status = 0",
                 params![bucket, key, version_id.to_u64() as i64],
                 |row| row.get(0),
             )
@@ -1367,8 +1404,21 @@ impl PgMetadataStore for PgStore {
             .map_err(|e| MetadataError::Db {
                 context: "get object tags",
                 source: e,
-            })?
-            .ok_or(MetadataError::ObjectNotFound)
+            })?;
+        match result {
+            Some(tags) => Ok(tags),
+            None => {
+                let status: Option<u8> = self.conn.query_row(
+                    "SELECT status FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
+                    params![bucket, key, version_id.to_u64() as i64],
+                    |row| row.get(0),
+                ).optional().map_err(|e| MetadataError::Db { context: "get object tags (check status)", source: e })?;
+                match status {
+                    Some(1) => Err(MetadataError::MethodNotAllowedOnDeleteMarker),
+                    _ => Err(MetadataError::ObjectNotFound),
+                }
+            }
+        }
     }
 
     fn delete_object_tags(
@@ -1380,7 +1430,7 @@ impl PgMetadataStore for PgStore {
         let updated = self
             .conn
             .execute(
-                "UPDATE objects SET tags = NULL WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
+                "UPDATE objects SET tags = NULL WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 AND status = 0",
                 params![bucket, key, version_id.to_u64() as i64],
             )
             .map_err(|e| MetadataError::Db {
@@ -1388,7 +1438,15 @@ impl PgMetadataStore for PgStore {
                 source: e,
             })?;
         if updated == 0 {
-            return Err(MetadataError::ObjectNotFound);
+            let status: Option<u8> = self.conn.query_row(
+                "SELECT status FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
+                params![bucket, key, version_id.to_u64() as i64],
+                |row| row.get(0),
+            ).optional().map_err(|e| MetadataError::Db { context: "delete object tags (check status)", source: e })?;
+            return match status {
+                Some(1) => Err(MetadataError::MethodNotAllowedOnDeleteMarker),
+                _ => Err(MetadataError::ObjectNotFound),
+            };
         }
         Ok(())
     }
@@ -2031,19 +2089,22 @@ impl PgMetadataStore for PgStore {
     fn complete_multipart_commit(
         &self,
         upload_id: &str,
-        obj: &PutObjectMetaReq,
+        obj: &CommitMultipartReq,
         parts: &[ObjectPartRecord],
     ) -> Result<(), MetadataError> {
+        if parts.is_empty() {
+            return Err(MetadataError::Db {
+                context: "complete multipart commit (empty parts)",
+                source: rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Null,
+                    Box::from("multipart commit requires at least one part"),
+                ),
+            });
+        }
         let now = PgStore::now_millis();
-        let data_layout = obj.data_layout.unwrap_or(DataLayout::ChunkManifestInternal);
-        Self::validate_object_layout(obj.status, data_layout, obj.parts_count).map_err(|e| {
-            MetadataError::Db {
-                context: "complete multipart commit (validate layout)",
-                source: e,
-            }
-        })?;
-        let data_layout = data_layout as u8;
-        let parts_count = obj.parts_count.map(|n| n as i64);
+        let data_layout = DataLayout::MultipartManifest as u8;
+        let parts_count = Some(parts.len() as i64);
         let metadata_blob: Option<&[u8]> = obj.metadata_blob.as_deref();
 
         self.conn
@@ -2054,6 +2115,17 @@ impl PgMetadataStore for PgStore {
             })?;
 
         let result = (|| -> Result<(), rusqlite::Error> {
+            // Validate part identity matches object.
+            for part in parts {
+                if part.bucket != obj.bucket || part.key != obj.key || part.version_id != obj.version_id {
+                    return Err(rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Null,
+                        Box::from("part does not match object"),
+                    ));
+                }
+            }
+
             // 1. Transition upload to Completing.
             let updated = self.conn.execute(
                 "UPDATE multipart_uploads SET state = ?1 \
@@ -2079,51 +2151,35 @@ impl PgMetadataStore for PgStore {
             }
 
             // 2. Write/overwrite object metadata row.
-            if obj.version_id.is_null() {
-                self.conn.execute(
-                    "INSERT OR REPLACE INTO objects \
-                     (bucket, key, version_id, size, etag, etag_kind, last_modified, \
-                      storage_class, ec_k, ec_m, status, data_layout, parts_count, metadata_blob) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12, ?13)",
-                    params![
-                        obj.bucket,
-                        obj.key,
-                        obj.version_id.to_u64() as i64,
-                        obj.size as i64,
-                        obj.etag,
-                        obj.etag_kind as u8,
-                        now as i64,
-                        obj.ec_k,
-                        obj.ec_m,
-                        obj.status as u8,
-                        data_layout,
-                        parts_count,
-                        metadata_blob,
-                    ],
-                )?;
+            let obj_sql = if obj.version_id.is_null() {
+                "INSERT OR REPLACE INTO objects \
+                 (bucket, key, version_id, size, etag, etag_kind, last_modified, \
+                  storage_class, ec_k, ec_m, status, data_layout, parts_count, metadata_blob) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12, ?13)"
             } else {
-                self.conn.execute(
-                    "INSERT INTO objects \
-                     (bucket, key, version_id, size, etag, etag_kind, last_modified, \
-                      storage_class, ec_k, ec_m, status, data_layout, parts_count, metadata_blob) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12, ?13)",
-                    params![
-                        obj.bucket,
-                        obj.key,
-                        obj.version_id.to_u64() as i64,
-                        obj.size as i64,
-                        obj.etag,
-                        obj.etag_kind as u8,
-                        now as i64,
-                        obj.ec_k,
-                        obj.ec_m,
-                        obj.status as u8,
-                        data_layout,
-                        parts_count,
-                        metadata_blob,
-                    ],
-                )?;
-            }
+                "INSERT INTO objects \
+                 (bucket, key, version_id, size, etag, etag_kind, last_modified, \
+                  storage_class, ec_k, ec_m, status, data_layout, parts_count, metadata_blob) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12, ?13)"
+            };
+            self.conn.execute(
+                obj_sql,
+                params![
+                    obj.bucket,
+                    obj.key,
+                    obj.version_id.to_u64() as i64,
+                    obj.size as i64,
+                    obj.etag,
+                    obj.etag_kind as u8,
+                    now as i64,
+                    obj.ec.k,
+                    obj.ec.m,
+                    ObjectState::Live as u8,
+                    data_layout,
+                    parts_count,
+                    metadata_blob,
+                ],
+            )?;
 
             // 3. Delete prior object_parts (null-version overwrite).
             self.conn.execute(
@@ -2449,7 +2505,7 @@ impl PgMetadataStore for PgStore {
     fn commit_stream_put(
         &self,
         session_id: &str,
-        obj: &PutObjectMetaReq,
+        obj: &CommitStreamPutReq,
         chunks: &[StreamObjectChunkRecord],
     ) -> Result<(), MetadataError> {
         self.conn
@@ -2520,15 +2576,8 @@ impl PgMetadataStore for PgStore {
 
             // 2. Write/overwrite object metadata row.
             let now = PgStore::now_millis();
-            let data_layout = obj.data_layout.unwrap_or(DataLayout::ChunkManifestInternal);
-            Self::validate_object_layout(obj.status, data_layout, obj.parts_count).map_err(
-                |e| MetadataError::Db {
-                    context: "commit stream put (validate layout)",
-                    source: e,
-                },
-            )?;
-            let data_layout = data_layout as u8;
-            let parts_count = obj.parts_count.map(|n| n as i64);
+            let data_layout = DataLayout::ChunkManifestInternal as u8;
+            let parts_count: Option<i64> = None;
 
             let obj_sql = if obj.version_id.is_null() {
                 "INSERT OR REPLACE INTO objects \
@@ -2552,9 +2601,9 @@ impl PgMetadataStore for PgStore {
                         obj.etag,
                         obj.etag_kind as u8,
                         now as i64,
-                        obj.ec_k,
-                        obj.ec_m,
-                        obj.status as u8,
+                        obj.ec.k,
+                        obj.ec.m,
+                        ObjectState::Live as u8,
                         data_layout,
                         parts_count,
                         obj.metadata_blob,
@@ -3165,20 +3214,17 @@ mod tests {
         // Insert several objects
         for key in &["photos/a.jpg", "photos/b.jpg", "photos/c.jpg", "docs/x"] {
             store
-                .put_object_meta(&PutObjectMetaReq {
+                .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
                     bucket: "bucket".into(),
                     key: ObjectKey::from(*key),
                     version_id: VersionId::Null,
-                    status: ObjectState::Live,
                     size: 10,
                     etag: vec![0; 8],
                     etag_kind: EtagKind::Crc64,
-                    ec_k: 4,
-                    ec_m: 2,
-                    data_layout: None,
-                    parts_count: None,
+                    ec: EcShape { k: 4, m: 2 },
+                    layout: ObjectLayout::ChunkManifest,
                     metadata_blob: None,
-                })
+                }))
                 .unwrap();
         }
 
@@ -3193,8 +3239,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.objects.len(), 2);
-        assert_eq!(resp.objects[0].key, "photos/b.jpg");
-        assert_eq!(resp.objects[1].key, "photos/c.jpg");
+        assert_eq!(resp.objects[0].key(), "photos/b.jpg");
+        assert_eq!(resp.objects[1].key(), "photos/c.jpg");
         assert!(!resp.is_truncated);
     }
 
@@ -3321,20 +3367,17 @@ mod tests {
 
         for i in 0..5 {
             store
-                .put_object_meta(&PutObjectMetaReq {
+                .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
                     bucket: "b".into(),
                     key: ObjectKey::from(format!("key-{:02}", i)),
                     version_id: VersionId::Null,
-                    status: ObjectState::Live,
                     size: 0,
                     etag: vec![0; 8],
                     etag_kind: EtagKind::Crc64,
-                    ec_k: 4,
-                    ec_m: 2,
-                    data_layout: None,
-                    parts_count: None,
+                    ec: EcShape { k: 4, m: 2 },
+                    layout: ObjectLayout::ChunkManifest,
                     metadata_blob: None,
-                })
+                }))
                 .unwrap();
         }
 
@@ -3349,8 +3392,8 @@ mod tests {
             .unwrap();
         assert_eq!(resp.objects.len(), 2);
         assert!(resp.is_truncated);
-        assert_eq!(resp.objects[0].key, "key-00");
-        assert_eq!(resp.objects[1].key, "key-01");
+        assert_eq!(resp.objects[0].key(), "key-00");
+        assert_eq!(resp.objects[1].key(), "key-01");
 
         // Second page
         let resp2 = store
@@ -3363,6 +3406,6 @@ mod tests {
             .unwrap();
         assert_eq!(resp2.objects.len(), 2);
         assert!(resp2.is_truncated);
-        assert_eq!(resp2.objects[0].key, "key-02");
+        assert_eq!(resp2.objects[0].key(), "key-02");
     }
 }

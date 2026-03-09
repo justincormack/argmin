@@ -38,7 +38,8 @@ CREATE TABLE IF NOT EXISTS objects (
             (data_layout = 0 AND parts_count IS NULL) OR
             (data_layout = 1 AND parts_count IS NOT NULL AND parts_count > 0)
         )) OR
-        (status = 1 AND data_layout = 0 AND parts_count IS NULL)
+        (status = 1 AND data_layout = 0 AND parts_count IS NULL AND tags IS NULL AND metadata_blob IS NULL
+         AND size = 0 AND etag = X'' AND etag_kind = 0 AND storage_class = 0 AND ec_k = 0 AND ec_m = 0)
     ),
     PRIMARY KEY (bucket, key, version_id)
 )";

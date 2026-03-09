@@ -499,9 +499,123 @@ impl std::fmt::Display for VersionId {
     }
 }
 
-/// Object record stored in per-PG metadata.
+// ── Composite helper types ─────────────────────────────────────────
+
+/// Erasure coding shape (k data shards, m parity shards).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EcShape {
+    pub k: u8,
+    pub m: u8,
+}
+
+/// Object data layout — encodes the `data_layout` column plus `parts_count`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectLayout {
+    /// Internal chunk manifest (normal PutObject writes).
+    ChunkManifest,
+    /// Composite manifest of independent parts (S3 multipart).
+    MultipartManifest { parts_count: std::num::NonZeroU32 },
+}
+
+impl ObjectLayout {
+    /// Convert from raw SQL columns.
+    pub fn from_parts(
+        data_layout: DataLayout,
+        parts_count: Option<u32>,
+    ) -> Result<Self, &'static str> {
+        match (data_layout, parts_count) {
+            (DataLayout::ChunkManifestInternal, None) => Ok(Self::ChunkManifest),
+            (DataLayout::MultipartManifest, Some(n)) => {
+                let nz = std::num::NonZeroU32::new(n)
+                    .ok_or("multipart manifest with zero parts_count")?;
+                Ok(Self::MultipartManifest { parts_count: nz })
+            }
+            (DataLayout::ChunkManifestInternal, Some(_)) => {
+                Err("chunk manifest must not have parts_count")
+            }
+            (DataLayout::MultipartManifest, None) => {
+                Err("multipart manifest missing parts_count")
+            }
+        }
+    }
+
+    /// The underlying data layout discriminant for SQL writes.
+    pub fn data_layout(self) -> DataLayout {
+        match self {
+            Self::ChunkManifest => DataLayout::ChunkManifestInternal,
+            Self::MultipartManifest { .. } => DataLayout::MultipartManifest,
+        }
+    }
+
+    /// The parts count for SQL writes (None for chunk manifest).
+    pub fn parts_count(self) -> Option<u32> {
+        match self {
+            Self::ChunkManifest => None,
+            Self::MultipartManifest { parts_count } => Some(parts_count.get()),
+        }
+    }
+}
+
+// ── Variant-based object model ────────────────────────────────────
+
+/// An object record read from storage — either a live object or a delete marker.
 #[derive(Debug, Clone)]
-pub struct ObjectRecord {
+pub enum StoredObject {
+    Live(LiveObjectRecord),
+    DeleteMarker(DeleteMarkerRecord),
+}
+
+impl StoredObject {
+    pub fn bucket(&self) -> &BucketName {
+        match self {
+            Self::Live(r) => &r.bucket,
+            Self::DeleteMarker(r) => &r.bucket,
+        }
+    }
+
+    pub fn key(&self) -> &ObjectKey {
+        match self {
+            Self::Live(r) => &r.key,
+            Self::DeleteMarker(r) => &r.key,
+        }
+    }
+
+    pub fn version_id(&self) -> VersionId {
+        match self {
+            Self::Live(r) => r.version_id,
+            Self::DeleteMarker(r) => r.version_id,
+        }
+    }
+
+    pub fn last_modified(&self) -> u64 {
+        match self {
+            Self::Live(r) => r.last_modified,
+            Self::DeleteMarker(r) => r.last_modified,
+        }
+    }
+
+    pub fn is_delete_marker(&self) -> bool {
+        matches!(self, Self::DeleteMarker(_))
+    }
+
+    pub fn as_live(&self) -> Option<&LiveObjectRecord> {
+        match self {
+            Self::Live(r) => Some(r),
+            Self::DeleteMarker(_) => None,
+        }
+    }
+
+    pub fn into_live(self) -> Option<LiveObjectRecord> {
+        match self {
+            Self::Live(r) => Some(r),
+            Self::DeleteMarker(_) => None,
+        }
+    }
+}
+
+/// A live object record (not a delete marker).
+#[derive(Debug, Clone)]
+pub struct LiveObjectRecord {
     pub bucket: BucketName,
     pub key: ObjectKey,
     pub version_id: VersionId,
@@ -512,17 +626,22 @@ pub struct ObjectRecord {
     /// Last modified timestamp (unix milliseconds).
     pub last_modified: u64,
     pub storage_class: StorageClass,
-    pub ec_k: u8,
-    pub ec_m: u8,
-    pub status: ObjectState,
+    pub ec: EcShape,
+    pub layout: ObjectLayout,
     /// Serialized tagging XML (None = no tags).
     pub tags: Option<String>,
-    /// Object data layout (ChunkManifestInternal or MultipartManifest).
-    pub data_layout: DataLayout,
-    /// Number of parts (set for MultipartManifest objects).
-    pub parts_count: Option<u32>,
-    /// Serialized user metadata headers (set for MultipartManifest objects).
+    /// Serialized user metadata headers.
     pub metadata_blob: Option<Vec<u8>>,
+}
+
+/// A delete marker record.
+#[derive(Debug, Clone)]
+pub struct DeleteMarkerRecord {
+    pub bucket: BucketName,
+    pub key: ObjectKey,
+    pub version_id: VersionId,
+    /// Last modified timestamp (unix milliseconds).
+    pub last_modified: u64,
 }
 
 /// Bucket metadata.
@@ -546,21 +665,61 @@ pub struct BucketInfo {
 }
 
 /// Request to store object metadata.
-pub struct PutObjectMetaReq {
+pub enum PutObjectReq {
+    Live(PutLiveObjectReq),
+    DeleteMarker(PutDeleteMarkerReq),
+}
+
+/// Request to store a live object.
+pub struct PutLiveObjectReq {
     pub bucket: BucketName,
     pub key: ObjectKey,
     pub version_id: VersionId,
     pub size: u64,
     pub etag: Vec<u8>,
     pub etag_kind: EtagKind,
-    pub ec_k: u8,
-    pub ec_m: u8,
-    pub status: ObjectState,
-    /// Object data layout. None defaults to ChunkManifestInternal (0).
-    pub data_layout: Option<DataLayout>,
-    /// Number of parts (set for MultipartManifest objects).
-    pub parts_count: Option<u32>,
-    /// Serialized user metadata headers (set for MultipartManifest objects).
+    pub ec: EcShape,
+    pub layout: ObjectLayout,
+    /// Serialized user metadata headers.
+    pub metadata_blob: Option<Vec<u8>>,
+}
+
+/// Request to store a delete marker.
+pub struct PutDeleteMarkerReq {
+    pub bucket: BucketName,
+    pub key: ObjectKey,
+    pub version_id: VersionId,
+}
+
+/// Request to finalize a multipart upload into a live object.
+///
+/// Layout is always `MultipartManifest`. The `parts_count` is derived from the
+/// manifest slice passed alongside this request — it is not a separate field,
+/// so divergence between the stored count and the actual manifest is impossible.
+pub struct CommitMultipartReq {
+    pub bucket: BucketName,
+    pub key: ObjectKey,
+    pub version_id: VersionId,
+    pub size: u64,
+    pub etag: Vec<u8>,
+    pub etag_kind: EtagKind,
+    pub ec: EcShape,
+    /// Serialized user metadata headers.
+    pub metadata_blob: Option<Vec<u8>>,
+}
+
+/// Request to finalize a streaming PutObject into a live object.
+///
+/// Layout is always `ChunkManifest` — no parts_count field.
+pub struct CommitStreamPutReq {
+    pub bucket: BucketName,
+    pub key: ObjectKey,
+    pub version_id: VersionId,
+    pub size: u64,
+    pub etag: Vec<u8>,
+    pub etag_kind: EtagKind,
+    pub ec: EcShape,
+    /// Serialized user metadata headers.
     pub metadata_blob: Option<Vec<u8>>,
 }
 
@@ -574,7 +733,7 @@ pub struct ListObjectsReq {
 
 /// Response from a list objects query.
 pub struct ListObjectsResp {
-    pub objects: Vec<ObjectRecord>,
+    pub objects: Vec<StoredObject>,
     pub is_truncated: bool,
     pub next_start_after: Option<ObjectKey>,
 }
@@ -590,7 +749,7 @@ pub struct ListObjectVersionsReq {
 
 /// Response from a list object versions query.
 pub struct ListObjectVersionsResp {
-    pub versions: Vec<ObjectRecord>,
+    pub versions: Vec<StoredObject>,
     pub is_truncated: bool,
     pub next_key_marker: Option<ObjectKey>,
     pub next_version_id_marker: Option<VersionId>,

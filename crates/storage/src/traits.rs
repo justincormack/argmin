@@ -109,13 +109,13 @@ pub trait PgMetadataStore {
     ///
     /// For VersionId::Null (unversioned): INSERT OR REPLACE (overwrite).
     /// For VersionId::Versioned (versioned): INSERT only (new version).
-    fn put_object_meta(&self, req: &PutObjectMetaReq) -> Result<(), MetadataError>;
+    fn put_object_meta(&self, req: &PutObjectReq) -> Result<(), MetadataError>;
 
     /// Get the latest object record (highest version_id).
     ///
     /// Returns the latest version whether live or delete marker.
     /// The coordinator decides what to do with delete markers.
-    fn get_object_meta(&self, bucket: &str, key: &str) -> Result<ObjectRecord, MetadataError>;
+    fn get_object_meta(&self, bucket: &str, key: &str) -> Result<StoredObject, MetadataError>;
 
     /// Get a specific version of an object.
     fn get_object_version(
@@ -123,7 +123,7 @@ pub trait PgMetadataStore {
         bucket: &str,
         key: &str,
         version_id: VersionId,
-    ) -> Result<ObjectRecord, MetadataError>;
+    ) -> Result<StoredObject, MetadataError>;
 
     /// Delete all versions of an object's metadata.
     fn delete_object_meta(&self, bucket: &str, key: &str) -> Result<(), MetadataError>;
@@ -253,7 +253,7 @@ pub trait PgMetadataStore {
     fn complete_multipart_commit(
         &self,
         upload_id: &str,
-        obj: &PutObjectMetaReq,
+        obj: &CommitMultipartReq,
         parts: &[ObjectPartRecord],
     ) -> Result<(), MetadataError>;
 
@@ -301,7 +301,7 @@ pub trait PgMetadataStore {
     fn commit_stream_put(
         &self,
         session_id: &str,
-        obj: &PutObjectMetaReq,
+        obj: &CommitStreamPutReq,
         chunks: &[StreamObjectChunkRecord],
     ) -> Result<(), MetadataError>;
 

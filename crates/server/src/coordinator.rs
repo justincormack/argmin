@@ -4,12 +4,14 @@ use std::sync::{Arc, MutexGuard};
 use ec::{EcConfig, ErasureCodec};
 use storage::traits::{PgMetadataStore, ShardStore};
 use storage::{
-    BucketInfo, BucketName, ChecksumAlgorithm, ChecksumType, CreateMultipartUploadReq,
-    CreateStreamUploadReq, DataLayout, ListMultipartUploadsReq, ListObjectVersionsReq,
-    ListObjectsReq, ListPartsReq, MultipartPartChunkRecord, MultipartPartRecord,
-    MultipartUploadRecord, ObjectKey, ObjectPartRecord, ObjectRecord, PutObjectMetaReq,
-    SessionId, ShardKey, SharedStorageNode, StreamObjectChunkRecord, StreamUploadChunkRecord,
-    StreamUploadState, StreamUploadTarget, UploadId, UploadState,
+    BucketInfo, BucketName, ChecksumAlgorithm, ChecksumType, CommitMultipartReq,
+    CommitStreamPutReq, CreateMultipartUploadReq,
+    CreateStreamUploadReq, EcShape, ListMultipartUploadsReq, ListObjectVersionsReq,
+    ListObjectsReq, ListPartsReq, LiveObjectRecord, MultipartPartChunkRecord, MultipartPartRecord,
+    MultipartUploadRecord, ObjectKey, ObjectLayout, ObjectPartRecord, PutDeleteMarkerReq,
+    PutLiveObjectReq, PutObjectReq, SessionId, ShardKey, SharedStorageNode,
+    StoredObject, StreamObjectChunkRecord, StreamUploadChunkRecord, StreamUploadState,
+    StreamUploadTarget, UploadId, UploadState,
 };
 
 use crate::conditional::{
@@ -364,7 +366,7 @@ impl<'a> TwoPgGuards<'a> {
 }
 
 struct LockedReadObject<'a> {
-    record: ObjectRecord,
+    record: StoredObject,
     pgs: TwoPgGuards<'a>,
 }
 
@@ -712,7 +714,7 @@ impl Coordinator {
         self.head_bucket(bucket)?;
         let pg_id = self.object_pg_id(bucket, key);
         let pg = self.storage_node.get_pg(pg_id)?;
-        let record = match version_id {
+        let stored = match version_id {
             Some(vid) => pg.get_object_version(bucket, key, vid),
             None => pg.get_object_meta(bucket, key),
         }
@@ -723,10 +725,10 @@ impl Coordinator {
             },
             other => ServerError::Metadata(other),
         })?;
-        if record.status.is_delete_marker() {
+        if stored.is_delete_marker() {
             return Err(ServerError::MethodNotAllowed);
         }
-        pg.put_object_tags(bucket, key, record.version_id, tags)
+        pg.put_object_tags(bucket, key, stored.version_id(), tags)
             .map_err(ServerError::Metadata)
     }
 
@@ -739,7 +741,7 @@ impl Coordinator {
         self.head_bucket(bucket)?;
         let pg_id = self.object_pg_id(bucket, key);
         let pg = self.storage_node.get_pg(pg_id)?;
-        let record = match version_id {
+        let stored = match version_id {
             Some(vid) => pg.get_object_version(bucket, key, vid),
             None => pg.get_object_meta(bucket, key),
         }
@@ -750,10 +752,10 @@ impl Coordinator {
             },
             other => ServerError::Metadata(other),
         })?;
-        if record.status.is_delete_marker() {
+        if stored.is_delete_marker() {
             return Err(ServerError::MethodNotAllowed);
         }
-        pg.get_object_tags(bucket, key, record.version_id)
+        pg.get_object_tags(bucket, key, stored.version_id())
             .map_err(ServerError::Metadata)
     }
 
@@ -766,7 +768,7 @@ impl Coordinator {
         self.head_bucket(bucket)?;
         let pg_id = self.object_pg_id(bucket, key);
         let pg = self.storage_node.get_pg(pg_id)?;
-        let record = match version_id {
+        let stored = match version_id {
             Some(vid) => pg.get_object_version(bucket, key, vid),
             None => pg.get_object_meta(bucket, key),
         }
@@ -777,10 +779,10 @@ impl Coordinator {
             },
             other => ServerError::Metadata(other),
         })?;
-        if record.status.is_delete_marker() {
+        if stored.is_delete_marker() {
             return Err(ServerError::MethodNotAllowed);
         }
-        pg.delete_object_tags(bucket, key, record.version_id)
+        pg.delete_object_tags(bucket, key, stored.version_id())
             .map_err(ServerError::Metadata)
     }
 
@@ -860,20 +862,17 @@ impl Coordinator {
         // 8. Record metadata (to metadata PG).
         //    Metadata blob stored in DB row; size == user data length.
         let user_size = user_data.len() as u64;
-        let meta_result = meta_pg.put_object_meta(&PutObjectMetaReq {
+        let meta_result = meta_pg.put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
             bucket: BucketName::from(bucket),
             key: ObjectKey::from(key),
             version_id,
-            status: storage::ObjectState::Live,
             size: user_size,
             etag: crc64_to_etag_bytes(etag_crc),
             etag_kind: storage::EtagKind::Crc64,
-            ec_k: self.ec_config.data_shards,
-            ec_m: self.ec_config.parity_shards,
-            data_layout: None,
-            parts_count: None,
+            ec: EcShape { k: self.ec_config.data_shards, m: self.ec_config.parity_shards },
+            layout: ObjectLayout::ChunkManifest,
             metadata_blob: Some(blob_bytes),
-        });
+        }));
 
         if let Err(e) = meta_result {
             // Best-effort cleanup of all written shards
@@ -936,10 +935,10 @@ impl Coordinator {
         // 2. Check write conditions if any are set
         if !cond.is_empty() {
             let existing_etag = match meta_pg.get_object_meta(bucket, key) {
-                Ok(record) => Some(format_object_etag(
+                Ok(stored) => stored.as_live().map(|record| format_object_etag(
                     &record.etag,
                     record.etag_kind,
-                    record.parts_count,
+                    record.layout.parts_count(),
                 )),
                 Err(storage::MetadataError::ObjectNotFound) => None,
                 Err(e) => return Err(ServerError::Metadata(e)),
@@ -1247,10 +1246,10 @@ impl Coordinator {
         // Check write conditions.
         if !cond.is_empty() {
             let existing_etag = match meta_guard.get_object_meta(bucket, key) {
-                Ok(record) => Some(format_object_etag(
+                Ok(stored) => stored.as_live().map(|record| format_object_etag(
                     &record.etag,
                     record.etag_kind,
-                    record.parts_count,
+                    record.layout.parts_count(),
                 )),
                 Err(storage::MetadataError::ObjectNotFound) => None,
                 Err(e) => return Err(ServerError::Metadata(e)),
@@ -1303,18 +1302,14 @@ impl Coordinator {
         meta_guard
             .commit_stream_put(
                 session_id,
-                &PutObjectMetaReq {
+                &CommitStreamPutReq {
                     bucket: BucketName::from(bucket),
                     key: ObjectKey::from(key),
                     version_id,
-                    status: storage::ObjectState::Live,
                     size: total_size,
                     etag: crc64_to_etag_bytes(crc64),
                     etag_kind: storage::EtagKind::Crc64,
-                    ec_k: self.ec_config.data_shards,
-                    ec_m: self.ec_config.parity_shards,
-                    data_layout: None,
-                    parts_count: None,
+                    ec: EcShape { k: self.ec_config.data_shards, m: self.ec_config.parity_shards },
                     metadata_blob: Some(blob_bytes),
                 },
                 &committed_chunks,
@@ -1677,30 +1672,33 @@ impl Coordinator {
         // Phase 1: Read source object
         let (src_metadata, user_data) = {
             let LockedReadObject {
-                record: src_record,
+                record: src_stored,
                 pgs,
             } = self.lock_object_pgs_for_read(src_bucket, src_key, src_version_id)?;
 
             // Reject delete markers — they are not copyable objects.
             // AWS returns 400/InvalidRequest when an explicit versionId targets a
             // delete marker, and 404/NoSuchKey when current version is a delete marker.
-            if src_record.status.is_delete_marker() {
-                return if src_version_id.is_some() {
-                    Err(ServerError::InvalidRequest {
-                        reason: "The source of a copy request may not specifically refer to a delete marker by version id.".to_string(),
-                    })
-                } else {
-                    Err(ServerError::ObjectNotFound {
-                        bucket: src_bucket.to_string(),
-                        key: src_key.to_string(),
-                    })
-                };
-            }
+            let src_record = match src_stored {
+                StoredObject::Live(r) => r,
+                StoredObject::DeleteMarker(_) => {
+                    return if src_version_id.is_some() {
+                        Err(ServerError::InvalidRequest {
+                            reason: "The source of a copy request may not specifically refer to a delete marker by version id.".to_string(),
+                        })
+                    } else {
+                        Err(ServerError::ObjectNotFound {
+                            bucket: src_bucket.to_string(),
+                            key: src_key.to_string(),
+                        })
+                    };
+                }
+            };
 
             let src_etag = format_object_etag(
                 &src_record.etag,
                 src_record.etag_kind,
-                src_record.parts_count,
+                src_record.layout.parts_count(),
             );
             check_copy_source_conditions(src_cond, &src_etag, src_record.last_modified)?;
 
@@ -1712,7 +1710,7 @@ impl Coordinator {
                 other => other,
             };
 
-            if src_record.data_layout == DataLayout::MultipartManifest {
+            if matches!(src_record.layout, ObjectLayout::MultipartManifest { .. }) {
                 // Multipart source: metadata from row, data from parts.
                 let meta_pg = pgs.meta();
                 let obj_parts = meta_pg
@@ -1856,10 +1854,10 @@ impl Coordinator {
         // Check dest write conditions
         if !dst_cond.is_empty() {
             let existing_etag = match dst_meta_pg.get_object_meta(dst_bucket, dst_key) {
-                Ok(record) => Some(format_object_etag(
+                Ok(stored) => stored.as_live().map(|record| format_object_etag(
                     &record.etag,
                     record.etag_kind,
-                    record.parts_count,
+                    record.layout.parts_count(),
                 )),
                 Err(storage::MetadataError::ObjectNotFound) => None,
                 Err(e) => return Err(ServerError::Metadata(e)),
@@ -1878,7 +1876,7 @@ impl Coordinator {
         )?;
 
         // Read back dest metadata to get the authoritative last_modified
-        let dst_record = dst_meta_pg
+        let dst_stored = dst_meta_pg
             .get_object_meta(dst_bucket, dst_key)
             .map_err(ServerError::Metadata)?;
         drop(pgs);
@@ -1888,7 +1886,7 @@ impl Coordinator {
 
         Ok(CopyObjectResult {
             etag: put_result.etag,
-            last_modified: dst_record.last_modified,
+            last_modified: dst_stored.last_modified(),
             version_id: put_result.version_id,
         })
     }
@@ -1898,7 +1896,7 @@ impl Coordinator {
         bucket: &str,
         key: &str,
         version_id: Option<storage::VersionId>,
-    ) -> Result<ObjectRecord, ServerError> {
+    ) -> Result<StoredObject, ServerError> {
         match version_id {
             Some(vid) => meta_pg.get_object_version(bucket, key, vid),
             None => meta_pg.get_object_meta(bucket, key),
@@ -1929,7 +1927,7 @@ impl Coordinator {
         loop {
             let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
             let record = Self::lookup_object_record(&meta_guard, bucket, key, version_id)?;
-            let shard_pg_id = self.shard_pg_id(bucket, key, record.version_id);
+            let shard_pg_id = self.shard_pg_id(bucket, key, record.version_id());
 
             if shard_pg_id == meta_pg_id {
                 return Ok(LockedReadObject {
@@ -1952,7 +1950,7 @@ impl Coordinator {
             let (meta_guard, shard_guard) =
                 self.storage_node.lock_two_pgs(meta_pg_id, shard_pg_id)?;
             let record = Self::lookup_object_record(&meta_guard, bucket, key, version_id)?;
-            let verify_shard_pg_id = self.shard_pg_id(bucket, key, record.version_id);
+            let verify_shard_pg_id = self.shard_pg_id(bucket, key, record.version_id());
 
             // Latest-version target changed while relocking; try again with new mapping.
             if verify_shard_pg_id != shard_pg_id {
@@ -2041,11 +2039,11 @@ impl Coordinator {
         pg: &storage::PgStore,
         okh: &[u8; 16],
         version_id: storage::VersionId,
-        record: &ObjectRecord,
+        record: &LiveObjectRecord,
         needed: &[usize],
     ) -> Result<(Vec<Vec<u8>>, usize), ServerError> {
-        let k = record.ec_k as usize;
-        let m = record.ec_m as usize;
+        let k = record.ec.k as usize;
+        let m = record.ec.m as usize;
 
         // Try reading just the needed shards first
         let mut result_shards: Vec<Option<Vec<u8>>> = Vec::with_capacity(needed.len());
@@ -2113,12 +2111,12 @@ impl Coordinator {
                 .collect();
 
             let tmp_codec;
-            let codec = if record.ec_k == self.ec_config.data_shards
-                && record.ec_m == self.ec_config.parity_shards
+            let codec = if record.ec.k == self.ec_config.data_shards
+                && record.ec.m == self.ec_config.parity_shards
             {
                 &self.ec_codec
             } else {
-                let ec_config = EcConfig::new(record.ec_k, record.ec_m)?;
+                let ec_config = EcConfig::new(record.ec.k, record.ec.m)?;
                 tmp_codec = ErasureCodec::new(ec_config)?;
                 &tmp_codec
             };
@@ -2186,16 +2184,16 @@ impl Coordinator {
         pg: &storage::PgStore,
         okh: &[u8; 16],
         version_id: storage::VersionId,
-        record: &ObjectRecord,
+        record: &LiveObjectRecord,
         start: usize,
         end: usize,
     ) -> Result<Vec<u8>, ServerError> {
-        let shard_size = Self::compute_shard_size(record.size, record.ec_k);
+        let shard_size = Self::compute_shard_size(record.size, record.ec.k);
         if shard_size == 0 {
             return Ok(vec![]);
         }
 
-        let needed = Self::shards_for_byte_range(start, end, shard_size, record.ec_k);
+        let needed = Self::shards_for_byte_range(start, end, shard_size, record.ec.k);
         if needed.is_empty() {
             return Ok(vec![]);
         }
@@ -2618,21 +2616,24 @@ impl Coordinator {
         version_id: Option<storage::VersionId>,
         cond: &ReadCondition,
     ) -> Result<GetObjectResult, ServerError> {
-        let LockedReadObject { record, pgs } =
+        let LockedReadObject { record: stored, pgs } =
             self.lock_object_pgs_for_read(bucket, key, version_id)?;
 
         // If latest version is a delete marker, return 404 with x-amz-delete-marker
-        if record.status.is_delete_marker() {
-            return Err(ServerError::DeleteMarkerHit {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-            });
-        }
+        let record = match stored {
+            StoredObject::Live(r) => r,
+            StoredObject::DeleteMarker(_) => {
+                return Err(ServerError::DeleteMarkerHit {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                });
+            }
+        };
 
-        let etag_str = format_object_etag(&record.etag, record.etag_kind, record.parts_count);
+        let etag_str = format_object_etag(&record.etag, record.etag_kind, record.layout.parts_count());
         check_read_conditions(cond, &etag_str, record.last_modified)?;
 
-        if record.data_layout == DataLayout::MultipartManifest {
+        if matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
             // Multipart: metadata is in object row, data spans multiple parts.
             let meta_pg = pgs.meta();
             let obj_parts = meta_pg
@@ -2760,20 +2761,23 @@ impl Coordinator {
         part_number: u32,
         cond: &ReadCondition,
     ) -> Result<GetObjectPartResult, ServerError> {
-        let LockedReadObject { record, pgs } =
+        let LockedReadObject { record: stored, pgs } =
             self.lock_object_pgs_for_read(bucket, key, version_id)?;
 
-        if record.status.is_delete_marker() {
-            return Err(ServerError::DeleteMarkerHit {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-            });
-        }
+        let record = match stored {
+            StoredObject::Live(r) => r,
+            StoredObject::DeleteMarker(_) => {
+                return Err(ServerError::DeleteMarkerHit {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                });
+            }
+        };
 
-        let etag_str = format_object_etag(&record.etag, record.etag_kind, record.parts_count);
+        let etag_str = format_object_etag(&record.etag, record.etag_kind, record.layout.parts_count());
         check_read_conditions(cond, &etag_str, record.last_modified)?;
 
-        if record.data_layout == DataLayout::MultipartManifest {
+        if matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
             let meta_pg = pgs.meta();
             let obj_parts = meta_pg
                 .get_object_parts(bucket, key, record.version_id)
@@ -2942,20 +2946,23 @@ impl Coordinator {
         part_number: u32,
         cond: &ReadCondition,
     ) -> Result<HeadObjectPartResult, ServerError> {
-        let LockedReadObject { record, pgs } =
+        let LockedReadObject { record: stored, pgs } =
             self.lock_object_pgs_for_read(bucket, key, version_id)?;
 
-        if record.status.is_delete_marker() {
-            return Err(ServerError::DeleteMarkerHit {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-            });
-        }
+        let record = match stored {
+            StoredObject::Live(r) => r,
+            StoredObject::DeleteMarker(_) => {
+                return Err(ServerError::DeleteMarkerHit {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                });
+            }
+        };
 
-        let etag_str = format_object_etag(&record.etag, record.etag_kind, record.parts_count);
+        let etag_str = format_object_etag(&record.etag, record.etag_kind, record.layout.parts_count());
         check_read_conditions(cond, &etag_str, record.last_modified)?;
 
-        if record.data_layout == DataLayout::MultipartManifest {
+        if matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
             let meta_pg = pgs.meta();
             let obj_parts = meta_pg
                 .get_object_parts(bucket, key, record.version_id)
@@ -3034,18 +3041,21 @@ impl Coordinator {
         version_id: Option<storage::VersionId>,
         cond: &ReadCondition,
     ) -> Result<HeadObjectResult, ServerError> {
-        let LockedReadObject { record, .. } =
+        let LockedReadObject { record: stored, .. } =
             self.lock_object_pgs_for_read(bucket, key, version_id)?;
 
         // If latest version is a delete marker, return 404 with x-amz-delete-marker
-        if record.status.is_delete_marker() {
-            return Err(ServerError::DeleteMarkerHit {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-            });
-        }
+        let record = match stored {
+            StoredObject::Live(r) => r,
+            StoredObject::DeleteMarker(_) => {
+                return Err(ServerError::DeleteMarkerHit {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                });
+            }
+        };
 
-        let etag_str = format_object_etag(&record.etag, record.etag_kind, record.parts_count);
+        let etag_str = format_object_etag(&record.etag, record.etag_kind, record.layout.parts_count());
         check_read_conditions(cond, &etag_str, record.last_modified)?;
 
         // Metadata always from DB row (both multipart and non-multipart).
@@ -3079,17 +3089,20 @@ impl Coordinator {
         part_number_marker: Option<u32>,
         max_parts: u32,
     ) -> Result<GetObjectAttributesResult, ServerError> {
-        let LockedReadObject { record, pgs } =
+        let LockedReadObject { record: stored, pgs } =
             self.lock_object_pgs_for_read(bucket, key, version_id)?;
 
-        if record.status.is_delete_marker() {
-            return Err(ServerError::DeleteMarkerHit {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-            });
-        }
+        let record = match stored {
+            StoredObject::Live(r) => r,
+            StoredObject::DeleteMarker(_) => {
+                return Err(ServerError::DeleteMarkerHit {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                });
+            }
+        };
 
-        let etag_str = format_object_etag(&record.etag, record.etag_kind, record.parts_count);
+        let etag_str = format_object_etag(&record.etag, record.etag_kind, record.layout.parts_count());
         check_read_conditions(cond, &etag_str, record.last_modified)?;
 
         // Metadata always from DB row (both multipart and non-multipart).
@@ -3100,7 +3113,7 @@ impl Coordinator {
             .transpose()?
             .unwrap_or_default();
 
-        let object_parts = if want_parts && record.data_layout == DataLayout::MultipartManifest {
+        let object_parts = if want_parts && matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
             // Check if this multipart upload used checksums
             let has_checksum = metadata.get("x-amz-checksum-algorithm").is_some();
 
@@ -3191,18 +3204,21 @@ impl Coordinator {
         range: ByteRange,
         cond: &ReadCondition,
     ) -> Result<GetObjectRangeResult, ServerError> {
-        let LockedReadObject { record, pgs } =
+        let LockedReadObject { record: stored, pgs } =
             self.lock_object_pgs_for_read(bucket, key, version_id)?;
 
         // If latest version is a delete marker, return 404 with x-amz-delete-marker
-        if record.status.is_delete_marker() {
-            return Err(ServerError::DeleteMarkerHit {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-            });
-        }
+        let record = match stored {
+            StoredObject::Live(r) => r,
+            StoredObject::DeleteMarker(_) => {
+                return Err(ServerError::DeleteMarkerHit {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                });
+            }
+        };
 
-        let etag_str = format_object_etag(&record.etag, record.etag_kind, record.parts_count);
+        let etag_str = format_object_etag(&record.etag, record.etag_kind, record.layout.parts_count());
         check_read_conditions(cond, &etag_str, record.last_modified)?;
 
         // Resolve byte range against user data size
@@ -3221,7 +3237,7 @@ impl Coordinator {
             other => other,
         };
 
-        let (metadata, user_data) = if record.data_layout == DataLayout::MultipartManifest {
+        let (metadata, user_data) = if matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
             // Multipart: metadata from object row, data spans parts.
             let meta_pg = pgs.meta();
             let obj_parts = meta_pg
@@ -3318,7 +3334,7 @@ impl Coordinator {
         match (bucket_info.versioning, request_version_id) {
             // Unversioned bucket: physical delete (current behavior)
             (storage::BucketVersioningState::Disabled, _) => {
-                let LockedReadObject { record, pgs } =
+                let LockedReadObject { record: stored, pgs } =
                     match self.lock_object_pgs_for_read(bucket, key, None) {
                         Ok(locked) => locked,
                         Err(ServerError::ObjectNotFound { .. }) => {
@@ -3333,17 +3349,28 @@ impl Coordinator {
                         Err(other) => return Err(other),
                     };
 
+                // Unversioned bucket objects are always live (no delete markers).
+                let record = match stored {
+                    StoredObject::Live(r) => r,
+                    StoredObject::DeleteMarker(_) => {
+                        return Ok(DeleteObjectResult {
+                            version_id: storage::VersionId::Null,
+                            delete_marker: false,
+                        });
+                    }
+                };
+
                 let meta_pg = pgs.meta();
                 let shard_pg = pgs.shard();
 
                 // Check delete conditions
                 if !cond.is_empty() {
                     let etag_str =
-                        format_object_etag(&record.etag, record.etag_kind, record.parts_count);
+                        format_object_etag(&record.etag, record.etag_kind, record.layout.parts_count());
                     check_delete_conditions(cond, &etag_str)?;
                 }
 
-                if record.data_layout == DataLayout::MultipartManifest {
+                if matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
                     // Multipart: collect parts, delete metadata under lock,
                     // then delete part shards after releasing the lock.
                     let obj_parts = meta_pg
@@ -3393,7 +3420,7 @@ impl Coordinator {
                         let _ = self.delete_chunk_shards(&chunks);
                     } else {
                         let okh = object_key_hash(bucket, key);
-                        let total = record.ec_k as usize + record.ec_m as usize;
+                        let total = record.ec.k as usize + record.ec.m as usize;
 
                         for i in 0..total {
                             let shard_key = ShardKey::new(&okh, vid.to_u64(), i as u8);
@@ -3412,7 +3439,7 @@ impl Coordinator {
 
             // Versioned/Suspended + specific versionId: permanent delete that version
             (_, Some(vid)) => {
-                let LockedReadObject { record, pgs } =
+                let LockedReadObject { record: stored, pgs } =
                     match self.lock_object_pgs_for_read(bucket, key, Some(vid)) {
                         Ok(locked) => locked,
                         Err(ServerError::ObjectNotFound { .. }) => {
@@ -3426,10 +3453,11 @@ impl Coordinator {
 
                 let meta_pg = pgs.meta();
                 let shard_pg = pgs.shard();
+                let is_delete_marker = stored.is_delete_marker();
 
                 // Delete shards if it's a live object (not a delete marker)
-                if record.status == storage::ObjectState::Live {
-                    if record.data_layout == DataLayout::MultipartManifest {
+                if let StoredObject::Live(record) = &stored {
+                    if matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
                         let obj_parts = meta_pg
                             .get_object_parts(bucket, key, vid)
                             .map_err(ServerError::Metadata)?;
@@ -3482,7 +3510,7 @@ impl Coordinator {
                     }
 
                     let okh = object_key_hash(bucket, key);
-                    let total = record.ec_k as usize + record.ec_m as usize;
+                    let total = record.ec.k as usize + record.ec.m as usize;
 
                     for i in 0..total {
                         let shard_key = ShardKey::new(&okh, vid.to_u64(), i as u8);
@@ -3491,8 +3519,6 @@ impl Coordinator {
                 }
 
                 meta_pg.delete_object_version(bucket, key, vid)?;
-
-                let is_delete_marker = record.status.is_delete_marker();
 
                 Ok(DeleteObjectResult {
                     version_id: vid,
@@ -3505,20 +3531,11 @@ impl Coordinator {
                 let meta_pg_id = self.object_pg_id(bucket, key);
                 let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
                 let marker_vid = meta_pg.next_version_id(bucket, key)?;
-                meta_pg.put_object_meta(&PutObjectMetaReq {
+                meta_pg.put_object_meta(&PutObjectReq::DeleteMarker(PutDeleteMarkerReq {
                     bucket: BucketName::from(bucket),
                     key: ObjectKey::from(key),
                     version_id: marker_vid,
-                    status: storage::ObjectState::DeleteMarker,
-                    size: 0,
-                    etag: vec![],
-                    etag_kind: storage::EtagKind::Crc64,
-                    ec_k: 0,
-                    ec_m: 0,
-                    data_layout: None,
-                    parts_count: None,
-                    metadata_blob: None,
-                })?;
+                }))?;
 
                 Ok(DeleteObjectResult {
                     version_id: marker_vid,
@@ -3563,7 +3580,7 @@ impl Coordinator {
         };
 
         // Fan out to all PGs and collect results, with a hard memory cap.
-        let mut all_objects: Vec<ObjectRecord> = Vec::new();
+        let mut all_objects: Vec<StoredObject> = Vec::new();
         let mut hit_record_cap = false;
         self.pg_topology.for_each_pg(|pg_id| {
             if hit_record_cap {
@@ -3585,11 +3602,11 @@ impl Coordinator {
         })?;
 
         // Sort by key
-        all_objects.sort_by(|a, b| a.key.cmp(&b.key));
+        all_objects.sort_by(|a, b| a.key().cmp(b.key()));
 
         // Dedup by key (same key from different PGs shouldn't happen with
         // correct PG derivation, but be safe)
-        all_objects.dedup_by(|a, b| a.key == b.key);
+        all_objects.dedup_by(|a, b| a.key() == b.key());
 
         // Apply delimiter logic and build result entries, stopping at max_keys
         let max = max_keys as usize;
@@ -3610,14 +3627,15 @@ impl Coordinator {
                     is_truncated = true;
                     break;
                 }
-                let record = &all_objects[i];
-                let after_prefix = &record.key[prefix_str.len()..];
+                let obj = &all_objects[i];
+                let obj_key = obj.key();
+                let after_prefix = &obj_key[prefix_str.len()..];
                 if let Some(pos) = after_prefix.find(delim) {
                     let cp = format!("{}{}", prefix_str, &after_prefix[..pos + delim.len()]);
                     // Skip all remaining keys under this common prefix so the
                     // continuation token advances past the entire group.
                     let is_new = seen_prefixes.insert(cp.clone());
-                    while i < all_objects.len() && all_objects[i].key.starts_with(&cp) {
+                    while i < all_objects.len() && all_objects[i].key().starts_with(&cp) {
                         i += 1;
                     }
                     if is_new && token.is_none_or(|t| cp.as_str() > t) {
@@ -3626,42 +3644,45 @@ impl Coordinator {
                         last_entry = Some(cp);
                     }
                 } else {
-                    if token.is_none_or(|t| record.key.as_str() > t) {
+                    if token.is_none_or(|t| obj_key.as_str() > t) {
+                        let record = obj.as_live().expect("list_objects returns only live objects");
                         objects.push(ListEntry {
-                            key: record.key.to_string(),
+                            key: obj_key.to_string(),
                             size: record.size,
                             etag: format_object_etag(
                                 &record.etag,
                                 record.etag_kind,
-                                record.parts_count,
+                                record.layout.parts_count(),
                             ),
                             last_modified: record.last_modified,
                         });
                         entry_count += 1;
-                        last_entry = Some(record.key.to_string());
+                        last_entry = Some(obj_key.to_string());
                     }
                     i += 1;
                 }
             }
         } else {
-            for record in &all_objects {
+            for obj in &all_objects {
                 if entry_count >= max {
                     is_truncated = true;
                     break;
                 }
-                if token.is_none_or(|t| record.key.as_str() > t) {
+                let obj_key = obj.key();
+                if token.is_none_or(|t| obj_key.as_str() > t) {
+                    let record = obj.as_live().expect("list_objects returns only live objects");
                     objects.push(ListEntry {
-                        key: record.key.to_string(),
+                        key: obj_key.to_string(),
                         size: record.size,
                         etag: format_object_etag(
                             &record.etag,
                             record.etag_kind,
-                            record.parts_count,
+                            record.layout.parts_count(),
                         ),
                         last_modified: record.last_modified,
                     });
                     entry_count += 1;
-                    last_entry = Some(record.key.to_string());
+                    last_entry = Some(obj_key.to_string());
                 }
             }
 
@@ -3708,7 +3729,7 @@ impl Coordinator {
         }
 
         // Fan out to all PGs and collect version records
-        let mut all_versions: Vec<ObjectRecord> = Vec::new();
+        let mut all_versions: Vec<StoredObject> = Vec::new();
         self.pg_topology.for_each_pg(|pg_id| {
             let pg = self.storage_node.get_pg(pg_id)?;
             let resp = pg.list_object_versions(&ListObjectVersionsReq {
@@ -3723,30 +3744,36 @@ impl Coordinator {
         })?;
 
         // Sort by (key ASC, version_id DESC)
-        all_versions.sort_by(|a, b| a.key.cmp(&b.key).then(b.version_id.to_u64().cmp(&a.version_id.to_u64())));
+        all_versions.sort_by(|a, b| a.key().cmp(b.key()).then(b.version_id().to_u64().cmp(&a.version_id().to_u64())));
 
         // Build result entries, tracking is_latest per key
         let max = max_keys as usize;
         let mut versions: Vec<VersionEntry> = Vec::new();
         let mut last_key: Option<&str> = None;
 
-        for record in &all_versions {
+        for obj in &all_versions {
             if versions.len() >= max {
                 break;
             }
-            let is_latest = last_key.is_none_or(|k| k != record.key);
+            let obj_key = obj.key();
+            let is_latest = last_key.is_none_or(|k| k != obj_key.as_str());
             if is_latest {
-                last_key = Some(&record.key);
+                last_key = Some(obj_key);
             }
 
+            let (size, etag) = match obj.as_live() {
+                Some(record) => (record.size, format_object_etag(&record.etag, record.etag_kind, record.layout.parts_count())),
+                None => (0, String::new()),
+            };
+
             versions.push(VersionEntry {
-                key: record.key.to_string(),
-                version_id: record.version_id,
+                key: obj_key.to_string(),
+                version_id: obj.version_id(),
                 is_latest,
-                size: record.size,
-                etag: format_object_etag(&record.etag, record.etag_kind, record.parts_count),
-                last_modified: record.last_modified,
-                is_delete_marker: record.status.is_delete_marker(),
+                size,
+                etag,
+                last_modified: obj.last_modified(),
+                is_delete_marker: obj.is_delete_marker(),
             });
         }
 
@@ -3899,28 +3926,31 @@ impl Coordinator {
         // Phase 1: Read source object (only the needed range)
         let source_data = {
             let LockedReadObject {
-                record: src_record,
+                record: src_stored,
                 pgs,
             } = self.lock_object_pgs_for_read(src_bucket, src_key, src_version_id)?;
 
             // Reject delete markers — they are not copyable objects.
-            if src_record.status.is_delete_marker() {
-                return if src_version_id.is_some() {
-                    Err(ServerError::InvalidRequest {
-                        reason: "The source of a copy request may not specifically refer to a delete marker by version id.".to_string(),
-                    })
-                } else {
-                    Err(ServerError::ObjectNotFound {
-                        bucket: src_bucket.to_string(),
-                        key: src_key.to_string(),
-                    })
-                };
-            }
+            let src_record = match src_stored {
+                StoredObject::Live(r) => r,
+                StoredObject::DeleteMarker(_) => {
+                    return if src_version_id.is_some() {
+                        Err(ServerError::InvalidRequest {
+                            reason: "The source of a copy request may not specifically refer to a delete marker by version id.".to_string(),
+                        })
+                    } else {
+                        Err(ServerError::ObjectNotFound {
+                            bucket: src_bucket.to_string(),
+                            key: src_key.to_string(),
+                        })
+                    };
+                }
+            };
 
             let src_etag = format_object_etag(
                 &src_record.etag,
                 src_record.etag_kind,
-                src_record.parts_count,
+                src_record.layout.parts_count(),
             );
             check_copy_source_conditions(src_cond, &src_etag, src_record.last_modified)?;
 
@@ -3951,7 +3981,7 @@ impl Coordinator {
 
             if source_size == 0 {
                 vec![]
-            } else if src_record.data_layout == DataLayout::MultipartManifest {
+            } else if matches!(src_record.layout, ObjectLayout::MultipartManifest { .. }) {
                 let meta_pg = pgs.meta();
                 let obj_parts = meta_pg
                     .get_object_parts(src_bucket, src_key, src_record.version_id)
@@ -4561,18 +4591,14 @@ impl Coordinator {
         }
 
         // 9. Build the object metadata and manifest parts.
-        let obj_req = PutObjectMetaReq {
+        let obj_req = CommitMultipartReq {
             bucket: BucketName::from(bucket),
             key: ObjectKey::from(key),
             version_id,
-            status: storage::ObjectState::Live,
             size: total_size,
             etag: etag_bytes,
             etag_kind: storage::EtagKind::MultipartComposite,
-            ec_k: 0,      // per-part, not per-object
-            ec_m: 0,
-            data_layout: Some(DataLayout::MultipartManifest),
-            parts_count: Some(part_records.len() as u32),
+            ec: EcShape { k: 0, m: 0 },      // per-part, not per-object
             metadata_blob: Some(metadata_blob_bytes),
         };
 
@@ -7949,9 +7975,10 @@ mod tests {
         let meta_pg_id = coord.object_pg_id("bucket", "key");
         let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
         let obj = pg.get_object_meta("bucket", "key").unwrap();
-        assert_eq!(obj.data_layout, DataLayout::MultipartManifest);
-        assert_eq!(obj.parts_count, Some(2));
-        assert_eq!(obj.size, big_part.len() as u64 + small_last.len() as u64);
+        let live_obj = obj.as_live().expect("expected live object");
+        assert!(matches!(live_obj.layout, ObjectLayout::MultipartManifest { .. }));
+        assert_eq!(live_obj.layout.parts_count(), Some(2));
+        assert_eq!(live_obj.size, big_part.len() as u64 + small_last.len() as u64);
 
         // object_parts should be committed.
         let committed = pg
@@ -8166,7 +8193,8 @@ mod tests {
         let meta_pg_id = coord.object_pg_id("bucket", "key");
         let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
         let obj = pg.get_object_meta("bucket", "key").unwrap();
-        assert_eq!(obj.parts_count, Some(2));
+        let live_obj = obj.as_live().expect("expected live object");
+        assert_eq!(live_obj.layout.parts_count(), Some(2));
 
         // Old manifest parts (from first upload) should be replaced.
         let committed = pg.get_object_parts("bucket", "key", storage::VersionId::Null).unwrap();
@@ -10644,7 +10672,7 @@ mod tests {
             let meta_pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
             let record = meta_pg.get_object_meta("bucket", "verify").unwrap();
             let chunks = meta_pg
-                .get_stream_object_chunks("bucket", "verify", record.version_id)
+                .get_stream_object_chunks("bucket", "verify", record.version_id())
                 .unwrap();
 
             assert_eq!(chunks.len(), 2);

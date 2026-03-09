@@ -3,36 +3,33 @@ use crate::types::*;
 
 /// Run the common metadata test suite against any PgMetadataStore implementation.
 fn metadata_put_get_delete(store: &dyn PgMetadataStore) {
-    let req = PutObjectMetaReq {
+    let req = PutObjectReq::Live(PutLiveObjectReq {
         bucket: "test-bucket".into(),
         key: "test-key".into(),
         version_id: VersionId::Null,
-        status: ObjectState::Live,
+        ec: EcShape { k: 4, m: 2 },
         size: 1024,
         etag: vec![0xAB, 0xCD],
-        etag_kind: EtagKind::Crc64,
-        ec_k: 4,
-        ec_m: 2,
-        data_layout: None,
-        parts_count: None,
+        etag_kind: EtagKind::Crc64,layout: ObjectLayout::ChunkManifest,
         metadata_blob: None,
-    };
+    });
 
     // Put
     store.put_object_meta(&req).unwrap();
 
     // Get
     let obj = store.get_object_meta("test-bucket", "test-key").unwrap();
-    assert_eq!(obj.bucket, "test-bucket");
-    assert_eq!(obj.key, "test-key");
-    assert_eq!(obj.version_id, VersionId::Null);
-    assert_eq!(obj.size, 1024);
-    assert_eq!(obj.etag, vec![0xAB, 0xCD]);
-    assert_eq!(obj.etag_kind, EtagKind::Crc64);
-    assert_eq!(obj.ec_k, 4);
-    assert_eq!(obj.ec_m, 2);
-    assert_eq!(obj.status, ObjectState::Live);
-    assert!(obj.last_modified > 0);
+    assert_eq!(*obj.bucket(), "test-bucket");
+    assert_eq!(*obj.key(), "test-key");
+    assert_eq!(obj.version_id(), VersionId::Null);
+    let live = obj.as_live().unwrap();
+    assert_eq!(live.size, 1024);
+    assert_eq!(live.etag, vec![0xAB, 0xCD]);
+    assert_eq!(live.etag_kind, EtagKind::Crc64);
+    assert_eq!(live.ec.k, 4);
+    assert_eq!(live.ec.m, 2);
+    assert!(!obj.is_delete_marker());
+    assert!(obj.last_modified() > 0);
 
     // Delete
     store.delete_object_meta("test-bucket", "test-key").unwrap();
@@ -44,41 +41,34 @@ fn metadata_put_get_delete(store: &dyn PgMetadataStore) {
 }
 
 fn metadata_put_overwrites(store: &dyn PgMetadataStore) {
-    let req1 = PutObjectMetaReq {
+    let req1 = PutObjectReq::Live(PutLiveObjectReq {
         bucket: "b".into(),
         key: "k".into(),
         version_id: VersionId::Null,
-        status: ObjectState::Live,
+        ec: EcShape { k: 4, m: 2 },
         size: 100,
         etag: vec![1],
-        etag_kind: EtagKind::Crc64,
-        ec_k: 4,
-        ec_m: 2,
-        data_layout: None,
-        parts_count: None,
+        etag_kind: EtagKind::Crc64,layout: ObjectLayout::ChunkManifest,
         metadata_blob: None,
-    };
+    });
     store.put_object_meta(&req1).unwrap();
 
-    let req2 = PutObjectMetaReq {
+    let req2 = PutObjectReq::Live(PutLiveObjectReq {
         bucket: "b".into(),
         key: "k".into(),
         version_id: VersionId::Null,
-        status: ObjectState::Live,
+        ec: EcShape { k: 4, m: 2 },
         size: 200,
         etag: vec![2],
-        etag_kind: EtagKind::Crc64,
-        ec_k: 4,
-        ec_m: 2,
-        data_layout: None,
-        parts_count: None,
+        etag_kind: EtagKind::Crc64,layout: ObjectLayout::ChunkManifest,
         metadata_blob: None,
-    };
+    });
     store.put_object_meta(&req2).unwrap();
 
     let obj = store.get_object_meta("b", "k").unwrap();
-    assert_eq!(obj.size, 200);
-    assert_eq!(obj.etag, vec![2]);
+    let live = obj.as_live().unwrap();
+    assert_eq!(live.size, 200);
+    assert_eq!(live.etag, vec![2]);
 }
 
 fn metadata_get_nonexistent(store: &dyn PgMetadataStore) {
@@ -88,20 +78,17 @@ fn metadata_get_nonexistent(store: &dyn PgMetadataStore) {
 
 fn metadata_list_basic(store: &dyn PgMetadataStore) {
     for i in 0..5 {
-        let req = PutObjectMetaReq {
+        let req = PutObjectReq::Live(PutLiveObjectReq {
             bucket: "list-bucket".into(),
             key: format!("obj-{i:02}").into(),
             version_id: VersionId::Null,
-            status: ObjectState::Live,
             size: i * 100,
             etag: vec![i as u8],
             etag_kind: EtagKind::Crc64,
-            ec_k: 4,
-            ec_m: 2,
-            data_layout: None,
-            parts_count: None,
+            ec: EcShape { k: 4, m: 2 },
+            layout: ObjectLayout::ChunkManifest,
             metadata_blob: None,
-        };
+        });
         store.put_object_meta(&req).unwrap();
     }
 
@@ -118,26 +105,22 @@ fn metadata_list_basic(store: &dyn PgMetadataStore) {
     assert!(!resp.is_truncated);
     // Verify ordering.
     for (i, obj) in resp.objects.iter().enumerate() {
-        assert_eq!(obj.key, format!("obj-{i:02}"));
+        assert_eq!(*obj.key(), format!("obj-{i:02}"));
     }
 }
 
 fn metadata_list_with_prefix(store: &dyn PgMetadataStore) {
     for key in &["photos/a.jpg", "photos/b.jpg", "docs/c.txt", "photos/d.jpg"] {
-        let req = PutObjectMetaReq {
+        let req = PutObjectReq::Live(PutLiveObjectReq {
             bucket: "prefix-bucket".into(),
             key: (*key).into(),
             version_id: VersionId::Null,
-            status: ObjectState::Live,
+            ec: EcShape { k: 4, m: 2 },
             size: 100,
             etag: vec![0],
-            etag_kind: EtagKind::Crc64,
-            ec_k: 4,
-            ec_m: 2,
-            data_layout: None,
-            parts_count: None,
-            metadata_blob: None,
-        };
+            etag_kind: EtagKind::Crc64,layout: ObjectLayout::ChunkManifest,
+        metadata_blob: None,
+    });
         store.put_object_meta(&req).unwrap();
     }
 
@@ -151,25 +134,22 @@ fn metadata_list_with_prefix(store: &dyn PgMetadataStore) {
         .unwrap();
 
     assert_eq!(resp.objects.len(), 3);
-    assert!(resp.objects.iter().all(|o| o.key.starts_with("photos/")));
+    assert!(resp.objects.iter().all(|o| o.key().starts_with("photos/")));
 }
 
 fn metadata_list_pagination(store: &dyn PgMetadataStore) {
     for i in 0..10 {
-        let req = PutObjectMetaReq {
+        let req = PutObjectReq::Live(PutLiveObjectReq {
             bucket: "page-bucket".into(),
             key: format!("item-{i:02}").into(),
             version_id: VersionId::Null,
-            status: ObjectState::Live,
             size: 0,
             etag: vec![],
             etag_kind: EtagKind::Crc64,
-            ec_k: 4,
-            ec_m: 2,
-            data_layout: None,
-            parts_count: None,
+            ec: EcShape { k: 4, m: 2 },
+            layout: ObjectLayout::ChunkManifest,
             metadata_blob: None,
-        };
+        });
         store.put_object_meta(&req).unwrap();
     }
 
@@ -185,8 +165,8 @@ fn metadata_list_pagination(store: &dyn PgMetadataStore) {
 
     assert_eq!(resp1.objects.len(), 3);
     assert!(resp1.is_truncated);
-    assert_eq!(resp1.objects[0].key, "item-00");
-    assert_eq!(resp1.objects[2].key, "item-02");
+    assert_eq!(resp1.objects[0].key(), "item-00");
+    assert_eq!(resp1.objects[2].key(), "item-02");
     assert_eq!(resp1.next_start_after, Some("item-02".into()));
 
     // Second page.
@@ -201,12 +181,12 @@ fn metadata_list_pagination(store: &dyn PgMetadataStore) {
 
     assert_eq!(resp2.objects.len(), 3);
     assert!(resp2.is_truncated);
-    assert_eq!(resp2.objects[0].key, "item-03");
+    assert_eq!(resp2.objects[0].key(), "item-03");
 
     // Continue until not truncated.
     let mut all_keys = Vec::new();
-    all_keys.extend(resp1.objects.iter().map(|o| o.key.clone()));
-    all_keys.extend(resp2.objects.iter().map(|o| o.key.clone()));
+    all_keys.extend(resp1.objects.iter().map(|o| o.key().clone()));
+    all_keys.extend(resp2.objects.iter().map(|o| o.key().clone()));
 
     let mut start_after = resp2.next_start_after;
     loop {
@@ -219,7 +199,7 @@ fn metadata_list_pagination(store: &dyn PgMetadataStore) {
             })
             .unwrap();
 
-        all_keys.extend(resp.objects.iter().map(|o| o.key.clone()));
+        all_keys.extend(resp.objects.iter().map(|o| o.key().clone()));
         if !resp.is_truncated {
             break;
         }
@@ -249,68 +229,56 @@ fn metadata_list_empty_bucket(store: &dyn PgMetadataStore) {
 
 fn metadata_empty_key(store: &dyn PgMetadataStore) {
     // S3 allows empty keys (though unusual).
-    let req = PutObjectMetaReq {
+    let req = PutObjectReq::Live(PutLiveObjectReq {
         bucket: "b".into(),
         key: "".into(),
         version_id: VersionId::Null,
-        status: ObjectState::Live,
+        ec: EcShape { k: 4, m: 2 },
         size: 0,
         etag: vec![],
-        etag_kind: EtagKind::Crc64,
-        ec_k: 4,
-        ec_m: 2,
-        data_layout: None,
-        parts_count: None,
+        etag_kind: EtagKind::Crc64,layout: ObjectLayout::ChunkManifest,
         metadata_blob: None,
-    };
+    });
     store.put_object_meta(&req).unwrap();
 
     let obj = store.get_object_meta("b", "").unwrap();
-    assert_eq!(obj.key, "");
+    assert_eq!(*obj.key(), "");
 }
 
 fn metadata_long_key(store: &dyn PgMetadataStore) {
     // S3 allows keys up to 1024 bytes.
     let long_key = "x".repeat(1024);
-    let req = PutObjectMetaReq {
+    let req = PutObjectReq::Live(PutLiveObjectReq {
         bucket: "b".into(),
         key: long_key.clone().into(),
         version_id: VersionId::Null,
-        status: ObjectState::Live,
+        ec: EcShape { k: 4, m: 2 },
         size: 0,
         etag: vec![],
-        etag_kind: EtagKind::Crc64,
-        ec_k: 4,
-        ec_m: 2,
-        data_layout: None,
-        parts_count: None,
+        etag_kind: EtagKind::Crc64,layout: ObjectLayout::ChunkManifest,
         metadata_blob: None,
-    };
+    });
     store.put_object_meta(&req).unwrap();
 
     let obj = store.get_object_meta("b", &long_key).unwrap();
-    assert_eq!(obj.key, long_key);
+    assert_eq!(*obj.key(), long_key);
 }
 
 fn metadata_zero_size_object(store: &dyn PgMetadataStore) {
-    let req = PutObjectMetaReq {
+    let req = PutObjectReq::Live(PutLiveObjectReq {
         bucket: "b".into(),
         key: "empty-obj".into(),
         version_id: VersionId::Null,
-        status: ObjectState::Live,
+        ec: EcShape { k: 4, m: 2 },
         size: 0,
         etag: vec![],
-        etag_kind: EtagKind::Crc64,
-        ec_k: 4,
-        ec_m: 2,
-        data_layout: None,
-        parts_count: None,
+        etag_kind: EtagKind::Crc64,layout: ObjectLayout::ChunkManifest,
         metadata_blob: None,
-    };
+    });
     store.put_object_meta(&req).unwrap();
 
     let obj = store.get_object_meta("b", "empty-obj").unwrap();
-    assert_eq!(obj.size, 0);
+    assert_eq!(obj.as_live().unwrap().size, 0);
 }
 
 // --- PgStore (filesystem) tests ---
@@ -527,26 +495,22 @@ fn file_bucket_metadata_config_on_nonexistent_bucket() {
 fn file_metadata_object_has_inline_legacy_layout() {
     let (_dir, store) = make_pg_store();
     store
-        .put_object_meta(&PutObjectMetaReq {
+        .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
             bucket: "b".into(),
             key: "k".into(),
             version_id: VersionId::Null,
-            status: ObjectState::Live,
+            ec: EcShape { k: 4, m: 2 },
             size: 100,
             etag: vec![1, 2, 3],
-            etag_kind: EtagKind::Crc64,
-            ec_k: 4,
-            ec_m: 2,
-            data_layout: None,
-            parts_count: None,
-            metadata_blob: None,
-        })
+            etag_kind: EtagKind::Crc64,layout: ObjectLayout::ChunkManifest,
+        metadata_blob: None,
+    }))
         .unwrap();
 
     let obj = store.get_object_meta("b", "k").unwrap();
-    assert_eq!(obj.data_layout, DataLayout::ChunkManifestInternal);
-    assert_eq!(obj.parts_count, None);
-    assert_eq!(obj.metadata_blob, None);
+    let live = obj.as_live().unwrap();
+    assert_eq!(live.layout, ObjectLayout::ChunkManifest);
+    assert_eq!(live.metadata_blob, None);
 }
 
 #[test]
@@ -555,20 +519,16 @@ fn file_metadata_invalid_data_layout_returns_error() {
 
     // Insert a valid object first
     store
-        .put_object_meta(&PutObjectMetaReq {
+        .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
             bucket: "b".into(),
             key: "k".into(),
             version_id: VersionId::Null,
-            status: ObjectState::Live,
+            ec: EcShape { k: 4, m: 2 },
             size: 100,
             etag: vec![1, 2, 3],
-            etag_kind: EtagKind::Crc64,
-            ec_k: 4,
-            ec_m: 2,
-            data_layout: None,
-            parts_count: None,
-            metadata_blob: None,
-        })
+            etag_kind: EtagKind::Crc64,layout: ObjectLayout::ChunkManifest,
+        metadata_blob: None,
+    }))
         .unwrap();
 
     // Corrupting data_layout is blocked by DB CHECK constraints.
@@ -586,7 +546,7 @@ fn file_metadata_invalid_data_layout_returns_error() {
 
     // Record remains readable and unchanged.
     let obj = store.get_object_meta("b", "k").unwrap();
-    assert_eq!(obj.data_layout, DataLayout::ChunkManifestInternal);
+    assert_eq!(obj.as_live().unwrap().layout, ObjectLayout::ChunkManifest);
 }
 
 // --- Multipart metadata tests (PgStore only — needs SQL) ---
@@ -773,18 +733,14 @@ fn mpu_complete_multipart_commit_preserves_checksums() {
         })
         .unwrap();
 
-    let obj = PutObjectMetaReq {
+    let obj = CommitMultipartReq {
         bucket: "b".into(),
         key: "k".into(),
         version_id: VersionId::Null,
         size: 6 * 1024 * 1024,
         etag: vec![0xCC],
         etag_kind: EtagKind::MultipartComposite,
-        ec_k: 4,
-        ec_m: 2,
-        status: ObjectState::Live,
-        data_layout: Some(DataLayout::MultipartManifest),
-        parts_count: Some(2),
+        ec: EcShape { k: 4, m: 2 },
         metadata_blob: Some(vec![]),
     };
 
@@ -2236,20 +2192,16 @@ mod prop_tests {
 
     fn insert_keys(store: &dyn PgMetadataStore, bucket: &str, keys: &[String]) {
         for key in keys {
-            let req = PutObjectMetaReq {
+            let req = PutObjectReq::Live(PutLiveObjectReq {
                 bucket: bucket.into(),
                 key: key.clone().into(),
                 version_id: VersionId::Null,
-                status: ObjectState::Live,
+                ec: EcShape { k: 4, m: 2 },
                 size: 0,
                 etag: vec![],
-                etag_kind: EtagKind::Crc64,
-                ec_k: 4,
-                ec_m: 2,
-                data_layout: None,
-                parts_count: None,
-                metadata_blob: None,
-            };
+                etag_kind: EtagKind::Crc64,layout: ObjectLayout::ChunkManifest,
+        metadata_blob: None,
+    });
             store.put_object_meta(&req).unwrap();
         }
     }
@@ -2273,10 +2225,10 @@ mod prop_tests {
                 .unwrap();
 
             for w in resp.objects.windows(2) {
-                assert!(w[0].key < w[1].key);
+                assert!(w[0].key() < w[1].key());
             }
 
-            all.extend(resp.objects.iter().map(|o| o.key.clone()));
+            all.extend(resp.objects.iter().map(|o| o.key().clone()));
             if !resp.is_truncated {
                 break;
             }
@@ -2553,18 +2505,14 @@ fn commit_stream_put_atomic() {
         .unwrap();
 
     // Commit
-    let obj = PutObjectMetaReq {
+    let obj = CommitStreamPutReq {
         bucket: "b".into(),
         key: "k".into(),
         version_id: VersionId::Null,
         size: 6_000_000,
         etag: vec![0xAB; 8],
         etag_kind: EtagKind::Crc64,
-        ec_k: 4,
-        ec_m: 2,
-        status: ObjectState::Live,
-        data_layout: Some(DataLayout::ChunkManifestInternal),
-        parts_count: None,
+        ec: EcShape { k: 4, m: 2 },
         metadata_blob: None,
     };
 
@@ -2601,8 +2549,9 @@ fn commit_stream_put_atomic() {
 
     // Object metadata is committed
     let record = store.get_object_meta("b", "k").unwrap();
-    assert_eq!(record.size, 6_000_000);
-    assert_eq!(record.data_layout, DataLayout::ChunkManifestInternal);
+    let live = record.as_live().unwrap();
+    assert_eq!(live.size, 6_000_000);
+    assert_eq!(live.layout, ObjectLayout::ChunkManifest);
 
     // Committed chunks are readable
     let chunks = store.get_stream_object_chunks("b", "k", VersionId::Null).unwrap();
@@ -2641,20 +2590,16 @@ fn commit_stream_put_overwrite_unversioned() {
     store
         .commit_stream_put(
             "s1",
-            &PutObjectMetaReq {
-                bucket: "b".into(),
-                key: "k".into(),
-                version_id: VersionId::Null,
-                size: 100,
-                etag: vec![1],
-                etag_kind: EtagKind::Crc64,
-                ec_k: 4,
-                ec_m: 2,
-                status: ObjectState::Live,
-                data_layout: Some(DataLayout::ChunkManifestInternal),
-                parts_count: None,
-                metadata_blob: None,
-            },
+            &CommitStreamPutReq {
+        bucket: "b".into(),
+        key: "k".into(),
+        version_id: VersionId::Null,
+        size: 100,
+        etag: vec![1],
+        etag_kind: EtagKind::Crc64,
+        ec: EcShape { k: 4, m: 2 },
+        metadata_blob: None,
+    },
             &[StreamObjectChunkRecord {
                 bucket: "b".into(),
                 key: "k".into(),
@@ -2682,20 +2627,16 @@ fn commit_stream_put_overwrite_unversioned() {
     store
         .commit_stream_put(
             "s2",
-            &PutObjectMetaReq {
-                bucket: "b".into(),
-                key: "k".into(),
-                version_id: VersionId::Null,
-                size: 200,
-                etag: vec![2],
-                etag_kind: EtagKind::Crc64,
-                ec_k: 4,
-                ec_m: 2,
-                status: ObjectState::Live,
-                data_layout: Some(DataLayout::ChunkManifestInternal),
-                parts_count: None,
-                metadata_blob: None,
-            },
+            &CommitStreamPutReq {
+        bucket: "b".into(),
+        key: "k".into(),
+        version_id: VersionId::Null,
+        size: 200,
+        etag: vec![2],
+        etag_kind: EtagKind::Crc64,
+        ec: EcShape { k: 4, m: 2 },
+        metadata_blob: None,
+    },
             &[StreamObjectChunkRecord {
                 bucket: "b".into(),
                 key: "k".into(),
@@ -2713,7 +2654,7 @@ fn commit_stream_put_overwrite_unversioned() {
 
     // Verify overwrite: new data
     let record = store.get_object_meta("b", "k").unwrap();
-    assert_eq!(record.size, 200);
+    assert_eq!(record.as_live().unwrap().size, 200);
 
     // Chunks replaced
     let chunks = store.get_stream_object_chunks("b", "k", VersionId::Null).unwrap();
@@ -2737,20 +2678,16 @@ fn delete_stream_object_chunks_cleanup() {
     store
         .commit_stream_put(
             "s-del",
-            &PutObjectMetaReq {
-                bucket: "b".into(),
-                key: "k".into(),
-                version_id: VersionId::Null,
-                size: 100,
-                etag: vec![1],
-                etag_kind: EtagKind::Crc64,
-                ec_k: 4,
-                ec_m: 2,
-                status: ObjectState::Live,
-                data_layout: Some(DataLayout::ChunkManifestInternal),
-                parts_count: None,
-                metadata_blob: None,
-            },
+            &CommitStreamPutReq {
+        bucket: "b".into(),
+        key: "k".into(),
+        version_id: VersionId::Null,
+        size: 100,
+        etag: vec![1],
+        etag_kind: EtagKind::Crc64,
+        ec: EcShape { k: 4, m: 2 },
+        metadata_blob: None,
+    },
             &[StreamObjectChunkRecord {
                 bucket: "b".into(),
                 key: "k".into(),
@@ -2797,20 +2734,16 @@ fn commit_stream_put_rejects_non_in_progress() {
     let err = store
         .commit_stream_put(
             "sess-bad",
-            &PutObjectMetaReq {
-                bucket: "b".into(),
-                key: "k".into(),
-                version_id: VersionId::Null,
-                size: 0,
-                etag: vec![],
-                etag_kind: EtagKind::Crc64,
-                ec_k: 4,
-                ec_m: 2,
-                status: ObjectState::Live,
-                data_layout: None,
-                parts_count: None,
-                metadata_blob: None,
-            },
+            &CommitStreamPutReq {
+        bucket: "b".into(),
+        key: "k".into(),
+        version_id: VersionId::Null,
+        size: 0,
+        etag: vec![],
+        etag_kind: EtagKind::Crc64,
+        ec: EcShape { k: 4, m: 2 },
+        metadata_blob: None,
+    },
             &[],
         )
         .unwrap_err();
@@ -2993,20 +2926,16 @@ fn commit_stream_put_rejects_wrong_kind() {
     let err = store
         .commit_stream_put(
             "sess-wrong-kind",
-            &PutObjectMetaReq {
-                bucket: "b".into(),
-                key: "k".into(),
-                version_id: VersionId::Null,
-                size: 0,
-                etag: vec![],
-                etag_kind: EtagKind::Crc64,
-                ec_k: 4,
-                ec_m: 2,
-                status: ObjectState::Live,
-                data_layout: None,
-                parts_count: None,
-                metadata_blob: None,
-            },
+            &CommitStreamPutReq {
+        bucket: "b".into(),
+        key: "k".into(),
+        version_id: VersionId::Null,
+        size: 0,
+        etag: vec![],
+        etag_kind: EtagKind::Crc64,
+        ec: EcShape { k: 4, m: 2 },
+        metadata_blob: None,
+    },
             &[],
         )
         .unwrap_err();
@@ -3036,20 +2965,16 @@ fn commit_stream_put_rejects_wrong_bucket_key() {
     let err = store
         .commit_stream_put(
             "sess-mismatch",
-            &PutObjectMetaReq {
-                bucket: "b2".into(),
-                key: "k2".into(),
-                version_id: VersionId::Null,
-                size: 0,
-                etag: vec![],
-                etag_kind: EtagKind::Crc64,
-                ec_k: 4,
-                ec_m: 2,
-                status: ObjectState::Live,
-                data_layout: None,
-                parts_count: None,
-                metadata_blob: None,
-            },
+            &CommitStreamPutReq {
+        bucket: "b2".into(),
+        key: "k2".into(),
+        version_id: VersionId::Null,
+        size: 0,
+        etag: vec![],
+        etag_kind: EtagKind::Crc64,
+        ec: EcShape { k: 4, m: 2 },
+        metadata_blob: None,
+    },
             &[],
         )
         .unwrap_err();
@@ -3265,20 +3190,16 @@ fn commit_stream_put_rejects_mismatched_chunk_target() {
     let err = store
         .commit_stream_put(
             "sp-ct",
-            &PutObjectMetaReq {
-                bucket: "b".into(),
-                key: "k".into(),
-                version_id: VersionId::Null,
-                size: 100,
-                etag: vec![1],
-                etag_kind: EtagKind::Crc64,
-                ec_k: 4,
-                ec_m: 2,
-                status: ObjectState::Live,
-                data_layout: Some(DataLayout::ChunkManifestInternal),
-                parts_count: None,
-                metadata_blob: None,
-            },
+            &CommitStreamPutReq {
+        bucket: "b".into(),
+        key: "k".into(),
+        version_id: VersionId::Null,
+        size: 100,
+        etag: vec![1],
+        etag_kind: EtagKind::Crc64,
+        ec: EcShape { k: 4, m: 2 },
+        metadata_blob: None,
+    },
             &[StreamObjectChunkRecord {
                 bucket: "WRONG".into(),
                 key: "k".into(),

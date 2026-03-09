@@ -16,20 +16,17 @@ fn shard_and_metadata_roundtrip() {
     let ack = store.write_shard(&shard_key, shard_data).unwrap();
 
     // Write object metadata referencing the shard.
-    let req = PutObjectMetaReq {
+    let req = PutObjectReq::Live(PutLiveObjectReq {
         bucket: "test-bucket".into(),
         key: "my/object.txt".into(),
         version_id: VersionId::Null,
-        status: ObjectState::Live,
         size: shard_data.len() as u64,
         etag: ack.crc64.to_be_bytes().to_vec(),
         etag_kind: EtagKind::Crc64,
-        ec_k: 4,
-        ec_m: 2,
-        data_layout: None,
-        parts_count: None,
+        ec: EcShape { k: 4, m: 2 },
+        layout: ObjectLayout::ChunkManifest,
         metadata_blob: None,
-    };
+    });
     store.put_object_meta(&req).unwrap();
 
     // Read back both.
@@ -40,8 +37,9 @@ fn shard_and_metadata_roundtrip() {
     let obj = store
         .get_object_meta("test-bucket", "my/object.txt")
         .unwrap();
-    assert_eq!(obj.size, shard_data.len() as u64);
-    assert_eq!(obj.etag, ack.crc64.to_be_bytes().to_vec());
+    let live = obj.as_live().unwrap();
+    assert_eq!(live.size, shard_data.len() as u64);
+    assert_eq!(live.etag, ack.crc64.to_be_bytes().to_vec());
 }
 
 /// Integration test: LocalStorageNode with multiple PGs.
@@ -109,20 +107,17 @@ fn full_lifecycle() {
     let data = b"hello world";
     let ack = pg.write_shard(&shard_key, data).unwrap();
 
-    pg.put_object_meta(&PutObjectMetaReq {
+    pg.put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
         bucket: "my-bucket".into(),
         key: "greeting.txt".into(),
         version_id: VersionId::Null,
-        status: ObjectState::Live,
         size: data.len() as u64,
         etag: ack.crc64.to_be_bytes().to_vec(),
         etag_kind: EtagKind::Crc64,
-        ec_k: 4,
-        ec_m: 2,
-        data_layout: None,
-        parts_count: None,
+        ec: EcShape { k: 4, m: 2 },
+        layout: ObjectLayout::ChunkManifest,
         metadata_blob: None,
-    })
+    }))
     .unwrap();
 
     // HeadBucket.
@@ -131,7 +126,7 @@ fn full_lifecycle() {
 
     // GetObject: read metadata + shard.
     let obj = pg.get_object_meta("my-bucket", "greeting.txt").unwrap();
-    assert_eq!(obj.size, 11);
+    assert_eq!(obj.as_live().unwrap().size, 11);
 
     let read = pg.read_shard(&shard_key).unwrap();
     assert_eq!(read.data, b"hello world");
@@ -162,20 +157,17 @@ fn pg_store_persistence() {
         let store = crate::PgStore::open(&pg_dir, 0).unwrap();
         store.write_shard(&key, data).unwrap();
         store
-            .put_object_meta(&PutObjectMetaReq {
+            .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
                 bucket: "b".into(),
                 key: "k".into(),
                 version_id: VersionId::Null,
-                status: ObjectState::Live,
                 size: data.len() as u64,
                 etag: vec![1],
                 etag_kind: EtagKind::Crc64,
-                ec_k: 4,
-                ec_m: 2,
-                data_layout: None,
-                parts_count: None,
+                ec: EcShape { k: 4, m: 2 },
+                layout: ObjectLayout::ChunkManifest,
                 metadata_blob: None,
-            })
+            }))
             .unwrap();
     }
 
@@ -187,6 +179,6 @@ fn pg_store_persistence() {
         assert_eq!(read.data, data);
 
         let obj = store.get_object_meta("b", "k").unwrap();
-        assert_eq!(obj.size, data.len() as u64);
+        assert_eq!(obj.as_live().unwrap().size, data.len() as u64);
     }
 }

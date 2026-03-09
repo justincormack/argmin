@@ -44,6 +44,9 @@ pub enum MetadataError {
     #[error("object not found")]
     ObjectNotFound,
 
+    #[error("method not allowed on delete marker")]
+    MethodNotAllowedOnDeleteMarker,
+
     #[error("invalid versioning transition from {from:?} to {to:?}")]
     InvalidVersioningTransition {
         from: crate::types::BucketVersioningState,
