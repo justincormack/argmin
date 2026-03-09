@@ -253,8 +253,6 @@ pub struct ObjectRecord {
     pub key: String,
     pub version_id: u64,
     pub size: u64,
-    /// Total stored size in shards (user data only), before EC padding.
-    pub total_size: u64,
     /// Binary etag (e.g. CRC64-NVME bytes), max 64 bytes.
     pub etag: Vec<u8>,
     /// 0 = CRC64-NVME.
@@ -303,7 +301,6 @@ pub struct PutObjectMetaReq {
     pub key: String,
     pub version_id: u64,
     pub size: u64,
-    pub total_size: u64,
     pub etag: Vec<u8>,
     pub etag_kind: u8,
     pub ec_k: u8,

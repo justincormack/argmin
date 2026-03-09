@@ -857,7 +857,7 @@ impl Coordinator {
         }
 
         // 8. Record metadata (to metadata PG).
-        //    Metadata blob stored in DB row; size == total_size (user data only).
+        //    Metadata blob stored in DB row; size == user data length.
         let user_size = user_data.len() as u64;
         let meta_result = meta_pg.put_object_meta(&PutObjectMetaReq {
             bucket: bucket.to_string(),
@@ -865,7 +865,6 @@ impl Coordinator {
             version_id,
             status: 0,
             size: user_size,
-            total_size: user_size,
             etag: crc64_to_etag_bytes(etag_crc),
             etag_kind: 0,
             ec_k: self.ec_config.data_shards,
@@ -1309,7 +1308,6 @@ impl Coordinator {
                     version_id,
                     status: 0,
                     size: total_size,
-                    total_size,
                     etag: crc64_to_etag_bytes(crc64),
                     etag_kind: 0,
                     ec_k: self.ec_config.data_shards,
@@ -2152,13 +2150,13 @@ impl Coordinator {
         Ok((shards, shard_size))
     }
 
-    /// Compute shard_size from total stored size and EC k.
+    /// Compute shard_size from object size and EC k.
     ///
-    /// `total_size` is the pre-padding size (user data only).
+    /// `size` is the pre-padding user-data size.
     /// Returns the per-shard size after padding to a multiple of k.
-    fn compute_shard_size(total_size: u64, ec_k: u8) -> usize {
+    fn compute_shard_size(size: u64, ec_k: u8) -> usize {
         let k = ec_k as u64;
-        let padded = total_size.div_ceil(k) * k;
+        let padded = size.div_ceil(k) * k;
         (padded / k) as usize
     }
 
@@ -2191,7 +2189,7 @@ impl Coordinator {
         start: usize,
         end: usize,
     ) -> Result<Vec<u8>, ServerError> {
-        let shard_size = Self::compute_shard_size(record.total_size, record.ec_k);
+        let shard_size = Self::compute_shard_size(record.size, record.ec_k);
         if shard_size == 0 {
             return Ok(vec![]);
         }
@@ -3512,7 +3510,6 @@ impl Coordinator {
                     version_id: marker_vid,
                     status: 1,
                     size: 0,
-                    total_size: 0,
                     etag: vec![],
                     etag_kind: 0,
                     ec_k: 0,
@@ -4569,7 +4566,6 @@ impl Coordinator {
             version_id,
             status: 0,
             size: total_size,
-            total_size,
             etag: etag_bytes,
             etag_kind: 1, // multipart-composite CRC64
             ec_k: 0,      // per-part, not per-object

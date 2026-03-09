@@ -261,23 +261,23 @@ impl PgStore {
             .transpose()
     }
 
-    /// Map a row with columns (bucket, key, version_id, size, total_size, etag,
-    /// etag_kind, last_modified, storage_class, ec_k, ec_m, status, tags,
-    /// data_layout, parts_count, metadata_blob) to an ObjectRecord.
+    /// Map a row with columns (bucket, key, version_id, size, etag, etag_kind,
+    /// last_modified, storage_class, ec_k, ec_m, status, tags, data_layout,
+    /// parts_count, metadata_blob) to an ObjectRecord.
     fn row_to_object_record(row: &rusqlite::Row<'_>) -> Result<ObjectRecord, rusqlite::Error> {
-        let status = row.get::<_, u8>(11)?;
+        let status = row.get::<_, u8>(10)?;
         let data_layout = {
-            let raw = row.get::<_, u8>(13)?;
+            let raw = row.get::<_, u8>(12)?;
             DataLayout::from_u8(raw).ok_or_else(|| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    13,
+                    12,
                     rusqlite::types::Type::Integer,
                     Box::from(format!("invalid data_layout: {raw}")),
                 )
             })?
         };
         let parts_count =
-            Self::parse_optional_u32(row.get::<_, Option<i64>>(14)?, 14, "parts_count")?;
+            Self::parse_optional_u32(row.get::<_, Option<i64>>(13)?, 13, "parts_count")?;
         Self::validate_object_layout(status, data_layout, parts_count)?;
 
         Ok(ObjectRecord {
@@ -285,18 +285,17 @@ impl PgStore {
             key: row.get(1)?,
             version_id: row.get::<_, i64>(2)? as u64,
             size: row.get::<_, i64>(3)? as u64,
-            total_size: row.get::<_, i64>(4)? as u64,
-            etag: row.get(5)?,
-            etag_kind: row.get::<_, u8>(6)?,
-            last_modified: row.get::<_, i64>(7)? as u64,
-            storage_class: row.get::<_, u8>(8)?,
-            ec_k: row.get::<_, u8>(9)?,
-            ec_m: row.get::<_, u8>(10)?,
+            etag: row.get(4)?,
+            etag_kind: row.get::<_, u8>(5)?,
+            last_modified: row.get::<_, i64>(6)? as u64,
+            storage_class: row.get::<_, u8>(7)?,
+            ec_k: row.get::<_, u8>(8)?,
+            ec_m: row.get::<_, u8>(9)?,
             status,
-            tags: row.get(12)?,
+            tags: row.get(11)?,
             data_layout,
             parts_count,
-            metadata_blob: row.get(15)?,
+            metadata_blob: row.get(14)?,
         })
     }
 }
@@ -934,15 +933,14 @@ impl PgMetadataStore for PgStore {
             self.conn
                 .execute(
                     "INSERT OR REPLACE INTO objects \
-                     (bucket, key, version_id, size, total_size, etag, etag_kind, last_modified, \
+                     (bucket, key, version_id, size, etag, etag_kind, last_modified, \
                       storage_class, ec_k, ec_m, status, data_layout, parts_count, metadata_blob) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12, ?13)",
                     params![
                         req.bucket,
                         req.key,
                         req.version_id as i64,
                         req.size as i64,
-                        req.total_size as i64,
                         req.etag,
                         req.etag_kind,
                         now as i64,
@@ -963,15 +961,14 @@ impl PgMetadataStore for PgStore {
             self.conn
                 .execute(
                     "INSERT INTO objects \
-                     (bucket, key, version_id, size, total_size, etag, etag_kind, last_modified, \
+                     (bucket, key, version_id, size, etag, etag_kind, last_modified, \
                       storage_class, ec_k, ec_m, status, data_layout, parts_count, metadata_blob) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12, ?13)",
                     params![
                         req.bucket,
                         req.key,
                         req.version_id as i64,
                         req.size as i64,
-                        req.total_size as i64,
                         req.etag,
                         req.etag_kind,
                         now as i64,
@@ -994,7 +991,7 @@ impl PgMetadataStore for PgStore {
     fn get_object_meta(&self, bucket: &str, key: &str) -> Result<ObjectRecord, MetadataError> {
         self.conn
             .query_row(
-                "SELECT bucket, key, version_id, size, total_size, etag, etag_kind, \
+                "SELECT bucket, key, version_id, size, etag, etag_kind, \
                  last_modified, storage_class, ec_k, ec_m, status, tags, \
                  data_layout, parts_count, metadata_blob \
                  FROM objects WHERE bucket = ?1 AND key = ?2 \
@@ -1018,7 +1015,7 @@ impl PgMetadataStore for PgStore {
     ) -> Result<ObjectRecord, MetadataError> {
         self.conn
             .query_row(
-                "SELECT bucket, key, version_id, size, total_size, etag, etag_kind, \
+                "SELECT bucket, key, version_id, size, etag, etag_kind, \
                  last_modified, storage_class, ec_k, ec_m, status, tags, \
                  data_layout, parts_count, metadata_blob \
                  FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
@@ -1102,7 +1099,7 @@ impl PgMetadataStore for PgStore {
                 WHERE bucket = ?1 \
                 GROUP BY bucket, key \
             ) \
-            SELECT o.bucket, o.key, o.version_id, o.size, o.total_size, o.etag, o.etag_kind, \
+            SELECT o.bucket, o.key, o.version_id, o.size, o.etag, o.etag_kind, \
                    o.last_modified, o.storage_class, o.ec_k, o.ec_m, o.status, o.tags, \
                    o.data_layout, o.parts_count, o.metadata_blob \
             FROM objects o \
@@ -1197,7 +1194,7 @@ impl PgMetadataStore for PgStore {
         let where_str = where_clauses.join(" AND ");
 
         let sql = format!(
-            "SELECT bucket, key, version_id, size, total_size, etag, etag_kind, \
+            "SELECT bucket, key, version_id, size, etag, etag_kind, \
              last_modified, storage_class, ec_k, ec_m, status, tags, \
              data_layout, parts_count, metadata_blob \
              FROM objects \
@@ -2022,15 +2019,14 @@ impl PgMetadataStore for PgStore {
             if obj.version_id == 0 {
                 self.conn.execute(
                     "INSERT OR REPLACE INTO objects \
-                     (bucket, key, version_id, size, total_size, etag, etag_kind, last_modified, \
+                     (bucket, key, version_id, size, etag, etag_kind, last_modified, \
                       storage_class, ec_k, ec_m, status, data_layout, parts_count, metadata_blob) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12, ?13)",
                     params![
                         obj.bucket,
                         obj.key,
                         obj.version_id as i64,
                         obj.size as i64,
-                        obj.total_size as i64,
                         obj.etag,
                         obj.etag_kind,
                         now as i64,
@@ -2045,15 +2041,14 @@ impl PgMetadataStore for PgStore {
             } else {
                 self.conn.execute(
                     "INSERT INTO objects \
-                     (bucket, key, version_id, size, total_size, etag, etag_kind, last_modified, \
+                     (bucket, key, version_id, size, etag, etag_kind, last_modified, \
                       storage_class, ec_k, ec_m, status, data_layout, parts_count, metadata_blob) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12, ?13)",
                     params![
                         obj.bucket,
                         obj.key,
                         obj.version_id as i64,
                         obj.size as i64,
-                        obj.total_size as i64,
                         obj.etag,
                         obj.etag_kind,
                         now as i64,
@@ -2474,14 +2469,14 @@ impl PgMetadataStore for PgStore {
 
             let obj_sql = if obj.version_id == 0 {
                 "INSERT OR REPLACE INTO objects \
-                 (bucket, key, version_id, size, total_size, etag, etag_kind, last_modified, \
+                 (bucket, key, version_id, size, etag, etag_kind, last_modified, \
                   storage_class, ec_k, ec_m, status, data_layout, parts_count, metadata_blob) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14)"
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12, ?13)"
             } else {
                 "INSERT INTO objects \
-                 (bucket, key, version_id, size, total_size, etag, etag_kind, last_modified, \
+                 (bucket, key, version_id, size, etag, etag_kind, last_modified, \
                   storage_class, ec_k, ec_m, status, data_layout, parts_count, metadata_blob) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14)"
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12, ?13)"
             };
             self.conn
                 .execute(
@@ -2491,7 +2486,6 @@ impl PgMetadataStore for PgStore {
                         obj.key,
                         obj.version_id as i64,
                         obj.size as i64,
-                        obj.total_size as i64,
                         obj.etag,
                         obj.etag_kind,
                         now as i64,
@@ -3114,7 +3108,6 @@ mod tests {
                     version_id: 0,
                     status: 0,
                     size: 10,
-                    total_size: 0,
                     etag: vec![0; 8],
                     etag_kind: 0,
                     ec_k: 4,
@@ -3202,7 +3195,6 @@ mod tests {
                     'k' AS key, \
                     0 AS version_id, \
                     1 AS size, \
-                    1 AS total_size, \
                     zeroblob(8) AS etag, \
                     1 AS etag_kind, \
                     0 AS last_modified, \
@@ -3220,7 +3212,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            rusqlite::Error::FromSqlConversionFailure(14, rusqlite::types::Type::Integer, _)
+            rusqlite::Error::FromSqlConversionFailure(13, rusqlite::types::Type::Integer, _)
         ));
     }
 
@@ -3236,7 +3228,6 @@ mod tests {
                     'k' AS key, \
                     0 AS version_id, \
                     1 AS size, \
-                    1 AS total_size, \
                     zeroblob(8) AS etag, \
                     1 AS etag_kind, \
                     0 AS last_modified, \
@@ -3273,7 +3264,6 @@ mod tests {
                     version_id: 0,
                     status: 0,
                     size: 0,
-                    total_size: 0,
                     etag: vec![0; 8],
                     etag_kind: 0,
                     ec_k: 4,
