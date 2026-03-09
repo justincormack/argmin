@@ -21,7 +21,6 @@ use crate::conditional::{
 use crate::error::ServerError;
 use crate::etag::{
     compute_multipart_etag, crc64_to_etag_bytes, etag_bytes_to_crc64, format_etag,
-    format_object_etag,
 };
 use crate::metadata_blob::MetadataBlob;
 #[cfg(test)]
@@ -867,8 +866,7 @@ impl Coordinator {
             key: ObjectKey::from(key),
             version_id,
             size: user_size,
-            etag: crc64_to_etag_bytes(etag_crc),
-            etag_kind: storage::EtagKind::Crc64,
+            etag: storage::ObjectEtag::single_part(etag_crc),
             ec: EcShape { k: self.ec_config.data_shards, m: self.ec_config.parity_shards },
             layout: ObjectLayout::ChunkManifest,
             metadata_blob: Some(blob_bytes),
@@ -935,11 +933,7 @@ impl Coordinator {
         // 2. Check write conditions if any are set
         if !cond.is_empty() {
             let existing_etag = match meta_pg.get_object_meta(bucket, key) {
-                Ok(stored) => stored.as_live().map(|record| format_object_etag(
-                    &record.etag,
-                    record.etag_kind,
-                    record.layout.parts_count(),
-                )),
+                Ok(stored) => stored.as_live().map(|record| record.etag.format()),
                 Err(storage::MetadataError::ObjectNotFound) => None,
                 Err(e) => return Err(ServerError::Metadata(e)),
             };
@@ -1246,11 +1240,7 @@ impl Coordinator {
         // Check write conditions.
         if !cond.is_empty() {
             let existing_etag = match meta_guard.get_object_meta(bucket, key) {
-                Ok(stored) => stored.as_live().map(|record| format_object_etag(
-                    &record.etag,
-                    record.etag_kind,
-                    record.layout.parts_count(),
-                )),
+                Ok(stored) => stored.as_live().map(|record| record.etag.format()),
                 Err(storage::MetadataError::ObjectNotFound) => None,
                 Err(e) => return Err(ServerError::Metadata(e)),
             };
@@ -1307,8 +1297,7 @@ impl Coordinator {
                     key: ObjectKey::from(key),
                     version_id,
                     size: total_size,
-                    etag: crc64_to_etag_bytes(crc64),
-                    etag_kind: storage::EtagKind::Crc64,
+                    etag_crc64: crc64,
                     ec: EcShape { k: self.ec_config.data_shards, m: self.ec_config.parity_shards },
                     metadata_blob: Some(blob_bytes),
                 },
@@ -1695,11 +1684,7 @@ impl Coordinator {
                 }
             };
 
-            let src_etag = format_object_etag(
-                &src_record.etag,
-                src_record.etag_kind,
-                src_record.layout.parts_count(),
-            );
+            let src_etag = src_record.etag.format();
             check_copy_source_conditions(src_cond, &src_etag, src_record.last_modified)?;
 
             let not_found = |e: ServerError| match e {
@@ -1741,7 +1726,7 @@ impl Coordinator {
                 (metadata, data)
             } else {
                 // Non-multipart source: metadata from DB row, user data from shards.
-                let src_etag_crc = etag_bytes_to_crc64(&src_record.etag).unwrap_or(0);
+                let src_etag_crc = src_record.etag.crc64();
                 let user_size = src_record.size as usize;
 
                 // Check for chunk manifest (stream-put objects).
@@ -1854,11 +1839,7 @@ impl Coordinator {
         // Check dest write conditions
         if !dst_cond.is_empty() {
             let existing_etag = match dst_meta_pg.get_object_meta(dst_bucket, dst_key) {
-                Ok(stored) => stored.as_live().map(|record| format_object_etag(
-                    &record.etag,
-                    record.etag_kind,
-                    record.layout.parts_count(),
-                )),
+                Ok(stored) => stored.as_live().map(|record| record.etag.format()),
                 Err(storage::MetadataError::ObjectNotFound) => None,
                 Err(e) => return Err(ServerError::Metadata(e)),
             };
@@ -2630,7 +2611,7 @@ impl Coordinator {
             }
         };
 
-        let etag_str = format_object_etag(&record.etag, record.etag_kind, record.layout.parts_count());
+        let etag_str = record.etag.format();
         check_read_conditions(cond, &etag_str, record.last_modified)?;
 
         if matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
@@ -2674,7 +2655,7 @@ impl Coordinator {
             })
         } else {
             // Non-multipart: metadata from DB row, user data from shards.
-            let etag_crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
+            let etag_crc = record.etag.crc64();
             let user_size = record.size as usize;
 
             // Check for chunk manifest (stream-put objects).
@@ -2774,7 +2755,7 @@ impl Coordinator {
             }
         };
 
-        let etag_str = format_object_etag(&record.etag, record.etag_kind, record.layout.parts_count());
+        let etag_str = record.etag.format();
         check_read_conditions(cond, &etag_str, record.last_modified)?;
 
         if matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
@@ -2862,7 +2843,7 @@ impl Coordinator {
                 return Err(ServerError::InvalidPart { part_number });
             }
 
-            let etag_crc = etag_bytes_to_crc64(&record.etag).unwrap_or(0);
+            let etag_crc = record.etag.crc64();
             let user_size = record.size as usize;
 
             // Check for chunk manifest (stream-put objects).
@@ -2959,7 +2940,7 @@ impl Coordinator {
             }
         };
 
-        let etag_str = format_object_etag(&record.etag, record.etag_kind, record.layout.parts_count());
+        let etag_str = record.etag.format();
         check_read_conditions(cond, &etag_str, record.last_modified)?;
 
         if matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
@@ -3055,7 +3036,7 @@ impl Coordinator {
             }
         };
 
-        let etag_str = format_object_etag(&record.etag, record.etag_kind, record.layout.parts_count());
+        let etag_str = record.etag.format();
         check_read_conditions(cond, &etag_str, record.last_modified)?;
 
         // Metadata always from DB row (both multipart and non-multipart).
@@ -3102,7 +3083,7 @@ impl Coordinator {
             }
         };
 
-        let etag_str = format_object_etag(&record.etag, record.etag_kind, record.layout.parts_count());
+        let etag_str = record.etag.format();
         check_read_conditions(cond, &etag_str, record.last_modified)?;
 
         // Metadata always from DB row (both multipart and non-multipart).
@@ -3218,7 +3199,7 @@ impl Coordinator {
             }
         };
 
-        let etag_str = format_object_etag(&record.etag, record.etag_kind, record.layout.parts_count());
+        let etag_str = record.etag.format();
         check_read_conditions(cond, &etag_str, record.last_modified)?;
 
         // Resolve byte range against user data size
@@ -3366,7 +3347,7 @@ impl Coordinator {
                 // Check delete conditions
                 if !cond.is_empty() {
                     let etag_str =
-                        format_object_etag(&record.etag, record.etag_kind, record.layout.parts_count());
+                        record.etag.format();
                     check_delete_conditions(cond, &etag_str)?;
                 }
 
@@ -3649,11 +3630,7 @@ impl Coordinator {
                         objects.push(ListEntry {
                             key: obj_key.to_string(),
                             size: record.size,
-                            etag: format_object_etag(
-                                &record.etag,
-                                record.etag_kind,
-                                record.layout.parts_count(),
-                            ),
+                            etag: record.etag.format(),
                             last_modified: record.last_modified,
                         });
                         entry_count += 1;
@@ -3674,11 +3651,7 @@ impl Coordinator {
                     objects.push(ListEntry {
                         key: obj_key.to_string(),
                         size: record.size,
-                        etag: format_object_etag(
-                            &record.etag,
-                            record.etag_kind,
-                            record.layout.parts_count(),
-                        ),
+                        etag: record.etag.format(),
                         last_modified: record.last_modified,
                     });
                     entry_count += 1;
@@ -3762,7 +3735,7 @@ impl Coordinator {
             }
 
             let (size, etag) = match obj.as_live() {
-                Some(record) => (record.size, format_object_etag(&record.etag, record.etag_kind, record.layout.parts_count())),
+                Some(record) => (record.size, record.etag.format()),
                 None => (0, String::new()),
             };
 
@@ -3947,11 +3920,7 @@ impl Coordinator {
                 }
             };
 
-            let src_etag = format_object_etag(
-                &src_record.etag,
-                src_record.etag_kind,
-                src_record.layout.parts_count(),
-            );
+            let src_etag = src_record.etag.format();
             check_copy_source_conditions(src_cond, &src_etag, src_record.last_modified)?;
 
             let source_size = src_record.size;
@@ -4446,7 +4415,9 @@ impl Coordinator {
 
         // 7. Compute composite multipart ETag.
         let part_etags: Vec<&[u8]> = part_records.iter().map(|p| p.etag.as_slice()).collect();
-        let (etag_bytes, etag_str) = compute_multipart_etag(&part_etags);
+        let (etag_bytes_vec, etag_str) = compute_multipart_etag(&part_etags);
+        let mut etag_crc64 = [0u8; 8];
+        etag_crc64.copy_from_slice(&etag_bytes_vec);
 
         // 8. Compute total object size.
         let total_size: u64 = part_records.iter().map(|p| p.size).sum();
@@ -4596,8 +4567,7 @@ impl Coordinator {
             key: ObjectKey::from(key),
             version_id,
             size: total_size,
-            etag: etag_bytes,
-            etag_kind: storage::EtagKind::MultipartComposite,
+            etag_crc64,
             ec: EcShape { k: 0, m: 0 },      // per-part, not per-object
             metadata_blob: Some(metadata_blob_bytes),
         };

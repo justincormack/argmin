@@ -332,13 +332,22 @@ impl PgStore {
                         )
                     })?;
 
+                let etag_bytes: Vec<u8> = row.get(4)?;
+                let etag =
+                    ObjectEtag::from_parts(&etag_bytes, etag_kind, parts_count).map_err(|msg| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            4,
+                            rusqlite::types::Type::Blob,
+                            Box::from(msg),
+                        )
+                    })?;
+
                 Ok(StoredObject::Live(LiveObjectRecord {
                     bucket,
                     key,
                     version_id,
                     size: row.get::<_, i64>(3)? as u64,
-                    etag: row.get(4)?,
-                    etag_kind,
+                    etag,
                     last_modified,
                     storage_class,
                     ec: EcShape {
@@ -988,8 +997,16 @@ impl PgMetadataStore for PgStore {
         let now = PgStore::now_millis();
         match req {
             PutObjectReq::Live(req) => {
+                req.validate().map_err(|msg| MetadataError::Db {
+                    context: "put object meta (etag/layout mismatch)",
+                    source: rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Null,
+                        Box::from(msg),
+                    ),
+                })?;
                 let data_layout_u8 = req.layout.data_layout() as u8;
-                let etag_kind_u8 = req.etag_kind as u8;
+                let etag_kind_u8 = req.etag.etag_kind() as u8;
                 let status_u8 = ObjectState::Live as u8;
                 let parts_count = req.layout.parts_count().map(|n| n as i64);
                 let metadata_blob: Option<&[u8]> = req.metadata_blob.as_deref();
@@ -1012,7 +1029,7 @@ impl PgMetadataStore for PgStore {
                             req.key,
                             req.version_id.to_u64() as i64,
                             req.size as i64,
-                            req.etag,
+                            req.etag.as_bytes().as_slice(),
                             etag_kind_u8,
                             now as i64,
                             req.ec.k,
@@ -2169,8 +2186,8 @@ impl PgMetadataStore for PgStore {
                     obj.key,
                     obj.version_id.to_u64() as i64,
                     obj.size as i64,
-                    obj.etag,
-                    obj.etag_kind as u8,
+                    obj.etag_crc64.as_slice(),
+                    EtagKind::MultipartComposite as u8,
                     now as i64,
                     obj.ec.k,
                     obj.ec.m,
@@ -2598,8 +2615,8 @@ impl PgMetadataStore for PgStore {
                         obj.key,
                         obj.version_id.to_u64() as i64,
                         obj.size as i64,
-                        obj.etag,
-                        obj.etag_kind as u8,
+                        obj.etag_crc64.to_be_bytes().as_slice(),
+                        EtagKind::Crc64 as u8,
                         now as i64,
                         obj.ec.k,
                         obj.ec.m,
@@ -3219,8 +3236,7 @@ mod tests {
                     key: ObjectKey::from(*key),
                     version_id: VersionId::Null,
                     size: 10,
-                    etag: vec![0; 8],
-                    etag_kind: EtagKind::Crc64,
+                    etag: ObjectEtag::SinglePart([0; 8]),
                     ec: EcShape { k: 4, m: 2 },
                     layout: ObjectLayout::ChunkManifest,
                     metadata_blob: None,
@@ -3372,8 +3388,7 @@ mod tests {
                     key: ObjectKey::from(format!("key-{:02}", i)),
                     version_id: VersionId::Null,
                     size: 0,
-                    etag: vec![0; 8],
-                    etag_kind: EtagKind::Crc64,
+                    etag: ObjectEtag::SinglePart([0; 8]),
                     ec: EcShape { k: 4, m: 2 },
                     layout: ObjectLayout::ChunkManifest,
                     metadata_blob: None,

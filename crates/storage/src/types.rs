@@ -508,6 +508,113 @@ pub struct EcShape {
     pub m: u8,
 }
 
+/// Object-level ETag — either a single-part CRC64-NVME or a multipart composite.
+///
+/// Eliminates the correlated `etag: Vec<u8>` + `etag_kind: EtagKind` +
+/// `parts_count: Option<u32>` triple. Invalid combinations (e.g. multipart
+/// without a parts count, or single-part with one) are unrepresentable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectEtag {
+    /// CRC64-NVME of the object data (8 bytes, big-endian).
+    SinglePart([u8; 8]),
+    /// Composite ETag for multipart uploads: CRC64-NVME of concatenated
+    /// per-part CRC64s, plus the number of parts.
+    MultipartComposite {
+        crc64: [u8; 8],
+        parts: std::num::NonZeroU32,
+    },
+}
+
+impl ObjectEtag {
+    /// Construct a single-part ETag from a CRC64-NVME value.
+    pub fn single_part(crc64: u64) -> Self {
+        Self::SinglePart(crc64.to_be_bytes())
+    }
+
+    /// Construct a multipart composite ETag.
+    ///
+    /// # Panics
+    /// Panics if `parts` is zero.
+    pub fn multipart(crc64_bytes: [u8; 8], parts: u32) -> Self {
+        Self::MultipartComposite {
+            crc64: crc64_bytes,
+            parts: std::num::NonZeroU32::new(parts)
+                .expect("multipart etag requires non-zero parts count"),
+        }
+    }
+
+    /// The raw CRC64-NVME bytes (8 bytes, big-endian).
+    pub fn as_bytes(&self) -> &[u8; 8] {
+        match self {
+            Self::SinglePart(b) => b,
+            Self::MultipartComposite { crc64, .. } => crc64,
+        }
+    }
+
+    /// The CRC64-NVME value as a u64.
+    pub fn crc64(&self) -> u64 {
+        u64::from_be_bytes(*self.as_bytes())
+    }
+
+    /// The ETag kind discriminant for SQL writes.
+    pub fn etag_kind(&self) -> EtagKind {
+        match self {
+            Self::SinglePart(_) => EtagKind::Crc64,
+            Self::MultipartComposite { .. } => EtagKind::MultipartComposite,
+        }
+    }
+
+    /// The parts count (None for single-part).
+    pub fn parts_count(&self) -> Option<u32> {
+        match self {
+            Self::SinglePart(_) => None,
+            Self::MultipartComposite { parts, .. } => Some(parts.get()),
+        }
+    }
+
+    /// Reconstruct from raw SQL columns.
+    pub fn from_parts(
+        etag_bytes: &[u8],
+        etag_kind: EtagKind,
+        parts_count: Option<u32>,
+    ) -> Result<Self, &'static str> {
+        if etag_bytes.len() != 8 {
+            return Err("etag must be exactly 8 bytes");
+        }
+        let mut crc64 = [0u8; 8];
+        crc64.copy_from_slice(etag_bytes);
+        match (etag_kind, parts_count) {
+            (EtagKind::Crc64, None) => Ok(Self::SinglePart(crc64)),
+            (EtagKind::MultipartComposite, Some(n)) => {
+                let parts = std::num::NonZeroU32::new(n)
+                    .ok_or("multipart composite with zero parts count")?;
+                Ok(Self::MultipartComposite { crc64, parts })
+            }
+            (EtagKind::Crc64, Some(_)) => Err("single-part etag must not have parts_count"),
+            (EtagKind::MultipartComposite, None) => {
+                Err("multipart composite etag missing parts_count")
+            }
+        }
+    }
+
+    /// Format as a quoted hex ETag string (S3 wire format).
+    ///
+    /// Single-part: `"abcdef1234567890"`
+    /// Multipart: `"abcdef1234567890-3"`
+    pub fn format(&self) -> String {
+        match self {
+            Self::SinglePart(b) => {
+                let crc = u64::from_be_bytes(*b);
+                format!("\"{:016x}\"", crc)
+            }
+            Self::MultipartComposite { crc64, parts } => {
+                let crc = u64::from_be_bytes(*crc64);
+                format!("\"{:016x}-{}\"", crc, parts)
+            }
+        }
+    }
+}
+
 /// Object data layout — encodes the `data_layout` column plus `parts_count`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectLayout {
@@ -620,9 +727,7 @@ pub struct LiveObjectRecord {
     pub key: ObjectKey,
     pub version_id: VersionId,
     pub size: u64,
-    /// Binary etag (e.g. CRC64-NVME bytes), max 64 bytes.
-    pub etag: Vec<u8>,
-    pub etag_kind: EtagKind,
+    pub etag: ObjectEtag,
     /// Last modified timestamp (unix milliseconds).
     pub last_modified: u64,
     pub storage_class: StorageClass,
@@ -671,17 +776,42 @@ pub enum PutObjectReq {
 }
 
 /// Request to store a live object.
+///
+/// Invariant: the ETag variant must match the layout — `SinglePart` with
+/// `ChunkManifest`, `MultipartComposite` with `MultipartManifest`. Use
+/// [`PutLiveObjectReq::validate`] or rely on `put_object_meta` which calls it.
 pub struct PutLiveObjectReq {
     pub bucket: BucketName,
     pub key: ObjectKey,
     pub version_id: VersionId,
     pub size: u64,
-    pub etag: Vec<u8>,
-    pub etag_kind: EtagKind,
+    pub etag: ObjectEtag,
     pub ec: EcShape,
     pub layout: ObjectLayout,
     /// Serialized user metadata headers.
     pub metadata_blob: Option<Vec<u8>>,
+}
+
+impl PutLiveObjectReq {
+    /// Validate that the etag variant is consistent with the layout.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        match (&self.etag, &self.layout) {
+            (ObjectEtag::SinglePart(_), ObjectLayout::ChunkManifest) => Ok(()),
+            (ObjectEtag::MultipartComposite { parts, .. }, ObjectLayout::MultipartManifest { parts_count }) => {
+                if parts == parts_count {
+                    Ok(())
+                } else {
+                    Err("etag parts count does not match layout parts count")
+                }
+            }
+            (ObjectEtag::SinglePart(_), ObjectLayout::MultipartManifest { .. }) => {
+                Err("single-part etag with multipart layout")
+            }
+            (ObjectEtag::MultipartComposite { .. }, ObjectLayout::ChunkManifest) => {
+                Err("multipart composite etag with chunk manifest layout")
+            }
+        }
+    }
 }
 
 /// Request to store a delete marker.
@@ -696,13 +826,17 @@ pub struct PutDeleteMarkerReq {
 /// Layout is always `MultipartManifest`. The `parts_count` is derived from the
 /// manifest slice passed alongside this request — it is not a separate field,
 /// so divergence between the stored count and the actual manifest is impossible.
+///
+/// The ETag is the composite CRC64 bytes; the storage layer constructs the
+/// `MultipartComposite` variant using the parts slice length, so the caller
+/// cannot produce a variant mismatch.
 pub struct CommitMultipartReq {
     pub bucket: BucketName,
     pub key: ObjectKey,
     pub version_id: VersionId,
     pub size: u64,
-    pub etag: Vec<u8>,
-    pub etag_kind: EtagKind,
+    /// Composite CRC64-NVME bytes (CRC of concatenated per-part CRC64s).
+    pub etag_crc64: [u8; 8],
     pub ec: EcShape,
     /// Serialized user metadata headers.
     pub metadata_blob: Option<Vec<u8>>,
@@ -711,13 +845,15 @@ pub struct CommitMultipartReq {
 /// Request to finalize a streaming PutObject into a live object.
 ///
 /// Layout is always `ChunkManifest` — no parts_count field.
+/// The ETag is a single-part CRC64; the storage layer constructs the
+/// `SinglePart` variant, so the caller cannot produce a variant mismatch.
 pub struct CommitStreamPutReq {
     pub bucket: BucketName,
     pub key: ObjectKey,
     pub version_id: VersionId,
     pub size: u64,
-    pub etag: Vec<u8>,
-    pub etag_kind: EtagKind,
+    /// CRC64-NVME of the object data.
+    pub etag_crc64: u64,
     pub ec: EcShape,
     /// Serialized user metadata headers.
     pub metadata_blob: Option<Vec<u8>>,

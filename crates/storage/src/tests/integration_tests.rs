@@ -21,8 +21,7 @@ fn shard_and_metadata_roundtrip() {
         key: "my/object.txt".into(),
         version_id: VersionId::Null,
         size: shard_data.len() as u64,
-        etag: ack.crc64.to_be_bytes().to_vec(),
-        etag_kind: EtagKind::Crc64,
+        etag: ObjectEtag::single_part(ack.crc64),
         ec: EcShape { k: 4, m: 2 },
         layout: ObjectLayout::ChunkManifest,
         metadata_blob: None,
@@ -39,7 +38,7 @@ fn shard_and_metadata_roundtrip() {
         .unwrap();
     let live = obj.as_live().unwrap();
     assert_eq!(live.size, shard_data.len() as u64);
-    assert_eq!(live.etag, ack.crc64.to_be_bytes().to_vec());
+    assert_eq!(live.etag, ObjectEtag::single_part(ack.crc64));
 }
 
 /// Integration test: LocalStorageNode with multiple PGs.
@@ -112,8 +111,7 @@ fn full_lifecycle() {
         key: "greeting.txt".into(),
         version_id: VersionId::Null,
         size: data.len() as u64,
-        etag: ack.crc64.to_be_bytes().to_vec(),
-        etag_kind: EtagKind::Crc64,
+        etag: ObjectEtag::single_part(ack.crc64),
         ec: EcShape { k: 4, m: 2 },
         layout: ObjectLayout::ChunkManifest,
         metadata_blob: None,
@@ -162,8 +160,7 @@ fn pg_store_persistence() {
                 key: "k".into(),
                 version_id: VersionId::Null,
                 size: data.len() as u64,
-                etag: vec![1],
-                etag_kind: EtagKind::Crc64,
+                etag: ObjectEtag::SinglePart([1, 0, 0, 0, 0, 0, 0, 0]),
                 ec: EcShape { k: 4, m: 2 },
                 layout: ObjectLayout::ChunkManifest,
                 metadata_blob: None,

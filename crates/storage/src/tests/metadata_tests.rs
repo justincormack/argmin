@@ -9,8 +9,8 @@ fn metadata_put_get_delete(store: &dyn PgMetadataStore) {
         version_id: VersionId::Null,
         ec: EcShape { k: 4, m: 2 },
         size: 1024,
-        etag: vec![0xAB, 0xCD],
-        etag_kind: EtagKind::Crc64,layout: ObjectLayout::ChunkManifest,
+        etag: ObjectEtag::SinglePart([0xAB, 0xCD, 0, 0, 0, 0, 0, 0]),
+        layout: ObjectLayout::ChunkManifest,
         metadata_blob: None,
     });
 
@@ -24,8 +24,8 @@ fn metadata_put_get_delete(store: &dyn PgMetadataStore) {
     assert_eq!(obj.version_id(), VersionId::Null);
     let live = obj.as_live().unwrap();
     assert_eq!(live.size, 1024);
-    assert_eq!(live.etag, vec![0xAB, 0xCD]);
-    assert_eq!(live.etag_kind, EtagKind::Crc64);
+    assert_eq!(live.etag, ObjectEtag::SinglePart([0xAB, 0xCD, 0, 0, 0, 0, 0, 0]));
+    assert_eq!(live.etag.etag_kind(), EtagKind::Crc64);
     assert_eq!(live.ec.k, 4);
     assert_eq!(live.ec.m, 2);
     assert!(!obj.is_delete_marker());
@@ -47,8 +47,8 @@ fn metadata_put_overwrites(store: &dyn PgMetadataStore) {
         version_id: VersionId::Null,
         ec: EcShape { k: 4, m: 2 },
         size: 100,
-        etag: vec![1],
-        etag_kind: EtagKind::Crc64,layout: ObjectLayout::ChunkManifest,
+        etag: ObjectEtag::SinglePart([1, 0, 0, 0, 0, 0, 0, 0]),
+        layout: ObjectLayout::ChunkManifest,
         metadata_blob: None,
     });
     store.put_object_meta(&req1).unwrap();
@@ -59,8 +59,8 @@ fn metadata_put_overwrites(store: &dyn PgMetadataStore) {
         version_id: VersionId::Null,
         ec: EcShape { k: 4, m: 2 },
         size: 200,
-        etag: vec![2],
-        etag_kind: EtagKind::Crc64,layout: ObjectLayout::ChunkManifest,
+        etag: ObjectEtag::SinglePart([2, 0, 0, 0, 0, 0, 0, 0]),
+        layout: ObjectLayout::ChunkManifest,
         metadata_blob: None,
     });
     store.put_object_meta(&req2).unwrap();
@@ -68,7 +68,7 @@ fn metadata_put_overwrites(store: &dyn PgMetadataStore) {
     let obj = store.get_object_meta("b", "k").unwrap();
     let live = obj.as_live().unwrap();
     assert_eq!(live.size, 200);
-    assert_eq!(live.etag, vec![2]);
+    assert_eq!(live.etag, ObjectEtag::SinglePart([2, 0, 0, 0, 0, 0, 0, 0]));
 }
 
 fn metadata_get_nonexistent(store: &dyn PgMetadataStore) {
@@ -83,8 +83,7 @@ fn metadata_list_basic(store: &dyn PgMetadataStore) {
             key: format!("obj-{i:02}").into(),
             version_id: VersionId::Null,
             size: i * 100,
-            etag: vec![i as u8],
-            etag_kind: EtagKind::Crc64,
+            etag: ObjectEtag::SinglePart([i as u8, 0, 0, 0, 0, 0, 0, 0]),
             ec: EcShape { k: 4, m: 2 },
             layout: ObjectLayout::ChunkManifest,
             metadata_blob: None,
@@ -117,8 +116,8 @@ fn metadata_list_with_prefix(store: &dyn PgMetadataStore) {
             version_id: VersionId::Null,
             ec: EcShape { k: 4, m: 2 },
             size: 100,
-            etag: vec![0],
-            etag_kind: EtagKind::Crc64,layout: ObjectLayout::ChunkManifest,
+            etag: ObjectEtag::SinglePart([0; 8]),
+            layout: ObjectLayout::ChunkManifest,
         metadata_blob: None,
     });
         store.put_object_meta(&req).unwrap();
@@ -144,8 +143,7 @@ fn metadata_list_pagination(store: &dyn PgMetadataStore) {
             key: format!("item-{i:02}").into(),
             version_id: VersionId::Null,
             size: 0,
-            etag: vec![],
-            etag_kind: EtagKind::Crc64,
+            etag: ObjectEtag::SinglePart([0; 8]),
             ec: EcShape { k: 4, m: 2 },
             layout: ObjectLayout::ChunkManifest,
             metadata_blob: None,
@@ -235,8 +233,8 @@ fn metadata_empty_key(store: &dyn PgMetadataStore) {
         version_id: VersionId::Null,
         ec: EcShape { k: 4, m: 2 },
         size: 0,
-        etag: vec![],
-        etag_kind: EtagKind::Crc64,layout: ObjectLayout::ChunkManifest,
+        etag: ObjectEtag::SinglePart([0; 8]),
+        layout: ObjectLayout::ChunkManifest,
         metadata_blob: None,
     });
     store.put_object_meta(&req).unwrap();
@@ -254,8 +252,8 @@ fn metadata_long_key(store: &dyn PgMetadataStore) {
         version_id: VersionId::Null,
         ec: EcShape { k: 4, m: 2 },
         size: 0,
-        etag: vec![],
-        etag_kind: EtagKind::Crc64,layout: ObjectLayout::ChunkManifest,
+        etag: ObjectEtag::SinglePart([0; 8]),
+        layout: ObjectLayout::ChunkManifest,
         metadata_blob: None,
     });
     store.put_object_meta(&req).unwrap();
@@ -271,8 +269,8 @@ fn metadata_zero_size_object(store: &dyn PgMetadataStore) {
         version_id: VersionId::Null,
         ec: EcShape { k: 4, m: 2 },
         size: 0,
-        etag: vec![],
-        etag_kind: EtagKind::Crc64,layout: ObjectLayout::ChunkManifest,
+        etag: ObjectEtag::SinglePart([0; 8]),
+        layout: ObjectLayout::ChunkManifest,
         metadata_blob: None,
     });
     store.put_object_meta(&req).unwrap();
@@ -501,8 +499,8 @@ fn file_metadata_object_has_inline_legacy_layout() {
             version_id: VersionId::Null,
             ec: EcShape { k: 4, m: 2 },
             size: 100,
-            etag: vec![1, 2, 3],
-            etag_kind: EtagKind::Crc64,layout: ObjectLayout::ChunkManifest,
+            etag: ObjectEtag::SinglePart([1, 2, 3, 0, 0, 0, 0, 0]),
+            layout: ObjectLayout::ChunkManifest,
         metadata_blob: None,
     }))
         .unwrap();
@@ -525,8 +523,8 @@ fn file_metadata_invalid_data_layout_returns_error() {
             version_id: VersionId::Null,
             ec: EcShape { k: 4, m: 2 },
             size: 100,
-            etag: vec![1, 2, 3],
-            etag_kind: EtagKind::Crc64,layout: ObjectLayout::ChunkManifest,
+            etag: ObjectEtag::SinglePart([1, 2, 3, 0, 0, 0, 0, 0]),
+            layout: ObjectLayout::ChunkManifest,
         metadata_blob: None,
     }))
         .unwrap();
@@ -738,8 +736,7 @@ fn mpu_complete_multipart_commit_preserves_checksums() {
         key: "k".into(),
         version_id: VersionId::Null,
         size: 6 * 1024 * 1024,
-        etag: vec![0xCC],
-        etag_kind: EtagKind::MultipartComposite,
+        etag_crc64: [0xCC, 0, 0, 0, 0, 0, 0, 0],
         ec: EcShape { k: 4, m: 2 },
         metadata_blob: Some(vec![]),
     };
@@ -2198,8 +2195,8 @@ mod prop_tests {
                 version_id: VersionId::Null,
                 ec: EcShape { k: 4, m: 2 },
                 size: 0,
-                etag: vec![],
-                etag_kind: EtagKind::Crc64,layout: ObjectLayout::ChunkManifest,
+                etag: ObjectEtag::SinglePart([0; 8]),
+                layout: ObjectLayout::ChunkManifest,
         metadata_blob: None,
     });
             store.put_object_meta(&req).unwrap();
@@ -2510,8 +2507,7 @@ fn commit_stream_put_atomic() {
         key: "k".into(),
         version_id: VersionId::Null,
         size: 6_000_000,
-        etag: vec![0xAB; 8],
-        etag_kind: EtagKind::Crc64,
+        etag_crc64: u64::from_le_bytes([0xAB; 8]),
         ec: EcShape { k: 4, m: 2 },
         metadata_blob: None,
     };
@@ -2595,8 +2591,7 @@ fn commit_stream_put_overwrite_unversioned() {
         key: "k".into(),
         version_id: VersionId::Null,
         size: 100,
-        etag: vec![1],
-        etag_kind: EtagKind::Crc64,
+        etag_crc64: 1u64,
         ec: EcShape { k: 4, m: 2 },
         metadata_blob: None,
     },
@@ -2632,8 +2627,7 @@ fn commit_stream_put_overwrite_unversioned() {
         key: "k".into(),
         version_id: VersionId::Null,
         size: 200,
-        etag: vec![2],
-        etag_kind: EtagKind::Crc64,
+        etag_crc64: 2u64,
         ec: EcShape { k: 4, m: 2 },
         metadata_blob: None,
     },
@@ -2683,8 +2677,7 @@ fn delete_stream_object_chunks_cleanup() {
         key: "k".into(),
         version_id: VersionId::Null,
         size: 100,
-        etag: vec![1],
-        etag_kind: EtagKind::Crc64,
+        etag_crc64: 1u64,
         ec: EcShape { k: 4, m: 2 },
         metadata_blob: None,
     },
@@ -2739,8 +2732,7 @@ fn commit_stream_put_rejects_non_in_progress() {
         key: "k".into(),
         version_id: VersionId::Null,
         size: 0,
-        etag: vec![],
-        etag_kind: EtagKind::Crc64,
+        etag_crc64: 0u64,
         ec: EcShape { k: 4, m: 2 },
         metadata_blob: None,
     },
@@ -2931,8 +2923,7 @@ fn commit_stream_put_rejects_wrong_kind() {
         key: "k".into(),
         version_id: VersionId::Null,
         size: 0,
-        etag: vec![],
-        etag_kind: EtagKind::Crc64,
+        etag_crc64: 0u64,
         ec: EcShape { k: 4, m: 2 },
         metadata_blob: None,
     },
@@ -2970,8 +2961,7 @@ fn commit_stream_put_rejects_wrong_bucket_key() {
         key: "k2".into(),
         version_id: VersionId::Null,
         size: 0,
-        etag: vec![],
-        etag_kind: EtagKind::Crc64,
+        etag_crc64: 0u64,
         ec: EcShape { k: 4, m: 2 },
         metadata_blob: None,
     },
@@ -3195,8 +3185,7 @@ fn commit_stream_put_rejects_mismatched_chunk_target() {
         key: "k".into(),
         version_id: VersionId::Null,
         size: 100,
-        etag: vec![1],
-        etag_kind: EtagKind::Crc64,
+        etag_crc64: 1u64,
         ec: EcShape { k: 4, m: 2 },
         metadata_blob: None,
     },
