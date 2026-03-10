@@ -1041,37 +1041,17 @@ impl HttpFrontend {
                     });
                 }
 
-                // SHA algorithms only support COMPOSITE; reject FULL_OBJECT.
-                if let (Some(algo), Some(ChecksumType::FullObject)) =
-                    (checksum_algorithm, checksum_type)
-                {
-                    if matches!(algo, ChecksumAlgorithm::Sha1 | ChecksumAlgorithm::Sha256) {
-                        return Err(ServerError::InvalidArgument {
-                            reason: format!(
-                                "FULL_OBJECT checksum type is not supported for {}",
-                                algo.as_str()
-                            ),
-                        });
-                    }
-                }
-
-                // CRC64NVME only supports FULL_OBJECT; reject COMPOSITE.
-                if let (Some(ChecksumAlgorithm::Crc64nvme), Some(ChecksumType::Composite)) =
-                    (checksum_algorithm, checksum_type)
-                {
-                    return Err(ServerError::InvalidArgument {
-                        reason: "COMPOSITE checksum type is not supported for CRC64NVME"
-                            .to_string(),
-                    });
-                }
+                // Build validated config (rejects invalid algo+type combinations).
+                let checksum = checksum_algorithm
+                    .map(|algo| crate::coordinator::MultipartChecksumConfig::new(algo, checksum_type))
+                    .transpose()?;
 
                 let result = self.coordinator.create_multipart_upload(
                     &crate::coordinator::CreateMultipartUploadRequest {
                         bucket: &bucket,
                         key: &key,
                         metadata: &metadata,
-                        checksum_algorithm,
-                        checksum_type,
+                        checksum,
                     },
                 )?;
                 Ok(S3Response::create_multipart_upload(
