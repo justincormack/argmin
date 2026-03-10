@@ -490,11 +490,13 @@ impl HttpFrontend {
                         .collect();
                     let cond = write_condition_from_headers(req)?;
                     let result = self.coordinator.put_object(
-                        &bucket,
-                        &key,
-                        &req.body,
-                        &header_pairs,
-                        &cond,
+                        &crate::coordinator::PutObjectRequest {
+                            bucket: &bucket,
+                            key: &key,
+                            data: &req.body,
+                            headers: &header_pairs,
+                            cond: &cond,
+                        },
                     )?;
                     if let Some(tags_xml) = inline_tags_xml {
                         self.coordinator.put_object_tags(
@@ -1631,7 +1633,13 @@ impl HttpFrontend {
         let cond = crate::conditional::WriteCondition::default();
         let result = self
             .coordinator
-            .put_object(bucket, &key, &form.file_data, &hp_refs, &cond)?;
+            .put_object(&crate::coordinator::PutObjectRequest {
+                bucket,
+                key: &key,
+                data: &form.file_data,
+                headers: &hp_refs,
+                cond: &cond,
+            })?;
 
         // Build response based on success_action_status
         let success_status = form
