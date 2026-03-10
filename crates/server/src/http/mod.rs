@@ -36,16 +36,23 @@ use storage::{ChecksumAlgorithm, ChecksumType};
 /// Parse versionId query parameter from an S3 request.
 /// Returns `Ok(None)` if the parameter is absent, `Ok(Some(id))` if valid,
 /// or `Err` if the value is present but not a valid version ID.
+/// Parse a version-id string into a typed `VersionId`.
+fn parse_version_id_str(v: &str) -> Result<storage::VersionId, ServerError> {
+    if v == "null" {
+        Ok(storage::VersionId::Null)
+    } else {
+        v.parse::<u64>()
+            .map(storage::VersionId::from_u64)
+            .map_err(|_| ServerError::InvalidArgument {
+                reason: format!("invalid versionId: {v}"),
+            })
+    }
+}
+
 fn parse_version_id(req: &S3Request) -> Result<Option<storage::VersionId>, ServerError> {
     match req.query_param("versionId") {
         None => Ok(None),
-        Some(v) if v == "null" => Ok(Some(storage::VersionId::Null)),
-        Some(v) => v
-            .parse::<u64>()
-            .map(|n| Some(storage::VersionId::from_u64(n)))
-            .map_err(|_| ServerError::InvalidArgument {
-                reason: format!("invalid versionId: {v}"),
-            }),
+        Some(v) => parse_version_id_str(&v).map(Some),
     }
 }
 
@@ -284,11 +291,13 @@ impl HttpFrontend {
                 let max_keys: u32 = parse_max_keys(req.query_param("max-keys"))?;
 
                 let result = self.coordinator.list_objects_v2(
-                    &bucket,
-                    prefix.as_deref(),
-                    delimiter.as_deref(),
-                    marker.as_deref(),
-                    max_keys,
+                    &crate::coordinator::ListObjectsV2Request {
+                        bucket: &bucket,
+                        prefix: prefix.as_deref(),
+                        delimiter: delimiter.as_deref(),
+                        continuation_token: marker.as_deref(),
+                        max_keys,
+                    },
                 )?;
                 Ok(S3Response::list_objects_v1(
                     &bucket,
@@ -333,11 +342,13 @@ impl HttpFrontend {
                 let max_keys: u32 = parse_max_keys(req.query_param("max-keys"))?;
 
                 let result = self.coordinator.list_objects_v2(
-                    &bucket,
-                    prefix.as_deref(),
-                    delimiter.as_deref(),
-                    continuation_token,
-                    max_keys,
+                    &crate::coordinator::ListObjectsV2Request {
+                        bucket: &bucket,
+                        prefix: prefix.as_deref(),
+                        delimiter: delimiter.as_deref(),
+                        continuation_token,
+                        max_keys,
+                    },
                 )?;
                 Ok(S3Response::list_objects_v2(
                     &bucket,
@@ -773,9 +784,27 @@ impl HttpFrontend {
             }
             S3Operation::DeleteObjects { bucket } => {
                 self.authorize_bucket_write(auth, &bucket)?;
-                let (entries, quiet) = xml::parse_delete_objects_xml(&req.body)?;
+                let (xml_entries, quiet) = xml::parse_delete_objects_xml(&req.body)?;
                 let cond = delete_condition_from_headers(req)?;
-                let result = self.coordinator.delete_objects(&bucket, &entries, &cond)?;
+                let entries: Vec<crate::coordinator::DeleteEntry> = xml_entries
+                    .iter()
+                    .map(|e| {
+                        let version_id = e.version_id.as_deref()
+                            .map(parse_version_id_str)
+                            .transpose()?;
+                        Ok(crate::coordinator::DeleteEntry {
+                            key: &e.key,
+                            version_id,
+                        })
+                    })
+                    .collect::<Result<_, ServerError>>()?;
+                let result = self.coordinator.delete_objects(
+                    &crate::coordinator::DeleteObjectsRequest {
+                        bucket: &bucket,
+                        entries: &entries,
+                        cond: &cond,
+                    },
+                )?;
                 Ok(S3Response::delete_objects(&result, quiet))
             }
             S3Operation::PutBucketVersioning { bucket } => {
@@ -1173,7 +1202,11 @@ impl HttpFrontend {
                             reason: "missing uploadId query parameter".to_string(),
                         })?;
                 self.coordinator
-                    .abort_multipart_upload(&bucket, &key, &upload_id)?;
+                    .abort_multipart_upload(&crate::coordinator::AbortMultipartUploadRequest {
+                        bucket: &bucket,
+                        key: &key,
+                        upload_id: &upload_id,
+                    })?;
                 Ok(S3Response::abort_multipart_upload())
             }
             S3Operation::ListMultipartUploads { bucket } => {
@@ -1188,11 +1221,13 @@ impl HttpFrontend {
                     })?,
                 };
                 let result = self.coordinator.list_multipart_uploads(
-                    &bucket,
-                    prefix.as_deref(),
-                    key_marker.as_deref(),
-                    upload_id_marker.as_deref(),
-                    max_uploads,
+                    &crate::coordinator::ListMultipartUploadsRequest {
+                        bucket: &bucket,
+                        prefix: prefix.as_deref(),
+                        key_marker: key_marker.as_deref(),
+                        upload_id_marker: upload_id_marker.as_deref(),
+                        max_uploads,
+                    },
                 )?;
                 Ok(S3Response::list_multipart_uploads(
                     &bucket,
@@ -1225,11 +1260,13 @@ impl HttpFrontend {
                     })?,
                 };
                 let result = self.coordinator.list_parts(
-                    &bucket,
-                    &key,
-                    &upload_id,
-                    part_number_marker,
-                    max_parts,
+                    &crate::coordinator::ListPartsRequest {
+                        bucket: &bucket,
+                        key: &key,
+                        upload_id: &upload_id,
+                        part_number_marker,
+                        max_parts,
+                    },
                 )?;
                 Ok(S3Response::list_parts(
                     &bucket,
@@ -1263,11 +1300,13 @@ impl HttpFrontend {
                     .unwrap_or(1000);
 
                 let result = self.coordinator.list_object_versions(
-                    &bucket,
-                    prefix.as_deref(),
-                    key_marker.as_deref(),
-                    version_id_marker,
-                    max_keys,
+                    &crate::coordinator::ListObjectVersionsRequest {
+                        bucket: &bucket,
+                        prefix: prefix.as_deref(),
+                        key_marker: key_marker.as_deref(),
+                        version_id_marker,
+                        max_keys,
+                    },
                 )?;
                 Ok(S3Response::list_object_versions(
                     &bucket,
@@ -3866,6 +3905,66 @@ mod tests {
         match fe.maybe_decode_chunked(&req, &test_auth()) {
             Err(ServerError::InvalidArgument { .. }) => {} // expected
             other => panic!("expected InvalidArgument, got {:?}", other.err()),
+        }
+    }
+
+    // ── DeleteObjects version-id validation ────────────────────────────
+
+    #[test]
+    fn delete_objects_invalid_version_id_rejected() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+
+        let xml = br#"<?xml version="1.0"?>
+<Delete>
+  <Object><Key>key1</Key><VersionId>not-a-number</VersionId></Object>
+</Delete>"#;
+        let req = S3Request {
+            method: "POST".to_string(),
+            path: "/mybucket".to_string(),
+            query_string: "delete".to_string(),
+            headers: vec![],
+            body: xml.to_vec(),
+        };
+        let op = S3Operation::DeleteObjects {
+            bucket: "mybucket".to_string(),
+        };
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::InvalidArgument { .. }) => {}
+            Err(e) => panic!("expected InvalidArgument, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn delete_objects_null_version_id_accepted() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+
+        let xml = br#"<?xml version="1.0"?>
+<Delete>
+  <Object><Key>key1</Key><VersionId>null</VersionId></Object>
+</Delete>"#;
+        let req = S3Request {
+            method: "POST".to_string(),
+            path: "/mybucket".to_string(),
+            query_string: "delete".to_string(),
+            headers: vec![],
+            body: xml.to_vec(),
+        };
+        let op = S3Operation::DeleteObjects {
+            bucket: "mybucket".to_string(),
+        };
+        // "null" is a valid version ID — should not error on parsing
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Ok(_) => {}
+            Err(e) => panic!("expected Ok, got {e:?}"),
         }
     }
 }

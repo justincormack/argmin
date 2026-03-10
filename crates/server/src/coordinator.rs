@@ -286,6 +286,69 @@ pub struct DeleteObjectRequest<'a> {
     pub cond: &'a DeleteCondition,
 }
 
+/// Request for a ListObjectsV2 operation.
+#[derive(Debug)]
+pub struct ListObjectsV2Request<'a> {
+    pub bucket: &'a str,
+    pub prefix: Option<&'a str>,
+    pub delimiter: Option<&'a str>,
+    pub continuation_token: Option<&'a str>,
+    pub max_keys: u32,
+}
+
+/// Request for a ListObjectVersions operation.
+#[derive(Debug)]
+pub struct ListObjectVersionsRequest<'a> {
+    pub bucket: &'a str,
+    pub prefix: Option<&'a str>,
+    pub key_marker: Option<&'a str>,
+    pub version_id_marker: Option<storage::VersionId>,
+    pub max_keys: u32,
+}
+
+/// Request for a ListParts operation.
+#[derive(Debug)]
+pub struct ListPartsRequest<'a> {
+    pub bucket: &'a str,
+    pub key: &'a str,
+    pub upload_id: &'a str,
+    pub part_number_marker: Option<u32>,
+    pub max_parts: u32,
+}
+
+/// Request for a ListMultipartUploads operation.
+#[derive(Debug)]
+pub struct ListMultipartUploadsRequest<'a> {
+    pub bucket: &'a str,
+    pub prefix: Option<&'a str>,
+    pub key_marker: Option<&'a str>,
+    pub upload_id_marker: Option<&'a str>,
+    pub max_uploads: u32,
+}
+
+/// A single entry in a batch-delete request, with an already-parsed version ID.
+#[derive(Debug)]
+pub struct DeleteEntry<'a> {
+    pub key: &'a str,
+    pub version_id: Option<storage::VersionId>,
+}
+
+/// Request for a DeleteObjects (multi-delete) operation.
+#[derive(Debug)]
+pub struct DeleteObjectsRequest<'a> {
+    pub bucket: &'a str,
+    pub entries: &'a [DeleteEntry<'a>],
+    pub cond: &'a DeleteCondition,
+}
+
+/// Request for an AbortMultipartUpload operation.
+#[derive(Debug)]
+pub struct AbortMultipartUploadRequest<'a> {
+    pub bucket: &'a str,
+    pub key: &'a str,
+    pub upload_id: &'a str,
+}
+
 /// Request for a CreateMultipartUpload operation.
 #[derive(Debug)]
 pub struct CreateMultipartUploadRequest<'a> {
@@ -3790,12 +3853,13 @@ impl Coordinator {
     /// List objects in a bucket (ListObjectsV2).
     pub fn list_objects_v2(
         &self,
-        bucket: &str,
-        prefix: Option<&str>,
-        delimiter: Option<&str>,
-        continuation_token: Option<&str>,
-        max_keys: u32,
+        req: &ListObjectsV2Request,
     ) -> Result<ListObjectsResult, ServerError> {
+        let bucket = req.bucket;
+        let prefix = req.prefix;
+        let delimiter = req.delimiter;
+        let continuation_token = req.continuation_token;
+        let max_keys = req.max_keys;
         // Verify bucket exists
         let bucket_info = self.head_bucket(bucket)?;
 
@@ -3949,12 +4013,13 @@ impl Coordinator {
     /// List object versions in a bucket.
     pub fn list_object_versions(
         &self,
-        bucket: &str,
-        prefix: Option<&str>,
-        key_marker: Option<&str>,
-        version_id_marker: Option<storage::VersionId>,
-        max_keys: u32,
+        req: &ListObjectVersionsRequest,
     ) -> Result<ListObjectVersionsResult, ServerError> {
+        let bucket = req.bucket;
+        let prefix = req.prefix;
+        let key_marker = req.key_marker;
+        let version_id_marker = req.version_id_marker;
+        let max_keys = req.max_keys;
         let _bucket_info = self.head_bucket(bucket)?;
 
         if max_keys == 0 {
@@ -4041,34 +4106,28 @@ impl Coordinator {
     /// Batch-delete objects.
     pub fn delete_objects(
         &self,
-        bucket: &str,
-        entries: &[crate::http::xml::DeleteObjectEntry],
-        cond: &DeleteCondition,
+        req: &DeleteObjectsRequest,
     ) -> Result<DeleteObjectsResult, ServerError> {
+        let bucket = req.bucket;
+        let entries = req.entries;
+        let cond = req.cond;
         self.head_bucket(bucket)?;
 
         let mut deleted = Vec::new();
         let mut errors = Vec::new();
 
         for entry in entries {
-            let vid = entry.version_id.as_deref().and_then(|v| {
-                if v == "null" {
-                    Some(storage::VersionId::Null)
-                } else {
-                    v.parse::<u64>().ok().map(storage::VersionId::from_u64)
-                }
-            });
-            match self.delete_object(&DeleteObjectRequest { bucket, key: &entry.key, version_id: vid, cond }) {
+            match self.delete_object(&DeleteObjectRequest { bucket, key: entry.key, version_id: entry.version_id, cond }) {
                 Ok(result) => {
                     deleted.push(DeletedObject {
-                        key: entry.key.clone(),
+                        key: entry.key.to_string(),
                         version_id: result.version_id,
                         delete_marker: result.delete_marker,
                     });
                 }
                 Err(e) => {
                     errors.push(DeleteError {
-                        key: entry.key.clone(),
+                        key: entry.key.to_string(),
                         code: e.s3_error_code().to_string(),
                         message: e.to_string(),
                     });
@@ -4897,10 +4956,11 @@ impl Coordinator {
     /// then deletes the upload and part metadata rows.
     pub fn abort_multipart_upload(
         &self,
-        bucket: &str,
-        key: &str,
-        upload_id: &str,
+        req: &AbortMultipartUploadRequest,
     ) -> Result<(), ServerError> {
+        let bucket = req.bucket;
+        let key = req.key;
+        let upload_id = req.upload_id;
         // 1. Lock meta PG and validate upload.
         let meta_pg_id = self.object_pg_id(bucket, key);
         let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
@@ -4989,14 +5049,12 @@ impl Coordinator {
     }
 
     /// List parts of an in-progress multipart upload.
-    pub fn list_parts(
-        &self,
-        bucket: &str,
-        key: &str,
-        upload_id: &str,
-        part_number_marker: Option<u32>,
-        max_parts: u32,
-    ) -> Result<ListPartsResult, ServerError> {
+    pub fn list_parts(&self, req: &ListPartsRequest) -> Result<ListPartsResult, ServerError> {
+        let bucket = req.bucket;
+        let key = req.key;
+        let upload_id = req.upload_id;
+        let part_number_marker = req.part_number_marker;
+        let max_parts = req.max_parts;
         // 1. Lock meta PG and validate upload.
         let meta_pg_id = self.object_pg_id(bucket, key);
         let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
@@ -5058,12 +5116,13 @@ impl Coordinator {
     /// and applies pagination.
     pub fn list_multipart_uploads(
         &self,
-        bucket: &str,
-        prefix: Option<&str>,
-        key_marker: Option<&str>,
-        upload_id_marker: Option<&str>,
-        max_uploads: u32,
+        req: &ListMultipartUploadsRequest,
     ) -> Result<ListMultipartUploadsResult, ServerError> {
+        let bucket = req.bucket;
+        let prefix = req.prefix;
+        let key_marker = req.key_marker;
+        let upload_id_marker = req.upload_id_marker;
+        let max_uploads = req.max_uploads;
         self.head_bucket(bucket)?;
 
         if max_uploads == 0 {
@@ -5301,7 +5360,7 @@ mod tests {
         coord.create_bucket(bucket).unwrap();
 
         let resp = coord
-            .list_objects_v2(bucket, None, None, None, 1000)
+            .list_objects_v2(&ListObjectsV2Request { bucket, prefix: None, delimiter: None, continuation_token: None, max_keys: 1000 })
             .unwrap();
         assert!(resp.objects.is_empty());
     }
@@ -5316,7 +5375,7 @@ mod tests {
         coord.create_bucket(bucket).unwrap();
 
         let resp = coord
-            .list_object_versions(bucket, None, None, None, 1000)
+            .list_object_versions(&ListObjectVersionsRequest { bucket, prefix: None, key_marker: None, version_id_marker: None, max_keys: 1000 })
             .unwrap();
         assert!(resp.versions.is_empty());
     }
@@ -5335,7 +5394,7 @@ mod tests {
             .unwrap();
 
         let resp = coord
-            .list_multipart_uploads(bucket, None, None, None, 1000)
+            .list_multipart_uploads(&ListMultipartUploadsRequest { bucket, prefix: None, key_marker: None, upload_id_marker: None, max_uploads: 1000 })
             .unwrap();
         assert_eq!(resp.uploads.len(), 1);
         assert_eq!(resp.uploads[0].key, key);
@@ -5574,7 +5633,7 @@ mod tests {
             .unwrap();
 
         let result = coord
-            .list_objects_v2("bucket", None, None, None, 1000)
+            .list_objects_v2(&ListObjectsV2Request { bucket: "bucket", prefix: None, delimiter: None, continuation_token: None, max_keys: 1000 })
             .unwrap();
         assert_eq!(result.objects.len(), 3);
         // Should be sorted
@@ -5600,7 +5659,7 @@ mod tests {
             .unwrap();
 
         let result = coord
-            .list_objects_v2("bucket", Some("photos/"), None, None, 1000)
+            .list_objects_v2(&ListObjectsV2Request { bucket: "bucket", prefix: Some("photos/"), delimiter: None, continuation_token: None, max_keys: 1000 })
             .unwrap();
         assert_eq!(result.objects.len(), 2);
     }
@@ -5625,7 +5684,7 @@ mod tests {
             .unwrap();
 
         let result = coord
-            .list_objects_v2("bucket", None, Some("/"), None, 1000)
+            .list_objects_v2(&ListObjectsV2Request { bucket: "bucket", prefix: None, delimiter: Some("/"), continuation_token: None, max_keys: 1000 })
             .unwrap();
         assert_eq!(result.objects.len(), 1);
         assert_eq!(result.objects[0].key, "root.txt");
@@ -5914,7 +5973,7 @@ mod tests {
 
         // First page: max_keys=2 with delimiter
         let result = coord
-            .list_objects_v2("bucket", None, Some("/"), None, 2)
+            .list_objects_v2(&ListObjectsV2Request { bucket: "bucket", prefix: None, delimiter: Some("/"), continuation_token: None, max_keys: 2 })
             .unwrap();
         assert_eq!(
             result.objects.len() + result.common_prefixes.len(),
@@ -5927,7 +5986,7 @@ mod tests {
         // Second page using continuation token
         let token = result.next_continuation_token.unwrap();
         let result2 = coord
-            .list_objects_v2("bucket", None, Some("/"), Some(&token), 2)
+            .list_objects_v2(&ListObjectsV2Request { bucket: "bucket", prefix: None, delimiter: Some("/"), continuation_token: Some(&token), max_keys: 2 })
             .unwrap();
         assert!(
             !result2.objects.is_empty() || !result2.common_prefixes.is_empty(),
@@ -5950,7 +6009,7 @@ mod tests {
         }
 
         let result = coord
-            .list_objects_v2("bucket", None, Some("/"), None, 3)
+            .list_objects_v2(&ListObjectsV2Request { bucket: "bucket", prefix: None, delimiter: Some("/"), continuation_token: None, max_keys: 3 })
             .unwrap();
         // With delimiter "/", all entries become common prefixes
         assert_eq!(result.common_prefixes.len(), 3);
@@ -5993,7 +6052,7 @@ mod tests {
 
         // Request fewer than available
         let result = coord
-            .list_objects_v2("bucket", None, None, None, 3)
+            .list_objects_v2(&ListObjectsV2Request { bucket: "bucket", prefix: None, delimiter: None, continuation_token: None, max_keys: 3 })
             .unwrap();
         assert_eq!(result.objects.len(), 3);
         assert!(result.is_truncated);
@@ -6015,7 +6074,7 @@ mod tests {
 
         // First page
         let page1 = coord
-            .list_objects_v2("bucket", None, None, None, 2)
+            .list_objects_v2(&ListObjectsV2Request { bucket: "bucket", prefix: None, delimiter: None, continuation_token: None, max_keys: 2 })
             .unwrap();
         assert_eq!(page1.objects.len(), 2);
         assert!(page1.is_truncated);
@@ -6023,7 +6082,7 @@ mod tests {
 
         // Second page using continuation token
         let page2 = coord
-            .list_objects_v2("bucket", None, None, Some(token), 2)
+            .list_objects_v2(&ListObjectsV2Request { bucket: "bucket", prefix: None, delimiter: None, continuation_token: Some(token), max_keys: 2 })
             .unwrap();
         assert_eq!(page2.objects.len(), 2);
         assert!(page2.is_truncated);
@@ -6031,7 +6090,7 @@ mod tests {
 
         // Third page — should get remainder
         let page3 = coord
-            .list_objects_v2("bucket", None, None, Some(token2), 2)
+            .list_objects_v2(&ListObjectsV2Request { bucket: "bucket", prefix: None, delimiter: None, continuation_token: Some(token2), max_keys: 2 })
             .unwrap();
         assert_eq!(page3.objects.len(), 1);
         assert!(!page3.is_truncated);
@@ -6059,7 +6118,7 @@ mod tests {
 
         // List with prefix "photos/" and delimiter "/"
         let result = coord
-            .list_objects_v2("bucket", Some("photos/"), Some("/"), None, 1000)
+            .list_objects_v2(&ListObjectsV2Request { bucket: "bucket", prefix: Some("photos/"), delimiter: Some("/"), continuation_token: None, max_keys: 1000 })
             .unwrap();
         // top.jpg is a direct child, 2024/ and 2025/ are common prefixes
         assert_eq!(result.objects.len(), 1);
@@ -6081,7 +6140,7 @@ mod tests {
             .unwrap();
 
         let result = coord
-            .list_objects_v2("bucket", None, None, None, 1000)
+            .list_objects_v2(&ListObjectsV2Request { bucket: "bucket", prefix: None, delimiter: None, continuation_token: None, max_keys: 1000 })
             .unwrap();
         assert_eq!(result.objects.len(), 1);
         assert!(!result.is_truncated);
@@ -6099,7 +6158,7 @@ mod tests {
             .unwrap();
 
         let result = coord
-            .list_objects_v2("bucket", None, None, None, 0)
+            .list_objects_v2(&ListObjectsV2Request { bucket: "bucket", prefix: None, delimiter: None, continuation_token: None, max_keys: 0 })
             .unwrap();
         assert!(result.objects.is_empty());
         assert!(result.common_prefixes.is_empty());
@@ -6118,7 +6177,7 @@ mod tests {
             .unwrap();
 
         let result = coord
-            .list_objects_v2("bucket", None, Some("/"), None, 0)
+            .list_objects_v2(&ListObjectsV2Request { bucket: "bucket", prefix: None, delimiter: Some("/"), continuation_token: None, max_keys: 0 })
             .unwrap();
         assert!(result.objects.is_empty());
         assert!(result.common_prefixes.is_empty());
@@ -6131,7 +6190,7 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         let err = coord
-            .list_objects_v2("no-bucket", None, None, None, 1000)
+            .list_objects_v2(&ListObjectsV2Request { bucket: "no-bucket", prefix: None, delimiter: None, continuation_token: None, max_keys: 1000 })
             .unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
     }
@@ -6150,22 +6209,22 @@ mod tests {
             .unwrap();
 
         let entries = vec![
-            crate::http::xml::DeleteObjectEntry {
-                key: "key1".to_string(),
+            DeleteEntry {
+                key: "key1",
                 version_id: None,
             },
-            crate::http::xml::DeleteObjectEntry {
-                key: "key2".to_string(),
+            DeleteEntry {
+                key: "key2",
                 version_id: None,
             },
             // key3 doesn't exist — should still succeed (idempotent)
-            crate::http::xml::DeleteObjectEntry {
-                key: "key3".to_string(),
+            DeleteEntry {
+                key: "key3",
                 version_id: None,
             },
         ];
 
-        let result = coord.delete_objects("bucket", &entries, NO_DELETE).unwrap();
+        let result = coord.delete_objects(&DeleteObjectsRequest { bucket: "bucket", entries: &entries, cond: NO_DELETE }).unwrap();
         assert_eq!(result.deleted.len(), 3);
         assert!(result.errors.is_empty());
 
@@ -6179,13 +6238,13 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        let entries = vec![crate::http::xml::DeleteObjectEntry {
-            key: "key1".to_string(),
+        let entries = vec![DeleteEntry {
+            key: "key1",
             version_id: None,
         }];
 
         let err = coord
-            .delete_objects("no-bucket", &entries, NO_DELETE)
+            .delete_objects(&DeleteObjectsRequest { bucket: "no-bucket", entries: &entries, cond: NO_DELETE })
             .unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
     }
@@ -6215,7 +6274,7 @@ mod tests {
 
         // Step 1: ListObjectVersions
         let versions_result = coord
-            .list_object_versions("test-bucket", None, None, None, 1000)
+            .list_object_versions(&ListObjectVersionsRequest { bucket: "test-bucket", prefix: None, key_marker: None, version_id_marker: None, max_keys: 1000 })
             .unwrap();
         assert_eq!(versions_result.versions.len(), 3);
 
@@ -6237,7 +6296,7 @@ mod tests {
 
         // Also verify we can still list for the delete step below
         let list_result = coord
-            .list_objects_v2("test-bucket", None, None, None, 1000)
+            .list_objects_v2(&ListObjectsV2Request { bucket: "test-bucket", prefix: None, delimiter: None, continuation_token: None, max_keys: 1000 })
             .unwrap();
         assert_eq!(list_result.objects.len(), 3);
 
@@ -6250,21 +6309,22 @@ mod tests {
         delete_xml.push_str("</Delete>");
 
         // Step 4: Parse the delete XML (as our server would on receiving the POST)
-        let (entries, quiet) =
+        let (xml_entries, quiet) =
             crate::http::xml::parse_delete_objects_xml(delete_xml.as_bytes()).unwrap();
-        assert_eq!(entries.len(), 3);
+        assert_eq!(xml_entries.len(), 3);
         assert!(!quiet);
+        let entries: Vec<DeleteEntry> = xml_entries.iter().map(|e| DeleteEntry { key: &e.key, version_id: None }).collect();
 
         // Step 5: Batch delete
         let delete_result = coord
-            .delete_objects("test-bucket", &entries, NO_DELETE)
+            .delete_objects(&DeleteObjectsRequest { bucket: "test-bucket", entries: &entries, cond: NO_DELETE })
             .unwrap();
         assert_eq!(delete_result.deleted.len(), 3);
         assert!(delete_result.errors.is_empty());
 
         // Step 6: Bucket should now be empty and deletable
         let list_after = coord
-            .list_objects_v2("test-bucket", None, None, None, 1000)
+            .list_objects_v2(&ListObjectsV2Request { bucket: "test-bucket", prefix: None, delimiter: None, continuation_token: None, max_keys: 1000 })
             .unwrap();
         assert!(list_after.objects.is_empty());
         coord.delete_bucket("test-bucket").unwrap();
@@ -6286,7 +6346,7 @@ mod tests {
 
         // Page 1: max_keys=2
         let page1 = coord
-            .list_objects_v2("bucket", None, None, None, 2)
+            .list_objects_v2(&ListObjectsV2Request { bucket: "bucket", prefix: None, delimiter: None, continuation_token: None, max_keys: 2 })
             .unwrap();
         assert_eq!(page1.objects.len(), 2);
         assert!(page1.is_truncated);
@@ -6294,14 +6354,14 @@ mod tests {
 
         // Page 2
         let page2 = coord
-            .list_objects_v2("bucket", None, None, Some(&token), 2)
+            .list_objects_v2(&ListObjectsV2Request { bucket: "bucket", prefix: None, delimiter: None, continuation_token: Some(&token), max_keys: 2 })
             .unwrap();
         assert_eq!(page2.objects.len(), 2);
         let token2 = page2.next_continuation_token.clone().unwrap();
 
         // Page 3
         let page3 = coord
-            .list_objects_v2("bucket", None, None, Some(&token2), 2)
+            .list_objects_v2(&ListObjectsV2Request { bucket: "bucket", prefix: None, delimiter: None, continuation_token: Some(&token2), max_keys: 2 })
             .unwrap();
         assert_eq!(page3.objects.len(), 1);
         assert!(!page3.is_truncated);
@@ -6323,12 +6383,13 @@ mod tests {
         }
         delete_xml.push_str("</Delete>");
 
-        let (entries, quiet) =
+        let (xml_entries, quiet) =
             crate::http::xml::parse_delete_objects_xml(delete_xml.as_bytes()).unwrap();
-        assert_eq!(entries.len(), 5);
+        assert_eq!(xml_entries.len(), 5);
         assert!(quiet);
+        let entries: Vec<DeleteEntry> = xml_entries.iter().map(|e| DeleteEntry { key: &e.key, version_id: None }).collect();
 
-        let delete_result = coord.delete_objects("bucket", &entries, NO_DELETE).unwrap();
+        let delete_result = coord.delete_objects(&DeleteObjectsRequest { bucket: "bucket", entries: &entries, cond: NO_DELETE }).unwrap();
         assert_eq!(delete_result.deleted.len(), 5);
         assert!(delete_result.errors.is_empty());
 
@@ -6731,16 +6792,16 @@ mod tests {
         // Use key1's etag for both entries; key2 will fail the condition
         let cond = DeleteCondition::IfMatch(p1.etag);
         let entries = vec![
-            crate::http::xml::DeleteObjectEntry {
-                key: "key1".to_string(),
+            DeleteEntry {
+                key: "key1",
                 version_id: None,
             },
-            crate::http::xml::DeleteObjectEntry {
-                key: "key2".to_string(),
+            DeleteEntry {
+                key: "key2",
                 version_id: None,
             },
         ];
-        let result = coord.delete_objects("bucket", &entries, &cond).unwrap();
+        let result = coord.delete_objects(&DeleteObjectsRequest { bucket: "bucket", entries: &entries, cond: &cond }).unwrap();
         assert_eq!(result.deleted.len(), 1);
         assert_eq!(result.deleted[0].key, "key1");
         assert_eq!(result.errors.len(), 1);
@@ -7595,7 +7656,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let result = coord
-            .list_multipart_uploads("bucket", None, None, None, 1000)
+            .list_multipart_uploads(&ListMultipartUploadsRequest { bucket: "bucket", prefix: None, key_marker: None, upload_id_marker: None, max_uploads: 1000 })
             .unwrap();
         assert!(result.uploads.is_empty());
         assert!(!result.is_truncated);
@@ -7616,7 +7677,7 @@ mod tests {
             .unwrap();
 
         let result = coord
-            .list_multipart_uploads("bucket", None, None, None, 1000)
+            .list_multipart_uploads(&ListMultipartUploadsRequest { bucket: "bucket", prefix: None, key_marker: None, upload_id_marker: None, max_uploads: 1000 })
             .unwrap();
         assert_eq!(result.uploads.len(), 2);
 
@@ -7644,7 +7705,7 @@ mod tests {
             .unwrap();
 
         let result = coord
-            .list_multipart_uploads("bucket", None, None, None, 1000)
+            .list_multipart_uploads(&ListMultipartUploadsRequest { bucket: "bucket", prefix: None, key_marker: None, upload_id_marker: None, max_uploads: 1000 })
             .unwrap();
         assert_eq!(result.uploads.len(), 2);
 
@@ -7680,7 +7741,7 @@ mod tests {
 
         // Page 1: max_uploads=2.
         let page1 = coord
-            .list_multipart_uploads("bucket", None, None, None, 2)
+            .list_multipart_uploads(&ListMultipartUploadsRequest { bucket: "bucket", prefix: None, key_marker: None, upload_id_marker: None, max_uploads: 2 })
             .unwrap();
         assert_eq!(page1.uploads.len(), 2);
         assert!(page1.is_truncated);
@@ -7691,13 +7752,13 @@ mod tests {
 
         // Page 2: use markers from page 1.
         let page2 = coord
-            .list_multipart_uploads(
-                "bucket",
-                None,
-                page1.next_key_marker.as_deref(),
-                page1.next_upload_id_marker.as_deref(),
-                2,
-            )
+            .list_multipart_uploads(&ListMultipartUploadsRequest {
+                bucket: "bucket",
+                prefix: None,
+                key_marker: page1.next_key_marker.as_deref(),
+                upload_id_marker: page1.next_upload_id_marker.as_deref(),
+                max_uploads: 2,
+            })
             .unwrap();
         assert_eq!(page2.uploads.len(), 1);
         assert!(!page2.is_truncated);
@@ -7722,7 +7783,7 @@ mod tests {
             .unwrap();
 
         let result = coord
-            .list_multipart_uploads("bucket", Some("photos/"), None, None, 1000)
+            .list_multipart_uploads(&ListMultipartUploadsRequest { bucket: "bucket", prefix: Some("photos/"), key_marker: None, upload_id_marker: None, max_uploads: 1000 })
             .unwrap();
         assert_eq!(result.uploads.len(), 2);
         assert!(result.uploads.iter().all(|u| u.key.starts_with("photos/")));
@@ -7740,7 +7801,7 @@ mod tests {
             .unwrap();
 
         let result = coord
-            .list_multipart_uploads("bucket", None, None, None, 0)
+            .list_multipart_uploads(&ListMultipartUploadsRequest { bucket: "bucket", prefix: None, key_marker: None, upload_id_marker: None, max_uploads: 0 })
             .unwrap();
         assert!(result.uploads.is_empty());
         assert!(!result.is_truncated);
@@ -7752,7 +7813,7 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         let err = coord
-            .list_multipart_uploads("no-such-bucket", None, None, None, 1000)
+            .list_multipart_uploads(&ListMultipartUploadsRequest { bucket: "no-such-bucket", prefix: None, key_marker: None, upload_id_marker: None, max_uploads: 1000 })
             .unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
     }
@@ -7835,7 +7896,7 @@ mod tests {
 
         // Page 1: max_uploads=2 — should get first 2 by initiation time.
         let page1 = coord
-            .list_multipart_uploads("bucket", None, None, None, 2)
+            .list_multipart_uploads(&ListMultipartUploadsRequest { bucket: "bucket", prefix: None, key_marker: None, upload_id_marker: None, max_uploads: 2 })
             .unwrap();
         assert_eq!(page1.uploads.len(), 2);
         assert!(page1.is_truncated);
@@ -7846,13 +7907,13 @@ mod tests {
 
         // Page 2: use markers from page 1 — should get remaining upload.
         let page2 = coord
-            .list_multipart_uploads(
-                "bucket",
-                None,
-                page1.next_key_marker.as_deref(),
-                page1.next_upload_id_marker.as_deref(),
-                2,
-            )
+            .list_multipart_uploads(&ListMultipartUploadsRequest {
+                bucket: "bucket",
+                prefix: None,
+                key_marker: page1.next_key_marker.as_deref(),
+                upload_id_marker: page1.next_upload_id_marker.as_deref(),
+                max_uploads: 2,
+            })
             .unwrap();
         assert_eq!(page2.uploads.len(), 1);
         assert!(!page2.is_truncated);
@@ -8432,7 +8493,7 @@ mod tests {
 
         // list_objects_v2 should return the composite ETag with -N suffix.
         let list = coord
-            .list_objects_v2("bucket", None, None, None, 100)
+            .list_objects_v2(&ListObjectsV2Request { bucket: "bucket", prefix: None, delimiter: None, continuation_token: None, max_keys: 100 })
             .unwrap();
         assert_eq!(list.objects.len(), 1);
         assert_eq!(list.objects[0].etag, result.etag);
@@ -8459,7 +8520,7 @@ mod tests {
             .unwrap();
 
         let versions = coord
-            .list_object_versions("bucket", None, None, None, 100)
+            .list_object_versions(&ListObjectVersionsRequest { bucket: "bucket", prefix: None, key_marker: None, version_id_marker: None, max_keys: 100 })
             .unwrap();
         assert_eq!(versions.versions.len(), 1);
         assert_eq!(versions.versions[0].etag, result.etag);
@@ -8482,7 +8543,7 @@ mod tests {
             create_upload_with_parts(&coord, "bucket", "key", &[(1, b"part1"), (2, b"part2")]);
 
         coord
-            .abort_multipart_upload("bucket", "key", &upload_id)
+            .abort_multipart_upload(&AbortMultipartUploadRequest { bucket: "bucket", key: "key", upload_id: &upload_id })
             .unwrap();
 
         // Upload should no longer exist.
@@ -8496,7 +8557,7 @@ mod tests {
 
         // ListMultipartUploads should be empty.
         let uploads = coord
-            .list_multipart_uploads("bucket", None, None, None, 100)
+            .list_multipart_uploads(&ListMultipartUploadsRequest { bucket: "bucket", prefix: None, key_marker: None, upload_id_marker: None, max_uploads: 100 })
             .unwrap();
         assert!(uploads.uploads.is_empty());
     }
@@ -8508,7 +8569,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let err = coord
-            .abort_multipart_upload("bucket", "key", "no-such-upload")
+            .abort_multipart_upload(&AbortMultipartUploadRequest { bucket: "bucket", key: "key", upload_id: "no-such-upload" })
             .unwrap_err();
         assert!(
             matches!(err, ServerError::NoSuchUpload { .. }),
@@ -8529,12 +8590,12 @@ mod tests {
 
         // First abort succeeds.
         coord
-            .abort_multipart_upload("bucket", "key", &create.upload_id)
+            .abort_multipart_upload(&AbortMultipartUploadRequest { bucket: "bucket", key: "key", upload_id: &create.upload_id })
             .unwrap();
 
         // Second abort: upload is already deleted, returns UploadNotFound.
         let err = coord
-            .abort_multipart_upload("bucket", "key", &create.upload_id)
+            .abort_multipart_upload(&AbortMultipartUploadRequest { bucket: "bucket", key: "key", upload_id: &create.upload_id })
             .unwrap_err();
         assert!(
             matches!(err, ServerError::NoSuchUpload { .. }),
@@ -8555,7 +8616,7 @@ mod tests {
             .unwrap();
 
         let err = coord
-            .abort_multipart_upload("other", "key", &create.upload_id)
+            .abort_multipart_upload(&AbortMultipartUploadRequest { bucket: "other", key: "key", upload_id: &create.upload_id })
             .unwrap_err();
         assert!(
             matches!(err, ServerError::NoSuchUpload { .. }),
@@ -8578,7 +8639,7 @@ mod tests {
 
         // Abort the same upload_id should fail (already deleted by complete).
         let err = coord
-            .abort_multipart_upload("bucket", "key", &upload_id)
+            .abort_multipart_upload(&AbortMultipartUploadRequest { bucket: "bucket", key: "key", upload_id: &upload_id })
             .unwrap_err();
         assert!(
             matches!(err, ServerError::NoSuchUpload { .. }),
@@ -8587,7 +8648,7 @@ mod tests {
 
         // Object should still exist (visible in listing).
         let list = coord
-            .list_objects_v2("bucket", None, None, None, 100)
+            .list_objects_v2(&ListObjectsV2Request { bucket: "bucket", prefix: None, delimiter: None, continuation_token: None, max_keys: 100 })
             .unwrap();
         assert_eq!(list.objects.len(), 1);
         assert_eq!(list.objects[0].key, "key");
@@ -8608,7 +8669,7 @@ mod tests {
             .unwrap();
 
         coord
-            .abort_multipart_upload("bucket", "key", &create.upload_id)
+            .abort_multipart_upload(&AbortMultipartUploadRequest { bucket: "bucket", key: "key", upload_id: &create.upload_id })
             .unwrap();
 
         let err = coord
@@ -8636,7 +8697,7 @@ mod tests {
         );
 
         let result = coord
-            .list_parts("bucket", "key", &upload_id, None, 100)
+            .list_parts(&ListPartsRequest { bucket: "bucket", key: "key", upload_id: &upload_id, part_number_marker: None, max_parts: 100 })
             .unwrap();
         assert_eq!(result.parts.len(), 3);
         assert_eq!(result.parts[0].part_number, 1);
@@ -8662,7 +8723,7 @@ mod tests {
 
         // Page 1: max_parts=2
         let page1 = coord
-            .list_parts("bucket", "key", &upload_id, None, 2)
+            .list_parts(&ListPartsRequest { bucket: "bucket", key: "key", upload_id: &upload_id, part_number_marker: None, max_parts: 2 })
             .unwrap();
         assert_eq!(page1.parts.len(), 2);
         assert_eq!(page1.parts[0].part_number, 1);
@@ -8672,13 +8733,13 @@ mod tests {
 
         // Page 2: continue from marker
         let page2 = coord
-            .list_parts(
-                "bucket",
-                "key",
-                &upload_id,
-                page1.next_part_number_marker,
-                2,
-            )
+            .list_parts(&ListPartsRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload_id,
+                part_number_marker: page1.next_part_number_marker,
+                max_parts: 2,
+            })
             .unwrap();
         assert_eq!(page2.parts.len(), 2);
         assert_eq!(page2.parts[0].part_number, 3);
@@ -8696,7 +8757,7 @@ mod tests {
             create_upload_with_parts(&coord, "bucket", "key", &[(1, b"hello")]);
 
         let result = coord
-            .list_parts("bucket", "key", &upload_id, None, 100)
+            .list_parts(&ListPartsRequest { bucket: "bucket", key: "key", upload_id: &upload_id, part_number_marker: None, max_parts: 100 })
             .unwrap();
         assert_eq!(result.parts.len(), 1);
         // ListParts ETag should match the ETag returned by UploadPart.
@@ -8716,7 +8777,7 @@ mod tests {
             .unwrap();
 
         let err = coord
-            .list_parts("other", "key", &create.upload_id, None, 100)
+            .list_parts(&ListPartsRequest { bucket: "other", key: "key", upload_id: &create.upload_id, part_number_marker: None, max_parts: 100 })
             .unwrap_err();
         assert!(
             matches!(err, ServerError::NoSuchUpload { .. }),
@@ -8731,7 +8792,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let err = coord
-            .list_parts("bucket", "key", "no-such-upload", None, 100)
+            .list_parts(&ListPartsRequest { bucket: "bucket", key: "key", upload_id: "no-such-upload", part_number_marker: None, max_parts: 100 })
             .unwrap_err();
         assert!(
             matches!(err, ServerError::NoSuchUpload { .. }),
@@ -8759,7 +8820,7 @@ mod tests {
             .unwrap();
 
         let result = coord
-            .list_parts("bucket", "key", &create.upload_id, None, 100)
+            .list_parts(&ListPartsRequest { bucket: "bucket", key: "key", upload_id: &create.upload_id, part_number_marker: None, max_parts: 100 })
             .unwrap();
         assert_eq!(result.parts.len(), 1);
         assert_eq!(result.parts[0].etag, reupload.etag);
@@ -8788,7 +8849,7 @@ mod tests {
         drop(pg);
 
         let err = coord
-            .list_parts("bucket", "key", &create.upload_id, None, 100)
+            .list_parts(&ListPartsRequest { bucket: "bucket", key: "key", upload_id: &create.upload_id, part_number_marker: None, max_parts: 100 })
             .unwrap_err();
         assert!(
             matches!(err, ServerError::NoSuchUpload { .. }),
@@ -8815,7 +8876,7 @@ mod tests {
         drop(pg);
 
         let err = coord
-            .abort_multipart_upload("bucket", "key", &create.upload_id)
+            .abort_multipart_upload(&AbortMultipartUploadRequest { bucket: "bucket", key: "key", upload_id: &create.upload_id })
             .unwrap_err();
         assert!(
             matches!(err, ServerError::NoSuchUpload { .. }),
@@ -10666,7 +10727,7 @@ mod tests {
 
         // Abort the MPU.
         coord
-            .abort_multipart_upload("bucket", "key", &mpu.upload_id)
+            .abort_multipart_upload(&AbortMultipartUploadRequest { bucket: "bucket", key: "key", upload_id: &mpu.upload_id })
             .unwrap();
 
         // Verify chunk manifest rows are gone.

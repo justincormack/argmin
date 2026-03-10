@@ -275,6 +275,7 @@ pub fn list_objects_v1_xml(
 }
 
 /// An entry in a DeleteObjects request.
+#[derive(Debug)]
 pub struct DeleteObjectEntry {
     pub key: String,
     pub version_id: Option<String>,
