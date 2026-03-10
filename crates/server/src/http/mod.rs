@@ -400,9 +400,40 @@ impl HttpFrontend {
                         .iter()
                         .map(|(k, v)| (k.as_str(), v.as_str()))
                         .collect();
+                    // Parse metadata and checksum algorithm at the HTTP boundary
+                    // so the coordinator never sees raw headers.
+                    let replace_metadata;
+                    let replace_checksum_algo;
                     let directive = match req.header("x-amz-metadata-directive") {
                         Some(d) if d.eq_ignore_ascii_case("REPLACE") => {
-                            MetadataDirective::Replace(&header_pairs)
+                            let mut blob = MetadataBlob::from_headers(&header_pairs)?;
+                            // Strip unverifiable checksum value headers — CopyObject
+                            // has no body so these can't be verified.
+                            const CHECKSUM_VALUE_HEADERS: &[&str] = &[
+                                "x-amz-checksum-crc32",
+                                "x-amz-checksum-crc32c",
+                                "x-amz-checksum-crc64nvme",
+                                "x-amz-checksum-sha256",
+                                "x-amz-checksum-sha1",
+                            ];
+                            blob.entries
+                                .retain(|e| !CHECKSUM_VALUE_HEADERS.contains(&e.key.as_str()));
+                            replace_metadata = blob;
+
+                            // Parse checksum algorithm if present.
+                            replace_checksum_algo = match req.header("x-amz-checksum-algorithm") {
+                                None => None,
+                                Some(v) => Some(ChecksumAlgorithm::parse(v).ok_or_else(|| {
+                                    ServerError::InvalidArgument {
+                                        reason: format!("unsupported checksum algorithm: {v}"),
+                                    }
+                                })?),
+                            };
+
+                            MetadataDirective::Replace {
+                                metadata: &replace_metadata,
+                                checksum_algorithm: replace_checksum_algo,
+                            }
                         }
                         _ => MetadataDirective::Copy,
                     };
@@ -1043,7 +1074,7 @@ impl HttpFrontend {
 
                 // Build validated config (rejects invalid algo+type combinations).
                 let checksum = checksum_algorithm
-                    .map(|algo| crate::coordinator::MultipartChecksumConfig::new(algo, checksum_type))
+                    .map(|algo| storage::MultipartChecksumConfig::new(algo, checksum_type))
                     .transpose()?;
 
                 let result = self.coordinator.create_multipart_upload(

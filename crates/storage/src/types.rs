@@ -353,6 +353,74 @@ impl ChecksumType {
     }
 }
 
+/// Error returned when an invalid algorithm + checksum-type combination is
+/// requested (e.g. SHA256 + FULL_OBJECT, CRC64NVME + COMPOSITE).
+#[derive(Debug, Clone)]
+pub struct InvalidChecksumConfig {
+    pub reason: String,
+}
+
+impl std::fmt::Display for InvalidChecksumConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for InvalidChecksumConfig {}
+
+/// Validated checksum configuration for a multipart upload.
+///
+/// Encodes the S3 combination rules:
+/// - SHA1/SHA256 only support COMPOSITE
+/// - CRC64NVME only supports FULL_OBJECT
+/// - CRC32/CRC32C support both (default COMPOSITE)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MultipartChecksumConfig {
+    algorithm: ChecksumAlgorithm,
+    checksum_type: ChecksumType,
+}
+
+impl MultipartChecksumConfig {
+    /// Create a validated checksum configuration.
+    ///
+    /// If `checksum_type` is `None`, the default for the algorithm is used.
+    /// Returns an error for invalid combinations.
+    pub fn new(
+        algorithm: ChecksumAlgorithm,
+        checksum_type: Option<ChecksumType>,
+    ) -> Result<Self, InvalidChecksumConfig> {
+        let checksum_type = checksum_type.unwrap_or_else(|| ChecksumType::default_for(algorithm));
+
+        match (algorithm, checksum_type) {
+            (ChecksumAlgorithm::Sha1 | ChecksumAlgorithm::Sha256, ChecksumType::FullObject) => {
+                Err(InvalidChecksumConfig {
+                    reason: format!(
+                        "FULL_OBJECT checksum type is not supported for {}",
+                        algorithm.as_str()
+                    ),
+                })
+            }
+            (ChecksumAlgorithm::Crc64nvme, ChecksumType::Composite) => {
+                Err(InvalidChecksumConfig {
+                    reason: "COMPOSITE checksum type is not supported for CRC64NVME".to_string(),
+                })
+            }
+            _ => Ok(Self {
+                algorithm,
+                checksum_type,
+            }),
+        }
+    }
+
+    pub fn algorithm(self) -> ChecksumAlgorithm {
+        self.algorithm
+    }
+
+    pub fn checksum_type(self) -> ChecksumType {
+        self.checksum_type
+    }
+}
+
 /// A checksum with its algorithm — eliminates correlated `Option<algo>` +
 /// `Option<bytes>` pairs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -965,10 +1033,8 @@ pub struct MultipartUploadRecord {
     /// Serialized user metadata headers.
     pub metadata_blob: Vec<u8>,
     pub owner_principal: Option<String>,
-    /// Checksum algorithm requested for this upload.
-    pub checksum_algorithm: Option<ChecksumAlgorithm>,
-    /// Checksum type (COMPOSITE or FULL_OBJECT).
-    pub checksum_type: Option<ChecksumType>,
+    /// Validated checksum configuration for this upload.
+    pub checksum: Option<MultipartChecksumConfig>,
 }
 
 /// In-progress multipart part record.
@@ -1019,8 +1085,7 @@ pub struct CreateMultipartUploadReq {
     pub key: ObjectKey,
     pub metadata_blob: Vec<u8>,
     pub owner_principal: Option<String>,
-    pub checksum_algorithm: Option<ChecksumAlgorithm>,
-    pub checksum_type: Option<ChecksumType>,
+    pub checksum: Option<MultipartChecksumConfig>,
 }
 
 /// Request to list multipart uploads.

@@ -204,8 +204,16 @@ pub struct GetObjectPartResult {
 pub enum MetadataDirective<'a> {
     /// Preserve source object's metadata.
     Copy,
-    /// Replace metadata with values from request headers.
-    Replace(&'a [(&'a str, &'a str)]),
+    /// Replace metadata with an already-parsed blob and optional checksum algorithm.
+    ///
+    /// The `MetadataBlob` should already have checksum value headers stripped
+    /// (they can't be verified on CopyObject since there's no body).
+    /// If `checksum_algorithm` is provided, a fresh checksum will be computed
+    /// from the copied data.
+    Replace {
+        metadata: &'a MetadataBlob,
+        checksum_algorithm: Option<ChecksumAlgorithm>,
+    },
 }
 
 /// Parsed copy-source reference, shared by CopyObject and UploadPartCopy.
@@ -349,66 +357,13 @@ pub struct AbortMultipartUploadRequest<'a> {
     pub upload_id: &'a str,
 }
 
-/// Validated checksum configuration for a multipart upload.
-///
-/// Encodes the S3 combination rules:
-/// - SHA1/SHA256 only support COMPOSITE
-/// - CRC64NVME only supports FULL_OBJECT
-/// - CRC32/CRC32C support both (default COMPOSITE)
-#[derive(Debug, Clone, Copy)]
-pub struct MultipartChecksumConfig {
-    algorithm: ChecksumAlgorithm,
-    checksum_type: ChecksumType,
-}
-
-impl MultipartChecksumConfig {
-    /// Create a validated checksum configuration.
-    ///
-    /// If `checksum_type` is `None`, the default for the algorithm is used.
-    /// Returns an error for invalid combinations (SHA + FULL_OBJECT, CRC64NVME + COMPOSITE).
-    pub fn new(
-        algorithm: ChecksumAlgorithm,
-        checksum_type: Option<ChecksumType>,
-    ) -> Result<Self, ServerError> {
-        let checksum_type = checksum_type.unwrap_or_else(|| ChecksumType::default_for(algorithm));
-
-        match (algorithm, checksum_type) {
-            (ChecksumAlgorithm::Sha1 | ChecksumAlgorithm::Sha256, ChecksumType::FullObject) => {
-                Err(ServerError::InvalidArgument {
-                    reason: format!(
-                        "FULL_OBJECT checksum type is not supported for {}",
-                        algorithm.as_str()
-                    ),
-                })
-            }
-            (ChecksumAlgorithm::Crc64nvme, ChecksumType::Composite) => {
-                Err(ServerError::InvalidArgument {
-                    reason: "COMPOSITE checksum type is not supported for CRC64NVME".to_string(),
-                })
-            }
-            _ => Ok(Self {
-                algorithm,
-                checksum_type,
-            }),
-        }
-    }
-
-    pub fn algorithm(self) -> ChecksumAlgorithm {
-        self.algorithm
-    }
-
-    pub fn checksum_type(self) -> ChecksumType {
-        self.checksum_type
-    }
-}
-
 /// Request for a CreateMultipartUpload operation.
 #[derive(Debug)]
 pub struct CreateMultipartUploadRequest<'a> {
     pub bucket: &'a str,
     pub key: &'a str,
     pub metadata: &'a MetadataBlob,
-    pub checksum: Option<MultipartChecksumConfig>,
+    pub checksum: Option<storage::MultipartChecksumConfig>,
 }
 
 /// Request for an UploadPart operation.
@@ -1396,7 +1351,7 @@ impl Coordinator {
 
         Ok(BeginStreamPartResult {
             session_id,
-            checksum_algorithm: upload.checksum_algorithm,
+            checksum_algorithm: upload.checksum.map(|c| c.algorithm()),
         })
     }
 
@@ -1714,7 +1669,8 @@ impl Coordinator {
 
         // Resolve checksum algorithm: upload-level takes precedence.
         let claimed_algo = claimed_checksum.map(|c| c.algorithm());
-        let effective_algo = match (upload.checksum_algorithm, claimed_algo) {
+        let upload_checksum_algo = upload.checksum.map(|c| c.algorithm());
+        let effective_algo = match (upload_checksum_algo, claimed_algo) {
             (Some(upload_algo), Some(part_algo)) if upload_algo != part_algo => {
                 return Err(ServerError::InvalidRequest {
                     reason: format!(
@@ -2129,39 +2085,17 @@ impl Coordinator {
         // Phase 2: Write destination object
         let metadata_blob = match directive {
             MetadataDirective::Copy => src_metadata,
-            MetadataDirective::Replace(new_headers) => {
-                let mut blob = MetadataBlob::from_headers(new_headers)?;
+            MetadataDirective::Replace {
+                metadata: new_metadata,
+                checksum_algorithm,
+            } => {
+                let mut blob = (*new_metadata).clone();
 
-                // Strip any client-supplied checksum VALUE headers — CopyObject
-                // has no body so these can't be verified and would persist
-                // unverified values.  If x-amz-checksum-algorithm is present we
-                // recompute the checksum from the copied data instead.
-                let checksum_value_headers: &[&str] = &[
-                    "x-amz-checksum-crc32",
-                    "x-amz-checksum-crc32c",
-                    "x-amz-checksum-crc64nvme",
-                    "x-amz-checksum-sha256",
-                    "x-amz-checksum-sha1",
-                ];
-                blob.entries
-                    .retain(|e| !checksum_value_headers.contains(&e.key.as_str()));
-
-                // If x-amz-checksum-algorithm is declared, compute a fresh
-                // checksum from the copied data and store it in the metadata.
-                if let Some(algo_val) = new_headers.iter().find_map(|(k, v)| {
-                    if k.eq_ignore_ascii_case("x-amz-checksum-algorithm") {
-                        Some(*v)
-                    } else {
-                        None
-                    }
-                }) {
-                    let algo = ChecksumAlgorithm::parse(algo_val).ok_or_else(|| {
-                        ServerError::InvalidArgument {
-                            reason: format!("unsupported checksum algorithm: {algo_val}"),
-                        }
-                    })?;
+                // If a checksum algorithm is specified, compute a fresh checksum
+                // from the copied data and store it in the metadata.
+                if let Some(algo) = checksum_algorithm {
                     use base64::Engine;
-                    let cksum = compute_checksum(algo, &user_data);
+                    let cksum = compute_checksum(*algo, &user_data);
                     let b64 = base64::engine::general_purpose::STANDARD.encode(&cksum);
                     blob.entries.push(crate::metadata_blob::MetadataEntry {
                         key: algo.header_name().to_string(),
@@ -4203,8 +4137,6 @@ impl Coordinator {
         let bucket = req.bucket;
         let key = req.key;
         let metadata = req.metadata;
-        let checksum_algorithm = req.checksum.map(|c| c.algorithm());
-        let checksum_type = req.checksum.map(|c| c.checksum_type());
         let _bucket_guard = self.storage_node.lock_bucket(bucket);
         let bucket_info = self.head_bucket(bucket)?;
 
@@ -4233,8 +4165,7 @@ impl Coordinator {
             key: ObjectKey::from(key),
             metadata_blob,
             owner_principal: Some(bucket_info.owner_principal),
-            checksum_algorithm,
-            checksum_type,
+            checksum: req.checksum,
         })?;
 
         Ok(CreateMultipartUploadResult { upload_id })
@@ -4430,7 +4361,7 @@ impl Coordinator {
                     upload_id: upload_id.to_string(),
                 });
             }
-            let upload_algo = upload.checksum_algorithm;
+            let upload_algo = upload.checksum.map(|c| c.algorithm());
 
             // Determine next generation for this part number.
             let generation = match meta_pg.get_multipart_part(upload_id, part_number) {
@@ -4476,7 +4407,7 @@ impl Coordinator {
                     upload_id: upload_id.to_string(),
                 });
             }
-            let upload_algo = upload.checksum_algorithm;
+            let upload_algo = upload.checksum.map(|c| c.algorithm());
 
             let generation = match meta_pg.get_multipart_part(upload_id, part_number) {
                 Ok(existing) => existing.generation + 1,
@@ -4707,11 +4638,8 @@ impl Coordinator {
         }
 
         // Resolve checksum configuration early so per-part validation can use it.
-        let checksum_algo = upload.checksum_algorithm;
-        let checksum_type = match (checksum_algo, upload.checksum_type) {
-            (Some(algo), None) => Some(ChecksumType::default_for(algo)),
-            (_, ct) => ct,
-        };
+        let checksum_algo = upload.checksum.map(|c| c.algorithm());
+        let checksum_type = upload.checksum.map(|c| c.checksum_type());
 
         // 4. Validate all parts exist and ETags match.
         let mut part_records: Vec<MultipartPartRecord> = Vec::with_capacity(parts.len());
@@ -5162,8 +5090,8 @@ impl Coordinator {
             parts,
             is_truncated: resp.is_truncated,
             next_part_number_marker: resp.next_part_number_marker,
-            checksum_algorithm: upload.checksum_algorithm,
-            checksum_type: upload.checksum_type,
+            checksum_algorithm: upload.checksum.map(|c| c.algorithm()),
+            checksum_type: upload.checksum.map(|c| c.checksum_type()),
         })
     }
 
@@ -6966,6 +6894,7 @@ mod tests {
             .unwrap();
 
         let new_headers = [("Content-Type", "text/html"), ("X-Amz-Meta-Version", "2")];
+        let new_metadata = MetadataBlob::from_headers(&new_headers).unwrap();
         coord
             .copy_object(&CopyObjectRequest {
                 source: CopySource {
@@ -6977,7 +6906,7 @@ mod tests {
                 dst_bucket: "bucket",
                 dst_key: "dst",
                 dst_condition: NO_WRITE,
-                directive: MetadataDirective::Replace(&new_headers),
+                directive: MetadataDirective::Replace { metadata: &new_metadata, checksum_algorithm: None },
             })
             .unwrap();
 
@@ -7000,7 +6929,7 @@ mod tests {
             .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", metadata: &MetadataBlob::from_headers(&headers).unwrap(), cond: NO_WRITE })
             .unwrap();
 
-        let new_headers = [("Content-Type", "application/json")];
+        let new_metadata = MetadataBlob::from_headers(&[("Content-Type", "application/json")]).unwrap();
         coord
             .copy_object(&CopyObjectRequest {
                 source: CopySource {
@@ -7012,7 +6941,7 @@ mod tests {
                 dst_bucket: "bucket",
                 dst_key: "key",
                 dst_condition: NO_WRITE,
-                directive: MetadataDirective::Replace(&new_headers),
+                directive: MetadataDirective::Replace { metadata: &new_metadata, checksum_algorithm: None },
             })
             .unwrap();
 
@@ -7033,11 +6962,9 @@ mod tests {
             .put_object(&PutObjectRequest { bucket: "bucket", key: "src", data: b"hello", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
-        // Client sends a bogus checksum value header with REPLACE.
-        let new_headers = [
-            ("Content-Type", "text/plain"),
-            ("x-amz-checksum-crc32c", "AAAA=="),
-        ];
+        // Metadata blob with only content-type (checksum value headers should
+        // be stripped at the HTTP boundary before reaching the coordinator).
+        let new_metadata = MetadataBlob::from_headers(&[("Content-Type", "text/plain")]).unwrap();
         coord
             .copy_object(&CopyObjectRequest {
                 source: CopySource {
@@ -7049,13 +6976,13 @@ mod tests {
                 dst_bucket: "bucket",
                 dst_key: "dst",
                 dst_condition: NO_WRITE,
-                directive: MetadataDirective::Replace(&new_headers),
+                directive: MetadataDirective::Replace { metadata: &new_metadata, checksum_algorithm: None },
             })
             .unwrap();
 
         let obj = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "dst", version_id: None, cond: NO_READ }).unwrap();
         assert_eq!(obj.data, b"hello");
-        // The fake checksum must NOT be persisted.
+        // No checksum should be present since none was requested.
         assert_eq!(obj.metadata.get("x-amz-checksum-crc32c"), None);
     }
 
@@ -7073,10 +7000,7 @@ mod tests {
             .put_object(&PutObjectRequest { bucket: "bucket", key: "src", data, metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
-        let new_headers = [
-            ("Content-Type", "text/plain"),
-            ("x-amz-checksum-algorithm", "CRC32C"),
-        ];
+        let new_metadata = MetadataBlob::from_headers(&[("Content-Type", "text/plain")]).unwrap();
         coord
             .copy_object(&CopyObjectRequest {
                 source: CopySource {
@@ -7088,7 +7012,10 @@ mod tests {
                 dst_bucket: "bucket",
                 dst_key: "dst",
                 dst_condition: NO_WRITE,
-                directive: MetadataDirective::Replace(&new_headers),
+                directive: MetadataDirective::Replace {
+                    metadata: &new_metadata,
+                    checksum_algorithm: Some(ChecksumAlgorithm::Crc32c),
+                },
             })
             .unwrap();
 
@@ -7105,34 +7032,13 @@ mod tests {
     }
 
     #[test]
-    fn copy_object_replace_rejects_invalid_checksum_algorithm() {
-        let tmp = test_util::tempdir();
-        let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
-
-        coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "src", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
-            .unwrap();
-
-        let new_headers = [("x-amz-checksum-algorithm", "BOGUS")];
-        let err = coord
-            .copy_object(&CopyObjectRequest {
-                source: CopySource {
-                    bucket: "bucket",
-                    key: "src",
-                    version_id: None,
-                    condition: NO_READ,
-                },
-                dst_bucket: "bucket",
-                dst_key: "dst",
-                dst_condition: NO_WRITE,
-                directive: MetadataDirective::Replace(&new_headers),
-            })
-            .unwrap_err();
-        assert!(
-            matches!(err, ServerError::InvalidArgument { .. }),
-            "expected InvalidArgument, got {err:?}"
-        );
+    fn checksum_algorithm_parse_rejects_bogus() {
+        // Invalid checksum algorithm strings are rejected at the parse boundary
+        // (HTTP layer), so they can never reach the coordinator as typed values.
+        assert!(ChecksumAlgorithm::parse("BOGUS").is_none());
+        assert!(ChecksumAlgorithm::parse("").is_none());
+        // Valid ones are accepted.
+        assert_eq!(ChecksumAlgorithm::parse("CRC32C"), Some(ChecksumAlgorithm::Crc32c));
     }
 
     #[test]
@@ -9357,7 +9263,7 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let create = coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket, key, metadata: &metadata, checksum: Some(MultipartChecksumConfig::new(algo, ctype).unwrap()) })
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket, key, metadata: &metadata, checksum: Some(storage::MultipartChecksumConfig::new(algo, ctype).unwrap()) })
             .unwrap();
         let mut complete_parts = Vec::new();
         for (i, data) in part_data.iter().enumerate() {

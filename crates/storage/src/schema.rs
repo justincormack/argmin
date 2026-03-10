@@ -249,5 +249,39 @@ fn migrate_checksum_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
             Err(e) => return Err(e),
         }
     }
+
+    // Enforce valid checksum algorithm + type combinations via trigger.
+    // SQLite cannot add CHECK constraints to existing tables, so we use
+    // BEFORE INSERT/UPDATE triggers instead.
+    //
+    // Rules:
+    //   - SHA1 (2) / SHA256 (3) + FULL_OBJECT (1) → invalid
+    //   - CRC64NVME (4) + COMPOSITE (0) → invalid
+    //   - checksum_type without checksum_algorithm → invalid
+    conn.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS check_multipart_checksum_insert
+         BEFORE INSERT ON multipart_uploads
+         WHEN NEW.checksum_algorithm IS NOT NULL OR NEW.checksum_type IS NOT NULL
+         BEGIN
+           SELECT RAISE(ABORT, 'checksum_type without checksum_algorithm')
+             WHERE NEW.checksum_type IS NOT NULL AND NEW.checksum_algorithm IS NULL;
+           SELECT RAISE(ABORT, 'SHA + FULL_OBJECT is invalid')
+             WHERE NEW.checksum_algorithm IN (2, 3) AND NEW.checksum_type = 1;
+           SELECT RAISE(ABORT, 'CRC64NVME + COMPOSITE is invalid')
+             WHERE NEW.checksum_algorithm = 4 AND NEW.checksum_type = 0;
+         END;
+         CREATE TRIGGER IF NOT EXISTS check_multipart_checksum_update
+         BEFORE UPDATE ON multipart_uploads
+         WHEN NEW.checksum_algorithm IS NOT NULL OR NEW.checksum_type IS NOT NULL
+         BEGIN
+           SELECT RAISE(ABORT, 'checksum_type without checksum_algorithm')
+             WHERE NEW.checksum_type IS NOT NULL AND NEW.checksum_algorithm IS NULL;
+           SELECT RAISE(ABORT, 'SHA + FULL_OBJECT is invalid')
+             WHERE NEW.checksum_algorithm IN (2, 3) AND NEW.checksum_type = 1;
+           SELECT RAISE(ABORT, 'CRC64NVME + COMPOSITE is invalid')
+             WHERE NEW.checksum_algorithm = 4 AND NEW.checksum_type = 0;
+         END;"
+    )?;
+
     Ok(())
 }

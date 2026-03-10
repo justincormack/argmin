@@ -575,8 +575,7 @@ fn mpu_create_and_get_upload() {
             key: "k".into(),
             metadata_blob: vec![1, 2, 3],
             owner_principal: Some("alice".to_string()),
-            checksum_algorithm: None,
-            checksum_type: None,
+            checksum: None,
         })
         .unwrap();
 
@@ -600,14 +599,13 @@ fn mpu_create_upload_with_checksum_fields() {
             key: "k".into(),
             metadata_blob: vec![],
             owner_principal: None,
-            checksum_algorithm: Some(ChecksumAlgorithm::Sha256),
-            checksum_type: Some(ChecksumType::Composite),
+            checksum: Some(MultipartChecksumConfig::new(ChecksumAlgorithm::Sha256, Some(ChecksumType::Composite)).unwrap()),
         })
         .unwrap();
 
     let rec = store.get_multipart_upload("uid-cksum").unwrap();
-    assert_eq!(rec.checksum_algorithm, Some(ChecksumAlgorithm::Sha256));
-    assert_eq!(rec.checksum_type, Some(ChecksumType::Composite));
+    assert_eq!(rec.checksum.map(|c| c.algorithm()), Some(ChecksumAlgorithm::Sha256));
+    assert_eq!(rec.checksum.map(|c| c.checksum_type()), Some(ChecksumType::Composite));
 
     // None case round-trips as well
     store
@@ -617,13 +615,11 @@ fn mpu_create_upload_with_checksum_fields() {
             key: "k2".into(),
             metadata_blob: vec![],
             owner_principal: None,
-            checksum_algorithm: None,
-            checksum_type: None,
+            checksum: None,
         })
         .unwrap();
     let rec2 = store.get_multipart_upload("uid-no-cksum").unwrap();
-    assert_eq!(rec2.checksum_algorithm, None);
-    assert_eq!(rec2.checksum_type, None);
+    assert_eq!(rec2.checksum, None);
 }
 
 #[test]
@@ -636,8 +632,7 @@ fn mpu_part_checksum_round_trip() {
             key: "k".into(),
             metadata_blob: vec![],
             owner_principal: None,
-            checksum_algorithm: Some(ChecksumAlgorithm::Crc32),
-            checksum_type: Some(ChecksumType::FullObject),
+            checksum: Some(MultipartChecksumConfig::new(ChecksumAlgorithm::Crc32, Some(ChecksumType::FullObject)).unwrap()),
         })
         .unwrap();
 
@@ -744,8 +739,7 @@ fn mpu_complete_multipart_commit_preserves_checksums() {
             key: "k".into(),
             metadata_blob: vec![],
             owner_principal: None,
-            checksum_algorithm: Some(ChecksumAlgorithm::Sha256),
-            checksum_type: Some(ChecksumType::Composite),
+            checksum: Some(MultipartChecksumConfig::new(ChecksumAlgorithm::Sha256, Some(ChecksumType::Composite)).unwrap()),
         })
         .unwrap();
 
@@ -823,8 +817,7 @@ fn mpu_set_upload_state_transition() {
             key: "k".into(),
             metadata_blob: vec![],
             owner_principal: None,
-            checksum_algorithm: None,
-            checksum_type: None,
+            checksum: None,
         })
         .unwrap();
 
@@ -867,8 +860,7 @@ fn mpu_delete_upload_cascades_parts() {
             key: "k".into(),
             metadata_blob: vec![],
             owner_principal: None,
-            checksum_algorithm: None,
-            checksum_type: None,
+            checksum: None,
         })
         .unwrap();
 
@@ -919,8 +911,7 @@ fn mpu_upsert_part_and_get() {
             key: "k".into(),
             metadata_blob: vec![],
             owner_principal: None,
-            checksum_algorithm: None,
-            checksum_type: None,
+            checksum: None,
         })
         .unwrap();
 
@@ -985,8 +976,7 @@ fn mpu_list_parts_pagination() {
             key: "k".into(),
             metadata_blob: vec![],
             owner_principal: None,
-            checksum_algorithm: None,
-            checksum_type: None,
+            checksum: None,
         })
         .unwrap();
 
@@ -1063,8 +1053,7 @@ fn mpu_list_uploads_pagination() {
                 key: key.into(),
                 metadata_blob: vec![],
                 owner_principal: None,
-                checksum_algorithm: None,
-                checksum_type: None,
+                checksum: None,
             })
             .unwrap();
     }
@@ -1115,8 +1104,7 @@ fn mpu_list_uploads_with_prefix() {
                 key: key.into(),
                 metadata_blob: vec![],
                 owner_principal: None,
-                checksum_algorithm: None,
-                checksum_type: None,
+                checksum: None,
             })
             .unwrap();
     }
@@ -1147,8 +1135,7 @@ fn mpu_list_uploads_same_key_multiple_upload_ids() {
                 key: "same-key".into(),
                 metadata_blob: vec![],
                 owner_principal: None,
-                checksum_algorithm: None,
-                checksum_type: None,
+                checksum: None,
             })
             .unwrap();
     }
@@ -1197,8 +1184,7 @@ fn mpu_list_uploads_stale_marker_returns_remaining() {
                 key: "key".into(),
                 metadata_blob: vec![],
                 owner_principal: None,
-                checksum_algorithm: None,
-                checksum_type: None,
+                checksum: None,
             })
             .unwrap();
     }
@@ -1237,8 +1223,7 @@ fn mpu_corrupted_part_okh_returns_error() {
             key: "k".into(),
             metadata_blob: vec![],
             owner_principal: None,
-            checksum_algorithm: None,
-            checksum_type: None,
+            checksum: None,
         })
         .unwrap();
 
@@ -1329,8 +1314,7 @@ fn mpu_get_missing_part_returns_part_not_found() {
             key: "k".into(),
             metadata_blob: vec![],
             owner_principal: None,
-            checksum_algorithm: None,
-            checksum_type: None,
+            checksum: None,
         })
         .unwrap();
 
@@ -1357,8 +1341,7 @@ fn mpu_set_upload_state_rejects_in_progress_target() {
             key: "k".into(),
             metadata_blob: vec![],
             owner_principal: None,
-            checksum_algorithm: None,
-            checksum_type: None,
+            checksum: None,
         })
         .unwrap();
 
@@ -1589,8 +1572,7 @@ fn create_upload(store: &dyn PgMetadataStore, upload_id: &str) {
             key: "k".into(),
             metadata_blob: vec![],
             owner_principal: None,
-            checksum_algorithm: None,
-            checksum_type: None,
+            checksum: None,
         })
         .unwrap();
 }
@@ -2855,8 +2837,7 @@ fn commit_stream_part_replaces_prior_chunks_on_reupload() {
             key: "k".into(),
             metadata_blob: vec![],
             owner_principal: None,
-            checksum_algorithm: None,
-            checksum_type: None,
+            checksum: None,
         })
         .unwrap();
 
@@ -3046,8 +3027,7 @@ fn commit_stream_part_rejects_wrong_upload_id() {
             key: "k".into(),
             metadata_blob: vec![],
             owner_principal: None,
-            checksum_algorithm: None,
-            checksum_type: None,
+            checksum: None,
         })
         .unwrap();
 
@@ -3104,8 +3084,7 @@ fn commit_stream_part_zero_chunks_clears_prior() {
             key: "k".into(),
             metadata_blob: vec![],
             owner_principal: None,
-            checksum_algorithm: None,
-            checksum_type: None,
+            checksum: None,
         })
         .unwrap();
 
@@ -3281,8 +3260,7 @@ fn commit_stream_part_rejects_mismatched_chunk_part_number() {
             key: "k".into(),
             metadata_blob: vec![],
             owner_principal: None,
-            checksum_algorithm: None,
-            checksum_type: None,
+            checksum: None,
         })
         .unwrap();
 
@@ -3352,8 +3330,7 @@ fn commit_stream_part_rejects_non_staging_chunk_version_id() {
             key: "k".into(),
             metadata_blob: vec![],
             owner_principal: None,
-            checksum_algorithm: None,
-            checksum_type: None,
+            checksum: None,
         })
         .unwrap();
 

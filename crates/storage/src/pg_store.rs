@@ -1487,8 +1487,8 @@ impl PgMetadataStore for PgStore {
 
     fn create_multipart_upload(&self, req: &CreateMultipartUploadReq) -> Result<(), MetadataError> {
         let now = PgStore::now_millis();
-        let algo = req.checksum_algorithm.map(|a| a as u8);
-        let ctype = req.checksum_type.map(|t| t as u8);
+        let algo = req.checksum.map(|c| c.algorithm() as u8);
+        let ctype = req.checksum.map(|c| c.checksum_type() as u8);
         self.conn
             .execute(
                 "INSERT INTO multipart_uploads \
@@ -1527,6 +1527,33 @@ impl PgMetadataStore for PgStore {
                     let state_raw = row.get::<_, u8>(4)?;
                     let algo_raw: Option<u8> = row.get(7)?;
                     let ctype_raw: Option<u8> = row.get(8)?;
+                    let checksum = if let Some(algo_val) = algo_raw {
+                        let algo = ChecksumAlgorithm::from_u8(algo_val).ok_or_else(|| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                7,
+                                rusqlite::types::Type::Integer,
+                                Box::from(format!("invalid checksum algorithm: {algo_val}")),
+                            )
+                        })?;
+                        let ctype = ctype_raw.map(|v| {
+                            ChecksumType::from_u8(v).ok_or_else(|| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    8,
+                                    rusqlite::types::Type::Integer,
+                                    Box::from(format!("invalid checksum type: {v}")),
+                                )
+                            })
+                        }).transpose()?;
+                        Some(MultipartChecksumConfig::new(algo, ctype).map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                7,
+                                rusqlite::types::Type::Integer,
+                                Box::from(e.reason),
+                            )
+                        })?)
+                    } else {
+                        None
+                    };
                     Ok(MultipartUploadRecord {
                         upload_id: row.get(0)?,
                         bucket: row.get(1)?,
@@ -1541,28 +1568,7 @@ impl PgMetadataStore for PgStore {
                         })?,
                         metadata_blob: row.get(5)?,
                         owner_principal: row.get(6)?,
-                        checksum_algorithm: algo_raw
-                            .map(|v| {
-                                ChecksumAlgorithm::from_u8(v).ok_or_else(|| {
-                                    rusqlite::Error::FromSqlConversionFailure(
-                                        7,
-                                        rusqlite::types::Type::Integer,
-                                        Box::from(format!("invalid checksum algorithm: {v}")),
-                                    )
-                                })
-                            })
-                            .transpose()?,
-                        checksum_type: ctype_raw
-                            .map(|v| {
-                                ChecksumType::from_u8(v).ok_or_else(|| {
-                                    rusqlite::Error::FromSqlConversionFailure(
-                                        8,
-                                        rusqlite::types::Type::Integer,
-                                        Box::from(format!("invalid checksum type: {v}")),
-                                    )
-                                })
-                            })
-                            .transpose()?,
+                        checksum,
                     })
                 },
             )
@@ -1732,6 +1738,33 @@ impl PgMetadataStore for PgStore {
                 let state_raw = row.get::<_, u8>(4)?;
                 let algo_raw: Option<u8> = row.get(7)?;
                 let ctype_raw: Option<u8> = row.get(8)?;
+                let checksum = if let Some(algo_val) = algo_raw {
+                    let algo = ChecksumAlgorithm::from_u8(algo_val).ok_or_else(|| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            7,
+                            rusqlite::types::Type::Integer,
+                            Box::from(format!("invalid checksum algorithm: {algo_val}")),
+                        )
+                    })?;
+                    let ctype = ctype_raw.map(|v| {
+                        ChecksumType::from_u8(v).ok_or_else(|| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                8,
+                                rusqlite::types::Type::Integer,
+                                Box::from(format!("invalid checksum type: {v}")),
+                            )
+                        })
+                    }).transpose()?;
+                    Some(MultipartChecksumConfig::new(algo, ctype).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            7,
+                            rusqlite::types::Type::Integer,
+                            Box::from(e.reason),
+                        )
+                    })?)
+                } else {
+                    None
+                };
                 Ok(MultipartUploadRecord {
                     upload_id: row.get(0)?,
                     bucket: row.get(1)?,
@@ -1746,28 +1779,7 @@ impl PgMetadataStore for PgStore {
                     })?,
                     metadata_blob: row.get(5)?,
                     owner_principal: row.get(6)?,
-                    checksum_algorithm: algo_raw
-                        .map(|v| {
-                            ChecksumAlgorithm::from_u8(v).ok_or_else(|| {
-                                rusqlite::Error::FromSqlConversionFailure(
-                                    7,
-                                    rusqlite::types::Type::Integer,
-                                    Box::from(format!("invalid checksum algorithm: {v}")),
-                                )
-                            })
-                        })
-                        .transpose()?,
-                    checksum_type: ctype_raw
-                        .map(|v| {
-                            ChecksumType::from_u8(v).ok_or_else(|| {
-                                rusqlite::Error::FromSqlConversionFailure(
-                                    8,
-                                    rusqlite::types::Type::Integer,
-                                    Box::from(format!("invalid checksum type: {v}")),
-                                )
-                            })
-                        })
-                        .transpose()?,
+                    checksum,
                 })
             })
             .map_err(|e| MetadataError::Db {

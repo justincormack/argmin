@@ -261,6 +261,12 @@ impl From<MetadataError> for ServerError {
     }
 }
 
+impl From<storage::InvalidChecksumConfig> for ServerError {
+    fn from(e: storage::InvalidChecksumConfig) -> Self {
+        ServerError::InvalidArgument { reason: e.reason }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
