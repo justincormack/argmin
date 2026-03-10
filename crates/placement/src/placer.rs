@@ -429,4 +429,127 @@ mod unit_tests {
             }
         );
     }
+
+    // ── Debug implementation ─────────────────────────────────────────────────
+
+    #[test]
+    fn placer_debug_impl() {
+        let map = build_cluster(6, 3, 1.0);
+        let placer = Placer::new(
+            PlacementConfig::new(6).unwrap(),
+            &map,
+            PlacementConstraint::none(),
+        )
+        .unwrap();
+        let debug_str = format!("{:?}", placer);
+        assert!(debug_str.contains("Placer"));
+        assert!(debug_str.contains("node_count"));
+    }
+
+    // ── Zero weight nodes during place() ─────────────────────────────────────
+
+    #[test]
+    fn place_skips_zero_weight_nodes() {
+        // Create a cluster where some nodes have zero weight.
+        // The placer should skip zero-weight nodes during the place() loop.
+        let nodes = vec![
+            node(0, 0, 1.0),
+            node(1, 0, 0.0), // zero weight - should be skipped
+            node(2, 1, 1.0),
+            node(3, 1, 0.0), // zero weight - should be skipped
+            node(4, 2, 1.0),
+            node(5, 2, 1.0),
+        ];
+        let map = ClusterMap::new(&nodes).unwrap();
+        let placer = Placer::new(
+            PlacementConfig::new(4).unwrap(),
+            &map,
+            PlacementConstraint::none(),
+        )
+        .unwrap();
+        let mut out = [NodeId::new(0); 4];
+        placer.place(b"key", &mut out).unwrap();
+        // Verify that zero-weight nodes (1 and 3) were not selected
+        for &node_id in &out {
+            assert_ne!(node_id, NodeId::new(1), "zero-weight node 1 should not be placed");
+            assert_ne!(node_id, NodeId::new(3), "zero-weight node 3 should not be placed");
+        }
+    }
+
+    // ── Constrained admission with no same-group candidate ───────────────────
+
+    #[test]
+    fn constrained_admission_no_same_group_candidate() {
+        // Test the case where Admission::Constrained is returned but there's
+        // no same-group candidate in the buffer to replace.
+        //
+        // This happens when rack_cap is 0: the rack is immediately at capacity,
+        // so admit returns Constrained, but there's no same-group candidate to
+        // replace (find_worst_in_group returns None).
+        let nodes = vec![
+            node(0, 0, 1.0),
+            node(1, 1, 1.0),
+            node(2, 2, 1.0),
+        ];
+        let map = ClusterMap::new(&nodes).unwrap();
+        // rack_cap(0) means no nodes from any rack can be selected via Global admission
+        // When a node arrives, same_group_count=0 >= max=0, so Constrained is returned,
+        // but find_worst_in_group returns None since no rack is represented yet.
+        let constraint = PlacementConstraint::rack_cap(0);
+        let placer = Placer::new(
+            PlacementConfig::new(2).unwrap(),
+            &map,
+            constraint,
+        )
+        .unwrap();
+        let mut out = [NodeId::new(0); 2];
+        // All nodes return Constrained with no same-group candidate to replace,
+        // so no nodes can be placed
+        let result = placer.place(b"key", &mut out);
+        assert!(matches!(result, Err(PlacementError::ConstraintUnsatisfiable { .. })));
+    }
+
+    // ── Admission::Excluded ──────────────────────────────────────────────────
+
+    #[test]
+    fn excluded_nodes_are_skipped() {
+        // Test that nodes returning Admission::Excluded are skipped during placement.
+        use crate::constraint::PlacementConstraint;
+        use std::sync::Arc;
+
+        // Create a custom constraint that excludes node 1 and 3
+        let constraint = PlacementConstraint {
+            group_key: Arc::new(|_| 0),
+            admit: Arc::new(|_, node| {
+                if node.id == NodeId::new(1) || node.id == NodeId::new(3) {
+                    Admission::Excluded
+                } else {
+                    Admission::Global
+                }
+            }),
+        };
+
+        let nodes = vec![
+            node(0, 0, 1.0),
+            node(1, 0, 1.0), // Will be excluded
+            node(2, 1, 1.0),
+            node(3, 1, 1.0), // Will be excluded
+            node(4, 2, 1.0),
+            node(5, 2, 1.0),
+        ];
+        let map = ClusterMap::new(&nodes).unwrap();
+        let placer = Placer::new(
+            PlacementConfig::new(4).unwrap(),
+            &map,
+            constraint,
+        )
+        .unwrap();
+        let mut out = [NodeId::new(0); 4];
+        placer.place(b"key", &mut out).unwrap();
+        // Verify excluded nodes were not selected
+        for &node_id in &out {
+            assert_ne!(node_id, NodeId::new(1), "excluded node 1 should not be placed");
+            assert_ne!(node_id, NodeId::new(3), "excluded node 3 should not be placed");
+        }
+    }
 }
