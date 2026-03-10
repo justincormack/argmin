@@ -43,10 +43,10 @@ async fn start_server(
     let storage_node =
         Arc::new(storage::SharedStorageNode::open(&data_path, &pg_ids).expect("open storage"));
 
-    let frontends: Vec<server::http::HttpFrontend> = (0..pool_size)
+    let frontends: Vec<server_http::http::HttpFrontend> = (0..pool_size)
         .map(|_| {
             let ec_config = ec::EcConfig::new(4, 2).unwrap();
-            let coordinator = server::coordinator::Coordinator::new(
+            let coordinator = server_http::coordinator::Coordinator::new(
                 Arc::clone(&storage_node),
                 ec_config,
                 "us-east-1".to_string(),
@@ -59,21 +59,21 @@ async fn start_server(
                 auth::SecretKey::new(s3_tests::server::TEST_SECRET_KEY.to_string()),
             );
 
-            server::http::HttpFrontend {
+            server_http::http::HttpFrontend {
                 coordinator,
                 credentials,
             }
         })
         .collect();
 
-    let config = server::http::serve::ServeConfig {
+    let config = server_http::http::serve::ServeConfig {
         // Use a short request wait timeout so the SlowDown test completes
         // in ~100ms instead of the production default (5s).
         request_wait_timeout: Duration::from_millis(100),
-        ..server::http::serve::ServeConfig::default()
+        ..server_http::http::serve::ServeConfig::default()
     };
 
-    let handle = tokio::spawn(server::http::serve::serve(
+    let handle = tokio::spawn(server_http::http::serve::serve(
         listener,
         frontends,
         max_connections,

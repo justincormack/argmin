@@ -55,10 +55,10 @@ impl TestServer {
             storage::SharedStorageNode::open(&data_path, &pg_ids).expect("open storage node"),
         );
 
-        let frontends: Vec<server::http::HttpFrontend> = (0..POOL_SIZE)
+        let frontends: Vec<server_http::http::HttpFrontend> = (0..POOL_SIZE)
             .map(|_| {
                 let ec_config = ec::EcConfig::new(4, 2).expect("EC config");
-                let coordinator = server::coordinator::Coordinator::new(
+                let coordinator = server_http::coordinator::Coordinator::new(
                     Arc::clone(&storage_node),
                     ec_config,
                     TEST_REGION.to_string(),
@@ -75,7 +75,7 @@ impl TestServer {
                     auth::SecretKey::new(ALT_SECRET_KEY.to_string()),
                 );
 
-                server::http::HttpFrontend {
+                server_http::http::HttpFrontend {
                     coordinator,
                     credentials,
                 }
@@ -83,11 +83,11 @@ impl TestServer {
             .collect();
 
         // Spawn the server as a background task
-        let server_task = tokio::spawn(server::http::serve::serve(
+        let server_task = tokio::spawn(server_http::http::serve::serve(
             listener,
             frontends,
             64,
-            server::http::serve::ServeConfig::default(),
+            server_http::http::serve::ServeConfig::default(),
         ));
 
         TestServer {

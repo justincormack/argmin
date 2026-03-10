@@ -6,9 +6,9 @@ use ec::EcConfig;
 use storage::SharedStorageNode;
 use tokio::net::TcpListener;
 
-use server::config::ServerConfig;
-use server::coordinator::Coordinator;
-use server::http::HttpFrontend;
+use server_http::config::ServerConfig;
+use server_http::coordinator::Coordinator;
+use server_http::http::HttpFrontend;
 
 #[tokio::main]
 async fn main() {
@@ -89,11 +89,11 @@ async fn main() {
         config.region
     );
 
-    server::http::serve::serve(
+    server_http::http::serve::serve(
         listener,
         frontends,
         config.max_connections,
-        server::http::serve::ServeConfig::default(),
+        server_http::http::serve::ServeConfig::default(),
     )
     .await;
 }
