@@ -14,7 +14,8 @@ use auth::{authenticate_request, AuthContext, AuthMode, CredentialStore};
 use bytes::Bytes;
 use http_body_util::Full;
 
-use crate::authz::can_write_bucket;
+use crate::coordinator::BeginStreamPartRequest;
+use crate::coordinator::BeginStreamPutRequest;
 use crate::coordinator::ChecksumClaim;
 use crate::coordinator::Coordinator;
 use crate::coordinator::CopyObjectRequest;
@@ -273,8 +274,13 @@ impl HttpFrontend {
                 Ok(S3Response::create_bucket(&bucket))
             }
             S3Operation::DeleteBucket { bucket } => {
-                self.authorize_bucket_write(auth, &bucket)?;
-                self.coordinator.delete_bucket(&bucket)?;
+                let requester =
+                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                self.coordinator
+                    .delete_bucket(&crate::coordinator::DeleteBucketRequest {
+                        name: &bucket,
+                        requester,
+                    })?;
                 Ok(S3Response::delete_bucket())
             }
             S3Operation::HeadBucket { bucket } => {
@@ -1002,7 +1008,6 @@ impl HttpFrontend {
                 Ok(S3Response::put_bucket_acl())
             }
             S3Operation::CreateMultipartUpload { bucket, key } => {
-                self.authorize_bucket_write(auth, &bucket)?;
                 let header_pairs: Vec<(&str, &str)> = req
                     .headers
                     .iter()
@@ -1039,6 +1044,8 @@ impl HttpFrontend {
                 let checksum = checksum_algorithm
                     .map(|algo| MultipartChecksumConfig::new(algo, checksum_type))
                     .transpose()?;
+                let requester =
+                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
 
                 let result = self.coordinator.create_multipart_upload(
                     &crate::coordinator::CreateMultipartUploadRequest {
@@ -1046,6 +1053,7 @@ impl HttpFrontend {
                         key: &key,
                         metadata: &metadata,
                         checksum,
+                        requester,
                     },
                 )?;
                 Ok(S3Response::create_multipart_upload(
@@ -1114,10 +1122,10 @@ impl HttpFrontend {
                     ))
                 } else {
                     // Normal UploadPart path
-                    self.authorize_bucket_write(auth, &bucket)?;
-
                     // Extract claimed checksum from request headers (at most one).
                     let claimed_checksum = extract_checksum_header(req)?;
+                    let requester =
+                        crate::coordinator::Requester::from_principal(auth.principal.as_deref());
 
                     let result =
                         self.coordinator
@@ -1128,6 +1136,7 @@ impl HttpFrontend {
                                 part_number,
                                 data: &req.body,
                                 claimed_checksum: claimed_checksum.as_ref(),
+                                requester,
                             })?;
                     Ok(S3Response::upload_part(
                         &result.etag,
@@ -1136,7 +1145,6 @@ impl HttpFrontend {
                 }
             }
             S3Operation::CompleteMultipartUpload { bucket, key } => {
-                self.authorize_bucket_write(auth, &bucket)?;
                 let upload_id =
                     req.query_param("uploadId")
                         .ok_or_else(|| ServerError::InvalidRequest {
@@ -1150,6 +1158,8 @@ impl HttpFrontend {
                 let claimed_ref = claimed_checksum
                     .as_ref()
                     .map(|(algo, val)| (*algo, val.as_str()));
+                let requester =
+                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
                 let result = self.coordinator.complete_multipart_upload(
                     &crate::coordinator::CompleteMultipartUploadRequest {
                         bucket: &bucket,
@@ -1157,6 +1167,7 @@ impl HttpFrontend {
                         upload_id: &upload_id,
                         parts: &parts,
                         claimed_checksum: claimed_ref,
+                        requester,
                     },
                 )?;
                 Ok(S3Response::complete_multipart_upload(
@@ -1170,17 +1181,19 @@ impl HttpFrontend {
                 ))
             }
             S3Operation::AbortMultipartUpload { bucket, key } => {
-                self.authorize_bucket_write(auth, &bucket)?;
                 let upload_id =
                     req.query_param("uploadId")
                         .ok_or_else(|| ServerError::InvalidRequest {
                             reason: "missing uploadId query parameter".to_string(),
                         })?;
+                let requester =
+                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
                 self.coordinator.abort_multipart_upload(
                     &crate::coordinator::AbortMultipartUploadRequest {
                         bucket: &bucket,
                         key: &key,
                         upload_id: &upload_id,
+                        requester,
                     },
                 )?;
                 Ok(S3Response::abort_multipart_upload())
@@ -1516,15 +1529,6 @@ impl HttpFrontend {
             .ok_or(ServerError::Auth(auth::AuthError::AccessDenied))
     }
 
-    fn authorize_bucket_write(&self, auth: &AuthContext, bucket: &str) -> Result<(), ServerError> {
-        let info = self.coordinator.head_bucket(bucket)?;
-        if can_write_bucket(auth, &info.owner_principal) {
-            Ok(())
-        } else {
-            Err(ServerError::Auth(auth::AuthError::AccessDenied))
-        }
-    }
-
     fn handle_post_object(
         &self,
         req: &S3Request,
@@ -1624,9 +1628,6 @@ impl HttpFrontend {
             &post_auth
         };
 
-        // Authorize write access
-        self.authorize_bucket_write(effective_auth, bucket)?;
-
         // Verify checksum if provided
         if let Some(checksum_b64) = form.field("x-amz-checksum-sha256") {
             use base64::Engine;
@@ -1711,26 +1712,6 @@ impl HttpFrontend {
         key: &str,
     ) -> Result<StreamingPutContext, ServerError> {
         let auth = self.authenticate(req)?;
-        self.authorize_bucket_write(&auth, bucket)?;
-
-        // Enforce BucketOwnerEnforced ACL constraint.
-        if let Some(acl_value) = req.header("x-amz-acl") {
-            let requester =
-                crate::coordinator::Requester::from_principal(auth.principal.as_deref());
-            if let Some(ref oc_xml) = self
-                .coordinator
-                .get_bucket_ownership_controls(bucket, requester)?
-            {
-                if let Ok(val) = xml::parse_ownership_controls_xml(oc_xml.as_bytes()) {
-                    if val == "BucketOwnerEnforced"
-                        && acl_value != "bucket-owner-full-control"
-                        && acl_value != "private"
-                    {
-                        return Err(ServerError::AccessControlListNotSupported);
-                    }
-                }
-            }
-        }
 
         validate_checksum_headers(req, false)?;
 
@@ -1788,7 +1769,12 @@ impl HttpFrontend {
             }
         }
 
-        let session_id = self.coordinator.begin_stream_put(bucket, key)?;
+        let session_id = self.coordinator.begin_stream_put(&BeginStreamPutRequest {
+            bucket,
+            key,
+            requester: crate::coordinator::Requester::from_principal(auth.principal.as_deref()),
+            acl: parse_put_object_acl(req.header("x-amz-acl")),
+        })?;
 
         Ok(StreamingPutContext {
             session_id,
@@ -1899,7 +1885,6 @@ impl HttpFrontend {
         part_number: u32,
     ) -> Result<StreamingPartContext, ServerError> {
         let auth = self.authenticate(req)?;
-        self.authorize_bucket_write(&auth, bucket)?;
 
         let claimed_checksum = extract_checksum_header(req)?;
 
@@ -1912,7 +1897,13 @@ impl HttpFrontend {
 
         let begin = self
             .coordinator
-            .begin_stream_part(bucket, key, upload_id, part_number)?;
+            .begin_stream_part(&BeginStreamPartRequest {
+                bucket,
+                key,
+                upload_id,
+                part_number,
+                requester: crate::coordinator::Requester::from_principal(auth.principal.as_deref()),
+            })?;
 
         Ok(StreamingPartContext {
             session_id: begin.session_id,

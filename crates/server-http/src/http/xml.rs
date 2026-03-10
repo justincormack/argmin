@@ -3507,7 +3507,12 @@ mod tests {
             })
             .unwrap();
         assert!(list_after.objects.is_empty());
-        coord.delete_bucket("test-bucket").unwrap();
+        coord
+            .delete_bucket(&crate::coordinator::DeleteBucketRequest {
+                name: "test-bucket",
+                requester: TEST_REQUESTER,
+            })
+            .unwrap();
     }
 
     #[test]
@@ -3613,6 +3618,11 @@ mod tests {
         assert!(!result_xml.contains("<Deleted>"));
         assert!(result_xml.contains("DeleteResult"));
 
-        coord.delete_bucket("bucket").unwrap();
+        coord
+            .delete_bucket(&crate::coordinator::DeleteBucketRequest {
+                name: "bucket",
+                requester: TEST_REQUESTER,
+            })
+            .unwrap();
     }
 }

@@ -449,12 +449,20 @@ pub struct DeleteObjectsRequest<'a> {
     pub requester: Requester<'a>,
 }
 
+/// Request for a DeleteBucket operation.
+#[derive(Debug)]
+pub struct DeleteBucketRequest<'a> {
+    pub name: &'a str,
+    pub requester: Requester<'a>,
+}
+
 /// Request for an AbortMultipartUpload operation.
 #[derive(Debug)]
 pub struct AbortMultipartUploadRequest<'a> {
     pub bucket: &'a str,
     pub key: &'a str,
     pub upload_id: &'a str,
+    pub requester: Requester<'a>,
 }
 
 /// Request for a CreateMultipartUpload operation.
@@ -464,6 +472,7 @@ pub struct CreateMultipartUploadRequest<'a> {
     pub key: &'a str,
     pub metadata: &'a MetadataBlob,
     pub checksum: Option<MultipartChecksumConfig>,
+    pub requester: Requester<'a>,
 }
 
 /// Request for an UploadPart operation.
@@ -475,6 +484,7 @@ pub struct UploadPartRequest<'a> {
     pub part_number: u32,
     pub data: &'a [u8],
     pub claimed_checksum: Option<&'a ChecksumClaim>,
+    pub requester: Requester<'a>,
 }
 
 /// Request for a GetObjectAttributes operation.
@@ -498,6 +508,26 @@ pub struct CompleteMultipartUploadRequest<'a> {
     pub upload_id: &'a str,
     pub parts: &'a [CompletePart],
     pub claimed_checksum: Option<(ChecksumAlgorithm, &'a str)>,
+    pub requester: Requester<'a>,
+}
+
+/// Request for beginning a streaming PutObject session.
+#[derive(Debug)]
+pub struct BeginStreamPutRequest<'a> {
+    pub bucket: &'a str,
+    pub key: &'a str,
+    pub requester: Requester<'a>,
+    pub acl: PutObjectAcl<'a>,
+}
+
+/// Request for beginning a streaming UploadPart session.
+#[derive(Debug)]
+pub struct BeginStreamPartRequest<'a> {
+    pub bucket: &'a str,
+    pub key: &'a str,
+    pub upload_id: &'a str,
+    pub part_number: u32,
+    pub requester: Requester<'a>,
 }
 
 /// Parsed request for finalizing a streaming PutObject.
@@ -906,8 +936,10 @@ impl Coordinator {
         }
     }
 
-    pub fn delete_bucket(&self, name: &str) -> Result<(), ServerError> {
+    pub fn delete_bucket(&self, req: &DeleteBucketRequest<'_>) -> Result<(), ServerError> {
+        let name = req.name;
         let _bucket_guard = self.storage_node.lock_bucket(name);
+        let _bucket_info = self.authorize_bucket_write_requester(req.requester, name)?;
 
         // Check emptiness: list all object versions (including delete markers)
         // and multipart uploads across all PGs.
@@ -1555,11 +1587,21 @@ impl Coordinator {
     /// Creates a session on the metadata PG for `(bucket, key)`. The caller
     /// feeds chunks via `append_stream_chunk` and commits via
     /// `finalize_stream_put`.
-    pub fn begin_stream_put(&self, bucket: &str, key: &str) -> Result<String, ServerError> {
+    pub fn begin_stream_put(&self, req: &BeginStreamPutRequest<'_>) -> Result<String, ServerError> {
+        let bucket = req.bucket;
+        let key = req.key;
         let _bucket_guard = self.storage_node.lock_bucket(bucket);
 
-        // Verify bucket exists.
-        let _bucket_info = self.head_bucket(bucket)?;
+        let _bucket_info = self.authorize_bucket_write_requester(req.requester, bucket)?;
+        let ownership_controls = self.get_bucket_ownership_controls(bucket, req.requester)?;
+        if Self::is_bucket_owner_enforced(ownership_controls.as_deref())
+            && !matches!(
+                req.acl,
+                PutObjectAcl::None | PutObjectAcl::Private | PutObjectAcl::BucketOwnerFullControl
+            )
+        {
+            return Err(ServerError::AccessControlListNotSupported);
+        }
 
         // Generate session ID (same pattern as multipart upload_id).
         let rng = ring::rand::SystemRandom::new();
@@ -1594,17 +1636,21 @@ impl Coordinator {
     /// multipart upload. Validates that the upload exists and is InProgress.
     pub fn begin_stream_part(
         &self,
-        bucket: &str,
-        key: &str,
-        upload_id: &str,
-        part_number: u32,
+        req: &BeginStreamPartRequest<'_>,
     ) -> Result<BeginStreamPartResult, ServerError> {
+        let bucket = req.bucket;
+        let key = req.key;
+        let upload_id = req.upload_id;
+        let part_number = req.part_number;
+
         // Validate part number range.
         if part_number == 0 || part_number > 10_000 {
             return Err(ServerError::InvalidArgument {
                 reason: format!("part number must be between 1 and 10000, got {part_number}"),
             });
         }
+
+        let _bucket_info = self.authorize_bucket_write_requester(req.requester, bucket)?;
 
         // Lock metadata PG and validate upload exists.
         let meta_pg_id = self.object_pg_id(bucket, key);
@@ -4467,7 +4513,7 @@ impl Coordinator {
         let key = req.key;
         let metadata = req.metadata;
         let _bucket_guard = self.storage_node.lock_bucket(bucket);
-        let bucket_info = self.head_bucket(bucket)?;
+        let bucket_info = self.authorize_bucket_write_requester(req.requester, bucket)?;
 
         // Generate 16 random bytes → 32-char hex upload ID.
         let rng = ring::rand::SystemRandom::new();
@@ -4506,6 +4552,7 @@ impl Coordinator {
     /// writes shards, upserts the part record, and best-effort deletes
     /// any prior generation's shards.
     pub fn upload_part(&self, req: &UploadPartRequest) -> Result<UploadPartResult, ServerError> {
+        let _bucket_info = self.authorize_bucket_write_requester(req.requester, req.bucket)?;
         let inner = self.write_part_inner(
             req.bucket,
             req.key,
@@ -4935,7 +4982,7 @@ impl Coordinator {
         let _bucket_guard = self.storage_node.lock_bucket(bucket);
 
         // 1. Validate bucket exists and get versioning state.
-        let bucket_info = self.head_bucket(bucket)?;
+        let bucket_info = self.authorize_bucket_write_requester(req.requester, bucket)?;
 
         // 2. Validate part list: non-empty, within max count, and strictly increasing.
         if parts.is_empty() {
@@ -5282,6 +5329,7 @@ impl Coordinator {
         let bucket = req.bucket;
         let key = req.key;
         let upload_id = req.upload_id;
+        let _bucket_info = self.authorize_bucket_write_requester(req.requester, bucket)?;
         // 1. Lock meta PG and validate upload.
         let meta_pg_id = self.object_pg_id(bucket, key);
         let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
@@ -5566,6 +5614,42 @@ mod tests {
         Coordinator::new(storage_node, ec_config, "us-east-1".to_string()).unwrap()
     }
 
+    fn delete_bucket_test(coord: &Coordinator, name: &str) -> Result<(), ServerError> {
+        coord.delete_bucket(&DeleteBucketRequest {
+            name,
+            requester: TEST_REQUESTER,
+        })
+    }
+
+    fn begin_stream_put_test(
+        coord: &Coordinator,
+        bucket: &str,
+        key: &str,
+    ) -> Result<String, ServerError> {
+        coord.begin_stream_put(&BeginStreamPutRequest {
+            bucket,
+            key,
+            requester: TEST_REQUESTER,
+            acl: NO_PUT_OBJECT_ACL,
+        })
+    }
+
+    fn begin_stream_part_test(
+        coord: &Coordinator,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number: u32,
+    ) -> Result<BeginStreamPartResult, ServerError> {
+        coord.begin_stream_part(&BeginStreamPartRequest {
+            bucket,
+            key,
+            upload_id,
+            part_number,
+            requester: TEST_REQUESTER,
+        })
+    }
+
     #[test]
     fn bucket_crud() {
         let tmp = test_util::tempdir();
@@ -5583,7 +5667,7 @@ mod tests {
         assert_eq!(buckets.len(), 1);
 
         // Delete
-        coord.delete_bucket("test-bucket").unwrap();
+        delete_bucket_test(&coord, "test-bucket").unwrap();
         assert!(coord.head_bucket("test-bucket").is_err());
     }
 
@@ -5733,6 +5817,8 @@ mod tests {
                 key,
                 metadata: &MetadataBlob::new(),
                 checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -5768,7 +5854,7 @@ mod tests {
             })
             .unwrap();
 
-        let err = coord.delete_bucket("bucket").unwrap_err();
+        let err = delete_bucket_test(&coord, "bucket").unwrap_err();
         assert!(matches!(err, ServerError::BucketNotEmpty));
     }
 
@@ -5844,7 +5930,7 @@ mod tests {
         let guard = storage_node.lock_bucket("bucket");
         let (tx, rx) = mpsc::channel();
         let handle = thread::spawn(move || {
-            let res = deleter.delete_bucket("bucket");
+            let res = delete_bucket_test(&deleter, "bucket");
             tx.send(res).unwrap();
         });
 
@@ -6848,7 +6934,7 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        let err = coord.delete_bucket("no-such-bucket").unwrap_err();
+        let err = delete_bucket_test(&coord, "no-such-bucket").unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
     }
 
@@ -7266,6 +7352,8 @@ mod tests {
                 key: "key",
                 metadata: &MetadataBlob::new(),
                 checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -7285,6 +7373,8 @@ mod tests {
                 upload_id: &create.upload_id,
                 parts: &parts,
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidRequest { .. }));
@@ -7971,6 +8061,210 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn delete_bucket_rejects_non_owner_requester() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+
+        let err = coord
+            .delete_bucket(&DeleteBucketRequest {
+                name: "bucket",
+                requester: Requester::principal("other-user"),
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn create_multipart_upload_rejects_non_owner_requester() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+
+        let err = coord
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                metadata: &MetadataBlob::new(),
+                checksum: None,
+                requester: Requester::principal("other-user"),
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn upload_part_rejects_non_owner_requester() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+
+        let upload = coord
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                metadata: &MetadataBlob::new(),
+                checksum: None,
+                requester: Requester::principal("owner-a"),
+            })
+            .unwrap();
+
+        let err = coord
+            .upload_part(&UploadPartRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload.upload_id,
+                part_number: 1,
+                data: b"data",
+                claimed_checksum: None,
+                requester: Requester::principal("other-user"),
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn complete_multipart_upload_rejects_non_owner_requester() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+
+        let upload = coord
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                metadata: &MetadataBlob::new(),
+                checksum: None,
+                requester: Requester::principal("owner-a"),
+            })
+            .unwrap();
+
+        let err = coord
+            .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload.upload_id,
+                parts: &[],
+                claimed_checksum: None,
+                requester: Requester::principal("other-user"),
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn abort_multipart_upload_rejects_non_owner_requester() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+
+        let upload = coord
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                metadata: &MetadataBlob::new(),
+                checksum: None,
+                requester: Requester::principal("owner-a"),
+            })
+            .unwrap();
+
+        let err = coord
+            .abort_multipart_upload(&AbortMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload.upload_id,
+                requester: Requester::principal("other-user"),
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn begin_stream_put_rejects_non_owner_requester() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+
+        let err = coord
+            .begin_stream_put(&BeginStreamPutRequest {
+                bucket: "bucket",
+                key: "key",
+                requester: Requester::principal("other-user"),
+                acl: NO_PUT_OBJECT_ACL,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn begin_stream_part_rejects_non_owner_requester() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+
+        let upload = coord
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                metadata: &MetadataBlob::new(),
+                checksum: None,
+                requester: Requester::principal("owner-a"),
+            })
+            .unwrap();
+
+        let err = coord
+            .begin_stream_part(&BeginStreamPartRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload.upload_id,
+                part_number: 1,
+                requester: Requester::principal("other-user"),
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn begin_stream_put_rejects_acl_on_bucket_owner_enforced_bucket() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        coord
+            .put_bucket_ownership_controls(
+                "bucket",
+                "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
+                Requester::principal("owner-a"),
+            )
+            .unwrap();
+
+        let err = coord
+            .begin_stream_put(&BeginStreamPutRequest {
+                bucket: "bucket",
+                key: "key",
+                requester: Requester::principal("owner-a"),
+                acl: PutObjectAcl::Other("public-read"),
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessControlListNotSupported));
     }
 
     #[test]
@@ -9471,6 +9765,8 @@ mod tests {
                 key: "key",
                 metadata: &metadata,
                 checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -9492,6 +9788,8 @@ mod tests {
                 key: "key",
                 metadata: &metadata,
                 checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         let r2 = coord
@@ -9500,6 +9798,8 @@ mod tests {
                 key: "key",
                 metadata: &metadata,
                 checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_ne!(r1.upload_id, r2.upload_id);
@@ -9517,6 +9817,8 @@ mod tests {
                 key: "key",
                 metadata: &metadata,
                 checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
@@ -9555,6 +9857,8 @@ mod tests {
                 key: "alpha",
                 metadata: &metadata,
                 checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         let r2 = coord
@@ -9563,6 +9867,8 @@ mod tests {
                 key: "beta",
                 metadata: &metadata,
                 checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -9600,6 +9906,8 @@ mod tests {
                 key: "key",
                 metadata: &metadata,
                 checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         let r2 = coord
@@ -9608,6 +9916,8 @@ mod tests {
                 key: "key",
                 metadata: &metadata,
                 checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -9649,6 +9959,8 @@ mod tests {
                 key: "a",
                 metadata: &metadata,
                 checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         coord
@@ -9657,6 +9969,8 @@ mod tests {
                 key: "b",
                 metadata: &metadata,
                 checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         coord
@@ -9665,6 +9979,8 @@ mod tests {
                 key: "c",
                 metadata: &metadata,
                 checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -9715,6 +10031,8 @@ mod tests {
                 key: "photos/a.jpg",
                 metadata: &metadata,
                 checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         coord
@@ -9723,6 +10041,8 @@ mod tests {
                 key: "photos/b.jpg",
                 metadata: &metadata,
                 checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         coord
@@ -9731,6 +10051,8 @@ mod tests {
                 key: "docs/readme.md",
                 metadata: &metadata,
                 checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -9761,6 +10083,8 @@ mod tests {
                 key: "key",
                 metadata: &metadata,
                 checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -9814,6 +10138,8 @@ mod tests {
                 key: "photo.png",
                 metadata: &metadata,
                 checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -9843,11 +10169,13 @@ mod tests {
                 key: "key",
                 metadata: &metadata,
                 checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
         // Bucket has no objects but has an in-progress MPU — should fail.
-        let err = coord.delete_bucket("bucket").unwrap_err();
+        let err = delete_bucket_test(&coord, "bucket").unwrap_err();
         assert!(matches!(err, ServerError::BucketNotEmpty));
     }
 
@@ -9882,6 +10210,8 @@ mod tests {
                     key: "key",
                     metadata: &metadata,
                     checksum: None,
+
+                    requester: TEST_REQUESTER,
                 })
                 .unwrap();
             upload_ids.push(r.upload_id);
@@ -9948,6 +10278,8 @@ mod tests {
                 key: "key",
                 metadata: &metadata,
                 checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -9959,6 +10291,8 @@ mod tests {
                 part_number: 1,
                 data: b"hello world",
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -9988,6 +10322,8 @@ mod tests {
                 key: "key",
                 metadata: &metadata,
                 checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -10000,6 +10336,8 @@ mod tests {
                 part_number: 1,
                 data: b"first",
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -10012,6 +10350,8 @@ mod tests {
                 part_number: 1,
                 data: b"second",
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -10039,6 +10379,8 @@ mod tests {
                 key: "key",
                 metadata: &metadata,
                 checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -10050,6 +10392,8 @@ mod tests {
                 part_number: 0,
                 data: b"data",
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidArgument { .. }));
@@ -10068,6 +10412,8 @@ mod tests {
                 key: "key",
                 metadata: &metadata,
                 checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -10079,6 +10425,8 @@ mod tests {
                 part_number: 10_001,
                 data: b"data",
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidArgument { .. }));
@@ -10098,6 +10446,8 @@ mod tests {
                 part_number: 1,
                 data: b"data",
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::NoSuchUpload { .. }));
@@ -10116,6 +10466,8 @@ mod tests {
                 key: "key",
                 metadata: &metadata,
                 checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -10127,6 +10479,8 @@ mod tests {
                 part_number: 1,
                 data: b"part-one",
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         coord
@@ -10137,6 +10491,8 @@ mod tests {
                 part_number: 2,
                 data: b"part-two",
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         coord
@@ -10147,6 +10503,8 @@ mod tests {
                 part_number: 3,
                 data: b"part-three",
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -10180,6 +10538,8 @@ mod tests {
                 key: "key",
                 metadata: &metadata,
                 checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -10194,6 +10554,7 @@ mod tests {
                     part_number: 1,
                     data: data.as_bytes(),
                     claimed_checksum: None,
+                    requester: TEST_REQUESTER,
                 })
                 .unwrap();
         }
@@ -10218,6 +10579,8 @@ mod tests {
                 key: "key",
                 metadata: &metadata,
                 checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -10230,6 +10593,8 @@ mod tests {
                 part_number: 1,
                 data: b"a",
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         // Part 10000 (max valid).
@@ -10241,6 +10606,8 @@ mod tests {
                 part_number: 10_000,
                 data: b"z",
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -10263,6 +10630,8 @@ mod tests {
                 key: "key",
                 metadata: &metadata,
                 checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -10275,6 +10644,8 @@ mod tests {
                 part_number: 1,
                 data: b"data",
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::NoSuchUpload { .. }));
@@ -10289,6 +10660,8 @@ mod tests {
                 part_number: 1,
                 data: b"data",
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::NoSuchUpload { .. }));
@@ -10307,6 +10680,8 @@ mod tests {
                 key: "key",
                 metadata: &metadata,
                 checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -10320,6 +10695,8 @@ mod tests {
                 part_number: 1,
                 data: b"writer-A",
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap()
             .etag;
@@ -10331,6 +10708,8 @@ mod tests {
                 part_number: 1,
                 data: b"writer-B",
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap()
             .etag;
@@ -10342,6 +10721,8 @@ mod tests {
                 part_number: 1,
                 data: b"writer-C",
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap()
             .etag;
@@ -10375,6 +10756,8 @@ mod tests {
                 key,
                 metadata: &metadata,
                 checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         let mut complete_parts = Vec::new();
@@ -10387,6 +10770,7 @@ mod tests {
                     part_number,
                     data,
                     claimed_checksum: None,
+                    requester: TEST_REQUESTER,
                 })
                 .unwrap();
             complete_parts.push(CompletePart {
@@ -10418,6 +10802,8 @@ mod tests {
                 upload_id: &upload_id,
                 parts: &parts,
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -10478,6 +10864,8 @@ mod tests {
                 upload_id: &upload_id,
                 parts: &parts,
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidPart { part_number: 2 }));
@@ -10502,6 +10890,8 @@ mod tests {
                 upload_id: &upload_id,
                 parts: &parts,
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidPart { part_number: 1 }));
@@ -10525,6 +10915,8 @@ mod tests {
                 upload_id: &upload_id,
                 parts: &reversed,
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidPartOrder));
@@ -10551,6 +10943,8 @@ mod tests {
                 upload_id: &upload_id,
                 parts: &parts,
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap_err();
         assert!(matches!(
@@ -10575,6 +10969,8 @@ mod tests {
                 upload_id: &upload_id,
                 parts: &parts,
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert!(result.etag.ends_with("-1\""));
@@ -10593,6 +10989,8 @@ mod tests {
                 key: "key",
                 metadata: &metadata,
                 checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -10603,6 +11001,8 @@ mod tests {
                 upload_id: &create.upload_id,
                 parts: &[],
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidRequest { .. }));
@@ -10626,6 +11026,8 @@ mod tests {
                 upload_id: &upload_id,
                 parts: &parts,
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::EntityTooSmall { .. }));
@@ -10640,6 +11042,8 @@ mod tests {
                 part_number: 1,
                 data: &big_data,
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -10658,6 +11062,8 @@ mod tests {
                 upload_id: &upload_id,
                 parts: &retry_parts,
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert!(result.etag.ends_with("-2\""));
@@ -10681,6 +11087,8 @@ mod tests {
                 upload_id: &upload_id,
                 parts: &duped,
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidPartOrder));
@@ -10702,6 +11110,8 @@ mod tests {
                 upload_id: &upload_id1,
                 parts: &parts1,
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert!(result1.etag.ends_with("-1\""));
@@ -10721,6 +11131,8 @@ mod tests {
                 upload_id: &upload_id2,
                 parts: &parts2,
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert!(result2.etag.ends_with("-2\""));
@@ -10755,6 +11167,8 @@ mod tests {
                 upload_id: &upload_id,
                 parts: &parts,
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -10796,6 +11210,8 @@ mod tests {
                 upload_id: &upload_id,
                 parts: &parts,
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -10834,6 +11250,8 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 upload_id: &upload_id,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -10846,6 +11264,8 @@ mod tests {
                 part_number: 1,
                 data: b"nope",
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap_err();
         assert!(
@@ -10878,6 +11298,8 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 upload_id: "no-such-upload",
+
+                requester: TEST_REQUESTER,
             })
             .unwrap_err();
         assert!(
@@ -10899,6 +11321,8 @@ mod tests {
                 key: "key",
                 metadata: &metadata,
                 checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -10908,6 +11332,8 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 upload_id: &create.upload_id,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -10917,6 +11343,8 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 upload_id: &create.upload_id,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap_err();
         assert!(
@@ -10939,6 +11367,8 @@ mod tests {
                 key: "key",
                 metadata: &metadata,
                 checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -10947,6 +11377,8 @@ mod tests {
                 bucket: "other",
                 key: "key",
                 upload_id: &create.upload_id,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap_err();
         assert!(
@@ -10971,6 +11403,8 @@ mod tests {
                 upload_id: &upload_id,
                 parts: &parts,
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -10980,6 +11414,8 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 upload_id: &upload_id,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap_err();
         assert!(
@@ -11015,6 +11451,8 @@ mod tests {
                 key: "key",
                 metadata: &metadata,
                 checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         coord
@@ -11025,6 +11463,8 @@ mod tests {
                 part_number: 1,
                 data: b"data",
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -11033,6 +11473,8 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 upload_id: &create.upload_id,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -11044,6 +11486,8 @@ mod tests {
                 part_number: 2,
                 data: b"more",
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap_err();
         assert!(
@@ -11171,6 +11615,8 @@ mod tests {
                 key: "key",
                 metadata: &metadata,
                 checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -11225,6 +11671,8 @@ mod tests {
                 key: "key",
                 metadata: &metadata,
                 checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -11237,6 +11685,8 @@ mod tests {
                 part_number: 1,
                 data: b"original",
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         let reupload = coord
@@ -11247,6 +11697,8 @@ mod tests {
                 part_number: 1,
                 data: b"replaced",
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -11278,6 +11730,8 @@ mod tests {
                 key: "key",
                 metadata: &metadata,
                 checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         coord
@@ -11288,6 +11742,8 @@ mod tests {
                 part_number: 1,
                 data: b"data",
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -11327,6 +11783,8 @@ mod tests {
                 key: "key",
                 metadata: &metadata,
                 checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -11342,6 +11800,8 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 upload_id: &create.upload_id,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap_err();
         assert!(
@@ -11374,6 +11834,8 @@ mod tests {
                 key,
                 metadata: &metadata,
                 checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         let mut complete_parts = Vec::new();
@@ -11386,6 +11848,8 @@ mod tests {
                     part_number: *part_number,
                     data,
                     claimed_checksum: None,
+
+                    requester: TEST_REQUESTER,
                 })
                 .unwrap();
             complete_parts.push(CompletePart {
@@ -11401,6 +11865,8 @@ mod tests {
                 upload_id: &create.upload_id,
                 parts: &complete_parts,
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap()
     }
@@ -11926,6 +12392,8 @@ mod tests {
                 key,
                 metadata: &metadata,
                 checksum: Some(MultipartChecksumConfig::new(algo, ctype).unwrap()),
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         let mut complete_parts = Vec::new();
@@ -11941,6 +12409,7 @@ mod tests {
                     part_number,
                     data,
                     claimed_checksum: Some(&claim),
+                    requester: TEST_REQUESTER,
                 })
                 .unwrap();
             complete_parts.push(CompletePart {
@@ -11978,6 +12447,8 @@ mod tests {
                 upload_id: &upload_id,
                 parts: &parts,
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -12024,6 +12495,8 @@ mod tests {
                 upload_id: &upload_id,
                 parts: &parts,
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -12064,6 +12537,8 @@ mod tests {
                 upload_id: &upload_id,
                 parts: &parts,
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -12103,6 +12578,8 @@ mod tests {
                 upload_id: &upload_id,
                 parts: &parts,
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -12146,6 +12623,8 @@ mod tests {
                 upload_id: &upload_id,
                 parts: &parts,
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -12192,6 +12671,8 @@ mod tests {
                 upload_id: &upload_id,
                 parts: &parts,
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap_err();
         assert!(
@@ -12218,6 +12699,8 @@ mod tests {
                 upload_id: &upload_id,
                 parts: &parts,
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -12255,6 +12738,8 @@ mod tests {
                 upload_id: &upload_id,
                 parts: &parts,
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap_err();
         assert!(
@@ -12272,7 +12757,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         // Begin session.
-        let session_id = coord.begin_stream_put("bucket", "mykey").unwrap();
+        let session_id = begin_stream_put_test(&coord, "bucket", "mykey").unwrap();
         assert_eq!(session_id.len(), 32);
 
         // Append two chunks.
@@ -12327,7 +12812,7 @@ mod tests {
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
-        let session_id = coord.begin_stream_put("bucket", "mykey").unwrap();
+        let session_id = begin_stream_put_test(&coord, "bucket", "mykey").unwrap();
 
         // Finalize with no chunks appended — zero-byte object.
         let crc = checksum::crc64::checksum(&[]);
@@ -12364,7 +12849,7 @@ mod tests {
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
-        let session_id = coord.begin_stream_put("bucket", "mykey").unwrap();
+        let session_id = begin_stream_put_test(&coord, "bucket", "mykey").unwrap();
         coord
             .append_stream_chunk("bucket", "mykey", &session_id, 0, b"data")
             .unwrap();
@@ -12393,7 +12878,7 @@ mod tests {
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
-        let session_id = coord.begin_stream_put("bucket", "mykey").unwrap();
+        let session_id = begin_stream_put_test(&coord, "bucket", "mykey").unwrap();
         let crc = checksum::crc64::checksum(&[]);
         let metadata = MetadataBlob::new();
         coord
@@ -12427,7 +12912,7 @@ mod tests {
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
-        let session_id = coord.begin_stream_put("bucket", "mykey").unwrap();
+        let session_id = begin_stream_put_test(&coord, "bucket", "mykey").unwrap();
         coord
             .abort_stream_put("bucket", "mykey", &session_id)
             .unwrap();
@@ -12460,7 +12945,7 @@ mod tests {
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
-        let session_id = coord.begin_stream_put("bucket", "key1").unwrap();
+        let session_id = begin_stream_put_test(&coord, "bucket", "key1").unwrap();
 
         // Attempt append with wrong key.
         let err = coord
@@ -12484,7 +12969,7 @@ mod tests {
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
-        let session_id = coord.begin_stream_put("bucket", "key1").unwrap();
+        let session_id = begin_stream_put_test(&coord, "bucket", "key1").unwrap();
 
         let crc = checksum::crc64::checksum(&[]);
         let metadata = MetadataBlob::new();
@@ -12514,7 +12999,7 @@ mod tests {
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
 
-        let err = coord.begin_stream_put("nonexistent", "key").unwrap_err();
+        let err = begin_stream_put_test(&coord, "nonexistent", "key").unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
     }
 
@@ -12538,7 +13023,7 @@ mod tests {
             .unwrap();
 
         // Stream-put a new version.
-        let session_id = coord.begin_stream_put("bucket", "key").unwrap();
+        let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         let new_data = b"new-streamed-data";
         coord
             .append_stream_chunk("bucket", "key", &session_id, 0, new_data)
@@ -12592,7 +13077,7 @@ mod tests {
             .unwrap();
 
         // Stream put with if-match on the correct etag succeeds.
-        let session_id = coord.begin_stream_put("bucket", "key").unwrap();
+        let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         coord
             .append_stream_chunk("bucket", "key", &session_id, 0, b"updated")
             .unwrap();
@@ -12612,7 +13097,7 @@ mod tests {
             .unwrap();
 
         // Stream put with if-match on a wrong etag fails.
-        let session_id2 = coord.begin_stream_put("bucket", "key").unwrap();
+        let session_id2 = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         coord
             .append_stream_chunk("bucket", "key", &session_id2, 0, b"third")
             .unwrap();
@@ -12641,7 +13126,7 @@ mod tests {
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
-        let session_id = coord.begin_stream_put("bucket", "key").unwrap();
+        let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
 
         // Append 3 chunks.
         let chunks: Vec<&[u8]> = vec![b"aaa", b"bbb", b"ccc"];
@@ -12689,7 +13174,7 @@ mod tests {
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
-        let session_id = coord.begin_stream_put("bucket", "key").unwrap();
+        let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         coord
             .append_stream_chunk("bucket", "key", &session_id, 0, b"data-to-clean")
             .unwrap();
@@ -12720,7 +13205,7 @@ mod tests {
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
-        let session_id = coord.begin_stream_put("bucket", "key").unwrap();
+        let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         coord
             .append_stream_chunk("bucket", "key", &session_id, 0, b"hello")
             .unwrap();
@@ -12771,7 +13256,7 @@ mod tests {
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
-        let session_id = coord.begin_stream_put("bucket", "key").unwrap();
+        let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         coord
             .append_stream_chunk("bucket", "key", &session_id, 0, b"aaaa")
             .unwrap();
@@ -12816,7 +13301,7 @@ mod tests {
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
-        let session_id = coord.begin_stream_put("bucket", "key").unwrap();
+        let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         coord
             .append_stream_chunk("bucket", "key", &session_id, 0, b"AAAA")
             .unwrap();
@@ -12898,7 +13383,7 @@ mod tests {
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
-        let session_id = coord.begin_stream_put("bucket", "src").unwrap();
+        let session_id = begin_stream_put_test(&coord, "bucket", "src").unwrap();
         coord
             .append_stream_chunk("bucket", "src", &session_id, 0, b"copy-me")
             .unwrap();
@@ -12953,7 +13438,7 @@ mod tests {
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
-        let session_id = coord.begin_stream_put("bucket", "empty").unwrap();
+        let session_id = begin_stream_put_test(&coord, "bucket", "empty").unwrap();
         let crc = checksum::crc64::checksum(b"");
         coord
             .finalize_stream_put(&FinalizeStreamPutRequest {
@@ -12987,7 +13472,7 @@ mod tests {
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
-        let session_id = coord.begin_stream_put("bucket", "key").unwrap();
+        let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         coord
             .append_stream_chunk("bucket", "key", &session_id, 0, b"partdata")
             .unwrap();
@@ -13025,7 +13510,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         // Stream-write an object.
-        let session_id = coord.begin_stream_put("bucket", "key").unwrap();
+        let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         coord
             .append_stream_chunk("bucket", "key", &session_id, 0, b"stream-data")
             .unwrap();
@@ -13087,7 +13572,7 @@ mod tests {
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
-        let session_id = coord.begin_stream_put("bucket", "key").unwrap();
+        let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         coord
             .append_stream_chunk("bucket", "key", &session_id, 0, b"delete-me")
             .unwrap();
@@ -13136,7 +13621,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         // Stream-write a source object.
-        let session_id = coord.begin_stream_put("bucket", "src").unwrap();
+        let session_id = begin_stream_put_test(&coord, "bucket", "src").unwrap();
         coord
             .append_stream_chunk("bucket", "src", &session_id, 0, b"source-data")
             .unwrap();
@@ -13160,6 +13645,8 @@ mod tests {
                 key: "dst",
                 metadata: &MetadataBlob::new(),
                 checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -13207,6 +13694,8 @@ mod tests {
                 key: "dst",
                 metadata: &MetadataBlob::new(),
                 checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -13235,7 +13724,7 @@ mod tests {
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
-        let session_id = coord.begin_stream_put("bucket", "key").unwrap();
+        let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         coord
             .append_stream_chunk("bucket", "key", &session_id, 0, b"first")
             .unwrap();
@@ -13271,7 +13760,7 @@ mod tests {
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
-        let session_id = coord.begin_stream_put("bucket", "key").unwrap();
+        let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         coord
             .append_stream_chunk("bucket", "key", &session_id, 0, b"hello")
             .unwrap();
@@ -13337,13 +13826,13 @@ mod tests {
                 key: "key",
                 metadata: &MetadataBlob::new(),
                 checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
         // Begin a streaming part session.
-        let session = coord
-            .begin_stream_part("bucket", "key", &mpu.upload_id, 1)
-            .unwrap();
+        let session = begin_stream_part_test(&coord, "bucket", "key", &mpu.upload_id, 1).unwrap();
         let session_id = session.session_id;
 
         // Append chunks.
@@ -13376,9 +13865,7 @@ mod tests {
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
-        let err = coord
-            .begin_stream_part("bucket", "key", "nonexistent", 1)
-            .unwrap_err();
+        let err = begin_stream_part_test(&coord, "bucket", "key", "nonexistent", 1).unwrap_err();
         assert!(matches!(err, ServerError::NoSuchUpload { .. }));
     }
 
@@ -13394,19 +13881,18 @@ mod tests {
                 key: "key",
                 metadata: &MetadataBlob::new(),
                 checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
         // Part 0 is invalid.
-        let err = coord
-            .begin_stream_part("bucket", "key", &mpu.upload_id, 0)
-            .unwrap_err();
+        let err = begin_stream_part_test(&coord, "bucket", "key", &mpu.upload_id, 0).unwrap_err();
         assert!(matches!(err, ServerError::InvalidArgument { .. }));
 
         // Part 10001 is invalid.
-        let err = coord
-            .begin_stream_part("bucket", "key", &mpu.upload_id, 10_001)
-            .unwrap_err();
+        let err =
+            begin_stream_part_test(&coord, "bucket", "key", &mpu.upload_id, 10_001).unwrap_err();
         assert!(matches!(err, ServerError::InvalidArgument { .. }));
     }
 
@@ -13441,7 +13927,7 @@ mod tests {
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
-        let session_id = coord.begin_stream_put("bucket", "key").unwrap();
+        let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         coord
             .append_stream_chunk("bucket", "key", &session_id, 0, b"data")
             .unwrap();
@@ -13452,6 +13938,8 @@ mod tests {
                 key: "key",
                 metadata: &MetadataBlob::new(),
                 checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -13489,6 +13977,8 @@ mod tests {
                 key: "key",
                 metadata: &metadata,
                 checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         let mpu_b = coord
@@ -13497,13 +13987,14 @@ mod tests {
                 key: "key",
                 metadata: &metadata,
                 checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
         // Helper: stream a single part with given data.
         let stream_part = |upload_id: &str, data: &[u8]| -> CompletePart {
-            let sess = coord
-                .begin_stream_part("bucket", "key", upload_id, 1)
+            let sess = begin_stream_part_test(&coord, "bucket", "key", upload_id, 1)
                 .unwrap()
                 .session_id;
             coord
@@ -13545,6 +14036,8 @@ mod tests {
                 upload_id: &mpu_a.upload_id,
                 parts: &[part_a],
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -13572,6 +14065,8 @@ mod tests {
                 upload_id: &mpu_b.upload_id,
                 parts: &[part_b],
                 claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -13611,12 +14106,13 @@ mod tests {
                 key: "key",
                 metadata: &metadata,
                 checksum: None,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
         // Upload a streaming part.
-        let sess = coord
-            .begin_stream_part("bucket", "key", &mpu.upload_id, 1)
+        let sess = begin_stream_part_test(&coord, "bucket", "key", &mpu.upload_id, 1)
             .unwrap()
             .session_id;
         let data = b"streamed-part-data-for-abort-test";
@@ -13668,6 +14164,8 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 upload_id: &mpu.upload_id,
+
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -13706,7 +14204,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         // Begin a session (creates with current timestamp).
-        let session_id = coord.begin_stream_put("bucket", "key").unwrap();
+        let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         coord
             .append_stream_chunk("bucket", "key", &session_id, 0, b"data")
             .unwrap();
@@ -13740,7 +14238,7 @@ mod tests {
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
-        let session_id = coord.begin_stream_put("bucket", "key").unwrap();
+        let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         coord
             .append_stream_chunk("bucket", "key", &session_id, 0, b"safe-data")
             .unwrap();
@@ -13781,7 +14279,7 @@ mod tests {
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
-        let session_id = coord.begin_stream_put("bucket", "new-key").unwrap();
+        let session_id = begin_stream_put_test(&coord, "bucket", "new-key").unwrap();
         coord
             .append_stream_chunk("bucket", "new-key", &session_id, 0, b"pending")
             .unwrap();
@@ -13819,7 +14317,7 @@ mod tests {
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
-        let session_id = coord.begin_stream_put("bucket", "verify").unwrap();
+        let session_id = begin_stream_put_test(&coord, "bucket", "verify").unwrap();
         coord
             .append_stream_chunk("bucket", "verify", &session_id, 0, b"chunk-0-")
             .unwrap();
@@ -13880,7 +14378,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         // 1. Stream-write.
-        let session_id = coord.begin_stream_put("bucket", "cycle").unwrap();
+        let session_id = begin_stream_put_test(&coord, "bucket", "cycle").unwrap();
         coord
             .append_stream_chunk("bucket", "cycle", &session_id, 0, b"v1")
             .unwrap();
@@ -13942,7 +14440,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         // First stream-write.
-        let s1 = coord.begin_stream_put("bucket", "key").unwrap();
+        let s1 = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         coord
             .append_stream_chunk("bucket", "key", &s1, 0, b"old-data")
             .unwrap();
@@ -13959,7 +14457,7 @@ mod tests {
             .unwrap();
 
         // Second stream-write (overwrite).
-        let s2 = coord.begin_stream_put("bucket", "key").unwrap();
+        let s2 = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         coord
             .append_stream_chunk("bucket", "key", &s2, 0, b"new-data")
             .unwrap();

@@ -22,15 +22,56 @@ Completed:
    - `GetObjectAttributes`
    - `DeleteObject`
    - `DeleteObjects`
+7. bucket and list authorization moved into `server-core` for:
+   - `DeleteBucket`
+   - `HeadBucket`
+   - `ListObjectsV1`
+   - `ListObjectsV2`
+   - `ListObjectVersions`
+   - `ListMultipartUploads`
+   - `ListParts`
+   - `PutBucketVersioning`
+   - `GetBucketVersioning`
+   - `PutBucketCors`
+   - `GetBucketCors`
+   - `DeleteBucketCors`
+   - `PutBucketTagging`
+   - `GetBucketTagging`
+   - `DeleteBucketTagging`
+   - `PutObjectTagging`
+   - `GetObjectTagging`
+   - `DeleteObjectTagging`
+   - `PutBucketPublicAccessBlock`
+   - `GetBucketPublicAccessBlock`
+   - `DeleteBucketPublicAccessBlock`
+   - `PutBucketOwnershipControls`
+   - `GetBucketOwnershipControls`
+   - `DeleteBucketOwnershipControls`
+   - `PutBucketAcl`
+8. multipart and streaming write authorization moved into `server-core` for:
+   - `CreateMultipartUpload`
+   - `UploadPart`
+   - `CompleteMultipartUpload`
+   - `AbortMultipartUpload`
+   - streaming `PutObject` session creation
+   - streaming `UploadPart` session creation
+9. stored-state ACL and ownership-controls policy moved into `server-core` for:
+   - `PutBucketOwnershipControls`
+   - `PutBucketAcl`
+   - `PutObject`
+   - `CopyObject`
+   - streaming `PutObject`
+10. `server-http` no longer has bucket/object auth helpers
 
 Current state:
 
 1. `server-http` owns HTTP authentication, header/XML/query parsing, and
    response rendering
-2. `server-core` owns object-level authorization for the common object paths
+2. `server-core` owns bucket/object authorization for the S3 data-path and
+   bucket-subresource operations
 3. `storage` remains independent of both `server-core` and `server-http`
-4. the main remaining boundary issue is bucket-scoped and multipart/streaming
-   authorization and stored-state policy still living in `server-http`
+4. the main authz boundary goal of this plan is effectively complete
+5. the remaining issues are now cleanup-level rather than layering-critical
 5. the in-flight read vs object reclamation race discovered during this work is
    tracked separately in
    [`plans/in-flight-read-reclamation-plan.md`](./in-flight-read-reclamation-plan.md)
@@ -50,24 +91,21 @@ The original `server-http -> storage` boundary cleanup has served its purpose:
 3. `server-http` no longer depends on storage-owned types in normal code
 4. runtime/bootstrap wiring no longer lives in `server-http`
 
-The remaining issue is now narrower:
+The original issue has now been addressed for the main API surface:
 
-1. `server-http` still performs authorization for a number of bucket-scoped,
-   multipart, and streaming operations
-2. `server-http` still enforces some policy checks that depend on stored bucket
-   state
-3. `server-core` then executes the operation later against current state
+1. `server-http` authenticates and parses requests
+2. `server-core` authorizes against current bucket/object state and executes
+   the operation
+3. `storage` remains policy-agnostic
 
-That is still the wrong layering, and for write paths it still leaves the check
-outside the point of use.
+The remaining work is follow-on cleanup, not the original boundary bug.
 
 ## Goals
 
-1. finish moving authorization into `server-core`
-2. move stored-state policy checks into `server-core`
-3. keep `server-http` responsible only for authentication and request parsing
-4. keep `storage` policy-agnostic
-5. only revisit the deeper `server-core -> storage` concreteness after this
+1. keep `server-http` responsible only for authentication and request parsing
+2. keep `storage` policy-agnostic
+3. finish any remaining cleanup that still weakens the split
+4. only revisit the deeper `server-core -> storage` concreteness after this
    boundary cleanup is actually complete
 
 ## Non-goals
@@ -117,54 +155,19 @@ reclamation race is not an auth problem and is tracked separately.
 
 ## Remaining Surface
 
-### Bucket and list operations still using HTTP-side authorization
+### Still worth cleaning up
 
-1. `DeleteBucket`
-2. `HeadBucket`
-3. `ListObjectsV1`
-4. `ListObjectsV2`
-5. `ListObjectVersions`
-6. `PutBucketVersioning`
-7. `GetBucketVersioning`
-8. `PutBucketCors`
-9. `GetBucketCors`
-10. `DeleteBucketCors`
-11. `PutBucketTagging`
-12. `GetBucketTagging`
-13. `DeleteBucketTagging`
-14. `PutObjectTagging`
-15. `GetObjectTagging`
-16. `DeleteObjectTagging`
-17. `PutBucketPublicAccessBlock`
-18. `GetBucketPublicAccessBlock`
-19. `DeleteBucketPublicAccessBlock`
-20. `PutBucketOwnershipControls`
-21. `GetBucketOwnershipControls`
-22. `DeleteBucketOwnershipControls`
-23. `PutBucketAcl`
-
-### Multipart and streaming operations still using HTTP-side authorization
-
-1. `CreateMultipartUpload`
-2. `UploadPart`
-3. `CompleteMultipartUpload`
-4. `AbortMultipartUpload`
-5. `ListMultipartUploads`
-6. `ListParts`
-7. `POST Object`
-8. streaming `PutObject`
-9. streaming `UploadPart`
-
-### Stored-state policy still enforced in `server-http`
-
-1. `authorize_bucket_read` still derives effective public visibility from
-   `public_read` plus `IgnorePublicAcls`
-2. `PutBucketOwnershipControls` still checks
-   `BucketOwnerEnforced` against the current bucket ACL state
-3. `PutBucketAcl` still enforces `BucketOwnerEnforced` and `BlockPublicAcls`
-   using stored bucket state
-4. `POST Object` and streaming `PutObject` still enforce
-   BucketOwnerEnforced-vs-ACL in HTTP
+1. `ListBuckets` still derives the owner principal in `server-http` and calls
+   `list_buckets_for_owner(...)` directly
+2. `CreateBucket` still assembles request semantics in `server-http` by
+   translating `x-amz-acl` and `x-amz-object-ownership` into multiple core
+   calls (`create_bucket_for_owner` plus `put_bucket_ownership_controls`)
+3. successful write paths still apply tags as a second core call from
+   `server-http` in some flows (`PutObject`, `CopyObject`, `POST Object`,
+   streaming finalize), which is no longer an auth leak but is still a split
+   operation across the boundary
+4. the deeper `server-core -> storage` concreteness question remains open, but
+   is intentionally deferred
 
 ## Recommended Interface Shape
 
@@ -186,77 +189,35 @@ The rule is:
 
 ## Remaining Implementation Order
 
-### Step 1: bucket read and list operations
+### Step 1: decide whether to normalize `CreateBucket` and `ListBuckets`
 
-Move requester-aware authz into `server-core` for:
+Optional cleanup:
 
-1. `HeadBucket`
-2. `ListObjectsV1`
-3. `ListObjectsV2`
-4. `ListObjectVersions`
-5. `ListMultipartUploads`
-6. `ListParts`
+1. introduce core-owned request types for `CreateBucket` and `ListBuckets`
+2. move owner-principal plumbing and bucket-create request semantics fully into
+   `server-core`
 
-These are the remaining common read-shaped entry points still gated in HTTP.
+This is no longer a correctness blocker; it is an interface-cleanliness choice.
 
-### Step 2: bucket-scoped write and subresource operations
+### Step 2: collapse post-write tagging into core-owned flows
 
-Move requester-aware authz into `server-core` for:
+Optional cleanup:
 
-1. `DeleteBucket`
-2. `PutBucketVersioning`
-3. `GetBucketVersioning`
-4. `PutBucketCors`
-5. `GetBucketCors`
-6. `DeleteBucketCors`
-7. `PutBucketTagging`
-8. `GetBucketTagging`
-9. `DeleteBucketTagging`
-10. `PutObjectTagging`
-11. `GetObjectTagging`
-12. `DeleteObjectTagging`
-13. `PutBucketPublicAccessBlock`
-14. `GetBucketPublicAccessBlock`
-15. `DeleteBucketPublicAccessBlock`
-16. `PutBucketOwnershipControls`
-17. `GetBucketOwnershipControls`
-18. `DeleteBucketOwnershipControls`
-19. `PutBucketAcl`
+1. `PutObject`
+2. `CopyObject`
+3. `POST Object`
+4. streaming `PutObject` finalize
 
-This step should also move the stored-state policy checks for ownership
-controls, ACLs, and public-access-block into `server-core`.
+This would reduce boundary chatter and tighten write atomicity semantics, but
+it is separate from the authz layering problem already solved above.
 
-### Step 3: multipart mutation operations
+### Step 3: reassess the deeper core/storage boundary
 
-Move requester-aware authz into `server-core` for:
+Only after the HTTP/core split is judged complete enough on its own:
 
-1. `CreateMultipartUpload`
-2. `UploadPart`
-3. `CompleteMultipartUpload`
-4. `AbortMultipartUpload`
-
-The main requirement is that write authorization and bucket-state policy are
-checked in the same layer that finalizes or mutates the upload.
-
-### Step 4: POST and streaming write paths
-
-Move requester-aware authz and BucketOwnerEnforced ACL checks into
-`server-core` for:
-
-1. `POST Object`
-2. streaming `PutObject`
-3. streaming `UploadPart`
-
-`server-http` should keep POST authentication and chunk-signature validation,
-but it should stop making the authorization decision.
-
-### Step 5: delete HTTP-side authz helpers
-
-Once all remaining call sites are moved:
-
-1. remove `authorize_bucket_read`
-2. remove `authorize_bucket_write`
-3. remove the remaining direct use of HTTP-layer authz policy helpers
+1. decide whether `server-core` should continue to depend directly on
+   `SharedStorageNode` / `PgStore`
+2. decide whether a narrower storage service abstraction is worth the churn
 
 ## Deeper `server-core -> storage` Split
 

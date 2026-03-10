@@ -17,7 +17,6 @@
     clippy::unused_self
 )]
 
-pub mod authz;
 pub mod cors;
 pub mod http;
 
