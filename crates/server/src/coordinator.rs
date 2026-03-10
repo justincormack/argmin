@@ -248,6 +248,16 @@ pub struct PutObjectRequest<'a> {
     pub cond: &'a WriteCondition,
 }
 
+/// Request for a CreateMultipartUpload operation.
+#[derive(Debug)]
+pub struct CreateMultipartUploadRequest<'a> {
+    pub bucket: &'a str,
+    pub key: &'a str,
+    pub metadata: &'a MetadataBlob,
+    pub checksum_algorithm: Option<ChecksumAlgorithm>,
+    pub checksum_type: Option<ChecksumType>,
+}
+
 /// Request for an UploadPart operation.
 #[derive(Debug)]
 pub struct UploadPartRequest<'a> {
@@ -4042,12 +4052,13 @@ impl Coordinator {
     /// inserts a new multipart upload record in the metadata PG for (bucket, key).
     pub fn create_multipart_upload(
         &self,
-        bucket: &str,
-        key: &str,
-        metadata: &MetadataBlob,
-        checksum_algorithm: Option<ChecksumAlgorithm>,
-        checksum_type: Option<ChecksumType>,
+        req: &CreateMultipartUploadRequest,
     ) -> Result<CreateMultipartUploadResult, ServerError> {
+        let bucket = req.bucket;
+        let key = req.key;
+        let metadata = req.metadata;
+        let checksum_algorithm = req.checksum_algorithm;
+        let checksum_type = req.checksum_type;
         let _bucket_guard = self.storage_node.lock_bucket(bucket);
         let bucket_info = self.head_bucket(bucket)?;
 
@@ -5285,7 +5296,7 @@ mod tests {
         let key = "key-sparse";
         coord.create_bucket(bucket).unwrap();
         coord
-            .create_multipart_upload(bucket, key, &MetadataBlob::new(), None, None)
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket, key, metadata: &MetadataBlob::new(), checksum_algorithm: None, checksum_type: None })
             .unwrap();
 
         let resp = coord
@@ -6323,7 +6334,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let create = coord
-            .create_multipart_upload("bucket", "key", &MetadataBlob::new(), None, None)
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &MetadataBlob::new(), checksum_algorithm: None, checksum_type: None })
             .unwrap();
 
         // Build a part list with MAX_PARTS + 1 entries.
@@ -7548,7 +7559,7 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let result = coord
-            .create_multipart_upload("bucket", "key", &metadata, None, None)
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum_algorithm: None, checksum_type: None })
             .unwrap();
 
         // Upload ID should be 32 hex chars (16 random bytes).
@@ -7564,10 +7575,10 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let r1 = coord
-            .create_multipart_upload("bucket", "key", &metadata, None, None)
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum_algorithm: None, checksum_type: None })
             .unwrap();
         let r2 = coord
-            .create_multipart_upload("bucket", "key", &metadata, None, None)
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum_algorithm: None, checksum_type: None })
             .unwrap();
         assert_ne!(r1.upload_id, r2.upload_id);
     }
@@ -7579,7 +7590,7 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let err = coord
-            .create_multipart_upload("no-such-bucket", "key", &metadata, None, None)
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "no-such-bucket", key: "key", metadata: &metadata, checksum_algorithm: None, checksum_type: None })
             .unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
     }
@@ -7605,10 +7616,10 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let r1 = coord
-            .create_multipart_upload("bucket", "alpha", &metadata, None, None)
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "alpha", metadata: &metadata, checksum_algorithm: None, checksum_type: None })
             .unwrap();
         let r2 = coord
-            .create_multipart_upload("bucket", "beta", &metadata, None, None)
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "beta", metadata: &metadata, checksum_algorithm: None, checksum_type: None })
             .unwrap();
 
         let result = coord
@@ -7633,10 +7644,10 @@ mod tests {
         let metadata = MetadataBlob::new();
         // Create two uploads for the same key.
         let r1 = coord
-            .create_multipart_upload("bucket", "key", &metadata, None, None)
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum_algorithm: None, checksum_type: None })
             .unwrap();
         let r2 = coord
-            .create_multipart_upload("bucket", "key", &metadata, None, None)
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum_algorithm: None, checksum_type: None })
             .unwrap();
 
         let result = coord
@@ -7665,13 +7676,13 @@ mod tests {
         let metadata = MetadataBlob::new();
         // Create 3 uploads for distinct keys so ordering is deterministic.
         coord
-            .create_multipart_upload("bucket", "a", &metadata, None, None)
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "a", metadata: &metadata, checksum_algorithm: None, checksum_type: None })
             .unwrap();
         coord
-            .create_multipart_upload("bucket", "b", &metadata, None, None)
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "b", metadata: &metadata, checksum_algorithm: None, checksum_type: None })
             .unwrap();
         coord
-            .create_multipart_upload("bucket", "c", &metadata, None, None)
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "c", metadata: &metadata, checksum_algorithm: None, checksum_type: None })
             .unwrap();
 
         // Page 1: max_uploads=2.
@@ -7708,13 +7719,13 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         coord
-            .create_multipart_upload("bucket", "photos/a.jpg", &metadata, None, None)
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "photos/a.jpg", metadata: &metadata, checksum_algorithm: None, checksum_type: None })
             .unwrap();
         coord
-            .create_multipart_upload("bucket", "photos/b.jpg", &metadata, None, None)
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "photos/b.jpg", metadata: &metadata, checksum_algorithm: None, checksum_type: None })
             .unwrap();
         coord
-            .create_multipart_upload("bucket", "docs/readme.md", &metadata, None, None)
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "docs/readme.md", metadata: &metadata, checksum_algorithm: None, checksum_type: None })
             .unwrap();
 
         let result = coord
@@ -7732,7 +7743,7 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         coord
-            .create_multipart_upload("bucket", "key", &metadata, None, None)
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum_algorithm: None, checksum_type: None })
             .unwrap();
 
         let result = coord
@@ -7766,7 +7777,7 @@ mod tests {
         .unwrap();
 
         let result = coord
-            .create_multipart_upload("bucket", "photo.png", &metadata, None, None)
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "photo.png", metadata: &metadata, checksum_algorithm: None, checksum_type: None })
             .unwrap();
 
         // Verify we can retrieve the upload and its metadata blob is stored.
@@ -7790,7 +7801,7 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         coord
-            .create_multipart_upload("bucket", "key", &metadata, None, None)
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum_algorithm: None, checksum_type: None })
             .unwrap();
 
         // Bucket has no objects but has an in-progress MPU — should fail.
@@ -7824,7 +7835,7 @@ mod tests {
         let mut upload_ids = Vec::new();
         for _ in 0..3 {
             let r = coord
-                .create_multipart_upload("bucket", "key", &metadata, None, None)
+                .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum_algorithm: None, checksum_type: None })
                 .unwrap();
             upload_ids.push(r.upload_id);
         }
@@ -7877,7 +7888,7 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let create = coord
-            .create_multipart_upload("bucket", "key", &metadata, None, None)
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum_algorithm: None, checksum_type: None })
             .unwrap();
 
         let result = coord
@@ -7905,7 +7916,7 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let create = coord
-            .create_multipart_upload("bucket", "key", &metadata, None, None)
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum_algorithm: None, checksum_type: None })
             .unwrap();
 
         // First upload → generation 0.
@@ -7937,7 +7948,7 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let create = coord
-            .create_multipart_upload("bucket", "key", &metadata, None, None)
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum_algorithm: None, checksum_type: None })
             .unwrap();
 
         let err = coord
@@ -7954,7 +7965,7 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let create = coord
-            .create_multipart_upload("bucket", "key", &metadata, None, None)
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum_algorithm: None, checksum_type: None })
             .unwrap();
 
         let err = coord
@@ -7983,7 +7994,7 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let create = coord
-            .create_multipart_upload("bucket", "key", &metadata, None, None)
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum_algorithm: None, checksum_type: None })
             .unwrap();
 
         coord
@@ -8021,7 +8032,7 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let create = coord
-            .create_multipart_upload("bucket", "key", &metadata, None, None)
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum_algorithm: None, checksum_type: None })
             .unwrap();
 
         // Upload same part 4 times — generation should increment each time.
@@ -8047,7 +8058,7 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let create = coord
-            .create_multipart_upload("bucket", "key", &metadata, None, None)
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum_algorithm: None, checksum_type: None })
             .unwrap();
 
         // Part 1 (min valid).
@@ -8073,7 +8084,7 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let create = coord
-            .create_multipart_upload("bucket", "key", &metadata, None, None)
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum_algorithm: None, checksum_type: None })
             .unwrap();
 
         // Try uploading with wrong key — should be rejected even if upload_id is valid.
@@ -8098,7 +8109,7 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let create = coord
-            .create_multipart_upload("bucket", "key", &metadata, None, None)
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum_algorithm: None, checksum_type: None })
             .unwrap();
 
         // Simulate concurrent same-part uploads sequentially.
@@ -8140,7 +8151,7 @@ mod tests {
     ) -> (String, Vec<CompletePart>) {
         let metadata = MetadataBlob::new();
         let create = coord
-            .create_multipart_upload(bucket, key, &metadata, None, None)
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket, key, metadata: &metadata, checksum_algorithm: None, checksum_type: None })
             .unwrap();
         let mut complete_parts = Vec::new();
         for &(part_number, data) in part_data {
@@ -8310,7 +8321,7 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let create = coord
-            .create_multipart_upload("bucket", "key", &metadata, None, None)
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum_algorithm: None, checksum_type: None })
             .unwrap();
 
         let err = coord
@@ -8520,7 +8531,7 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let create = coord
-            .create_multipart_upload("bucket", "key", &metadata, None, None)
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum_algorithm: None, checksum_type: None })
             .unwrap();
 
         // First abort succeeds.
@@ -8547,7 +8558,7 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let create = coord
-            .create_multipart_upload("bucket", "key", &metadata, None, None)
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum_algorithm: None, checksum_type: None })
             .unwrap();
 
         let err = coord
@@ -8597,7 +8608,7 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let create = coord
-            .create_multipart_upload("bucket", "key", &metadata, None, None)
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum_algorithm: None, checksum_type: None })
             .unwrap();
         coord
             .upload_part(&UploadPartRequest { bucket: "bucket", key: "key", upload_id: &create.upload_id, part_number: 1, data: b"data", claimed_checksum: None })
@@ -8708,7 +8719,7 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let create = coord
-            .create_multipart_upload("bucket", "key", &metadata, None, None)
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum_algorithm: None, checksum_type: None })
             .unwrap();
 
         let err = coord
@@ -8743,7 +8754,7 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let create = coord
-            .create_multipart_upload("bucket", "key", &metadata, None, None)
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum_algorithm: None, checksum_type: None })
             .unwrap();
 
         // Upload part 1, then overwrite it.
@@ -8770,7 +8781,7 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let create = coord
-            .create_multipart_upload("bucket", "key", &metadata, None, None)
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum_algorithm: None, checksum_type: None })
             .unwrap();
         coord
             .upload_part(&UploadPartRequest { bucket: "bucket", key: "key", upload_id: &create.upload_id, part_number: 1, data: b"data", claimed_checksum: None })
@@ -8800,7 +8811,7 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let create = coord
-            .create_multipart_upload("bucket", "key", &metadata, None, None)
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum_algorithm: None, checksum_type: None })
             .unwrap();
 
         // Manually transition to Completing (simulates concurrent complete).
@@ -8838,7 +8849,7 @@ mod tests {
     ) -> CompleteMultipartUploadResult {
         let metadata = MetadataBlob::new();
         let create = coord
-            .create_multipart_upload(bucket, key, &metadata, None, None)
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket, key, metadata: &metadata, checksum_algorithm: None, checksum_type: None })
             .unwrap();
         let mut complete_parts = Vec::new();
         for (part_number, data) in part_data {
@@ -9253,7 +9264,7 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let create = coord
-            .create_multipart_upload(bucket, key, &metadata, Some(algo), ctype)
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket, key, metadata: &metadata, checksum_algorithm: Some(algo), checksum_type: ctype })
             .unwrap();
         let mut complete_parts = Vec::new();
         for (i, data) in part_data.iter().enumerate() {
@@ -10301,7 +10312,7 @@ mod tests {
 
         // Create a multipart upload for the destination.
         let upload = coord
-            .create_multipart_upload("bucket", "dst", &MetadataBlob::new(), None, None)
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "dst", metadata: &MetadataBlob::new(), checksum_algorithm: None, checksum_type: None })
             .unwrap();
 
         // UploadPartCopy from the stream-written source.
@@ -10426,7 +10437,7 @@ mod tests {
 
         // Create a multipart upload first.
         let mpu = coord
-            .create_multipart_upload("bucket", "key", &MetadataBlob::new(), None, None)
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &MetadataBlob::new(), checksum_algorithm: None, checksum_type: None })
             .unwrap();
 
         // Begin a streaming part session.
@@ -10478,7 +10489,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let mpu = coord
-            .create_multipart_upload("bucket", "key", &MetadataBlob::new(), None, None)
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &MetadataBlob::new(), checksum_algorithm: None, checksum_type: None })
             .unwrap();
 
         // Part 0 is invalid.
@@ -10538,7 +10549,7 @@ mod tests {
             .unwrap();
 
         let mpu = coord
-            .create_multipart_upload("bucket", "key", &MetadataBlob::new(), None, None)
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &MetadataBlob::new(), checksum_algorithm: None, checksum_type: None })
             .unwrap();
 
         let err = coord
@@ -10570,10 +10581,10 @@ mod tests {
 
         // Create two MPUs for the same key.
         let mpu_a = coord
-            .create_multipart_upload("bucket", "key", &metadata, None, None)
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum_algorithm: None, checksum_type: None })
             .unwrap();
         let mpu_b = coord
-            .create_multipart_upload("bucket", "key", &metadata, None, None)
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum_algorithm: None, checksum_type: None })
             .unwrap();
 
         // Helper: stream a single part with given data.
@@ -10656,7 +10667,7 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let mpu = coord
-            .create_multipart_upload("bucket", "key", &metadata, None, None)
+            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum_algorithm: None, checksum_type: None })
             .unwrap();
 
         // Upload a streaming part.

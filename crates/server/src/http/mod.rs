@@ -998,11 +998,13 @@ impl HttpFrontend {
                 }
 
                 let result = self.coordinator.create_multipart_upload(
-                    &bucket,
-                    &key,
-                    &metadata,
-                    checksum_algorithm,
-                    checksum_type,
+                    &crate::coordinator::CreateMultipartUploadRequest {
+                        bucket: &bucket,
+                        key: &key,
+                        metadata: &metadata,
+                        checksum_algorithm,
+                        checksum_type,
+                    },
                 )?;
                 Ok(S3Response::create_multipart_upload(
                     &bucket,
