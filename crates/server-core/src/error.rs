@@ -212,10 +212,12 @@ impl ServerError {
             Self::BucketNotEmpty => 409,
             Self::ObjectNotFound { .. } => 404,
             Self::DeleteMarkerHit { .. } => 404,
-            Self::Auth(auth::AuthError::MalformedAuth)
-            | Self::Auth(auth::AuthError::UnsupportedAuthType)
-            | Self::Auth(auth::AuthError::InvalidQueryParam { .. })
-            | Self::Auth(auth::AuthError::MissingQueryParam { .. }) => 400,
+            Self::Auth(
+                auth::AuthError::MalformedAuth
+                | auth::AuthError::UnsupportedAuthType
+                | auth::AuthError::InvalidQueryParam { .. }
+                | auth::AuthError::MissingQueryParam { .. },
+            ) => 400,
             Self::Auth(_) => 403,
             Self::InvalidRequest { .. }
             | Self::InvalidArgument { .. }

@@ -176,7 +176,7 @@ pub struct ServeConfig {
     /// idle timeout between keep-alive requests.
     pub header_read_timeout: Duration,
     /// Time a request will wait for a processing slot before being shed with
-    /// 503 SlowDown.
+    /// 503 `SlowDown`.
     pub request_wait_timeout: Duration,
     /// Per-frame idle timeout for body reads. Resets on every chunk so
     /// slow-but-steady uploads complete; only truly stalled connections are
@@ -211,8 +211,8 @@ struct ServerState {
 ///   acquired before body collection to bound memory.
 ///
 /// Connection-level timeouts prevent idle/slow clients from pinning slots.
-/// Requests that cannot acquire a processing slot within REQUEST_WAIT_TIMEOUT
-/// are shed with 503 SlowDown.
+/// Requests that cannot acquire a processing slot within `REQUEST_WAIT_TIMEOUT`
+/// are shed with 503 `SlowDown`.
 pub async fn serve(
     listener: TcpListener,
     frontends: Vec<HttpFrontend>,
@@ -244,7 +244,7 @@ pub async fn serve(
         let (stream, _addr) = match listener.accept().await {
             Ok(conn) => conn,
             Err(e) => {
-                eprintln!("accept error: {}", e);
+                eprintln!("accept error: {e}");
                 drop(conn_permit);
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
@@ -288,17 +288,16 @@ async fn handle(
     req: Request<Incoming>,
 ) -> Result<http::Response<Full<Bytes>>, Infallible> {
     // Acquire request permit before body collection to bound memory.
-    let _req_permit = match tokio::time::timeout(
+    let _req_permit = if let Ok(Ok(permit)) = tokio::time::timeout(
         state.config.request_wait_timeout,
         state.request_semaphore.acquire(),
     )
     .await
     {
-        Ok(Ok(permit)) => permit,
-        _ => {
-            let resp = S3Response::error(&ServerError::SlowDown, "");
-            return Ok(s3_response_to_hyper(resp));
-        }
+        permit
+    } else {
+        let resp = S3Response::error(&ServerError::SlowDown, "");
+        return Ok(s3_response_to_hyper(resp));
     };
 
     let (parts, body) = req.into_parts();
@@ -369,8 +368,8 @@ async fn handle(
 
 /// Check if a PUT request should use the streaming write path.
 ///
-/// Returns a `StreamingWriteOp` for PutObject and UploadPart requests that:
-/// - Are not CopyObject (no `x-amz-copy-source` header)
+/// Returns a `StreamingWriteOp` for `PutObject` and `UploadPart` requests that:
+/// - Are not `CopyObject` (no `x-amz-copy-source` header)
 /// - Use UNSIGNED-PAYLOAD or a STREAMING-* aws-chunked content hash
 ///
 fn is_streaming_write(parts: &http::request::Parts) -> Option<StreamingWriteOp> {
@@ -391,20 +390,21 @@ fn is_streaming_write(parts: &http::request::Parts) -> Option<StreamingWriteOp> 
 
     let chunked = match content_sha256 {
         Some("UNSIGNED-PAYLOAD") => ChunkedMode::None,
-        Some("STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
-        | Some("STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER")
-        | Some("STREAMING-UNSIGNED-PAYLOAD-TRAILER") => {
+        Some(
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
+            | "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"
+            | "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+        ) => {
             // Validate aws-chunked preconditions before routing to streaming path.
             // content-encoding must contain aws-chunked.
             let has_aws_chunked = parts
                 .headers
                 .get("content-encoding")
                 .and_then(|v| v.to_str().ok())
-                .map(|ce| {
+                .is_some_and(|ce| {
                     ce.split(',')
                         .any(|part| part.trim().eq_ignore_ascii_case("aws-chunked"))
-                })
-                .unwrap_or(false);
+                });
             if !has_aws_chunked {
                 return None; // Will fall through to buffered path which returns proper error
             }
@@ -468,7 +468,7 @@ fn extract_query_param(query: &str, name: &str) -> Option<String> {
     None
 }
 
-/// Handle a streaming PutObject: read body frame-by-frame, feed chunks to
+/// Handle a streaming `PutObject`: read body frame-by-frame, feed chunks to
 /// coordinator append API, finalize atomically.
 ///
 /// Each chunk append is dispatched via `spawn_blocking` with a brief frontend
@@ -711,7 +711,7 @@ async fn abort_streaming(state: &Arc<ServerState>, ctx: &Arc<super::StreamingPut
     .await;
 }
 
-/// Handle a streaming UploadPart: read body frame-by-frame, feed chunks to
+/// Handle a streaming `UploadPart`: read body frame-by-frame, feed chunks to
 /// coordinator append API, finalize atomically.
 #[allow(clippy::too_many_arguments)]
 async fn handle_streaming_part(
@@ -964,7 +964,7 @@ async fn handle_streaming_part(
     }
 }
 
-/// Best-effort abort of a streaming UploadPart session.
+/// Best-effort abort of a streaming `UploadPart` session.
 async fn abort_streaming_part_ctx(
     state: &Arc<ServerState>,
     ctx: &Arc<super::StreamingPartContext>,
@@ -1033,10 +1033,7 @@ fn validate_chunked_post_decode(
 
         if content_trailers.is_empty() {
             return Err(ServerError::MalformedTrailerError {
-                reason: format!(
-                    "x-amz-trailer header declares {} but no trailers in body",
-                    declared
-                ),
+                reason: format!("x-amz-trailer header declares {declared} but no trailers in body"),
             });
         }
 
@@ -1044,10 +1041,7 @@ fn validate_chunked_post_decode(
         for (name, _) in &content_trailers {
             if !declared_names.iter().any(|d| d == name.as_str()) {
                 return Err(ServerError::MalformedTrailerError {
-                    reason: format!(
-                        "undeclared trailer in body: {} (declared: {})",
-                        name, declared
-                    ),
+                    reason: format!("undeclared trailer in body: {name} (declared: {declared})"),
                 });
             }
         }
@@ -1058,8 +1052,7 @@ fn validate_chunked_post_decode(
             if !body_names.contains(&name.as_str()) {
                 return Err(ServerError::MalformedTrailerError {
                     reason: format!(
-                        "declared trailer missing from body: {} (declared: {})",
-                        name, declared
+                        "declared trailer missing from body: {name} (declared: {declared})"
                     ),
                 });
             }
@@ -1160,7 +1153,7 @@ fn make_chunked_decoder(
     }
 }
 
-/// Acquire a frontend from the pool using round-robin with try_lock.
+/// Acquire a frontend from the pool using round-robin with `try_lock`.
 fn acquire_frontend(state: &ServerState) -> MutexGuard<'_, HttpFrontend> {
     let pool_size = state.pool.len();
     let start = state.counter.fetch_add(1, Ordering::Relaxed) % pool_size;
@@ -1598,7 +1591,10 @@ mod tests {
         let expected = checksum::crc32c::checksum(b"");
         let hasher = TrailingChecksumHasher::from_trailer_header("x-amz-checksum-crc32c").unwrap();
         let cksum = hasher.finalize_raw();
-        assert_eq!(u32::from_be_bytes(cksum.bytes().try_into().unwrap()), expected);
+        assert_eq!(
+            u32::from_be_bytes(cksum.bytes().try_into().unwrap()),
+            expected
+        );
     }
 
     #[test]
@@ -1612,7 +1608,10 @@ mod tests {
         hasher.update(data);
         let cksum = hasher.finalize_raw();
         assert_eq!(cksum.algorithm(), storage::ChecksumAlgorithm::Crc32);
-        assert_eq!(u32::from_be_bytes(cksum.bytes().try_into().unwrap()), expected);
+        assert_eq!(
+            u32::from_be_bytes(cksum.bytes().try_into().unwrap()),
+            expected
+        );
     }
 
     #[test]
@@ -1625,7 +1624,10 @@ mod tests {
         hasher.update(data);
         let cksum = hasher.finalize_raw();
         assert_eq!(cksum.algorithm(), storage::ChecksumAlgorithm::Crc64nvme);
-        assert_eq!(u64::from_be_bytes(cksum.bytes().try_into().unwrap()), expected);
+        assert_eq!(
+            u64::from_be_bytes(cksum.bytes().try_into().unwrap()),
+            expected
+        );
     }
 
     #[test]

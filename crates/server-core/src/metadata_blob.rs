@@ -86,8 +86,7 @@ impl MetadataBlob {
                 if has_invalid_header_bytes(value) {
                     return Err(ServerError::InvalidRequest {
                         reason: format!(
-                            "metadata value for '{}' contains invalid header bytes",
-                            lower
+                            "metadata value for '{lower}' contains invalid header bytes"
                         ),
                     });
                 }
@@ -206,7 +205,7 @@ impl MetadataBlob {
         pos += 1;
         if version != FORMAT_VERSION {
             return Err(ServerError::MetadataBlobError {
-                reason: format!("unknown metadata blob version: {}", version),
+                reason: format!("unknown metadata blob version: {version}"),
             });
         }
 

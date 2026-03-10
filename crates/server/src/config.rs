@@ -17,16 +17,16 @@ pub struct ServerConfig {
 impl ServerConfig {
     /// Load configuration from environment variables.
     ///
-    /// Required: ARGMIN_ACCESS_KEY_ID, ARGMIN_SECRET_ACCESS_KEY
+    /// Required: `ARGMIN_ACCESS_KEY_ID`, `ARGMIN_SECRET_ACCESS_KEY`
     /// Optional (with defaults):
-    ///   ARGMIN_LISTEN_ADDR (127.0.0.1:9000)
-    ///   ARGMIN_DATA_DIR (./data)
-    ///   ARGMIN_PG_COUNT (16)
-    ///   ARGMIN_EC_K (4)
-    ///   ARGMIN_EC_M (2)
-    ///   ARGMIN_REGION (us-east-1)
-    ///   ARGMIN_WORKERS (4)
-    ///   ARGMIN_MAX_CONNECTIONS (512)
+    ///   `ARGMIN_LISTEN_ADDR` (127.0.0.1:9000)
+    ///   `ARGMIN_DATA_DIR` (./data)
+    ///   `ARGMIN_PG_COUNT` (16)
+    ///   `ARGMIN_EC_K` (4)
+    ///   `ARGMIN_EC_M` (2)
+    ///   `ARGMIN_REGION` (us-east-1)
+    ///   `ARGMIN_WORKERS` (4)
+    ///   `ARGMIN_MAX_CONNECTIONS` (512)
     pub fn from_env() -> Result<Self, String> {
         Self::from_lookup(|key| std::env::var(key).ok())
     }
@@ -44,24 +44,24 @@ impl ServerConfig {
         let pg_count: u32 = get("ARGMIN_PG_COUNT")
             .unwrap_or_else(|| "16".to_string())
             .parse()
-            .map_err(|e| format!("invalid ARGMIN_PG_COUNT: {}", e))?;
+            .map_err(|e| format!("invalid ARGMIN_PG_COUNT: {e}"))?;
         let ec_k: u8 = get("ARGMIN_EC_K")
             .unwrap_or_else(|| "4".to_string())
             .parse()
-            .map_err(|e| format!("invalid ARGMIN_EC_K: {}", e))?;
+            .map_err(|e| format!("invalid ARGMIN_EC_K: {e}"))?;
         let ec_m: u8 = get("ARGMIN_EC_M")
             .unwrap_or_else(|| "2".to_string())
             .parse()
-            .map_err(|e| format!("invalid ARGMIN_EC_M: {}", e))?;
+            .map_err(|e| format!("invalid ARGMIN_EC_M: {e}"))?;
         let region = get("ARGMIN_REGION").unwrap_or_else(|| "us-east-1".to_string());
         let workers: u32 = get("ARGMIN_WORKERS")
             .unwrap_or_else(|| "4".to_string())
             .parse()
-            .map_err(|e| format!("invalid ARGMIN_WORKERS: {}", e))?;
+            .map_err(|e| format!("invalid ARGMIN_WORKERS: {e}"))?;
         let max_connections: u32 = get("ARGMIN_MAX_CONNECTIONS")
             .unwrap_or_else(|| "512".to_string())
             .parse()
-            .map_err(|e| format!("invalid ARGMIN_MAX_CONNECTIONS: {}", e))?;
+            .map_err(|e| format!("invalid ARGMIN_MAX_CONNECTIONS: {e}"))?;
 
         if pg_count == 0 {
             return Err("ARGMIN_PG_COUNT must be > 0".to_string());
@@ -110,7 +110,7 @@ mod tests {
     }
 
     fn lookup<'a>(m: &'a HashMap<&'a str, &'a str>) -> impl Fn(&str) -> Option<String> + 'a {
-        move |key| m.get(key).map(|v| v.to_string())
+        move |key| m.get(key).map(std::string::ToString::to_string)
     }
 
     #[test]

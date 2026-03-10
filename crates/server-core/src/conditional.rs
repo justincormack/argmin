@@ -189,10 +189,10 @@ pub fn check_write_conditions(
         WriteCondition::IfMatch(required_etag) => match existing_etag {
             None => Err(ServerError::PreconditionFailed),
             Some(obj_etag) => {
-                if !etags_match(required_etag.as_str(), obj_etag) {
-                    Err(ServerError::PreconditionFailed)
-                } else {
+                if etags_match(required_etag.as_str(), obj_etag) {
                     Ok(())
+                } else {
+                    Err(ServerError::PreconditionFailed)
                 }
             }
         },

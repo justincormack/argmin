@@ -21,7 +21,7 @@ pub fn read_condition_from_headers(req: &S3Request) -> ReadCondition {
 /// Extract write conditions from an S3 request's headers.
 ///
 /// AWS S3 only supports `If-Match: <etag>` and `If-None-Match: *` on writes.
-/// `If-Match: *` and `If-None-Match: <etag>` return 501 NotImplemented.
+/// `If-Match: *` and `If-None-Match: <etag>` return 501 `NotImplemented`.
 pub fn write_condition_from_headers(req: &S3Request) -> Result<WriteCondition, ServerError> {
     let if_match = req.header("if-match");
     let if_none_match = req.header("if-none-match");
@@ -65,9 +65,9 @@ pub fn write_condition_from_headers(req: &S3Request) -> Result<WriteCondition, S
 
 /// Extract delete conditions from an S3 request's headers.
 ///
-/// AWS S3 only supports `If-Match` on DeleteObject (general-purpose buckets).
+/// AWS S3 only supports `If-Match` on `DeleteObject` (general-purpose buckets).
 /// `x-amz-if-match-last-modified-time` and `x-amz-if-match-size` are
-/// directory-bucket-only features and return 501 NotImplemented.
+/// directory-bucket-only features and return 501 `NotImplemented`.
 pub fn delete_condition_from_headers(req: &S3Request) -> Result<DeleteCondition, ServerError> {
     if req.header("x-amz-if-match-last-modified-time").is_some() {
         return Err(ServerError::NotImplemented {

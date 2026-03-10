@@ -629,7 +629,7 @@ mod tests {
     #[test]
     fn object_key_too_long() {
         let long_key = "k".repeat(1025);
-        let path = format!("/bucket/{}", long_key);
+        let path = format!("/bucket/{long_key}");
         assert!(route("GET", &path, "").is_err());
     }
 

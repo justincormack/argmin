@@ -15,14 +15,14 @@ async fn main() {
     let config = match ServerConfig::from_env() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("configuration error: {}", e);
+            eprintln!("configuration error: {e}");
             std::process::exit(1);
         }
     };
 
     // EC self-test
     if let Err(e) = ec::self_test() {
-        eprintln!("EC self-test failed: {}", e);
+        eprintln!("EC self-test failed: {e}");
         std::process::exit(1);
     }
 
@@ -30,7 +30,7 @@ async fn main() {
     let ec_config = match EcConfig::new(config.ec_k, config.ec_m) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("invalid EC config: {}", e);
+            eprintln!("invalid EC config: {e}");
             std::process::exit(1);
         }
     };
@@ -42,7 +42,7 @@ async fn main() {
     let storage_node = match SharedStorageNode::open(data_dir, &pg_ids) {
         Ok(s) => Arc::new(s),
         Err(e) => {
-            eprintln!("failed to open storage: {}", e);
+            eprintln!("failed to open storage: {e}");
             std::process::exit(1);
         }
     };
@@ -55,7 +55,7 @@ async fn main() {
             match Coordinator::new(Arc::clone(&storage_node), ec_config, config.region.clone()) {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("failed to create coordinator: {}", e);
+                    eprintln!("failed to create coordinator: {e}");
                     std::process::exit(1);
                 }
             };

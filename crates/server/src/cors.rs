@@ -24,6 +24,7 @@ pub struct CorsConfiguration {
 /// Match a value against a pattern that may contain at most one `*` wildcard.
 ///
 /// The wildcard matches zero or more characters. Matching is case-sensitive.
+#[must_use]
 pub fn wildcard_match(pattern: &str, value: &str) -> bool {
     if pattern == "*" {
         return true;
@@ -46,6 +47,7 @@ pub fn wildcard_match(pattern: &str, value: &str) -> bool {
 /// For actual requests, pass an empty slice.
 ///
 /// Returns the matching origin pattern if matched, or `None`.
+#[must_use]
 pub fn match_rule<'a>(
     rule: &'a CorsRule,
     origin: &str,
@@ -94,6 +96,7 @@ pub struct CorsMatch<'a> {
 /// Find the first matching CORS rule for the given request parameters.
 ///
 /// Returns `None` if no rule matches (no CORS headers should be added).
+#[must_use]
 pub fn find_matching_rule<'a>(
     config: &'a CorsConfiguration,
     origin: &str,
@@ -114,6 +117,7 @@ pub fn find_matching_rule<'a>(
 /// Build CORS response headers for a preflight (OPTIONS) request.
 ///
 /// `matched_origin` is the origin pattern from the rule that matched the request.
+#[must_use]
 pub fn preflight_response_headers(
     rule: &CorsRule,
     origin: &str,
@@ -164,6 +168,7 @@ pub fn preflight_response_headers(
 /// Build CORS response headers for an actual (non-preflight) request.
 ///
 /// `matched_origin` is the origin pattern from the rule that matched the request.
+#[must_use]
 pub fn actual_response_headers(
     rule: &CorsRule,
     origin: &str,

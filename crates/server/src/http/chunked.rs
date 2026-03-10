@@ -155,13 +155,13 @@ fn parse_chunk_header(line: &[u8]) -> Result<(usize, Option<String>), ServerErro
 
     let size = usize::from_str_radix(size_part.trim(), 16).map_err(|_| {
         ServerError::MalformedChunkedBody {
-            reason: format!("invalid chunk size: {}", size_part),
+            reason: format!("invalid chunk size: {size_part}"),
         }
     })?;
 
     let sig = rest.and_then(|ext| {
         ext.strip_prefix("chunk-signature=")
-            .map(|hex| hex.to_string())
+            .map(std::string::ToString::to_string)
     });
 
     Ok((size, sig))
@@ -238,7 +238,7 @@ fn verify_chunk_signature(
 /// ```text
 /// AWS4-HMAC-SHA256-TRAILER\n{timestamp}\n{scope}\n{prev_sig}\n{sha256(canonical_trailers)}
 /// ```
-/// where canonical_trailers is the sorted non-signature trailer headers, each as
+/// where `canonical_trailers` is the sorted non-signature trailer headers, each as
 /// `key:value\n`.
 fn verify_trailer_signature(
     ctx: &StreamingSigningContext,
@@ -271,7 +271,7 @@ fn verify_trailer_signature(
     sorted_trailers.sort_by(|a, b| a.0.cmp(&b.0));
     let canonical: String = sorted_trailers
         .iter()
-        .map(|(k, v)| format!("{}:{}\n", k, v))
+        .map(|(k, v)| format!("{k}:{v}\n"))
         .collect();
 
     let trailer_hash = auth::canonical::sha256_hex(canonical.as_bytes());
@@ -334,6 +334,7 @@ enum ChunkedDecoderState {
 }
 
 impl IncrementalChunkedDecoder {
+    #[must_use]
     pub fn new(streaming: Option<StreamingSigningContext>, trailer_mode: bool) -> Self {
         let prev_sig = streaming.as_ref().map(|s| s.seed_signature.clone());
         Self {
@@ -516,11 +517,13 @@ impl IncrementalChunkedDecoder {
     }
 
     /// Check if decoding is complete (terminal chunk + trailers processed).
+    #[must_use]
     pub fn is_done(&self) -> bool {
         self.done
     }
 
     /// Consume the decoder and return trailers. Panics if not done.
+    #[must_use]
     pub fn into_trailers(self) -> Vec<(String, String)> {
         self.trailers
     }
@@ -603,7 +606,7 @@ mod tests {
         let region = "us-east-1";
         let service = "s3";
         let timestamp = "20130524T000000Z";
-        let scope = format!("{}/{}/{}/aws4_request", date, region, service);
+        let scope = format!("{date}/{region}/{service}/aws4_request");
 
         // Derive signing key.
         let signing_key = auth::sigv4::derive_signing_key(
@@ -629,8 +632,7 @@ mod tests {
         let empty_hash = auth::canonical::sha256_hex(b"");
         let chunk_hash = auth::canonical::sha256_hex(chunk_data);
         let sts = format!(
-            "AWS4-HMAC-SHA256-PAYLOAD\n{}\n{}\n{}\n{}\n{}",
-            timestamp, scope, seed_sig, empty_hash, chunk_hash
+            "AWS4-HMAC-SHA256-PAYLOAD\n{timestamp}\n{scope}\n{seed_sig}\n{empty_hash}\n{chunk_hash}"
         );
         let key = hmac::Key::new(hmac::HMAC_SHA256, &key_bytes);
         let chunk_sig = hex_encode(hmac::sign(&key, sts.as_bytes()).as_ref());
@@ -638,14 +640,12 @@ mod tests {
         // Compute terminal chunk signature (size=0, data=empty).
         let terminal_hash = auth::canonical::sha256_hex(b"");
         let sts_terminal = format!(
-            "AWS4-HMAC-SHA256-PAYLOAD\n{}\n{}\n{}\n{}\n{}",
-            timestamp, scope, chunk_sig, empty_hash, terminal_hash
+            "AWS4-HMAC-SHA256-PAYLOAD\n{timestamp}\n{scope}\n{chunk_sig}\n{empty_hash}\n{terminal_hash}"
         );
         let terminal_sig = hex_encode(hmac::sign(&key, sts_terminal.as_bytes()).as_ref());
 
         let wire = format!(
-            "5;chunk-signature={}\r\nHello\r\n0;chunk-signature={}\r\n\r\n",
-            chunk_sig, terminal_sig
+            "5;chunk-signature={chunk_sig}\r\nHello\r\n0;chunk-signature={terminal_sig}\r\n\r\n"
         );
 
         let result = decode_chunked_body(wire.as_bytes(), Some(&ctx), false).unwrap();
@@ -698,7 +698,7 @@ mod tests {
         let region = "us-east-1";
         let service = "s3";
         let timestamp = "20130524T000000Z";
-        let scope = format!("{}/{}/{}/aws4_request", date, region, service);
+        let scope = format!("{date}/{region}/{service}/aws4_request");
 
         let signing_key = auth::sigv4::derive_signing_key(
             &auth::SecretKey::new(secret.to_string()),
@@ -724,16 +724,14 @@ mod tests {
 
         // Chunk signature.
         let sts = format!(
-            "AWS4-HMAC-SHA256-PAYLOAD\n{}\n{}\n{}\n{}\n{}",
-            timestamp, scope, seed_sig, empty_hash, chunk_hash
+            "AWS4-HMAC-SHA256-PAYLOAD\n{timestamp}\n{scope}\n{seed_sig}\n{empty_hash}\n{chunk_hash}"
         );
         let chunk_sig = hex_encode(hmac::sign(&key, sts.as_bytes()).as_ref());
 
         // Terminal chunk signature.
         let terminal_hash = auth::canonical::sha256_hex(b"");
         let sts_terminal = format!(
-            "AWS4-HMAC-SHA256-PAYLOAD\n{}\n{}\n{}\n{}\n{}",
-            timestamp, scope, chunk_sig, empty_hash, terminal_hash
+            "AWS4-HMAC-SHA256-PAYLOAD\n{timestamp}\n{scope}\n{chunk_sig}\n{empty_hash}\n{terminal_hash}"
         );
         let terminal_sig = hex_encode(hmac::sign(&key, sts_terminal.as_bytes()).as_ref());
 
@@ -741,14 +739,12 @@ mod tests {
         let canonical_trailers = "x-amz-checksum-crc32:abcd1234\n";
         let trailer_hash = auth::canonical::sha256_hex(canonical_trailers.as_bytes());
         let sts_trailer = format!(
-            "AWS4-HMAC-SHA256-TRAILER\n{}\n{}\n{}\n{}",
-            timestamp, scope, terminal_sig, trailer_hash
+            "AWS4-HMAC-SHA256-TRAILER\n{timestamp}\n{scope}\n{terminal_sig}\n{trailer_hash}"
         );
         let trailer_sig = hex_encode(hmac::sign(&key, sts_trailer.as_bytes()).as_ref());
 
         let wire = format!(
-            "5;chunk-signature={}\r\nHello\r\n0;chunk-signature={}\r\nx-amz-checksum-crc32:abcd1234\r\nx-amz-trailer-signature:{}\r\n\r\n",
-            chunk_sig, terminal_sig, trailer_sig
+            "5;chunk-signature={chunk_sig}\r\nHello\r\n0;chunk-signature={terminal_sig}\r\nx-amz-checksum-crc32:abcd1234\r\nx-amz-trailer-signature:{trailer_sig}\r\n\r\n"
         );
 
         let result = decode_chunked_body(wire.as_bytes(), Some(&ctx), true).unwrap();
@@ -766,7 +762,7 @@ mod tests {
         let region = "us-east-1";
         let service = "s3";
         let timestamp = "20130524T000000Z";
-        let scope = format!("{}/{}/{}/aws4_request", date, region, service);
+        let scope = format!("{date}/{region}/{service}/aws4_request");
 
         let signing_key = auth::sigv4::derive_signing_key(
             &auth::SecretKey::new(secret.to_string()),
@@ -791,15 +787,13 @@ mod tests {
         let key = hmac::Key::new(hmac::HMAC_SHA256, &key_bytes);
 
         let sts = format!(
-            "AWS4-HMAC-SHA256-PAYLOAD\n{}\n{}\n{}\n{}\n{}",
-            timestamp, scope, seed_sig, empty_hash, chunk_hash
+            "AWS4-HMAC-SHA256-PAYLOAD\n{timestamp}\n{scope}\n{seed_sig}\n{empty_hash}\n{chunk_hash}"
         );
         let chunk_sig = hex_encode(hmac::sign(&key, sts.as_bytes()).as_ref());
 
         let terminal_hash = auth::canonical::sha256_hex(b"");
         let sts_terminal = format!(
-            "AWS4-HMAC-SHA256-PAYLOAD\n{}\n{}\n{}\n{}\n{}",
-            timestamp, scope, chunk_sig, empty_hash, terminal_hash
+            "AWS4-HMAC-SHA256-PAYLOAD\n{timestamp}\n{scope}\n{chunk_sig}\n{empty_hash}\n{terminal_hash}"
         );
         let terminal_sig = hex_encode(hmac::sign(&key, sts_terminal.as_bytes()).as_ref());
 
@@ -807,8 +801,7 @@ mod tests {
         let bad_trailer_sig = "0".repeat(64);
 
         let wire = format!(
-            "5;chunk-signature={}\r\nHello\r\n0;chunk-signature={}\r\nx-amz-checksum-crc32:abcd1234\r\nx-amz-trailer-signature:{}\r\n\r\n",
-            chunk_sig, terminal_sig, bad_trailer_sig
+            "5;chunk-signature={chunk_sig}\r\nHello\r\n0;chunk-signature={terminal_sig}\r\nx-amz-checksum-crc32:abcd1234\r\nx-amz-trailer-signature:{bad_trailer_sig}\r\n\r\n"
         );
 
         let err = decode_chunked_body(wire.as_bytes(), Some(&ctx), true).unwrap_err();
@@ -851,7 +844,7 @@ mod tests {
         let mut dec = IncrementalChunkedDecoder::new(None, false);
         let wire = b"5\r\nhello\r\n0\r\n\r\n";
         let mut all_payload = Vec::new();
-        for &b in wire.iter() {
+        for &b in wire {
             let chunk = dec.feed(&[b]).unwrap();
             all_payload.extend_from_slice(&chunk);
         }
@@ -918,7 +911,7 @@ mod tests {
         let region = "us-east-1";
         let service = "s3";
         let timestamp = "20130524T000000Z";
-        let scope = format!("{}/{}/{}/aws4_request", date, region, service);
+        let scope = format!("{date}/{region}/{service}/aws4_request");
 
         let signing_key = auth::sigv4::derive_signing_key(
             &auth::SecretKey::new(secret.to_string()),
@@ -943,21 +936,18 @@ mod tests {
         let key = hmac::Key::new(hmac::HMAC_SHA256, &key_bytes);
 
         let sts = format!(
-            "AWS4-HMAC-SHA256-PAYLOAD\n{}\n{}\n{}\n{}\n{}",
-            timestamp, scope, seed_sig, empty_hash, chunk_hash
+            "AWS4-HMAC-SHA256-PAYLOAD\n{timestamp}\n{scope}\n{seed_sig}\n{empty_hash}\n{chunk_hash}"
         );
         let chunk_sig = hex_encode(hmac::sign(&key, sts.as_bytes()).as_ref());
 
         let terminal_hash = auth::canonical::sha256_hex(b"");
         let sts_terminal = format!(
-            "AWS4-HMAC-SHA256-PAYLOAD\n{}\n{}\n{}\n{}\n{}",
-            timestamp, scope, chunk_sig, empty_hash, terminal_hash
+            "AWS4-HMAC-SHA256-PAYLOAD\n{timestamp}\n{scope}\n{chunk_sig}\n{empty_hash}\n{terminal_hash}"
         );
         let terminal_sig = hex_encode(hmac::sign(&key, sts_terminal.as_bytes()).as_ref());
 
         let wire = format!(
-            "5;chunk-signature={}\r\nHello\r\n0;chunk-signature={}\r\n\r\n",
-            chunk_sig, terminal_sig
+            "5;chunk-signature={chunk_sig}\r\nHello\r\n0;chunk-signature={terminal_sig}\r\n\r\n"
         );
 
         let mut dec = IncrementalChunkedDecoder::new(Some(ctx), false);

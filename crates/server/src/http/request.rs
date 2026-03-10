@@ -10,7 +10,7 @@ fn validate_content_length(value: &str) -> Result<u64, ServerError> {
     value
         .parse::<u64>()
         .map_err(|_| ServerError::InvalidRequest {
-            reason: format!("invalid Content-Length: {}", value),
+            reason: format!("invalid Content-Length: {value}"),
         })
 }
 
@@ -24,7 +24,7 @@ pub struct S3Request {
 }
 
 impl S3Request {
-    /// Parse hyper request parts and collected body into an S3Request.
+    /// Parse hyper request parts and collected body into an `S3Request`.
     ///
     /// Body size limiting is done by the caller (serve layer) via `http_body_util::Limited`.
     pub fn from_hyper(
@@ -49,7 +49,7 @@ impl S3Request {
                 Ok(s) => s.to_string(),
                 Err(_) => std::str::from_utf8(value.as_bytes())
                     .map_err(|_| ServerError::InvalidRequest {
-                        reason: format!("invalid UTF-8 in header value for {}", name),
+                        reason: format!("invalid UTF-8 in header value for {name}"),
                     })?
                     .to_string(),
             };
@@ -72,7 +72,7 @@ impl S3Request {
         })
     }
 
-    /// Parse hyper request parts into an S3Request with an empty body.
+    /// Parse hyper request parts into an `S3Request` with an empty body.
     ///
     /// Used by the streaming write path where the body is consumed frame-by-frame
     /// rather than collected upfront. Auth works because the `x-amz-content-sha256`
@@ -82,6 +82,7 @@ impl S3Request {
     }
 
     /// Get a header value by lowercase name.
+    #[must_use]
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
@@ -89,11 +90,12 @@ impl S3Request {
             .map(|(_, v)| v.as_str())
     }
 
-    /// Get the body hash for SigV4 canonical request.
+    /// Get the body hash for `SigV4` canonical request.
     ///
     /// If the client sends `x-amz-content-sha256: UNSIGNED-PAYLOAD`, the literal
     /// string "UNSIGNED-PAYLOAD" is used in the canonical request (not the actual
     /// body hash). Otherwise, use the provided hash or compute from body.
+    #[must_use]
     pub fn body_hash(&self) -> String {
         match self.header("x-amz-content-sha256") {
             Some("UNSIGNED-PAYLOAD") => "UNSIGNED-PAYLOAD".to_string(),
@@ -102,8 +104,9 @@ impl S3Request {
         }
     }
 
-    /// Create a new S3Request with a decoded body and trailer headers,
+    /// Create a new `S3Request` with a decoded body and trailer headers,
     /// stripping `aws-chunked` from Content-Encoding.
+    #[must_use]
     pub fn with_decoded_body(&self, body: Vec<u8>, trailers: Vec<(String, String)>) -> Self {
         let mut headers: Vec<(String, String)> = self
             .headers
@@ -113,7 +116,7 @@ impl S3Request {
                     // Strip "aws-chunked" from Content-Encoding.
                     let filtered: Vec<&str> = v
                         .split(',')
-                        .map(|s| s.trim())
+                        .map(str::trim)
                         .filter(|s| !s.eq_ignore_ascii_case("aws-chunked"))
                         .collect();
                     if filtered.is_empty() {
@@ -152,6 +155,7 @@ impl S3Request {
     }
 
     /// Get headers as borrowed pairs for auth verification.
+    #[must_use]
     pub fn header_pairs(&self) -> Vec<(&str, &str)> {
         self.headers
             .iter()
@@ -160,6 +164,7 @@ impl S3Request {
     }
 
     /// Get query parameter by name.
+    #[must_use]
     pub fn query_param(&self, name: &str) -> Option<String> {
         self.query_string
             .split('&')
@@ -227,7 +232,7 @@ pub(crate) fn parse_copy_source(
             let vid = query
                 .split('&')
                 .find_map(|param| param.strip_prefix("versionId="))
-                .map(|v| v.to_string());
+                .map(std::string::ToString::to_string);
             (&s[..pos], vid)
         }
         None => (s, None),
@@ -531,7 +536,7 @@ mod tests {
             http::HeaderValue::from_bytes(b"caf\xc3\xa9").unwrap(),
         );
         let uri = http::Uri::from_static("/bucket/key");
-        let (mut parts, _) = http::Request::builder()
+        let (mut parts, ()) = http::Request::builder()
             .method("GET")
             .uri(uri)
             .body(())
@@ -554,7 +559,7 @@ mod tests {
             http::HeaderValue::from_bytes(b"val\x80").unwrap(),
         );
         let uri = http::Uri::from_static("/bucket/key");
-        let (mut parts, _) = http::Request::builder()
+        let (mut parts, ()) = http::Request::builder()
             .method("GET")
             .uri(uri)
             .body(())
@@ -565,8 +570,7 @@ mod tests {
             Err(ServerError::InvalidRequest { reason }) => {
                 assert!(
                     reason.contains("invalid UTF-8") && reason.contains("x-amz-meta-raw"),
-                    "unexpected reason: {}",
-                    reason
+                    "unexpected reason: {reason}"
                 );
             }
             other => panic!("expected InvalidRequest, got {:?}", other.err()),

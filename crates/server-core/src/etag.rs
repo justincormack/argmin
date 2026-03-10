@@ -3,7 +3,7 @@
 ///
 /// Example: `format_etag(0xABCDEF1234567890)` → `"\"abcdef1234567890\""`
 pub fn format_etag(crc64: u64) -> String {
-    format!("\"{:016x}\"", crc64)
+    format!("\"{crc64:016x}\"")
 }
 
 /// Parse a quoted hex ETag string back to a CRC64-NVME value.

@@ -12,6 +12,7 @@ pub struct PostFormData {
 }
 
 /// Extract the multipart boundary string from a Content-Type header value.
+#[must_use]
 pub fn extract_boundary(content_type: &str) -> Option<&str> {
     if !content_type
         .split(';')
@@ -198,6 +199,7 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 impl PostFormData {
     /// Get a form field value by name (case-insensitive).
+    #[must_use]
     pub fn field(&self, name: &str) -> Option<&str> {
         self.fields
             .iter()

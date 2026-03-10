@@ -10,6 +10,7 @@ use storage::{BucketInfo, BucketVersioningState, ChecksumAlgorithm};
 use super::response::format_version_id;
 
 /// Format a POST Object 201 response XML.
+#[must_use]
 pub fn post_response_xml(bucket: &str, key: &str, etag: &str) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -25,6 +26,7 @@ pub fn post_response_xml(bucket: &str, key: &str, etag: &str) -> String {
 }
 
 /// Format an S3 error response XML.
+#[must_use]
 pub fn error_xml(code: &str, message: &str, resource: &str, request_id: &str) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -41,7 +43,8 @@ pub fn error_xml(code: &str, message: &str, resource: &str, request_id: &str) ->
     )
 }
 
-/// Format a ListAllMyBucketsResult XML response.
+/// Format a `ListAllMyBucketsResult` XML response.
+#[must_use]
 pub fn list_buckets_xml(buckets: &[BucketInfo], owner_principal: &str) -> String {
     let mut xml = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -65,8 +68,9 @@ pub fn list_buckets_xml(buckets: &[BucketInfo], owner_principal: &str) -> String
     xml
 }
 
-/// Format a ListBucketResult (ListObjectsV2) XML response.
+/// Format a `ListBucketResult` (`ListObjectsV2`) XML response.
 #[allow(clippy::too_many_arguments)]
+#[must_use]
 pub fn list_objects_v2_xml(
     bucket: &str,
     prefix: Option<&str>,
@@ -175,7 +179,8 @@ pub fn list_objects_v2_xml(
     xml
 }
 
-/// Format a ListBucketResult (ListObjects v1) XML response.
+/// Format a `ListBucketResult` (`ListObjects` v1) XML response.
+#[must_use]
 pub fn list_objects_v1_xml(
     bucket: &str,
     prefix: Option<&str>,
@@ -274,14 +279,14 @@ pub fn list_objects_v1_xml(
     xml
 }
 
-/// An entry in a DeleteObjects request.
+/// An entry in a `DeleteObjects` request.
 #[derive(Debug)]
 pub struct DeleteObjectEntry {
     pub key: String,
     pub version_id: Option<String>,
 }
 
-/// Parse a DeleteObjects XML request body.
+/// Parse a `DeleteObjects` XML request body.
 ///
 /// Returns the list of object entries and the quiet flag.
 pub fn parse_delete_objects_xml(
@@ -299,9 +304,7 @@ pub fn parse_delete_objects_xml(
     }
 
     // Detect quiet mode
-    let quiet = extract_tag_content(text, "Quiet")
-        .map(|v| v == "true")
-        .unwrap_or(false);
+    let quiet = extract_tag_content(text, "Quiet").is_some_and(|v| v == "true");
 
     // Parse <Object> blocks
     let mut entries = Vec::new();
@@ -338,16 +341,16 @@ pub fn parse_delete_objects_xml(
 
 /// Extract the text content of a simple XML tag (no attributes, no nesting).
 fn extract_tag_content<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
-    let close = format!("</{}>", tag);
+    let close = format!("</{tag}>");
     // Try exact match first: <Tag>
-    let open_exact = format!("<{}>", tag);
+    let open_exact = format!("<{tag}>");
     if let Some(pos) = xml.find(&open_exact) {
         let start = pos + open_exact.len();
         let end = xml[start..].find(&close)? + start;
         return Some(&xml[start..end]);
     }
     // Try match with attributes: <Tag ...>
-    let open_prefix = format!("<{} ", tag);
+    let open_prefix = format!("<{tag} ");
     let pos = xml.find(&open_prefix)?;
     let gt = xml[pos..].find('>')? + pos;
     let start = gt + 1;
@@ -355,7 +358,8 @@ fn extract_tag_content<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
     Some(&xml[start..end])
 }
 
-/// Format a DeleteResult XML response.
+/// Format a `DeleteResult` XML response.
+#[must_use]
 pub fn delete_objects_result_xml(
     deleted: &[DeletedObject],
     errors: &[DeleteError],
@@ -398,7 +402,7 @@ pub fn delete_objects_result_xml(
     xml
 }
 
-/// Parse a PutBucketVersioning XML request body.
+/// Parse a `PutBucketVersioning` XML request body.
 ///
 /// Returns the versioning state as a `BucketVersioningState` enum.
 pub fn parse_versioning_config_xml(data: &[u8]) -> Result<BucketVersioningState, ServerError> {
@@ -411,7 +415,7 @@ pub fn parse_versioning_config_xml(data: &[u8]) -> Result<BucketVersioningState,
             "Enabled" => Ok(BucketVersioningState::Enabled),
             "Suspended" => Ok(BucketVersioningState::Suspended),
             other => Err(ServerError::InvalidRequest {
-                reason: format!("invalid versioning status: {}", other),
+                reason: format!("invalid versioning status: {other}"),
             }),
         }
     } else {
@@ -421,7 +425,8 @@ pub fn parse_versioning_config_xml(data: &[u8]) -> Result<BucketVersioningState,
     }
 }
 
-/// Format a GetBucketVersioning XML response.
+/// Format a `GetBucketVersioning` XML response.
+#[must_use]
 pub fn get_bucket_versioning_xml(state: BucketVersioningState) -> String {
     let mut xml = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -438,7 +443,8 @@ pub fn get_bucket_versioning_xml(state: BucketVersioningState) -> String {
     xml
 }
 
-/// Format a ListVersionsResult XML response.
+/// Format a `ListVersionsResult` XML response.
+#[must_use]
 pub fn list_object_versions_xml(
     bucket: &str,
     prefix: Option<&str>,
@@ -549,6 +555,7 @@ fn encode_value(value: &str, encoding_type: Option<&str>) -> String {
 }
 
 /// Escape special XML characters.
+#[must_use]
 pub fn xml_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -660,7 +667,7 @@ pub fn parse_cors_config_xml(data: &[u8]) -> Result<crate::cors::CorsConfigurati
         for m in &allowed_methods {
             if !valid_methods.contains(&m.as_str()) {
                 return Err(ServerError::InvalidRequest {
-                    reason: format!("invalid CORS method: {}", m),
+                    reason: format!("invalid CORS method: {m}"),
                 });
             }
         }
@@ -681,7 +688,7 @@ pub fn parse_cors_config_xml(data: &[u8]) -> Result<crate::cors::CorsConfigurati
         let max_age_seconds = extract_tag_content(block, "MaxAgeSeconds")
             .map(|s| {
                 s.parse::<u32>().map_err(|_| ServerError::InvalidRequest {
-                    reason: format!("invalid MaxAgeSeconds: {}", s),
+                    reason: format!("invalid MaxAgeSeconds: {s}"),
                 })
             })
             .transpose()?;
@@ -712,6 +719,7 @@ pub fn parse_cors_config_xml(data: &[u8]) -> Result<crate::cors::CorsConfigurati
 }
 
 /// Serialize a CORS configuration to XML.
+#[must_use]
 pub fn get_cors_config_xml(config: &crate::cors::CorsConfiguration) -> String {
     let mut xml = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -760,8 +768,8 @@ pub fn get_cors_config_xml(config: &crate::cors::CorsConfiguration) -> String {
 
 /// Extract all occurrences of a simple XML tag's text content.
 fn extract_all_tag_contents(xml: &str, tag: &str) -> Vec<String> {
-    let open = format!("<{}>", tag);
-    let close = format!("</{}>", tag);
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
     let mut results = Vec::new();
     let mut search_from = 0;
     while let Some(start_pos) = xml[search_from..].find(&open) {
@@ -776,7 +784,8 @@ fn extract_all_tag_contents(xml: &str, tag: &str) -> Vec<String> {
     results
 }
 
-/// Format a CopyObjectResult XML response.
+/// Format a `CopyObjectResult` XML response.
+#[must_use]
 pub fn copy_object_result_xml(etag: &str, last_modified: u64) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -789,7 +798,8 @@ pub fn copy_object_result_xml(etag: &str, last_modified: u64) -> String {
     )
 }
 
-/// Format a CopyPartResult XML response.
+/// Format a `CopyPartResult` XML response.
+#[must_use]
 pub fn copy_part_result_xml(etag: &str, last_modified: u64) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -815,10 +825,7 @@ pub(crate) fn format_timestamp(millis: u64) -> String {
     // Convert days since epoch to date (civil calendar)
     let (year, month, day) = days_to_date(days_since_epoch as i64);
 
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.000Z",
-        year, month, day, hours, minutes, seconds
-    )
+    format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}.000Z")
 }
 
 /// Convert days since Unix epoch to (year, month, day).
@@ -828,7 +835,7 @@ fn days_to_date(days: i64) -> (i64, u32, u32) {
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
     let doe = (z - era * 146097) as u32;
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe as i64 + era * 400;
+    let y = i64::from(yoe) + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
     let d = doy - (153 * mp + 2) / 5 + 1;
@@ -886,7 +893,7 @@ pub fn parse_tagging_xml(
         let key_chars = key.chars().count();
         if key_chars == 0 || key_chars > 128 {
             return Err(ServerError::InvalidTag {
-                reason: format!("tag key must be 1-128 characters, got {}", key_chars),
+                reason: format!("tag key must be 1-128 characters, got {key_chars}"),
             });
         }
         if key.starts_with("aws:") {
@@ -901,13 +908,13 @@ pub fn parse_tagging_xml(
         let value_chars = value.chars().count();
         if value_chars > 256 {
             return Err(ServerError::InvalidTag {
-                reason: format!("tag value must be 0-256 characters, got {}", value_chars),
+                reason: format!("tag value must be 0-256 characters, got {value_chars}"),
             });
         }
 
         if !seen_keys.insert(key.clone()) {
             return Err(ServerError::InvalidTag {
-                reason: format!("duplicate tag key: {}", key),
+                reason: format!("duplicate tag key: {key}"),
             });
         }
 
@@ -918,6 +925,7 @@ pub fn parse_tagging_xml(
 }
 
 /// Serialize a list of (key, value) tag pairs into S3 tagging XML.
+#[must_use]
 pub fn get_tagging_xml(tags: &[(String, String)]) -> String {
     let mut xml = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -961,7 +969,7 @@ pub fn parse_url_encoded_tags(input: &str) -> Result<Vec<(String, String)>, Serv
         let key_chars = key.chars().count();
         if key_chars == 0 || key_chars > 128 {
             return Err(ServerError::InvalidTag {
-                reason: format!("tag key must be 1-128 characters, got {}", key_chars),
+                reason: format!("tag key must be 1-128 characters, got {key_chars}"),
             });
         }
         if key.starts_with("aws:") {
@@ -972,13 +980,13 @@ pub fn parse_url_encoded_tags(input: &str) -> Result<Vec<(String, String)>, Serv
         let value_chars = value.chars().count();
         if value_chars > 256 {
             return Err(ServerError::InvalidTag {
-                reason: format!("tag value must be 0-256 characters, got {}", value_chars),
+                reason: format!("tag value must be 0-256 characters, got {value_chars}"),
             });
         }
 
         if !seen_keys.insert(key.clone()) {
             return Err(ServerError::InvalidTag {
-                reason: format!("duplicate tag key: {}", key),
+                reason: format!("duplicate tag key: {key}"),
             });
         }
 
@@ -995,6 +1003,7 @@ pub fn parse_url_encoded_tags(input: &str) -> Result<Vec<(String, String)>, Serv
 }
 
 /// Count the number of tags in a stored tagging XML string.
+#[must_use]
 pub fn count_tags_in_xml(xml: &str) -> usize {
     let tag_set = extract_tag_content(xml, "TagSet").unwrap_or("");
     extract_all_tag_contents(tag_set, "Tag").len()
@@ -1070,9 +1079,7 @@ pub fn parse_public_access_block_xml(data: &[u8]) -> Result<PublicAccessBlockCon
     })?;
 
     fn parse_bool_element(xml: &str, tag: &str) -> bool {
-        extract_tag_content(xml, tag)
-            .map(|v| v.trim().eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
+        extract_tag_content(xml, tag).is_some_and(|v| v.trim().eq_ignore_ascii_case("true"))
     }
 
     Ok(PublicAccessBlockConfig {
@@ -1084,6 +1091,7 @@ pub fn parse_public_access_block_xml(data: &[u8]) -> Result<PublicAccessBlockCon
 }
 
 /// Serialize a `PublicAccessBlockConfig` into S3 response XML.
+#[must_use]
 pub fn get_public_access_block_xml(config: &PublicAccessBlockConfig) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -1148,6 +1156,7 @@ pub fn parse_ownership_controls_xml(data: &[u8]) -> Result<String, ServerError> 
 }
 
 /// Serialize an `ObjectOwnership` value into S3 response XML.
+#[must_use]
 pub fn get_ownership_controls_xml(object_ownership: &str) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -1158,7 +1167,7 @@ pub fn get_ownership_controls_xml(object_ownership: &str) -> String {
     )
 }
 
-/// Recognized object attribute names for GetObjectAttributes.
+/// Recognized object attribute names for `GetObjectAttributes`.
 const VALID_OBJECT_ATTRIBUTES: &[&str] = &[
     "ETag",
     "Checksum",
@@ -1167,7 +1176,8 @@ const VALID_OBJECT_ATTRIBUTES: &[&str] = &[
     "ObjectSize",
 ];
 
-/// Check whether an attribute name is valid for GetObjectAttributes.
+/// Check whether an attribute name is valid for `GetObjectAttributes`.
+#[must_use]
 pub fn is_valid_object_attribute(name: &str) -> bool {
     VALID_OBJECT_ATTRIBUTES.contains(&name)
 }
@@ -1177,8 +1187,9 @@ pub fn is_valid_object_attribute(name: &str) -> bool {
 /// `requested` is the set of attribute names from the `x-amz-object-attributes`
 /// header. Only requested attributes appear in the response.
 ///
-/// `etag` should be the quoted ETag string (quotes will be stripped).
+/// `etag` should be the quoted `ETag` string (quotes will be stripped).
 /// `checksum_entries` are the `x-amz-checksum-*` metadata entries.
+#[must_use]
 pub fn get_object_attributes_xml(
     requested: &[&str],
     etag: &str,
@@ -1289,7 +1300,7 @@ pub fn get_object_attributes_xml(
 
 /// Strip the composite checksum "-N" suffix (e.g. "abc=-3" → "abc=").
 ///
-/// AWS returns the bare hash (no part count) in GetObjectAttributes; the part
+/// AWS returns the bare hash (no part count) in `GetObjectAttributes`; the part
 /// count is conveyed by `<ChecksumType>COMPOSITE</ChecksumType>` instead.
 /// Standard base64 never contains '-', so a trailing "-\d+" is always the
 /// composite suffix.
@@ -1317,7 +1328,8 @@ fn checksum_header_to_xml_tag(header: &str) -> Option<&'static str> {
 
 // ── Multipart upload XML ─────────────────────────────────────────
 
-/// Format an InitiateMultipartUploadResult XML response.
+/// Format an `InitiateMultipartUploadResult` XML response.
+#[must_use]
 pub fn initiate_multipart_upload_xml(
     bucket: &str,
     key: &str,
@@ -1373,7 +1385,8 @@ fn uri_encode_key(s: &str) -> String {
     out
 }
 
-/// Format a CompleteMultipartUploadResult XML response.
+/// Format a `CompleteMultipartUploadResult` XML response.
+#[must_use]
 pub fn complete_multipart_upload_xml(
     bucket: &str,
     key: &str,
@@ -1411,7 +1424,8 @@ pub fn complete_multipart_upload_xml(
     )
 }
 
-/// Format a ListMultipartUploadsResult XML response.
+/// Format a `ListMultipartUploadsResult` XML response.
+#[must_use]
 pub fn list_multipart_uploads_xml(
     bucket: &str,
     prefix: Option<&str>,
@@ -1477,7 +1491,8 @@ pub fn list_multipart_uploads_xml(
     xml
 }
 
-/// Format a ListPartsResult XML response.
+/// Format a `ListPartsResult` XML response.
+#[must_use]
 pub fn list_parts_xml(
     bucket: &str,
     key: &str,
@@ -1557,8 +1572,8 @@ fn extract_checksum_element(
     // Note: ChecksumCRC32C must be checked before ChecksumCRC32 to avoid
     // prefix-matching CRC32C as CRC32 (already ordered in CHECKSUM_ELEMENTS).
     for &(elem, algo) in CHECKSUM_ELEMENTS {
-        let open = format!("<{}>", elem);
-        let close = format!("</{}>", elem);
+        let open = format!("<{elem}>");
+        let close = format!("</{elem}>");
         if let Some(start) = part_content.find(&open) {
             if found.is_some() {
                 return Err(ServerError::InvalidRequest {
@@ -1584,7 +1599,7 @@ fn extract_checksum_element(
     Ok(found)
 }
 
-/// Parse a CompleteMultipartUpload request XML body into a list of parts.
+/// Parse a `CompleteMultipartUpload` request XML body into a list of parts.
 ///
 /// Expected format:
 /// ```xml
@@ -3491,7 +3506,7 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         for i in 0..5 {
-            let key = format!("key-{:02}", i);
+            let key = format!("key-{i:02}");
             coord
                 .put_object(&PutObjectRequest {
                     bucket: "bucket",
@@ -3551,7 +3566,7 @@ mod tests {
 
         let mut delete_xml = String::from("<Delete><Quiet>true</Quiet>");
         for key in &all_keys {
-            delete_xml.push_str(&format!("<Object><Key>{}</Key></Object>", key));
+            delete_xml.push_str(&format!("<Object><Key>{key}</Key></Object>"));
         }
         delete_xml.push_str("</Delete>");
 

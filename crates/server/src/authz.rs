@@ -8,6 +8,7 @@ pub enum ResourceVisibility {
 }
 
 /// Return true when request may read a bucket.
+#[must_use]
 pub fn can_read_bucket(
     auth: &AuthContext,
     owner_principal: &str,
@@ -21,6 +22,7 @@ pub fn can_read_bucket(
 }
 
 /// Return true when request may mutate a bucket.
+#[must_use]
 pub fn can_write_bucket(auth: &AuthContext, owner_principal: &str) -> bool {
     auth.principal.as_deref() == Some(owner_principal)
 }

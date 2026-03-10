@@ -10,9 +10,10 @@ use storage::{BucketInfo, ChecksumAlgorithm, ChecksumType};
 
 use super::xml;
 
-/// Format a version_id for S3 API responses.
+/// Format a `version_id` for S3 API responses.
 /// Null version is displayed as "null".
 /// Versioned IDs are displayed as decimal strings.
+#[must_use]
 pub fn format_version_id(version_id: storage::VersionId) -> String {
     version_id.to_string()
 }
@@ -39,7 +40,7 @@ fn rfc2047_encode(value: &str) -> String {
             // Everything else (non-ASCII, control chars, =, ?, _) → =XX
             _ => {
                 encoded.push('=');
-                encoded.push_str(&format!("{:02X}", byte));
+                encoded.push_str(&format!("{byte:02X}"));
             }
         }
     }
@@ -94,7 +95,8 @@ impl S3Response {
         self
     }
 
-    /// Build a response for a successful PutObject.
+    /// Build a response for a successful `PutObject`.
+    #[must_use]
     pub fn put_object(result: &PutObjectResult) -> Self {
         let mut resp = Self::new(200).header("ETag", &result.etag);
         if result.version_id.is_versioned() {
@@ -108,6 +110,7 @@ impl S3Response {
     ///
     /// `success_status`: one of 200, 201, 204 (default).
     /// For 201, an XML body with bucket/key/etag is returned.
+    #[must_use]
     pub fn post_object(
         result: &PutObjectResult,
         bucket: &str,
@@ -132,7 +135,8 @@ impl S3Response {
         resp
     }
 
-    /// Build a response for a successful CopyObject.
+    /// Build a response for a successful `CopyObject`.
+    #[must_use]
     pub fn copy_object(result: &CopyObjectResult) -> Self {
         let body = xml::copy_object_result_xml(&result.etag, result.last_modified);
         let mut resp = Self::new(200).xml_body(body);
@@ -143,8 +147,9 @@ impl S3Response {
         resp
     }
 
-    /// Build a response for a successful GetObject.
+    /// Build a response for a successful `GetObject`.
     /// If `checksum_mode` is `Some("ENABLED")`, include stored checksum headers.
+    #[must_use]
     pub fn get_object(result: GetObjectResult, checksum_mode: Option<&str>) -> Self {
         let mut resp = Self::new(200)
             .header("ETag", &result.etag)
@@ -185,10 +190,7 @@ impl S3Response {
         }
 
         // Checksum headers (only when ChecksumMode=ENABLED)
-        if checksum_mode
-            .map(|m| m.eq_ignore_ascii_case("ENABLED"))
-            .unwrap_or(false)
-        {
+        if checksum_mode.is_some_and(|m| m.eq_ignore_ascii_case("ENABLED")) {
             for entry in result.metadata.checksum_entries() {
                 resp = resp.header(&entry.key, &entry.value);
             }
@@ -200,8 +202,9 @@ impl S3Response {
         resp.data_body(result.data)
     }
 
-    /// Build a response for a successful HeadObject.
+    /// Build a response for a successful `HeadObject`.
     /// If `checksum_mode` is `Some("ENABLED")`, include stored checksum headers.
+    #[must_use]
     pub fn head_object(result: &HeadObjectResult, checksum_mode: Option<&str>) -> Self {
         let mut resp = Self::new(200)
             .header("ETag", &result.etag)
@@ -241,10 +244,7 @@ impl S3Response {
         }
 
         // Checksum headers (only when ChecksumMode=ENABLED)
-        if checksum_mode
-            .map(|m| m.eq_ignore_ascii_case("ENABLED"))
-            .unwrap_or(false)
-        {
+        if checksum_mode.is_some_and(|m| m.eq_ignore_ascii_case("ENABLED")) {
             for entry in result.metadata.checksum_entries() {
                 resp = resp.header(&entry.key, &entry.value);
             }
@@ -256,8 +256,9 @@ impl S3Response {
         resp
     }
 
-    /// Build a response for HeadObject with partNumber.
+    /// Build a response for `HeadObject` with partNumber.
     /// Returns 200 with Content-Length of the part and x-amz-mp-parts-count.
+    #[must_use]
     pub fn head_object_part(result: &HeadObjectPartResult) -> Self {
         let mut resp = Self::new(200)
             .header("ETag", &result.etag)
@@ -310,7 +311,8 @@ impl S3Response {
         resp
     }
 
-    /// Build a response for a successful range GetObject (206 Partial Content).
+    /// Build a response for a successful range `GetObject` (206 Partial Content).
+    #[must_use]
     pub fn get_object_range(result: GetObjectRangeResult) -> Self {
         let content_range = format!(
             "bytes {}-{}/{}",
@@ -356,9 +358,10 @@ impl S3Response {
         resp.data_body(result.data)
     }
 
-    /// Build a response for a part-level GetObject (206 Partial Content).
+    /// Build a response for a part-level `GetObject` (206 Partial Content).
     /// Per-part checksum and checksum-type are always emitted (Ceph/AWS
     /// return them without requiring ChecksumMode=ENABLED on part GETs).
+    #[must_use]
     pub fn get_object_part(result: GetObjectPartResult) -> Self {
         let mut resp = Self::new(206)
             .header("ETag", &result.etag)
@@ -421,8 +424,9 @@ impl S3Response {
     }
 
     /// Build a 416 Range Not Satisfiable response.
+    #[must_use]
     pub fn range_not_satisfiable(total_size: u64) -> Self {
-        let content_range = format!("bytes */{}", total_size);
+        let content_range = format!("bytes */{total_size}");
         let body = xml::error_xml(
             "InvalidRange",
             "The requested range is not satisfiable",
@@ -434,7 +438,8 @@ impl S3Response {
             .xml_body(body)
     }
 
-    /// Build a response for DeleteObject (204 No Content).
+    /// Build a response for `DeleteObject` (204 No Content).
+    #[must_use]
     pub fn delete_object(result: &DeleteObjectResult) -> Self {
         let mut resp = Self::new(204);
         if result.version_id.is_versioned() {
@@ -447,41 +452,48 @@ impl S3Response {
         resp
     }
 
-    /// Build a response for CreateBucket.
+    /// Build a response for `CreateBucket`.
+    #[must_use]
     pub fn create_bucket(location: &str) -> Self {
-        Self::new(200).header("Location", &format!("/{}", location))
+        Self::new(200).header("Location", &format!("/{location}"))
     }
 
-    /// Build a response for DeleteBucket.
+    /// Build a response for `DeleteBucket`.
+    #[must_use]
     pub fn delete_bucket() -> Self {
         Self::new(204)
     }
 
-    /// Build a response for HeadBucket.
+    /// Build a response for `HeadBucket`.
+    #[must_use]
     pub fn head_bucket(info: &BucketInfo) -> Self {
         let _ = info; // We could add x-amz-bucket-region etc.
         Self::new(200)
     }
 
-    /// Build a response for PutBucketVersioning.
+    /// Build a response for `PutBucketVersioning`.
+    #[must_use]
     pub fn put_bucket_versioning() -> Self {
         Self::new(200)
     }
 
-    /// Build a response for GetBucketVersioning.
+    /// Build a response for `GetBucketVersioning`.
+    #[must_use]
     pub fn get_bucket_versioning(state: storage::BucketVersioningState) -> Self {
         let body = xml::get_bucket_versioning_xml(state);
         Self::new(200).xml_body(body)
     }
 
-    /// Build a response for ListBuckets.
+    /// Build a response for `ListBuckets`.
+    #[must_use]
     pub fn list_buckets(buckets: &[BucketInfo], owner_principal: &str) -> Self {
         let body = xml::list_buckets_xml(buckets, owner_principal);
         Self::new(200).xml_body(body)
     }
 
-    /// Build a response for ListObjectsV2.
+    /// Build a response for `ListObjectsV2`.
     #[allow(clippy::too_many_arguments)]
+    #[must_use]
     pub fn list_objects_v2(
         bucket: &str,
         prefix: Option<&str>,
@@ -507,7 +519,8 @@ impl S3Response {
         Self::new(200).xml_body(body)
     }
 
-    /// Build a response for ListObjects v1.
+    /// Build a response for `ListObjects` v1.
+    #[must_use]
     pub fn list_objects_v1(
         bucket: &str,
         prefix: Option<&str>,
@@ -529,13 +542,15 @@ impl S3Response {
         Self::new(200).xml_body(body)
     }
 
-    /// Build a response for DeleteObjects (batch delete).
+    /// Build a response for `DeleteObjects` (batch delete).
+    #[must_use]
     pub fn delete_objects(result: &DeleteObjectsResult, quiet: bool) -> Self {
         let body = xml::delete_objects_result_xml(&result.deleted, &result.errors, quiet);
         Self::new(200).xml_body(body)
     }
 
-    /// Build a response for ListObjectVersions.
+    /// Build a response for `ListObjectVersions`.
+    #[must_use]
     pub fn list_object_versions(
         bucket: &str,
         prefix: Option<&str>,
@@ -547,7 +562,7 @@ impl S3Response {
         Self::new(200).xml_body(body)
     }
 
-    /// Build a 304 Not Modified response with ETag and Last-Modified headers, no body.
+    /// Build a 304 Not Modified response with `ETag` and Last-Modified headers, no body.
     #[must_use]
     pub fn not_modified(etag: &str, last_modified: u64) -> Self {
         Self::new(304)
@@ -567,82 +582,98 @@ impl S3Response {
         Self::new(412).xml_body(body)
     }
 
-    /// Build a response for PutBucketCors (200 OK, no body).
+    /// Build a response for `PutBucketCors` (200 OK, no body).
+    #[must_use]
     pub fn put_bucket_cors() -> Self {
         Self::new(200)
     }
 
-    /// Build a response for GetBucketCors (200 OK, XML body).
+    /// Build a response for `GetBucketCors` (200 OK, XML body).
+    #[must_use]
     pub fn get_bucket_cors(config_xml: &str) -> Self {
         Self::new(200).xml_body(config_xml.to_string())
     }
 
-    /// Build a response for DeleteBucketCors (204 No Content).
+    /// Build a response for `DeleteBucketCors` (204 No Content).
+    #[must_use]
     pub fn delete_bucket_cors() -> Self {
         Self::new(204)
     }
 
-    /// Build a response for PutBucketTagging (200 OK, no body).
+    /// Build a response for `PutBucketTagging` (200 OK, no body).
+    #[must_use]
     pub fn put_bucket_tagging() -> Self {
         Self::new(200)
     }
 
-    /// Build a response for GetBucketTagging (200 OK, XML body).
+    /// Build a response for `GetBucketTagging` (200 OK, XML body).
+    #[must_use]
     pub fn get_bucket_tagging(xml: &str) -> Self {
         Self::new(200).xml_body(xml.to_string())
     }
 
-    /// Build a response for DeleteBucketTagging (204 No Content).
+    /// Build a response for `DeleteBucketTagging` (204 No Content).
+    #[must_use]
     pub fn delete_bucket_tagging() -> Self {
         Self::new(204)
     }
 
-    /// Build a response for PutObjectTagging (200 OK, no body).
+    /// Build a response for `PutObjectTagging` (200 OK, no body).
+    #[must_use]
     pub fn put_object_tagging() -> Self {
         Self::new(200)
     }
 
-    /// Build a response for GetObjectTagging (200 OK, XML body).
+    /// Build a response for `GetObjectTagging` (200 OK, XML body).
+    #[must_use]
     pub fn get_object_tagging(xml: &str) -> Self {
         Self::new(200).xml_body(xml.to_string())
     }
 
-    /// Build a response for DeleteObjectTagging (204 No Content).
+    /// Build a response for `DeleteObjectTagging` (204 No Content).
+    #[must_use]
     pub fn delete_object_tagging() -> Self {
         Self::new(204)
     }
 
-    /// Build a response for PutBucketPublicAccessBlock (200 OK, no body).
+    /// Build a response for `PutBucketPublicAccessBlock` (200 OK, no body).
+    #[must_use]
     pub fn put_bucket_public_access_block() -> Self {
         Self::new(200)
     }
 
-    /// Build a response for GetBucketPublicAccessBlock (200 OK, XML body).
+    /// Build a response for `GetBucketPublicAccessBlock` (200 OK, XML body).
+    #[must_use]
     pub fn get_bucket_public_access_block(config_xml: &str) -> Self {
         Self::new(200).xml_body(config_xml.to_string())
     }
 
-    /// Build a response for DeleteBucketPublicAccessBlock (204 No Content).
+    /// Build a response for `DeleteBucketPublicAccessBlock` (204 No Content).
+    #[must_use]
     pub fn delete_bucket_public_access_block() -> Self {
         Self::new(204)
     }
 
-    /// Build a response for PutBucketOwnershipControls (200 OK, no body).
+    /// Build a response for `PutBucketOwnershipControls` (200 OK, no body).
+    #[must_use]
     pub fn put_bucket_ownership_controls() -> Self {
         Self::new(200)
     }
 
-    /// Build a response for GetBucketOwnershipControls (200 OK, XML body).
+    /// Build a response for `GetBucketOwnershipControls` (200 OK, XML body).
+    #[must_use]
     pub fn get_bucket_ownership_controls(config_xml: &str) -> Self {
         Self::new(200).xml_body(config_xml.to_string())
     }
 
-    /// Build a response for DeleteBucketOwnershipControls (204 No Content).
+    /// Build a response for `DeleteBucketOwnershipControls` (204 No Content).
+    #[must_use]
     pub fn delete_bucket_ownership_controls() -> Self {
         Self::new(204)
     }
 
-    /// Build a response for GetObjectAttributes (200 OK, XML body).
+    /// Build a response for `GetObjectAttributes` (200 OK, XML body).
+    #[must_use]
     pub fn get_object_attributes(
         body_xml: &str,
         last_modified: u64,
@@ -657,12 +688,14 @@ impl S3Response {
         resp
     }
 
-    /// Build a response for PutBucketAcl (200 OK, no body).
+    /// Build a response for `PutBucketAcl` (200 OK, no body).
+    #[must_use]
     pub fn put_bucket_acl() -> Self {
         Self::new(200)
     }
 
-    /// Build a response for CreateMultipartUpload (200 OK, XML body).
+    /// Build a response for `CreateMultipartUpload` (200 OK, XML body).
+    #[must_use]
     pub fn create_multipart_upload(
         bucket: &str,
         key: &str,
@@ -674,13 +707,14 @@ impl S3Response {
             bucket,
             key,
             upload_id,
-            checksum_algorithm.map(|a| a.as_str()),
-            checksum_type.map(|t| t.as_str()),
+            checksum_algorithm.map(storage::ChecksumAlgorithm::as_str),
+            checksum_type.map(storage::ChecksumType::as_str),
         );
         Self::new(200).xml_body(body)
     }
 
-    /// Build a response for UploadPart (200 OK, ETag header, optional checksum).
+    /// Build a response for `UploadPart` (200 OK, `ETag` header, optional checksum).
+    #[must_use]
     pub fn upload_part(etag: &str, checksum: Option<&storage::RawChecksum>) -> Self {
         let mut resp = Self::new(200).header("ETag", etag);
         if let Some(cksum) = checksum {
@@ -691,13 +725,15 @@ impl S3Response {
         resp
     }
 
-    /// Build a response for UploadPartCopy (200 OK, XML body with CopyPartResult).
+    /// Build a response for `UploadPartCopy` (200 OK, XML body with `CopyPartResult`).
+    #[must_use]
     pub fn upload_part_copy(etag: &str, last_modified: u64) -> Self {
         let body = xml::copy_part_result_xml(etag, last_modified);
         Self::new(200).xml_body(body)
     }
 
-    /// Build a response for CompleteMultipartUpload (200 OK, XML body).
+    /// Build a response for `CompleteMultipartUpload` (200 OK, XML body).
+    #[must_use]
     pub fn complete_multipart_upload(
         bucket: &str,
         key: &str,
@@ -727,12 +763,14 @@ impl S3Response {
         resp
     }
 
-    /// Build a response for AbortMultipartUpload (204 No Content).
+    /// Build a response for `AbortMultipartUpload` (204 No Content).
+    #[must_use]
     pub fn abort_multipart_upload() -> Self {
         Self::new(204)
     }
 
-    /// Build a response for ListMultipartUploads (200 OK, XML body).
+    /// Build a response for `ListMultipartUploads` (200 OK, XML body).
+    #[must_use]
     pub fn list_multipart_uploads(
         bucket: &str,
         prefix: Option<&str>,
@@ -752,7 +790,8 @@ impl S3Response {
         Self::new(200).xml_body(body)
     }
 
-    /// Build a response for ListParts (200 OK, XML body).
+    /// Build a response for `ListParts` (200 OK, XML body).
+    #[must_use]
     pub fn list_parts(
         bucket: &str,
         key: &str,
@@ -773,17 +812,20 @@ impl S3Response {
     }
 
     /// Build a 200 response for a CORS preflight (headers added by caller).
+    #[must_use]
     pub fn cors_preflight() -> Self {
         Self::new(200)
     }
 
     /// Build a 403 Forbidden response.
+    #[must_use]
     pub fn forbidden() -> Self {
         let body = xml::error_xml("AccessDenied", "Access Denied", "", "request-id");
         Self::new(403).xml_body(body)
     }
 
     /// Build an error response.
+    #[must_use]
     pub fn error(err: &ServerError, resource: &str) -> Self {
         // Special cases that need extra XML elements
         match err {
@@ -877,7 +919,7 @@ fn days_to_date(days: i64) -> (i64, u32, u32) {
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = (z - era * 146_097) as u32;
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
+    let y = i64::from(yoe) + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
     let d = doy - (153 * mp + 2) / 5 + 1;
@@ -928,7 +970,7 @@ fn date_to_days(year: i64, month: u32, day: u32) -> i64 {
     let m = if month > 2 { month - 3 } else { month + 9 };
     let doy = (153 * m + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe as i64 - 719_468
+    era * 146_097 + i64::from(doe) - 719_468
 }
 
 #[cfg(test)]

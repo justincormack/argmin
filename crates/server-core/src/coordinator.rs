@@ -802,10 +802,7 @@ impl Coordinator {
                 },
                 storage::MetadataError::InvalidVersioningTransition { from, to } => {
                     ServerError::InvalidRequest {
-                        reason: format!(
-                            "invalid versioning transition from {:?} to {:?}",
-                            from, to
-                        ),
+                        reason: format!("invalid versioning transition from {from:?} to {to:?}"),
                     }
                 }
                 other => ServerError::Metadata(other),
@@ -1111,8 +1108,10 @@ impl Coordinator {
 
         // 5. Allocate parity buffers and encode
         let mut parity_bufs: Vec<Vec<u8>> = (0..m).map(|_| vec![0u8; shard_size]).collect();
-        let mut parity_refs: Vec<&mut [u8]> =
-            parity_bufs.iter_mut().map(|v| v.as_mut_slice()).collect();
+        let mut parity_refs: Vec<&mut [u8]> = parity_bufs
+            .iter_mut()
+            .map(std::vec::Vec::as_mut_slice)
+            .collect();
         self.ec_codec.encode(&data_shards, &mut parity_refs)?;
 
         // 6. Compute object_key_hash
@@ -1348,7 +1347,9 @@ impl Coordinator {
 
         Ok(BeginStreamPartResult {
             session_id,
-            checksum_algorithm: upload.checksum.map(|c| c.algorithm()),
+            checksum_algorithm: upload
+                .checksum
+                .map(storage::MultipartChecksumConfig::algorithm),
         })
     }
 
@@ -1428,8 +1429,10 @@ impl Coordinator {
             .map(|i| &padded[i * shard_size..(i + 1) * shard_size])
             .collect();
         let mut parity_bufs: Vec<Vec<u8>> = (0..m).map(|_| vec![0u8; shard_size]).collect();
-        let mut parity_refs: Vec<&mut [u8]> =
-            parity_bufs.iter_mut().map(|v| v.as_mut_slice()).collect();
+        let mut parity_refs: Vec<&mut [u8]> = parity_bufs
+            .iter_mut()
+            .map(std::vec::Vec::as_mut_slice)
+            .collect();
         self.ec_codec.encode(&data_shards, &mut parity_refs)?;
 
         // Write shards with cleanup on failure.
@@ -1665,8 +1668,10 @@ impl Coordinator {
         }
 
         // Resolve checksum algorithm: upload-level takes precedence.
-        let claimed_algo = claimed_checksum.map(|c| c.algorithm());
-        let upload_checksum_algo = upload.checksum.map(|c| c.algorithm());
+        let claimed_algo = claimed_checksum.map(ChecksumClaim::algorithm);
+        let upload_checksum_algo = upload
+            .checksum
+            .map(storage::MultipartChecksumConfig::algorithm);
         let effective_algo = match (upload_checksum_algo, claimed_algo) {
             (Some(upload_algo), Some(part_algo)) if upload_algo != part_algo => {
                 return Err(ServerError::InvalidRequest {
@@ -1772,7 +1777,7 @@ impl Coordinator {
             etag: crc64_to_etag_bytes(crc64),
             etag_kind: storage::EtagKind::Crc64,
             part_okh: [0u8; 16], // no single-shard placement for streamed parts
-            part_vid: generation as u64,
+            part_vid: u64::from(generation),
             ec_k: self.ec_config.data_shards,
             ec_m: self.ec_config.parity_shards,
             last_modified: now,
@@ -1792,7 +1797,7 @@ impl Coordinator {
             let old_gen = generation - 1;
             // Clean old non-streaming shards.
             let old_okh = part_key_hash(upload_id, part_number, old_gen);
-            let old_vid = old_gen as u64;
+            let old_vid = u64::from(old_gen);
             let old_shard_pg_id = self.shard_pg_id(
                 &format!("mpu/{upload_id}"),
                 &format!("{part_number}/{old_gen}"),
@@ -2303,15 +2308,12 @@ impl Coordinator {
 
         for &idx in needed {
             let shard_key = ShardKey::new(okh, version_id.to_u64(), idx as u8);
-            match pg.read_shard(&shard_key) {
-                Ok(sd) => {
-                    shard_size = sd.data.len();
-                    result_shards.push(Some(sd.data));
-                }
-                Err(_) => {
-                    all_present = false;
-                    result_shards.push(None);
-                }
+            if let Ok(sd) = pg.read_shard(&shard_key) {
+                shard_size = sd.data.len();
+                result_shards.push(Some(sd.data));
+            } else {
+                all_present = false;
+                result_shards.push(None);
             }
         }
 
@@ -2376,8 +2378,10 @@ impl Coordinator {
                 .iter()
                 .map(|_| vec![0u8; shard_size])
                 .collect();
-            let mut output_refs: Vec<&mut [u8]> =
-                outputs.iter_mut().map(|v| v.as_mut_slice()).collect();
+            let mut output_refs: Vec<&mut [u8]> = outputs
+                .iter_mut()
+                .map(std::vec::Vec::as_mut_slice)
+                .collect();
 
             codec.reconstruct(
                 &present_indices,
@@ -2405,7 +2409,7 @@ impl Coordinator {
     /// `size` is the pre-padding user-data size.
     /// Returns the per-shard size after padding to a multiple of k.
     fn compute_shard_size(size: u64, ec_k: u8) -> usize {
-        let k = ec_k as u64;
+        let k = u64::from(ec_k);
         let padded = size.div_ceil(k) * k;
         (padded / k) as usize
     }
@@ -2531,8 +2535,10 @@ impl Coordinator {
                 .iter()
                 .map(|_| vec![0u8; shard_size])
                 .collect();
-            let mut output_refs: Vec<&mut [u8]> =
-                outputs.iter_mut().map(|v| v.as_mut_slice()).collect();
+            let mut output_refs: Vec<&mut [u8]> = outputs
+                .iter_mut()
+                .map(std::vec::Vec::as_mut_slice)
+                .collect();
 
             codec.reconstruct(
                 &present_indices,
@@ -2767,8 +2773,10 @@ impl Coordinator {
                 .iter()
                 .map(|_| vec![0u8; shard_size])
                 .collect();
-            let mut output_refs: Vec<&mut [u8]> =
-                outputs.iter_mut().map(|v| v.as_mut_slice()).collect();
+            let mut output_refs: Vec<&mut [u8]> = outputs
+                .iter_mut()
+                .map(std::vec::Vec::as_mut_slice)
+                .collect();
 
             codec.reconstruct(
                 &present_indices,
@@ -3425,10 +3433,10 @@ impl Coordinator {
                         })
                         .collect();
 
-                    let next_part_number_marker = if !page.is_empty() {
-                        page.last().map(|p| p.part_number)
-                    } else {
+                    let next_part_number_marker = if page.is_empty() {
                         Some(marker)
+                    } else {
+                        page.last().map(|p| p.part_number)
                     };
 
                     Some(ObjectPartsInfo {
@@ -3559,17 +3567,7 @@ impl Coordinator {
                     .get_stream_object_chunks(bucket, key, record.version_id)
                     .map_err(ServerError::Metadata)?;
 
-                let data = if !chunks.is_empty() {
-                    drop(pgs);
-                    self.read_chunk_manifest_range(
-                        bucket,
-                        key,
-                        &chunks,
-                        user_start as usize,
-                        user_end as usize,
-                    )
-                    .map_err(not_found)?
-                } else {
+                let data = if chunks.is_empty() {
                     let okh = object_key_hash(bucket, key);
                     let shard_pg = pgs.shard();
                     let d = self
@@ -3584,6 +3582,16 @@ impl Coordinator {
                         .map_err(not_found)?;
                     drop(pgs);
                     d
+                } else {
+                    drop(pgs);
+                    self.read_chunk_manifest_range(
+                        bucket,
+                        key,
+                        &chunks,
+                        user_start as usize,
+                        user_end as usize,
+                    )
+                    .map_err(not_found)?
                 };
 
                 (metadata, data)
@@ -3694,14 +3702,7 @@ impl Coordinator {
                         .get_stream_object_chunks(bucket, key, vid)
                         .map_err(ServerError::Metadata)?;
 
-                    if !chunks.is_empty() {
-                        meta_pg
-                            .delete_stream_object_chunks(bucket, key, vid)
-                            .map_err(ServerError::Metadata)?;
-                        meta_pg.delete_object_meta(bucket, key)?;
-                        drop(pgs);
-                        let _ = self.delete_chunk_shards(&chunks);
-                    } else {
+                    if chunks.is_empty() {
                         let okh = object_key_hash(bucket, key);
                         let total = record.ec.k as usize + record.ec.m as usize;
 
@@ -3711,6 +3712,13 @@ impl Coordinator {
                         }
 
                         meta_pg.delete_object_meta(bucket, key)?;
+                    } else {
+                        meta_pg
+                            .delete_stream_object_chunks(bucket, key, vid)
+                            .map_err(ServerError::Metadata)?;
+                        meta_pg.delete_object_meta(bucket, key)?;
+                        drop(pgs);
+                        let _ = self.delete_chunk_shards(&chunks);
                     }
                 }
 
@@ -4280,17 +4288,7 @@ impl Coordinator {
                     .get_stream_object_chunks(src_bucket, src_key, src_record.version_id)
                     .map_err(ServerError::Metadata)?;
 
-                if !chunks.is_empty() {
-                    drop(pgs);
-                    self.read_chunk_manifest_range(
-                        src_bucket,
-                        src_key,
-                        &chunks,
-                        read_start as usize,
-                        read_end as usize,
-                    )
-                    .map_err(not_found)?
-                } else {
+                if chunks.is_empty() {
                     let src_shard_pg = pgs.shard();
                     let src_okh = object_key_hash(src_bucket, src_key);
 
@@ -4299,6 +4297,16 @@ impl Coordinator {
                         &src_okh,
                         src_record.version_id,
                         &src_record,
+                        read_start as usize,
+                        read_end as usize,
+                    )
+                    .map_err(not_found)?
+                } else {
+                    drop(pgs);
+                    self.read_chunk_manifest_range(
+                        src_bucket,
+                        src_key,
+                        &chunks,
                         read_start as usize,
                         read_end as usize,
                     )
@@ -4360,7 +4368,9 @@ impl Coordinator {
                     upload_id: upload_id.to_string(),
                 });
             }
-            let upload_algo = upload.checksum.map(|c| c.algorithm());
+            let upload_algo = upload
+                .checksum
+                .map(storage::MultipartChecksumConfig::algorithm);
 
             // Determine next generation for this part number.
             let generation = match meta_pg.get_multipart_part(upload_id, part_number) {
@@ -4372,7 +4382,7 @@ impl Coordinator {
             let shard_pg_id = self.shard_pg_id(
                 &format!("mpu/{upload_id}"),
                 &format!("{part_number}/{generation}"),
-                storage::VersionId::from_u64(generation as u64),
+                storage::VersionId::from_u64(u64::from(generation)),
             );
 
             if shard_pg_id == meta_pg_id {
@@ -4406,7 +4416,9 @@ impl Coordinator {
                     upload_id: upload_id.to_string(),
                 });
             }
-            let upload_algo = upload.checksum.map(|c| c.algorithm());
+            let upload_algo = upload
+                .checksum
+                .map(storage::MultipartChecksumConfig::algorithm);
 
             let generation = match meta_pg.get_multipart_part(upload_id, part_number) {
                 Ok(existing) => existing.generation + 1,
@@ -4417,7 +4429,7 @@ impl Coordinator {
             let verify_shard_pg_id = self.shard_pg_id(
                 &format!("mpu/{upload_id}"),
                 &format!("{part_number}/{generation}"),
-                storage::VersionId::from_u64(generation as u64),
+                storage::VersionId::from_u64(u64::from(generation)),
             );
 
             // Generation changed while relocking — shard PG may differ. Retry.
@@ -4432,7 +4444,7 @@ impl Coordinator {
         //    The upload's checksum_algorithm is the single source of truth.
         //    Parts may only carry a checksum if the upload was configured with one,
         //    and it must match. This prevents untagged raw bytes from being stored.
-        let claimed_algo = claimed_checksum.map(|c| c.algorithm());
+        let claimed_algo = claimed_checksum.map(ChecksumClaim::algorithm);
         let effective_algo = match (upload_checksum_algo, claimed_algo) {
             (Some(upload_algo), Some(part_algo)) if upload_algo != part_algo => {
                 return Err(ServerError::InvalidRequest {
@@ -4464,7 +4476,7 @@ impl Coordinator {
 
         // 4. Compute part identity.
         let part_okh = part_key_hash(upload_id, part_number, generation);
-        let part_vid = generation as u64;
+        let part_vid = u64::from(generation);
 
         // 5. EC-encode part data (no metadata blob for parts — raw data only).
         let etag_crc = checksum::crc64::checksum(data);
@@ -4482,8 +4494,10 @@ impl Coordinator {
             .map(|i| &padded[i * shard_size..(i + 1) * shard_size])
             .collect();
         let mut parity_bufs: Vec<Vec<u8>> = (0..m).map(|_| vec![0u8; shard_size]).collect();
-        let mut parity_refs: Vec<&mut [u8]> =
-            parity_bufs.iter_mut().map(|v| v.as_mut_slice()).collect();
+        let mut parity_refs: Vec<&mut [u8]> = parity_bufs
+            .iter_mut()
+            .map(std::vec::Vec::as_mut_slice)
+            .collect();
         self.ec_codec.encode(&data_shards, &mut parity_refs)?;
 
         // 6. Write shards, with cleanup on failure.
@@ -4549,7 +4563,7 @@ impl Coordinator {
         drop(meta_pg);
         if let Some(old_gen) = prev_gen {
             let old_okh = part_key_hash(upload_id, part_number, old_gen);
-            let old_vid = old_gen as u64;
+            let old_vid = u64::from(old_gen);
             let old_shard_pg_id = self.shard_pg_id(
                 &format!("mpu/{upload_id}"),
                 &format!("{part_number}/{old_gen}"),
@@ -4637,8 +4651,12 @@ impl Coordinator {
         }
 
         // Resolve checksum configuration early so per-part validation can use it.
-        let checksum_algo = upload.checksum.map(|c| c.algorithm());
-        let checksum_type = upload.checksum.map(|c| c.checksum_type());
+        let checksum_algo = upload
+            .checksum
+            .map(storage::MultipartChecksumConfig::algorithm);
+        let checksum_type = upload
+            .checksum
+            .map(storage::MultipartChecksumConfig::checksum_type);
 
         // 4. Validate all parts exist and ETags match.
         let mut part_records: Vec<MultipartPartRecord> = Vec::with_capacity(parts.len());
@@ -5089,8 +5107,12 @@ impl Coordinator {
             parts,
             is_truncated: resp.is_truncated,
             next_part_number_marker: resp.next_part_number_marker,
-            checksum_algorithm: upload.checksum.map(|c| c.algorithm()),
-            checksum_type: upload.checksum.map(|c| c.checksum_type()),
+            checksum_algorithm: upload
+                .checksum
+                .map(storage::MultipartChecksumConfig::algorithm),
+            checksum_type: upload
+                .checksum
+                .map(storage::MultipartChecksumConfig::checksum_type),
         })
     }
 
@@ -6359,7 +6381,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
         // Create many prefixed objects to ensure common_prefixes count toward max_keys
         for i in 0..10 {
-            let key = format!("dir{}/file.txt", i);
+            let key = format!("dir{i}/file.txt");
             coord
                 .put_object(&PutObjectRequest {
                     bucket: "bucket",
@@ -6419,7 +6441,7 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         for i in 0..5 {
-            let key = format!("key-{:02}", i);
+            let key = format!("key-{i:02}");
             coord
                 .put_object(&PutObjectRequest {
                     bucket: "bucket",
@@ -6453,7 +6475,7 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         for i in 0..5 {
-            let key = format!("key-{:02}", i);
+            let key = format!("key-{i:02}");
             coord
                 .put_object(&PutObjectRequest {
                     bucket: "bucket",

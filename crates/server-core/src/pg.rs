@@ -69,9 +69,9 @@ fn pick_pg(pg_ids: &[u32], hash: u64) -> u32 {
 /// pg_id = rapidhash(bucket + "/" + key) % pg_count
 #[cfg(test)]
 pub(crate) fn derive_pg(bucket: &str, key: &str, pg_count: u32) -> u32 {
-    let full_key = format!("{}/{}", bucket, key);
+    let full_key = format!("{bucket}/{key}");
     let hash = rapidhash::rapidhash(full_key.as_bytes());
-    (hash % pg_count as u64) as u32
+    (hash % u64::from(pg_count)) as u32
 }
 
 /// Derive the PG ID for bucket metadata placement.
@@ -81,7 +81,7 @@ pub(crate) fn derive_pg(bucket: &str, key: &str, pg_count: u32) -> u32 {
 pub(crate) fn derive_bucket_pg(bucket: &str, pg_count: u32) -> u32 {
     let full_key = format!("bucket/{bucket}");
     let hash = rapidhash::rapidhash(full_key.as_bytes());
-    (hash % pg_count as u64) as u32
+    (hash % u64::from(pg_count)) as u32
 }
 
 /// Derive the PG ID for shard data placement.
@@ -92,9 +92,9 @@ pub(crate) fn derive_bucket_pg(bucket: &str, pg_count: u32) -> u32 {
 /// pg_id = rapidhash(bucket + "/" + key + "/" + version_id) % pg_count
 #[cfg(test)]
 pub(crate) fn derive_pg_shards(bucket: &str, key: &str, version_id: u64, pg_count: u32) -> u32 {
-    let full_key = format!("{}/{}/{}", bucket, key, version_id);
+    let full_key = format!("{bucket}/{key}/{version_id}");
     let hash = rapidhash::rapidhash(full_key.as_bytes());
-    (hash % pg_count as u64) as u32
+    (hash % u64::from(pg_count)) as u32
 }
 
 /// Compute the 16-byte object key hash used in ShardKey construction.
@@ -102,7 +102,7 @@ pub(crate) fn derive_pg_shards(bucket: &str, key: &str, version_id: u64, pg_coun
 /// Uses SHA-256 truncated to 16 bytes for deterministic, well-distributed hashing.
 pub fn object_key_hash(bucket: &str, key: &str) -> [u8; 16] {
     use ring::digest;
-    let full_key = format!("{}/{}", bucket, key);
+    let full_key = format!("{bucket}/{key}");
     let hash = digest::digest(&digest::SHA256, full_key.as_bytes());
     let mut result = [0u8; 16];
     result.copy_from_slice(&hash.as_ref()[..16]);
@@ -176,7 +176,7 @@ mod tests {
     fn derive_bucket_pg_within_range() {
         for pg_count in [1, 4, 16, 256] {
             for i in 0..100 {
-                let bucket = format!("bucket-{}", i);
+                let bucket = format!("bucket-{i}");
                 let pg = derive_bucket_pg(&bucket, pg_count);
                 assert!(pg < pg_count);
             }
@@ -193,7 +193,7 @@ mod tests {
             counts[pg as usize] += 1;
         }
         for count in &counts {
-            assert!(*count > 0, "at least one PG got no buckets: {:?}", counts);
+            assert!(*count > 0, "at least one PG got no buckets: {counts:?}");
         }
     }
 
@@ -201,7 +201,7 @@ mod tests {
     fn derive_pg_within_range() {
         for pg_count in [1, 4, 16, 256] {
             for i in 0..100 {
-                let key = format!("key-{}", i);
+                let key = format!("key-{i}");
                 let pg = derive_pg("bucket", &key, pg_count);
                 assert!(pg < pg_count);
             }
@@ -213,13 +213,13 @@ mod tests {
         let pg_count = 16u32;
         let mut counts = vec![0u32; pg_count as usize];
         for i in 0..1000 {
-            let key = format!("object-{}", i);
+            let key = format!("object-{i}");
             let pg = derive_pg("test-bucket", &key, pg_count);
             counts[pg as usize] += 1;
         }
         // Each PG should get at least some objects (rough check)
         for count in &counts {
-            assert!(*count > 0, "at least one PG got no objects: {:?}", counts);
+            assert!(*count > 0, "at least one PG got no objects: {counts:?}");
         }
     }
 
@@ -234,7 +234,7 @@ mod tests {
     fn derive_pg_shards_within_range() {
         for pg_count in [1, 4, 16, 256] {
             for i in 0..100 {
-                let key = format!("key-{}", i);
+                let key = format!("key-{i}");
                 let pg = derive_pg_shards("bucket", &key, i, pg_count);
                 assert!(pg < pg_count);
             }

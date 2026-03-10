@@ -67,7 +67,8 @@ impl HttpFrontend {
     /// Handle a parsed S3 request: authenticate, dispatch, and return the response.
     ///
     /// The caller (serve layer) is responsible for parsing the HTTP request into
-    /// an S3Request and converting the S3Response back to an HTTP response.
+    /// an `S3Request` and converting the `S3Response` back to an HTTP response.
+    #[must_use]
     pub fn handle_s3_request(&self, s3req: &S3Request) -> S3Response {
         // Route first to detect OPTIONS requests (which bypass auth).
         let operation = match route(&s3req.method, &s3req.path, &s3req.query_string) {
@@ -141,7 +142,7 @@ impl HttpFrontend {
 
         let request_headers_str = req.header("access-control-request-headers");
         let request_headers: Vec<&str> = request_headers_str
-            .map(|h| h.split(',').map(|s| s.trim()).collect())
+            .map(|h| h.split(',').map(str::trim).collect())
             .unwrap_or_default();
 
         // Load CORS config
@@ -317,8 +318,7 @@ impl HttpFrontend {
                 let encoding_type = req.query_param("encoding-type");
                 let fetch_owner = req
                     .query_param("fetch-owner")
-                    .map(|v| v == "true" || v == "1" || v == "True")
-                    .unwrap_or(false);
+                    .is_some_and(|v| v == "true" || v == "1" || v == "True");
                 let allow_unordered = req.query_param("allow-unordered");
                 if allow_unordered.is_some() && delimiter.is_some() {
                     return Err(ServerError::InvalidArgument {
@@ -734,7 +734,7 @@ impl HttpFrontend {
                 let requested: Vec<&str> = attr_values
                     .into_iter()
                     .flat_map(|value| value.split(','))
-                    .map(|s| s.trim())
+                    .map(str::trim)
                     .filter(|s| !s.is_empty())
                     .collect();
                 if requested.is_empty() {
@@ -899,13 +899,12 @@ impl HttpFrontend {
             S3Operation::GetObjectTagging { bucket, key } => {
                 self.authorize_bucket_read(auth, &bucket)?;
                 let vid = parse_version_id(req)?;
-                match self.coordinator.get_object_tags(&bucket, &key, vid)? {
-                    Some(tags_xml) => Ok(S3Response::get_object_tagging(&tags_xml)),
-                    None => {
-                        // S3 returns empty TagSet (not 404) for objects with no tags
-                        let empty = xml::get_tagging_xml(&[]);
-                        Ok(S3Response::get_object_tagging(&empty))
-                    }
+                if let Some(tags_xml) = self.coordinator.get_object_tags(&bucket, &key, vid)? {
+                    Ok(S3Response::get_object_tagging(&tags_xml))
+                } else {
+                    // S3 returns empty TagSet (not 404) for objects with no tags
+                    let empty = xml::get_tagging_xml(&[]);
+                    Ok(S3Response::get_object_tagging(&empty))
                 }
             }
             S3Operation::DeleteObjectTagging { bucket, key } => {
@@ -1400,7 +1399,7 @@ impl HttpFrontend {
     }
 
     /// If the request uses aws-chunked encoding, decode the body and return
-    /// a new S3Request with the decoded payload. Returns None for non-chunked requests.
+    /// a new `S3Request` with the decoded payload. Returns None for non-chunked requests.
     fn maybe_decode_chunked(
         &self,
         req: &S3Request,
@@ -1418,19 +1417,16 @@ impl HttpFrontend {
             | "STREAMING-UNSIGNED-PAYLOAD-TRAILER" => {}
             _ => {
                 return Err(ServerError::InvalidArgument {
-                    reason: format!("unsupported streaming token: {}", content_sha),
+                    reason: format!("unsupported streaming token: {content_sha}"),
                 });
             }
         }
 
         // Require content-encoding contains aws-chunked.
-        let has_aws_chunked = req
-            .header("content-encoding")
-            .map(|ce| {
-                ce.split(',')
-                    .any(|part| part.trim().eq_ignore_ascii_case("aws-chunked"))
-            })
-            .unwrap_or(false);
+        let has_aws_chunked = req.header("content-encoding").is_some_and(|ce| {
+            ce.split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case("aws-chunked"))
+        });
         if !has_aws_chunked {
             return Err(ServerError::MalformedTrailerError {
                 reason: "content-encoding must contain aws-chunked for streaming uploads"
@@ -1446,7 +1442,7 @@ impl HttpFrontend {
             expected_str
                 .parse::<usize>()
                 .map_err(|_| ServerError::InvalidRequest {
-                    reason: format!("invalid x-amz-decoded-content-length: {}", expected_str),
+                    reason: format!("invalid x-amz-decoded-content-length: {expected_str}"),
                 })?;
 
         let is_trailer_mode = content_sha.ends_with("-TRAILER");
@@ -1507,8 +1503,7 @@ impl HttpFrontend {
             if content_trailers.is_empty() {
                 return Err(ServerError::MalformedTrailerError {
                     reason: format!(
-                        "x-amz-trailer header declares {} but no trailers in body",
-                        declared
+                        "x-amz-trailer header declares {declared} but no trailers in body"
                     ),
                 });
             }
@@ -1517,8 +1512,7 @@ impl HttpFrontend {
                 if !declared_names.iter().any(|d| d == name.as_str()) {
                     return Err(ServerError::MalformedTrailerError {
                         reason: format!(
-                            "undeclared trailer in body: {} (declared: {})",
-                            name, declared
+                            "undeclared trailer in body: {name} (declared: {declared})"
                         ),
                     });
                 }
@@ -1529,8 +1523,7 @@ impl HttpFrontend {
                 if !body_names.contains(&name.as_str()) {
                     return Err(ServerError::MalformedTrailerError {
                         reason: format!(
-                            "declared trailer missing from body: {} (declared: {})",
-                            name, declared
+                            "declared trailer missing from body: {name} (declared: {declared})"
                         ),
                     });
                 }
@@ -1673,10 +1666,10 @@ impl HttpFrontend {
         }
 
         // Use POST auth context if authenticated, otherwise fall back to header auth
-        let effective_auth = if post_auth.mode != AuthMode::Anonymous {
-            &post_auth
-        } else {
+        let effective_auth = if post_auth.mode == AuthMode::Anonymous {
             auth
+        } else {
+            &post_auth
         };
 
         // Authorize write access
@@ -1751,7 +1744,7 @@ impl HttpFrontend {
 
     // ── Streaming write helpers ─────────────────────────────────────
 
-    /// Prepare a streaming PutObject: authenticate, validate, begin session.
+    /// Prepare a streaming `PutObject`: authenticate, validate, begin session.
     ///
     /// Returns a context struct that the async streaming loop uses to drive
     /// chunk appends and finalization.
@@ -1795,13 +1788,10 @@ impl HttpFrontend {
         // Reject if both a trailing checksum (via x-amz-trailer) and an inline
         // checksum value header are present. AWS returns:
         //   InvalidRequest: Expecting a single x-amz-checksum- header
-        let has_trailing_checksum = req
-            .header("x-amz-trailer")
-            .map(|v| {
-                v.split(',')
-                    .any(|name| checksum_algo_from_header(name.trim()).is_some())
-            })
-            .unwrap_or(false);
+        let has_trailing_checksum = req.header("x-amz-trailer").is_some_and(|v| {
+            v.split(',')
+                .any(|name| checksum_algo_from_header(name.trim()).is_some())
+        });
 
         if has_trailing_checksum {
             let checksum_value_headers: &[&str] = &[
@@ -1867,7 +1857,7 @@ impl HttpFrontend {
         )
     }
 
-    /// Finalize a streaming PutObject session and return an S3Response.
+    /// Finalize a streaming `PutObject` session and return an `S3Response`.
     ///
     /// `trailer_checksums` contains checksum headers extracted from aws-chunked
     /// trailers (e.g. `x-amz-checksum-crc32`). These are merged into the
@@ -1936,7 +1926,7 @@ impl HttpFrontend {
             .abort_stream_put(&ctx.bucket, &ctx.key, &ctx.session_id);
     }
 
-    /// Prepare a streaming UploadPart session.
+    /// Prepare a streaming `UploadPart` session.
     pub fn prepare_streaming_part(
         &self,
         req: &S3Request,
@@ -1974,7 +1964,7 @@ impl HttpFrontend {
         })
     }
 
-    /// Append a chunk to a streaming UploadPart session.
+    /// Append a chunk to a streaming `UploadPart` session.
     pub fn streaming_append_part_chunk(
         &self,
         ctx: &StreamingPartContext,
@@ -1990,7 +1980,7 @@ impl HttpFrontend {
         )
     }
 
-    /// Finalize a streaming UploadPart session and return an S3Response.
+    /// Finalize a streaming `UploadPart` session and return an `S3Response`.
     ///
     /// `trailer_checksums` contains checksum headers from aws-chunked trailers.
     /// `computed_checksum` is the incrementally computed checksum (algo, bytes).
@@ -2059,7 +2049,7 @@ impl HttpFrontend {
         Ok(resp)
     }
 
-    /// Abort a streaming UploadPart session (best-effort cleanup).
+    /// Abort a streaming `UploadPart` session (best-effort cleanup).
     pub fn abort_streaming_part(&self, ctx: &StreamingPartContext) {
         let _ = self
             .coordinator
@@ -2067,7 +2057,7 @@ impl HttpFrontend {
     }
 }
 
-/// Context for an in-progress streaming PutObject.
+/// Context for an in-progress streaming `PutObject`.
 ///
 /// Created by `prepare_streaming_put`, used across async/blocking boundaries.
 pub struct StreamingPutContext {
@@ -2082,7 +2072,7 @@ pub struct StreamingPutContext {
     pub streaming_signing: Option<auth::StreamingSigningContext>,
 }
 
-/// Context for an in-progress streaming UploadPart.
+/// Context for an in-progress streaming `UploadPart`.
 ///
 /// Created by `prepare_streaming_part`, used across async/blocking boundaries.
 pub struct StreamingPartContext {
@@ -2098,7 +2088,8 @@ pub struct StreamingPartContext {
     pub streaming_signing: Option<auth::StreamingSigningContext>,
 }
 
-/// Convert an S3Response into a hyper-compatible HTTP response.
+/// Convert an `S3Response` into a hyper-compatible HTTP response.
+#[must_use]
 pub fn s3_response_to_hyper(resp: S3Response) -> http::Response<Full<Bytes>> {
     let mut builder = http::Response::builder().status(resp.status_code);
     for (name, value) in &resp.headers {
@@ -2140,7 +2131,7 @@ fn checksum_algo_from_header(header: &str) -> Option<ChecksumAlgorithm> {
     None
 }
 
-/// Validate checksum headers on PutObject.
+/// Validate checksum headers on `PutObject`.
 ///
 /// Enforces that at most one checksum header is present, validates base64
 /// format/length, and if `x-amz-checksum-algorithm` is set it must match
@@ -2170,8 +2161,7 @@ fn validate_checksum_headers(req: &S3Request, verify_body: bool) -> Result<(), S
                 if !declared.eq_ignore_ascii_case(algo) {
                     return Err(ServerError::InvalidRequest {
                         reason: format!(
-                            "checksum algorithm mismatch: header says {} but got {}",
-                            declared, algo
+                            "checksum algorithm mismatch: header says {declared} but got {algo}"
                         ),
                     });
                 }
@@ -2194,7 +2184,7 @@ fn validate_checksum_headers(req: &S3Request, verify_body: bool) -> Result<(), S
                 Some(ref bytes) if bytes.len() == expected_len => {}
                 _ => {
                     return Err(ServerError::InvalidRequest {
-                        reason: format!("Value for {} header is invalid.", header),
+                        reason: format!("Value for {header} header is invalid."),
                     });
                 }
             }
@@ -2275,8 +2265,7 @@ fn extract_checksum_header_raw(
                 if !declared.eq_ignore_ascii_case(algo_name) {
                     return Err(ServerError::InvalidRequest {
                         reason: format!(
-                            "checksum algorithm mismatch: header says {} but got {}",
-                            declared, algo_name
+                            "checksum algorithm mismatch: header says {declared} but got {algo_name}"
                         ),
                     });
                 }
@@ -2291,7 +2280,7 @@ fn extract_checksum_header_raw(
 
 /// Extract a claimed checksum from request headers, decoded and validated.
 ///
-/// Used by UploadPart and streaming paths where the value is always plain base64.
+/// Used by `UploadPart` and streaming paths where the value is always plain base64.
 fn extract_checksum_header(req: &S3Request) -> Result<Option<ChecksumClaim>, ServerError> {
     match extract_checksum_header_raw(req)? {
         Some((algo, value)) => Ok(Some(ChecksumClaim::from_base64(algo, &value)?)),
@@ -2299,7 +2288,7 @@ fn extract_checksum_header(req: &S3Request) -> Result<Option<ChecksumClaim>, Ser
     }
 }
 
-/// Append any checksum headers that were sent on PutObject to the response.
+/// Append any checksum headers that were sent on `PutObject` to the response.
 fn append_checksum_response_headers(resp: &mut S3Response, req: &S3Request) {
     for &(_, header) in CHECKSUM_HEADERS {
         if let Some(value) = req.header(header) {
@@ -2330,8 +2319,8 @@ enum BucketAcl {
     Private,
     PublicRead,
     /// ACL values that grant public access but whose specific semantics we don't implement
-    /// (public-read-write, authenticated-read). Kept separate so BlockPublicAcls can reject
-    /// them with 403 while normal requests get NotImplemented.
+    /// (public-read-write, authenticated-read). Kept separate so `BlockPublicAcls` can reject
+    /// them with 403 while normal requests get `NotImplemented`.
     UnsupportedPublic,
 }
 
@@ -2339,7 +2328,7 @@ fn parse_bucket_acl(req: &S3Request) -> Result<BucketAcl, ServerError> {
     match req.header("x-amz-acl") {
         None | Some("private") => Ok(BucketAcl::Private),
         Some("public-read") => Ok(BucketAcl::PublicRead),
-        Some("public-read-write") | Some("authenticated-read") => Ok(BucketAcl::UnsupportedPublic),
+        Some("public-read-write" | "authenticated-read") => Ok(BucketAcl::UnsupportedPublic),
         Some(other) => Err(ServerError::InvalidArgument {
             reason: format!("unsupported x-amz-acl value: {other}"),
         }),
@@ -3110,7 +3099,7 @@ mod tests {
 
     // ── UploadPart checksum validation ──────────────────────────────
 
-    /// Helper: create a multipart upload with optional checksum algorithm, return upload_id.
+    /// Helper: create a multipart upload with optional checksum algorithm, return `upload_id`.
     fn create_upload_with_checksum(
         fe: &HttpFrontend,
         bucket: &str,
