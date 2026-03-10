@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use bytes::Bytes;
+use checksum::{ChecksumAlgorithm, RawChecksum};
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
@@ -36,15 +37,15 @@ enum TrailingChecksumHasher {
 }
 
 impl TrailingChecksumHasher {
-    fn from_checksum_algorithm(algo: storage::ChecksumAlgorithm) -> Self {
+    fn from_checksum_algorithm(algo: ChecksumAlgorithm) -> Self {
         match algo {
-            storage::ChecksumAlgorithm::Crc32 => Self::Crc32(0),
-            storage::ChecksumAlgorithm::Crc32c => Self::Crc32c(checksum::crc32c::Hasher::new()),
-            storage::ChecksumAlgorithm::Crc64nvme => Self::Crc64(checksum::crc64::Hasher::new()),
-            storage::ChecksumAlgorithm::Sha256 => {
+            ChecksumAlgorithm::Crc32 => Self::Crc32(0),
+            ChecksumAlgorithm::Crc32c => Self::Crc32c(checksum::crc32c::Hasher::new()),
+            ChecksumAlgorithm::Crc64nvme => Self::Crc64(checksum::crc64::Hasher::new()),
+            ChecksumAlgorithm::Sha256 => {
                 Self::Sha256(ring::digest::Context::new(&ring::digest::SHA256))
             }
-            storage::ChecksumAlgorithm::Sha1 => Self::Sha1(ring::digest::Context::new(
+            ChecksumAlgorithm::Sha1 => Self::Sha1(ring::digest::Context::new(
                 &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
             )),
         }
@@ -84,30 +85,27 @@ impl TrailingChecksumHasher {
     }
 
     /// Finalize and return a validated `RawChecksum`.
-    fn finalize_raw(self) -> storage::RawChecksum {
+    fn finalize_raw(self) -> RawChecksum {
         let (algo, bytes) = match self {
-            Self::Crc32(crc) => (
-                storage::ChecksumAlgorithm::Crc32,
-                crc.to_be_bytes().to_vec(),
-            ),
+            Self::Crc32(crc) => (ChecksumAlgorithm::Crc32, crc.to_be_bytes().to_vec()),
             Self::Crc32c(h) => (
-                storage::ChecksumAlgorithm::Crc32c,
+                ChecksumAlgorithm::Crc32c,
                 h.finalize().to_be_bytes().to_vec(),
             ),
             Self::Crc64(h) => (
-                storage::ChecksumAlgorithm::Crc64nvme,
+                ChecksumAlgorithm::Crc64nvme,
                 h.finalize().to_be_bytes().to_vec(),
             ),
             Self::Sha256(ctx) => {
                 let digest = ctx.finish();
-                (storage::ChecksumAlgorithm::Sha256, digest.as_ref().to_vec())
+                (ChecksumAlgorithm::Sha256, digest.as_ref().to_vec())
             }
             Self::Sha1(ctx) => {
                 let digest = ctx.finish();
-                (storage::ChecksumAlgorithm::Sha1, digest.as_ref().to_vec())
+                (ChecksumAlgorithm::Sha1, digest.as_ref().to_vec())
             }
         };
-        storage::RawChecksum::new(algo, bytes).expect("hasher produces correct length")
+        RawChecksum::new(algo, bytes).expect("hasher produces correct length")
     }
 
     /// Finalize and return the base64-encoded checksum string.
@@ -1528,7 +1526,7 @@ mod tests {
         assert!(hasher.is_some());
         // Verify it's a CRC32 hasher by finalizing empty data.
         let cksum = hasher.unwrap().finalize_raw();
-        assert_eq!(cksum.algorithm(), storage::ChecksumAlgorithm::Crc32);
+        assert_eq!(cksum.algorithm(), ChecksumAlgorithm::Crc32);
     }
 
     #[test]
@@ -1541,7 +1539,7 @@ mod tests {
         let hasher = trailing_hasher_from_parts(&parts);
         assert!(hasher.is_some());
         let cksum = hasher.unwrap().finalize_raw();
-        assert_eq!(cksum.algorithm(), storage::ChecksumAlgorithm::Sha256);
+        assert_eq!(cksum.algorithm(), ChecksumAlgorithm::Sha256);
     }
 
     #[test]
@@ -1560,7 +1558,7 @@ mod tests {
             TrailingChecksumHasher::from_trailer_header("x-amz-checksum-crc32c").unwrap();
         hasher.update(data);
         let cksum = hasher.finalize_raw();
-        assert_eq!(cksum.algorithm(), storage::ChecksumAlgorithm::Crc32c);
+        assert_eq!(cksum.algorithm(), ChecksumAlgorithm::Crc32c);
         assert_eq!(
             u32::from_be_bytes(cksum.bytes().try_into().unwrap()),
             expected,
@@ -1607,7 +1605,7 @@ mod tests {
             TrailingChecksumHasher::from_trailer_header("x-amz-checksum-crc32").unwrap();
         hasher.update(data);
         let cksum = hasher.finalize_raw();
-        assert_eq!(cksum.algorithm(), storage::ChecksumAlgorithm::Crc32);
+        assert_eq!(cksum.algorithm(), ChecksumAlgorithm::Crc32);
         assert_eq!(
             u32::from_be_bytes(cksum.bytes().try_into().unwrap()),
             expected
@@ -1623,7 +1621,7 @@ mod tests {
             TrailingChecksumHasher::from_trailer_header("x-amz-checksum-crc64nvme").unwrap();
         hasher.update(data);
         let cksum = hasher.finalize_raw();
-        assert_eq!(cksum.algorithm(), storage::ChecksumAlgorithm::Crc64nvme);
+        assert_eq!(cksum.algorithm(), ChecksumAlgorithm::Crc64nvme);
         assert_eq!(
             u64::from_be_bytes(cksum.bytes().try_into().unwrap()),
             expected
@@ -1639,7 +1637,7 @@ mod tests {
             TrailingChecksumHasher::from_trailer_header("x-amz-checksum-sha256").unwrap();
         hasher.update(data);
         let cksum = hasher.finalize_raw();
-        assert_eq!(cksum.algorithm(), storage::ChecksumAlgorithm::Sha256);
+        assert_eq!(cksum.algorithm(), ChecksumAlgorithm::Sha256);
         assert_eq!(cksum.bytes(), expected.as_ref());
     }
 
@@ -1652,7 +1650,7 @@ mod tests {
             TrailingChecksumHasher::from_trailer_header("x-amz-checksum-sha1").unwrap();
         hasher.update(data);
         let cksum = hasher.finalize_raw();
-        assert_eq!(cksum.algorithm(), storage::ChecksumAlgorithm::Sha1);
+        assert_eq!(cksum.algorithm(), ChecksumAlgorithm::Sha1);
         assert_eq!(cksum.bytes(), expected.as_ref());
     }
 
@@ -1683,7 +1681,7 @@ mod tests {
         let (h, claimed) = result.unwrap();
         assert_eq!(claimed, "AAAAAA==");
         let cksum = h.finalize_raw();
-        assert_eq!(cksum.algorithm(), storage::ChecksumAlgorithm::Crc32);
+        assert_eq!(cksum.algorithm(), ChecksumAlgorithm::Crc32);
     }
 
     #[test]
@@ -1704,7 +1702,7 @@ mod tests {
         let (h, claimed) = result.unwrap();
         assert_eq!(claimed, "dGVzdA==");
         let cksum = h.finalize_raw();
-        assert_eq!(cksum.algorithm(), storage::ChecksumAlgorithm::Sha256);
+        assert_eq!(cksum.algorithm(), ChecksumAlgorithm::Sha256);
     }
 
     #[test]

@@ -6,7 +6,8 @@ use crate::coordinator::{
     PutObjectResult,
 };
 use crate::error::ServerError;
-use storage::{BucketInfo, ChecksumAlgorithm, ChecksumType};
+use checksum::{ChecksumAlgorithm, ChecksumType, RawChecksum};
+use storage::BucketInfo;
 
 use super::xml;
 
@@ -700,22 +701,22 @@ impl S3Response {
         bucket: &str,
         key: &str,
         upload_id: &str,
-        checksum_algorithm: Option<storage::ChecksumAlgorithm>,
-        checksum_type: Option<storage::ChecksumType>,
+        checksum_algorithm: Option<ChecksumAlgorithm>,
+        checksum_type: Option<ChecksumType>,
     ) -> Self {
         let body = xml::initiate_multipart_upload_xml(
             bucket,
             key,
             upload_id,
-            checksum_algorithm.map(storage::ChecksumAlgorithm::as_str),
-            checksum_type.map(storage::ChecksumType::as_str),
+            checksum_algorithm.map(ChecksumAlgorithm::as_str),
+            checksum_type.map(ChecksumType::as_str),
         );
         Self::new(200).xml_body(body)
     }
 
     /// Build a response for `UploadPart` (200 OK, `ETag` header, optional checksum).
     #[must_use]
-    pub fn upload_part(etag: &str, checksum: Option<&storage::RawChecksum>) -> Self {
+    pub fn upload_part(etag: &str, checksum: Option<&RawChecksum>) -> Self {
         let mut resp = Self::new(200).header("ETag", etag);
         if let Some(cksum) = checksum {
             use base64::Engine;

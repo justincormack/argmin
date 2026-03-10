@@ -599,13 +599,25 @@ fn mpu_create_upload_with_checksum_fields() {
             key: "k".into(),
             metadata_blob: vec![],
             owner_principal: None,
-            checksum: Some(MultipartChecksumConfig::new(ChecksumAlgorithm::Sha256, Some(ChecksumType::Composite)).unwrap()),
+            checksum: Some(
+                MultipartChecksumConfig::new(
+                    ChecksumAlgorithm::Sha256,
+                    Some(ChecksumType::Composite),
+                )
+                .unwrap(),
+            ),
         })
         .unwrap();
 
     let rec = store.get_multipart_upload("uid-cksum").unwrap();
-    assert_eq!(rec.checksum.map(|c| c.algorithm()), Some(ChecksumAlgorithm::Sha256));
-    assert_eq!(rec.checksum.map(|c| c.checksum_type()), Some(ChecksumType::Composite));
+    assert_eq!(
+        rec.checksum.map(|c| c.algorithm()),
+        Some(ChecksumAlgorithm::Sha256)
+    );
+    assert_eq!(
+        rec.checksum.map(|c| c.checksum_type()),
+        Some(ChecksumType::Composite)
+    );
 
     // None case round-trips as well
     store
@@ -632,7 +644,13 @@ fn mpu_part_checksum_round_trip() {
             key: "k".into(),
             metadata_blob: vec![],
             owner_principal: None,
-            checksum: Some(MultipartChecksumConfig::new(ChecksumAlgorithm::Crc32, Some(ChecksumType::FullObject)).unwrap()),
+            checksum: Some(
+                MultipartChecksumConfig::new(
+                    ChecksumAlgorithm::Crc32,
+                    Some(ChecksumType::FullObject),
+                )
+                .unwrap(),
+            ),
         })
         .unwrap();
 
@@ -739,7 +757,13 @@ fn mpu_complete_multipart_commit_preserves_checksums() {
             key: "k".into(),
             metadata_blob: vec![],
             owner_principal: None,
-            checksum: Some(MultipartChecksumConfig::new(ChecksumAlgorithm::Sha256, Some(ChecksumType::Composite)).unwrap()),
+            checksum: Some(
+                MultipartChecksumConfig::new(
+                    ChecksumAlgorithm::Sha256,
+                    Some(ChecksumType::Composite),
+                )
+                .unwrap(),
+            ),
         })
         .unwrap();
 

@@ -25,6 +25,7 @@ use crate::coordinator::MetadataDirective;
 use crate::coordinator::UploadPartCopyRequest;
 use crate::error::ServerError;
 use crate::metadata_blob::MetadataBlob;
+use checksum::{ChecksumAlgorithm, ChecksumType, MultipartChecksumConfig, RawChecksum};
 use conditional::{
     copy_source_condition_from_headers, delete_condition_from_headers, read_condition_from_headers,
     write_condition_from_headers,
@@ -32,7 +33,6 @@ use conditional::{
 use request::S3Request;
 use response::S3Response;
 use router::{route, S3Operation};
-use storage::{ChecksumAlgorithm, ChecksumType};
 
 /// Parse versionId query parameter from an S3 request.
 /// Returns `Ok(None)` if the parameter is absent, `Ok(Some(id))` if valid,
@@ -1067,7 +1067,7 @@ impl HttpFrontend {
 
                 // Build validated config (rejects invalid algo+type combinations).
                 let checksum = checksum_algorithm
-                    .map(|algo| storage::MultipartChecksumConfig::new(algo, checksum_type))
+                    .map(|algo| MultipartChecksumConfig::new(algo, checksum_type))
                     .transpose()?;
 
                 let result = self.coordinator.create_multipart_upload(
@@ -1991,7 +1991,7 @@ impl HttpFrontend {
         crc64: u64,
         total_size: u64,
         trailer_checksums: &[(String, String)],
-        computed_checksum: Option<storage::RawChecksum>,
+        computed_checksum: Option<RawChecksum>,
     ) -> Result<S3Response, ServerError> {
         // If trailer checksums are present, use the first one as the claimed
         // checksum (overriding any from request headers). Trailing checksums
@@ -3490,12 +3490,12 @@ mod tests {
             let mut headers = Vec::new();
             let mut checksum_b64 = None;
             if let Some(a) = algo {
-                let algo_enum = storage::ChecksumAlgorithm::parse(a).unwrap();
+                let algo_enum = ChecksumAlgorithm::parse(a).unwrap();
                 let raw: Vec<u8> = match algo_enum {
-                    storage::ChecksumAlgorithm::Crc32 => {
+                    ChecksumAlgorithm::Crc32 => {
                         checksum::crc32::checksum(data).to_be_bytes().to_vec()
                     }
-                    storage::ChecksumAlgorithm::Crc32c => {
+                    ChecksumAlgorithm::Crc32c => {
                         checksum::crc32c::checksum(data).to_be_bytes().to_vec()
                     }
                     _ => unimplemented!("test only supports CRC32/CRC32C"),
@@ -3530,7 +3530,7 @@ mod tests {
                 "<Part><PartNumber>{pn}</PartNumber><ETag>{etag}</ETag>"
             ));
             if let (Some(a), Some(val)) = (algo, cksum) {
-                let algo_enum = storage::ChecksumAlgorithm::parse(a).unwrap();
+                let algo_enum = ChecksumAlgorithm::parse(a).unwrap();
                 let elem = algo_enum.xml_element_name();
                 xml_parts.push_str(&format!("<{elem}>{val}</{elem}>"));
             }

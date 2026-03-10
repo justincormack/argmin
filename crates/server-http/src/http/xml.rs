@@ -5,7 +5,8 @@ use crate::coordinator::{
 };
 use crate::error::ServerError;
 use auth::canonical::uri_encode_path;
-use storage::{BucketInfo, BucketVersioningState, ChecksumAlgorithm};
+use checksum::ChecksumAlgorithm;
+use storage::{BucketInfo, BucketVersioningState};
 
 use super::response::format_version_id;
 
@@ -3157,7 +3158,7 @@ mod tests {
     #[test]
     fn list_parts_xml_with_checksum_algorithm_and_parts() {
         use crate::coordinator::PartEntry;
-        use storage::ChecksumAlgorithm;
+        use checksum::ChecksumAlgorithm;
         let result = ListPartsResult {
             parts: vec![
                 PartEntry {
@@ -3213,7 +3214,7 @@ mod tests {
     #[test]
     fn get_object_attributes_object_parts_with_checksums() {
         use crate::coordinator::{ObjectPartEntry, ObjectPartsInfo};
-        use storage::ChecksumAlgorithm;
+        use checksum::ChecksumAlgorithm;
         let parts_info = ObjectPartsInfo {
             total_parts_count: 2,
             has_detail: true,

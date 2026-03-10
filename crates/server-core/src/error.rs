@@ -263,8 +263,8 @@ impl From<MetadataError> for ServerError {
     }
 }
 
-impl From<storage::InvalidChecksumConfig> for ServerError {
-    fn from(e: storage::InvalidChecksumConfig) -> Self {
+impl From<checksum::InvalidChecksumConfig> for ServerError {
+    fn from(e: checksum::InvalidChecksumConfig) -> Self {
         ServerError::InvalidArgument { reason: e.reason }
     }
 }

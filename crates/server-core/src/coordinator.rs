@@ -1,16 +1,17 @@
 /// Coordinator: orchestrates S3 operations across EC, storage, and metadata layers.
 use std::sync::{Arc, MutexGuard};
 
+use checksum::{ChecksumAlgorithm, ChecksumType, MultipartChecksumConfig, RawChecksum};
 use ec::{EcConfig, ErasureCodec};
 use storage::traits::{PgMetadataStore, ShardStore};
 use storage::{
-    BucketInfo, BucketName, ChecksumAlgorithm, ChecksumType, CommitMultipartReq,
-    CommitStreamPutReq, CreateMultipartUploadReq, CreateStreamUploadReq, EcShape,
-    ListMultipartUploadsReq, ListObjectVersionsReq, ListObjectsReq, ListPartsReq, LiveObjectRecord,
-    MultipartPartChunkRecord, MultipartPartRecord, MultipartUploadRecord, ObjectKey, ObjectLayout,
-    ObjectPartRecord, PutDeleteMarkerReq, PutLiveObjectReq, PutObjectReq, SessionId, ShardKey,
-    SharedStorageNode, StoredObject, StreamObjectChunkRecord, StreamUploadChunkRecord,
-    StreamUploadState, StreamUploadTarget, UploadId, UploadState,
+    BucketInfo, BucketName, CommitMultipartReq, CommitStreamPutReq, CreateMultipartUploadReq,
+    CreateStreamUploadReq, EcShape, ListMultipartUploadsReq, ListObjectVersionsReq, ListObjectsReq,
+    ListPartsReq, LiveObjectRecord, MultipartPartChunkRecord, MultipartPartRecord,
+    MultipartUploadRecord, ObjectKey, ObjectLayout, ObjectPartRecord, PutDeleteMarkerReq,
+    PutLiveObjectReq, PutObjectReq, SessionId, ShardKey, SharedStorageNode, StoredObject,
+    StreamObjectChunkRecord, StreamUploadChunkRecord, StreamUploadState, StreamUploadTarget,
+    UploadId, UploadState,
 };
 
 use crate::conditional::{
@@ -128,7 +129,7 @@ pub struct HeadObjectPartResult {
     pub version_id: storage::VersionId,
     pub tags: Option<String>,
     /// Per-part checksum (algorithm + raw bytes).
-    pub checksum: Option<storage::RawChecksum>,
+    pub checksum: Option<RawChecksum>,
 }
 
 /// A single part entry for GetObjectAttributes ObjectParts response.
@@ -193,7 +194,7 @@ pub struct GetObjectPartResult {
     pub version_id: storage::VersionId,
     pub tags: Option<String>,
     /// Per-part checksum (algorithm + raw bytes).
-    pub checksum: Option<storage::RawChecksum>,
+    pub checksum: Option<RawChecksum>,
 }
 
 /// Metadata handling directive for `CopyObject`.
@@ -360,7 +361,7 @@ pub struct CreateMultipartUploadRequest<'a> {
     pub bucket: &'a str,
     pub key: &'a str,
     pub metadata: &'a MetadataBlob,
-    pub checksum: Option<storage::MultipartChecksumConfig>,
+    pub checksum: Option<MultipartChecksumConfig>,
 }
 
 /// Request for an UploadPart operation.
@@ -419,7 +420,7 @@ pub struct FinalizeStreamPartRequest<'a> {
     pub crc64: u64,
     pub total_size: u64,
     pub claimed_checksum: Option<&'a ChecksumClaim>,
-    pub computed_checksum: Option<storage::RawChecksum>,
+    pub computed_checksum: Option<RawChecksum>,
 }
 
 /// Result of a `CopyObject` operation.
@@ -505,7 +506,7 @@ pub struct DeleteObjectsResult {
 pub struct UploadPartResult {
     pub etag: String,
     /// Verified checksum for this part (if any).
-    pub checksum: Option<storage::RawChecksum>,
+    pub checksum: Option<RawChecksum>,
 }
 
 /// Result of an UploadPartCopy operation.
@@ -518,7 +519,7 @@ pub struct UploadPartCopyResult {
 /// Internal result from the shared part-write path.
 struct WritePartInnerResult {
     etag: String,
-    checksum: Option<storage::RawChecksum>,
+    checksum: Option<RawChecksum>,
     last_modified: u64,
 }
 
@@ -1347,9 +1348,7 @@ impl Coordinator {
 
         Ok(BeginStreamPartResult {
             session_id,
-            checksum_algorithm: upload
-                .checksum
-                .map(storage::MultipartChecksumConfig::algorithm),
+            checksum_algorithm: upload.checksum.map(MultipartChecksumConfig::algorithm),
         })
     }
 
@@ -1669,9 +1668,7 @@ impl Coordinator {
 
         // Resolve checksum algorithm: upload-level takes precedence.
         let claimed_algo = claimed_checksum.map(ChecksumClaim::algorithm);
-        let upload_checksum_algo = upload
-            .checksum
-            .map(storage::MultipartChecksumConfig::algorithm);
+        let upload_checksum_algo = upload.checksum.map(MultipartChecksumConfig::algorithm);
         let effective_algo = match (upload_checksum_algo, claimed_algo) {
             (Some(upload_algo), Some(part_algo)) if upload_algo != part_algo => {
                 return Err(ServerError::InvalidRequest {
@@ -1829,11 +1826,11 @@ impl Coordinator {
 
         let checksum = match (effective_algo, checksum_bytes) {
             (Some(algo), Some(bytes)) => {
-                Some(storage::RawChecksum::new(algo, bytes).map_err(|_| {
-                    ServerError::InternalError {
+                Some(
+                    RawChecksum::new(algo, bytes).map_err(|_| ServerError::InternalError {
                         reason: "computed checksum length does not match algorithm".into(),
-                    }
-                })?)
+                    })?,
+                )
             }
             _ => None,
         };
@@ -3097,18 +3094,16 @@ impl Coordinator {
                     .get("x-amz-checksum-algorithm")
                     .and_then(ChecksumAlgorithm::parse)
                 {
-                    Some(algo) => {
-                        Some(storage::RawChecksum::new(algo, raw.clone()).map_err(|_| {
-                            ServerError::InternalError {
-                                reason: format!(
-                                    "stored checksum length {} does not match {} (expected {})",
-                                    raw.len(),
-                                    algo.as_str(),
-                                    algo.expected_byte_length(),
-                                ),
-                            }
-                        })?)
-                    }
+                    Some(algo) => Some(RawChecksum::new(algo, raw.clone()).map_err(|_| {
+                        ServerError::InternalError {
+                            reason: format!(
+                                "stored checksum length {} does not match {} (expected {})",
+                                raw.len(),
+                                algo.as_str(),
+                                algo.expected_byte_length(),
+                            ),
+                        }
+                    })?),
                     None => None,
                 }
             } else {
@@ -3261,18 +3256,16 @@ impl Coordinator {
                     .get("x-amz-checksum-algorithm")
                     .and_then(ChecksumAlgorithm::parse)
                 {
-                    Some(algo) => {
-                        Some(storage::RawChecksum::new(algo, raw.clone()).map_err(|_| {
-                            ServerError::InternalError {
-                                reason: format!(
-                                    "stored checksum length {} does not match {} (expected {})",
-                                    raw.len(),
-                                    algo.as_str(),
-                                    algo.expected_byte_length(),
-                                ),
-                            }
-                        })?)
-                    }
+                    Some(algo) => Some(RawChecksum::new(algo, raw.clone()).map_err(|_| {
+                        ServerError::InternalError {
+                            reason: format!(
+                                "stored checksum length {} does not match {} (expected {})",
+                                raw.len(),
+                                algo.as_str(),
+                                algo.expected_byte_length(),
+                            ),
+                        }
+                    })?),
                     None => None,
                 }
             } else {
@@ -4368,9 +4361,7 @@ impl Coordinator {
                     upload_id: upload_id.to_string(),
                 });
             }
-            let upload_algo = upload
-                .checksum
-                .map(storage::MultipartChecksumConfig::algorithm);
+            let upload_algo = upload.checksum.map(MultipartChecksumConfig::algorithm);
 
             // Determine next generation for this part number.
             let generation = match meta_pg.get_multipart_part(upload_id, part_number) {
@@ -4416,9 +4407,7 @@ impl Coordinator {
                     upload_id: upload_id.to_string(),
                 });
             }
-            let upload_algo = upload
-                .checksum
-                .map(storage::MultipartChecksumConfig::algorithm);
+            let upload_algo = upload.checksum.map(MultipartChecksumConfig::algorithm);
 
             let generation = match meta_pg.get_multipart_part(upload_id, part_number) {
                 Ok(existing) => existing.generation + 1,
@@ -4579,11 +4568,11 @@ impl Coordinator {
 
         let checksum = match (effective_algo, checksum_bytes) {
             (Some(algo), Some(bytes)) => {
-                Some(storage::RawChecksum::new(algo, bytes).map_err(|_| {
-                    ServerError::InternalError {
+                Some(
+                    RawChecksum::new(algo, bytes).map_err(|_| ServerError::InternalError {
                         reason: "computed checksum length does not match algorithm".into(),
-                    }
-                })?)
+                    })?,
+                )
             }
             _ => None,
         };
@@ -4651,12 +4640,8 @@ impl Coordinator {
         }
 
         // Resolve checksum configuration early so per-part validation can use it.
-        let checksum_algo = upload
-            .checksum
-            .map(storage::MultipartChecksumConfig::algorithm);
-        let checksum_type = upload
-            .checksum
-            .map(storage::MultipartChecksumConfig::checksum_type);
+        let checksum_algo = upload.checksum.map(MultipartChecksumConfig::algorithm);
+        let checksum_type = upload.checksum.map(MultipartChecksumConfig::checksum_type);
 
         // 4. Validate all parts exist and ETags match.
         let mut part_records: Vec<MultipartPartRecord> = Vec::with_capacity(parts.len());
@@ -5107,12 +5092,8 @@ impl Coordinator {
             parts,
             is_truncated: resp.is_truncated,
             next_part_number_marker: resp.next_part_number_marker,
-            checksum_algorithm: upload
-                .checksum
-                .map(storage::MultipartChecksumConfig::algorithm),
-            checksum_type: upload
-                .checksum
-                .map(storage::MultipartChecksumConfig::checksum_type),
+            checksum_algorithm: upload.checksum.map(MultipartChecksumConfig::algorithm),
+            checksum_type: upload.checksum.map(MultipartChecksumConfig::checksum_type),
         })
     }
 
@@ -10869,7 +10850,7 @@ mod tests {
                 bucket,
                 key,
                 metadata: &metadata,
-                checksum: Some(storage::MultipartChecksumConfig::new(algo, ctype).unwrap()),
+                checksum: Some(MultipartChecksumConfig::new(algo, ctype).unwrap()),
             })
             .unwrap();
         let mut complete_parts = Vec::new();
@@ -12289,9 +12270,8 @@ mod tests {
     fn checksum_claim_invalid_base64_rejected() {
         // P2: Malformed base64 in claimed checksum must return an error,
         // not silently accept a None checksum.
-        let err =
-            ChecksumClaim::from_base64(storage::ChecksumAlgorithm::Crc32, "not-valid-base64!!!")
-                .unwrap_err();
+        let err = ChecksumClaim::from_base64(ChecksumAlgorithm::Crc32, "not-valid-base64!!!")
+            .unwrap_err();
         assert!(
             matches!(err, ServerError::InvalidRequest { .. }),
             "expected InvalidRequest for bad base64, got {err:?}"
@@ -12303,8 +12283,7 @@ mod tests {
         // A valid base64 string with the wrong byte length for the algorithm.
         use base64::Engine;
         let too_long = base64::engine::general_purpose::STANDARD.encode([0u8; 8]); // CRC32 expects 4
-        let err =
-            ChecksumClaim::from_base64(storage::ChecksumAlgorithm::Crc32, &too_long).unwrap_err();
+        let err = ChecksumClaim::from_base64(ChecksumAlgorithm::Crc32, &too_long).unwrap_err();
         assert!(
             matches!(err, ServerError::InvalidRequest { .. }),
             "expected InvalidRequest for wrong length, got {err:?}"

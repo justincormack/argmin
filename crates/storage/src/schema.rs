@@ -280,7 +280,7 @@ fn migrate_checksum_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
              WHERE NEW.checksum_algorithm IN (2, 3) AND NEW.checksum_type = 1;
            SELECT RAISE(ABORT, 'CRC64NVME + COMPOSITE is invalid')
              WHERE NEW.checksum_algorithm = 4 AND NEW.checksum_type = 0;
-         END;"
+         END;",
     )?;
 
     Ok(())
