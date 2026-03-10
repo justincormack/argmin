@@ -4,6 +4,7 @@ use crate::error::StoreError;
 pub use checksum::{
     ChecksumAlgorithm, ChecksumType, InvalidChecksumConfig, MultipartChecksumConfig, RawChecksum,
 };
+pub use s3_types::{BucketVersioningState, VersionId};
 
 // ── String newtypes ───────────────────────────────────────────────
 
@@ -161,9 +162,11 @@ impl ShardKey {
 
     /// Hex-encode the full key (for file paths).
     pub fn hex(&self) -> String {
+        use std::fmt::Write as _;
+
         let mut s = String::with_capacity(SHARD_KEY_LEN * 2);
         for b in &self.0 {
-            s.push_str(&format!("{b:02x}"));
+            let _ = write!(s, "{b:02x}");
         }
         s
     }
@@ -263,26 +266,6 @@ impl std::fmt::Display for ObjectState {
     }
 }
 
-/// Bucket versioning state.
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BucketVersioningState {
-    Disabled = 0,
-    Enabled = 1,
-    Suspended = 2,
-}
-
-impl BucketVersioningState {
-    pub fn from_u8(v: u8) -> Option<Self> {
-        match v {
-            0 => Some(Self::Disabled),
-            1 => Some(Self::Enabled),
-            2 => Some(Self::Suspended),
-            _ => None,
-        }
-    }
-}
-
 /// ETag kind discriminator.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -335,55 +318,6 @@ impl DataLayout {
             0 => Some(Self::ChunkManifestInternal),
             1 => Some(Self::MultipartManifest),
             _ => None,
-        }
-    }
-}
-
-/// Object version identifier.
-///
-/// `Null` represents the single unversioned copy (version_id=0 in the database).
-/// `Versioned` represents an explicit version (version_id≥1 in the database).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum VersionId {
-    /// The null version (unversioned bucket).
-    Null,
-    /// An explicit version in a versioning-enabled bucket.
-    Versioned(std::num::NonZeroU64),
-}
-
-impl VersionId {
-    /// Convert from the raw u64 stored in the database.
-    pub fn from_u64(v: u64) -> Self {
-        match std::num::NonZeroU64::new(v) {
-            Some(nz) => Self::Versioned(nz),
-            None => Self::Null,
-        }
-    }
-
-    /// Convert to the raw u64 for database storage.
-    pub fn to_u64(self) -> u64 {
-        match self {
-            Self::Null => 0,
-            Self::Versioned(v) => v.get(),
-        }
-    }
-
-    /// Returns true if this is the null (unversioned) version.
-    pub fn is_null(self) -> bool {
-        matches!(self, Self::Null)
-    }
-
-    /// Returns true if this is an explicit versioned ID.
-    pub fn is_versioned(self) -> bool {
-        matches!(self, Self::Versioned(_))
-    }
-}
-
-impl std::fmt::Display for VersionId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Null => f.write_str("null"),
-            Self::Versioned(v) => write!(f, "{v}"),
         }
     }
 }

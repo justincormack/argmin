@@ -33,24 +33,25 @@ use conditional::{
 use request::S3Request;
 use response::S3Response;
 use router::{route, S3Operation};
+use s3_types::VersionId;
 
 /// Parse versionId query parameter from an S3 request.
 /// Returns `Ok(None)` if the parameter is absent, `Ok(Some(id))` if valid,
 /// or `Err` if the value is present but not a valid version ID.
 /// Parse a version-id string into a typed `VersionId`.
-fn parse_version_id_str(v: &str) -> Result<storage::VersionId, ServerError> {
+fn parse_version_id_str(v: &str) -> Result<VersionId, ServerError> {
     if v == "null" {
-        Ok(storage::VersionId::Null)
+        Ok(VersionId::Null)
     } else {
         v.parse::<u64>()
-            .map(storage::VersionId::from_u64)
+            .map(VersionId::from_u64)
             .map_err(|_| ServerError::InvalidArgument {
                 reason: format!("invalid versionId: {v}"),
             })
     }
 }
 
-fn parse_version_id(req: &S3Request) -> Result<Option<storage::VersionId>, ServerError> {
+fn parse_version_id(req: &S3Request) -> Result<Option<VersionId>, ServerError> {
     match req.query_param("versionId") {
         None => Ok(None),
         Some(v) => parse_version_id_str(&v).map(Some),
@@ -370,12 +371,12 @@ impl HttpFrontend {
                         request::parse_copy_source(copy_source)?;
                     let src_version_id = match src_version_id_str {
                         None => None,
-                        Some(v) if v == "null" => Some(storage::VersionId::Null),
-                        Some(v) => Some(storage::VersionId::from_u64(v.parse::<u64>().map_err(
-                            |_| ServerError::InvalidArgument {
+                        Some(v) if v == "null" => Some(VersionId::Null),
+                        Some(v) => Some(VersionId::from_u64(v.parse::<u64>().map_err(|_| {
+                            ServerError::InvalidArgument {
                                 reason: format!("invalid versionId in copy source: {v}"),
-                            },
-                        )?)),
+                            }
+                        })?)),
                     };
                     self.authorize_bucket_write(auth, &bucket)?;
                     self.authorize_bucket_read(auth, &src_bucket)?;
@@ -1108,12 +1109,12 @@ impl HttpFrontend {
                         request::parse_copy_source(copy_source)?;
                     let src_version_id = match src_version_id_str {
                         None => None,
-                        Some(v) if v == "null" => Some(storage::VersionId::Null),
-                        Some(v) => Some(storage::VersionId::from_u64(v.parse::<u64>().map_err(
-                            |_| ServerError::InvalidArgument {
+                        Some(v) if v == "null" => Some(VersionId::Null),
+                        Some(v) => Some(VersionId::from_u64(v.parse::<u64>().map_err(|_| {
+                            ServerError::InvalidArgument {
                                 reason: format!("invalid versionId in copy source: {v}"),
-                            },
-                        )?)),
+                            }
+                        })?)),
                     };
                     self.authorize_bucket_write(auth, &bucket)?;
                     self.authorize_bucket_read(auth, &src_bucket)?;
@@ -1292,12 +1293,12 @@ impl HttpFrontend {
                 let key_marker = req.query_param("key-marker");
                 let version_id_marker = match req.query_param("version-id-marker") {
                     None => None,
-                    Some(v) if v == "null" => Some(storage::VersionId::Null),
-                    Some(v) => Some(storage::VersionId::from_u64(v.parse::<u64>().map_err(
-                        |_| ServerError::InvalidArgument {
+                    Some(v) if v == "null" => Some(VersionId::Null),
+                    Some(v) => Some(VersionId::from_u64(v.parse::<u64>().map_err(|_| {
+                        ServerError::InvalidArgument {
                             reason: format!("invalid version-id-marker: {v}"),
-                        },
-                    )?)),
+                        }
+                    })?)),
                 };
                 let max_keys: u32 = req
                     .query_param("max-keys")

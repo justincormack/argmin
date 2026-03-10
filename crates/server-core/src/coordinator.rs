@@ -3,6 +3,7 @@ use std::sync::{Arc, MutexGuard};
 
 use checksum::{ChecksumAlgorithm, ChecksumType, MultipartChecksumConfig, RawChecksum};
 use ec::{EcConfig, ErasureCodec};
+use s3_types::{BucketVersioningState, VersionId};
 use storage::traits::{PgMetadataStore, ShardStore};
 use storage::{
     BucketInfo, BucketName, CommitMultipartReq, CommitStreamPutReq, CreateMultipartUploadReq,
@@ -84,7 +85,7 @@ const MAX_LIST_RECORDS: usize = 100_000;
 #[derive(Debug)]
 pub struct PutObjectResult {
     pub etag: String,
-    pub version_id: storage::VersionId,
+    pub version_id: VersionId,
 }
 
 /// Result of beginning a streaming UploadPart session.
@@ -102,7 +103,7 @@ pub struct GetObjectResult {
     pub etag: String,
     pub size: u64,
     pub last_modified: u64,
-    pub version_id: storage::VersionId,
+    pub version_id: VersionId,
     pub tags: Option<String>,
 }
 
@@ -113,7 +114,7 @@ pub struct HeadObjectResult {
     pub etag: String,
     pub size: u64,
     pub last_modified: u64,
-    pub version_id: storage::VersionId,
+    pub version_id: VersionId,
     pub tags: Option<String>,
 }
 
@@ -126,7 +127,7 @@ pub struct HeadObjectPartResult {
     pub total_size: u64,
     pub last_modified: u64,
     pub parts_count: u32,
-    pub version_id: storage::VersionId,
+    pub version_id: VersionId,
     pub tags: Option<String>,
     /// Per-part checksum (algorithm + raw bytes).
     pub checksum: Option<RawChecksum>,
@@ -162,7 +163,7 @@ pub struct GetObjectAttributesResult {
     pub etag: String,
     pub size: u64,
     pub last_modified: u64,
-    pub version_id: storage::VersionId,
+    pub version_id: VersionId,
     pub object_parts: Option<ObjectPartsInfo>,
 }
 
@@ -176,7 +177,7 @@ pub struct GetObjectRangeResult {
     pub last_modified: u64,
     pub range_start: u64,
     pub range_end: u64,
-    pub version_id: storage::VersionId,
+    pub version_id: VersionId,
     pub tags: Option<String>,
 }
 
@@ -191,7 +192,7 @@ pub struct GetObjectPartResult {
     pub part_start: u64,
     pub part_end: u64,
     pub parts_count: u32,
-    pub version_id: storage::VersionId,
+    pub version_id: VersionId,
     pub tags: Option<String>,
     /// Per-part checksum (algorithm + raw bytes).
     pub checksum: Option<RawChecksum>,
@@ -219,7 +220,7 @@ pub enum MetadataDirective<'a> {
 pub struct CopySource<'a> {
     pub bucket: &'a str,
     pub key: &'a str,
-    pub version_id: Option<storage::VersionId>,
+    pub version_id: Option<VersionId>,
     pub condition: &'a ReadCondition,
 }
 
@@ -259,7 +260,7 @@ pub struct PutObjectRequest<'a> {
 pub struct GetObjectRequest<'a> {
     pub bucket: &'a str,
     pub key: &'a str,
-    pub version_id: Option<storage::VersionId>,
+    pub version_id: Option<VersionId>,
     pub cond: &'a ReadCondition,
 }
 
@@ -268,7 +269,7 @@ pub struct GetObjectRequest<'a> {
 pub struct GetObjectPartRequest<'a> {
     pub bucket: &'a str,
     pub key: &'a str,
-    pub version_id: Option<storage::VersionId>,
+    pub version_id: Option<VersionId>,
     pub part_number: u32,
     pub cond: &'a ReadCondition,
 }
@@ -278,7 +279,7 @@ pub struct GetObjectPartRequest<'a> {
 pub struct GetObjectRangeRequest<'a> {
     pub bucket: &'a str,
     pub key: &'a str,
-    pub version_id: Option<storage::VersionId>,
+    pub version_id: Option<VersionId>,
     pub range: ByteRange,
     pub cond: &'a ReadCondition,
 }
@@ -288,7 +289,7 @@ pub struct GetObjectRangeRequest<'a> {
 pub struct DeleteObjectRequest<'a> {
     pub bucket: &'a str,
     pub key: &'a str,
-    pub version_id: Option<storage::VersionId>,
+    pub version_id: Option<VersionId>,
     pub cond: &'a DeleteCondition,
 }
 
@@ -308,7 +309,7 @@ pub struct ListObjectVersionsRequest<'a> {
     pub bucket: &'a str,
     pub prefix: Option<&'a str>,
     pub key_marker: Option<&'a str>,
-    pub version_id_marker: Option<storage::VersionId>,
+    pub version_id_marker: Option<VersionId>,
     pub max_keys: u32,
 }
 
@@ -336,7 +337,7 @@ pub struct ListMultipartUploadsRequest<'a> {
 #[derive(Debug)]
 pub struct DeleteEntry<'a> {
     pub key: &'a str,
-    pub version_id: Option<storage::VersionId>,
+    pub version_id: Option<VersionId>,
 }
 
 /// Request for a DeleteObjects (multi-delete) operation.
@@ -380,7 +381,7 @@ pub struct UploadPartRequest<'a> {
 pub struct GetObjectAttributesRequest<'a> {
     pub bucket: &'a str,
     pub key: &'a str,
-    pub version_id: Option<storage::VersionId>,
+    pub version_id: Option<VersionId>,
     pub cond: &'a ReadCondition,
     pub want_parts: bool,
     pub part_number_marker: Option<u32>,
@@ -428,7 +429,7 @@ pub struct FinalizeStreamPartRequest<'a> {
 pub struct CopyObjectResult {
     pub etag: String,
     pub last_modified: u64,
-    pub version_id: storage::VersionId,
+    pub version_id: VersionId,
 }
 
 /// Object entry for listing.
@@ -454,7 +455,7 @@ pub struct ListObjectsResult {
 #[derive(Debug, Clone)]
 pub struct VersionEntry {
     pub key: String,
-    pub version_id: storage::VersionId,
+    pub version_id: VersionId,
     pub is_latest: bool,
     pub size: u64,
     pub etag: String,
@@ -468,13 +469,13 @@ pub struct ListObjectVersionsResult {
     pub versions: Vec<VersionEntry>,
     pub is_truncated: bool,
     pub next_key_marker: Option<String>,
-    pub next_version_id_marker: Option<storage::VersionId>,
+    pub next_version_id_marker: Option<VersionId>,
 }
 
 /// Result of a DeleteObject operation.
 #[derive(Debug)]
 pub struct DeleteObjectResult {
-    pub version_id: storage::VersionId,
+    pub version_id: VersionId,
     pub delete_marker: bool,
 }
 
@@ -482,7 +483,7 @@ pub struct DeleteObjectResult {
 #[derive(Debug)]
 pub struct DeletedObject {
     pub key: String,
-    pub version_id: storage::VersionId,
+    pub version_id: VersionId,
     pub delete_marker: bool,
 }
 
@@ -542,7 +543,7 @@ pub struct CompletePart {
 #[derive(Debug)]
 pub struct CompleteMultipartUploadResult {
     pub etag: String,
-    pub version_id: storage::VersionId,
+    pub version_id: VersionId,
     /// Object-level checksum algorithm (if configured).
     pub checksum_algorithm: Option<ChecksumAlgorithm>,
     /// Object-level checksum type.
@@ -629,7 +630,7 @@ struct LockedReadObject<'a> {
 }
 
 struct LockedWriteObject<'a> {
-    version_id: storage::VersionId,
+    version_id: VersionId,
     pgs: TwoPgGuards<'a>,
 }
 
@@ -676,7 +677,7 @@ impl Coordinator {
         self.pg_topology.object_pg(bucket, key)
     }
 
-    fn shard_pg_id(&self, bucket: &str, key: &str, version_id: storage::VersionId) -> u32 {
+    fn shard_pg_id(&self, bucket: &str, key: &str, version_id: VersionId) -> u32 {
         self.pg_topology.shard_pg(bucket, key, version_id.to_u64())
     }
 
@@ -792,7 +793,7 @@ impl Coordinator {
     pub fn put_bucket_versioning(
         &self,
         name: &str,
-        state: storage::BucketVersioningState,
+        state: BucketVersioningState,
     ) -> Result<(), ServerError> {
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg
@@ -810,10 +811,7 @@ impl Coordinator {
             })
     }
 
-    pub fn get_bucket_versioning(
-        &self,
-        name: &str,
-    ) -> Result<storage::BucketVersioningState, ServerError> {
+    pub fn get_bucket_versioning(&self, name: &str) -> Result<BucketVersioningState, ServerError> {
         let info = self.head_bucket(name)?;
         Ok(info.versioning)
     }
@@ -989,7 +987,7 @@ impl Coordinator {
         &self,
         bucket: &str,
         key: &str,
-        version_id: Option<storage::VersionId>,
+        version_id: Option<VersionId>,
         tags: &str,
     ) -> Result<(), ServerError> {
         self.head_bucket(bucket)?;
@@ -1017,7 +1015,7 @@ impl Coordinator {
         &self,
         bucket: &str,
         key: &str,
-        version_id: Option<storage::VersionId>,
+        version_id: Option<VersionId>,
     ) -> Result<Option<String>, ServerError> {
         self.head_bucket(bucket)?;
         let pg_id = self.object_pg_id(bucket, key);
@@ -1044,7 +1042,7 @@ impl Coordinator {
         &self,
         bucket: &str,
         key: &str,
-        version_id: Option<storage::VersionId>,
+        version_id: Option<VersionId>,
     ) -> Result<(), ServerError> {
         self.head_bucket(bucket)?;
         let pg_id = self.object_pg_id(bucket, key);
@@ -1081,7 +1079,7 @@ impl Coordinator {
         key: &str,
         metadata_blob: &MetadataBlob,
         user_data: &[u8],
-        version_id: storage::VersionId,
+        version_id: VersionId,
         meta_pg: &storage::PgStore,
         shard_pg: &storage::PgStore,
     ) -> Result<(PutObjectResult, Vec<StreamObjectChunkRecord>), ServerError> {
@@ -1375,7 +1373,7 @@ impl Coordinator {
         let shard_pg_id = self.shard_pg_id(
             &format!("chunk/{session_id}"),
             &chunk_index.to_string(),
-            storage::VersionId::Null,
+            VersionId::Null,
         );
 
         // Lock metadata PG + shard PG in global ascending order.
@@ -1542,10 +1540,10 @@ impl Coordinator {
         }
 
         // Allocate version_id.
-        let version_id = if bucket_info.versioning == storage::BucketVersioningState::Enabled {
+        let version_id = if bucket_info.versioning == BucketVersioningState::Enabled {
             meta_guard.next_version_id(bucket, key)?
         } else {
-            storage::VersionId::Null
+            VersionId::Null
         };
 
         // Build committed chunk manifest from staging rows and validate total_size.
@@ -1798,7 +1796,7 @@ impl Coordinator {
             let old_shard_pg_id = self.shard_pg_id(
                 &format!("mpu/{upload_id}"),
                 &format!("{part_number}/{old_gen}"),
-                storage::VersionId::from_u64(old_vid),
+                VersionId::from_u64(old_vid),
             );
             if let Ok(old_pg) = self.storage_node.get_pg(old_shard_pg_id) {
                 let k = self.ec_config.data_shards as usize;
@@ -1815,7 +1813,7 @@ impl Coordinator {
                 if let Ok(old_chunks) = pg.get_multipart_part_chunks(
                     bucket,
                     key,
-                    storage::VersionId::from_u64(old_vid),
+                    VersionId::from_u64(old_vid),
                     part_number,
                 ) {
                     drop(pg);
@@ -2148,7 +2146,7 @@ impl Coordinator {
         meta_pg: &storage::PgStore,
         bucket: &str,
         key: &str,
-        version_id: Option<storage::VersionId>,
+        version_id: Option<VersionId>,
     ) -> Result<StoredObject, ServerError> {
         match version_id {
             Some(vid) => meta_pg.get_object_version(bucket, key, vid),
@@ -2173,7 +2171,7 @@ impl Coordinator {
         &'a self,
         bucket: &str,
         key: &str,
-        version_id: Option<storage::VersionId>,
+        version_id: Option<VersionId>,
     ) -> Result<LockedReadObject<'a>, ServerError> {
         let meta_pg_id = self.object_pg_id(bucket, key);
 
@@ -2225,16 +2223,16 @@ impl Coordinator {
         &'a self,
         bucket: &str,
         key: &str,
-        versioning_state: storage::BucketVersioningState,
+        versioning_state: BucketVersioningState,
     ) -> Result<LockedWriteObject<'a>, ServerError> {
         let meta_pg_id = self.object_pg_id(bucket, key);
 
         loop {
             let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
-            let version_id = if versioning_state == storage::BucketVersioningState::Enabled {
+            let version_id = if versioning_state == BucketVersioningState::Enabled {
                 meta_guard.next_version_id(bucket, key)?
             } else {
-                storage::VersionId::Null
+                VersionId::Null
             };
             let shard_pg_id = self.shard_pg_id(bucket, key, version_id);
 
@@ -2247,7 +2245,7 @@ impl Coordinator {
 
             if meta_pg_id < shard_pg_id {
                 let shard_guard = self.storage_node.get_pg(shard_pg_id)?;
-                if versioning_state == storage::BucketVersioningState::Enabled {
+                if versioning_state == BucketVersioningState::Enabled {
                     let current = meta_guard.next_version_id(bucket, key)?;
                     if current != version_id {
                         continue;
@@ -2264,10 +2262,10 @@ impl Coordinator {
 
             let (meta_guard, shard_guard) =
                 self.storage_node.lock_two_pgs(meta_pg_id, shard_pg_id)?;
-            let version_id = if versioning_state == storage::BucketVersioningState::Enabled {
+            let version_id = if versioning_state == BucketVersioningState::Enabled {
                 meta_guard.next_version_id(bucket, key)?
             } else {
-                storage::VersionId::Null
+                VersionId::Null
             };
             let verify_shard_pg_id = self.shard_pg_id(bucket, key, version_id);
             if verify_shard_pg_id != shard_pg_id {
@@ -2291,7 +2289,7 @@ impl Coordinator {
         &self,
         pg: &storage::PgStore,
         okh: &[u8; 16],
-        version_id: storage::VersionId,
+        version_id: VersionId,
         record: &LiveObjectRecord,
         needed: &[usize],
     ) -> Result<(Vec<Vec<u8>>, usize), ServerError> {
@@ -2435,7 +2433,7 @@ impl Coordinator {
         &self,
         pg: &storage::PgStore,
         okh: &[u8; 16],
-        version_id: storage::VersionId,
+        version_id: VersionId,
         record: &LiveObjectRecord,
         start: usize,
         end: usize,
@@ -2626,7 +2624,7 @@ impl Coordinator {
             .map(|c| storage::StreamObjectChunkRecord {
                 bucket: c.bucket.clone(),
                 key: c.key.clone(),
-                version_id: storage::VersionId::from_u64(c.version_id),
+                version_id: VersionId::from_u64(c.version_id),
                 chunk_index: c.chunk_index,
                 size: c.size,
                 chunk_okh: c.chunk_okh,
@@ -3616,7 +3614,7 @@ impl Coordinator {
 
         match (bucket_info.versioning, request_version_id) {
             // Unversioned bucket: physical delete (current behavior)
-            (storage::BucketVersioningState::Disabled, _) => {
+            (BucketVersioningState::Disabled, _) => {
                 let LockedReadObject {
                     record: stored,
                     pgs,
@@ -3627,7 +3625,7 @@ impl Coordinator {
                             return Err(ServerError::PreconditionFailed);
                         }
                         return Ok(DeleteObjectResult {
-                            version_id: storage::VersionId::Null,
+                            version_id: VersionId::Null,
                             delete_marker: false,
                         });
                     }
@@ -3639,7 +3637,7 @@ impl Coordinator {
                     StoredObject::Live(r) => r,
                     StoredObject::DeleteMarker(_) => {
                         return Ok(DeleteObjectResult {
-                            version_id: storage::VersionId::Null,
+                            version_id: VersionId::Null,
                             delete_marker: false,
                         });
                     }
@@ -3716,7 +3714,7 @@ impl Coordinator {
                 }
 
                 Ok(DeleteObjectResult {
-                    version_id: storage::VersionId::Null,
+                    version_id: VersionId::Null,
                     delete_marker: false,
                 })
             }
@@ -4373,7 +4371,7 @@ impl Coordinator {
             let shard_pg_id = self.shard_pg_id(
                 &format!("mpu/{upload_id}"),
                 &format!("{part_number}/{generation}"),
-                storage::VersionId::from_u64(u64::from(generation)),
+                VersionId::from_u64(u64::from(generation)),
             );
 
             if shard_pg_id == meta_pg_id {
@@ -4418,7 +4416,7 @@ impl Coordinator {
             let verify_shard_pg_id = self.shard_pg_id(
                 &format!("mpu/{upload_id}"),
                 &format!("{part_number}/{generation}"),
-                storage::VersionId::from_u64(u64::from(generation)),
+                VersionId::from_u64(u64::from(generation)),
             );
 
             // Generation changed while relocking — shard PG may differ. Retry.
@@ -4556,7 +4554,7 @@ impl Coordinator {
             let old_shard_pg_id = self.shard_pg_id(
                 &format!("mpu/{upload_id}"),
                 &format!("{part_number}/{old_gen}"),
-                storage::VersionId::from_u64(old_vid),
+                VersionId::from_u64(old_vid),
             );
             if let Ok(old_pg) = self.storage_node.get_pg(old_shard_pg_id) {
                 for i in 0..(k + m) {
@@ -4724,10 +4722,10 @@ impl Coordinator {
         }
 
         // 6. Allocate version_id using existing versioning rules.
-        let version_id = if bucket_info.versioning == storage::BucketVersioningState::Enabled {
+        let version_id = if bucket_info.versioning == BucketVersioningState::Enabled {
             meta_pg.next_version_id(bucket, key)?
         } else {
-            storage::VersionId::Null
+            VersionId::Null
         };
 
         // 7. Compute composite multipart ETag.
@@ -4902,7 +4900,7 @@ impl Coordinator {
                 let shard_pg_id = self.shard_pg_id(
                     &format!("mpu/{}", p.upload_id),
                     &format!("{}/{}", p.part_number, p.generation),
-                    storage::VersionId::from_u64(p.part_vid),
+                    VersionId::from_u64(p.part_vid),
                 );
                 ObjectPartRecord {
                     bucket: BucketName::from(bucket),
@@ -5001,7 +4999,7 @@ impl Coordinator {
             let shard_pg_id = self.shard_pg_id(
                 &format!("mpu/{upload_id}"),
                 &format!("{}/{}", part.part_number, part.generation),
-                storage::VersionId::from_u64(part.part_vid),
+                VersionId::from_u64(part.part_vid),
             );
             if let Ok(shard_pg) = self.storage_node.get_pg(shard_pg_id) {
                 let k = part.ec_k as usize;
@@ -8003,7 +8001,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let state = coord.get_bucket_versioning("bucket").unwrap();
-        assert_eq!(state, storage::BucketVersioningState::Disabled);
+        assert_eq!(state, BucketVersioningState::Disabled);
     }
 
     #[test]
@@ -8013,11 +8011,11 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         coord
-            .put_bucket_versioning("bucket", storage::BucketVersioningState::Enabled)
+            .put_bucket_versioning("bucket", BucketVersioningState::Enabled)
             .unwrap();
         assert_eq!(
             coord.get_bucket_versioning("bucket").unwrap(),
-            storage::BucketVersioningState::Enabled
+            BucketVersioningState::Enabled
         );
     }
 
@@ -8028,14 +8026,14 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         coord
-            .put_bucket_versioning("bucket", storage::BucketVersioningState::Enabled)
+            .put_bucket_versioning("bucket", BucketVersioningState::Enabled)
             .unwrap();
         coord
-            .put_bucket_versioning("bucket", storage::BucketVersioningState::Suspended)
+            .put_bucket_versioning("bucket", BucketVersioningState::Suspended)
             .unwrap();
         assert_eq!(
             coord.get_bucket_versioning("bucket").unwrap(),
-            storage::BucketVersioningState::Suspended
+            BucketVersioningState::Suspended
         );
     }
 
@@ -8046,17 +8044,17 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         coord
-            .put_bucket_versioning("bucket", storage::BucketVersioningState::Enabled)
+            .put_bucket_versioning("bucket", BucketVersioningState::Enabled)
             .unwrap();
         coord
-            .put_bucket_versioning("bucket", storage::BucketVersioningState::Suspended)
+            .put_bucket_versioning("bucket", BucketVersioningState::Suspended)
             .unwrap();
         coord
-            .put_bucket_versioning("bucket", storage::BucketVersioningState::Enabled)
+            .put_bucket_versioning("bucket", BucketVersioningState::Enabled)
             .unwrap();
         assert_eq!(
             coord.get_bucket_versioning("bucket").unwrap(),
-            storage::BucketVersioningState::Enabled
+            BucketVersioningState::Enabled
         );
     }
 
@@ -8067,10 +8065,10 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         coord
-            .put_bucket_versioning("bucket", storage::BucketVersioningState::Enabled)
+            .put_bucket_versioning("bucket", BucketVersioningState::Enabled)
             .unwrap();
         let err = coord
-            .put_bucket_versioning("bucket", storage::BucketVersioningState::Disabled)
+            .put_bucket_versioning("bucket", BucketVersioningState::Disabled)
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidRequest { .. }));
     }
@@ -8081,7 +8079,7 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         let err = coord
-            .put_bucket_versioning("no-bucket", storage::BucketVersioningState::Enabled)
+            .put_bucket_versioning("no-bucket", BucketVersioningState::Enabled)
             .unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
     }
@@ -8101,7 +8099,7 @@ mod tests {
                 cond: NO_WRITE,
             })
             .unwrap();
-        assert_eq!(result.version_id, storage::VersionId::Null);
+        assert_eq!(result.version_id, VersionId::Null);
     }
 
     #[test]
@@ -8127,7 +8125,7 @@ mod tests {
                 cond: NO_READ,
             })
             .unwrap();
-        assert_eq!(obj.version_id, storage::VersionId::Null);
+        assert_eq!(obj.version_id, VersionId::Null);
     }
 
     #[test]
@@ -8153,7 +8151,7 @@ mod tests {
                 cond: NO_READ,
             })
             .unwrap();
-        assert_eq!(head.version_id, storage::VersionId::Null);
+        assert_eq!(head.version_id, VersionId::Null);
     }
 
     #[test]
@@ -8175,7 +8173,7 @@ mod tests {
         let admin = make_coord();
         admin.create_bucket("bucket").unwrap();
         admin
-            .put_bucket_versioning("bucket", storage::BucketVersioningState::Enabled)
+            .put_bucket_versioning("bucket", BucketVersioningState::Enabled)
             .unwrap();
 
         // Repeat to increase the chance of exposing races.
@@ -8425,7 +8423,7 @@ mod tests {
                 cond: NO_DELETE,
             })
             .unwrap();
-        assert_eq!(result.version_id, storage::VersionId::Null);
+        assert_eq!(result.version_id, VersionId::Null);
         assert!(!result.delete_marker);
     }
 
@@ -9698,7 +9696,7 @@ mod tests {
 
         // Old manifest parts (from first upload) should be replaced.
         let committed = pg
-            .get_object_parts("bucket", "key", storage::VersionId::Null)
+            .get_object_parts("bucket", "key", VersionId::Null)
             .unwrap();
         assert_eq!(committed.len(), 2);
     }
@@ -9746,7 +9744,7 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_bucket_versioning("bucket", storage::BucketVersioningState::Enabled)
+            .put_bucket_versioning("bucket", BucketVersioningState::Enabled)
             .unwrap();
 
         let (upload_id, parts) =
@@ -11229,7 +11227,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.etag, format_etag(crc));
-        assert_eq!(result.version_id, storage::VersionId::Null);
+        assert_eq!(result.version_id, VersionId::Null);
 
         // Verify object is visible via head_object.
         let head = coord
@@ -11613,11 +11611,7 @@ mod tests {
 
         // Record shard keys before abort for verification.
         let chunk_okh = crate::pg::chunk_key_hash(&session_id, 0);
-        let shard_pg_id = coord.shard_pg_id(
-            &format!("chunk/{session_id}"),
-            "0",
-            storage::VersionId::Null,
-        );
+        let shard_pg_id = coord.shard_pg_id(&format!("chunk/{session_id}"), "0", VersionId::Null);
 
         coord
             .abort_stream_put("bucket", "key", &session_id)
@@ -12446,8 +12440,8 @@ mod tests {
         );
 
         // Sanity: version IDs should both be 0 (unversioned).
-        assert_eq!(result_a.version_id, storage::VersionId::Null);
-        assert_eq!(result_b.version_id, storage::VersionId::Null);
+        assert_eq!(result_a.version_id, VersionId::Null);
+        assert_eq!(result_b.version_id, VersionId::Null);
     }
 
     #[test]

@@ -4,6 +4,7 @@ members = [
     "crates/ec-sys",
     "crates/ec",
     "crates/checksum",
+    "crates/s3-types",
     "crates/placement",
     "crates/storage",
     "crates/auth",

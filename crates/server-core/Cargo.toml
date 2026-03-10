@@ -8,6 +8,7 @@ auth = { path = "../auth" }
 checksum = { path = "../checksum" }
 ec = { path = "../ec" }
 storage = { path = "../storage" }
+s3-types = { path = "../s3-types" }
 base64 = "0.22"
 rapidhash = "1"
 ring = "0.17"

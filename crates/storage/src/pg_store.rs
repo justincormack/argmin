@@ -593,7 +593,7 @@ impl PgMetadataStore for PgStore {
         let now = PgStore::now_millis() as i64;
         let result = self.conn.execute(
             "INSERT INTO buckets (name, owner_principal, created_at, public_read) VALUES (?1, ?2, ?3, ?4)",
-            params![name, owner_principal, now, if public_read { 1 } else { 0 }],
+            params![name, owner_principal, now, i32::from(public_read)],
         );
         match result {
             Ok(_) => Ok(()),
@@ -925,7 +925,7 @@ impl PgMetadataStore for PgStore {
             .conn
             .execute(
                 "UPDATE buckets SET public_read = ?1 WHERE name = ?2",
-                params![if public_read { 1 } else { 0 }, name],
+                params![i32::from(public_read), name],
             )
             .map_err(|e| MetadataError::Db {
                 context: "put bucket acl",
@@ -1320,10 +1320,9 @@ impl PgMetadataStore for PgStore {
         }
 
         let (next_key_marker, next_version_id_marker) = if is_truncated {
-            versions
-                .last()
-                .map(|o| (Some(o.key().clone()), Some(o.version_id())))
-                .unwrap_or((None, None))
+            versions.last().map_or((None, None), |o| {
+                (Some(o.key().clone()), Some(o.version_id()))
+            })
         } else {
             (None, None)
         };
@@ -1430,18 +1429,24 @@ impl PgMetadataStore for PgStore {
                 context: "get object tags",
                 source: e,
             })?;
-        match result {
-            Some(tags) => Ok(tags),
-            None => {
-                let status: Option<u8> = self.conn.query_row(
+        if let Some(tags) = result {
+            Ok(tags)
+        } else {
+            let status: Option<u8> = self
+                .conn
+                .query_row(
                     "SELECT status FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
                     params![bucket, key, version_id.to_u64() as i64],
                     |row| row.get(0),
-                ).optional().map_err(|e| MetadataError::Db { context: "get object tags (check status)", source: e })?;
-                match status {
-                    Some(1) => Err(MetadataError::MethodNotAllowedOnDeleteMarker),
-                    _ => Err(MetadataError::ObjectNotFound),
-                }
+                )
+                .optional()
+                .map_err(|e| MetadataError::Db {
+                    context: "get object tags (check status)",
+                    source: e,
+                })?;
+            match status {
+                Some(1) => Err(MetadataError::MethodNotAllowedOnDeleteMarker),
+                _ => Err(MetadataError::ObjectNotFound),
             }
         }
     }
@@ -1805,10 +1810,9 @@ impl PgMetadataStore for PgStore {
         }
 
         let (next_key_marker, next_upload_id_marker) = if is_truncated {
-            uploads
-                .last()
-                .map(|u| (Some(u.key.clone()), Some(u.upload_id.clone())))
-                .unwrap_or((None, None))
+            uploads.last().map_or((None, None), |u| {
+                (Some(u.key.clone()), Some(u.upload_id.clone()))
+            })
         } else {
             (None, None)
         };
@@ -2863,7 +2867,7 @@ impl PgMetadataStore for PgStore {
                     source: e,
                 })?;
 
-            let new_gen = prev_gen.map(|g| g + 1).unwrap_or(1);
+            let new_gen = prev_gen.map_or(1, |g| g + 1);
 
             self.conn
                 .execute(

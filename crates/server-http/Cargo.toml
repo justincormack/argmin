@@ -16,6 +16,7 @@ auth = { path = "../auth" }
 checksum = { path = "../checksum" }
 ec = { path = "../ec" }
 server-core = { path = "../server-core" }
+s3-types = { path = "../s3-types" }
 storage = { path = "../storage" }
 base64 = "0.22"
 ec-sys = { path = "../ec-sys" }

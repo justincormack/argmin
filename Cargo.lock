@@ -1925,6 +1925,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "s3-types"
+version = "0.1.0"
+
+[[package]]
 name = "schannel"
 version = "0.1.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2039,6 +2043,7 @@ dependencies = [
  "ec",
  "rapidhash 1.4.0",
  "ring",
+ "s3-types",
  "storage",
  "test-util",
  "thiserror",
@@ -2059,6 +2064,7 @@ dependencies = [
  "hyper 1.8.1",
  "hyper-util",
  "ring",
+ "s3-types",
  "server-core",
  "storage",
  "test-util",
@@ -2181,6 +2187,7 @@ dependencies = [
  "proptest",
  "rapidhash 1.4.0",
  "rusqlite",
+ "s3-types",
  "test-util",
  "thiserror",
 ]

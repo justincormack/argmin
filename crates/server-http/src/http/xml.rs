@@ -6,7 +6,10 @@ use crate::coordinator::{
 use crate::error::ServerError;
 use auth::canonical::uri_encode_path;
 use checksum::ChecksumAlgorithm;
-use storage::{BucketInfo, BucketVersioningState};
+use s3_types::BucketVersioningState;
+#[cfg(test)]
+use s3_types::VersionId;
+use storage::BucketInfo;
 
 use super::response::format_version_id;
 
@@ -1991,7 +1994,7 @@ mod tests {
         use crate::coordinator::{DeleteError, DeletedObject};
         let deleted = vec![DeletedObject {
             key: "key1".to_string(),
-            version_id: storage::VersionId::Null,
+            version_id: VersionId::Null,
             delete_marker: false,
         }];
         let errors = vec![DeleteError {
@@ -2011,7 +2014,7 @@ mod tests {
         use crate::coordinator::DeletedObject;
         let deleted = vec![DeletedObject {
             key: "key1".to_string(),
-            version_id: storage::VersionId::Null,
+            version_id: VersionId::Null,
             delete_marker: false,
         }];
         let xml = delete_objects_result_xml(&deleted, &[], true);
@@ -2027,7 +2030,7 @@ mod tests {
         let result = ListObjectVersionsResult {
             versions: vec![VersionEntry {
                 key: "my-key".to_string(),
-                version_id: storage::VersionId::Null,
+                version_id: VersionId::Null,
                 is_latest: true,
                 size: 42,
                 etag: "\"abc123\"".to_string(),
