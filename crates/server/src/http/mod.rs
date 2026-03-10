@@ -1,5 +1,6 @@
 /// HTTP frontend: parses requests, authenticates, dispatches to coordinator.
 pub mod chunked;
+pub mod conditional;
 pub mod multipart;
 pub mod request;
 pub mod response;
@@ -14,10 +15,6 @@ use bytes::Bytes;
 use http_body_util::Full;
 
 use crate::authz::{can_read_bucket, can_write_bucket, ResourceVisibility};
-use crate::conditional::{
-    copy_source_condition_from_headers, delete_condition_from_headers, read_condition_from_headers,
-    write_condition_from_headers,
-};
 use crate::coordinator::ChecksumClaim;
 use crate::coordinator::Coordinator;
 use crate::coordinator::CopyObjectRequest;
@@ -28,6 +25,10 @@ use crate::coordinator::MetadataDirective;
 use crate::coordinator::UploadPartCopyRequest;
 use crate::error::ServerError;
 use crate::metadata_blob::MetadataBlob;
+use conditional::{
+    copy_source_condition_from_headers, delete_condition_from_headers, read_condition_from_headers,
+    write_condition_from_headers,
+};
 use request::S3Request;
 use response::S3Response;
 use router::{route, S3Operation};
@@ -524,15 +525,15 @@ impl HttpFrontend {
                         .collect();
                     let metadata_blob = MetadataBlob::from_headers(&header_pairs)?;
                     let cond = write_condition_from_headers(req)?;
-                    let result = self.coordinator.put_object(
-                        &crate::coordinator::PutObjectRequest {
-                            bucket: &bucket,
-                            key: &key,
-                            data: &req.body,
-                            metadata: &metadata_blob,
-                            cond: &cond,
-                        },
-                    )?;
+                    let result =
+                        self.coordinator
+                            .put_object(&crate::coordinator::PutObjectRequest {
+                                bucket: &bucket,
+                                key: &key,
+                                data: &req.body,
+                                metadata: &metadata_blob,
+                                cond: &cond,
+                            })?;
                     if let Some(tags_xml) = inline_tags_xml {
                         self.coordinator.put_object_tags(
                             &bucket,
@@ -589,16 +590,15 @@ impl HttpFrontend {
                     Ok(resp)
                 } else if let Some(range_header) = req.header("range") {
                     let byte_range = crate::range::ByteRange::parse(range_header)?;
-                    match self
-                        .coordinator
-                        .get_object_range(&crate::coordinator::GetObjectRangeRequest {
+                    match self.coordinator.get_object_range(
+                        &crate::coordinator::GetObjectRangeRequest {
                             bucket: &bucket,
                             key: &key,
                             version_id: vid,
                             range: byte_range,
                             cond: &cond,
-                        })
-                    {
+                        },
+                    ) {
                         Ok(result) => {
                             let tags = result.tags.clone();
                             let mut resp = S3Response::get_object_range(result);
@@ -619,14 +619,14 @@ impl HttpFrontend {
                         Err(e) => Err(e),
                     }
                 } else {
-                    let result = self.coordinator.get_object(
-                        &crate::coordinator::GetObjectRequest {
-                            bucket: &bucket,
-                            key: &key,
-                            version_id: vid,
-                            cond: &cond,
-                        },
-                    )?;
+                    let result =
+                        self.coordinator
+                            .get_object(&crate::coordinator::GetObjectRequest {
+                                bucket: &bucket,
+                                key: &key,
+                                version_id: vid,
+                                cond: &cond,
+                            })?;
                     let checksum_mode = req.header("x-amz-checksum-mode");
                     let tags = result.tags.clone();
                     let mut resp = S3Response::get_object(result, checksum_mode);
@@ -646,14 +646,14 @@ impl HttpFrontend {
                 self.authorize_bucket_write(auth, &bucket)?;
                 let cond = delete_condition_from_headers(req)?;
                 let vid = parse_version_id(req)?;
-                let result = self.coordinator.delete_object(
-                    &crate::coordinator::DeleteObjectRequest {
-                        bucket: &bucket,
-                        key: &key,
-                        version_id: vid,
-                        cond: &cond,
-                    },
-                )?;
+                let result =
+                    self.coordinator
+                        .delete_object(&crate::coordinator::DeleteObjectRequest {
+                            bucket: &bucket,
+                            key: &key,
+                            version_id: vid,
+                            cond: &cond,
+                        })?;
                 Ok(S3Response::delete_object(&result))
             }
             S3Operation::HeadObject { bucket, key } => {
@@ -695,14 +695,14 @@ impl HttpFrontend {
                     }
                     Ok(resp)
                 } else {
-                    let result = self.coordinator.head_object(
-                        &crate::coordinator::GetObjectRequest {
-                            bucket: &bucket,
-                            key: &key,
-                            version_id: vid,
-                            cond: &cond,
-                        },
-                    )?;
+                    let result =
+                        self.coordinator
+                            .head_object(&crate::coordinator::GetObjectRequest {
+                                bucket: &bucket,
+                                key: &key,
+                                version_id: vid,
+                                cond: &cond,
+                            })?;
                     let checksum_mode = req.header("x-amz-checksum-mode");
                     let mut resp = S3Response::head_object(&result, checksum_mode);
                     if let Some(tags_xml) = &result.tags {
@@ -812,7 +812,9 @@ impl HttpFrontend {
                 let entries: Vec<crate::coordinator::DeleteEntry> = xml_entries
                     .iter()
                     .map(|e| {
-                        let version_id = e.version_id.as_deref()
+                        let version_id = e
+                            .version_id
+                            .as_deref()
                             .map(parse_version_id_str)
                             .transpose()?;
                         Ok(crate::coordinator::DeleteEntry {
@@ -821,13 +823,13 @@ impl HttpFrontend {
                         })
                     })
                     .collect::<Result<_, ServerError>>()?;
-                let result = self.coordinator.delete_objects(
-                    &crate::coordinator::DeleteObjectsRequest {
-                        bucket: &bucket,
-                        entries: &entries,
-                        cond: &cond,
-                    },
-                )?;
+                let result =
+                    self.coordinator
+                        .delete_objects(&crate::coordinator::DeleteObjectsRequest {
+                            bucket: &bucket,
+                            entries: &entries,
+                            cond: &cond,
+                        })?;
                 Ok(S3Response::delete_objects(&result, quiet))
             }
             S3Operation::PutBucketVersioning { bucket } => {
@@ -1147,16 +1149,16 @@ impl HttpFrontend {
                     // Extract claimed checksum from request headers (at most one).
                     let claimed_checksum = extract_checksum_header(req)?;
 
-                    let result = self.coordinator.upload_part(
-                        &crate::coordinator::UploadPartRequest {
-                            bucket: &bucket,
-                            key: &key,
-                            upload_id: &upload_id,
-                            part_number,
-                            data: &req.body,
-                            claimed_checksum: claimed_checksum.as_ref(),
-                        },
-                    )?;
+                    let result =
+                        self.coordinator
+                            .upload_part(&crate::coordinator::UploadPartRequest {
+                                bucket: &bucket,
+                                key: &key,
+                                upload_id: &upload_id,
+                                part_number,
+                                data: &req.body,
+                                claimed_checksum: claimed_checksum.as_ref(),
+                            })?;
                     Ok(S3Response::upload_part(
                         &result.etag,
                         result.checksum.as_ref(),
@@ -1204,12 +1206,13 @@ impl HttpFrontend {
                         .ok_or_else(|| ServerError::InvalidRequest {
                             reason: "missing uploadId query parameter".to_string(),
                         })?;
-                self.coordinator
-                    .abort_multipart_upload(&crate::coordinator::AbortMultipartUploadRequest {
+                self.coordinator.abort_multipart_upload(
+                    &crate::coordinator::AbortMultipartUploadRequest {
                         bucket: &bucket,
                         key: &key,
                         upload_id: &upload_id,
-                    })?;
+                    },
+                )?;
                 Ok(S3Response::abort_multipart_upload())
             }
             S3Operation::ListMultipartUploads { bucket } => {
@@ -1262,15 +1265,15 @@ impl HttpFrontend {
                         reason: "invalid max-parts".to_string(),
                     })?,
                 };
-                let result = self.coordinator.list_parts(
-                    &crate::coordinator::ListPartsRequest {
-                        bucket: &bucket,
-                        key: &key,
-                        upload_id: &upload_id,
-                        part_number_marker,
-                        max_parts,
-                    },
-                )?;
+                let result =
+                    self.coordinator
+                        .list_parts(&crate::coordinator::ListPartsRequest {
+                            bucket: &bucket,
+                            key: &key,
+                            upload_id: &upload_id,
+                            part_number_marker,
+                            max_parts,
+                        })?;
                 Ok(S3Response::list_parts(
                     &bucket,
                     &key,
@@ -1888,15 +1891,17 @@ impl HttpFrontend {
             blob
         };
 
-        let result = self.coordinator.finalize_stream_put(&FinalizeStreamPutRequest {
-            bucket: &ctx.bucket,
-            key: &ctx.key,
-            session_id: &ctx.session_id,
-            crc64,
-            total_size,
-            metadata_blob: &metadata_blob,
-            cond: &ctx.cond,
-        })?;
+        let result = self
+            .coordinator
+            .finalize_stream_put(&FinalizeStreamPutRequest {
+                bucket: &ctx.bucket,
+                key: &ctx.key,
+                session_id: &ctx.session_id,
+                crc64,
+                total_size,
+                metadata_blob: &metadata_blob,
+                cond: &ctx.cond,
+            })?;
 
         if let Some(ref tags_xml) = ctx.inline_tags_xml {
             self.coordinator.put_object_tags(
@@ -2011,17 +2016,19 @@ impl HttpFrontend {
         };
         let effective_claim = trailer_claim.as_ref().or(ctx.claimed_checksum.as_ref());
 
-        let result = self.coordinator.finalize_stream_part(FinalizeStreamPartRequest {
-            bucket: &ctx.bucket,
-            key: &ctx.key,
-            session_id: &ctx.session_id,
-            upload_id: &ctx.upload_id,
-            part_number: ctx.part_number,
-            crc64,
-            total_size,
-            claimed_checksum: effective_claim,
-            computed_checksum,
-        })?;
+        let result = self
+            .coordinator
+            .finalize_stream_part(FinalizeStreamPartRequest {
+                bucket: &ctx.bucket,
+                key: &ctx.key,
+                session_id: &ctx.session_id,
+                upload_id: &ctx.upload_id,
+                part_number: ctx.part_number,
+                crc64,
+                total_size,
+                claimed_checksum: effective_claim,
+                computed_checksum,
+            })?;
 
         let mut resp = S3Response::upload_part(&result.etag, result.checksum.as_ref());
         // The coordinator's result already includes the checksum via
@@ -2285,9 +2292,7 @@ fn extract_checksum_header_raw(
 /// Extract a claimed checksum from request headers, decoded and validated.
 ///
 /// Used by UploadPart and streaming paths where the value is always plain base64.
-fn extract_checksum_header(
-    req: &S3Request,
-) -> Result<Option<ChecksumClaim>, ServerError> {
+fn extract_checksum_header(req: &S3Request) -> Result<Option<ChecksumClaim>, ServerError> {
     match extract_checksum_header_raw(req)? {
         Some((algo, value)) => Ok(Some(ChecksumClaim::from_base64(algo, &value)?)),
         None => Ok(None),
