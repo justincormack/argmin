@@ -19,9 +19,7 @@ server-core = { path = "../server-core" }
 storage = { path = "../storage" }
 base64 = "0.22"
 ec-sys = { path = "../ec-sys" }
-rapidhash = "1"
 ring = "0.17"
-thiserror = "2"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"

@@ -1914,6 +1914,7 @@ dependencies = [
  "ec",
  "ring",
  "serde_json",
+ "server-core",
  "server-http",
  "storage",
  "tempfile",
@@ -2057,12 +2058,10 @@ dependencies = [
  "http-body-util",
  "hyper 1.8.1",
  "hyper-util",
- "rapidhash 1.4.0",
  "ring",
  "server-core",
  "storage",
  "test-util",
- "thiserror",
  "tokio",
 ]
 

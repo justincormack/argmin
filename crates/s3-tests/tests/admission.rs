@@ -46,7 +46,7 @@ async fn start_server(
     let frontends: Vec<server_http::http::HttpFrontend> = (0..pool_size)
         .map(|_| {
             let ec_config = ec::EcConfig::new(4, 2).unwrap();
-            let coordinator = server_http::coordinator::Coordinator::new(
+            let coordinator = server_core::coordinator::Coordinator::new(
                 Arc::clone(&storage_node),
                 ec_config,
                 "us-east-1".to_string(),

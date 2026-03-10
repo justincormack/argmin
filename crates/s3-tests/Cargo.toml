@@ -7,6 +7,7 @@ publish = false
 [dependencies]
 # Server (for local TestServer)
 server_http = { package = "server-http", path = "../server-http" }
+server-core = { path = "../server-core" }
 auth = { path = "../auth" }
 ec = { path = "../ec" }
 storage = { path = "../storage" }

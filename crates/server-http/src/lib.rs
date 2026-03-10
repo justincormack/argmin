@@ -22,4 +22,4 @@ pub mod config;
 pub mod cors;
 pub mod http;
 
-pub use server_core::{conditional, coordinator, error, etag, metadata_blob, pg, range};
+pub(crate) use server_core::{conditional, coordinator, error, metadata_blob, range};

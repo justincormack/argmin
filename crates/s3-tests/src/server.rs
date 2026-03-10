@@ -58,7 +58,7 @@ impl TestServer {
         let frontends: Vec<server_http::http::HttpFrontend> = (0..POOL_SIZE)
             .map(|_| {
                 let ec_config = ec::EcConfig::new(4, 2).expect("EC config");
-                let coordinator = server_http::coordinator::Coordinator::new(
+                let coordinator = server_core::coordinator::Coordinator::new(
                     Arc::clone(&storage_node),
                     ec_config,
                     TEST_REGION.to_string(),

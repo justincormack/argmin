@@ -3,11 +3,11 @@ use std::sync::Arc;
 
 use auth::{CredentialStore, SecretKey};
 use ec::EcConfig;
+use server_core::coordinator::Coordinator;
 use storage::SharedStorageNode;
 use tokio::net::TcpListener;
 
 use server_http::config::ServerConfig;
-use server_http::coordinator::Coordinator;
 use server_http::http::HttpFrontend;
 
 #[tokio::main]
