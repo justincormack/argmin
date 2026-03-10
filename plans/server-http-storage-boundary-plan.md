@@ -1,5 +1,23 @@
 # Server HTTP / Storage Boundary Plan
 
+## Status
+
+Completed:
+
+1. Phase A: checksum-domain shared types moved into `checksum`
+2. Phase B: `VersionId` and `BucketVersioningState` moved into `s3-types`
+3. Phase C: `server-core` now returns a core-owned `BucketSummary` instead of
+   leaking `storage::BucketInfo` to HTTP
+4. Phase D: runtime wiring moved into `crates/argmin-s3`
+
+Current state:
+
+1. `server-http` no longer has a normal dependency on `storage`
+2. `server-http` remains a library/frontend crate
+3. `argmin-s3` is now the concrete runtime entrypoint and legitimately depends
+   on `storage`
+4. `storage` remains independent of `server-core` and `server-http`
+
 ## Context
 
 The `server` split is now in place:
@@ -8,26 +26,20 @@ The `server` split is now in place:
 2. `crates/server-http` holds HTTP parsing/rendering and the runtime-facing
    frontend
 
-That split is useful, but one boundary is still not as clean as it should be:
-`server-http` still depends directly on `storage`.
+That split is now materially cleaner:
 
-Today that happens for two different reasons:
-
-1. runtime bootstrap in [`crates/server-http/src/main.rs`](../crates/server-http/src/main.rs)
-   constructs `storage::SharedStorageNode` directly
-2. HTTP code imports shared value/domain types from `storage`, for example:
-   - [`crates/server-http/src/http/mod.rs`](../crates/server-http/src/http/mod.rs)
-   - [`crates/server-http/src/http/response.rs`](../crates/server-http/src/http/response.rs)
-   - [`crates/server-http/src/http/xml.rs`](../crates/server-http/src/http/xml.rs)
-   - [`crates/server-http/src/http/serve.rs`](../crates/server-http/src/http/serve.rs)
+1. shared checksum-domain types live in `checksum`
+2. shared non-checksum S3 value types currently live in `s3-types`
+3. `server-http` no longer imports storage-owned types in normal code
+4. runtime/bootstrap wiring now lives in [`crates/argmin-s3`](../crates/argmin-s3)
 
 Also, `server-core` is still concrete on `storage::SharedStorageNode`,
 `storage::PgStore`, and `MutexGuard<PgStore>` in
 [`crates/server-core/src/coordinator.rs`](../crates/server-core/src/coordinator.rs).
 
-So the immediate goal is not "abstract storage completely". The immediate goal
-is to remove the avoidable `server-http -> storage` coupling first, with low
-risk and without forcing a trait-heavy rewrite.
+So the remaining question is no longer the `server-http -> storage` boundary.
+The remaining question is whether the deeper `server-core -> storage`
+concreteness is worth abstracting further.
 
 ## Goals
 
@@ -182,6 +194,7 @@ pub struct BucketSummary {
     pub public_read: bool,
     pub owner_principal: String,
     pub versioning: BucketVersioningState,
+    pub public_access_block: Option<String>,
 }
 ```
 

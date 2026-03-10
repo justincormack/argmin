@@ -1,7 +1,7 @@
 /// Hand-formatted XML for S3 responses. No XML library dependency.
 use crate::coordinator::{
-    CompletePart, DeleteError, DeletedObject, ListMultipartUploadsResult, ListObjectVersionsResult,
-    ListObjectsResult, ListPartsResult, ObjectPartsInfo,
+    BucketSummary, CompletePart, DeleteError, DeletedObject, ListMultipartUploadsResult,
+    ListObjectVersionsResult, ListObjectsResult, ListPartsResult, ObjectPartsInfo,
 };
 use crate::error::ServerError;
 use auth::canonical::uri_encode_path;
@@ -9,7 +9,6 @@ use checksum::ChecksumAlgorithm;
 use s3_types::BucketVersioningState;
 #[cfg(test)]
 use s3_types::VersionId;
-use storage::BucketInfo;
 
 use super::response::format_version_id;
 
@@ -49,7 +48,7 @@ pub fn error_xml(code: &str, message: &str, resource: &str, request_id: &str) ->
 
 /// Format a `ListAllMyBucketsResult` XML response.
 #[must_use]
-pub fn list_buckets_xml(buckets: &[BucketInfo], owner_principal: &str) -> String {
+pub fn list_buckets_xml(buckets: &[BucketSummary], owner_principal: &str) -> String {
     let mut xml = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <ListAllMyBucketsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
@@ -1701,17 +1700,13 @@ mod tests {
 
     #[test]
     fn list_buckets_xml_format() {
-        let buckets = vec![BucketInfo {
-            name: storage::BucketName::from("test-bucket"),
+        let buckets = vec![BucketSummary {
+            name: "test-bucket".to_string(),
             owner_principal: "owner".to_string(),
             created_at: 1685000000000,
-            region: 0,
             versioning: BucketVersioningState::Disabled,
             public_read: false,
-            cors_config: None,
-            tags: None,
             public_access_block: None,
-            ownership_controls: None,
         }];
         let xml = list_buckets_xml(&buckets, "owner");
         assert!(xml.contains("<Name>test-bucket</Name>"));

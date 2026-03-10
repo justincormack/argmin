@@ -1,6 +1,6 @@
 /// Build HTTP responses for S3 operations.
 use crate::coordinator::{
-    CopyObjectResult, DeleteObjectResult, DeleteObjectsResult, GetObjectPartResult,
+    BucketSummary, CopyObjectResult, DeleteObjectResult, DeleteObjectsResult, GetObjectPartResult,
     GetObjectRangeResult, GetObjectResult, HeadObjectPartResult, HeadObjectResult,
     ListMultipartUploadsResult, ListObjectVersionsResult, ListObjectsResult, ListPartsResult,
     PutObjectResult,
@@ -8,7 +8,6 @@ use crate::coordinator::{
 use crate::error::ServerError;
 use checksum::{ChecksumAlgorithm, ChecksumType, RawChecksum};
 use s3_types::{BucketVersioningState, VersionId};
-use storage::BucketInfo;
 
 use super::xml;
 
@@ -468,7 +467,7 @@ impl S3Response {
 
     /// Build a response for `HeadBucket`.
     #[must_use]
-    pub fn head_bucket(info: &BucketInfo) -> Self {
+    pub fn head_bucket(info: &BucketSummary) -> Self {
         let _ = info; // We could add x-amz-bucket-region etc.
         Self::new(200)
     }
@@ -488,7 +487,7 @@ impl S3Response {
 
     /// Build a response for `ListBuckets`.
     #[must_use]
-    pub fn list_buckets(buckets: &[BucketInfo], owner_principal: &str) -> Self {
+    pub fn list_buckets(buckets: &[BucketSummary], owner_principal: &str) -> Self {
         let body = xml::list_buckets_xml(buckets, owner_principal);
         Self::new(200).xml_body(body)
     }
@@ -1345,17 +1344,13 @@ mod tests {
 
     #[test]
     fn head_bucket_response() {
-        let info = storage::BucketInfo {
+        let info = BucketSummary {
             name: "b".into(),
             owner_principal: "owner".into(),
             created_at: 0,
-            region: 0,
             versioning: BucketVersioningState::Disabled,
             public_read: false,
-            cors_config: None,
-            tags: None,
             public_access_block: None,
-            ownership_controls: None,
         };
         let resp = S3Response::head_bucket(&info);
         assert_eq!(resp.status_code, 200);
@@ -1365,17 +1360,13 @@ mod tests {
 
     #[test]
     fn list_buckets_response() {
-        let buckets = vec![storage::BucketInfo {
+        let buckets = vec![BucketSummary {
             name: "test-bucket".into(),
             owner_principal: "owner".into(),
             created_at: 1000,
-            region: 0,
             versioning: BucketVersioningState::Disabled,
             public_read: false,
-            cors_config: None,
-            tags: None,
             public_access_block: None,
-            ownership_controls: None,
         }];
         let resp = S3Response::list_buckets(&buckets, "owner");
         assert_eq!(resp.status_code, 200);

@@ -88,6 +88,17 @@ pub struct PutObjectResult {
     pub version_id: VersionId,
 }
 
+/// Core-owned bucket summary exposed above the storage layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BucketSummary {
+    pub name: String,
+    pub owner_principal: String,
+    pub created_at: u64,
+    pub public_read: bool,
+    pub versioning: BucketVersioningState,
+    pub public_access_block: Option<String>,
+}
+
 /// Result of beginning a streaming UploadPart session.
 #[derive(Debug)]
 pub struct BeginStreamPartResult {
@@ -644,6 +655,17 @@ pub struct Coordinator {
 }
 
 impl Coordinator {
+    fn bucket_summary(info: BucketInfo) -> BucketSummary {
+        BucketSummary {
+            name: info.name.into_string(),
+            owner_principal: info.owner_principal,
+            created_at: info.created_at,
+            public_read: info.public_read,
+            versioning: info.versioning,
+            public_access_block: info.public_access_block,
+        }
+    }
+
     /// Create a new coordinator.
     pub fn new(
         storage_node: Arc<SharedStorageNode>,
@@ -761,29 +783,32 @@ impl Coordinator {
         })
     }
 
-    pub fn head_bucket(&self, name: &str) -> Result<BucketInfo, ServerError> {
+    pub fn head_bucket(&self, name: &str) -> Result<BucketSummary, ServerError> {
         let bucket_pg = self.get_bucket_pg(name)?;
-        bucket_pg.head_bucket(name).map_err(|e| match e {
-            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                name: name.to_string(),
-            },
-            other => ServerError::Metadata(other),
-        })
+        bucket_pg
+            .head_bucket(name)
+            .map(Self::bucket_summary)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })
     }
 
-    pub fn list_buckets(&self) -> Result<Vec<BucketInfo>, ServerError> {
+    pub fn list_buckets(&self) -> Result<Vec<BucketSummary>, ServerError> {
         self.list_buckets_for_owner("default-owner")
     }
 
     pub fn list_buckets_for_owner(
         &self,
         owner_principal: &str,
-    ) -> Result<Vec<BucketInfo>, ServerError> {
+    ) -> Result<Vec<BucketSummary>, ServerError> {
         let mut out = Vec::new();
         self.pg_topology.for_each_pg(|pg_id| {
             let pg = self.storage_node.get_pg(pg_id)?;
             let mut buckets = pg.list_buckets(owner_principal)?;
-            out.append(&mut buckets);
+            out.extend(buckets.drain(..).map(Self::bucket_summary));
             Ok::<(), ServerError>(())
         })?;
         out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -5312,7 +5337,7 @@ mod tests {
             .list_buckets()
             .unwrap()
             .into_iter()
-            .map(|b| b.name.to_string())
+            .map(|b| b.name.clone())
             .collect();
         assert_eq!(names, vec!["alpha", "beta", "mango", "zz-top"]);
     }
@@ -5330,7 +5355,7 @@ mod tests {
             .list_buckets()
             .unwrap()
             .into_iter()
-            .map(|b| b.name.to_string())
+            .map(|b| b.name.clone())
             .collect();
         assert_eq!(names, vec![bucket]);
     }

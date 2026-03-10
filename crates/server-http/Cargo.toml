@@ -7,17 +7,12 @@ edition = "2021"
 name = "server_http"
 path = "src/lib.rs"
 
-[[bin]]
-name = "argmin-s3"
-path = "src/main.rs"
-
 [dependencies]
 auth = { path = "../auth" }
 checksum = { path = "../checksum" }
 ec = { path = "../ec" }
 server-core = { path = "../server-core" }
 s3-types = { path = "../s3-types" }
-storage = { path = "../storage" }
 base64 = "0.22"
 ec-sys = { path = "../ec-sys" }
 ring = "0.17"
@@ -30,3 +25,4 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync",
 
 [dev-dependencies]
 test-util = { path = "../test-util" }
+storage = { path = "../storage" }

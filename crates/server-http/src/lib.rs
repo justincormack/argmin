@@ -18,7 +18,6 @@
 )]
 
 pub mod authz;
-pub mod config;
 pub mod cors;
 pub mod http;
 

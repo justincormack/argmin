@@ -1,3 +1,5 @@
+mod config;
+
 use std::path::Path;
 use std::sync::Arc;
 
@@ -7,7 +9,7 @@ use server_core::coordinator::Coordinator;
 use storage::SharedStorageNode;
 use tokio::net::TcpListener;
 
-use server_http::config::ServerConfig;
+use config::ServerConfig;
 use server_http::http::HttpFrontend;
 
 #[tokio::main]

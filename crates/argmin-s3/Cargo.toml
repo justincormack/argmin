@@ -1,0 +1,16 @@
+[package]
+name = "argmin-s3"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "argmin-s3"
+path = "src/main.rs"
+
+[dependencies]
+auth = { path = "../auth" }
+ec = { path = "../ec" }
+server-core = { path = "../server-core" }
+server-http = { path = "../server-http" }
+storage = { path = "../storage" }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros"] }
