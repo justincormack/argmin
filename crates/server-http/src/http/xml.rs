@@ -3488,6 +3488,7 @@ mod tests {
                 bucket: "test-bucket",
                 entries: &entries,
                 cond: NO_DELETE,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(delete_result.deleted.len(), 3);
@@ -3595,6 +3596,7 @@ mod tests {
                 bucket: "bucket",
                 entries: &entries,
                 cond: NO_DELETE,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(delete_result.deleted.len(), 5);

@@ -371,6 +371,7 @@ pub struct DeleteObjectRequest<'a> {
     pub key: &'a str,
     pub version_id: Option<VersionId>,
     pub cond: &'a DeleteCondition,
+    pub requester: Requester<'a>,
 }
 
 /// Request for a ListObjectsV2 operation.
@@ -426,6 +427,7 @@ pub struct DeleteObjectsRequest<'a> {
     pub bucket: &'a str,
     pub entries: &'a [DeleteEntry<'a>],
     pub cond: &'a DeleteCondition,
+    pub requester: Requester<'a>,
 }
 
 /// Request for an AbortMultipartUpload operation.
@@ -3813,7 +3815,8 @@ impl Coordinator {
         let key = req.key;
         let request_version_id = req.version_id;
         let cond = req.cond;
-        let bucket_info = self.head_bucket(bucket)?;
+        let requester = req.requester;
+        let bucket_info = self.authorize_bucket_write_requester(requester, bucket)?;
 
         match (bucket_info.versioning, request_version_id) {
             // Unversioned bucket: physical delete (current behavior)
@@ -4293,7 +4296,8 @@ impl Coordinator {
         let bucket = req.bucket;
         let entries = req.entries;
         let cond = req.cond;
-        self.head_bucket(bucket)?;
+        let requester = req.requester;
+        let _bucket_info = self.authorize_bucket_write_requester(requester, bucket)?;
 
         let mut deleted = Vec::new();
         let mut errors = Vec::new();
@@ -4304,6 +4308,7 @@ impl Coordinator {
                 key: entry.key,
                 version_id: entry.version_id,
                 cond,
+                requester,
             }) {
                 Ok(result) => {
                     deleted.push(DeletedObject {
@@ -5928,6 +5933,7 @@ mod tests {
                 key: "key",
                 version_id: None,
                 cond: NO_DELETE,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -5956,6 +5962,7 @@ mod tests {
                 key: "no-such-key",
                 version_id: None,
                 cond: NO_DELETE,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
     }
@@ -7046,6 +7053,7 @@ mod tests {
                 bucket: "bucket",
                 entries: &entries,
                 cond: NO_DELETE,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(result.deleted.len(), 3);
@@ -7087,6 +7095,7 @@ mod tests {
                 bucket: "no-bucket",
                 entries: &entries,
                 cond: NO_DELETE,
+                requester: TEST_REQUESTER,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
@@ -7569,6 +7578,60 @@ mod tests {
     }
 
     #[test]
+    fn delete_object_rejects_non_owner_requester() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        coord
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+                requester: Requester::principal("owner-a"),
+                acl: NO_PUT_OBJECT_ACL,
+            })
+            .unwrap();
+
+        let err = coord
+            .delete_object(&DeleteObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: NO_DELETE,
+                requester: Requester::principal("other-user"),
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn delete_objects_rejects_non_owner_requester() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+
+        let entries = vec![DeleteEntry {
+            key: "key",
+            version_id: None,
+        }];
+        let err = coord
+            .delete_objects(&DeleteObjectsRequest {
+                bucket: "bucket",
+                entries: &entries,
+                cond: NO_DELETE,
+                requester: Requester::principal("other-user"),
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
     fn get_object_rejects_private_read_for_non_owner() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
@@ -7786,6 +7849,7 @@ mod tests {
                 key: "key",
                 version_id: None,
                 cond: &cond,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert!(coord
@@ -7823,6 +7887,7 @@ mod tests {
                 key: "key",
                 version_id: None,
                 cond: &cond,
+                requester: TEST_REQUESTER,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::PreconditionFailed));
@@ -7874,6 +7939,7 @@ mod tests {
                 bucket: "bucket",
                 entries: &entries,
                 cond: &cond,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(result.deleted.len(), 1);
@@ -9014,6 +9080,7 @@ mod tests {
                     key: "key",
                     version_id: None,
                     cond: NO_DELETE,
+                    requester: TEST_REQUESTER,
                 })
             });
 
@@ -9075,6 +9142,7 @@ mod tests {
                 key: "key",
                 version_id: None,
                 cond: NO_DELETE,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(result.version_id, VersionId::Null);
@@ -12714,6 +12782,7 @@ mod tests {
                 key: "key",
                 version_id: None,
                 cond: &crate::conditional::DeleteCondition::default(),
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 
@@ -13506,6 +13575,7 @@ mod tests {
                 key: "cycle",
                 version_id: None,
                 cond: &crate::conditional::DeleteCondition::default(),
+                requester: TEST_REQUESTER,
             })
             .unwrap();
 

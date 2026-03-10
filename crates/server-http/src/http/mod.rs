@@ -625,9 +625,10 @@ impl HttpFrontend {
                 }
             }
             S3Operation::DeleteObject { bucket, key } => {
-                self.authorize_bucket_write(auth, &bucket)?;
                 let cond = delete_condition_from_headers(req)?;
                 let vid = parse_version_id(req)?;
+                let requester =
+                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
                 let result =
                     self.coordinator
                         .delete_object(&crate::coordinator::DeleteObjectRequest {
@@ -635,6 +636,7 @@ impl HttpFrontend {
                             key: &key,
                             version_id: vid,
                             cond: &cond,
+                            requester,
                         })?;
                 Ok(S3Response::delete_object(&result))
             }
@@ -793,9 +795,10 @@ impl HttpFrontend {
                 ))
             }
             S3Operation::DeleteObjects { bucket } => {
-                self.authorize_bucket_write(auth, &bucket)?;
                 let (xml_entries, quiet) = xml::parse_delete_objects_xml(&req.body)?;
                 let cond = delete_condition_from_headers(req)?;
+                let requester =
+                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
                 let entries: Vec<crate::coordinator::DeleteEntry> = xml_entries
                     .iter()
                     .map(|e| {
@@ -816,6 +819,7 @@ impl HttpFrontend {
                             bucket: &bucket,
                             entries: &entries,
                             cond: &cond,
+                            requester,
                         })?;
                 Ok(S3Response::delete_objects(&result, quiet))
             }
