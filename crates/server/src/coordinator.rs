@@ -2097,10 +2097,7 @@ impl Coordinator {
                     use base64::Engine;
                     let cksum = compute_checksum(*algo, &user_data);
                     let b64 = base64::engine::general_purpose::STANDARD.encode(&cksum);
-                    blob.entries.push(crate::metadata_blob::MetadataEntry {
-                        key: algo.header_name().to_string(),
-                        value: b64,
-                    });
+                    blob.set(algo.header_name(), &b64);
                 }
 
                 blob

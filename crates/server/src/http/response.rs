@@ -178,7 +178,7 @@ impl S3Response {
         }
 
         // x-amz-meta-* headers
-        for entry in &result.metadata.entries {
+        for entry in result.metadata.iter() {
             if entry.key.starts_with("x-amz-meta-") {
                 resp = resp.meta_header(&entry.key, &entry.value);
             }
@@ -234,7 +234,7 @@ impl S3Response {
             resp = resp.header("Expires", ex);
         }
 
-        for entry in &result.metadata.entries {
+        for entry in result.metadata.iter() {
             if entry.key.starts_with("x-amz-meta-") {
                 resp = resp.meta_header(&entry.key, &entry.value);
             }
@@ -291,7 +291,7 @@ impl S3Response {
             resp = resp.header("Expires", ex);
         }
 
-        for entry in &result.metadata.entries {
+        for entry in result.metadata.iter() {
             if entry.key.starts_with("x-amz-meta-") {
                 resp = resp.meta_header(&entry.key, &entry.value);
             }
@@ -347,7 +347,7 @@ impl S3Response {
             resp = resp.header("Expires", ex);
         }
 
-        for entry in &result.metadata.entries {
+        for entry in result.metadata.iter() {
             if entry.key.starts_with("x-amz-meta-") {
                 resp = resp.meta_header(&entry.key, &entry.value);
             }
@@ -400,7 +400,7 @@ impl S3Response {
             resp = resp.header("Expires", ex);
         }
 
-        for entry in &result.metadata.entries {
+        for entry in result.metadata.iter() {
             if entry.key.starts_with("x-amz-meta-") {
                 resp = resp.meta_header(&entry.key, &entry.value);
             }
@@ -937,7 +937,7 @@ mod tests {
     use crate::coordinator::{
         GetObjectResult, HeadObjectResult, ListEntry, ListObjectsResult, PutObjectResult,
     };
-    use crate::metadata_blob::{MetadataBlob, MetadataEntry};
+    use crate::metadata_blob::MetadataBlob;
 
     fn find_header<'a>(resp: &'a S3Response, name: &str) -> Option<&'a str> {
         resp.headers
@@ -1026,12 +1026,7 @@ mod tests {
     fn get_object_with_content_type() {
         let result = GetObjectResult {
             data: b"hello".to_vec(),
-            metadata: MetadataBlob {
-                entries: vec![MetadataEntry {
-                    key: "content-type".into(),
-                    value: "text/plain".into(),
-                }],
-            },
+            metadata: MetadataBlob::from_pairs(&[("content-type", "text/plain")]),
             etag: "\"etag\"".into(),
             size: 5,
             last_modified: 0,
@@ -1066,12 +1061,7 @@ mod tests {
     fn get_object_with_amz_meta_headers() {
         let result = GetObjectResult {
             data: vec![],
-            metadata: MetadataBlob {
-                entries: vec![MetadataEntry {
-                    key: "x-amz-meta-author".into(),
-                    value: "alice".into(),
-                }],
-            },
+            metadata: MetadataBlob::from_pairs(&[("x-amz-meta-author", "alice")]),
             etag: "\"e\"".into(),
             size: 0,
             last_modified: 0,
@@ -1086,34 +1076,14 @@ mod tests {
     fn get_object_with_all_standard_metadata() {
         let result = GetObjectResult {
             data: vec![],
-            metadata: MetadataBlob {
-                entries: vec![
-                    MetadataEntry {
-                        key: "content-type".into(),
-                        value: "text/html".into(),
-                    },
-                    MetadataEntry {
-                        key: "content-encoding".into(),
-                        value: "gzip".into(),
-                    },
-                    MetadataEntry {
-                        key: "cache-control".into(),
-                        value: "max-age=3600".into(),
-                    },
-                    MetadataEntry {
-                        key: "content-disposition".into(),
-                        value: "attachment".into(),
-                    },
-                    MetadataEntry {
-                        key: "content-language".into(),
-                        value: "en-US".into(),
-                    },
-                    MetadataEntry {
-                        key: "expires".into(),
-                        value: "Thu, 01 Jan 2099 00:00:00 GMT".into(),
-                    },
-                ],
-            },
+            metadata: MetadataBlob::from_pairs(&[
+                ("content-type", "text/html"),
+                ("content-encoding", "gzip"),
+                ("cache-control", "max-age=3600"),
+                ("content-disposition", "attachment"),
+                ("content-language", "en-US"),
+                ("expires", "Thu, 01 Jan 2099 00:00:00 GMT"),
+            ]),
             etag: "\"e\"".into(),
             size: 0,
             last_modified: 0,
@@ -1139,18 +1109,10 @@ mod tests {
     fn get_object_checksum_type_with_checksum_mode_enabled() {
         let result = GetObjectResult {
             data: vec![],
-            metadata: MetadataBlob {
-                entries: vec![
-                    MetadataEntry {
-                        key: "x-amz-checksum-crc32".into(),
-                        value: "AAAAAA==".into(),
-                    },
-                    MetadataEntry {
-                        key: "x-amz-checksum-type".into(),
-                        value: "FULL_OBJECT".into(),
-                    },
-                ],
-            },
+            metadata: MetadataBlob::from_pairs(&[
+                ("x-amz-checksum-crc32", "AAAAAA=="),
+                ("x-amz-checksum-type", "FULL_OBJECT"),
+            ]),
             etag: "\"e\"".into(),
             size: 0,
             last_modified: 0,
@@ -1169,18 +1131,10 @@ mod tests {
     fn get_object_checksum_type_omitted_without_checksum_mode() {
         let result = GetObjectResult {
             data: vec![],
-            metadata: MetadataBlob {
-                entries: vec![
-                    MetadataEntry {
-                        key: "x-amz-checksum-crc32".into(),
-                        value: "AAAAAA==".into(),
-                    },
-                    MetadataEntry {
-                        key: "x-amz-checksum-type".into(),
-                        value: "FULL_OBJECT".into(),
-                    },
-                ],
-            },
+            metadata: MetadataBlob::from_pairs(&[
+                ("x-amz-checksum-crc32", "AAAAAA=="),
+                ("x-amz-checksum-type", "FULL_OBJECT"),
+            ]),
             etag: "\"e\"".into(),
             size: 0,
             last_modified: 0,
@@ -1197,12 +1151,7 @@ mod tests {
     #[test]
     fn head_object_response() {
         let result = HeadObjectResult {
-            metadata: MetadataBlob {
-                entries: vec![MetadataEntry {
-                    key: "content-type".into(),
-                    value: "image/png".into(),
-                }],
-            },
+            metadata: MetadataBlob::from_pairs(&[("content-type", "image/png")]),
             etag: "\"etag\"".into(),
             size: 1024,
             last_modified: 0,
@@ -1237,18 +1186,10 @@ mod tests {
     #[test]
     fn head_object_with_encoding_and_cache() {
         let result = HeadObjectResult {
-            metadata: MetadataBlob {
-                entries: vec![
-                    MetadataEntry {
-                        key: "content-encoding".into(),
-                        value: "br".into(),
-                    },
-                    MetadataEntry {
-                        key: "cache-control".into(),
-                        value: "no-cache".into(),
-                    },
-                ],
-            },
+            metadata: MetadataBlob::from_pairs(&[
+                ("content-encoding", "br"),
+                ("cache-control", "no-cache"),
+            ]),
             etag: "\"e\"".into(),
             size: 10,
             last_modified: 0,
@@ -1263,12 +1204,7 @@ mod tests {
     #[test]
     fn head_object_with_amz_meta() {
         let result = HeadObjectResult {
-            metadata: MetadataBlob {
-                entries: vec![MetadataEntry {
-                    key: "x-amz-meta-tag".into(),
-                    value: "value".into(),
-                }],
-            },
+            metadata: MetadataBlob::from_pairs(&[("x-amz-meta-tag", "value")]),
             etag: "\"e\"".into(),
             size: 0,
             last_modified: 0,
@@ -1282,18 +1218,10 @@ mod tests {
     #[test]
     fn head_object_checksum_type_with_checksum_mode_enabled() {
         let result = HeadObjectResult {
-            metadata: MetadataBlob {
-                entries: vec![
-                    MetadataEntry {
-                        key: "x-amz-checksum-crc32".into(),
-                        value: "AAAAAA==".into(),
-                    },
-                    MetadataEntry {
-                        key: "x-amz-checksum-type".into(),
-                        value: "COMPOSITE".into(),
-                    },
-                ],
-            },
+            metadata: MetadataBlob::from_pairs(&[
+                ("x-amz-checksum-crc32", "AAAAAA=="),
+                ("x-amz-checksum-type", "COMPOSITE"),
+            ]),
             etag: "\"e\"".into(),
             size: 0,
             last_modified: 0,
@@ -1308,18 +1236,10 @@ mod tests {
     #[test]
     fn head_object_checksum_type_omitted_without_checksum_mode() {
         let result = HeadObjectResult {
-            metadata: MetadataBlob {
-                entries: vec![
-                    MetadataEntry {
-                        key: "x-amz-checksum-crc32".into(),
-                        value: "AAAAAA==".into(),
-                    },
-                    MetadataEntry {
-                        key: "x-amz-checksum-type".into(),
-                        value: "COMPOSITE".into(),
-                    },
-                ],
-            },
+            metadata: MetadataBlob::from_pairs(&[
+                ("x-amz-checksum-crc32", "AAAAAA=="),
+                ("x-amz-checksum-type", "COMPOSITE"),
+            ]),
             etag: "\"e\"".into(),
             size: 0,
             last_modified: 0,

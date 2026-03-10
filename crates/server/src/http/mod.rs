@@ -409,15 +409,7 @@ impl HttpFrontend {
                             let mut blob = MetadataBlob::from_headers(&header_pairs)?;
                             // Strip unverifiable checksum value headers — CopyObject
                             // has no body so these can't be verified.
-                            const CHECKSUM_VALUE_HEADERS: &[&str] = &[
-                                "x-amz-checksum-crc32",
-                                "x-amz-checksum-crc32c",
-                                "x-amz-checksum-crc64nvme",
-                                "x-amz-checksum-sha256",
-                                "x-amz-checksum-sha1",
-                            ];
-                            blob.entries
-                                .retain(|e| !CHECKSUM_VALUE_HEADERS.contains(&e.key.as_str()));
+                            blob.strip_checksum_values();
                             replace_metadata = blob;
 
                             // Parse checksum algorithm if present.
@@ -1891,14 +1883,7 @@ impl HttpFrontend {
         } else {
             let mut blob = ctx.metadata_blob.clone();
             for (k, v) in trailer_checksums {
-                if let Some(entry) = blob.entries.iter_mut().find(|e| e.key == *k) {
-                    entry.value = v.clone();
-                } else {
-                    blob.entries.push(crate::metadata_blob::MetadataEntry {
-                        key: k.clone(),
-                        value: v.clone(),
-                    });
-                }
+                blob.set(k, v);
             }
             blob
         };

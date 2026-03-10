@@ -27,7 +27,7 @@ pub struct MetadataEntry {
 /// Metadata blob containing user-specified headers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetadataBlob {
-    pub entries: Vec<MetadataEntry>,
+    entries: Vec<MetadataEntry>,
 }
 
 /// Standard S3 headers that get stored in the metadata blob.
@@ -299,6 +299,51 @@ impl MetadataBlob {
         self.entries
             .iter()
             .filter(|e| e.key.starts_with("x-amz-checksum-") && e.key != "x-amz-checksum-algorithm")
+    }
+
+    /// Build a metadata blob from raw key-value pairs without header filtering.
+    /// Unlike `from_headers`, this does not filter by STORED_HEADERS or
+    /// lowercase keys — pairs are stored exactly as given.
+    pub fn from_pairs(pairs: &[(&str, &str)]) -> Self {
+        Self {
+            entries: pairs
+                .iter()
+                .map(|(k, v)| MetadataEntry {
+                    key: k.to_string(),
+                    value: v.to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Return the number of entries.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Return whether the blob is empty.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Iterate over all entries.
+    pub fn iter(&self) -> impl Iterator<Item = &MetadataEntry> {
+        self.entries.iter()
+    }
+
+    /// Remove checksum value headers (x-amz-checksum-crc32, etc.) that cannot
+    /// be verified. Used at the HTTP boundary for CopyObject REPLACE, where
+    /// there is no body to verify checksums against.
+    pub fn strip_checksum_values(&mut self) {
+        const CHECKSUM_VALUE_HEADERS: &[&str] = &[
+            "x-amz-checksum-crc32",
+            "x-amz-checksum-crc32c",
+            "x-amz-checksum-crc64nvme",
+            "x-amz-checksum-sha256",
+            "x-amz-checksum-sha1",
+        ];
+        self.entries
+            .retain(|e| !CHECKSUM_VALUE_HEADERS.contains(&e.key.as_str()));
     }
 }
 
