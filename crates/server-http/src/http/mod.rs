@@ -14,7 +14,7 @@ use auth::{authenticate_request, AuthContext, AuthMode, CredentialStore};
 use bytes::Bytes;
 use http_body_util::Full;
 
-use crate::authz::{can_read_bucket, can_write_bucket, ResourceVisibility};
+use crate::authz::can_write_bucket;
 use crate::coordinator::ChecksumClaim;
 use crate::coordinator::Coordinator;
 use crate::coordinator::CopyObjectRequest;
@@ -147,7 +147,7 @@ impl HttpFrontend {
             .unwrap_or_default();
 
         // Load CORS config
-        let cors_config_xml = match self.coordinator.get_bucket_cors(bucket) {
+        let cors_config_xml = match self.coordinator.get_bucket_cors_unchecked(bucket) {
             Ok(Some(xml)) => xml,
             _ => return S3Response::forbidden(),
         };
@@ -177,7 +177,7 @@ impl HttpFrontend {
     /// Apply CORS headers to an actual (non-preflight) response if the request
     /// has an Origin header and a matching CORS rule exists.
     fn apply_cors_headers(&self, resp: &mut S3Response, bucket: &str, origin: &str, method: &str) {
-        let cors_config_xml = match self.coordinator.get_bucket_cors(bucket) {
+        let cors_config_xml = match self.coordinator.get_bucket_cors_unchecked(bucket) {
             Ok(Some(xml)) => xml,
             _ => return,
         };
@@ -228,9 +228,9 @@ impl HttpFrontend {
                 let owner_principal = self.require_principal(auth)?;
                 let acl = parse_bucket_acl(req)?;
                 let public_read = match acl {
-                    BucketAcl::Private => false,
-                    BucketAcl::PublicRead => true,
-                    BucketAcl::UnsupportedPublic => {
+                    crate::coordinator::BucketAcl::Private => false,
+                    crate::coordinator::BucketAcl::PublicRead => true,
+                    crate::coordinator::BucketAcl::UnsupportedPublic => {
                         return Err(ServerError::NotImplemented {
                             feature: "public-read-write and authenticated-read ACLs".to_string(),
                         });
@@ -264,8 +264,11 @@ impl HttpFrontend {
                 self.coordinator
                     .create_bucket_for_owner(owner_principal, &bucket, public_read)?;
                 if let Some(config_xml) = ownership_xml {
-                    self.coordinator
-                        .put_bucket_ownership_controls(&bucket, &config_xml)?;
+                    self.coordinator.put_bucket_ownership_controls(
+                        &bucket,
+                        &config_xml,
+                        crate::coordinator::Requester::principal(owner_principal),
+                    )?;
                 }
                 Ok(S3Response::create_bucket(&bucket))
             }
@@ -477,13 +480,14 @@ impl HttpFrontend {
                             &src_bucket,
                             &src_key,
                             src_version_id,
+                            requester,
                         )? {
                             self.coordinator
-                                .put_object_tags(&bucket, &key, dst_vid, &src_tags)?;
+                                .put_object_tags(&bucket, &key, dst_vid, &src_tags, requester)?;
                         }
                     } else if let Some(tags_xml) = inline_tags_xml {
                         self.coordinator
-                            .put_object_tags(&bucket, &key, dst_vid, &tags_xml)?;
+                            .put_object_tags(&bucket, &key, dst_vid, &tags_xml, requester)?;
                     }
                     Ok(S3Response::copy_object(&result))
                 } else {
@@ -528,6 +532,7 @@ impl HttpFrontend {
                             &key,
                             Some(result.version_id),
                             &tags_xml,
+                            requester,
                         )?;
                     }
                     let mut resp = S3Response::put_object(&result);
@@ -834,28 +839,33 @@ impl HttpFrontend {
                 Ok(S3Response::delete_objects(&result, quiet))
             }
             S3Operation::PutBucketVersioning { bucket } => {
-                self.authorize_bucket_write(auth, &bucket)?;
                 let versioning_state = xml::parse_versioning_config_xml(&req.body)?;
+                let requester =
+                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
                 self.coordinator
-                    .put_bucket_versioning(&bucket, versioning_state)?;
+                    .put_bucket_versioning(&bucket, versioning_state, requester)?;
                 Ok(S3Response::put_bucket_versioning())
             }
             S3Operation::GetBucketVersioning { bucket } => {
-                self.authorize_bucket_read(auth, &bucket)?;
-                let state = self.coordinator.get_bucket_versioning(&bucket)?;
+                let requester =
+                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                let state = self.coordinator.get_bucket_versioning(&bucket, requester)?;
                 Ok(S3Response::get_bucket_versioning(state))
             }
             S3Operation::PostObject { bucket } => self.handle_post_object(req, auth, &bucket),
             S3Operation::PutBucketCors { bucket } => {
-                self.authorize_bucket_write(auth, &bucket)?;
                 let config = xml::parse_cors_config_xml(&req.body)?;
                 let config_xml = xml::get_cors_config_xml(&config);
-                self.coordinator.put_bucket_cors(&bucket, &config_xml)?;
+                let requester =
+                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                self.coordinator
+                    .put_bucket_cors(&bucket, &config_xml, requester)?;
                 Ok(S3Response::put_bucket_cors())
             }
             S3Operation::GetBucketCors { bucket } => {
-                self.authorize_bucket_read(auth, &bucket)?;
-                match self.coordinator.get_bucket_cors(&bucket)? {
+                let requester =
+                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                match self.coordinator.get_bucket_cors(&bucket, requester)? {
                     Some(config_xml) => Ok(S3Response::get_bucket_cors(&config_xml)),
                     None => Err(ServerError::NoSuchCorsConfiguration {
                         bucket: bucket.clone(),
@@ -863,20 +873,24 @@ impl HttpFrontend {
                 }
             }
             S3Operation::DeleteBucketCors { bucket } => {
-                self.authorize_bucket_write(auth, &bucket)?;
-                self.coordinator.delete_bucket_cors(&bucket)?;
+                let requester =
+                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                self.coordinator.delete_bucket_cors(&bucket, requester)?;
                 Ok(S3Response::delete_bucket_cors())
             }
             S3Operation::PutBucketTagging { bucket } => {
-                self.authorize_bucket_write(auth, &bucket)?;
                 let tags = xml::parse_tagging_xml(&req.body, 50)?;
                 let tags_xml = xml::get_tagging_xml(&tags);
-                self.coordinator.put_bucket_tags(&bucket, &tags_xml)?;
+                let requester =
+                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                self.coordinator
+                    .put_bucket_tags(&bucket, &tags_xml, requester)?;
                 Ok(S3Response::put_bucket_tagging())
             }
             S3Operation::GetBucketTagging { bucket } => {
-                self.authorize_bucket_read(auth, &bucket)?;
-                match self.coordinator.get_bucket_tags(&bucket)? {
+                let requester =
+                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                match self.coordinator.get_bucket_tags(&bucket, requester)? {
                     Some(tags_xml) => Ok(S3Response::get_bucket_tagging(&tags_xml)),
                     None => Err(ServerError::NoSuchTagSet {
                         resource: bucket.clone(),
@@ -884,23 +898,29 @@ impl HttpFrontend {
                 }
             }
             S3Operation::DeleteBucketTagging { bucket } => {
-                self.authorize_bucket_write(auth, &bucket)?;
-                self.coordinator.delete_bucket_tags(&bucket)?;
+                let requester =
+                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                self.coordinator.delete_bucket_tags(&bucket, requester)?;
                 Ok(S3Response::delete_bucket_tagging())
             }
             S3Operation::PutObjectTagging { bucket, key } => {
-                self.authorize_bucket_write(auth, &bucket)?;
                 let vid = parse_version_id(req)?;
                 let tags = xml::parse_tagging_xml(&req.body, 10)?;
                 let tags_xml = xml::get_tagging_xml(&tags);
+                let requester =
+                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
                 self.coordinator
-                    .put_object_tags(&bucket, &key, vid, &tags_xml)?;
+                    .put_object_tags(&bucket, &key, vid, &tags_xml, requester)?;
                 Ok(S3Response::put_object_tagging())
             }
             S3Operation::GetObjectTagging { bucket, key } => {
-                self.authorize_bucket_read(auth, &bucket)?;
                 let vid = parse_version_id(req)?;
-                if let Some(tags_xml) = self.coordinator.get_object_tags(&bucket, &key, vid)? {
+                let requester =
+                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                if let Some(tags_xml) = self
+                    .coordinator
+                    .get_object_tags(&bucket, &key, vid, requester)?
+                {
                     Ok(S3Response::get_object_tagging(&tags_xml))
                 } else {
                     // S3 returns empty TagSet (not 404) for objects with no tags
@@ -909,22 +929,29 @@ impl HttpFrontend {
                 }
             }
             S3Operation::DeleteObjectTagging { bucket, key } => {
-                self.authorize_bucket_write(auth, &bucket)?;
                 let vid = parse_version_id(req)?;
-                self.coordinator.delete_object_tags(&bucket, &key, vid)?;
+                let requester =
+                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                self.coordinator
+                    .delete_object_tags(&bucket, &key, vid, requester)?;
                 Ok(S3Response::delete_object_tagging())
             }
             S3Operation::PutBucketPublicAccessBlock { bucket } => {
-                self.authorize_bucket_write(auth, &bucket)?;
                 let config = xml::parse_public_access_block_xml(&req.body)?;
                 let config_xml = xml::get_public_access_block_xml(&config);
+                let requester =
+                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
                 self.coordinator
-                    .put_bucket_public_access_block(&bucket, &config_xml)?;
+                    .put_bucket_public_access_block(&bucket, &config_xml, requester)?;
                 Ok(S3Response::put_bucket_public_access_block())
             }
             S3Operation::GetBucketPublicAccessBlock { bucket } => {
-                self.authorize_bucket_write(auth, &bucket)?;
-                match self.coordinator.get_bucket_public_access_block(&bucket)? {
+                let requester =
+                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                match self
+                    .coordinator
+                    .get_bucket_public_access_block(&bucket, requester)?
+                {
                     Some(config_xml) => Ok(S3Response::get_bucket_public_access_block(&config_xml)),
                     None => Err(ServerError::NoSuchPublicAccessBlockConfiguration {
                         bucket: bucket.clone(),
@@ -932,28 +959,28 @@ impl HttpFrontend {
                 }
             }
             S3Operation::DeleteBucketPublicAccessBlock { bucket } => {
-                self.authorize_bucket_write(auth, &bucket)?;
+                let requester =
+                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
                 self.coordinator
-                    .delete_bucket_public_access_block(&bucket)?;
+                    .delete_bucket_public_access_block(&bucket, requester)?;
                 Ok(S3Response::delete_bucket_public_access_block())
             }
             S3Operation::PutBucketOwnershipControls { bucket } => {
-                self.authorize_bucket_write(auth, &bucket)?;
                 let value = xml::parse_ownership_controls_xml(&req.body)?;
-                if value == "BucketOwnerEnforced" {
-                    let info = self.coordinator.head_bucket(&bucket)?;
-                    if info.public_read {
-                        return Err(ServerError::InvalidBucketAclWithObjectOwnership);
-                    }
-                }
                 let config_xml = xml::get_ownership_controls_xml(&value);
+                let requester =
+                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
                 self.coordinator
-                    .put_bucket_ownership_controls(&bucket, &config_xml)?;
+                    .put_bucket_ownership_controls(&bucket, &config_xml, requester)?;
                 Ok(S3Response::put_bucket_ownership_controls())
             }
             S3Operation::GetBucketOwnershipControls { bucket } => {
-                self.authorize_bucket_write(auth, &bucket)?;
-                match self.coordinator.get_bucket_ownership_controls(&bucket)? {
+                let requester =
+                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                match self
+                    .coordinator
+                    .get_bucket_ownership_controls(&bucket, requester)?
+                {
                     Some(config_xml) => Ok(S3Response::get_bucket_ownership_controls(&config_xml)),
                     None => Err(ServerError::OwnershipControlsNotFound {
                         bucket: bucket.clone(),
@@ -961,75 +988,17 @@ impl HttpFrontend {
                 }
             }
             S3Operation::DeleteBucketOwnershipControls { bucket } => {
-                self.authorize_bucket_write(auth, &bucket)?;
-                self.coordinator.delete_bucket_ownership_controls(&bucket)?;
+                let requester =
+                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                self.coordinator
+                    .delete_bucket_ownership_controls(&bucket, requester)?;
                 Ok(S3Response::delete_bucket_ownership_controls())
             }
             S3Operation::PutBucketAcl { bucket } => {
-                self.authorize_bucket_write(auth, &bucket)?;
                 let acl = parse_bucket_acl(req)?;
-                match acl {
-                    BucketAcl::Private => {
-                        // Enforce BucketOwnerEnforced — all PutBucketAcl calls rejected
-                        if let Some(ref oc_xml) =
-                            self.coordinator.get_bucket_ownership_controls(&bucket)?
-                        {
-                            if let Ok(val) = xml::parse_ownership_controls_xml(oc_xml.as_bytes()) {
-                                if val == "BucketOwnerEnforced" {
-                                    return Err(ServerError::AccessControlListNotSupported);
-                                }
-                            }
-                        }
-                        self.coordinator.put_bucket_acl(&bucket, false)?;
-                    }
-                    BucketAcl::PublicRead => {
-                        // Enforce BucketOwnerEnforced
-                        if let Some(ref oc_xml) =
-                            self.coordinator.get_bucket_ownership_controls(&bucket)?
-                        {
-                            if let Ok(val) = xml::parse_ownership_controls_xml(oc_xml.as_bytes()) {
-                                if val == "BucketOwnerEnforced" {
-                                    return Err(ServerError::AccessControlListNotSupported);
-                                }
-                            }
-                        }
-                        // Enforce BlockPublicAcls
-                        if let Some(pab_xml) =
-                            self.coordinator.get_bucket_public_access_block(&bucket)?
-                        {
-                            let pab = xml::parse_public_access_block_xml(pab_xml.as_bytes())?;
-                            if pab.block_public_acls {
-                                return Err(ServerError::AccessDenied);
-                            }
-                        }
-                        self.coordinator.put_bucket_acl(&bucket, true)?;
-                    }
-                    BucketAcl::UnsupportedPublic => {
-                        // Enforce BucketOwnerEnforced
-                        if let Some(ref oc_xml) =
-                            self.coordinator.get_bucket_ownership_controls(&bucket)?
-                        {
-                            if let Ok(val) = xml::parse_ownership_controls_xml(oc_xml.as_bytes()) {
-                                if val == "BucketOwnerEnforced" {
-                                    return Err(ServerError::AccessControlListNotSupported);
-                                }
-                            }
-                        }
-                        // Check BlockPublicAcls first — return 403 if set
-                        if let Some(pab_xml) =
-                            self.coordinator.get_bucket_public_access_block(&bucket)?
-                        {
-                            let pab = xml::parse_public_access_block_xml(pab_xml.as_bytes())?;
-                            if pab.block_public_acls {
-                                return Err(ServerError::AccessDenied);
-                            }
-                        }
-                        // Not blocked, but we don't support these ACL semantics
-                        return Err(ServerError::NotImplemented {
-                            feature: "public-read-write and authenticated-read ACLs".to_string(),
-                        });
-                    }
-                }
+                let requester =
+                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                self.coordinator.put_bucket_acl(&bucket, acl, requester)?;
                 Ok(S3Response::put_bucket_acl())
             }
             S3Operation::CreateMultipartUpload { bucket, key } => {
@@ -1547,31 +1516,6 @@ impl HttpFrontend {
             .ok_or(ServerError::Auth(auth::AuthError::AccessDenied))
     }
 
-    fn authorize_bucket_read(&self, auth: &AuthContext, bucket: &str) -> Result<(), ServerError> {
-        let info = self.coordinator.head_bucket(bucket)?;
-        let mut effective_public_read = info.public_read;
-        // IgnorePublicAcls: treat public-read as private if set
-        if effective_public_read {
-            if let Some(ref pab_xml) = info.public_access_block {
-                if let Ok(pab) = xml::parse_public_access_block_xml(pab_xml.as_bytes()) {
-                    if pab.ignore_public_acls {
-                        effective_public_read = false;
-                    }
-                }
-            }
-        }
-        let visibility = if effective_public_read {
-            ResourceVisibility::PublicRead
-        } else {
-            ResourceVisibility::Private
-        };
-        if can_read_bucket(auth, &info.owner_principal, visibility) {
-            Ok(())
-        } else {
-            Err(ServerError::Auth(auth::AuthError::AccessDenied))
-        }
-    }
-
     fn authorize_bucket_write(&self, auth: &AuthContext, bucket: &str) -> Result<(), ServerError> {
         let info = self.coordinator.head_bucket(bucket)?;
         if can_write_bucket(auth, &info.owner_principal) {
@@ -1771,7 +1715,12 @@ impl HttpFrontend {
 
         // Enforce BucketOwnerEnforced ACL constraint.
         if let Some(acl_value) = req.header("x-amz-acl") {
-            if let Some(ref oc_xml) = self.coordinator.get_bucket_ownership_controls(bucket)? {
+            let requester =
+                crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+            if let Some(ref oc_xml) = self
+                .coordinator
+                .get_bucket_ownership_controls(bucket, requester)?
+            {
                 if let Ok(val) = xml::parse_ownership_controls_xml(oc_xml.as_bytes()) {
                     if val == "BucketOwnerEnforced"
                         && acl_value != "bucket-owner-full-control"
@@ -1848,6 +1797,7 @@ impl HttpFrontend {
             metadata_blob,
             cond,
             inline_tags_xml,
+            requester_principal: auth.principal.clone(),
             checksum_response,
             streaming_signing: auth.streaming,
         })
@@ -1911,6 +1861,7 @@ impl HttpFrontend {
                 &ctx.key,
                 Some(result.version_id),
                 tags_xml,
+                crate::coordinator::Requester::from_principal(ctx.requester_principal.as_deref()),
             )?;
         }
 
@@ -2079,6 +2030,7 @@ pub struct StreamingPutContext {
     pub metadata_blob: crate::metadata_blob::MetadataBlob,
     pub cond: crate::conditional::WriteCondition,
     pub inline_tags_xml: Option<String>,
+    pub requester_principal: Option<String>,
     pub checksum_response: Vec<(String, String)>,
     /// Signing context for aws-chunked modes, None for unsigned/plain.
     pub streaming_signing: Option<auth::StreamingSigningContext>,
@@ -2327,20 +2279,13 @@ fn apply_response_overrides(resp: &mut S3Response, req: &S3Request) {
     }
 }
 
-enum BucketAcl {
-    Private,
-    PublicRead,
-    /// ACL values that grant public access but whose specific semantics we don't implement
-    /// (public-read-write, authenticated-read). Kept separate so `BlockPublicAcls` can reject
-    /// them with 403 while normal requests get `NotImplemented`.
-    UnsupportedPublic,
-}
-
-fn parse_bucket_acl(req: &S3Request) -> Result<BucketAcl, ServerError> {
+fn parse_bucket_acl(req: &S3Request) -> Result<crate::coordinator::BucketAcl, ServerError> {
     match req.header("x-amz-acl") {
-        None | Some("private") => Ok(BucketAcl::Private),
-        Some("public-read") => Ok(BucketAcl::PublicRead),
-        Some("public-read-write" | "authenticated-read") => Ok(BucketAcl::UnsupportedPublic),
+        None | Some("private") => Ok(crate::coordinator::BucketAcl::Private),
+        Some("public-read") => Ok(crate::coordinator::BucketAcl::PublicRead),
+        Some("public-read-write" | "authenticated-read") => {
+            Ok(crate::coordinator::BucketAcl::UnsupportedPublic)
+        }
         Some(other) => Err(ServerError::InvalidArgument {
             reason: format!("unsupported x-amz-acl value: {other}"),
         }),
