@@ -378,23 +378,9 @@ impl HttpFrontend {
                             }
                         })?)),
                     };
-                    self.authorize_bucket_write(auth, &bucket)?;
-                    self.authorize_bucket_read(auth, &src_bucket)?;
-                    // Enforce BucketOwnerEnforced on CopyObject with x-amz-acl
-                    if let Some(acl_value) = req.header("x-amz-acl") {
-                        if let Some(ref oc_xml) =
-                            self.coordinator.get_bucket_ownership_controls(&bucket)?
-                        {
-                            if let Ok(val) = xml::parse_ownership_controls_xml(oc_xml.as_bytes()) {
-                                if val == "BucketOwnerEnforced"
-                                    && acl_value != "bucket-owner-full-control"
-                                    && acl_value != "private"
-                                {
-                                    return Err(ServerError::AccessControlListNotSupported);
-                                }
-                            }
-                        }
-                    }
+                    let requester =
+                        crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                    let acl = parse_put_object_acl(req.header("x-amz-acl"));
                     let src_cond = copy_source_condition_from_headers(req);
                     let dst_cond = write_condition_from_headers(req)?;
                     let header_pairs: Vec<(&str, &str)> = req
@@ -470,6 +456,8 @@ impl HttpFrontend {
                         dst_key: &key,
                         dst_condition: &dst_cond,
                         directive,
+                        requester,
+                        acl,
                     })?;
                     // Apply tagging based on directive
                     let dst_vid = Some(result.version_id);
@@ -1105,8 +1093,8 @@ impl HttpFrontend {
                             }
                         })?)),
                     };
-                    self.authorize_bucket_write(auth, &bucket)?;
-                    self.authorize_bucket_read(auth, &src_bucket)?;
+                    let requester =
+                        crate::coordinator::Requester::from_principal(auth.principal.as_deref());
                     let src_cond = copy_source_condition_from_headers(req);
                     let copy_source_range =
                         if let Some(range_header) = req.header("x-amz-copy-source-range") {
@@ -1126,6 +1114,7 @@ impl HttpFrontend {
                         upload_id: &upload_id,
                         part_number,
                         copy_source_range,
+                        requester,
                     })?;
                     Ok(S3Response::upload_part_copy(
                         &result.etag,

@@ -243,6 +243,8 @@ pub struct CopyObjectRequest<'a> {
     pub dst_key: &'a str,
     pub dst_condition: &'a WriteCondition,
     pub directive: MetadataDirective<'a>,
+    pub requester: Requester<'a>,
+    pub acl: PutObjectAcl<'a>,
 }
 
 /// Parsed UploadPartCopy request from the HTTP layer.
@@ -254,6 +256,7 @@ pub struct UploadPartCopyRequest<'a> {
     pub upload_id: &'a str,
     pub part_number: u32,
     pub copy_source_range: Option<(u64, u64)>,
+    pub requester: Requester<'a>,
 }
 
 /// Request for a PutObject operation.
@@ -727,11 +730,33 @@ impl Coordinator {
         requester.principal_opt() == Some(owner_principal)
     }
 
+    fn requester_can_read_bucket(
+        requester: Requester<'_>,
+        owner_principal: &str,
+        public_read: bool,
+    ) -> bool {
+        #[cfg(test)]
+        if requester.is_system {
+            return true;
+        }
+
+        requester.principal_opt() == Some(owner_principal) || public_read
+    }
+
     // Ownership-controls XML is stored in canonical form by the HTTP layer.
     fn is_bucket_owner_enforced(config_xml: Option<&str>) -> bool {
         config_xml.is_some_and(|xml| {
             xml.contains("<ObjectOwnership>BucketOwnerEnforced</ObjectOwnership>")
         })
+    }
+
+    // Public-access-block XML is stored in canonical form by the HTTP layer.
+    fn ignores_public_acls(config_xml: Option<&str>) -> bool {
+        config_xml.is_some_and(|xml| xml.contains("<IgnorePublicAcls>true</IgnorePublicAcls>"))
+    }
+
+    fn effective_public_read(bucket: &BucketSummary) -> bool {
+        bucket.public_read && !Self::ignores_public_acls(bucket.public_access_block.as_deref())
     }
 
     fn bucket_summary(info: BucketInfo) -> BucketSummary {
@@ -2071,7 +2096,33 @@ impl Coordinator {
         let src_cond = req.source.condition;
         let dst_cond = req.dst_condition;
         let directive = &req.directive;
+        let requester = req.requester;
+        let acl = req.acl;
         let _bucket_guard = self.storage_node.lock_bucket(dst_bucket);
+
+        let dst_bucket_info = self.head_bucket(dst_bucket)?;
+        if !Self::requester_can_write_bucket(requester, &dst_bucket_info.owner_principal) {
+            return Err(ServerError::AccessDenied);
+        }
+
+        let ownership_controls = self.get_bucket_ownership_controls(dst_bucket)?;
+        if Self::is_bucket_owner_enforced(ownership_controls.as_deref())
+            && !matches!(
+                acl,
+                PutObjectAcl::None | PutObjectAcl::Private | PutObjectAcl::BucketOwnerFullControl
+            )
+        {
+            return Err(ServerError::AccessControlListNotSupported);
+        }
+
+        let src_bucket_info = self.head_bucket(src_bucket)?;
+        if !Self::requester_can_read_bucket(
+            requester,
+            &src_bucket_info.owner_principal,
+            Self::effective_public_read(&src_bucket_info),
+        ) {
+            return Err(ServerError::AccessDenied);
+        }
 
         // Phase 1: Read source object
         let (src_metadata, user_data) = {
@@ -2218,7 +2269,6 @@ impl Coordinator {
             }
         };
 
-        let dst_bucket_info = self.head_bucket(dst_bucket)?;
         let LockedWriteObject {
             version_id: dst_version_id,
             pgs,
@@ -4323,6 +4373,22 @@ impl Coordinator {
         let part_number = req.part_number;
         let src_cond = req.source.condition;
         let copy_source_range = req.copy_source_range;
+        let requester = req.requester;
+
+        let dst_bucket_info = self.head_bucket(dst_bucket)?;
+        if !Self::requester_can_write_bucket(requester, &dst_bucket_info.owner_principal) {
+            return Err(ServerError::AccessDenied);
+        }
+
+        let src_bucket_info = self.head_bucket(src_bucket)?;
+        if !Self::requester_can_read_bucket(
+            requester,
+            &src_bucket_info.owner_principal,
+            Self::effective_public_read(&src_bucket_info),
+        ) {
+            return Err(ServerError::AccessDenied);
+        }
+
         // Phase 1: Read source object (only the needed range)
         let source_data = {
             let LockedReadObject {
@@ -7768,6 +7834,8 @@ mod tests {
                 dst_key: "dst",
                 dst_condition: NO_WRITE,
                 directive: MetadataDirective::Copy,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
         assert!(!result.etag.is_empty());
@@ -7781,6 +7849,90 @@ mod tests {
             })
             .unwrap();
         assert_eq!(obj.data, b"hello copy");
+    }
+
+    #[test]
+    fn copy_object_rejects_private_source_read_for_non_owner() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "src-bucket", false)
+            .unwrap();
+        coord
+            .create_bucket_for_owner("owner-b", "dst-bucket", false)
+            .unwrap();
+
+        coord
+            .put_object(&PutObjectRequest {
+                bucket: "src-bucket",
+                key: "src",
+                data: b"private",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+                requester: Requester::principal("owner-a"),
+                acl: NO_PUT_OBJECT_ACL,
+            })
+            .unwrap();
+
+        let err = coord
+            .copy_object(&CopyObjectRequest {
+                source: CopySource {
+                    bucket: "src-bucket",
+                    key: "src",
+                    version_id: None,
+                    condition: NO_READ,
+                },
+                dst_bucket: "dst-bucket",
+                dst_key: "dst",
+                dst_condition: NO_WRITE,
+                directive: MetadataDirective::Copy,
+                requester: Requester::principal("owner-b"),
+                acl: NO_PUT_OBJECT_ACL,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn copy_object_rejects_acl_on_bucket_owner_enforced_bucket() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+        coord
+            .put_bucket_ownership_controls(
+                "bucket",
+                "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
+            )
+            .unwrap();
+        coord
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "src",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
+            })
+            .unwrap();
+
+        let err = coord
+            .copy_object(&CopyObjectRequest {
+                source: CopySource {
+                    bucket: "bucket",
+                    key: "src",
+                    version_id: None,
+                    condition: NO_READ,
+                },
+                dst_bucket: "bucket",
+                dst_key: "dst",
+                dst_condition: NO_WRITE,
+                directive: MetadataDirective::Copy,
+                requester: TEST_REQUESTER,
+                acl: PutObjectAcl::Other("public-read"),
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessControlListNotSupported));
     }
 
     #[test]
@@ -7817,6 +7969,8 @@ mod tests {
                 dst_key: "dst",
                 dst_condition: NO_WRITE,
                 directive: MetadataDirective::Copy,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -7871,6 +8025,8 @@ mod tests {
                     metadata: &new_metadata,
                     checksum_algorithm: None,
                 },
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -7925,6 +8081,8 @@ mod tests {
                     metadata: &new_metadata,
                     checksum_algorithm: None,
                 },
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -7978,6 +8136,8 @@ mod tests {
                     metadata: &new_metadata,
                     checksum_algorithm: None,
                 },
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -8032,6 +8192,8 @@ mod tests {
                     metadata: &new_metadata,
                     checksum_algorithm: Some(ChecksumAlgorithm::Crc32c),
                 },
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -8085,6 +8247,8 @@ mod tests {
                 dst_key: "dst",
                 dst_condition: NO_WRITE,
                 directive: MetadataDirective::Copy,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
@@ -8119,6 +8283,8 @@ mod tests {
                 dst_key: "dst",
                 dst_condition: NO_WRITE,
                 directive: MetadataDirective::Copy,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
@@ -8157,6 +8323,8 @@ mod tests {
                 dst_key: "dst",
                 dst_condition: NO_WRITE,
                 directive: MetadataDirective::Copy,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::PreconditionFailed));
@@ -8204,6 +8372,8 @@ mod tests {
                 dst_key: "dst",
                 dst_condition: &dst_cond,
                 directive: MetadataDirective::Copy,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::PreconditionFailed));
@@ -8251,6 +8421,8 @@ mod tests {
                 dst_key: "dst",
                 dst_condition: &dst_cond,
                 directive: MetadataDirective::Copy,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
         assert!(!result.etag.is_empty());
@@ -8298,6 +8470,8 @@ mod tests {
                 dst_key: "key",
                 dst_condition: NO_WRITE,
                 directive: MetadataDirective::Copy,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -10890,6 +11064,8 @@ mod tests {
                 dst_key: "dst-key",
                 dst_condition: &WriteCondition::default(),
                 directive: MetadataDirective::Copy,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -11129,6 +11305,8 @@ mod tests {
                 dst_key: "key",
                 dst_condition: &WriteCondition::default(),
                 directive: MetadataDirective::Copy,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -12196,6 +12374,8 @@ mod tests {
                 dst_key: "dst",
                 dst_condition: &WriteCondition::default(),
                 directive: MetadataDirective::Copy,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -12436,9 +12616,56 @@ mod tests {
                 upload_id: &upload.upload_id,
                 part_number: 1,
                 copy_source_range: None,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert!(!result.etag.is_empty());
+    }
+
+    #[test]
+    fn upload_part_copy_rejects_non_owner_requester() {
+        let dir = test_util::tempdir();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        coord
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "src",
+                data: b"source-data",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
+            })
+            .unwrap();
+
+        let upload = coord
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "dst",
+                metadata: &MetadataBlob::new(),
+                checksum: None,
+            })
+            .unwrap();
+
+        let err = coord
+            .upload_part_copy(&UploadPartCopyRequest {
+                source: CopySource {
+                    bucket: "bucket",
+                    key: "src",
+                    version_id: None,
+                    condition: NO_READ,
+                },
+                dst_bucket: "bucket",
+                dst_key: "dst",
+                upload_id: &upload.upload_id,
+                part_number: 1,
+                copy_source_range: None,
+                requester: Requester::principal("other-user"),
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
     }
 
     #[test]
