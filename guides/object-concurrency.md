@@ -84,6 +84,6 @@ Do not open-code this pattern in object paths:
 8. For bucket+object mixed operations, is lock order explicit and ascending by PG ID?
 9. Did you run:
    - `cargo clippy --workspace -- -D warnings`
-   - `cargo test -p server --lib`
+   - `cargo test -p server-http --lib`
    - `cargo test -p s3-tests`
    - atomic stress loop (`test_atomic_dual_write`)

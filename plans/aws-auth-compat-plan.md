@@ -358,7 +358,7 @@ Commands:
 
 ```bash
 cargo test -p auth
-cargo test -p server
+cargo test -p server-http
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 

@@ -1,7 +1,11 @@
 [package]
-name = "server"
+name = "server-http"
 version = "0.1.0"
 edition = "2021"
+
+[lib]
+name = "server"
+path = "src/lib.rs"
 
 [[bin]]
 name = "argmin-s3"

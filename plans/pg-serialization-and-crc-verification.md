@@ -153,7 +153,7 @@ for _ in 0..config.workers {
 
 1. `cargo clippy --workspace -- -D warnings`
 2. `cargo test -p storage` — storage unit tests
-3. `cargo test -p server --lib` — coordinator + server unit tests
+3. `cargo test -p server-http --lib` — coordinator + server unit tests
 4. `cargo test -p s3-tests` — all integration tests
 5. Run `test_atomic_dual_write` in a loop to confirm no more flakiness:
    `for i in $(seq 1 50); do cargo test -p s3-tests --test atomic test_atomic_dual_write || break; done`

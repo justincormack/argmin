@@ -1914,7 +1914,7 @@ dependencies = [
  "ec",
  "ring",
  "serde_json",
- "server",
+ "server-http",
  "storage",
  "tempfile",
  "test-util",
@@ -2029,7 +2029,22 @@ dependencies = [
 ]
 
 [[package]]
-name = "server"
+name = "server-core"
+version = "0.1.0"
+dependencies = [
+ "auth",
+ "base64",
+ "checksum",
+ "ec",
+ "rapidhash 1.4.0",
+ "ring",
+ "storage",
+ "test-util",
+ "thiserror",
+]
+
+[[package]]
+name = "server-http"
 version = "0.1.0"
 dependencies = [
  "auth",
@@ -2049,21 +2064,6 @@ dependencies = [
  "test-util",
  "thiserror",
  "tokio",
-]
-
-[[package]]
-name = "server-core"
-version = "0.1.0"
-dependencies = [
- "auth",
- "base64",
- "checksum",
- "ec",
- "rapidhash 1.4.0",
- "ring",
- "storage",
- "test-util",
- "thiserror",
 ]
 
 [[package]]

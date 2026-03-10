@@ -206,7 +206,7 @@ need raw HTTP access beyond what the SDK provides. For these, use `ureq` alongsi
 ```toml
 [dependencies]
 # Server (for local TestServer)
-server = { path = "../server" }
+server = { package = "server-http", path = "../server" }
 auth = { path = "../auth" }
 ec = { path = "../ec" }
 storage = { path = "../storage" }

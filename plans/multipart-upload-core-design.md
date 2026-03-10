@@ -657,7 +657,7 @@ Acceptance:
 1. `cargo fmt`
 2. `cargo clippy --workspace -- -D warnings`
 3. `cargo test -p storage`
-4. `cargo test -p server --lib`
+4. `cargo test -p server-http --lib`
 5. `cargo test -p s3-tests --test multipart` (once added)
 6. `cargo test -p s3-tests`
 
