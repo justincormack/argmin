@@ -244,7 +244,7 @@ pub struct PutObjectRequest<'a> {
     pub bucket: &'a str,
     pub key: &'a str,
     pub data: &'a [u8],
-    pub headers: &'a [(&'a str, &'a str)],
+    pub metadata: &'a MetadataBlob,
     pub cond: &'a WriteCondition,
 }
 
@@ -1077,13 +1077,11 @@ impl Coordinator {
 
     /// Put an object into storage.
     pub fn put_object(&self, req: &PutObjectRequest) -> Result<PutObjectResult, ServerError> {
-        let PutObjectRequest {
-            bucket,
-            key,
-            data,
-            headers,
-            cond,
-        } = req;
+        let bucket = req.bucket;
+        let key = req.key;
+        let data = req.data;
+        let metadata_blob = req.metadata;
+        let cond = req.cond;
         let _bucket_guard = self.storage_node.lock_bucket(bucket);
 
         if data.len() as u64 > MAX_OBJECT_SIZE {
@@ -1095,8 +1093,6 @@ impl Coordinator {
 
         // 1. Verify bucket exists and get versioning state
         let bucket_info = self.head_bucket(bucket)?;
-
-        let metadata_blob = MetadataBlob::from_headers(headers)?;
         let LockedWriteObject { version_id, pgs } =
             self.lock_object_pgs_for_write(bucket, key, bucket_info.versioning)?;
         let meta_pg = pgs.meta();
@@ -1122,7 +1118,7 @@ impl Coordinator {
         let (result, stale_chunks) = self.write_object_inner(
             bucket,
             key,
-            &metadata_blob,
+            metadata_blob,
             data,
             version_id,
             meta_pg,
@@ -5306,7 +5302,7 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
         let err = coord.delete_bucket("bucket").unwrap_err();
@@ -5337,7 +5333,7 @@ mod tests {
         let guard = storage_node.lock_bucket("bucket");
         let (tx, rx) = mpsc::channel();
         let handle = thread::spawn(move || {
-            let res = writer.put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", headers: &[], cond: NO_WRITE });
+            let res = writer.put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE });
             tx.send(res).unwrap();
         });
 
@@ -5402,7 +5398,7 @@ mod tests {
 
         let headers = [("Content-Type", "text/plain")];
         let result = coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "hello.txt", data: b"Hello, world!", headers: &headers, cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "hello.txt", data: b"Hello, world!", metadata: &MetadataBlob::from_headers(&headers).unwrap(), cond: NO_WRITE })
             .unwrap();
         assert!(!result.etag.is_empty());
 
@@ -5427,7 +5423,7 @@ mod tests {
             ("X-Amz-Meta-Version", "42"),
         ];
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "obj", data: b"{}", headers: &headers, cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "obj", data: b"{}", metadata: &MetadataBlob::from_headers(&headers).unwrap(), cond: NO_WRITE })
             .unwrap();
 
         let obj = coord.get_object("bucket", "obj", None, NO_READ).unwrap();
@@ -5444,7 +5440,7 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", headers: &[("Content-Type", "text/plain")], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", metadata: &MetadataBlob::from_headers(&[("Content-Type", "text/plain")]).unwrap(), cond: NO_WRITE })
             .unwrap();
 
         let head = coord.head_object("bucket", "key", None, NO_READ).unwrap();
@@ -5459,10 +5455,10 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"v1", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"v1", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"v2", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"v2", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
         let obj = coord.get_object("bucket", "key", None, NO_READ).unwrap();
@@ -5476,7 +5472,7 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "empty", data: b"", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "empty", data: b"", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
         let obj = coord.get_object("bucket", "empty", None, NO_READ).unwrap();
@@ -5491,7 +5487,7 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
         coord
             .delete_object("bucket", "key", None, NO_DELETE)
@@ -5522,13 +5518,13 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "a/1", data: b"1", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "a/1", data: b"1", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "a/2", data: b"2", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "a/2", data: b"2", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "b/1", data: b"3", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "b/1", data: b"3", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
         let result = coord
@@ -5548,13 +5544,13 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "photos/cat.jpg", data: b"cat", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "photos/cat.jpg", data: b"cat", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "photos/dog.jpg", data: b"dog", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "photos/dog.jpg", data: b"dog", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "docs/readme.md", data: b"md", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "docs/readme.md", data: b"md", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
         let result = coord
@@ -5570,16 +5566,16 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "photos/cat.jpg", data: b"cat", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "photos/cat.jpg", data: b"cat", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "photos/dog.jpg", data: b"dog", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "photos/dog.jpg", data: b"dog", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "docs/readme.md", data: b"md", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "docs/readme.md", data: b"md", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "root.txt", data: b"root", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "root.txt", data: b"root", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
         let result = coord
@@ -5598,7 +5594,7 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "folder/", data: b"data", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "folder/", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
         let obj = coord
@@ -5677,7 +5673,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
         let data = b"This data should survive shard loss!";
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "resilient", data, headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "resilient", data, metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
         // Delete one data shard using the helper
@@ -5698,7 +5694,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
         let data = b"EC single shard loss test data";
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "obj1", data, headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "obj1", data, metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
         delete_shard_on_disk(tmp.path(), "bucket", "obj1", 0, 4);
@@ -5716,7 +5712,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
         let data = b"EC m-shard loss limit test data";
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "obj2", data, headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "obj2", data, metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
         // Delete 2 data shards (indices 0 and 1)
@@ -5736,7 +5732,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
         let data = b"EC m+1 shard loss test data";
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "obj3", data, headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "obj3", data, metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
         // Delete 3 shards (indices 0, 1, 2)
@@ -5759,7 +5755,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
         let data = b"EC corruption recovery test data";
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "obj4", data, headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "obj4", data, metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
         corrupt_shard_on_disk(tmp.path(), "bucket", "obj4", 0, 4);
@@ -5776,7 +5772,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
         let data = b"Hello, World! Range test with EC recovery";
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "obj5", data, headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "obj5", data, metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
         // Delete shard 0 (covers the beginning of the data)
@@ -5804,7 +5800,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
         let data = b"EC parity shard drop test";
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "obj6", data, headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "obj6", data, metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
         // Delete first parity shard (index 4, since k=4)
@@ -5820,7 +5816,7 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         let err = coord
-            .put_object(&PutObjectRequest { bucket: "no-such-bucket", key: "key", data: b"data", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "no-such-bucket", key: "key", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
     }
@@ -5844,7 +5840,7 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         let result = coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
         let obj = coord.get_object("bucket", "key", None, NO_READ).unwrap();
@@ -5861,19 +5857,19 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "a/1", data: b"1", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "a/1", data: b"1", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "a/2", data: b"2", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "a/2", data: b"2", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "b/1", data: b"3", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "b/1", data: b"3", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "c/1", data: b"4", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "c/1", data: b"4", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "root.txt", data: b"5", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "root.txt", data: b"5", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
         // First page: max_keys=2 with delimiter
@@ -5909,7 +5905,7 @@ mod tests {
         for i in 0..10 {
             let key = format!("dir{}/file.txt", i);
             coord
-                .put_object(&PutObjectRequest { bucket: "bucket", key: &key, data: b"data", headers: &[], cond: NO_WRITE })
+                .put_object(&PutObjectRequest { bucket: "bucket", key: &key, data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
                 .unwrap();
         }
 
@@ -5928,7 +5924,7 @@ mod tests {
 
         // Don't create bucket — put should fail at bucket check before writing shards
         let err = coord
-            .put_object(&PutObjectRequest { bucket: "no-bucket", key: "key", data: b"data", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "no-bucket", key: "key", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
     }
@@ -5951,7 +5947,7 @@ mod tests {
         for i in 0..5 {
             let key = format!("key-{:02}", i);
             coord
-                .put_object(&PutObjectRequest { bucket: "bucket", key: &key, data: b"data", headers: &[], cond: NO_WRITE })
+                .put_object(&PutObjectRequest { bucket: "bucket", key: &key, data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
                 .unwrap();
         }
 
@@ -5973,7 +5969,7 @@ mod tests {
         for i in 0..5 {
             let key = format!("key-{:02}", i);
             coord
-                .put_object(&PutObjectRequest { bucket: "bucket", key: &key, data: b"data", headers: &[], cond: NO_WRITE })
+                .put_object(&PutObjectRequest { bucket: "bucket", key: &key, data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
                 .unwrap();
         }
 
@@ -6009,16 +6005,16 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "photos/2024/jan.jpg", data: b"j", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "photos/2024/jan.jpg", data: b"j", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "photos/2024/feb.jpg", data: b"f", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "photos/2024/feb.jpg", data: b"f", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "photos/2025/mar.jpg", data: b"m", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "photos/2025/mar.jpg", data: b"m", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "photos/top.jpg", data: b"t", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "photos/top.jpg", data: b"t", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
         // List with prefix "photos/" and delimiter "/"
@@ -6041,7 +6037,7 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "only-one", data: b"data", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "only-one", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
         let result = coord
@@ -6059,7 +6055,7 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key1", data: b"data", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "key1", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
         let result = coord
@@ -6078,7 +6074,7 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "a/1", data: b"data", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "a/1", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
         let result = coord
@@ -6107,10 +6103,10 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key1", data: b"data1", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "key1", data: b"data1", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key2", data: b"data2", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "key2", data: b"data2", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
         let entries = vec![
@@ -6168,13 +6164,13 @@ mod tests {
 
         coord.create_bucket("test-bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "test-bucket", key: "dir/file1.txt", data: b"hello", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "test-bucket", key: "dir/file1.txt", data: b"hello", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "test-bucket", key: "dir/file2.txt", data: b"world", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "test-bucket", key: "dir/file2.txt", data: b"world", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "test-bucket", key: "root.txt", data: b"root", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "test-bucket", key: "root.txt", data: b"root", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
         // Step 1: ListObjectVersions
@@ -6244,7 +6240,7 @@ mod tests {
         for i in 0..5 {
             let key = format!("key-{:02}", i);
             coord
-                .put_object(&PutObjectRequest { bucket: "bucket", key: &key, data: b"data", headers: &[], cond: NO_WRITE })
+                .put_object(&PutObjectRequest { bucket: "bucket", key: &key, data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
                 .unwrap();
         }
 
@@ -6422,7 +6418,7 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"Hello, World!", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"Hello, World!", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
         // bytes=0-4 → "Hello"
@@ -6448,7 +6444,7 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"Hello, World!", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"Hello, World!", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
         // bytes=-6 → "World!"  (last 6 bytes)
@@ -6473,7 +6469,7 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"Hello, World!", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"Hello, World!", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
         // bytes=7- → "World!"
@@ -6496,7 +6492,7 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"Hello", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"Hello", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
         // bytes=100- → unsatisfiable
@@ -6519,7 +6515,7 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"Hello", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"Hello", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
         // bytes=0-99999 on 5-byte object → clamp to 0-4
@@ -6550,7 +6546,7 @@ mod tests {
 
         let cond = WriteCondition::IfNoneMatchStar;
         let result = coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "new-key", data: b"data", headers: &[], cond: &cond })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "new-key", data: b"data", metadata: &MetadataBlob::new(), cond: &cond })
             .unwrap();
         assert!(!result.etag.is_empty());
     }
@@ -6561,12 +6557,12 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"v1", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"v1", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
         let cond = WriteCondition::IfNoneMatchStar;
         let err = coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"v2", headers: &[], cond: &cond })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"v2", metadata: &MetadataBlob::new(), cond: &cond })
             .unwrap_err();
         assert!(matches!(err, ServerError::PreconditionFailed));
     }
@@ -6578,11 +6574,11 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let r1 = coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"v1", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"v1", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
         let cond = WriteCondition::IfMatch(SpecificEtag::new(r1.etag.clone()).unwrap());
         let r2 = coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"v2", headers: &[], cond: &cond })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"v2", metadata: &MetadataBlob::new(), cond: &cond })
             .unwrap();
         assert_ne!(r1.etag, r2.etag);
 
@@ -6597,16 +6593,16 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let r1 = coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"v1", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"v1", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
         // Overwrite so etag changes
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"v2", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"v2", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
         let cond = WriteCondition::IfMatch(SpecificEtag::new(r1.etag).unwrap());
         let err = coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"v3", headers: &[], cond: &cond })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"v3", metadata: &MetadataBlob::new(), cond: &cond })
             .unwrap_err();
         assert!(matches!(err, ServerError::PreconditionFailed));
     }
@@ -6618,7 +6614,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let put = coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
         let cond = ReadCondition {
             if_match: Some(put.etag),
@@ -6634,7 +6630,7 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
         let cond = ReadCondition {
@@ -6652,7 +6648,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let put = coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
         let cond = ReadCondition {
             if_none_match: Some(put.etag),
@@ -6669,7 +6665,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let put = coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
         let cond = ReadCondition {
             if_none_match: Some(put.etag),
@@ -6686,7 +6682,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let put = coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
         let cond = DeleteCondition::IfMatch(put.etag);
         coord.delete_object("bucket", "key", None, &cond).unwrap();
@@ -6699,7 +6695,7 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
         let cond = DeleteCondition::IfMatch("\"0000000000000000\"".to_string());
@@ -6716,10 +6712,10 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let p1 = coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key1", data: b"data1", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "key1", data: b"data1", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key2", data: b"data2", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "key2", data: b"data2", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
         // Use key1's etag for both entries; key2 will fail the condition
@@ -6748,7 +6744,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let put = coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"Hello, World!", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"Hello, World!", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
         let cond = ReadCondition {
             if_match: Some(put.etag),
@@ -6776,7 +6772,7 @@ mod tests {
 
         let headers = [("Content-Type", "text/plain")];
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "src", data: b"hello copy", headers: &headers, cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "src", data: b"hello copy", metadata: &MetadataBlob::from_headers(&headers).unwrap(), cond: NO_WRITE })
             .unwrap();
 
         let result = coord
@@ -6810,7 +6806,7 @@ mod tests {
             ("X-Amz-Meta-Author", "alice"),
         ];
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "src", data: b"data", headers: &headers, cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "src", data: b"data", metadata: &MetadataBlob::from_headers(&headers).unwrap(), cond: NO_WRITE })
             .unwrap();
 
         coord
@@ -6844,7 +6840,7 @@ mod tests {
             ("X-Amz-Meta-Author", "alice"),
         ];
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "src", data: b"data", headers: &headers, cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "src", data: b"data", metadata: &MetadataBlob::from_headers(&headers).unwrap(), cond: NO_WRITE })
             .unwrap();
 
         let new_headers = [("Content-Type", "text/html"), ("X-Amz-Meta-Version", "2")];
@@ -6879,7 +6875,7 @@ mod tests {
 
         let headers = [("Content-Type", "text/plain")];
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", headers: &headers, cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", metadata: &MetadataBlob::from_headers(&headers).unwrap(), cond: NO_WRITE })
             .unwrap();
 
         let new_headers = [("Content-Type", "application/json")];
@@ -6912,7 +6908,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "src", data: b"hello", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "src", data: b"hello", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
         // Client sends a bogus checksum value header with REPLACE.
@@ -6952,7 +6948,7 @@ mod tests {
 
         let data = b"hello";
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "src", data, headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "src", data, metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
         let new_headers = [
@@ -6993,7 +6989,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "src", data: b"data", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "src", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
         let new_headers = [("x-amz-checksum-algorithm", "BOGUS")];
@@ -7046,7 +7042,7 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "src", data: b"data", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "src", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
         let err = coord
@@ -7072,7 +7068,7 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "src", data: b"data", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "src", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
         let src_cond = ReadCondition {
@@ -7103,10 +7099,10 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "src", data: b"data", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "src", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "dst", data: b"existing", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "dst", data: b"existing", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
         let dst_cond = WriteCondition::IfNoneMatchStar;
@@ -7134,10 +7130,10 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "src", data: b"new data", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "src", data: b"new data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
         let existing = coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "dst", data: b"old data", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "dst", data: b"old data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
         let dst_cond = WriteCondition::IfMatch(SpecificEtag::new(existing.etag).unwrap());
@@ -7170,7 +7166,7 @@ mod tests {
 
         let headers = [("Content-Type", "text/plain")];
         coord
-            .put_object(&PutObjectRequest { bucket: "src-bucket", key: "key", data: b"cross bucket data", headers: &headers, cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "src-bucket", key: "key", data: b"cross bucket data", metadata: &MetadataBlob::from_headers(&headers).unwrap(), cond: NO_WRITE })
             .unwrap();
 
         coord
@@ -7300,7 +7296,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let result = coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
         assert_eq!(result.version_id, storage::VersionId::Null);
     }
@@ -7312,7 +7308,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
         let obj = coord.get_object("bucket", "key", None, NO_READ).unwrap();
         assert_eq!(obj.version_id, storage::VersionId::Null);
@@ -7325,7 +7321,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
         let head = coord.head_object("bucket", "key", None, NO_READ).unwrap();
         assert_eq!(head.version_id, storage::VersionId::Null);
@@ -7367,11 +7363,11 @@ mod tests {
 
             let t1 = thread::spawn(move || {
                 b1.wait();
-                coord_a.put_object(&PutObjectRequest { bucket: "bucket", key: &key_a, data: b"v1", headers: &[], cond: NO_WRITE })
+                coord_a.put_object(&PutObjectRequest { bucket: "bucket", key: &key_a, data: b"v1", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             });
             let t2 = thread::spawn(move || {
                 b2.wait();
-                coord_b.put_object(&PutObjectRequest { bucket: "bucket", key: &key_b, data: b"v2", headers: &[], cond: NO_WRITE })
+                coord_b.put_object(&PutObjectRequest { bucket: "bucket", key: &key_b, data: b"v2", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             });
 
             barrier.wait();
@@ -7409,7 +7405,7 @@ mod tests {
 
         let object_size = 512 * 1024;
         admin
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: &vec![b'A'; object_size], headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: &vec![b'A'; object_size], metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
         let mut current = b'A';
@@ -7425,7 +7421,7 @@ mod tests {
 
             let t_write = thread::spawn(move || {
                 b1.wait();
-                writer.put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: &new_payload, headers: &[], cond: NO_WRITE })
+                writer.put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: &new_payload, metadata: &MetadataBlob::new(), cond: NO_WRITE })
             });
             let t_read = thread::spawn(move || {
                 b2.wait();
@@ -7475,7 +7471,7 @@ mod tests {
 
         let object_size = 256 * 1024;
         admin
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: &vec![b'A'; object_size], headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: &vec![b'A'; object_size], metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
         for i in 0..50 {
@@ -7490,7 +7486,7 @@ mod tests {
 
             let t_write = thread::spawn(move || {
                 b1.wait();
-                writer.put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: &payload, headers: &[], cond: NO_WRITE })
+                writer.put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: &payload, metadata: &MetadataBlob::new(), cond: NO_WRITE })
             });
             let t_delete = thread::spawn(move || {
                 b2.wait();
@@ -7533,7 +7529,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
         let result = coord
             .delete_object("bucket", "key", None, NO_DELETE)
@@ -9124,7 +9120,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"hello world", headers: &[("x-amz-meta-foo", "bar")], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"hello world", metadata: &MetadataBlob::from_headers(&[("x-amz-meta-foo", "bar")]).unwrap(), cond: NO_WRITE })
             .unwrap();
 
         // partNumber=1 on non-multipart object returns the full object.
@@ -9150,7 +9146,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"", headers: &[], cond: NO_WRITE })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
         let result = coord
@@ -9780,7 +9776,7 @@ mod tests {
 
         // Write an existing object via normal put.
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"old-data", headers: &[], cond: &WriteCondition::default() })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"old-data", metadata: &MetadataBlob::new(), cond: &WriteCondition::default() })
             .unwrap();
 
         // Stream-put a new version.
@@ -9818,7 +9814,7 @@ mod tests {
 
         // Write initial object.
         let initial = coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"initial", headers: &[], cond: &WriteCondition::default() })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"initial", metadata: &MetadataBlob::new(), cond: &WriteCondition::default() })
             .unwrap();
 
         // Stream put with if-match on the correct etag succeeds.
@@ -10229,7 +10225,7 @@ mod tests {
 
         // Overwrite with a normal PUT.
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"normal-data", headers: &[], cond: &WriteCondition::default() })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"normal-data", metadata: &MetadataBlob::new(), cond: &WriteCondition::default() })
             .unwrap();
 
         // GET should return the new data, not stale chunk data.
@@ -10926,7 +10922,7 @@ mod tests {
 
         // 3. Normal put.
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "cycle", data: b"v2-normal", headers: &[], cond: &WriteCondition::default() })
+            .put_object(&PutObjectRequest { bucket: "bucket", key: "cycle", data: b"v2-normal", metadata: &MetadataBlob::new(), cond: &WriteCondition::default() })
             .unwrap();
 
         // 4. GET should return normal-put data, no chunk manifest interference.

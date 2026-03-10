@@ -488,13 +488,14 @@ impl HttpFrontend {
                         .iter()
                         .map(|(k, v)| (k.as_str(), v.as_str()))
                         .collect();
+                    let metadata_blob = MetadataBlob::from_headers(&header_pairs)?;
                     let cond = write_condition_from_headers(req)?;
                     let result = self.coordinator.put_object(
                         &crate::coordinator::PutObjectRequest {
                             bucket: &bucket,
                             key: &key,
                             data: &req.body,
-                            headers: &header_pairs,
+                            metadata: &metadata_blob,
                             cond: &cond,
                         },
                     )?;
@@ -1634,6 +1635,7 @@ impl HttpFrontend {
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
+        let metadata_blob = MetadataBlob::from_headers(&hp_refs)?;
 
         // Call put_object (same as PUT)
         let cond = crate::conditional::WriteCondition::default();
@@ -1643,7 +1645,7 @@ impl HttpFrontend {
                 bucket,
                 key: &key,
                 data: &form.file_data,
-                headers: &hp_refs,
+                metadata: &metadata_blob,
                 cond: &cond,
             })?;
 
