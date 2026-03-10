@@ -40,10 +40,7 @@ pub struct ChecksumClaim {
 
 impl ChecksumClaim {
     /// Parse a base64-encoded checksum value, validating format and length.
-    pub fn from_base64(
-        algorithm: ChecksumAlgorithm,
-        b64: &str,
-    ) -> Result<Self, ServerError> {
+    pub fn from_base64(algorithm: ChecksumAlgorithm, b64: &str) -> Result<Self, ServerError> {
         use base64::Engine;
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(b64)
@@ -1945,10 +1942,7 @@ impl Coordinator {
     /// Supports conditional headers on both source and destination,
     /// and metadata directive (COPY preserves source metadata, REPLACE
     /// uses new headers).
-    pub fn copy_object(
-        &self,
-        req: &CopyObjectRequest,
-    ) -> Result<CopyObjectResult, ServerError> {
+    pub fn copy_object(&self, req: &CopyObjectRequest) -> Result<CopyObjectResult, ServerError> {
         let src_bucket = req.source.bucket;
         let src_key = req.source.key;
         let src_version_id = req.source.version_id;
@@ -3609,7 +3603,10 @@ impl Coordinator {
     }
 
     /// Delete an object.
-    pub fn delete_object(&self, req: &DeleteObjectRequest) -> Result<DeleteObjectResult, ServerError> {
+    pub fn delete_object(
+        &self,
+        req: &DeleteObjectRequest,
+    ) -> Result<DeleteObjectResult, ServerError> {
         let bucket = req.bucket;
         let key = req.key;
         let request_version_id = req.version_id;
@@ -4100,7 +4097,12 @@ impl Coordinator {
         let mut errors = Vec::new();
 
         for entry in entries {
-            match self.delete_object(&DeleteObjectRequest { bucket, key: entry.key, version_id: entry.version_id, cond }) {
+            match self.delete_object(&DeleteObjectRequest {
+                bucket,
+                key: entry.key,
+                version_id: entry.version_id,
+                cond,
+            }) {
                 Ok(result) => {
                     deleted.push(DeletedObject {
                         key: entry.key.to_string(),
@@ -5342,7 +5344,13 @@ mod tests {
         coord.create_bucket(bucket).unwrap();
 
         let resp = coord
-            .list_objects_v2(&ListObjectsV2Request { bucket, prefix: None, delimiter: None, continuation_token: None, max_keys: 1000 })
+            .list_objects_v2(&ListObjectsV2Request {
+                bucket,
+                prefix: None,
+                delimiter: None,
+                continuation_token: None,
+                max_keys: 1000,
+            })
             .unwrap();
         assert!(resp.objects.is_empty());
     }
@@ -5357,7 +5365,13 @@ mod tests {
         coord.create_bucket(bucket).unwrap();
 
         let resp = coord
-            .list_object_versions(&ListObjectVersionsRequest { bucket, prefix: None, key_marker: None, version_id_marker: None, max_keys: 1000 })
+            .list_object_versions(&ListObjectVersionsRequest {
+                bucket,
+                prefix: None,
+                key_marker: None,
+                version_id_marker: None,
+                max_keys: 1000,
+            })
             .unwrap();
         assert!(resp.versions.is_empty());
     }
@@ -5372,11 +5386,22 @@ mod tests {
         let key = "key-sparse";
         coord.create_bucket(bucket).unwrap();
         coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket, key, metadata: &MetadataBlob::new(), checksum: None })
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket,
+                key,
+                metadata: &MetadataBlob::new(),
+                checksum: None,
+            })
             .unwrap();
 
         let resp = coord
-            .list_multipart_uploads(&ListMultipartUploadsRequest { bucket, prefix: None, key_marker: None, upload_id_marker: None, max_uploads: 1000 })
+            .list_multipart_uploads(&ListMultipartUploadsRequest {
+                bucket,
+                prefix: None,
+                key_marker: None,
+                upload_id_marker: None,
+                max_uploads: 1000,
+            })
             .unwrap();
         assert_eq!(resp.uploads.len(), 1);
         assert_eq!(resp.uploads[0].key, key);
@@ -5389,7 +5414,13 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
         let err = coord.delete_bucket("bucket").unwrap_err();
@@ -5420,7 +5451,13 @@ mod tests {
         let guard = storage_node.lock_bucket("bucket");
         let (tx, rx) = mpsc::channel();
         let handle = thread::spawn(move || {
-            let res = writer.put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE });
+            let res = writer.put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            });
             tx.send(res).unwrap();
         });
 
@@ -5485,12 +5522,23 @@ mod tests {
 
         let headers = [("Content-Type", "text/plain")];
         let result = coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "hello.txt", data: b"Hello, world!", metadata: &MetadataBlob::from_headers(&headers).unwrap(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "hello.txt",
+                data: b"Hello, world!",
+                metadata: &MetadataBlob::from_headers(&headers).unwrap(),
+                cond: NO_WRITE,
+            })
             .unwrap();
         assert!(!result.etag.is_empty());
 
         let obj = coord
-            .get_object(&GetObjectRequest { bucket: "bucket", key: "hello.txt", version_id: None, cond: NO_READ })
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "hello.txt",
+                version_id: None,
+                cond: NO_READ,
+            })
             .unwrap();
         assert_eq!(obj.data, b"Hello, world!");
         assert_eq!(obj.size, 13);
@@ -5510,10 +5558,23 @@ mod tests {
             ("X-Amz-Meta-Version", "42"),
         ];
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "obj", data: b"{}", metadata: &MetadataBlob::from_headers(&headers).unwrap(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "obj",
+                data: b"{}",
+                metadata: &MetadataBlob::from_headers(&headers).unwrap(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
-        let obj = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "obj", version_id: None, cond: NO_READ }).unwrap();
+        let obj = coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "obj",
+                version_id: None,
+                cond: NO_READ,
+            })
+            .unwrap();
         assert_eq!(obj.data, b"{}");
         assert_eq!(obj.metadata.get("content-type"), Some("application/json"));
         assert_eq!(obj.metadata.get("x-amz-meta-author"), Some("alice"));
@@ -5527,10 +5588,23 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", metadata: &MetadataBlob::from_headers(&[("Content-Type", "text/plain")]).unwrap(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"data",
+                metadata: &MetadataBlob::from_headers(&[("Content-Type", "text/plain")]).unwrap(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
-        let head = coord.head_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_READ }).unwrap();
+        let head = coord
+            .head_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: NO_READ,
+            })
+            .unwrap();
         assert_eq!(head.size, 4);
         assert_eq!(head.metadata.get("content-type"), Some("text/plain"));
     }
@@ -5542,13 +5616,32 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"v1", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"v1",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"v2", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"v2",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
-        let obj = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_READ }).unwrap();
+        let obj = coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: NO_READ,
+            })
+            .unwrap();
         assert_eq!(obj.data, b"v2");
     }
 
@@ -5559,10 +5652,23 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "empty", data: b"", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "empty",
+                data: b"",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
-        let obj = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "empty", version_id: None, cond: NO_READ }).unwrap();
+        let obj = coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "empty",
+                version_id: None,
+                cond: NO_READ,
+            })
+            .unwrap();
         assert_eq!(obj.data, b"");
         assert_eq!(obj.size, 0);
     }
@@ -5574,14 +5680,30 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
         coord
-            .delete_object(&DeleteObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_DELETE })
+            .delete_object(&DeleteObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: NO_DELETE,
+            })
             .unwrap();
 
         let err = coord
-            .get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_READ })
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: NO_READ,
+            })
             .unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
     }
@@ -5594,7 +5716,12 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
         // Should not error
         coord
-            .delete_object(&DeleteObjectRequest { bucket: "bucket", key: "no-such-key", version_id: None, cond: NO_DELETE })
+            .delete_object(&DeleteObjectRequest {
+                bucket: "bucket",
+                key: "no-such-key",
+                version_id: None,
+                cond: NO_DELETE,
+            })
             .unwrap();
     }
 
@@ -5605,17 +5732,41 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "a/1", data: b"1", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "a/1",
+                data: b"1",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "a/2", data: b"2", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "a/2",
+                data: b"2",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "b/1", data: b"3", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "b/1",
+                data: b"3",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
         let result = coord
-            .list_objects_v2(&ListObjectsV2Request { bucket: "bucket", prefix: None, delimiter: None, continuation_token: None, max_keys: 1000 })
+            .list_objects_v2(&ListObjectsV2Request {
+                bucket: "bucket",
+                prefix: None,
+                delimiter: None,
+                continuation_token: None,
+                max_keys: 1000,
+            })
             .unwrap();
         assert_eq!(result.objects.len(), 3);
         // Should be sorted
@@ -5631,17 +5782,41 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "photos/cat.jpg", data: b"cat", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "photos/cat.jpg",
+                data: b"cat",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "photos/dog.jpg", data: b"dog", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "photos/dog.jpg",
+                data: b"dog",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "docs/readme.md", data: b"md", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "docs/readme.md",
+                data: b"md",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
         let result = coord
-            .list_objects_v2(&ListObjectsV2Request { bucket: "bucket", prefix: Some("photos/"), delimiter: None, continuation_token: None, max_keys: 1000 })
+            .list_objects_v2(&ListObjectsV2Request {
+                bucket: "bucket",
+                prefix: Some("photos/"),
+                delimiter: None,
+                continuation_token: None,
+                max_keys: 1000,
+            })
             .unwrap();
         assert_eq!(result.objects.len(), 2);
     }
@@ -5653,20 +5828,50 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "photos/cat.jpg", data: b"cat", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "photos/cat.jpg",
+                data: b"cat",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "photos/dog.jpg", data: b"dog", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "photos/dog.jpg",
+                data: b"dog",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "docs/readme.md", data: b"md", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "docs/readme.md",
+                data: b"md",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "root.txt", data: b"root", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "root.txt",
+                data: b"root",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
         let result = coord
-            .list_objects_v2(&ListObjectsV2Request { bucket: "bucket", prefix: None, delimiter: Some("/"), continuation_token: None, max_keys: 1000 })
+            .list_objects_v2(&ListObjectsV2Request {
+                bucket: "bucket",
+                prefix: None,
+                delimiter: Some("/"),
+                continuation_token: None,
+                max_keys: 1000,
+            })
             .unwrap();
         assert_eq!(result.objects.len(), 1);
         assert_eq!(result.objects[0].key, "root.txt");
@@ -5681,11 +5886,22 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "folder/", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "folder/",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
         let obj = coord
-            .get_object(&GetObjectRequest { bucket: "bucket", key: "folder/", version_id: None, cond: NO_READ })
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "folder/",
+                version_id: None,
+                cond: NO_READ,
+            })
             .unwrap();
         assert_eq!(obj.data, b"data");
         assert_eq!(obj.size, 4);
@@ -5760,7 +5976,13 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
         let data = b"This data should survive shard loss!";
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "resilient", data, metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "resilient",
+                data,
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
         // Delete one data shard using the helper
@@ -5768,7 +5990,12 @@ mod tests {
 
         // Get should still succeed via EC reconstruction
         let obj = coord
-            .get_object(&GetObjectRequest { bucket: "bucket", key: "resilient", version_id: None, cond: NO_READ })
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "resilient",
+                version_id: None,
+                cond: NO_READ,
+            })
             .unwrap();
         assert_eq!(obj.data, data);
     }
@@ -5781,12 +6008,25 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
         let data = b"EC single shard loss test data";
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "obj1", data, metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "obj1",
+                data,
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
         delete_shard_on_disk(tmp.path(), "bucket", "obj1", 0, 4);
 
-        let obj = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "obj1", version_id: None, cond: NO_READ }).unwrap();
+        let obj = coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "obj1",
+                version_id: None,
+                cond: NO_READ,
+            })
+            .unwrap();
         assert_eq!(obj.data, data);
     }
 
@@ -5799,14 +6039,27 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
         let data = b"EC m-shard loss limit test data";
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "obj2", data, metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "obj2",
+                data,
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
         // Delete 2 data shards (indices 0 and 1)
         delete_shard_on_disk(tmp.path(), "bucket", "obj2", 0, 4);
         delete_shard_on_disk(tmp.path(), "bucket", "obj2", 1, 4);
 
-        let obj = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "obj2", version_id: None, cond: NO_READ }).unwrap();
+        let obj = coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "obj2",
+                version_id: None,
+                cond: NO_READ,
+            })
+            .unwrap();
         assert_eq!(obj.data, data);
     }
 
@@ -5819,7 +6072,13 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
         let data = b"EC m+1 shard loss test data";
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "obj3", data, metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "obj3",
+                data,
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
         // Delete 3 shards (indices 0, 1, 2)
@@ -5828,7 +6087,12 @@ mod tests {
         delete_shard_on_disk(tmp.path(), "bucket", "obj3", 2, 4);
 
         let err = coord
-            .get_object(&GetObjectRequest { bucket: "bucket", key: "obj3", version_id: None, cond: NO_READ })
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "obj3",
+                version_id: None,
+                cond: NO_READ,
+            })
             .unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
     }
@@ -5842,12 +6106,25 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
         let data = b"EC corruption recovery test data";
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "obj4", data, metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "obj4",
+                data,
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
         corrupt_shard_on_disk(tmp.path(), "bucket", "obj4", 0, 4);
 
-        let obj = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "obj4", version_id: None, cond: NO_READ }).unwrap();
+        let obj = coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "obj4",
+                version_id: None,
+                cond: NO_READ,
+            })
+            .unwrap();
         assert_eq!(obj.data, data);
     }
 
@@ -5859,7 +6136,13 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
         let data = b"Hello, World! Range test with EC recovery";
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "obj5", data, metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "obj5",
+                data,
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
         // Delete shard 0 (covers the beginning of the data)
@@ -5867,7 +6150,13 @@ mod tests {
 
         // Range get should still succeed via EC reconstruction
         let result = coord
-            .get_object_range(&GetObjectRangeRequest { bucket: "bucket", key: "obj5", version_id: None, range: ByteRange::Range { start: 0, end: 4 }, cond: NO_READ })
+            .get_object_range(&GetObjectRangeRequest {
+                bucket: "bucket",
+                key: "obj5",
+                version_id: None,
+                range: ByteRange::Range { start: 0, end: 4 },
+                cond: NO_READ,
+            })
             .unwrap();
         assert_eq!(result.data, b"Hello");
     }
@@ -5881,13 +6170,26 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
         let data = b"EC parity shard drop test";
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "obj6", data, metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "obj6",
+                data,
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
         // Delete first parity shard (index 4, since k=4)
         delete_shard_on_disk(tmp.path(), "bucket", "obj6", 4, 4);
 
-        let obj = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "obj6", version_id: None, cond: NO_READ }).unwrap();
+        let obj = coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "obj6",
+                version_id: None,
+                cond: NO_READ,
+            })
+            .unwrap();
         assert_eq!(obj.data, data);
     }
 
@@ -5897,7 +6199,13 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         let err = coord
-            .put_object(&PutObjectRequest { bucket: "no-such-bucket", key: "key", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "no-such-bucket",
+                key: "key",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
     }
@@ -5909,7 +6217,12 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         let err = coord
-            .get_object(&GetObjectRequest { bucket: "bucket", key: "no-such-key", version_id: None, cond: NO_READ })
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "no-such-key",
+                version_id: None,
+                cond: NO_READ,
+            })
             .unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
     }
@@ -5921,13 +6234,33 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         let result = coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
-        let obj = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_READ }).unwrap();
+        let obj = coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: NO_READ,
+            })
+            .unwrap();
         assert_eq!(result.etag, obj.etag);
 
-        let head = coord.head_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_READ }).unwrap();
+        let head = coord
+            .head_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: NO_READ,
+            })
+            .unwrap();
         assert_eq!(result.etag, head.etag);
     }
 
@@ -5938,24 +6271,60 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "a/1", data: b"1", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "a/1",
+                data: b"1",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "a/2", data: b"2", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "a/2",
+                data: b"2",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "b/1", data: b"3", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "b/1",
+                data: b"3",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "c/1", data: b"4", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "c/1",
+                data: b"4",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "root.txt", data: b"5", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "root.txt",
+                data: b"5",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
         // First page: max_keys=2 with delimiter
         let result = coord
-            .list_objects_v2(&ListObjectsV2Request { bucket: "bucket", prefix: None, delimiter: Some("/"), continuation_token: None, max_keys: 2 })
+            .list_objects_v2(&ListObjectsV2Request {
+                bucket: "bucket",
+                prefix: None,
+                delimiter: Some("/"),
+                continuation_token: None,
+                max_keys: 2,
+            })
             .unwrap();
         assert_eq!(
             result.objects.len() + result.common_prefixes.len(),
@@ -5968,7 +6337,13 @@ mod tests {
         // Second page using continuation token
         let token = result.next_continuation_token.unwrap();
         let result2 = coord
-            .list_objects_v2(&ListObjectsV2Request { bucket: "bucket", prefix: None, delimiter: Some("/"), continuation_token: Some(&token), max_keys: 2 })
+            .list_objects_v2(&ListObjectsV2Request {
+                bucket: "bucket",
+                prefix: None,
+                delimiter: Some("/"),
+                continuation_token: Some(&token),
+                max_keys: 2,
+            })
             .unwrap();
         assert!(
             !result2.objects.is_empty() || !result2.common_prefixes.is_empty(),
@@ -5986,12 +6361,24 @@ mod tests {
         for i in 0..10 {
             let key = format!("dir{}/file.txt", i);
             coord
-                .put_object(&PutObjectRequest { bucket: "bucket", key: &key, data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+                .put_object(&PutObjectRequest {
+                    bucket: "bucket",
+                    key: &key,
+                    data: b"data",
+                    metadata: &MetadataBlob::new(),
+                    cond: NO_WRITE,
+                })
                 .unwrap();
         }
 
         let result = coord
-            .list_objects_v2(&ListObjectsV2Request { bucket: "bucket", prefix: None, delimiter: Some("/"), continuation_token: None, max_keys: 3 })
+            .list_objects_v2(&ListObjectsV2Request {
+                bucket: "bucket",
+                prefix: None,
+                delimiter: Some("/"),
+                continuation_token: None,
+                max_keys: 3,
+            })
             .unwrap();
         // With delimiter "/", all entries become common prefixes
         assert_eq!(result.common_prefixes.len(), 3);
@@ -6005,7 +6392,13 @@ mod tests {
 
         // Don't create bucket — put should fail at bucket check before writing shards
         let err = coord
-            .put_object(&PutObjectRequest { bucket: "no-bucket", key: "key", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "no-bucket",
+                key: "key",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
     }
@@ -6028,13 +6421,25 @@ mod tests {
         for i in 0..5 {
             let key = format!("key-{:02}", i);
             coord
-                .put_object(&PutObjectRequest { bucket: "bucket", key: &key, data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+                .put_object(&PutObjectRequest {
+                    bucket: "bucket",
+                    key: &key,
+                    data: b"data",
+                    metadata: &MetadataBlob::new(),
+                    cond: NO_WRITE,
+                })
                 .unwrap();
         }
 
         // Request fewer than available
         let result = coord
-            .list_objects_v2(&ListObjectsV2Request { bucket: "bucket", prefix: None, delimiter: None, continuation_token: None, max_keys: 3 })
+            .list_objects_v2(&ListObjectsV2Request {
+                bucket: "bucket",
+                prefix: None,
+                delimiter: None,
+                continuation_token: None,
+                max_keys: 3,
+            })
             .unwrap();
         assert_eq!(result.objects.len(), 3);
         assert!(result.is_truncated);
@@ -6050,13 +6455,25 @@ mod tests {
         for i in 0..5 {
             let key = format!("key-{:02}", i);
             coord
-                .put_object(&PutObjectRequest { bucket: "bucket", key: &key, data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+                .put_object(&PutObjectRequest {
+                    bucket: "bucket",
+                    key: &key,
+                    data: b"data",
+                    metadata: &MetadataBlob::new(),
+                    cond: NO_WRITE,
+                })
                 .unwrap();
         }
 
         // First page
         let page1 = coord
-            .list_objects_v2(&ListObjectsV2Request { bucket: "bucket", prefix: None, delimiter: None, continuation_token: None, max_keys: 2 })
+            .list_objects_v2(&ListObjectsV2Request {
+                bucket: "bucket",
+                prefix: None,
+                delimiter: None,
+                continuation_token: None,
+                max_keys: 2,
+            })
             .unwrap();
         assert_eq!(page1.objects.len(), 2);
         assert!(page1.is_truncated);
@@ -6064,7 +6481,13 @@ mod tests {
 
         // Second page using continuation token
         let page2 = coord
-            .list_objects_v2(&ListObjectsV2Request { bucket: "bucket", prefix: None, delimiter: None, continuation_token: Some(token), max_keys: 2 })
+            .list_objects_v2(&ListObjectsV2Request {
+                bucket: "bucket",
+                prefix: None,
+                delimiter: None,
+                continuation_token: Some(token),
+                max_keys: 2,
+            })
             .unwrap();
         assert_eq!(page2.objects.len(), 2);
         assert!(page2.is_truncated);
@@ -6072,7 +6495,13 @@ mod tests {
 
         // Third page — should get remainder
         let page3 = coord
-            .list_objects_v2(&ListObjectsV2Request { bucket: "bucket", prefix: None, delimiter: None, continuation_token: Some(token2), max_keys: 2 })
+            .list_objects_v2(&ListObjectsV2Request {
+                bucket: "bucket",
+                prefix: None,
+                delimiter: None,
+                continuation_token: Some(token2),
+                max_keys: 2,
+            })
             .unwrap();
         assert_eq!(page3.objects.len(), 1);
         assert!(!page3.is_truncated);
@@ -6086,21 +6515,51 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "photos/2024/jan.jpg", data: b"j", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "photos/2024/jan.jpg",
+                data: b"j",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "photos/2024/feb.jpg", data: b"f", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "photos/2024/feb.jpg",
+                data: b"f",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "photos/2025/mar.jpg", data: b"m", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "photos/2025/mar.jpg",
+                data: b"m",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "photos/top.jpg", data: b"t", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "photos/top.jpg",
+                data: b"t",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
         // List with prefix "photos/" and delimiter "/"
         let result = coord
-            .list_objects_v2(&ListObjectsV2Request { bucket: "bucket", prefix: Some("photos/"), delimiter: Some("/"), continuation_token: None, max_keys: 1000 })
+            .list_objects_v2(&ListObjectsV2Request {
+                bucket: "bucket",
+                prefix: Some("photos/"),
+                delimiter: Some("/"),
+                continuation_token: None,
+                max_keys: 1000,
+            })
             .unwrap();
         // top.jpg is a direct child, 2024/ and 2025/ are common prefixes
         assert_eq!(result.objects.len(), 1);
@@ -6118,11 +6577,23 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "only-one", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "only-one",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
         let result = coord
-            .list_objects_v2(&ListObjectsV2Request { bucket: "bucket", prefix: None, delimiter: None, continuation_token: None, max_keys: 1000 })
+            .list_objects_v2(&ListObjectsV2Request {
+                bucket: "bucket",
+                prefix: None,
+                delimiter: None,
+                continuation_token: None,
+                max_keys: 1000,
+            })
             .unwrap();
         assert_eq!(result.objects.len(), 1);
         assert!(!result.is_truncated);
@@ -6136,11 +6607,23 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key1", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key1",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
         let result = coord
-            .list_objects_v2(&ListObjectsV2Request { bucket: "bucket", prefix: None, delimiter: None, continuation_token: None, max_keys: 0 })
+            .list_objects_v2(&ListObjectsV2Request {
+                bucket: "bucket",
+                prefix: None,
+                delimiter: None,
+                continuation_token: None,
+                max_keys: 0,
+            })
             .unwrap();
         assert!(result.objects.is_empty());
         assert!(result.common_prefixes.is_empty());
@@ -6155,11 +6638,23 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "a/1", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "a/1",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
         let result = coord
-            .list_objects_v2(&ListObjectsV2Request { bucket: "bucket", prefix: None, delimiter: Some("/"), continuation_token: None, max_keys: 0 })
+            .list_objects_v2(&ListObjectsV2Request {
+                bucket: "bucket",
+                prefix: None,
+                delimiter: Some("/"),
+                continuation_token: None,
+                max_keys: 0,
+            })
             .unwrap();
         assert!(result.objects.is_empty());
         assert!(result.common_prefixes.is_empty());
@@ -6172,7 +6667,13 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         let err = coord
-            .list_objects_v2(&ListObjectsV2Request { bucket: "no-bucket", prefix: None, delimiter: None, continuation_token: None, max_keys: 1000 })
+            .list_objects_v2(&ListObjectsV2Request {
+                bucket: "no-bucket",
+                prefix: None,
+                delimiter: None,
+                continuation_token: None,
+                max_keys: 1000,
+            })
             .unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
     }
@@ -6184,10 +6685,22 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key1", data: b"data1", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key1",
+                data: b"data1",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key2", data: b"data2", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key2",
+                data: b"data2",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
         let entries = vec![
@@ -6206,13 +6719,33 @@ mod tests {
             },
         ];
 
-        let result = coord.delete_objects(&DeleteObjectsRequest { bucket: "bucket", entries: &entries, cond: NO_DELETE }).unwrap();
+        let result = coord
+            .delete_objects(&DeleteObjectsRequest {
+                bucket: "bucket",
+                entries: &entries,
+                cond: NO_DELETE,
+            })
+            .unwrap();
         assert_eq!(result.deleted.len(), 3);
         assert!(result.errors.is_empty());
 
         // Verify objects are actually gone
-        assert!(coord.get_object(&GetObjectRequest { bucket: "bucket", key: "key1", version_id: None, cond: NO_READ }).is_err());
-        assert!(coord.get_object(&GetObjectRequest { bucket: "bucket", key: "key2", version_id: None, cond: NO_READ }).is_err());
+        assert!(coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "key1",
+                version_id: None,
+                cond: NO_READ
+            })
+            .is_err());
+        assert!(coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "key2",
+                version_id: None,
+                cond: NO_READ
+            })
+            .is_err());
     }
 
     #[test]
@@ -6226,166 +6759,13 @@ mod tests {
         }];
 
         let err = coord
-            .delete_objects(&DeleteObjectsRequest { bucket: "no-bucket", entries: &entries, cond: NO_DELETE })
+            .delete_objects(&DeleteObjectsRequest {
+                bucket: "no-bucket",
+                entries: &entries,
+                cond: NO_DELETE,
+            })
             .unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
-    }
-
-    /// Simulate the exact Ceph test suite cleanup workflow:
-    /// 1. Create bucket + objects
-    /// 2. GET /?versions → list_objects_v2 (no delimiter) to discover all keys
-    /// 3. Build DeleteObjects XML from the version listing
-    /// 4. Parse that XML back (as the server would)
-    /// 5. POST /?delete → delete_objects with parsed entries
-    /// 6. Verify bucket is empty and can be deleted
-    #[test]
-    fn ceph_cleanup_workflow() {
-        let tmp = test_util::tempdir();
-        let coord = setup_coordinator(tmp.path());
-
-        coord.create_bucket("test-bucket").unwrap();
-        coord
-            .put_object(&PutObjectRequest { bucket: "test-bucket", key: "dir/file1.txt", data: b"hello", metadata: &MetadataBlob::new(), cond: NO_WRITE })
-            .unwrap();
-        coord
-            .put_object(&PutObjectRequest { bucket: "test-bucket", key: "dir/file2.txt", data: b"world", metadata: &MetadataBlob::new(), cond: NO_WRITE })
-            .unwrap();
-        coord
-            .put_object(&PutObjectRequest { bucket: "test-bucket", key: "root.txt", data: b"root", metadata: &MetadataBlob::new(), cond: NO_WRITE })
-            .unwrap();
-
-        // Step 1: ListObjectVersions
-        let versions_result = coord
-            .list_object_versions(&ListObjectVersionsRequest { bucket: "test-bucket", prefix: None, key_marker: None, version_id_marker: None, max_keys: 1000 })
-            .unwrap();
-        assert_eq!(versions_result.versions.len(), 3);
-
-        // Step 2: Build XML like Ceph cleanup would, using keys from listing
-        let versions_xml = crate::http::xml::list_object_versions_xml(
-            "test-bucket",
-            None,
-            None,
-            1000,
-            &versions_result,
-        );
-        // Verify the XML has all three objects with version_id="null"
-        assert!(versions_xml.contains("<Key>dir/file1.txt</Key>"));
-        assert!(versions_xml.contains("<Key>dir/file2.txt</Key>"));
-        assert!(versions_xml.contains("<Key>root.txt</Key>"));
-        for _ in 0..3 {
-            assert!(versions_xml.contains("<VersionId>null</VersionId>"));
-        }
-
-        // Also verify we can still list for the delete step below
-        let list_result = coord
-            .list_objects_v2(&ListObjectsV2Request { bucket: "test-bucket", prefix: None, delimiter: None, continuation_token: None, max_keys: 1000 })
-            .unwrap();
-        assert_eq!(list_result.objects.len(), 3);
-
-        // Step 3: Build a DeleteObjects XML body from the listed keys
-        // (this is what the Ceph client sends)
-        let mut delete_xml = String::from("<Delete>");
-        for obj in &list_result.objects {
-            delete_xml.push_str(&format!("<Object><Key>{}</Key></Object>", obj.key));
-        }
-        delete_xml.push_str("</Delete>");
-
-        // Step 4: Parse the delete XML (as our server would on receiving the POST)
-        let (xml_entries, quiet) =
-            crate::http::xml::parse_delete_objects_xml(delete_xml.as_bytes()).unwrap();
-        assert_eq!(xml_entries.len(), 3);
-        assert!(!quiet);
-        let entries: Vec<DeleteEntry> = xml_entries.iter().map(|e| DeleteEntry { key: &e.key, version_id: None }).collect();
-
-        // Step 5: Batch delete
-        let delete_result = coord
-            .delete_objects(&DeleteObjectsRequest { bucket: "test-bucket", entries: &entries, cond: NO_DELETE })
-            .unwrap();
-        assert_eq!(delete_result.deleted.len(), 3);
-        assert!(delete_result.errors.is_empty());
-
-        // Step 6: Bucket should now be empty and deletable
-        let list_after = coord
-            .list_objects_v2(&ListObjectsV2Request { bucket: "test-bucket", prefix: None, delimiter: None, continuation_token: None, max_keys: 1000 })
-            .unwrap();
-        assert!(list_after.objects.is_empty());
-        coord.delete_bucket("test-bucket").unwrap();
-    }
-
-    /// Same workflow but with paginated listing and quiet-mode delete.
-    #[test]
-    fn ceph_cleanup_workflow_paginated() {
-        let tmp = test_util::tempdir();
-        let coord = setup_coordinator(tmp.path());
-
-        coord.create_bucket("bucket").unwrap();
-        for i in 0..5 {
-            let key = format!("key-{:02}", i);
-            coord
-                .put_object(&PutObjectRequest { bucket: "bucket", key: &key, data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
-                .unwrap();
-        }
-
-        // Page 1: max_keys=2
-        let page1 = coord
-            .list_objects_v2(&ListObjectsV2Request { bucket: "bucket", prefix: None, delimiter: None, continuation_token: None, max_keys: 2 })
-            .unwrap();
-        assert_eq!(page1.objects.len(), 2);
-        assert!(page1.is_truncated);
-        let token = page1.next_continuation_token.clone().unwrap();
-
-        // Page 2
-        let page2 = coord
-            .list_objects_v2(&ListObjectsV2Request { bucket: "bucket", prefix: None, delimiter: None, continuation_token: Some(&token), max_keys: 2 })
-            .unwrap();
-        assert_eq!(page2.objects.len(), 2);
-        let token2 = page2.next_continuation_token.clone().unwrap();
-
-        // Page 3
-        let page3 = coord
-            .list_objects_v2(&ListObjectsV2Request { bucket: "bucket", prefix: None, delimiter: None, continuation_token: Some(&token2), max_keys: 2 })
-            .unwrap();
-        assert_eq!(page3.objects.len(), 1);
-        assert!(!page3.is_truncated);
-
-        // Collect all keys across pages
-        let all_keys: Vec<String> = page1
-            .objects
-            .iter()
-            .chain(page2.objects.iter())
-            .chain(page3.objects.iter())
-            .map(|o| o.key.clone())
-            .collect();
-        assert_eq!(all_keys.len(), 5);
-
-        // Build quiet-mode delete XML
-        let mut delete_xml = String::from("<Delete><Quiet>true</Quiet>");
-        for key in &all_keys {
-            delete_xml.push_str(&format!("<Object><Key>{}</Key></Object>", key));
-        }
-        delete_xml.push_str("</Delete>");
-
-        let (xml_entries, quiet) =
-            crate::http::xml::parse_delete_objects_xml(delete_xml.as_bytes()).unwrap();
-        assert_eq!(xml_entries.len(), 5);
-        assert!(quiet);
-        let entries: Vec<DeleteEntry> = xml_entries.iter().map(|e| DeleteEntry { key: &e.key, version_id: None }).collect();
-
-        let delete_result = coord.delete_objects(&DeleteObjectsRequest { bucket: "bucket", entries: &entries, cond: NO_DELETE }).unwrap();
-        assert_eq!(delete_result.deleted.len(), 5);
-        assert!(delete_result.errors.is_empty());
-
-        // Verify quiet-mode XML omits <Deleted> elements
-        let result_xml = crate::http::xml::delete_objects_result_xml(
-            &delete_result.deleted,
-            &delete_result.errors,
-            quiet,
-        );
-        assert!(!result_xml.contains("<Deleted>"));
-        assert!(result_xml.contains("DeleteResult"));
-
-        // Bucket is empty, can be deleted
-        coord.delete_bucket("bucket").unwrap();
     }
 
     #[test]
@@ -6406,7 +6786,12 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let create = coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &MetadataBlob::new(), checksum: None })
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                metadata: &MetadataBlob::new(),
+                checksum: None,
+            })
             .unwrap();
 
         // Build a part list with MAX_PARTS + 1 entries.
@@ -6419,7 +6804,13 @@ mod tests {
             .collect();
 
         let err = coord
-            .complete_multipart_upload(&CompleteMultipartUploadRequest { bucket: "bucket", key: "key", upload_id: &create.upload_id, parts: &parts, claimed_checksum: None })
+            .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &create.upload_id,
+                parts: &parts,
+                claimed_checksum: None,
+            })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidRequest { .. }));
     }
@@ -6501,12 +6892,24 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"Hello, World!", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"Hello, World!",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
         // bytes=0-4 → "Hello"
         let result = coord
-            .get_object_range(&GetObjectRangeRequest { bucket: "bucket", key: "key", version_id: None, range: ByteRange::Range { start: 0, end: 4 }, cond: NO_READ })
+            .get_object_range(&GetObjectRangeRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                range: ByteRange::Range { start: 0, end: 4 },
+                cond: NO_READ,
+            })
             .unwrap();
         assert_eq!(result.data, b"Hello");
         assert_eq!(result.range_start, 0);
@@ -6521,12 +6924,24 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"Hello, World!", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"Hello, World!",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
         // bytes=-6 → "World!"  (last 6 bytes)
         let result = coord
-            .get_object_range(&GetObjectRangeRequest { bucket: "bucket", key: "key", version_id: None, range: ByteRange::Suffix { length: 6 }, cond: NO_READ })
+            .get_object_range(&GetObjectRangeRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                range: ByteRange::Suffix { length: 6 },
+                cond: NO_READ,
+            })
             .unwrap();
         assert_eq!(result.data, b"World!");
         assert_eq!(result.range_start, 7);
@@ -6540,12 +6955,24 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"Hello, World!", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"Hello, World!",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
         // bytes=7- → "World!"
         let result = coord
-            .get_object_range(&GetObjectRangeRequest { bucket: "bucket", key: "key", version_id: None, range: ByteRange::FromStart { start: 7 }, cond: NO_READ })
+            .get_object_range(&GetObjectRangeRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                range: ByteRange::FromStart { start: 7 },
+                cond: NO_READ,
+            })
             .unwrap();
         assert_eq!(result.data, b"World!");
     }
@@ -6557,12 +6984,24 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"Hello", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"Hello",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
         // bytes=100- → unsatisfiable
         let err = coord
-            .get_object_range(&GetObjectRangeRequest { bucket: "bucket", key: "key", version_id: None, range: ByteRange::FromStart { start: 100 }, cond: NO_READ })
+            .get_object_range(&GetObjectRangeRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                range: ByteRange::FromStart { start: 100 },
+                cond: NO_READ,
+            })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidRange { total_size: 5 }));
     }
@@ -6574,15 +7013,27 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"Hello", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"Hello",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
         // bytes=0-99999 on 5-byte object → clamp to 0-4
         let result = coord
-            .get_object_range(&GetObjectRangeRequest { bucket: "bucket", key: "key", version_id: None, range: ByteRange::Range {
+            .get_object_range(&GetObjectRangeRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                range: ByteRange::Range {
                     start: 0,
                     end: 99999,
-                }, cond: NO_READ })
+                },
+                cond: NO_READ,
+            })
             .unwrap();
         assert_eq!(result.data, b"Hello");
         assert_eq!(result.range_start, 0);
@@ -6599,7 +7050,13 @@ mod tests {
 
         let cond = WriteCondition::IfNoneMatchStar;
         let result = coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "new-key", data: b"data", metadata: &MetadataBlob::new(), cond: &cond })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "new-key",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                cond: &cond,
+            })
             .unwrap();
         assert!(!result.etag.is_empty());
     }
@@ -6610,12 +7067,24 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"v1", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"v1",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
         let cond = WriteCondition::IfNoneMatchStar;
         let err = coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"v2", metadata: &MetadataBlob::new(), cond: &cond })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"v2",
+                metadata: &MetadataBlob::new(),
+                cond: &cond,
+            })
             .unwrap_err();
         assert!(matches!(err, ServerError::PreconditionFailed));
     }
@@ -6627,15 +7096,34 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let r1 = coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"v1", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"v1",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
         let cond = WriteCondition::IfMatch(SpecificEtag::new(r1.etag.clone()).unwrap());
         let r2 = coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"v2", metadata: &MetadataBlob::new(), cond: &cond })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"v2",
+                metadata: &MetadataBlob::new(),
+                cond: &cond,
+            })
             .unwrap();
         assert_ne!(r1.etag, r2.etag);
 
-        let obj = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_READ }).unwrap();
+        let obj = coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: NO_READ,
+            })
+            .unwrap();
         assert_eq!(obj.data, b"v2");
     }
 
@@ -6646,16 +7134,34 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let r1 = coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"v1", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"v1",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
         // Overwrite so etag changes
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"v2", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"v2",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
         let cond = WriteCondition::IfMatch(SpecificEtag::new(r1.etag).unwrap());
         let err = coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"v3", metadata: &MetadataBlob::new(), cond: &cond })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"v3",
+                metadata: &MetadataBlob::new(),
+                cond: &cond,
+            })
             .unwrap_err();
         assert!(matches!(err, ServerError::PreconditionFailed));
     }
@@ -6667,13 +7173,26 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let put = coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
         let cond = ReadCondition {
             if_match: Some(put.etag),
             ..Default::default()
         };
-        let obj = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: &cond }).unwrap();
+        let obj = coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: &cond,
+            })
+            .unwrap();
         assert_eq!(obj.data, b"data");
     }
 
@@ -6683,14 +7202,27 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
         let cond = ReadCondition {
             if_match: Some("\"0000000000000000\"".to_string()),
             ..Default::default()
         };
-        let err = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: &cond }).unwrap_err();
+        let err = coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: &cond,
+            })
+            .unwrap_err();
         assert!(matches!(err, ServerError::PreconditionFailed));
     }
 
@@ -6701,13 +7233,26 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let put = coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
         let cond = ReadCondition {
             if_none_match: Some(put.etag),
             ..Default::default()
         };
-        let err = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: &cond }).unwrap_err();
+        let err = coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: &cond,
+            })
+            .unwrap_err();
         assert!(matches!(err, ServerError::NotModified { .. }));
     }
 
@@ -6718,13 +7263,26 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let put = coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
         let cond = ReadCondition {
             if_none_match: Some(put.etag),
             ..Default::default()
         };
-        let err = coord.head_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: &cond }).unwrap_err();
+        let err = coord
+            .head_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: &cond,
+            })
+            .unwrap_err();
         assert!(matches!(err, ServerError::NotModified { .. }));
     }
 
@@ -6735,11 +7293,31 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let put = coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
         let cond = DeleteCondition::IfMatch(put.etag);
-        coord.delete_object(&DeleteObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: &cond }).unwrap();
-        assert!(coord.get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_READ }).is_err());
+        coord
+            .delete_object(&DeleteObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: &cond,
+            })
+            .unwrap();
+        assert!(coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: NO_READ
+            })
+            .is_err());
     }
 
     #[test]
@@ -6748,12 +7326,23 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
         let cond = DeleteCondition::IfMatch("\"0000000000000000\"".to_string());
         let err = coord
-            .delete_object(&DeleteObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: &cond })
+            .delete_object(&DeleteObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: &cond,
+            })
             .unwrap_err();
         assert!(matches!(err, ServerError::PreconditionFailed));
     }
@@ -6765,10 +7354,22 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let p1 = coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key1", data: b"data1", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key1",
+                data: b"data1",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key2", data: b"data2", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key2",
+                data: b"data2",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
         // Use key1's etag for both entries; key2 will fail the condition
@@ -6783,7 +7384,13 @@ mod tests {
                 version_id: None,
             },
         ];
-        let result = coord.delete_objects(&DeleteObjectsRequest { bucket: "bucket", entries: &entries, cond: &cond }).unwrap();
+        let result = coord
+            .delete_objects(&DeleteObjectsRequest {
+                bucket: "bucket",
+                entries: &entries,
+                cond: &cond,
+            })
+            .unwrap();
         assert_eq!(result.deleted.len(), 1);
         assert_eq!(result.deleted[0].key, "key1");
         assert_eq!(result.errors.len(), 1);
@@ -6797,14 +7404,26 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let put = coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"Hello, World!", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"Hello, World!",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
         let cond = ReadCondition {
             if_match: Some(put.etag),
             ..Default::default()
         };
         let result = coord
-            .get_object_range(&GetObjectRangeRequest { bucket: "bucket", key: "key", version_id: None, range: ByteRange::Range { start: 0, end: 4 }, cond: &cond })
+            .get_object_range(&GetObjectRangeRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                range: ByteRange::Range { start: 0, end: 4 },
+                cond: &cond,
+            })
             .unwrap();
         assert_eq!(result.data, b"Hello");
     }
@@ -6819,7 +7438,13 @@ mod tests {
 
         let headers = [("Content-Type", "text/plain")];
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "src", data: b"hello copy", metadata: &MetadataBlob::from_headers(&headers).unwrap(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "src",
+                data: b"hello copy",
+                metadata: &MetadataBlob::from_headers(&headers).unwrap(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
         let result = coord
@@ -6838,7 +7463,14 @@ mod tests {
             .unwrap();
         assert!(!result.etag.is_empty());
 
-        let obj = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "dst", version_id: None, cond: NO_READ }).unwrap();
+        let obj = coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "dst",
+                version_id: None,
+                cond: NO_READ,
+            })
+            .unwrap();
         assert_eq!(obj.data, b"hello copy");
     }
 
@@ -6853,7 +7485,13 @@ mod tests {
             ("X-Amz-Meta-Author", "alice"),
         ];
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "src", data: b"data", metadata: &MetadataBlob::from_headers(&headers).unwrap(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "src",
+                data: b"data",
+                metadata: &MetadataBlob::from_headers(&headers).unwrap(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
         coord
@@ -6871,7 +7509,14 @@ mod tests {
             })
             .unwrap();
 
-        let obj = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "dst", version_id: None, cond: NO_READ }).unwrap();
+        let obj = coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "dst",
+                version_id: None,
+                cond: NO_READ,
+            })
+            .unwrap();
         assert_eq!(obj.metadata.get("content-type"), Some("image/png"));
         assert_eq!(obj.metadata.get("x-amz-meta-author"), Some("alice"));
     }
@@ -6887,7 +7532,13 @@ mod tests {
             ("X-Amz-Meta-Author", "alice"),
         ];
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "src", data: b"data", metadata: &MetadataBlob::from_headers(&headers).unwrap(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "src",
+                data: b"data",
+                metadata: &MetadataBlob::from_headers(&headers).unwrap(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
         let new_headers = [("Content-Type", "text/html"), ("X-Amz-Meta-Version", "2")];
@@ -6903,11 +7554,21 @@ mod tests {
                 dst_bucket: "bucket",
                 dst_key: "dst",
                 dst_condition: NO_WRITE,
-                directive: MetadataDirective::Replace { metadata: &new_metadata, checksum_algorithm: None },
+                directive: MetadataDirective::Replace {
+                    metadata: &new_metadata,
+                    checksum_algorithm: None,
+                },
             })
             .unwrap();
 
-        let obj = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "dst", version_id: None, cond: NO_READ }).unwrap();
+        let obj = coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "dst",
+                version_id: None,
+                cond: NO_READ,
+            })
+            .unwrap();
         assert_eq!(obj.data, b"data");
         assert_eq!(obj.metadata.get("content-type"), Some("text/html"));
         assert_eq!(obj.metadata.get("x-amz-meta-version"), Some("2"));
@@ -6923,10 +7584,17 @@ mod tests {
 
         let headers = [("Content-Type", "text/plain")];
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", metadata: &MetadataBlob::from_headers(&headers).unwrap(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"data",
+                metadata: &MetadataBlob::from_headers(&headers).unwrap(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
-        let new_metadata = MetadataBlob::from_headers(&[("Content-Type", "application/json")]).unwrap();
+        let new_metadata =
+            MetadataBlob::from_headers(&[("Content-Type", "application/json")]).unwrap();
         coord
             .copy_object(&CopyObjectRequest {
                 source: CopySource {
@@ -6938,11 +7606,21 @@ mod tests {
                 dst_bucket: "bucket",
                 dst_key: "key",
                 dst_condition: NO_WRITE,
-                directive: MetadataDirective::Replace { metadata: &new_metadata, checksum_algorithm: None },
+                directive: MetadataDirective::Replace {
+                    metadata: &new_metadata,
+                    checksum_algorithm: None,
+                },
             })
             .unwrap();
 
-        let obj = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_READ }).unwrap();
+        let obj = coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: NO_READ,
+            })
+            .unwrap();
         assert_eq!(obj.data, b"data");
         assert_eq!(obj.metadata.get("content-type"), Some("application/json"));
     }
@@ -6956,7 +7634,13 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "src", data: b"hello", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "src",
+                data: b"hello",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
         // Metadata blob with only content-type (checksum value headers should
@@ -6973,11 +7657,21 @@ mod tests {
                 dst_bucket: "bucket",
                 dst_key: "dst",
                 dst_condition: NO_WRITE,
-                directive: MetadataDirective::Replace { metadata: &new_metadata, checksum_algorithm: None },
+                directive: MetadataDirective::Replace {
+                    metadata: &new_metadata,
+                    checksum_algorithm: None,
+                },
             })
             .unwrap();
 
-        let obj = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "dst", version_id: None, cond: NO_READ }).unwrap();
+        let obj = coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "dst",
+                version_id: None,
+                cond: NO_READ,
+            })
+            .unwrap();
         assert_eq!(obj.data, b"hello");
         // No checksum should be present since none was requested.
         assert_eq!(obj.metadata.get("x-amz-checksum-crc32c"), None);
@@ -6994,7 +7688,13 @@ mod tests {
 
         let data = b"hello";
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "src", data, metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "src",
+                data,
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
         let new_metadata = MetadataBlob::from_headers(&[("Content-Type", "text/plain")]).unwrap();
@@ -7016,7 +7716,14 @@ mod tests {
             })
             .unwrap();
 
-        let obj = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "dst", version_id: None, cond: NO_READ }).unwrap();
+        let obj = coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "dst",
+                version_id: None,
+                cond: NO_READ,
+            })
+            .unwrap();
         assert_eq!(obj.data, data);
         // Checksum should be the real CRC32C of "hello", not missing.
         let expected_crc = checksum::crc32c::checksum(data);
@@ -7035,7 +7742,10 @@ mod tests {
         assert!(ChecksumAlgorithm::parse("BOGUS").is_none());
         assert!(ChecksumAlgorithm::parse("").is_none());
         // Valid ones are accepted.
-        assert_eq!(ChecksumAlgorithm::parse("CRC32C"), Some(ChecksumAlgorithm::Crc32c));
+        assert_eq!(
+            ChecksumAlgorithm::parse("CRC32C"),
+            Some(ChecksumAlgorithm::Crc32c)
+        );
     }
 
     #[test]
@@ -7067,7 +7777,13 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "src", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "src",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
         let err = coord
@@ -7093,7 +7809,13 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "src", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "src",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
         let src_cond = ReadCondition {
@@ -7124,10 +7846,22 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "src", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "src",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "dst", data: b"existing", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "dst",
+                data: b"existing",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
         let dst_cond = WriteCondition::IfNoneMatchStar;
@@ -7155,10 +7889,22 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "src", data: b"new data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "src",
+                data: b"new data",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
         let existing = coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "dst", data: b"old data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "dst",
+                data: b"old data",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
         let dst_cond = WriteCondition::IfMatch(SpecificEtag::new(existing.etag).unwrap());
@@ -7178,7 +7924,14 @@ mod tests {
             .unwrap();
         assert!(!result.etag.is_empty());
 
-        let obj = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "dst", version_id: None, cond: NO_READ }).unwrap();
+        let obj = coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "dst",
+                version_id: None,
+                cond: NO_READ,
+            })
+            .unwrap();
         assert_eq!(obj.data, b"new data");
     }
 
@@ -7191,7 +7944,13 @@ mod tests {
 
         let headers = [("Content-Type", "text/plain")];
         coord
-            .put_object(&PutObjectRequest { bucket: "src-bucket", key: "key", data: b"cross bucket data", metadata: &MetadataBlob::from_headers(&headers).unwrap(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "src-bucket",
+                key: "key",
+                data: b"cross bucket data",
+                metadata: &MetadataBlob::from_headers(&headers).unwrap(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
         coord
@@ -7210,14 +7969,24 @@ mod tests {
             .unwrap();
 
         let obj = coord
-            .get_object(&GetObjectRequest { bucket: "dst-bucket", key: "key", version_id: None, cond: NO_READ })
+            .get_object(&GetObjectRequest {
+                bucket: "dst-bucket",
+                key: "key",
+                version_id: None,
+                cond: NO_READ,
+            })
             .unwrap();
         assert_eq!(obj.data, b"cross bucket data");
         assert_eq!(obj.metadata.get("content-type"), Some("text/plain"));
 
         // Source should still exist
         let src = coord
-            .get_object(&GetObjectRequest { bucket: "src-bucket", key: "key", version_id: None, cond: NO_READ })
+            .get_object(&GetObjectRequest {
+                bucket: "src-bucket",
+                key: "key",
+                version_id: None,
+                cond: NO_READ,
+            })
             .unwrap();
         assert_eq!(src.data, b"cross bucket data");
     }
@@ -7321,7 +8090,13 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let result = coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
         assert_eq!(result.version_id, storage::VersionId::Null);
     }
@@ -7333,9 +8108,22 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
-        let obj = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_READ }).unwrap();
+        let obj = coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: NO_READ,
+            })
+            .unwrap();
         assert_eq!(obj.version_id, storage::VersionId::Null);
     }
 
@@ -7346,9 +8134,22 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
-        let head = coord.head_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_READ }).unwrap();
+        let head = coord
+            .head_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: NO_READ,
+            })
+            .unwrap();
         assert_eq!(head.version_id, storage::VersionId::Null);
     }
 
@@ -7388,11 +8189,23 @@ mod tests {
 
             let t1 = thread::spawn(move || {
                 b1.wait();
-                coord_a.put_object(&PutObjectRequest { bucket: "bucket", key: &key_a, data: b"v1", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+                coord_a.put_object(&PutObjectRequest {
+                    bucket: "bucket",
+                    key: &key_a,
+                    data: b"v1",
+                    metadata: &MetadataBlob::new(),
+                    cond: NO_WRITE,
+                })
             });
             let t2 = thread::spawn(move || {
                 b2.wait();
-                coord_b.put_object(&PutObjectRequest { bucket: "bucket", key: &key_b, data: b"v2", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+                coord_b.put_object(&PutObjectRequest {
+                    bucket: "bucket",
+                    key: &key_b,
+                    data: b"v2",
+                    metadata: &MetadataBlob::new(),
+                    cond: NO_WRITE,
+                })
             });
 
             barrier.wait();
@@ -7430,7 +8243,13 @@ mod tests {
 
         let object_size = 512 * 1024;
         admin
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: &vec![b'A'; object_size], metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: &vec![b'A'; object_size],
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
         let mut current = b'A';
@@ -7446,11 +8265,22 @@ mod tests {
 
             let t_write = thread::spawn(move || {
                 b1.wait();
-                writer.put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: &new_payload, metadata: &MetadataBlob::new(), cond: NO_WRITE })
+                writer.put_object(&PutObjectRequest {
+                    bucket: "bucket",
+                    key: "key",
+                    data: &new_payload,
+                    metadata: &MetadataBlob::new(),
+                    cond: NO_WRITE,
+                })
             });
             let t_read = thread::spawn(move || {
                 b2.wait();
-                reader.get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_READ })
+                reader.get_object(&GetObjectRequest {
+                    bucket: "bucket",
+                    key: "key",
+                    version_id: None,
+                    cond: NO_READ,
+                })
             });
 
             barrier.wait();
@@ -7496,7 +8326,13 @@ mod tests {
 
         let object_size = 256 * 1024;
         admin
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: &vec![b'A'; object_size], metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: &vec![b'A'; object_size],
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
         for i in 0..50 {
@@ -7511,11 +8347,22 @@ mod tests {
 
             let t_write = thread::spawn(move || {
                 b1.wait();
-                writer.put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: &payload, metadata: &MetadataBlob::new(), cond: NO_WRITE })
+                writer.put_object(&PutObjectRequest {
+                    bucket: "bucket",
+                    key: "key",
+                    data: &payload,
+                    metadata: &MetadataBlob::new(),
+                    cond: NO_WRITE,
+                })
             });
             let t_delete = thread::spawn(move || {
                 b2.wait();
-                deleter.delete_object(&DeleteObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_DELETE })
+                deleter.delete_object(&DeleteObjectRequest {
+                    bucket: "bucket",
+                    key: "key",
+                    version_id: None,
+                    cond: NO_DELETE,
+                })
             });
 
             barrier.wait();
@@ -7532,7 +8379,12 @@ mod tests {
                 "concurrent delete failed: {delete_res:?}"
             );
 
-            let check = make_coord().get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_READ });
+            let check = make_coord().get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: NO_READ,
+            });
             match check {
                 Ok(obj) => {
                     assert_eq!(obj.data.len(), object_size);
@@ -7554,10 +8406,21 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
         let result = coord
-            .delete_object(&DeleteObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_DELETE })
+            .delete_object(&DeleteObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: NO_DELETE,
+            })
             .unwrap();
         assert_eq!(result.version_id, storage::VersionId::Null);
         assert!(!result.delete_marker);
@@ -7573,7 +8436,12 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let result = coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum: None })
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                metadata: &metadata,
+                checksum: None,
+            })
             .unwrap();
 
         // Upload ID should be 32 hex chars (16 random bytes).
@@ -7589,10 +8457,20 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let r1 = coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum: None })
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                metadata: &metadata,
+                checksum: None,
+            })
             .unwrap();
         let r2 = coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum: None })
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                metadata: &metadata,
+                checksum: None,
+            })
             .unwrap();
         assert_ne!(r1.upload_id, r2.upload_id);
     }
@@ -7604,7 +8482,12 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let err = coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "no-such-bucket", key: "key", metadata: &metadata, checksum: None })
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "no-such-bucket",
+                key: "key",
+                metadata: &metadata,
+                checksum: None,
+            })
             .unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
     }
@@ -7616,7 +8499,13 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let result = coord
-            .list_multipart_uploads(&ListMultipartUploadsRequest { bucket: "bucket", prefix: None, key_marker: None, upload_id_marker: None, max_uploads: 1000 })
+            .list_multipart_uploads(&ListMultipartUploadsRequest {
+                bucket: "bucket",
+                prefix: None,
+                key_marker: None,
+                upload_id_marker: None,
+                max_uploads: 1000,
+            })
             .unwrap();
         assert!(result.uploads.is_empty());
         assert!(!result.is_truncated);
@@ -7630,14 +8519,30 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let r1 = coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "alpha", metadata: &metadata, checksum: None })
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "alpha",
+                metadata: &metadata,
+                checksum: None,
+            })
             .unwrap();
         let r2 = coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "beta", metadata: &metadata, checksum: None })
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "beta",
+                metadata: &metadata,
+                checksum: None,
+            })
             .unwrap();
 
         let result = coord
-            .list_multipart_uploads(&ListMultipartUploadsRequest { bucket: "bucket", prefix: None, key_marker: None, upload_id_marker: None, max_uploads: 1000 })
+            .list_multipart_uploads(&ListMultipartUploadsRequest {
+                bucket: "bucket",
+                prefix: None,
+                key_marker: None,
+                upload_id_marker: None,
+                max_uploads: 1000,
+            })
             .unwrap();
         assert_eq!(result.uploads.len(), 2);
 
@@ -7658,14 +8563,30 @@ mod tests {
         let metadata = MetadataBlob::new();
         // Create two uploads for the same key.
         let r1 = coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum: None })
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                metadata: &metadata,
+                checksum: None,
+            })
             .unwrap();
         let r2 = coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum: None })
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                metadata: &metadata,
+                checksum: None,
+            })
             .unwrap();
 
         let result = coord
-            .list_multipart_uploads(&ListMultipartUploadsRequest { bucket: "bucket", prefix: None, key_marker: None, upload_id_marker: None, max_uploads: 1000 })
+            .list_multipart_uploads(&ListMultipartUploadsRequest {
+                bucket: "bucket",
+                prefix: None,
+                key_marker: None,
+                upload_id_marker: None,
+                max_uploads: 1000,
+            })
             .unwrap();
         assert_eq!(result.uploads.len(), 2);
 
@@ -7690,18 +8611,39 @@ mod tests {
         let metadata = MetadataBlob::new();
         // Create 3 uploads for distinct keys so ordering is deterministic.
         coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "a", metadata: &metadata, checksum: None })
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "a",
+                metadata: &metadata,
+                checksum: None,
+            })
             .unwrap();
         coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "b", metadata: &metadata, checksum: None })
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "b",
+                metadata: &metadata,
+                checksum: None,
+            })
             .unwrap();
         coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "c", metadata: &metadata, checksum: None })
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "c",
+                metadata: &metadata,
+                checksum: None,
+            })
             .unwrap();
 
         // Page 1: max_uploads=2.
         let page1 = coord
-            .list_multipart_uploads(&ListMultipartUploadsRequest { bucket: "bucket", prefix: None, key_marker: None, upload_id_marker: None, max_uploads: 2 })
+            .list_multipart_uploads(&ListMultipartUploadsRequest {
+                bucket: "bucket",
+                prefix: None,
+                key_marker: None,
+                upload_id_marker: None,
+                max_uploads: 2,
+            })
             .unwrap();
         assert_eq!(page1.uploads.len(), 2);
         assert!(page1.is_truncated);
@@ -7733,17 +8675,38 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "photos/a.jpg", metadata: &metadata, checksum: None })
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "photos/a.jpg",
+                metadata: &metadata,
+                checksum: None,
+            })
             .unwrap();
         coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "photos/b.jpg", metadata: &metadata, checksum: None })
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "photos/b.jpg",
+                metadata: &metadata,
+                checksum: None,
+            })
             .unwrap();
         coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "docs/readme.md", metadata: &metadata, checksum: None })
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "docs/readme.md",
+                metadata: &metadata,
+                checksum: None,
+            })
             .unwrap();
 
         let result = coord
-            .list_multipart_uploads(&ListMultipartUploadsRequest { bucket: "bucket", prefix: Some("photos/"), key_marker: None, upload_id_marker: None, max_uploads: 1000 })
+            .list_multipart_uploads(&ListMultipartUploadsRequest {
+                bucket: "bucket",
+                prefix: Some("photos/"),
+                key_marker: None,
+                upload_id_marker: None,
+                max_uploads: 1000,
+            })
             .unwrap();
         assert_eq!(result.uploads.len(), 2);
         assert!(result.uploads.iter().all(|u| u.key.starts_with("photos/")));
@@ -7757,11 +8720,22 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum: None })
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                metadata: &metadata,
+                checksum: None,
+            })
             .unwrap();
 
         let result = coord
-            .list_multipart_uploads(&ListMultipartUploadsRequest { bucket: "bucket", prefix: None, key_marker: None, upload_id_marker: None, max_uploads: 0 })
+            .list_multipart_uploads(&ListMultipartUploadsRequest {
+                bucket: "bucket",
+                prefix: None,
+                key_marker: None,
+                upload_id_marker: None,
+                max_uploads: 0,
+            })
             .unwrap();
         assert!(result.uploads.is_empty());
         assert!(!result.is_truncated);
@@ -7773,7 +8747,13 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         let err = coord
-            .list_multipart_uploads(&ListMultipartUploadsRequest { bucket: "no-such-bucket", prefix: None, key_marker: None, upload_id_marker: None, max_uploads: 1000 })
+            .list_multipart_uploads(&ListMultipartUploadsRequest {
+                bucket: "no-such-bucket",
+                prefix: None,
+                key_marker: None,
+                upload_id_marker: None,
+                max_uploads: 1000,
+            })
             .unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
     }
@@ -7791,7 +8771,12 @@ mod tests {
         .unwrap();
 
         let result = coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "photo.png", metadata: &metadata, checksum: None })
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "photo.png",
+                metadata: &metadata,
+                checksum: None,
+            })
             .unwrap();
 
         // Verify we can retrieve the upload and its metadata blob is stored.
@@ -7815,7 +8800,12 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum: None })
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                metadata: &metadata,
+                checksum: None,
+            })
             .unwrap();
 
         // Bucket has no objects but has an in-progress MPU — should fail.
@@ -7849,14 +8839,25 @@ mod tests {
         let mut upload_ids = Vec::new();
         for _ in 0..3 {
             let r = coord
-                .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum: None })
+                .create_multipart_upload(&CreateMultipartUploadRequest {
+                    bucket: "bucket",
+                    key: "key",
+                    metadata: &metadata,
+                    checksum: None,
+                })
                 .unwrap();
             upload_ids.push(r.upload_id);
         }
 
         // Page 1: max_uploads=2 — should get first 2 by initiation time.
         let page1 = coord
-            .list_multipart_uploads(&ListMultipartUploadsRequest { bucket: "bucket", prefix: None, key_marker: None, upload_id_marker: None, max_uploads: 2 })
+            .list_multipart_uploads(&ListMultipartUploadsRequest {
+                bucket: "bucket",
+                prefix: None,
+                key_marker: None,
+                upload_id_marker: None,
+                max_uploads: 2,
+            })
             .unwrap();
         assert_eq!(page1.uploads.len(), 2);
         assert!(page1.is_truncated);
@@ -7902,11 +8903,23 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let create = coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum: None })
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                metadata: &metadata,
+                checksum: None,
+            })
             .unwrap();
 
         let result = coord
-            .upload_part(&UploadPartRequest { bucket: "bucket", key: "key", upload_id: &create.upload_id, part_number: 1, data: b"hello world", claimed_checksum: None })
+            .upload_part(&UploadPartRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &create.upload_id,
+                part_number: 1,
+                data: b"hello world",
+                claimed_checksum: None,
+            })
             .unwrap();
 
         // ETag should be a quoted hex CRC64.
@@ -7930,17 +8943,36 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let create = coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum: None })
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                metadata: &metadata,
+                checksum: None,
+            })
             .unwrap();
 
         // First upload → generation 0.
         coord
-            .upload_part(&UploadPartRequest { bucket: "bucket", key: "key", upload_id: &create.upload_id, part_number: 1, data: b"first", claimed_checksum: None })
+            .upload_part(&UploadPartRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &create.upload_id,
+                part_number: 1,
+                data: b"first",
+                claimed_checksum: None,
+            })
             .unwrap();
 
         // Re-upload same part number → generation 1.
         let result = coord
-            .upload_part(&UploadPartRequest { bucket: "bucket", key: "key", upload_id: &create.upload_id, part_number: 1, data: b"second", claimed_checksum: None })
+            .upload_part(&UploadPartRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &create.upload_id,
+                part_number: 1,
+                data: b"second",
+                claimed_checksum: None,
+            })
             .unwrap();
 
         let meta_pg_id = coord.object_pg_id("bucket", "key");
@@ -7962,11 +8994,23 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let create = coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum: None })
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                metadata: &metadata,
+                checksum: None,
+            })
             .unwrap();
 
         let err = coord
-            .upload_part(&UploadPartRequest { bucket: "bucket", key: "key", upload_id: &create.upload_id, part_number: 0, data: b"data", claimed_checksum: None })
+            .upload_part(&UploadPartRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &create.upload_id,
+                part_number: 0,
+                data: b"data",
+                claimed_checksum: None,
+            })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidArgument { .. }));
     }
@@ -7979,11 +9023,23 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let create = coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum: None })
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                metadata: &metadata,
+                checksum: None,
+            })
             .unwrap();
 
         let err = coord
-            .upload_part(&UploadPartRequest { bucket: "bucket", key: "key", upload_id: &create.upload_id, part_number: 10_001, data: b"data", claimed_checksum: None })
+            .upload_part(&UploadPartRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &create.upload_id,
+                part_number: 10_001,
+                data: b"data",
+                claimed_checksum: None,
+            })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidArgument { .. }));
     }
@@ -7995,7 +9051,14 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let err = coord
-            .upload_part(&UploadPartRequest { bucket: "bucket", key: "key", upload_id: "bogus-upload-id", part_number: 1, data: b"data", claimed_checksum: None })
+            .upload_part(&UploadPartRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: "bogus-upload-id",
+                part_number: 1,
+                data: b"data",
+                claimed_checksum: None,
+            })
             .unwrap_err();
         assert!(matches!(err, ServerError::NoSuchUpload { .. }));
     }
@@ -8008,17 +9071,43 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let create = coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum: None })
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                metadata: &metadata,
+                checksum: None,
+            })
             .unwrap();
 
         coord
-            .upload_part(&UploadPartRequest { bucket: "bucket", key: "key", upload_id: &create.upload_id, part_number: 1, data: b"part-one", claimed_checksum: None })
+            .upload_part(&UploadPartRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &create.upload_id,
+                part_number: 1,
+                data: b"part-one",
+                claimed_checksum: None,
+            })
             .unwrap();
         coord
-            .upload_part(&UploadPartRequest { bucket: "bucket", key: "key", upload_id: &create.upload_id, part_number: 2, data: b"part-two", claimed_checksum: None })
+            .upload_part(&UploadPartRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &create.upload_id,
+                part_number: 2,
+                data: b"part-two",
+                claimed_checksum: None,
+            })
             .unwrap();
         coord
-            .upload_part(&UploadPartRequest { bucket: "bucket", key: "key", upload_id: &create.upload_id, part_number: 3, data: b"part-three", claimed_checksum: None })
+            .upload_part(&UploadPartRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &create.upload_id,
+                part_number: 3,
+                data: b"part-three",
+                claimed_checksum: None,
+            })
             .unwrap();
 
         // Verify all three parts exist.
@@ -8046,14 +9135,26 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let create = coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum: None })
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                metadata: &metadata,
+                checksum: None,
+            })
             .unwrap();
 
         // Upload same part 4 times — generation should increment each time.
         for i in 0..4u32 {
             let data = format!("version-{i}");
             coord
-                .upload_part(&UploadPartRequest { bucket: "bucket", key: "key", upload_id: &create.upload_id, part_number: 1, data: data.as_bytes(), claimed_checksum: None })
+                .upload_part(&UploadPartRequest {
+                    bucket: "bucket",
+                    key: "key",
+                    upload_id: &create.upload_id,
+                    part_number: 1,
+                    data: data.as_bytes(),
+                    claimed_checksum: None,
+                })
                 .unwrap();
         }
 
@@ -8072,16 +9173,35 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let create = coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum: None })
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                metadata: &metadata,
+                checksum: None,
+            })
             .unwrap();
 
         // Part 1 (min valid).
         coord
-            .upload_part(&UploadPartRequest { bucket: "bucket", key: "key", upload_id: &create.upload_id, part_number: 1, data: b"a", claimed_checksum: None })
+            .upload_part(&UploadPartRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &create.upload_id,
+                part_number: 1,
+                data: b"a",
+                claimed_checksum: None,
+            })
             .unwrap();
         // Part 10000 (max valid).
         coord
-            .upload_part(&UploadPartRequest { bucket: "bucket", key: "key", upload_id: &create.upload_id, part_number: 10_000, data: b"z", claimed_checksum: None })
+            .upload_part(&UploadPartRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &create.upload_id,
+                part_number: 10_000,
+                data: b"z",
+                claimed_checksum: None,
+            })
             .unwrap();
 
         let meta_pg_id = coord.object_pg_id("bucket", "key");
@@ -8098,19 +9218,38 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let create = coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum: None })
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                metadata: &metadata,
+                checksum: None,
+            })
             .unwrap();
 
         // Try uploading with wrong key — should be rejected even if upload_id is valid.
         let err = coord
-            .upload_part(&UploadPartRequest { bucket: "bucket", key: "wrong-key", upload_id: &create.upload_id, part_number: 1, data: b"data", claimed_checksum: None })
+            .upload_part(&UploadPartRequest {
+                bucket: "bucket",
+                key: "wrong-key",
+                upload_id: &create.upload_id,
+                part_number: 1,
+                data: b"data",
+                claimed_checksum: None,
+            })
             .unwrap_err();
         assert!(matches!(err, ServerError::NoSuchUpload { .. }));
 
         // Try uploading with wrong bucket.
         coord.create_bucket("other-bucket").unwrap();
         let err = coord
-            .upload_part(&UploadPartRequest { bucket: "other-bucket", key: "key", upload_id: &create.upload_id, part_number: 1, data: b"data", claimed_checksum: None })
+            .upload_part(&UploadPartRequest {
+                bucket: "other-bucket",
+                key: "key",
+                upload_id: &create.upload_id,
+                part_number: 1,
+                data: b"data",
+                claimed_checksum: None,
+            })
             .unwrap_err();
         assert!(matches!(err, ServerError::NoSuchUpload { .. }));
     }
@@ -8123,21 +9262,47 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let create = coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum: None })
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                metadata: &metadata,
+                checksum: None,
+            })
             .unwrap();
 
         // Simulate concurrent same-part uploads sequentially.
         // Each successive upload should overwrite, with generation incrementing.
         let etag1 = coord
-            .upload_part(&UploadPartRequest { bucket: "bucket", key: "key", upload_id: &create.upload_id, part_number: 1, data: b"writer-A", claimed_checksum: None })
+            .upload_part(&UploadPartRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &create.upload_id,
+                part_number: 1,
+                data: b"writer-A",
+                claimed_checksum: None,
+            })
             .unwrap()
             .etag;
         let etag2 = coord
-            .upload_part(&UploadPartRequest { bucket: "bucket", key: "key", upload_id: &create.upload_id, part_number: 1, data: b"writer-B", claimed_checksum: None })
+            .upload_part(&UploadPartRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &create.upload_id,
+                part_number: 1,
+                data: b"writer-B",
+                claimed_checksum: None,
+            })
             .unwrap()
             .etag;
         let etag3 = coord
-            .upload_part(&UploadPartRequest { bucket: "bucket", key: "key", upload_id: &create.upload_id, part_number: 1, data: b"writer-C", claimed_checksum: None })
+            .upload_part(&UploadPartRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &create.upload_id,
+                part_number: 1,
+                data: b"writer-C",
+                claimed_checksum: None,
+            })
             .unwrap()
             .etag;
 
@@ -8165,12 +9330,24 @@ mod tests {
     ) -> (String, Vec<CompletePart>) {
         let metadata = MetadataBlob::new();
         let create = coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket, key, metadata: &metadata, checksum: None })
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket,
+                key,
+                metadata: &metadata,
+                checksum: None,
+            })
             .unwrap();
         let mut complete_parts = Vec::new();
         for &(part_number, data) in part_data {
             let result = coord
-                .upload_part(&UploadPartRequest { bucket, key, upload_id: &create.upload_id, part_number, data, claimed_checksum: None })
+                .upload_part(&UploadPartRequest {
+                    bucket,
+                    key,
+                    upload_id: &create.upload_id,
+                    part_number,
+                    data,
+                    claimed_checksum: None,
+                })
                 .unwrap();
             complete_parts.push(CompletePart {
                 part_number,
@@ -8195,7 +9372,13 @@ mod tests {
             create_upload_with_parts(&coord, "bucket", "key", &[(1, &big_part), (2, small_last)]);
 
         let result = coord
-            .complete_multipart_upload(&CompleteMultipartUploadRequest { bucket: "bucket", key: "key", upload_id: &upload_id, parts: &parts, claimed_checksum: None })
+            .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload_id,
+                parts: &parts,
+                claimed_checksum: None,
+            })
             .unwrap();
 
         // ETag should be composite format: "hex-2"
@@ -8249,7 +9432,13 @@ mod tests {
         );
 
         let err = coord
-            .complete_multipart_upload(&CompleteMultipartUploadRequest { bucket: "bucket", key: "key", upload_id: &upload_id, parts: &parts, claimed_checksum: None })
+            .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload_id,
+                parts: &parts,
+                claimed_checksum: None,
+            })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidPart { part_number: 2 }));
     }
@@ -8267,7 +9456,13 @@ mod tests {
         parts[0].etag = "\"ffffffffffffffff\"".to_string();
 
         let err = coord
-            .complete_multipart_upload(&CompleteMultipartUploadRequest { bucket: "bucket", key: "key", upload_id: &upload_id, parts: &parts, claimed_checksum: None })
+            .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload_id,
+                parts: &parts,
+                claimed_checksum: None,
+            })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidPart { part_number: 1 }));
     }
@@ -8284,7 +9479,13 @@ mod tests {
         // Reverse the order.
         let reversed = vec![parts[1].clone(), parts[0].clone()];
         let err = coord
-            .complete_multipart_upload(&CompleteMultipartUploadRequest { bucket: "bucket", key: "key", upload_id: &upload_id, parts: &reversed, claimed_checksum: None })
+            .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload_id,
+                parts: &reversed,
+                claimed_checksum: None,
+            })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidPartOrder));
     }
@@ -8304,7 +9505,13 @@ mod tests {
         );
 
         let err = coord
-            .complete_multipart_upload(&CompleteMultipartUploadRequest { bucket: "bucket", key: "key", upload_id: &upload_id, parts: &parts, claimed_checksum: None })
+            .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload_id,
+                parts: &parts,
+                claimed_checksum: None,
+            })
             .unwrap_err();
         assert!(matches!(
             err,
@@ -8322,7 +9529,13 @@ mod tests {
         let (upload_id, parts) = create_upload_with_parts(&coord, "bucket", "key", &[(1, b"tiny")]);
 
         let result = coord
-            .complete_multipart_upload(&CompleteMultipartUploadRequest { bucket: "bucket", key: "key", upload_id: &upload_id, parts: &parts, claimed_checksum: None })
+            .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload_id,
+                parts: &parts,
+                claimed_checksum: None,
+            })
             .unwrap();
         assert!(result.etag.ends_with("-1\""));
     }
@@ -8335,11 +9548,22 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let create = coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum: None })
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                metadata: &metadata,
+                checksum: None,
+            })
             .unwrap();
 
         let err = coord
-            .complete_multipart_upload(&CompleteMultipartUploadRequest { bucket: "bucket", key: "key", upload_id: &create.upload_id, parts: &[], claimed_checksum: None })
+            .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &create.upload_id,
+                parts: &[],
+                claimed_checksum: None,
+            })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidRequest { .. }));
     }
@@ -8356,14 +9580,27 @@ mod tests {
 
         // First attempt fails because part 1 is too small.
         let err = coord
-            .complete_multipart_upload(&CompleteMultipartUploadRequest { bucket: "bucket", key: "key", upload_id: &upload_id, parts: &parts, claimed_checksum: None })
+            .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload_id,
+                parts: &parts,
+                claimed_checksum: None,
+            })
             .unwrap_err();
         assert!(matches!(err, ServerError::EntityTooSmall { .. }));
 
         // Upload remains usable — re-upload part 1 with large data and retry.
         let big_data = vec![0u8; 5 * 1024 * 1024];
         let new_part1 = coord
-            .upload_part(&UploadPartRequest { bucket: "bucket", key: "key", upload_id: &upload_id, part_number: 1, data: &big_data, claimed_checksum: None })
+            .upload_part(&UploadPartRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload_id,
+                part_number: 1,
+                data: &big_data,
+                claimed_checksum: None,
+            })
             .unwrap();
 
         let retry_parts = vec![
@@ -8375,7 +9612,13 @@ mod tests {
             parts[1].clone(),
         ];
         let result = coord
-            .complete_multipart_upload(&CompleteMultipartUploadRequest { bucket: "bucket", key: "key", upload_id: &upload_id, parts: &retry_parts, claimed_checksum: None })
+            .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload_id,
+                parts: &retry_parts,
+                claimed_checksum: None,
+            })
             .unwrap();
         assert!(result.etag.ends_with("-2\""));
     }
@@ -8392,7 +9635,13 @@ mod tests {
         // Duplicate part number 1.
         let duped = vec![parts[0].clone(), parts[0].clone()];
         let err = coord
-            .complete_multipart_upload(&CompleteMultipartUploadRequest { bucket: "bucket", key: "key", upload_id: &upload_id, parts: &duped, claimed_checksum: None })
+            .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload_id,
+                parts: &duped,
+                claimed_checksum: None,
+            })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidPartOrder));
     }
@@ -8407,7 +9656,13 @@ mod tests {
         let (upload_id1, parts1) =
             create_upload_with_parts(&coord, "bucket", "key", &[(1, b"first-upload")]);
         let result1 = coord
-            .complete_multipart_upload(&CompleteMultipartUploadRequest { bucket: "bucket", key: "key", upload_id: &upload_id1, parts: &parts1, claimed_checksum: None })
+            .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload_id1,
+                parts: &parts1,
+                claimed_checksum: None,
+            })
             .unwrap();
         assert!(result1.etag.ends_with("-1\""));
 
@@ -8420,7 +9675,13 @@ mod tests {
             &[(1, &big_part), (2, b"second-data-b")],
         );
         let result2 = coord
-            .complete_multipart_upload(&CompleteMultipartUploadRequest { bucket: "bucket", key: "key", upload_id: &upload_id2, parts: &parts2, claimed_checksum: None })
+            .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload_id2,
+                parts: &parts2,
+                claimed_checksum: None,
+            })
             .unwrap();
         assert!(result2.etag.ends_with("-2\""));
         assert_ne!(result1.etag, result2.etag);
@@ -8448,12 +9709,24 @@ mod tests {
         let (upload_id, parts) =
             create_upload_with_parts(&coord, "bucket", "key", &[(1, b"data1")]);
         let result = coord
-            .complete_multipart_upload(&CompleteMultipartUploadRequest { bucket: "bucket", key: "key", upload_id: &upload_id, parts: &parts, claimed_checksum: None })
+            .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload_id,
+                parts: &parts,
+                claimed_checksum: None,
+            })
             .unwrap();
 
         // list_objects_v2 should return the composite ETag with -N suffix.
         let list = coord
-            .list_objects_v2(&ListObjectsV2Request { bucket: "bucket", prefix: None, delimiter: None, continuation_token: None, max_keys: 100 })
+            .list_objects_v2(&ListObjectsV2Request {
+                bucket: "bucket",
+                prefix: None,
+                delimiter: None,
+                continuation_token: None,
+                max_keys: 100,
+            })
             .unwrap();
         assert_eq!(list.objects.len(), 1);
         assert_eq!(list.objects[0].etag, result.etag);
@@ -8476,11 +9749,23 @@ mod tests {
         let (upload_id, parts) =
             create_upload_with_parts(&coord, "bucket", "key", &[(1, b"data1")]);
         let result = coord
-            .complete_multipart_upload(&CompleteMultipartUploadRequest { bucket: "bucket", key: "key", upload_id: &upload_id, parts: &parts, claimed_checksum: None })
+            .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload_id,
+                parts: &parts,
+                claimed_checksum: None,
+            })
             .unwrap();
 
         let versions = coord
-            .list_object_versions(&ListObjectVersionsRequest { bucket: "bucket", prefix: None, key_marker: None, version_id_marker: None, max_keys: 100 })
+            .list_object_versions(&ListObjectVersionsRequest {
+                bucket: "bucket",
+                prefix: None,
+                key_marker: None,
+                version_id_marker: None,
+                max_keys: 100,
+            })
             .unwrap();
         assert_eq!(versions.versions.len(), 1);
         assert_eq!(versions.versions[0].etag, result.etag);
@@ -8503,12 +9788,23 @@ mod tests {
             create_upload_with_parts(&coord, "bucket", "key", &[(1, b"part1"), (2, b"part2")]);
 
         coord
-            .abort_multipart_upload(&AbortMultipartUploadRequest { bucket: "bucket", key: "key", upload_id: &upload_id })
+            .abort_multipart_upload(&AbortMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload_id,
+            })
             .unwrap();
 
         // Upload should no longer exist.
         let err = coord
-            .upload_part(&UploadPartRequest { bucket: "bucket", key: "key", upload_id: &upload_id, part_number: 1, data: b"nope", claimed_checksum: None })
+            .upload_part(&UploadPartRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload_id,
+                part_number: 1,
+                data: b"nope",
+                claimed_checksum: None,
+            })
             .unwrap_err();
         assert!(
             matches!(err, ServerError::NoSuchUpload { .. }),
@@ -8517,7 +9813,13 @@ mod tests {
 
         // ListMultipartUploads should be empty.
         let uploads = coord
-            .list_multipart_uploads(&ListMultipartUploadsRequest { bucket: "bucket", prefix: None, key_marker: None, upload_id_marker: None, max_uploads: 100 })
+            .list_multipart_uploads(&ListMultipartUploadsRequest {
+                bucket: "bucket",
+                prefix: None,
+                key_marker: None,
+                upload_id_marker: None,
+                max_uploads: 100,
+            })
             .unwrap();
         assert!(uploads.uploads.is_empty());
     }
@@ -8529,7 +9831,11 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let err = coord
-            .abort_multipart_upload(&AbortMultipartUploadRequest { bucket: "bucket", key: "key", upload_id: "no-such-upload" })
+            .abort_multipart_upload(&AbortMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: "no-such-upload",
+            })
             .unwrap_err();
         assert!(
             matches!(err, ServerError::NoSuchUpload { .. }),
@@ -8545,17 +9851,30 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let create = coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum: None })
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                metadata: &metadata,
+                checksum: None,
+            })
             .unwrap();
 
         // First abort succeeds.
         coord
-            .abort_multipart_upload(&AbortMultipartUploadRequest { bucket: "bucket", key: "key", upload_id: &create.upload_id })
+            .abort_multipart_upload(&AbortMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &create.upload_id,
+            })
             .unwrap();
 
         // Second abort: upload is already deleted, returns UploadNotFound.
         let err = coord
-            .abort_multipart_upload(&AbortMultipartUploadRequest { bucket: "bucket", key: "key", upload_id: &create.upload_id })
+            .abort_multipart_upload(&AbortMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &create.upload_id,
+            })
             .unwrap_err();
         assert!(
             matches!(err, ServerError::NoSuchUpload { .. }),
@@ -8572,11 +9891,20 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let create = coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum: None })
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                metadata: &metadata,
+                checksum: None,
+            })
             .unwrap();
 
         let err = coord
-            .abort_multipart_upload(&AbortMultipartUploadRequest { bucket: "other", key: "key", upload_id: &create.upload_id })
+            .abort_multipart_upload(&AbortMultipartUploadRequest {
+                bucket: "other",
+                key: "key",
+                upload_id: &create.upload_id,
+            })
             .unwrap_err();
         assert!(
             matches!(err, ServerError::NoSuchUpload { .. }),
@@ -8594,12 +9922,22 @@ mod tests {
         let (upload_id, parts) =
             create_upload_with_parts(&coord, "bucket", "key", &[(1, b"data1")]);
         coord
-            .complete_multipart_upload(&CompleteMultipartUploadRequest { bucket: "bucket", key: "key", upload_id: &upload_id, parts: &parts, claimed_checksum: None })
+            .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload_id,
+                parts: &parts,
+                claimed_checksum: None,
+            })
             .unwrap();
 
         // Abort the same upload_id should fail (already deleted by complete).
         let err = coord
-            .abort_multipart_upload(&AbortMultipartUploadRequest { bucket: "bucket", key: "key", upload_id: &upload_id })
+            .abort_multipart_upload(&AbortMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload_id,
+            })
             .unwrap_err();
         assert!(
             matches!(err, ServerError::NoSuchUpload { .. }),
@@ -8608,7 +9946,13 @@ mod tests {
 
         // Object should still exist (visible in listing).
         let list = coord
-            .list_objects_v2(&ListObjectsV2Request { bucket: "bucket", prefix: None, delimiter: None, continuation_token: None, max_keys: 100 })
+            .list_objects_v2(&ListObjectsV2Request {
+                bucket: "bucket",
+                prefix: None,
+                delimiter: None,
+                continuation_token: None,
+                max_keys: 100,
+            })
             .unwrap();
         assert_eq!(list.objects.len(), 1);
         assert_eq!(list.objects[0].key, "key");
@@ -8622,18 +9966,41 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let create = coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum: None })
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                metadata: &metadata,
+                checksum: None,
+            })
             .unwrap();
         coord
-            .upload_part(&UploadPartRequest { bucket: "bucket", key: "key", upload_id: &create.upload_id, part_number: 1, data: b"data", claimed_checksum: None })
+            .upload_part(&UploadPartRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &create.upload_id,
+                part_number: 1,
+                data: b"data",
+                claimed_checksum: None,
+            })
             .unwrap();
 
         coord
-            .abort_multipart_upload(&AbortMultipartUploadRequest { bucket: "bucket", key: "key", upload_id: &create.upload_id })
+            .abort_multipart_upload(&AbortMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &create.upload_id,
+            })
             .unwrap();
 
         let err = coord
-            .upload_part(&UploadPartRequest { bucket: "bucket", key: "key", upload_id: &create.upload_id, part_number: 2, data: b"more", claimed_checksum: None })
+            .upload_part(&UploadPartRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &create.upload_id,
+                part_number: 2,
+                data: b"more",
+                claimed_checksum: None,
+            })
             .unwrap_err();
         assert!(
             matches!(err, ServerError::NoSuchUpload { .. }),
@@ -8657,7 +10024,13 @@ mod tests {
         );
 
         let result = coord
-            .list_parts(&ListPartsRequest { bucket: "bucket", key: "key", upload_id: &upload_id, part_number_marker: None, max_parts: 100 })
+            .list_parts(&ListPartsRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload_id,
+                part_number_marker: None,
+                max_parts: 100,
+            })
             .unwrap();
         assert_eq!(result.parts.len(), 3);
         assert_eq!(result.parts[0].part_number, 1);
@@ -8683,7 +10056,13 @@ mod tests {
 
         // Page 1: max_parts=2
         let page1 = coord
-            .list_parts(&ListPartsRequest { bucket: "bucket", key: "key", upload_id: &upload_id, part_number_marker: None, max_parts: 2 })
+            .list_parts(&ListPartsRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload_id,
+                part_number_marker: None,
+                max_parts: 2,
+            })
             .unwrap();
         assert_eq!(page1.parts.len(), 2);
         assert_eq!(page1.parts[0].part_number, 1);
@@ -8717,7 +10096,13 @@ mod tests {
             create_upload_with_parts(&coord, "bucket", "key", &[(1, b"hello")]);
 
         let result = coord
-            .list_parts(&ListPartsRequest { bucket: "bucket", key: "key", upload_id: &upload_id, part_number_marker: None, max_parts: 100 })
+            .list_parts(&ListPartsRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload_id,
+                part_number_marker: None,
+                max_parts: 100,
+            })
             .unwrap();
         assert_eq!(result.parts.len(), 1);
         // ListParts ETag should match the ETag returned by UploadPart.
@@ -8733,11 +10118,22 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let create = coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum: None })
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                metadata: &metadata,
+                checksum: None,
+            })
             .unwrap();
 
         let err = coord
-            .list_parts(&ListPartsRequest { bucket: "other", key: "key", upload_id: &create.upload_id, part_number_marker: None, max_parts: 100 })
+            .list_parts(&ListPartsRequest {
+                bucket: "other",
+                key: "key",
+                upload_id: &create.upload_id,
+                part_number_marker: None,
+                max_parts: 100,
+            })
             .unwrap_err();
         assert!(
             matches!(err, ServerError::NoSuchUpload { .. }),
@@ -8752,7 +10148,13 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let err = coord
-            .list_parts(&ListPartsRequest { bucket: "bucket", key: "key", upload_id: "no-such-upload", part_number_marker: None, max_parts: 100 })
+            .list_parts(&ListPartsRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: "no-such-upload",
+                part_number_marker: None,
+                max_parts: 100,
+            })
             .unwrap_err();
         assert!(
             matches!(err, ServerError::NoSuchUpload { .. }),
@@ -8768,19 +10170,44 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let create = coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum: None })
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                metadata: &metadata,
+                checksum: None,
+            })
             .unwrap();
 
         // Upload part 1, then overwrite it.
         coord
-            .upload_part(&UploadPartRequest { bucket: "bucket", key: "key", upload_id: &create.upload_id, part_number: 1, data: b"original", claimed_checksum: None })
+            .upload_part(&UploadPartRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &create.upload_id,
+                part_number: 1,
+                data: b"original",
+                claimed_checksum: None,
+            })
             .unwrap();
         let reupload = coord
-            .upload_part(&UploadPartRequest { bucket: "bucket", key: "key", upload_id: &create.upload_id, part_number: 1, data: b"replaced", claimed_checksum: None })
+            .upload_part(&UploadPartRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &create.upload_id,
+                part_number: 1,
+                data: b"replaced",
+                claimed_checksum: None,
+            })
             .unwrap();
 
         let result = coord
-            .list_parts(&ListPartsRequest { bucket: "bucket", key: "key", upload_id: &create.upload_id, part_number_marker: None, max_parts: 100 })
+            .list_parts(&ListPartsRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &create.upload_id,
+                part_number_marker: None,
+                max_parts: 100,
+            })
             .unwrap();
         assert_eq!(result.parts.len(), 1);
         assert_eq!(result.parts[0].etag, reupload.etag);
@@ -8795,10 +10222,22 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let create = coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum: None })
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                metadata: &metadata,
+                checksum: None,
+            })
             .unwrap();
         coord
-            .upload_part(&UploadPartRequest { bucket: "bucket", key: "key", upload_id: &create.upload_id, part_number: 1, data: b"data", claimed_checksum: None })
+            .upload_part(&UploadPartRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &create.upload_id,
+                part_number: 1,
+                data: b"data",
+                claimed_checksum: None,
+            })
             .unwrap();
 
         // Manually transition to Aborting (simulates the window during abort).
@@ -8809,7 +10248,13 @@ mod tests {
         drop(pg);
 
         let err = coord
-            .list_parts(&ListPartsRequest { bucket: "bucket", key: "key", upload_id: &create.upload_id, part_number_marker: None, max_parts: 100 })
+            .list_parts(&ListPartsRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &create.upload_id,
+                part_number_marker: None,
+                max_parts: 100,
+            })
             .unwrap_err();
         assert!(
             matches!(err, ServerError::NoSuchUpload { .. }),
@@ -8825,7 +10270,12 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let create = coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum: None })
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                metadata: &metadata,
+                checksum: None,
+            })
             .unwrap();
 
         // Manually transition to Completing (simulates concurrent complete).
@@ -8836,7 +10286,11 @@ mod tests {
         drop(pg);
 
         let err = coord
-            .abort_multipart_upload(&AbortMultipartUploadRequest { bucket: "bucket", key: "key", upload_id: &create.upload_id })
+            .abort_multipart_upload(&AbortMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &create.upload_id,
+            })
             .unwrap_err();
         assert!(
             matches!(err, ServerError::NoSuchUpload { .. }),
@@ -8863,12 +10317,24 @@ mod tests {
     ) -> CompleteMultipartUploadResult {
         let metadata = MetadataBlob::new();
         let create = coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket, key, metadata: &metadata, checksum: None })
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket,
+                key,
+                metadata: &metadata,
+                checksum: None,
+            })
             .unwrap();
         let mut complete_parts = Vec::new();
         for (part_number, data) in part_data {
             let result = coord
-                .upload_part(&UploadPartRequest { bucket, key, upload_id: &create.upload_id, part_number: *part_number, data, claimed_checksum: None })
+                .upload_part(&UploadPartRequest {
+                    bucket,
+                    key,
+                    upload_id: &create.upload_id,
+                    part_number: *part_number,
+                    data,
+                    claimed_checksum: None,
+                })
                 .unwrap();
             complete_parts.push(CompletePart {
                 part_number: *part_number,
@@ -8877,7 +10343,13 @@ mod tests {
             });
         }
         coord
-            .complete_multipart_upload(&CompleteMultipartUploadRequest { bucket, key, upload_id: &create.upload_id, parts: &complete_parts, claimed_checksum: None })
+            .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                bucket,
+                key,
+                upload_id: &create.upload_id,
+                parts: &complete_parts,
+                claimed_checksum: None,
+            })
             .unwrap()
     }
 
@@ -8895,7 +10367,12 @@ mod tests {
             create_completed_multipart_vec(&coord, "bucket", "key", &[(1, part1), (2, part2)]);
 
         let obj = coord
-            .get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: &ReadCondition::default() })
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: &ReadCondition::default(),
+            })
             .unwrap();
         assert_eq!(obj.data, expected);
         assert_eq!(obj.etag, result.etag);
@@ -8912,7 +10389,12 @@ mod tests {
         create_completed_multipart_vec(&coord, "bucket", "key", &[(1, b"only-part".to_vec())]);
 
         let obj = coord
-            .get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: &ReadCondition::default() })
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: &ReadCondition::default(),
+            })
             .unwrap();
         assert_eq!(obj.data, b"only-part");
     }
@@ -8931,7 +10413,12 @@ mod tests {
             create_completed_multipart_vec(&coord, "bucket", "key", &[(1, part1), (2, part2)]);
 
         let head = coord
-            .head_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: &ReadCondition::default() })
+            .head_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: &ReadCondition::default(),
+            })
             .unwrap();
         assert_eq!(head.size, total_size as u64);
         assert_eq!(head.etag, result.etag);
@@ -8951,7 +10438,13 @@ mod tests {
 
         // Range within first part: bytes 10-19
         let range = coord
-            .get_object_range(&GetObjectRangeRequest { bucket: "bucket", key: "key", version_id: None, range: ByteRange::Range { start: 10, end: 19 }, cond: &ReadCondition::default() })
+            .get_object_range(&GetObjectRangeRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                range: ByteRange::Range { start: 10, end: 19 },
+                cond: &ReadCondition::default(),
+            })
             .unwrap();
         assert_eq!(range.data, vec![0xAA; 10]);
         assert_eq!(range.range_start, 10);
@@ -8978,10 +10471,16 @@ mod tests {
         // Range spanning part1/part2 boundary: last 4 bytes of part1 + first 4 of part2
         let boundary = MIN_PART as u64;
         let range = coord
-            .get_object_range(&GetObjectRangeRequest { bucket: "bucket", key: "key", version_id: None, range: ByteRange::Range {
+            .get_object_range(&GetObjectRangeRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                range: ByteRange::Range {
                     start: boundary - 4,
                     end: boundary + 3,
-                }, cond: &ReadCondition::default() })
+                },
+                cond: &ReadCondition::default(),
+            })
             .unwrap();
         let mut expected = vec![0xAA; 4];
         expected.extend_from_slice(&[0xBB; 4]);
@@ -9001,7 +10500,13 @@ mod tests {
 
         // Suffix range: last 50 bytes (all within part2)
         let range = coord
-            .get_object_range(&GetObjectRangeRequest { bucket: "bucket", key: "key", version_id: None, range: ByteRange::Suffix { length: 50 }, cond: &ReadCondition::default() })
+            .get_object_range(&GetObjectRangeRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                range: ByteRange::Suffix { length: 50 },
+                cond: &ReadCondition::default(),
+            })
             .unwrap();
         assert_eq!(range.data, vec![0xBB; 50]);
     }
@@ -9037,7 +10542,12 @@ mod tests {
 
         // Destination should have the concatenated data as inline object.
         let dst = coord
-            .get_object(&GetObjectRequest { bucket: "dst-bucket", key: "dst-key", version_id: None, cond: &ReadCondition::default() })
+            .get_object(&GetObjectRequest {
+                bucket: "dst-bucket",
+                key: "dst-key",
+                version_id: None,
+                cond: &ReadCondition::default(),
+            })
             .unwrap();
         assert_eq!(dst.data, expected);
     }
@@ -9051,7 +10561,12 @@ mod tests {
         create_completed_multipart_vec(&coord, "bucket", "key", &[(1, vec![])]);
 
         let obj = coord
-            .get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: &ReadCondition::default() })
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: &ReadCondition::default(),
+            })
             .unwrap();
         assert!(obj.data.is_empty());
         assert_eq!(obj.size, 0);
@@ -9069,7 +10584,12 @@ mod tests {
         create_completed_multipart_vec(&coord, "bucket", "key", &[(1, part1), (2, vec![])]);
 
         let obj = coord
-            .get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: &ReadCondition::default() })
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: &ReadCondition::default(),
+            })
             .unwrap();
         assert_eq!(obj.data, expected);
         assert_eq!(obj.size, MIN_PART as u64);
@@ -9084,7 +10604,13 @@ mod tests {
         create_completed_multipart_vec(&coord, "bucket", "key", &[(1, vec![])]);
 
         let result = coord
-            .get_object_part(&GetObjectPartRequest { bucket: "bucket", key: "key", version_id: None, part_number: 1, cond: &ReadCondition::default() })
+            .get_object_part(&GetObjectPartRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                part_number: 1,
+                cond: &ReadCondition::default(),
+            })
             .unwrap();
         assert!(result.data.is_empty());
         assert_eq!(result.size, 0);
@@ -9104,7 +10630,13 @@ mod tests {
 
         // Part 1 should return full data
         let result = coord
-            .get_object_part(&GetObjectPartRequest { bucket: "bucket", key: "key", version_id: None, part_number: 1, cond: &ReadCondition::default() })
+            .get_object_part(&GetObjectPartRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                part_number: 1,
+                cond: &ReadCondition::default(),
+            })
             .unwrap();
         assert_eq!(result.data, part1);
         assert_eq!(result.part_start, 0);
@@ -9112,7 +10644,13 @@ mod tests {
 
         // Part 2 (zero-byte) should return empty data
         let result = coord
-            .get_object_part(&GetObjectPartRequest { bucket: "bucket", key: "key", version_id: None, part_number: 2, cond: &ReadCondition::default() })
+            .get_object_part(&GetObjectPartRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                part_number: 2,
+                cond: &ReadCondition::default(),
+            })
             .unwrap();
         assert!(result.data.is_empty());
         assert_eq!(result.parts_count, 2);
@@ -9127,12 +10665,24 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"hello world", metadata: &MetadataBlob::from_headers(&[("x-amz-meta-foo", "bar")]).unwrap(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"hello world",
+                metadata: &MetadataBlob::from_headers(&[("x-amz-meta-foo", "bar")]).unwrap(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
         // partNumber=1 on non-multipart object returns the full object.
         let result = coord
-            .head_object_part(&GetObjectPartRequest { bucket: "bucket", key: "key", version_id: None, part_number: 1, cond: &ReadCondition::default() })
+            .head_object_part(&GetObjectPartRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                part_number: 1,
+                cond: &ReadCondition::default(),
+            })
             .unwrap();
         assert_eq!(result.part_size, 11);
         assert_eq!(result.total_size, 11);
@@ -9141,7 +10691,13 @@ mod tests {
 
         // partNumber=2 on non-multipart object returns InvalidPart.
         let err = coord
-            .head_object_part(&GetObjectPartRequest { bucket: "bucket", key: "key", version_id: None, part_number: 2, cond: &ReadCondition::default() })
+            .head_object_part(&GetObjectPartRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                part_number: 2,
+                cond: &ReadCondition::default(),
+            })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidPart { part_number: 2 }));
     }
@@ -9153,11 +10709,23 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"", metadata: &MetadataBlob::new(), cond: NO_WRITE })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
             .unwrap();
 
         let result = coord
-            .head_object_part(&GetObjectPartRequest { bucket: "bucket", key: "key", version_id: None, part_number: 1, cond: &ReadCondition::default() })
+            .head_object_part(&GetObjectPartRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                part_number: 1,
+                cond: &ReadCondition::default(),
+            })
             .unwrap();
         assert_eq!(result.part_size, 0);
         assert_eq!(result.total_size, 0);
@@ -9173,7 +10741,12 @@ mod tests {
         create_completed_multipart_vec(&coord, "bucket", "key", &[(1, vec![])]);
 
         let head = coord
-            .head_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: &ReadCondition::default() })
+            .head_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: &ReadCondition::default(),
+            })
             .unwrap();
         assert_eq!(head.size, 0);
     }
@@ -9203,7 +10776,12 @@ mod tests {
             .unwrap();
 
         let dst = coord
-            .get_object(&GetObjectRequest { bucket: "dst", key: "key", version_id: None, cond: &ReadCondition::default() })
+            .get_object(&GetObjectRequest {
+                bucket: "dst",
+                key: "key",
+                version_id: None,
+                cond: &ReadCondition::default(),
+            })
             .unwrap();
         assert!(dst.data.is_empty());
     }
@@ -9235,7 +10813,12 @@ mod tests {
         drop(pg);
 
         let err = coord
-            .get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: &ReadCondition::default() })
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: &ReadCondition::default(),
+            })
             .unwrap_err();
         assert!(
             matches!(err, ServerError::IntegrityError { .. }),
@@ -9260,7 +10843,12 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let create = coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket, key, metadata: &metadata, checksum: Some(storage::MultipartChecksumConfig::new(algo, ctype).unwrap()) })
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket,
+                key,
+                metadata: &metadata,
+                checksum: Some(storage::MultipartChecksumConfig::new(algo, ctype).unwrap()),
+            })
             .unwrap();
         let mut complete_parts = Vec::new();
         for (i, data) in part_data.iter().enumerate() {
@@ -9268,7 +10856,14 @@ mod tests {
             let checksum_b64 = b64.encode(compute_checksum(algo, data));
             let claim = ChecksumClaim::from_base64(algo, &checksum_b64).unwrap();
             let result = coord
-                .upload_part(&UploadPartRequest { bucket, key, upload_id: &create.upload_id, part_number, data, claimed_checksum: Some(&claim) })
+                .upload_part(&UploadPartRequest {
+                    bucket,
+                    key,
+                    upload_id: &create.upload_id,
+                    part_number,
+                    data,
+                    claimed_checksum: Some(&claim),
+                })
                 .unwrap();
             complete_parts.push(CompletePart {
                 part_number,
@@ -9299,7 +10894,13 @@ mod tests {
         );
 
         let result = coord
-            .complete_multipart_upload(&CompleteMultipartUploadRequest { bucket: "bucket", key: "key", upload_id: &upload_id, parts: &parts, claimed_checksum: None })
+            .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload_id,
+                parts: &parts,
+                claimed_checksum: None,
+            })
             .unwrap();
 
         assert_eq!(result.checksum_algorithm, Some(ChecksumAlgorithm::Sha256));
@@ -9339,7 +10940,13 @@ mod tests {
         );
 
         let result = coord
-            .complete_multipart_upload(&CompleteMultipartUploadRequest { bucket: "bucket", key: "key", upload_id: &upload_id, parts: &parts, claimed_checksum: None })
+            .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload_id,
+                parts: &parts,
+                claimed_checksum: None,
+            })
             .unwrap();
 
         assert_eq!(result.checksum_algorithm, Some(ChecksumAlgorithm::Crc32));
@@ -9373,7 +10980,13 @@ mod tests {
         );
 
         let result = coord
-            .complete_multipart_upload(&CompleteMultipartUploadRequest { bucket: "bucket", key: "key", upload_id: &upload_id, parts: &parts, claimed_checksum: None })
+            .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload_id,
+                parts: &parts,
+                claimed_checksum: None,
+            })
             .unwrap();
 
         assert_eq!(result.checksum_algorithm, Some(ChecksumAlgorithm::Crc32c));
@@ -9406,7 +11019,13 @@ mod tests {
         );
 
         let result = coord
-            .complete_multipart_upload(&CompleteMultipartUploadRequest { bucket: "bucket", key: "key", upload_id: &upload_id, parts: &parts, claimed_checksum: None })
+            .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload_id,
+                parts: &parts,
+                claimed_checksum: None,
+            })
             .unwrap();
 
         assert_eq!(
@@ -9443,7 +11062,13 @@ mod tests {
         );
 
         let result = coord
-            .complete_multipart_upload(&CompleteMultipartUploadRequest { bucket: "bucket", key: "key", upload_id: &upload_id, parts: &parts, claimed_checksum: None })
+            .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload_id,
+                parts: &parts,
+                claimed_checksum: None,
+            })
             .unwrap();
 
         assert_eq!(result.checksum_algorithm, Some(ChecksumAlgorithm::Crc32));
@@ -9483,7 +11108,13 @@ mod tests {
         parts[0].checksum = Some((ChecksumAlgorithm::Crc32, "AAAAAAAA".to_string()));
 
         let err = coord
-            .complete_multipart_upload(&CompleteMultipartUploadRequest { bucket: "bucket", key: "key", upload_id: &upload_id, parts: &parts, claimed_checksum: None })
+            .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload_id,
+                parts: &parts,
+                claimed_checksum: None,
+            })
             .unwrap_err();
         assert!(
             matches!(err, ServerError::InvalidRequest { .. }),
@@ -9503,7 +11134,13 @@ mod tests {
             create_upload_with_parts(&coord, "bucket", "key", &[(1, &big), (2, small)]);
 
         let result = coord
-            .complete_multipart_upload(&CompleteMultipartUploadRequest { bucket: "bucket", key: "key", upload_id: &upload_id, parts: &parts, claimed_checksum: None })
+            .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload_id,
+                parts: &parts,
+                claimed_checksum: None,
+            })
             .unwrap();
 
         assert_eq!(result.checksum_algorithm, None);
@@ -9534,7 +11171,13 @@ mod tests {
         parts[0].checksum = Some((ChecksumAlgorithm::Sha256, correct_value));
 
         let err = coord
-            .complete_multipart_upload(&CompleteMultipartUploadRequest { bucket: "bucket", key: "key", upload_id: &upload_id, parts: &parts, claimed_checksum: None })
+            .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload_id,
+                parts: &parts,
+                claimed_checksum: None,
+            })
             .unwrap_err();
         assert!(
             matches!(err, ServerError::InvalidRequest { .. }),
@@ -9586,7 +11229,14 @@ mod tests {
         assert_eq!(result.version_id, storage::VersionId::Null);
 
         // Verify object is visible via head_object.
-        let head = coord.head_object(&GetObjectRequest { bucket: "bucket", key: "mykey", version_id: None, cond: NO_READ }).unwrap();
+        let head = coord
+            .head_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "mykey",
+                version_id: None,
+                cond: NO_READ,
+            })
+            .unwrap();
         assert_eq!(head.size, full_data.len() as u64);
         assert_eq!(head.etag, format_etag(crc));
         assert_eq!(head.metadata.get("x-amz-meta-foo"), Some("bar"));
@@ -9617,7 +11267,14 @@ mod tests {
 
         assert_eq!(result.etag, format_etag(crc));
 
-        let head = coord.head_object(&GetObjectRequest { bucket: "bucket", key: "mykey", version_id: None, cond: NO_READ }).unwrap();
+        let head = coord
+            .head_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "mykey",
+                version_id: None,
+                cond: NO_READ,
+            })
+            .unwrap();
         assert_eq!(head.size, 0);
     }
 
@@ -9639,7 +11296,12 @@ mod tests {
 
         // Object should not exist.
         let err = coord
-            .head_object(&GetObjectRequest { bucket: "bucket", key: "mykey", version_id: None, cond: NO_READ })
+            .head_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "mykey",
+                version_id: None,
+                cond: NO_READ,
+            })
             .unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
     }
@@ -9783,7 +11445,13 @@ mod tests {
 
         // Write an existing object via normal put.
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"old-data", metadata: &MetadataBlob::new(), cond: &WriteCondition::default() })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"old-data",
+                metadata: &MetadataBlob::new(),
+                cond: &WriteCondition::default(),
+            })
             .unwrap();
 
         // Stream-put a new version.
@@ -9809,7 +11477,14 @@ mod tests {
         assert_eq!(result.etag, format_etag(crc));
 
         // Head should show the new object.
-        let head = coord.head_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_READ }).unwrap();
+        let head = coord
+            .head_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: NO_READ,
+            })
+            .unwrap();
         assert_eq!(head.size, new_data.len() as u64);
     }
 
@@ -9821,7 +11496,13 @@ mod tests {
 
         // Write initial object.
         let initial = coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"initial", metadata: &MetadataBlob::new(), cond: &WriteCondition::default() })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"initial",
+                metadata: &MetadataBlob::new(),
+                cond: &WriteCondition::default(),
+            })
             .unwrap();
 
         // Stream put with if-match on the correct etag succeeds.
@@ -9976,11 +11657,25 @@ mod tests {
             .unwrap();
 
         // HEAD works (metadata-only).
-        let head = coord.head_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_READ }).unwrap();
+        let head = coord
+            .head_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: NO_READ,
+            })
+            .unwrap();
         assert_eq!(head.size, 5);
 
         // GET returns the correct data.
-        let result = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_READ }).unwrap();
+        let result = coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: NO_READ,
+            })
+            .unwrap();
         assert_eq!(result.data, b"hello");
         assert_eq!(result.size, 5);
     }
@@ -10017,7 +11712,14 @@ mod tests {
             })
             .unwrap();
 
-        let result = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_READ }).unwrap();
+        let result = coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: NO_READ,
+            })
+            .unwrap();
         assert_eq!(result.data, full_data);
         assert_eq!(result.size, 10);
     }
@@ -10053,25 +11755,49 @@ mod tests {
 
         // Range within first chunk.
         let r1 = coord
-            .get_object_range(&GetObjectRangeRequest { bucket: "bucket", key: "key", version_id: None, range: ByteRange::Range { start: 0, end: 3 }, cond: NO_READ })
+            .get_object_range(&GetObjectRangeRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                range: ByteRange::Range { start: 0, end: 3 },
+                cond: NO_READ,
+            })
             .unwrap();
         assert_eq!(r1.data, b"AAAA");
 
         // Range spanning chunks.
         let r2 = coord
-            .get_object_range(&GetObjectRangeRequest { bucket: "bucket", key: "key", version_id: None, range: ByteRange::Range { start: 2, end: 5 }, cond: NO_READ })
+            .get_object_range(&GetObjectRangeRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                range: ByteRange::Range { start: 2, end: 5 },
+                cond: NO_READ,
+            })
             .unwrap();
         assert_eq!(r2.data, b"AABB");
 
         // Range within second chunk.
         let r3 = coord
-            .get_object_range(&GetObjectRangeRequest { bucket: "bucket", key: "key", version_id: None, range: ByteRange::Range { start: 4, end: 7 }, cond: NO_READ })
+            .get_object_range(&GetObjectRangeRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                range: ByteRange::Range { start: 4, end: 7 },
+                cond: NO_READ,
+            })
             .unwrap();
         assert_eq!(r3.data, b"BBBB");
 
         // Suffix range.
         let r4 = coord
-            .get_object_range(&GetObjectRangeRequest { bucket: "bucket", key: "key", version_id: None, range: ByteRange::Suffix { length: 3 }, cond: NO_READ })
+            .get_object_range(&GetObjectRangeRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                range: ByteRange::Suffix { length: 3 },
+                cond: NO_READ,
+            })
             .unwrap();
         assert_eq!(r4.data, b"BBB");
     }
@@ -10117,7 +11843,14 @@ mod tests {
             .unwrap();
 
         // Destination should be a normal (non-chunk-manifest) object.
-        let result = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "dst", version_id: None, cond: NO_READ }).unwrap();
+        let result = coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "dst",
+                version_id: None,
+                cond: NO_READ,
+            })
+            .unwrap();
         assert_eq!(result.data, b"copy-me");
     }
 
@@ -10142,7 +11875,14 @@ mod tests {
             })
             .unwrap();
 
-        let result = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "empty", version_id: None, cond: NO_READ }).unwrap();
+        let result = coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "empty",
+                version_id: None,
+                cond: NO_READ,
+            })
+            .unwrap();
         assert_eq!(result.data, b"");
         assert_eq!(result.size, 0);
     }
@@ -10172,7 +11912,13 @@ mod tests {
             .unwrap();
 
         let result = coord
-            .get_object_part(&GetObjectPartRequest { bucket: "bucket", key: "key", version_id: None, part_number: 1, cond: NO_READ })
+            .get_object_part(&GetObjectPartRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                part_number: 1,
+                cond: NO_READ,
+            })
             .unwrap();
         assert_eq!(result.data, b"partdata");
     }
@@ -10203,16 +11949,36 @@ mod tests {
             .unwrap();
 
         // Verify stream-put is readable.
-        let r1 = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_READ }).unwrap();
+        let r1 = coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: NO_READ,
+            })
+            .unwrap();
         assert_eq!(r1.data, b"stream-data");
 
         // Overwrite with a normal PUT.
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"normal-data", metadata: &MetadataBlob::new(), cond: &WriteCondition::default() })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"normal-data",
+                metadata: &MetadataBlob::new(),
+                cond: &WriteCondition::default(),
+            })
             .unwrap();
 
         // GET should return the new data, not stale chunk data.
-        let r2 = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_READ }).unwrap();
+        let r2 = coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: NO_READ,
+            })
+            .unwrap();
         assert_eq!(r2.data, b"normal-data");
     }
 
@@ -10242,12 +12008,22 @@ mod tests {
 
         // Delete the object.
         coord
-            .delete_object(&DeleteObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: &crate::conditional::DeleteCondition::default() })
+            .delete_object(&DeleteObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: &crate::conditional::DeleteCondition::default(),
+            })
             .unwrap();
 
         // Object should be gone.
         let err = coord
-            .get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_READ })
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: NO_READ,
+            })
             .unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
     }
@@ -10279,7 +12055,12 @@ mod tests {
 
         // Create a multipart upload for the destination.
         let upload = coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "dst", metadata: &MetadataBlob::new(), checksum: None })
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "dst",
+                metadata: &MetadataBlob::new(),
+                checksum: None,
+            })
             .unwrap();
 
         // UploadPartCopy from the stream-written source.
@@ -10404,7 +12185,12 @@ mod tests {
 
         // Create a multipart upload first.
         let mpu = coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &MetadataBlob::new(), checksum: None })
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                metadata: &MetadataBlob::new(),
+                checksum: None,
+            })
             .unwrap();
 
         // Begin a streaming part session.
@@ -10456,7 +12242,12 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let mpu = coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &MetadataBlob::new(), checksum: None })
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                metadata: &MetadataBlob::new(),
+                checksum: None,
+            })
             .unwrap();
 
         // Part 0 is invalid.
@@ -10476,11 +12267,9 @@ mod tests {
     fn checksum_claim_invalid_base64_rejected() {
         // P2: Malformed base64 in claimed checksum must return an error,
         // not silently accept a None checksum.
-        let err = ChecksumClaim::from_base64(
-            storage::ChecksumAlgorithm::Crc32,
-            "not-valid-base64!!!",
-        )
-        .unwrap_err();
+        let err =
+            ChecksumClaim::from_base64(storage::ChecksumAlgorithm::Crc32, "not-valid-base64!!!")
+                .unwrap_err();
         assert!(
             matches!(err, ServerError::InvalidRequest { .. }),
             "expected InvalidRequest for bad base64, got {err:?}"
@@ -10492,11 +12281,8 @@ mod tests {
         // A valid base64 string with the wrong byte length for the algorithm.
         use base64::Engine;
         let too_long = base64::engine::general_purpose::STANDARD.encode([0u8; 8]); // CRC32 expects 4
-        let err = ChecksumClaim::from_base64(
-            storage::ChecksumAlgorithm::Crc32,
-            &too_long,
-        )
-        .unwrap_err();
+        let err =
+            ChecksumClaim::from_base64(storage::ChecksumAlgorithm::Crc32, &too_long).unwrap_err();
         assert!(
             matches!(err, ServerError::InvalidRequest { .. }),
             "expected InvalidRequest for wrong length, got {err:?}"
@@ -10516,7 +12302,12 @@ mod tests {
             .unwrap();
 
         let mpu = coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &MetadataBlob::new(), checksum: None })
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                metadata: &MetadataBlob::new(),
+                checksum: None,
+            })
             .unwrap();
 
         let err = coord
@@ -10548,10 +12339,20 @@ mod tests {
 
         // Create two MPUs for the same key.
         let mpu_a = coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum: None })
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                metadata: &metadata,
+                checksum: None,
+            })
             .unwrap();
         let mpu_b = coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum: None })
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                metadata: &metadata,
+                checksum: None,
+            })
             .unwrap();
 
         // Helper: stream a single part with given data.
@@ -10593,12 +12394,24 @@ mod tests {
 
         // Complete A first.
         let result_a = coord
-            .complete_multipart_upload(&CompleteMultipartUploadRequest { bucket: "bucket", key: "key", upload_id: &mpu_a.upload_id, parts: &[part_a], claimed_checksum: None })
+            .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &mpu_a.upload_id,
+                parts: &[part_a],
+                claimed_checksum: None,
+            })
             .unwrap();
 
         // Read back A's data — should be A's content.
         let obj_a = coord
-            .get_object_part(&GetObjectPartRequest { bucket: "bucket", key: "key", version_id: None, part_number: 1, cond: &ReadCondition::default() })
+            .get_object_part(&GetObjectPartRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                part_number: 1,
+                cond: &ReadCondition::default(),
+            })
             .unwrap();
         assert_eq!(
             obj_a.data, data_a,
@@ -10607,12 +12420,24 @@ mod tests {
 
         // Complete B — overwrites A on unversioned bucket.
         let result_b = coord
-            .complete_multipart_upload(&CompleteMultipartUploadRequest { bucket: "bucket", key: "key", upload_id: &mpu_b.upload_id, parts: &[part_b], claimed_checksum: None })
+            .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &mpu_b.upload_id,
+                parts: &[part_b],
+                claimed_checksum: None,
+            })
             .unwrap();
 
         // Read back B's data — should be B's content, not A's.
         let obj_b = coord
-            .get_object_part(&GetObjectPartRequest { bucket: "bucket", key: "key", version_id: None, part_number: 1, cond: &ReadCondition::default() })
+            .get_object_part(&GetObjectPartRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                part_number: 1,
+                cond: &ReadCondition::default(),
+            })
             .unwrap();
         assert_eq!(
             obj_b.data, data_b,
@@ -10634,7 +12459,12 @@ mod tests {
 
         let metadata = MetadataBlob::new();
         let mpu = coord
-            .create_multipart_upload(&CreateMultipartUploadRequest { bucket: "bucket", key: "key", metadata: &metadata, checksum: None })
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                metadata: &metadata,
+                checksum: None,
+            })
             .unwrap();
 
         // Upload a streaming part.
@@ -10687,7 +12517,11 @@ mod tests {
 
         // Abort the MPU.
         coord
-            .abort_multipart_upload(&AbortMultipartUploadRequest { bucket: "bucket", key: "key", upload_id: &mpu.upload_id })
+            .abort_multipart_upload(&AbortMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &mpu.upload_id,
+            })
             .unwrap();
 
         // Verify chunk manifest rows are gone.
@@ -10781,7 +12615,14 @@ mod tests {
         assert_eq!(count, 0);
 
         // Object should still be readable.
-        let result = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_READ }).unwrap();
+        let result = coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: NO_READ,
+            })
+            .unwrap();
         assert_eq!(result.data, b"safe-data");
     }
 
@@ -10799,13 +12640,23 @@ mod tests {
 
         // Key should not exist yet.
         let err = coord
-            .get_object(&GetObjectRequest { bucket: "bucket", key: "new-key", version_id: None, cond: NO_READ })
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "new-key",
+                version_id: None,
+                cond: NO_READ,
+            })
             .unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
 
         // HEAD should also fail.
         let err = coord
-            .head_object(&GetObjectRequest { bucket: "bucket", key: "new-key", version_id: None, cond: NO_READ })
+            .head_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "new-key",
+                version_id: None,
+                cond: NO_READ,
+            })
             .unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
     }
@@ -10856,7 +12707,14 @@ mod tests {
         } // Drop PG lock before coordinator calls.
 
         // Verify full readback via coordinator.
-        let result = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "verify", version_id: None, cond: NO_READ }).unwrap();
+        let result = coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "verify",
+                version_id: None,
+                cond: NO_READ,
+            })
+            .unwrap();
         assert_eq!(result.data, full);
 
         // Verify CRC matches.
@@ -10890,16 +12748,34 @@ mod tests {
 
         // 2. Delete.
         coord
-            .delete_object(&DeleteObjectRequest { bucket: "bucket", key: "cycle", version_id: None, cond: &crate::conditional::DeleteCondition::default() })
+            .delete_object(&DeleteObjectRequest {
+                bucket: "bucket",
+                key: "cycle",
+                version_id: None,
+                cond: &crate::conditional::DeleteCondition::default(),
+            })
             .unwrap();
 
         // 3. Normal put.
         coord
-            .put_object(&PutObjectRequest { bucket: "bucket", key: "cycle", data: b"v2-normal", metadata: &MetadataBlob::new(), cond: &WriteCondition::default() })
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "cycle",
+                data: b"v2-normal",
+                metadata: &MetadataBlob::new(),
+                cond: &WriteCondition::default(),
+            })
             .unwrap();
 
         // 4. GET should return normal-put data, no chunk manifest interference.
-        let result = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "cycle", version_id: None, cond: NO_READ }).unwrap();
+        let result = coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "cycle",
+                version_id: None,
+                cond: NO_READ,
+            })
+            .unwrap();
         assert_eq!(result.data, b"v2-normal");
     }
 
@@ -10944,7 +12820,14 @@ mod tests {
             })
             .unwrap();
 
-        let result = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_READ }).unwrap();
+        let result = coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: NO_READ,
+            })
+            .unwrap();
         assert_eq!(result.data, b"new-data");
     }
 }

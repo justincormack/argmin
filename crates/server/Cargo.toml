@@ -11,6 +11,7 @@ path = "src/main.rs"
 auth = { path = "../auth" }
 checksum = { path = "../checksum" }
 ec = { path = "../ec" }
+server-core = { path = "../server-core" }
 storage = { path = "../storage" }
 base64 = "0.22"
 ec-sys = { path = "../ec-sys" }

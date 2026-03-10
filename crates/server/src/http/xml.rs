@@ -1646,7 +1646,26 @@ pub fn parse_complete_multipart_upload_xml(body: &[u8]) -> Result<Vec<CompletePa
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conditional::{DeleteCondition, WriteCondition};
     use crate::coordinator::ListEntry;
+    use crate::coordinator::{
+        Coordinator, DeleteEntry, DeleteObjectsRequest, ListObjectVersionsRequest,
+        ListObjectsV2Request, PutObjectRequest,
+    };
+    use crate::metadata_blob::MetadataBlob;
+    use ec::EcConfig;
+    use std::sync::Arc;
+    use storage::SharedStorageNode;
+
+    fn setup_coordinator(dir: &std::path::Path) -> Coordinator {
+        let pg_ids: Vec<u32> = (0..4).collect();
+        let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
+        let ec_config = EcConfig::new(4, 2).unwrap();
+        Coordinator::new(storage_node, ec_config, "us-east-1".to_string()).unwrap()
+    }
+
+    const NO_WRITE: &WriteCondition = &WriteCondition::None;
+    const NO_DELETE: &DeleteCondition = &DeleteCondition::None;
 
     #[test]
     fn error_xml_format() {
@@ -3358,5 +3377,210 @@ mod tests {
             <Part><PartNumber>-1</PartNumber><ETag>\"a\"</ETag></Part>\
             </CompleteMultipartUpload>";
         assert!(parse_complete_multipart_upload_xml(xml).is_err());
+    }
+
+    #[test]
+    fn ceph_cleanup_workflow() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+
+        coord.create_bucket("test-bucket").unwrap();
+        coord
+            .put_object(&PutObjectRequest {
+                bucket: "test-bucket",
+                key: "dir/file1.txt",
+                data: b"hello",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
+            .unwrap();
+        coord
+            .put_object(&PutObjectRequest {
+                bucket: "test-bucket",
+                key: "dir/file2.txt",
+                data: b"world",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
+            .unwrap();
+        coord
+            .put_object(&PutObjectRequest {
+                bucket: "test-bucket",
+                key: "root.txt",
+                data: b"root",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+            })
+            .unwrap();
+
+        let versions_result = coord
+            .list_object_versions(&ListObjectVersionsRequest {
+                bucket: "test-bucket",
+                prefix: None,
+                key_marker: None,
+                version_id_marker: None,
+                max_keys: 1000,
+            })
+            .unwrap();
+        assert_eq!(versions_result.versions.len(), 3);
+
+        let versions_xml =
+            list_object_versions_xml("test-bucket", None, None, 1000, &versions_result);
+        assert!(versions_xml.contains("<Key>dir/file1.txt</Key>"));
+        assert!(versions_xml.contains("<Key>dir/file2.txt</Key>"));
+        assert!(versions_xml.contains("<Key>root.txt</Key>"));
+        for _ in 0..3 {
+            assert!(versions_xml.contains("<VersionId>null</VersionId>"));
+        }
+
+        let list_result = coord
+            .list_objects_v2(&ListObjectsV2Request {
+                bucket: "test-bucket",
+                prefix: None,
+                delimiter: None,
+                continuation_token: None,
+                max_keys: 1000,
+            })
+            .unwrap();
+        assert_eq!(list_result.objects.len(), 3);
+
+        let mut delete_xml = String::from("<Delete>");
+        for obj in &list_result.objects {
+            delete_xml.push_str(&format!("<Object><Key>{}</Key></Object>", obj.key));
+        }
+        delete_xml.push_str("</Delete>");
+
+        let (xml_entries, quiet) = parse_delete_objects_xml(delete_xml.as_bytes()).unwrap();
+        assert_eq!(xml_entries.len(), 3);
+        assert!(!quiet);
+        let entries: Vec<DeleteEntry> = xml_entries
+            .iter()
+            .map(|e| DeleteEntry {
+                key: &e.key,
+                version_id: None,
+            })
+            .collect();
+
+        let delete_result = coord
+            .delete_objects(&DeleteObjectsRequest {
+                bucket: "test-bucket",
+                entries: &entries,
+                cond: NO_DELETE,
+            })
+            .unwrap();
+        assert_eq!(delete_result.deleted.len(), 3);
+        assert!(delete_result.errors.is_empty());
+
+        let list_after = coord
+            .list_objects_v2(&ListObjectsV2Request {
+                bucket: "test-bucket",
+                prefix: None,
+                delimiter: None,
+                continuation_token: None,
+                max_keys: 1000,
+            })
+            .unwrap();
+        assert!(list_after.objects.is_empty());
+        coord.delete_bucket("test-bucket").unwrap();
+    }
+
+    #[test]
+    fn ceph_cleanup_workflow_paginated() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+
+        coord.create_bucket("bucket").unwrap();
+        for i in 0..5 {
+            let key = format!("key-{:02}", i);
+            coord
+                .put_object(&PutObjectRequest {
+                    bucket: "bucket",
+                    key: &key,
+                    data: b"data",
+                    metadata: &MetadataBlob::new(),
+                    cond: NO_WRITE,
+                })
+                .unwrap();
+        }
+
+        let page1 = coord
+            .list_objects_v2(&ListObjectsV2Request {
+                bucket: "bucket",
+                prefix: None,
+                delimiter: None,
+                continuation_token: None,
+                max_keys: 2,
+            })
+            .unwrap();
+        assert_eq!(page1.objects.len(), 2);
+        assert!(page1.is_truncated);
+        let token = page1.next_continuation_token.clone().unwrap();
+
+        let page2 = coord
+            .list_objects_v2(&ListObjectsV2Request {
+                bucket: "bucket",
+                prefix: None,
+                delimiter: None,
+                continuation_token: Some(&token),
+                max_keys: 2,
+            })
+            .unwrap();
+        assert_eq!(page2.objects.len(), 2);
+        let token2 = page2.next_continuation_token.clone().unwrap();
+
+        let page3 = coord
+            .list_objects_v2(&ListObjectsV2Request {
+                bucket: "bucket",
+                prefix: None,
+                delimiter: None,
+                continuation_token: Some(&token2),
+                max_keys: 2,
+            })
+            .unwrap();
+        assert_eq!(page3.objects.len(), 1);
+        assert!(!page3.is_truncated);
+
+        let all_keys: Vec<String> = page1
+            .objects
+            .iter()
+            .chain(page2.objects.iter())
+            .chain(page3.objects.iter())
+            .map(|o| o.key.clone())
+            .collect();
+        assert_eq!(all_keys.len(), 5);
+
+        let mut delete_xml = String::from("<Delete><Quiet>true</Quiet>");
+        for key in &all_keys {
+            delete_xml.push_str(&format!("<Object><Key>{}</Key></Object>", key));
+        }
+        delete_xml.push_str("</Delete>");
+
+        let (xml_entries, quiet) = parse_delete_objects_xml(delete_xml.as_bytes()).unwrap();
+        assert_eq!(xml_entries.len(), 5);
+        assert!(quiet);
+        let entries: Vec<DeleteEntry> = xml_entries
+            .iter()
+            .map(|e| DeleteEntry {
+                key: &e.key,
+                version_id: None,
+            })
+            .collect();
+
+        let delete_result = coord
+            .delete_objects(&DeleteObjectsRequest {
+                bucket: "bucket",
+                entries: &entries,
+                cond: NO_DELETE,
+            })
+            .unwrap();
+        assert_eq!(delete_result.deleted.len(), 5);
+        assert!(delete_result.errors.is_empty());
+
+        let result_xml =
+            delete_objects_result_xml(&delete_result.deleted, &delete_result.errors, quiet);
+        assert!(!result_xml.contains("<Deleted>"));
+        assert!(result_xml.contains("DeleteResult"));
+
+        coord.delete_bucket("bucket").unwrap();
     }
 }

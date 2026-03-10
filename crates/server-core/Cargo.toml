@@ -1,0 +1,17 @@
+[package]
+name = "server-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+auth = { path = "../auth" }
+checksum = { path = "../checksum" }
+ec = { path = "../ec" }
+storage = { path = "../storage" }
+base64 = "0.22"
+rapidhash = "1"
+ring = "0.17"
+thiserror = "2"
+
+[dev-dependencies]
+test-util = { path = "../test-util" }

@@ -4,7 +4,7 @@
 /// conditional semantics for writes and deletes.
 ///
 /// This module contains only the condition types and their evaluation — no
-/// HTTP parsing. Header extraction lives in `crate::http::conditional`.
+/// HTTP parsing. Header extraction lives in the HTTP/frontend crate.
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::ServerError;
