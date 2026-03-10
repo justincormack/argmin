@@ -248,6 +248,44 @@ pub struct PutObjectRequest<'a> {
     pub cond: &'a WriteCondition,
 }
 
+/// Request for a GetObject or HeadObject operation.
+#[derive(Debug)]
+pub struct GetObjectRequest<'a> {
+    pub bucket: &'a str,
+    pub key: &'a str,
+    pub version_id: Option<storage::VersionId>,
+    pub cond: &'a ReadCondition,
+}
+
+/// Request for a GetObjectPart or HeadObjectPart operation.
+#[derive(Debug)]
+pub struct GetObjectPartRequest<'a> {
+    pub bucket: &'a str,
+    pub key: &'a str,
+    pub version_id: Option<storage::VersionId>,
+    pub part_number: u32,
+    pub cond: &'a ReadCondition,
+}
+
+/// Request for a GetObjectRange operation.
+#[derive(Debug)]
+pub struct GetObjectRangeRequest<'a> {
+    pub bucket: &'a str,
+    pub key: &'a str,
+    pub version_id: Option<storage::VersionId>,
+    pub range: ByteRange,
+    pub cond: &'a ReadCondition,
+}
+
+/// Request for a DeleteObject operation.
+#[derive(Debug)]
+pub struct DeleteObjectRequest<'a> {
+    pub bucket: &'a str,
+    pub key: &'a str,
+    pub version_id: Option<storage::VersionId>,
+    pub cond: &'a DeleteCondition,
+}
+
 /// Request for a CreateMultipartUpload operation.
 #[derive(Debug)]
 pub struct CreateMultipartUploadRequest<'a> {
@@ -2782,13 +2820,11 @@ impl Coordinator {
     }
 
     /// Get an object from storage.
-    pub fn get_object(
-        &self,
-        bucket: &str,
-        key: &str,
-        version_id: Option<storage::VersionId>,
-        cond: &ReadCondition,
-    ) -> Result<GetObjectResult, ServerError> {
+    pub fn get_object(&self, req: &GetObjectRequest) -> Result<GetObjectResult, ServerError> {
+        let bucket = req.bucket;
+        let key = req.key;
+        let version_id = req.version_id;
+        let cond = req.cond;
         let LockedReadObject {
             record: stored,
             pgs,
@@ -2930,12 +2966,13 @@ impl Coordinator {
     /// For non-multipart objects, `part_number == 1` returns the full body.
     pub fn get_object_part(
         &self,
-        bucket: &str,
-        key: &str,
-        version_id: Option<storage::VersionId>,
-        part_number: u32,
-        cond: &ReadCondition,
+        req: &GetObjectPartRequest,
     ) -> Result<GetObjectPartResult, ServerError> {
+        let bucket = req.bucket;
+        let key = req.key;
+        let version_id = req.version_id;
+        let part_number = req.part_number;
+        let cond = req.cond;
         let LockedReadObject {
             record: stored,
             pgs,
@@ -3127,12 +3164,13 @@ impl Coordinator {
     /// Head a single part of an object by part number (no body).
     pub fn head_object_part(
         &self,
-        bucket: &str,
-        key: &str,
-        version_id: Option<storage::VersionId>,
-        part_number: u32,
-        cond: &ReadCondition,
+        req: &GetObjectPartRequest,
     ) -> Result<HeadObjectPartResult, ServerError> {
+        let bucket = req.bucket;
+        let key = req.key;
+        let version_id = req.version_id;
+        let part_number = req.part_number;
+        let cond = req.cond;
         let LockedReadObject {
             record: stored,
             pgs,
@@ -3233,13 +3271,11 @@ impl Coordinator {
     /// Head object: returns metadata without body.
     ///
     /// Metadata is always read from the DB row (no shard read needed).
-    pub fn head_object(
-        &self,
-        bucket: &str,
-        key: &str,
-        version_id: Option<storage::VersionId>,
-        cond: &ReadCondition,
-    ) -> Result<HeadObjectResult, ServerError> {
+    pub fn head_object(&self, req: &GetObjectRequest) -> Result<HeadObjectResult, ServerError> {
+        let bucket = req.bucket;
+        let key = req.key;
+        let version_id = req.version_id;
+        let cond = req.cond;
         let LockedReadObject { record: stored, .. } =
             self.lock_object_pgs_for_read(bucket, key, version_id)?;
 
@@ -3399,12 +3435,13 @@ impl Coordinator {
     /// Returns 206 Partial Content data.
     pub fn get_object_range(
         &self,
-        bucket: &str,
-        key: &str,
-        version_id: Option<storage::VersionId>,
-        range: ByteRange,
-        cond: &ReadCondition,
+        req: &GetObjectRangeRequest,
     ) -> Result<GetObjectRangeResult, ServerError> {
+        let bucket = req.bucket;
+        let key = req.key;
+        let version_id = req.version_id;
+        let range = req.range;
+        let cond = req.cond;
         let LockedReadObject {
             record: stored,
             pgs,
@@ -3526,13 +3563,11 @@ impl Coordinator {
     }
 
     /// Delete an object.
-    pub fn delete_object(
-        &self,
-        bucket: &str,
-        key: &str,
-        request_version_id: Option<storage::VersionId>,
-        cond: &DeleteCondition,
-    ) -> Result<DeleteObjectResult, ServerError> {
+    pub fn delete_object(&self, req: &DeleteObjectRequest) -> Result<DeleteObjectResult, ServerError> {
+        let bucket = req.bucket;
+        let key = req.key;
+        let request_version_id = req.version_id;
+        let cond = req.cond;
         let bucket_info = self.head_bucket(bucket)?;
 
         match (bucket_info.versioning, request_version_id) {
@@ -4023,7 +4058,7 @@ impl Coordinator {
                     v.parse::<u64>().ok().map(storage::VersionId::from_u64)
                 }
             });
-            match self.delete_object(bucket, &entry.key, vid, cond) {
+            match self.delete_object(&DeleteObjectRequest { bucket, key: &entry.key, version_id: vid, cond }) {
                 Ok(result) => {
                     deleted.push(DeletedObject {
                         key: entry.key.clone(),
@@ -5414,7 +5449,7 @@ mod tests {
         assert!(!result.etag.is_empty());
 
         let obj = coord
-            .get_object("bucket", "hello.txt", None, NO_READ)
+            .get_object(&GetObjectRequest { bucket: "bucket", key: "hello.txt", version_id: None, cond: NO_READ })
             .unwrap();
         assert_eq!(obj.data, b"Hello, world!");
         assert_eq!(obj.size, 13);
@@ -5437,7 +5472,7 @@ mod tests {
             .put_object(&PutObjectRequest { bucket: "bucket", key: "obj", data: b"{}", metadata: &MetadataBlob::from_headers(&headers).unwrap(), cond: NO_WRITE })
             .unwrap();
 
-        let obj = coord.get_object("bucket", "obj", None, NO_READ).unwrap();
+        let obj = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "obj", version_id: None, cond: NO_READ }).unwrap();
         assert_eq!(obj.data, b"{}");
         assert_eq!(obj.metadata.get("content-type"), Some("application/json"));
         assert_eq!(obj.metadata.get("x-amz-meta-author"), Some("alice"));
@@ -5454,7 +5489,7 @@ mod tests {
             .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", metadata: &MetadataBlob::from_headers(&[("Content-Type", "text/plain")]).unwrap(), cond: NO_WRITE })
             .unwrap();
 
-        let head = coord.head_object("bucket", "key", None, NO_READ).unwrap();
+        let head = coord.head_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_READ }).unwrap();
         assert_eq!(head.size, 4);
         assert_eq!(head.metadata.get("content-type"), Some("text/plain"));
     }
@@ -5472,7 +5507,7 @@ mod tests {
             .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"v2", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
-        let obj = coord.get_object("bucket", "key", None, NO_READ).unwrap();
+        let obj = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_READ }).unwrap();
         assert_eq!(obj.data, b"v2");
     }
 
@@ -5486,7 +5521,7 @@ mod tests {
             .put_object(&PutObjectRequest { bucket: "bucket", key: "empty", data: b"", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
-        let obj = coord.get_object("bucket", "empty", None, NO_READ).unwrap();
+        let obj = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "empty", version_id: None, cond: NO_READ }).unwrap();
         assert_eq!(obj.data, b"");
         assert_eq!(obj.size, 0);
     }
@@ -5501,11 +5536,11 @@ mod tests {
             .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
         coord
-            .delete_object("bucket", "key", None, NO_DELETE)
+            .delete_object(&DeleteObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_DELETE })
             .unwrap();
 
         let err = coord
-            .get_object("bucket", "key", None, NO_READ)
+            .get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_READ })
             .unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
     }
@@ -5518,7 +5553,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
         // Should not error
         coord
-            .delete_object("bucket", "no-such-key", None, NO_DELETE)
+            .delete_object(&DeleteObjectRequest { bucket: "bucket", key: "no-such-key", version_id: None, cond: NO_DELETE })
             .unwrap();
     }
 
@@ -5609,7 +5644,7 @@ mod tests {
             .unwrap();
 
         let obj = coord
-            .get_object("bucket", "folder/", None, NO_READ)
+            .get_object(&GetObjectRequest { bucket: "bucket", key: "folder/", version_id: None, cond: NO_READ })
             .unwrap();
         assert_eq!(obj.data, b"data");
         assert_eq!(obj.size, 4);
@@ -5692,7 +5727,7 @@ mod tests {
 
         // Get should still succeed via EC reconstruction
         let obj = coord
-            .get_object("bucket", "resilient", None, NO_READ)
+            .get_object(&GetObjectRequest { bucket: "bucket", key: "resilient", version_id: None, cond: NO_READ })
             .unwrap();
         assert_eq!(obj.data, data);
     }
@@ -5710,7 +5745,7 @@ mod tests {
 
         delete_shard_on_disk(tmp.path(), "bucket", "obj1", 0, 4);
 
-        let obj = coord.get_object("bucket", "obj1", None, NO_READ).unwrap();
+        let obj = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "obj1", version_id: None, cond: NO_READ }).unwrap();
         assert_eq!(obj.data, data);
     }
 
@@ -5730,7 +5765,7 @@ mod tests {
         delete_shard_on_disk(tmp.path(), "bucket", "obj2", 0, 4);
         delete_shard_on_disk(tmp.path(), "bucket", "obj2", 1, 4);
 
-        let obj = coord.get_object("bucket", "obj2", None, NO_READ).unwrap();
+        let obj = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "obj2", version_id: None, cond: NO_READ }).unwrap();
         assert_eq!(obj.data, data);
     }
 
@@ -5752,7 +5787,7 @@ mod tests {
         delete_shard_on_disk(tmp.path(), "bucket", "obj3", 2, 4);
 
         let err = coord
-            .get_object("bucket", "obj3", None, NO_READ)
+            .get_object(&GetObjectRequest { bucket: "bucket", key: "obj3", version_id: None, cond: NO_READ })
             .unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
     }
@@ -5771,7 +5806,7 @@ mod tests {
 
         corrupt_shard_on_disk(tmp.path(), "bucket", "obj4", 0, 4);
 
-        let obj = coord.get_object("bucket", "obj4", None, NO_READ).unwrap();
+        let obj = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "obj4", version_id: None, cond: NO_READ }).unwrap();
         assert_eq!(obj.data, data);
     }
 
@@ -5791,13 +5826,7 @@ mod tests {
 
         // Range get should still succeed via EC reconstruction
         let result = coord
-            .get_object_range(
-                "bucket",
-                "obj5",
-                None,
-                ByteRange::Range { start: 0, end: 4 },
-                NO_READ,
-            )
+            .get_object_range(&GetObjectRangeRequest { bucket: "bucket", key: "obj5", version_id: None, range: ByteRange::Range { start: 0, end: 4 }, cond: NO_READ })
             .unwrap();
         assert_eq!(result.data, b"Hello");
     }
@@ -5817,7 +5846,7 @@ mod tests {
         // Delete first parity shard (index 4, since k=4)
         delete_shard_on_disk(tmp.path(), "bucket", "obj6", 4, 4);
 
-        let obj = coord.get_object("bucket", "obj6", None, NO_READ).unwrap();
+        let obj = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "obj6", version_id: None, cond: NO_READ }).unwrap();
         assert_eq!(obj.data, data);
     }
 
@@ -5839,7 +5868,7 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         let err = coord
-            .get_object("bucket", "no-such-key", None, NO_READ)
+            .get_object(&GetObjectRequest { bucket: "bucket", key: "no-such-key", version_id: None, cond: NO_READ })
             .unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
     }
@@ -5854,10 +5883,10 @@ mod tests {
             .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
 
-        let obj = coord.get_object("bucket", "key", None, NO_READ).unwrap();
+        let obj = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_READ }).unwrap();
         assert_eq!(result.etag, obj.etag);
 
-        let head = coord.head_object("bucket", "key", None, NO_READ).unwrap();
+        let head = coord.head_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_READ }).unwrap();
         assert_eq!(result.etag, head.etag);
     }
 
@@ -6141,8 +6170,8 @@ mod tests {
         assert!(result.errors.is_empty());
 
         // Verify objects are actually gone
-        assert!(coord.get_object("bucket", "key1", None, NO_READ).is_err());
-        assert!(coord.get_object("bucket", "key2", None, NO_READ).is_err());
+        assert!(coord.get_object(&GetObjectRequest { bucket: "bucket", key: "key1", version_id: None, cond: NO_READ }).is_err());
+        assert!(coord.get_object(&GetObjectRequest { bucket: "bucket", key: "key2", version_id: None, cond: NO_READ }).is_err());
     }
 
     #[test]
@@ -6434,13 +6463,7 @@ mod tests {
 
         // bytes=0-4 → "Hello"
         let result = coord
-            .get_object_range(
-                "bucket",
-                "key",
-                None,
-                ByteRange::Range { start: 0, end: 4 },
-                NO_READ,
-            )
+            .get_object_range(&GetObjectRangeRequest { bucket: "bucket", key: "key", version_id: None, range: ByteRange::Range { start: 0, end: 4 }, cond: NO_READ })
             .unwrap();
         assert_eq!(result.data, b"Hello");
         assert_eq!(result.range_start, 0);
@@ -6460,13 +6483,7 @@ mod tests {
 
         // bytes=-6 → "World!"  (last 6 bytes)
         let result = coord
-            .get_object_range(
-                "bucket",
-                "key",
-                None,
-                ByteRange::Suffix { length: 6 },
-                NO_READ,
-            )
+            .get_object_range(&GetObjectRangeRequest { bucket: "bucket", key: "key", version_id: None, range: ByteRange::Suffix { length: 6 }, cond: NO_READ })
             .unwrap();
         assert_eq!(result.data, b"World!");
         assert_eq!(result.range_start, 7);
@@ -6485,13 +6502,7 @@ mod tests {
 
         // bytes=7- → "World!"
         let result = coord
-            .get_object_range(
-                "bucket",
-                "key",
-                None,
-                ByteRange::FromStart { start: 7 },
-                NO_READ,
-            )
+            .get_object_range(&GetObjectRangeRequest { bucket: "bucket", key: "key", version_id: None, range: ByteRange::FromStart { start: 7 }, cond: NO_READ })
             .unwrap();
         assert_eq!(result.data, b"World!");
     }
@@ -6508,13 +6519,7 @@ mod tests {
 
         // bytes=100- → unsatisfiable
         let err = coord
-            .get_object_range(
-                "bucket",
-                "key",
-                None,
-                ByteRange::FromStart { start: 100 },
-                NO_READ,
-            )
+            .get_object_range(&GetObjectRangeRequest { bucket: "bucket", key: "key", version_id: None, range: ByteRange::FromStart { start: 100 }, cond: NO_READ })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidRange { total_size: 5 }));
     }
@@ -6531,16 +6536,10 @@ mod tests {
 
         // bytes=0-99999 on 5-byte object → clamp to 0-4
         let result = coord
-            .get_object_range(
-                "bucket",
-                "key",
-                None,
-                ByteRange::Range {
+            .get_object_range(&GetObjectRangeRequest { bucket: "bucket", key: "key", version_id: None, range: ByteRange::Range {
                     start: 0,
                     end: 99999,
-                },
-                NO_READ,
-            )
+                }, cond: NO_READ })
             .unwrap();
         assert_eq!(result.data, b"Hello");
         assert_eq!(result.range_start, 0);
@@ -6593,7 +6592,7 @@ mod tests {
             .unwrap();
         assert_ne!(r1.etag, r2.etag);
 
-        let obj = coord.get_object("bucket", "key", None, NO_READ).unwrap();
+        let obj = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_READ }).unwrap();
         assert_eq!(obj.data, b"v2");
     }
 
@@ -6631,7 +6630,7 @@ mod tests {
             if_match: Some(put.etag),
             ..Default::default()
         };
-        let obj = coord.get_object("bucket", "key", None, &cond).unwrap();
+        let obj = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: &cond }).unwrap();
         assert_eq!(obj.data, b"data");
     }
 
@@ -6648,7 +6647,7 @@ mod tests {
             if_match: Some("\"0000000000000000\"".to_string()),
             ..Default::default()
         };
-        let err = coord.get_object("bucket", "key", None, &cond).unwrap_err();
+        let err = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: &cond }).unwrap_err();
         assert!(matches!(err, ServerError::PreconditionFailed));
     }
 
@@ -6665,7 +6664,7 @@ mod tests {
             if_none_match: Some(put.etag),
             ..Default::default()
         };
-        let err = coord.get_object("bucket", "key", None, &cond).unwrap_err();
+        let err = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: &cond }).unwrap_err();
         assert!(matches!(err, ServerError::NotModified { .. }));
     }
 
@@ -6682,7 +6681,7 @@ mod tests {
             if_none_match: Some(put.etag),
             ..Default::default()
         };
-        let err = coord.head_object("bucket", "key", None, &cond).unwrap_err();
+        let err = coord.head_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: &cond }).unwrap_err();
         assert!(matches!(err, ServerError::NotModified { .. }));
     }
 
@@ -6696,8 +6695,8 @@ mod tests {
             .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
         let cond = DeleteCondition::IfMatch(put.etag);
-        coord.delete_object("bucket", "key", None, &cond).unwrap();
-        assert!(coord.get_object("bucket", "key", None, NO_READ).is_err());
+        coord.delete_object(&DeleteObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: &cond }).unwrap();
+        assert!(coord.get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_READ }).is_err());
     }
 
     #[test]
@@ -6711,7 +6710,7 @@ mod tests {
 
         let cond = DeleteCondition::IfMatch("\"0000000000000000\"".to_string());
         let err = coord
-            .delete_object("bucket", "key", None, &cond)
+            .delete_object(&DeleteObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: &cond })
             .unwrap_err();
         assert!(matches!(err, ServerError::PreconditionFailed));
     }
@@ -6762,13 +6761,7 @@ mod tests {
             ..Default::default()
         };
         let result = coord
-            .get_object_range(
-                "bucket",
-                "key",
-                None,
-                ByteRange::Range { start: 0, end: 4 },
-                &cond,
-            )
+            .get_object_range(&GetObjectRangeRequest { bucket: "bucket", key: "key", version_id: None, range: ByteRange::Range { start: 0, end: 4 }, cond: &cond })
             .unwrap();
         assert_eq!(result.data, b"Hello");
     }
@@ -6802,7 +6795,7 @@ mod tests {
             .unwrap();
         assert!(!result.etag.is_empty());
 
-        let obj = coord.get_object("bucket", "dst", None, NO_READ).unwrap();
+        let obj = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "dst", version_id: None, cond: NO_READ }).unwrap();
         assert_eq!(obj.data, b"hello copy");
     }
 
@@ -6835,7 +6828,7 @@ mod tests {
             })
             .unwrap();
 
-        let obj = coord.get_object("bucket", "dst", None, NO_READ).unwrap();
+        let obj = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "dst", version_id: None, cond: NO_READ }).unwrap();
         assert_eq!(obj.metadata.get("content-type"), Some("image/png"));
         assert_eq!(obj.metadata.get("x-amz-meta-author"), Some("alice"));
     }
@@ -6870,7 +6863,7 @@ mod tests {
             })
             .unwrap();
 
-        let obj = coord.get_object("bucket", "dst", None, NO_READ).unwrap();
+        let obj = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "dst", version_id: None, cond: NO_READ }).unwrap();
         assert_eq!(obj.data, b"data");
         assert_eq!(obj.metadata.get("content-type"), Some("text/html"));
         assert_eq!(obj.metadata.get("x-amz-meta-version"), Some("2"));
@@ -6905,7 +6898,7 @@ mod tests {
             })
             .unwrap();
 
-        let obj = coord.get_object("bucket", "key", None, NO_READ).unwrap();
+        let obj = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_READ }).unwrap();
         assert_eq!(obj.data, b"data");
         assert_eq!(obj.metadata.get("content-type"), Some("application/json"));
     }
@@ -6942,7 +6935,7 @@ mod tests {
             })
             .unwrap();
 
-        let obj = coord.get_object("bucket", "dst", None, NO_READ).unwrap();
+        let obj = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "dst", version_id: None, cond: NO_READ }).unwrap();
         assert_eq!(obj.data, b"hello");
         // The fake checksum must NOT be persisted.
         assert_eq!(obj.metadata.get("x-amz-checksum-crc32c"), None);
@@ -6981,7 +6974,7 @@ mod tests {
             })
             .unwrap();
 
-        let obj = coord.get_object("bucket", "dst", None, NO_READ).unwrap();
+        let obj = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "dst", version_id: None, cond: NO_READ }).unwrap();
         assert_eq!(obj.data, data);
         // Checksum should be the real CRC32C of "hello", not missing.
         let expected_crc = checksum::crc32c::checksum(data);
@@ -7164,7 +7157,7 @@ mod tests {
             .unwrap();
         assert!(!result.etag.is_empty());
 
-        let obj = coord.get_object("bucket", "dst", None, NO_READ).unwrap();
+        let obj = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "dst", version_id: None, cond: NO_READ }).unwrap();
         assert_eq!(obj.data, b"new data");
     }
 
@@ -7196,14 +7189,14 @@ mod tests {
             .unwrap();
 
         let obj = coord
-            .get_object("dst-bucket", "key", None, NO_READ)
+            .get_object(&GetObjectRequest { bucket: "dst-bucket", key: "key", version_id: None, cond: NO_READ })
             .unwrap();
         assert_eq!(obj.data, b"cross bucket data");
         assert_eq!(obj.metadata.get("content-type"), Some("text/plain"));
 
         // Source should still exist
         let src = coord
-            .get_object("src-bucket", "key", None, NO_READ)
+            .get_object(&GetObjectRequest { bucket: "src-bucket", key: "key", version_id: None, cond: NO_READ })
             .unwrap();
         assert_eq!(src.data, b"cross bucket data");
     }
@@ -7321,7 +7314,7 @@ mod tests {
         coord
             .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
-        let obj = coord.get_object("bucket", "key", None, NO_READ).unwrap();
+        let obj = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_READ }).unwrap();
         assert_eq!(obj.version_id, storage::VersionId::Null);
     }
 
@@ -7334,7 +7327,7 @@ mod tests {
         coord
             .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
-        let head = coord.head_object("bucket", "key", None, NO_READ).unwrap();
+        let head = coord.head_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_READ }).unwrap();
         assert_eq!(head.version_id, storage::VersionId::Null);
     }
 
@@ -7436,7 +7429,7 @@ mod tests {
             });
             let t_read = thread::spawn(move || {
                 b2.wait();
-                reader.get_object("bucket", "key", None, NO_READ)
+                reader.get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_READ })
             });
 
             barrier.wait();
@@ -7501,7 +7494,7 @@ mod tests {
             });
             let t_delete = thread::spawn(move || {
                 b2.wait();
-                deleter.delete_object("bucket", "key", None, NO_DELETE)
+                deleter.delete_object(&DeleteObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_DELETE })
             });
 
             barrier.wait();
@@ -7518,7 +7511,7 @@ mod tests {
                 "concurrent delete failed: {delete_res:?}"
             );
 
-            let check = make_coord().get_object("bucket", "key", None, NO_READ);
+            let check = make_coord().get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_READ });
             match check {
                 Ok(obj) => {
                     assert_eq!(obj.data.len(), object_size);
@@ -7543,7 +7536,7 @@ mod tests {
             .put_object(&PutObjectRequest { bucket: "bucket", key: "key", data: b"data", metadata: &MetadataBlob::new(), cond: NO_WRITE })
             .unwrap();
         let result = coord
-            .delete_object("bucket", "key", None, NO_DELETE)
+            .delete_object(&DeleteObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_DELETE })
             .unwrap();
         assert_eq!(result.version_id, storage::VersionId::Null);
         assert!(!result.delete_marker);
@@ -8881,7 +8874,7 @@ mod tests {
             create_completed_multipart_vec(&coord, "bucket", "key", &[(1, part1), (2, part2)]);
 
         let obj = coord
-            .get_object("bucket", "key", None, &ReadCondition::default())
+            .get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: &ReadCondition::default() })
             .unwrap();
         assert_eq!(obj.data, expected);
         assert_eq!(obj.etag, result.etag);
@@ -8898,7 +8891,7 @@ mod tests {
         create_completed_multipart_vec(&coord, "bucket", "key", &[(1, b"only-part".to_vec())]);
 
         let obj = coord
-            .get_object("bucket", "key", None, &ReadCondition::default())
+            .get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: &ReadCondition::default() })
             .unwrap();
         assert_eq!(obj.data, b"only-part");
     }
@@ -8917,7 +8910,7 @@ mod tests {
             create_completed_multipart_vec(&coord, "bucket", "key", &[(1, part1), (2, part2)]);
 
         let head = coord
-            .head_object("bucket", "key", None, &ReadCondition::default())
+            .head_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: &ReadCondition::default() })
             .unwrap();
         assert_eq!(head.size, total_size as u64);
         assert_eq!(head.etag, result.etag);
@@ -8937,13 +8930,7 @@ mod tests {
 
         // Range within first part: bytes 10-19
         let range = coord
-            .get_object_range(
-                "bucket",
-                "key",
-                None,
-                ByteRange::Range { start: 10, end: 19 },
-                &ReadCondition::default(),
-            )
+            .get_object_range(&GetObjectRangeRequest { bucket: "bucket", key: "key", version_id: None, range: ByteRange::Range { start: 10, end: 19 }, cond: &ReadCondition::default() })
             .unwrap();
         assert_eq!(range.data, vec![0xAA; 10]);
         assert_eq!(range.range_start, 10);
@@ -8970,16 +8957,10 @@ mod tests {
         // Range spanning part1/part2 boundary: last 4 bytes of part1 + first 4 of part2
         let boundary = MIN_PART as u64;
         let range = coord
-            .get_object_range(
-                "bucket",
-                "key",
-                None,
-                ByteRange::Range {
+            .get_object_range(&GetObjectRangeRequest { bucket: "bucket", key: "key", version_id: None, range: ByteRange::Range {
                     start: boundary - 4,
                     end: boundary + 3,
-                },
-                &ReadCondition::default(),
-            )
+                }, cond: &ReadCondition::default() })
             .unwrap();
         let mut expected = vec![0xAA; 4];
         expected.extend_from_slice(&[0xBB; 4]);
@@ -8999,13 +8980,7 @@ mod tests {
 
         // Suffix range: last 50 bytes (all within part2)
         let range = coord
-            .get_object_range(
-                "bucket",
-                "key",
-                None,
-                ByteRange::Suffix { length: 50 },
-                &ReadCondition::default(),
-            )
+            .get_object_range(&GetObjectRangeRequest { bucket: "bucket", key: "key", version_id: None, range: ByteRange::Suffix { length: 50 }, cond: &ReadCondition::default() })
             .unwrap();
         assert_eq!(range.data, vec![0xBB; 50]);
     }
@@ -9041,7 +9016,7 @@ mod tests {
 
         // Destination should have the concatenated data as inline object.
         let dst = coord
-            .get_object("dst-bucket", "dst-key", None, &ReadCondition::default())
+            .get_object(&GetObjectRequest { bucket: "dst-bucket", key: "dst-key", version_id: None, cond: &ReadCondition::default() })
             .unwrap();
         assert_eq!(dst.data, expected);
     }
@@ -9055,7 +9030,7 @@ mod tests {
         create_completed_multipart_vec(&coord, "bucket", "key", &[(1, vec![])]);
 
         let obj = coord
-            .get_object("bucket", "key", None, &ReadCondition::default())
+            .get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: &ReadCondition::default() })
             .unwrap();
         assert!(obj.data.is_empty());
         assert_eq!(obj.size, 0);
@@ -9073,7 +9048,7 @@ mod tests {
         create_completed_multipart_vec(&coord, "bucket", "key", &[(1, part1), (2, vec![])]);
 
         let obj = coord
-            .get_object("bucket", "key", None, &ReadCondition::default())
+            .get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: &ReadCondition::default() })
             .unwrap();
         assert_eq!(obj.data, expected);
         assert_eq!(obj.size, MIN_PART as u64);
@@ -9088,7 +9063,7 @@ mod tests {
         create_completed_multipart_vec(&coord, "bucket", "key", &[(1, vec![])]);
 
         let result = coord
-            .get_object_part("bucket", "key", None, 1, &ReadCondition::default())
+            .get_object_part(&GetObjectPartRequest { bucket: "bucket", key: "key", version_id: None, part_number: 1, cond: &ReadCondition::default() })
             .unwrap();
         assert!(result.data.is_empty());
         assert_eq!(result.size, 0);
@@ -9108,7 +9083,7 @@ mod tests {
 
         // Part 1 should return full data
         let result = coord
-            .get_object_part("bucket", "key", None, 1, &ReadCondition::default())
+            .get_object_part(&GetObjectPartRequest { bucket: "bucket", key: "key", version_id: None, part_number: 1, cond: &ReadCondition::default() })
             .unwrap();
         assert_eq!(result.data, part1);
         assert_eq!(result.part_start, 0);
@@ -9116,7 +9091,7 @@ mod tests {
 
         // Part 2 (zero-byte) should return empty data
         let result = coord
-            .get_object_part("bucket", "key", None, 2, &ReadCondition::default())
+            .get_object_part(&GetObjectPartRequest { bucket: "bucket", key: "key", version_id: None, part_number: 2, cond: &ReadCondition::default() })
             .unwrap();
         assert!(result.data.is_empty());
         assert_eq!(result.parts_count, 2);
@@ -9136,7 +9111,7 @@ mod tests {
 
         // partNumber=1 on non-multipart object returns the full object.
         let result = coord
-            .head_object_part("bucket", "key", None, 1, &ReadCondition::default())
+            .head_object_part(&GetObjectPartRequest { bucket: "bucket", key: "key", version_id: None, part_number: 1, cond: &ReadCondition::default() })
             .unwrap();
         assert_eq!(result.part_size, 11);
         assert_eq!(result.total_size, 11);
@@ -9145,7 +9120,7 @@ mod tests {
 
         // partNumber=2 on non-multipart object returns InvalidPart.
         let err = coord
-            .head_object_part("bucket", "key", None, 2, &ReadCondition::default())
+            .head_object_part(&GetObjectPartRequest { bucket: "bucket", key: "key", version_id: None, part_number: 2, cond: &ReadCondition::default() })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidPart { part_number: 2 }));
     }
@@ -9161,7 +9136,7 @@ mod tests {
             .unwrap();
 
         let result = coord
-            .head_object_part("bucket", "key", None, 1, &ReadCondition::default())
+            .head_object_part(&GetObjectPartRequest { bucket: "bucket", key: "key", version_id: None, part_number: 1, cond: &ReadCondition::default() })
             .unwrap();
         assert_eq!(result.part_size, 0);
         assert_eq!(result.total_size, 0);
@@ -9177,7 +9152,7 @@ mod tests {
         create_completed_multipart_vec(&coord, "bucket", "key", &[(1, vec![])]);
 
         let head = coord
-            .head_object("bucket", "key", None, &ReadCondition::default())
+            .head_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: &ReadCondition::default() })
             .unwrap();
         assert_eq!(head.size, 0);
     }
@@ -9207,7 +9182,7 @@ mod tests {
             .unwrap();
 
         let dst = coord
-            .get_object("dst", "key", None, &ReadCondition::default())
+            .get_object(&GetObjectRequest { bucket: "dst", key: "key", version_id: None, cond: &ReadCondition::default() })
             .unwrap();
         assert!(dst.data.is_empty());
     }
@@ -9239,7 +9214,7 @@ mod tests {
         drop(pg);
 
         let err = coord
-            .get_object("bucket", "key", None, &ReadCondition::default())
+            .get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: &ReadCondition::default() })
             .unwrap_err();
         assert!(
             matches!(err, ServerError::IntegrityError { .. }),
@@ -9590,7 +9565,7 @@ mod tests {
         assert_eq!(result.version_id, storage::VersionId::Null);
 
         // Verify object is visible via head_object.
-        let head = coord.head_object("bucket", "mykey", None, NO_READ).unwrap();
+        let head = coord.head_object(&GetObjectRequest { bucket: "bucket", key: "mykey", version_id: None, cond: NO_READ }).unwrap();
         assert_eq!(head.size, full_data.len() as u64);
         assert_eq!(head.etag, format_etag(crc));
         assert_eq!(head.metadata.get("x-amz-meta-foo"), Some("bar"));
@@ -9621,7 +9596,7 @@ mod tests {
 
         assert_eq!(result.etag, format_etag(crc));
 
-        let head = coord.head_object("bucket", "mykey", None, NO_READ).unwrap();
+        let head = coord.head_object(&GetObjectRequest { bucket: "bucket", key: "mykey", version_id: None, cond: NO_READ }).unwrap();
         assert_eq!(head.size, 0);
     }
 
@@ -9643,7 +9618,7 @@ mod tests {
 
         // Object should not exist.
         let err = coord
-            .head_object("bucket", "mykey", None, NO_READ)
+            .head_object(&GetObjectRequest { bucket: "bucket", key: "mykey", version_id: None, cond: NO_READ })
             .unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
     }
@@ -9813,7 +9788,7 @@ mod tests {
         assert_eq!(result.etag, format_etag(crc));
 
         // Head should show the new object.
-        let head = coord.head_object("bucket", "key", None, NO_READ).unwrap();
+        let head = coord.head_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_READ }).unwrap();
         assert_eq!(head.size, new_data.len() as u64);
     }
 
@@ -9980,11 +9955,11 @@ mod tests {
             .unwrap();
 
         // HEAD works (metadata-only).
-        let head = coord.head_object("bucket", "key", None, NO_READ).unwrap();
+        let head = coord.head_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_READ }).unwrap();
         assert_eq!(head.size, 5);
 
         // GET returns the correct data.
-        let result = coord.get_object("bucket", "key", None, NO_READ).unwrap();
+        let result = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_READ }).unwrap();
         assert_eq!(result.data, b"hello");
         assert_eq!(result.size, 5);
     }
@@ -10021,7 +9996,7 @@ mod tests {
             })
             .unwrap();
 
-        let result = coord.get_object("bucket", "key", None, NO_READ).unwrap();
+        let result = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_READ }).unwrap();
         assert_eq!(result.data, full_data);
         assert_eq!(result.size, 10);
     }
@@ -10057,49 +10032,25 @@ mod tests {
 
         // Range within first chunk.
         let r1 = coord
-            .get_object_range(
-                "bucket",
-                "key",
-                None,
-                ByteRange::Range { start: 0, end: 3 },
-                NO_READ,
-            )
+            .get_object_range(&GetObjectRangeRequest { bucket: "bucket", key: "key", version_id: None, range: ByteRange::Range { start: 0, end: 3 }, cond: NO_READ })
             .unwrap();
         assert_eq!(r1.data, b"AAAA");
 
         // Range spanning chunks.
         let r2 = coord
-            .get_object_range(
-                "bucket",
-                "key",
-                None,
-                ByteRange::Range { start: 2, end: 5 },
-                NO_READ,
-            )
+            .get_object_range(&GetObjectRangeRequest { bucket: "bucket", key: "key", version_id: None, range: ByteRange::Range { start: 2, end: 5 }, cond: NO_READ })
             .unwrap();
         assert_eq!(r2.data, b"AABB");
 
         // Range within second chunk.
         let r3 = coord
-            .get_object_range(
-                "bucket",
-                "key",
-                None,
-                ByteRange::Range { start: 4, end: 7 },
-                NO_READ,
-            )
+            .get_object_range(&GetObjectRangeRequest { bucket: "bucket", key: "key", version_id: None, range: ByteRange::Range { start: 4, end: 7 }, cond: NO_READ })
             .unwrap();
         assert_eq!(r3.data, b"BBBB");
 
         // Suffix range.
         let r4 = coord
-            .get_object_range(
-                "bucket",
-                "key",
-                None,
-                ByteRange::Suffix { length: 3 },
-                NO_READ,
-            )
+            .get_object_range(&GetObjectRangeRequest { bucket: "bucket", key: "key", version_id: None, range: ByteRange::Suffix { length: 3 }, cond: NO_READ })
             .unwrap();
         assert_eq!(r4.data, b"BBB");
     }
@@ -10145,7 +10096,7 @@ mod tests {
             .unwrap();
 
         // Destination should be a normal (non-chunk-manifest) object.
-        let result = coord.get_object("bucket", "dst", None, NO_READ).unwrap();
+        let result = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "dst", version_id: None, cond: NO_READ }).unwrap();
         assert_eq!(result.data, b"copy-me");
     }
 
@@ -10170,7 +10121,7 @@ mod tests {
             })
             .unwrap();
 
-        let result = coord.get_object("bucket", "empty", None, NO_READ).unwrap();
+        let result = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "empty", version_id: None, cond: NO_READ }).unwrap();
         assert_eq!(result.data, b"");
         assert_eq!(result.size, 0);
     }
@@ -10200,7 +10151,7 @@ mod tests {
             .unwrap();
 
         let result = coord
-            .get_object_part("bucket", "key", None, 1, NO_READ)
+            .get_object_part(&GetObjectPartRequest { bucket: "bucket", key: "key", version_id: None, part_number: 1, cond: NO_READ })
             .unwrap();
         assert_eq!(result.data, b"partdata");
     }
@@ -10231,7 +10182,7 @@ mod tests {
             .unwrap();
 
         // Verify stream-put is readable.
-        let r1 = coord.get_object("bucket", "key", None, NO_READ).unwrap();
+        let r1 = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_READ }).unwrap();
         assert_eq!(r1.data, b"stream-data");
 
         // Overwrite with a normal PUT.
@@ -10240,7 +10191,7 @@ mod tests {
             .unwrap();
 
         // GET should return the new data, not stale chunk data.
-        let r2 = coord.get_object("bucket", "key", None, NO_READ).unwrap();
+        let r2 = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_READ }).unwrap();
         assert_eq!(r2.data, b"normal-data");
     }
 
@@ -10270,17 +10221,12 @@ mod tests {
 
         // Delete the object.
         coord
-            .delete_object(
-                "bucket",
-                "key",
-                None,
-                &crate::conditional::DeleteCondition::default(),
-            )
+            .delete_object(&DeleteObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: &crate::conditional::DeleteCondition::default() })
             .unwrap();
 
         // Object should be gone.
         let err = coord
-            .get_object("bucket", "key", None, NO_READ)
+            .get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_READ })
             .unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
     }
@@ -10631,7 +10577,7 @@ mod tests {
 
         // Read back A's data — should be A's content.
         let obj_a = coord
-            .get_object_part("bucket", "key", None, 1, &ReadCondition::default())
+            .get_object_part(&GetObjectPartRequest { bucket: "bucket", key: "key", version_id: None, part_number: 1, cond: &ReadCondition::default() })
             .unwrap();
         assert_eq!(
             obj_a.data, data_a,
@@ -10645,7 +10591,7 @@ mod tests {
 
         // Read back B's data — should be B's content, not A's.
         let obj_b = coord
-            .get_object_part("bucket", "key", None, 1, &ReadCondition::default())
+            .get_object_part(&GetObjectPartRequest { bucket: "bucket", key: "key", version_id: None, part_number: 1, cond: &ReadCondition::default() })
             .unwrap();
         assert_eq!(
             obj_b.data, data_b,
@@ -10814,7 +10760,7 @@ mod tests {
         assert_eq!(count, 0);
 
         // Object should still be readable.
-        let result = coord.get_object("bucket", "key", None, NO_READ).unwrap();
+        let result = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_READ }).unwrap();
         assert_eq!(result.data, b"safe-data");
     }
 
@@ -10832,13 +10778,13 @@ mod tests {
 
         // Key should not exist yet.
         let err = coord
-            .get_object("bucket", "new-key", None, NO_READ)
+            .get_object(&GetObjectRequest { bucket: "bucket", key: "new-key", version_id: None, cond: NO_READ })
             .unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
 
         // HEAD should also fail.
         let err = coord
-            .head_object("bucket", "new-key", None, NO_READ)
+            .head_object(&GetObjectRequest { bucket: "bucket", key: "new-key", version_id: None, cond: NO_READ })
             .unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
     }
@@ -10889,7 +10835,7 @@ mod tests {
         } // Drop PG lock before coordinator calls.
 
         // Verify full readback via coordinator.
-        let result = coord.get_object("bucket", "verify", None, NO_READ).unwrap();
+        let result = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "verify", version_id: None, cond: NO_READ }).unwrap();
         assert_eq!(result.data, full);
 
         // Verify CRC matches.
@@ -10923,12 +10869,7 @@ mod tests {
 
         // 2. Delete.
         coord
-            .delete_object(
-                "bucket",
-                "cycle",
-                None,
-                &crate::conditional::DeleteCondition::default(),
-            )
+            .delete_object(&DeleteObjectRequest { bucket: "bucket", key: "cycle", version_id: None, cond: &crate::conditional::DeleteCondition::default() })
             .unwrap();
 
         // 3. Normal put.
@@ -10937,7 +10878,7 @@ mod tests {
             .unwrap();
 
         // 4. GET should return normal-put data, no chunk manifest interference.
-        let result = coord.get_object("bucket", "cycle", None, NO_READ).unwrap();
+        let result = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "cycle", version_id: None, cond: NO_READ }).unwrap();
         assert_eq!(result.data, b"v2-normal");
     }
 
@@ -10982,7 +10923,7 @@ mod tests {
             })
             .unwrap();
 
-        let result = coord.get_object("bucket", "key", None, NO_READ).unwrap();
+        let result = coord.get_object(&GetObjectRequest { bucket: "bucket", key: "key", version_id: None, cond: NO_READ }).unwrap();
         assert_eq!(result.data, b"new-data");
     }
 }

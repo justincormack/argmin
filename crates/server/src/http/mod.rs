@@ -529,7 +529,13 @@ impl HttpFrontend {
                     }
                     let result = self
                         .coordinator
-                        .get_object_part(&bucket, &key, vid, part_number, &cond)
+                        .get_object_part(&crate::coordinator::GetObjectPartRequest {
+                            bucket: &bucket,
+                            key: &key,
+                            version_id: vid,
+                            part_number,
+                            cond: &cond,
+                        })
                         .map_err(|e| match e {
                             ServerError::InvalidPart { .. } => {
                                 ServerError::InvalidRange { total_size: 0 }
@@ -551,7 +557,13 @@ impl HttpFrontend {
                     let byte_range = crate::range::ByteRange::parse(range_header)?;
                     match self
                         .coordinator
-                        .get_object_range(&bucket, &key, vid, byte_range, &cond)
+                        .get_object_range(&crate::coordinator::GetObjectRangeRequest {
+                            bucket: &bucket,
+                            key: &key,
+                            version_id: vid,
+                            range: byte_range,
+                            cond: &cond,
+                        })
                     {
                         Ok(result) => {
                             let tags = result.tags.clone();
@@ -573,7 +585,14 @@ impl HttpFrontend {
                         Err(e) => Err(e),
                     }
                 } else {
-                    let result = self.coordinator.get_object(&bucket, &key, vid, &cond)?;
+                    let result = self.coordinator.get_object(
+                        &crate::coordinator::GetObjectRequest {
+                            bucket: &bucket,
+                            key: &key,
+                            version_id: vid,
+                            cond: &cond,
+                        },
+                    )?;
                     let checksum_mode = req.header("x-amz-checksum-mode");
                     let tags = result.tags.clone();
                     let mut resp = S3Response::get_object(result, checksum_mode);
@@ -593,7 +612,14 @@ impl HttpFrontend {
                 self.authorize_bucket_write(auth, &bucket)?;
                 let cond = delete_condition_from_headers(req)?;
                 let vid = parse_version_id(req)?;
-                let result = self.coordinator.delete_object(&bucket, &key, vid, &cond)?;
+                let result = self.coordinator.delete_object(
+                    &crate::coordinator::DeleteObjectRequest {
+                        bucket: &bucket,
+                        key: &key,
+                        version_id: vid,
+                        cond: &cond,
+                    },
+                )?;
                 Ok(S3Response::delete_object(&result))
             }
             S3Operation::HeadObject { bucket, key } => {
@@ -612,7 +638,13 @@ impl HttpFrontend {
                     }
                     let result = self
                         .coordinator
-                        .head_object_part(&bucket, &key, vid, part_number, &cond)
+                        .head_object_part(&crate::coordinator::GetObjectPartRequest {
+                            bucket: &bucket,
+                            key: &key,
+                            version_id: vid,
+                            part_number,
+                            cond: &cond,
+                        })
                         .map_err(|e| match e {
                             ServerError::InvalidPart { .. } => {
                                 ServerError::InvalidRange { total_size: 0 }
@@ -629,7 +661,14 @@ impl HttpFrontend {
                     }
                     Ok(resp)
                 } else {
-                    let result = self.coordinator.head_object(&bucket, &key, vid, &cond)?;
+                    let result = self.coordinator.head_object(
+                        &crate::coordinator::GetObjectRequest {
+                            bucket: &bucket,
+                            key: &key,
+                            version_id: vid,
+                            cond: &cond,
+                        },
+                    )?;
                     let checksum_mode = req.header("x-amz-checksum-mode");
                     let mut resp = S3Response::head_object(&result, checksum_mode);
                     if let Some(tags_xml) = &result.tags {
