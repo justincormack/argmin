@@ -340,6 +340,40 @@ pub enum BucketAcl {
     UnsupportedPublic,
 }
 
+/// Object ownership mode relevant to CreateBucket semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BucketObjectOwnership {
+    BucketOwnerEnforced,
+    BucketOwnerPreferred,
+    ObjectWriter,
+}
+
+impl BucketObjectOwnership {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BucketOwnerEnforced => "BucketOwnerEnforced",
+            Self::BucketOwnerPreferred => "BucketOwnerPreferred",
+            Self::ObjectWriter => "ObjectWriter",
+        }
+    }
+}
+
+/// Request for a CreateBucket operation.
+#[derive(Debug)]
+pub struct CreateBucketRequest<'a> {
+    pub name: &'a str,
+    pub requester: Requester<'a>,
+    pub acl: BucketAcl,
+    pub ownership: BucketObjectOwnership,
+}
+
+/// Request for a ListBuckets operation.
+#[derive(Debug)]
+pub struct ListBucketsRequest<'a> {
+    pub requester: Requester<'a>,
+}
+
 /// Request for a GetObject or HeadObject operation.
 #[derive(Debug)]
 pub struct GetObjectRequest<'a> {
@@ -818,6 +852,17 @@ impl Coordinator {
         bucket.public_read && !Self::ignores_public_acls(bucket.public_access_block.as_deref())
     }
 
+    fn requester_principal_required(requester: Requester<'_>) -> Result<&str, ServerError> {
+        requester.principal_opt().ok_or(ServerError::AccessDenied)
+    }
+
+    fn ownership_controls_xml(ownership: BucketObjectOwnership) -> String {
+        format!(
+            "<OwnershipControls><Rule><ObjectOwnership>{}</ObjectOwnership></Rule></OwnershipControls>",
+            ownership.as_str()
+        )
+    }
+
     fn authorize_bucket_read_requester(
         &self,
         requester: Requester<'_>,
@@ -905,6 +950,33 @@ impl Coordinator {
 
     pub fn create_bucket(&self, name: &str) -> Result<(), ServerError> {
         self.create_bucket_for_owner("default-owner", name, false)
+    }
+
+    pub fn create_bucket_for_requester(
+        &self,
+        req: &CreateBucketRequest<'_>,
+    ) -> Result<(), ServerError> {
+        let owner_principal = Self::requester_principal_required(req.requester)?;
+        let public_read = match req.acl {
+            BucketAcl::Private => false,
+            BucketAcl::PublicRead => true,
+            BucketAcl::UnsupportedPublic => {
+                return Err(ServerError::NotImplemented {
+                    feature: "public-read-write and authenticated-read ACLs".to_string(),
+                });
+            }
+        };
+
+        if req.ownership == BucketObjectOwnership::BucketOwnerEnforced && public_read {
+            return Err(ServerError::InvalidBucketAclWithObjectOwnership);
+        }
+
+        self.create_bucket_for_owner(owner_principal, req.name, public_read)?;
+        self.put_bucket_ownership_controls(
+            req.name,
+            &Self::ownership_controls_xml(req.ownership),
+            Requester::principal(owner_principal),
+        )
     }
 
     pub fn create_bucket_for_owner(
@@ -1000,6 +1072,13 @@ impl Coordinator {
 
     pub fn list_buckets(&self) -> Result<Vec<BucketSummary>, ServerError> {
         self.list_buckets_for_owner("default-owner")
+    }
+
+    pub fn list_buckets_for_requester(
+        &self,
+        req: &ListBucketsRequest<'_>,
+    ) -> Result<Vec<BucketSummary>, ServerError> {
+        self.list_buckets_for_owner(Self::requester_principal_required(req.requester)?)
     }
 
     pub fn list_buckets_for_owner(
@@ -5738,6 +5817,59 @@ mod tests {
             .map(|b| b.name.clone())
             .collect();
         assert_eq!(names, vec!["alpha", "beta", "mango", "zz-top"]);
+    }
+
+    #[test]
+    fn list_buckets_for_requester_rejects_anonymous() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+
+        let err = coord
+            .list_buckets_for_requester(&ListBucketsRequest {
+                requester: Requester::anonymous(),
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn create_bucket_for_requester_sets_ownership_controls() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+
+        coord
+            .create_bucket_for_requester(&CreateBucketRequest {
+                name: "bucket",
+                requester: Requester::principal("owner-a"),
+                acl: BucketAcl::Private,
+                ownership: BucketObjectOwnership::ObjectWriter,
+            })
+            .unwrap();
+
+        let controls = coord
+            .get_bucket_ownership_controls("bucket", Requester::principal("owner-a"))
+            .unwrap()
+            .unwrap();
+        assert!(controls.contains("<ObjectOwnership>ObjectWriter</ObjectOwnership>"));
+    }
+
+    #[test]
+    fn create_bucket_for_requester_rejects_public_read_with_owner_enforced() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+
+        let err = coord
+            .create_bucket_for_requester(&CreateBucketRequest {
+                name: "bucket",
+                requester: Requester::principal("owner-a"),
+                acl: BucketAcl::PublicRead,
+                ownership: BucketObjectOwnership::BucketOwnerEnforced,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ServerError::InvalidBucketAclWithObjectOwnership
+        ));
     }
 
     #[test]

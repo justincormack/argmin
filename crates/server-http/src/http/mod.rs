@@ -221,56 +221,27 @@ impl HttpFrontend {
         // Dispatch to coordinator
         match operation {
             S3Operation::ListBuckets => {
-                let owner_principal = self.require_principal(auth)?;
-                let buckets = self.coordinator.list_buckets_for_owner(owner_principal)?;
+                let requester =
+                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                let owner_principal = auth.principal.as_deref().ok_or(ServerError::AccessDenied)?;
+                let buckets = self.coordinator.list_buckets_for_requester(
+                    &crate::coordinator::ListBucketsRequest { requester },
+                )?;
                 Ok(S3Response::list_buckets(&buckets, owner_principal))
             }
             S3Operation::CreateBucket { bucket } => {
-                let owner_principal = self.require_principal(auth)?;
                 let acl = parse_bucket_acl(req)?;
-                let public_read = match acl {
-                    crate::coordinator::BucketAcl::Private => false,
-                    crate::coordinator::BucketAcl::PublicRead => true,
-                    crate::coordinator::BucketAcl::UnsupportedPublic => {
-                        return Err(ServerError::NotImplemented {
-                            feature: "public-read-write and authenticated-read ACLs".to_string(),
-                        });
-                    }
-                };
-                // Validate x-amz-object-ownership header before creating bucket
-                let ownership_xml = if let Some(ownership) = req.header("x-amz-object-ownership") {
-                    match ownership {
-                        "BucketOwnerEnforced" | "BucketOwnerPreferred" | "ObjectWriter" => {
-                            // BucketOwnerEnforced conflicts with public ACLs
-                            if ownership == "BucketOwnerEnforced" && public_read {
-                                return Err(ServerError::InvalidBucketAclWithObjectOwnership);
-                            }
-                            Some(xml::get_ownership_controls_xml(ownership))
-                        }
-                        _ => {
-                            return Err(ServerError::InvalidArgument {
-                                reason: format!(
-                                    "invalid x-amz-object-ownership value: {ownership}"
-                                ),
-                            });
-                        }
-                    }
-                } else {
-                    // AWS default since April 2023: BucketOwnerEnforced
-                    if public_read {
-                        return Err(ServerError::InvalidBucketAclWithObjectOwnership);
-                    }
-                    Some(xml::get_ownership_controls_xml("BucketOwnerEnforced"))
-                };
-                self.coordinator
-                    .create_bucket_for_owner(owner_principal, &bucket, public_read)?;
-                if let Some(config_xml) = ownership_xml {
-                    self.coordinator.put_bucket_ownership_controls(
-                        &bucket,
-                        &config_xml,
-                        crate::coordinator::Requester::principal(owner_principal),
-                    )?;
-                }
+                let ownership = parse_bucket_ownership(req.header("x-amz-object-ownership"))?;
+                let requester =
+                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                self.coordinator.create_bucket_for_requester(
+                    &crate::coordinator::CreateBucketRequest {
+                        name: &bucket,
+                        requester,
+                        acl,
+                        ownership,
+                    },
+                )?;
                 Ok(S3Response::create_bucket(&bucket))
             }
             S3Operation::DeleteBucket { bucket } => {
@@ -1523,12 +1494,6 @@ impl HttpFrontend {
         Ok(Some(req.with_decoded_body(decoded.data, decoded.trailers)))
     }
 
-    fn require_principal<'a>(&self, auth: &'a AuthContext) -> Result<&'a str, ServerError> {
-        auth.principal
-            .as_deref()
-            .ok_or(ServerError::Auth(auth::AuthError::AccessDenied))
-    }
-
     fn handle_post_object(
         &self,
         req: &S3Request,
@@ -2279,6 +2244,24 @@ fn parse_bucket_acl(req: &S3Request) -> Result<crate::coordinator::BucketAcl, Se
         }
         Some(other) => Err(ServerError::InvalidArgument {
             reason: format!("unsupported x-amz-acl value: {other}"),
+        }),
+    }
+}
+
+fn parse_bucket_ownership(
+    value: Option<&str>,
+) -> Result<crate::coordinator::BucketObjectOwnership, ServerError> {
+    match value {
+        None => Ok(crate::coordinator::BucketObjectOwnership::BucketOwnerEnforced),
+        Some("BucketOwnerEnforced") => {
+            Ok(crate::coordinator::BucketObjectOwnership::BucketOwnerEnforced)
+        }
+        Some("BucketOwnerPreferred") => {
+            Ok(crate::coordinator::BucketObjectOwnership::BucketOwnerPreferred)
+        }
+        Some("ObjectWriter") => Ok(crate::coordinator::BucketObjectOwnership::ObjectWriter),
+        Some(other) => Err(ServerError::InvalidArgument {
+            reason: format!("invalid x-amz-object-ownership value: {other}"),
         }),
     }
 }

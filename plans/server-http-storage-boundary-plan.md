@@ -62,6 +62,9 @@ Completed:
    - `CopyObject`
    - streaming `PutObject`
 10. `server-http` no longer has bucket/object auth helpers
+11. `CreateBucket` and `ListBuckets` now use core-owned request types and no
+    longer route owner-principal plumbing or ownership-controls semantics
+    through `server-http`
 
 Current state:
 
@@ -157,16 +160,11 @@ reclamation race is not an auth problem and is tracked separately.
 
 ### Still worth cleaning up
 
-1. `ListBuckets` still derives the owner principal in `server-http` and calls
-   `list_buckets_for_owner(...)` directly
-2. `CreateBucket` still assembles request semantics in `server-http` by
-   translating `x-amz-acl` and `x-amz-object-ownership` into multiple core
-   calls (`create_bucket_for_owner` plus `put_bucket_ownership_controls`)
-3. successful write paths still apply tags as a second core call from
+1. successful write paths still apply tags as a second core call from
    `server-http` in some flows (`PutObject`, `CopyObject`, `POST Object`,
    streaming finalize), which is no longer an auth leak but is still a split
    operation across the boundary
-4. the deeper `server-core -> storage` concreteness question remains open, but
+2. the deeper `server-core -> storage` concreteness question remains open, but
    is intentionally deferred
 
 ## Recommended Interface Shape
@@ -189,17 +187,7 @@ The rule is:
 
 ## Remaining Implementation Order
 
-### Step 1: decide whether to normalize `CreateBucket` and `ListBuckets`
-
-Optional cleanup:
-
-1. introduce core-owned request types for `CreateBucket` and `ListBuckets`
-2. move owner-principal plumbing and bucket-create request semantics fully into
-   `server-core`
-
-This is no longer a correctness blocker; it is an interface-cleanliness choice.
-
-### Step 2: collapse post-write tagging into core-owned flows
+### Step 1: collapse post-write tagging into core-owned flows
 
 Optional cleanup:
 
@@ -211,7 +199,7 @@ Optional cleanup:
 This would reduce boundary chatter and tighten write atomicity semantics, but
 it is separate from the authz layering problem already solved above.
 
-### Step 3: reassess the deeper core/storage boundary
+### Step 2: reassess the deeper core/storage boundary
 
 Only after the HTTP/core split is judged complete enough on its own:
 
