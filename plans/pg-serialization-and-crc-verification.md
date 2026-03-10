@@ -28,14 +28,14 @@ The etag is `crc64::checksum(metadata_blob_bytes || user_data)` computed before 
 
 ### Changes
 
-**`crates/server/src/error.rs`** — Add variant:
+**`crates/server-core/src/error.rs`** — Add variant:
 ```rust
 #[error("data integrity error for {bucket}/{key}")]
 IntegrityError { bucket: String, key: String, expected: u64, actual: u64 },
 ```
 - `s3_error_code` → `"InternalError"`, `http_status` → `500`
 
-**`crates/server/src/coordinator.rs`** — In `get_object`, after line 1004 (after `read_range` succeeds):
+**`crates/server-core/src/coordinator.rs`** — In `get_object`, after line 1004 (after `read_range` succeeds):
 ```rust
 let actual_crc = crc64::checksum(&data);
 if actual_crc != etag_crc {
@@ -95,7 +95,7 @@ let shard_pg: &PgStore = match &shard_guard { Some(g) => g, None => meta_pg };
 
 ### Coordinator changes
 
-**`crates/server/src/coordinator.rs`**:
+**`crates/server-core/src/coordinator.rs`**:
 
 1. `storage_node: LocalStorageNode` → `storage_node: Arc<SharedStorageNode>`
 2. `Coordinator::new()` takes `Arc<SharedStorageNode>`
@@ -119,7 +119,7 @@ let shard_pg: &PgStore = match &shard_guard { Some(g) => g, None => meta_pg };
 
 ### Server creation changes
 
-**`crates/server/src/main.rs`** — Create one `Arc<SharedStorageNode>`, share across workers:
+**`crates/server-http/src/main.rs`** — Create one `Arc<SharedStorageNode>`, share across workers:
 ```rust
 let storage_node = Arc::new(SharedStorageNode::open(data_dir, &pg_ids)?);
 for _ in 0..config.workers {
@@ -135,9 +135,9 @@ for _ in 0..config.workers {
 |------|--------|
 | `crates/storage/src/node.rs` | Add `SharedStorageNode` with `Mutex<PgStore>` + `lock_two_pgs` |
 | `crates/storage/src/lib.rs` | Add `pub use node::SharedStorageNode` |
-| `crates/server/src/error.rs` | Add `IntegrityError` variant + mappings |
-| `crates/server/src/coordinator.rs` | `Arc<SharedStorageNode>`, refactor `write_object_inner`, CRC verification, all `get_pg` call sites |
-| `crates/server/src/main.rs` | Shared `Arc<SharedStorageNode>` across workers |
+| `crates/server-core/src/error.rs` | Add `IntegrityError` variant + mappings |
+| `crates/server-core/src/coordinator.rs` | `Arc<SharedStorageNode>`, refactor `write_object_inner`, CRC verification, all `get_pg` call sites |
+| `crates/server-http/src/main.rs` | Shared `Arc<SharedStorageNode>` across workers |
 | `crates/s3-tests/src/server.rs` | Shared `Arc<SharedStorageNode>` across frontends |
 
 ## Implementation order

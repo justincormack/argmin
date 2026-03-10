@@ -8,7 +8,7 @@ members = [
     "crates/storage",
     "crates/auth",
     "crates/server-core",
-    "crates/server",
+    "crates/server-http",
     "crates/test-util",
     "crates/s3-tests",
 ]

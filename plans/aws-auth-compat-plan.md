@@ -183,8 +183,8 @@ Update:
 - `crates/storage/src/types.rs` (`BucketInfo.owner_id: u64` -> `owner_principal: String`)
 - `crates/storage/src/traits.rs` (`create_bucket/list_buckets` owner arg types to `&str`)
 - `crates/storage/src/bucket_db.rs`
-- `crates/server/src/coordinator.rs`
-- `crates/server/src/http/xml.rs` list owner serialization (owner ID/display should be principal or stable derived canonical id)
+- `crates/server-core/src/coordinator.rs`
+- `crates/server-http/src/http/xml.rs` list owner serialization (owner ID/display should be principal or stable derived canonical id)
 
 ## Data Size Limits (Required)
 
@@ -214,7 +214,7 @@ Notes for AWS compatibility:
 
 ## Authorization Policy (Minimal)
 
-Implement a small policy module in `crates/server/src/authz.rs`:
+Implement a small policy module in `crates/server-http/src/authz.rs`:
 
 ```rust
 pub enum ResourceVisibility {
@@ -345,7 +345,7 @@ Add tests in:
   - Presigned positive/negative.
   - Session token required/mismatch.
   - Expired token/expired presign.
-- `crates/server/src/http/mod.rs`:
+- `crates/server-http/src/http/mod.rs`:
   - Anonymous vs authenticated routing.
   - Owner checks and access denied.
   - Public-read allow path.

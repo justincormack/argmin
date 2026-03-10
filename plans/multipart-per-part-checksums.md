@@ -92,7 +92,7 @@ Files:
 - `crates/storage/src/schema.rs`
 - `crates/storage/src/types.rs`
 - `crates/storage/src/pg_store.rs`
-- `crates/server/src/coordinator.rs` (types only)
+- `crates/server-core/src/coordinator.rs` (types only)
 
 Tasks:
 
@@ -108,10 +108,10 @@ Acceptance:
 
 Files:
 
-- `crates/server/src/coordinator.rs`
-- `crates/server/src/http/mod.rs` (if shared helpers are placed here)
+- `crates/server-core/src/coordinator.rs`
+- `crates/server-http/src/http/mod.rs` (if shared helpers are placed here)
 - `crates/crc64/src/lib.rs` (reference for API shape only)
-- `crates/server/src` tests (unit tests for combine correctness)
+- `crates/server-http/src` tests (unit tests for combine correctness)
 
 Tasks:
 
@@ -132,10 +132,10 @@ Acceptance:
 
 Files:
 
-- `crates/server/src/http/mod.rs`
-- `crates/server/src/coordinator.rs`
-- `crates/server/src/http/xml.rs`
-- `crates/server/src/http/response.rs`
+- `crates/server-http/src/http/mod.rs`
+- `crates/server-core/src/coordinator.rs`
+- `crates/server-http/src/http/xml.rs`
+- `crates/server-http/src/http/response.rs`
 
 Tasks:
 
@@ -152,9 +152,9 @@ Acceptance:
 
 Files:
 
-- `crates/server/src/http/mod.rs`
-- `crates/server/src/coordinator.rs`
-- `crates/server/src/http/response.rs`
+- `crates/server-http/src/http/mod.rs`
+- `crates/server-core/src/coordinator.rs`
+- `crates/server-http/src/http/response.rs`
 
 Tasks:
 
@@ -173,10 +173,10 @@ Acceptance:
 
 Files:
 
-- `crates/server/src/http/xml.rs`
-- `crates/server/src/coordinator.rs`
-- `crates/server/src/http/response.rs`
-- `crates/server/src/metadata_blob.rs`
+- `crates/server-http/src/http/xml.rs`
+- `crates/server-core/src/coordinator.rs`
+- `crates/server-http/src/http/response.rs`
+- `crates/server-core/src/metadata_blob.rs`
 
 Tasks:
 
@@ -197,9 +197,9 @@ Acceptance:
 
 Files:
 
-- `crates/server/src/coordinator.rs`
-- `crates/server/src/http/response.rs`
-- `crates/server/src/http/xml.rs`
+- `crates/server-core/src/coordinator.rs`
+- `crates/server-http/src/http/response.rs`
+- `crates/server-http/src/http/xml.rs`
 
 Tasks:
 
@@ -224,7 +224,7 @@ Files:
 
 - `crates/s3-tests/tests/checksums.rs`
 - `crates/s3-tests/tests/object_attributes.rs`
-- server unit tests under `crates/server/src/http/` and `crates/server/src/coordinator.rs`
+- server unit tests under `crates/server-http/src/http/` and `crates/server-core/src/coordinator.rs`
 
 Tasks:
 

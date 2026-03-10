@@ -302,8 +302,8 @@ Output:
 
 Files:
 
-- `crates/server/src/coordinator.rs`
-- `crates/server/src/error.rs`
+- `crates/server-core/src/coordinator.rs`
+- `crates/server-core/src/error.rs`
 
 Output:
 
@@ -314,7 +314,7 @@ Output:
 
 Files:
 
-- `crates/server/src/coordinator.rs`
+- `crates/server-core/src/coordinator.rs`
 
 Output:
 
@@ -324,10 +324,10 @@ Output:
 
 Files:
 
-- `crates/server/src/http/router.rs`
-- `crates/server/src/http/mod.rs`
-- `crates/server/src/http/xml.rs`
-- `crates/server/src/http/response.rs`
+- `crates/server-http/src/http/router.rs`
+- `crates/server-http/src/http/mod.rs`
+- `crates/server-http/src/http/xml.rs`
+- `crates/server-http/src/http/response.rs`
 
 ### Phase E: Integration tests
 
@@ -430,7 +430,7 @@ Acceptance:
 
 Files:
 
-- `crates/server/src/coordinator.rs`
+- `crates/server-core/src/coordinator.rs`
 
 Tasks:
 
@@ -448,7 +448,7 @@ Acceptance:
 
 Files:
 
-- `crates/server/src/coordinator.rs`
+- `crates/server-core/src/coordinator.rs`
 
 Tasks:
 
@@ -464,7 +464,7 @@ Acceptance:
 
 Files:
 
-- `crates/server/src/coordinator.rs`
+- `crates/server-core/src/coordinator.rs`
 
 Tasks:
 
@@ -485,8 +485,8 @@ Acceptance:
 
 Files:
 
-- `crates/server/src/coordinator.rs`
-- `crates/server/src/error.rs` (multipart-specific errors)
+- `crates/server-core/src/coordinator.rs`
+- `crates/server-core/src/error.rs` (multipart-specific errors)
 
 Tasks:
 
@@ -546,7 +546,7 @@ Acceptance:
 
 Files:
 
-- `crates/server/src/coordinator.rs`
+- `crates/server-core/src/coordinator.rs`
 
 Tasks:
 
@@ -566,7 +566,7 @@ Acceptance:
 
 Files:
 
-- `crates/server/src/coordinator.rs`
+- `crates/server-core/src/coordinator.rs`
 
 Tasks:
 
@@ -587,8 +587,8 @@ Acceptance:
 
 Files:
 
-- `crates/server/src/http/router.rs`
-- `crates/server/src/http/mod.rs`
+- `crates/server-http/src/http/router.rs`
+- `crates/server-http/src/http/mod.rs`
 
 Tasks:
 
@@ -606,8 +606,8 @@ Acceptance:
 
 Files:
 
-- `crates/server/src/http/xml.rs`
-- `crates/server/src/http/response.rs`
+- `crates/server-http/src/http/xml.rs`
+- `crates/server-http/src/http/response.rs`
 
 Tasks:
 

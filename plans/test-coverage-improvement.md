@@ -9,7 +9,7 @@ and ease (pure unit tests first).
 
 Current state: 4465 covered lines, 900 missed → 79.84%
 
-## Step 1: `crates/server/src/error.rs` — 0% → ~100% (31 lines)
+## Step 1: `crates/server-core/src/error.rs` — 0% → ~100% (31 lines)
 
 Pure unit tests. No dependencies beyond constructing error variants.
 
@@ -20,7 +20,7 @@ Pure unit tests. No dependencies beyond constructing error variants.
 - Verify the wildcard `Auth(_)` arm (e.g. `MissingSignedHeader`) maps to "AccessDenied"
 - Verify wildcard `_` arm in `http_status` returns 500
 
-## Step 2: `crates/server/src/http/response.rs` — 0% → ~90% (289 lines)
+## Step 2: `crates/server-http/src/http/response.rs` — 0% → ~90% (289 lines)
 
 `S3Response` is a plain struct — no tiny_http needed. All constructors are testable.
 
@@ -42,7 +42,7 @@ Pure unit tests. No dependencies beyond constructing error variants.
 - `list_objects_v2()` → verify XML body
 - `error()` → verify status code and XML error body for a few error types
 
-## Step 3: `crates/server/src/config.rs` — 0% → ~90% (69 lines)
+## Step 3: `crates/server-http/src/config.rs` — 0% → ~90% (69 lines)
 
 Env var parsing. Tests need isolation to avoid cross-test interference.
 
@@ -59,7 +59,7 @@ Env var parsing. Tests need isolation to avoid cross-test interference.
 can provide values without touching real env vars. Or use `std::sync::Mutex` to
 serialize tests that manipulate environment.
 
-## Step 4: `crates/server/src/http/request.rs` — 72% → ~85% (68 missed)
+## Step 4: `crates/server-http/src/http/request.rs` — 72% → ~85% (68 missed)
 
 `from_http()` requires `tiny_http::Request` (deferred). Focus on remaining unit-testable gaps.
 

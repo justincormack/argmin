@@ -80,8 +80,8 @@ option.
 | `crates/storage/src/pg_store.rs` | INSERT/SELECT queries updated |
 | `crates/storage/src/memory_store.rs` | total_size in record construction |
 | `crates/debug-cli/src/main.rs` | TOTAL_SIZE column in objects display |
-| `crates/server/src/coordinator.rs` | `read_range`, shard planning, get/head/range ops |
-| `crates/server/src/range.rs` | ByteRange parse/resolve |
-| `crates/server/src/error.rs` | InvalidRange variant |
-| `crates/server/src/http/response.rs` | Accept-Ranges, 206/416 responses |
-| `crates/server/src/http/mod.rs` | Range header dispatch |
+| `crates/server-core/src/coordinator.rs` | `read_range`, shard planning, get/head/range ops |
+| `crates/server-core/src/range.rs` | ByteRange parse/resolve |
+| `crates/server-core/src/error.rs` | InvalidRange variant |
+| `crates/server-http/src/http/response.rs` | Accept-Ranges, 206/416 responses |
+| `crates/server-http/src/http/mod.rs` | Range header dispatch |

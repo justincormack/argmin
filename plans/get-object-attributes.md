@@ -34,7 +34,7 @@ metadata blob with checksums). We just build a different response format.
 
 ### 1. Router: add `GetObjectAttributes` operation
 
-In `crates/server/src/http/router.rs`:
+In `crates/server-http/src/http/router.rs`:
 
 - Add `GetObjectAttributes { bucket, key }` variant to `S3Operation` enum
 - Route `GET /<bucket>/<key>?attributes` to it — must appear before the
@@ -43,7 +43,7 @@ In `crates/server/src/http/router.rs`:
 
 ### 2. XML: add response formatter
 
-In `crates/server/src/http/xml.rs`:
+In `crates/server-http/src/http/xml.rs`:
 
 - Add `get_object_attributes_xml()` function that takes the requested
   attributes set, etag, size, and checksum entries, and builds the
@@ -53,7 +53,7 @@ In `crates/server/src/http/xml.rs`:
 
 ### 3. Handler: add operation handler
 
-In `crates/server/src/http/mod.rs`:
+In `crates/server-http/src/http/mod.rs`:
 
 - Parse the `x-amz-object-attributes` header (comma-separated, trim
   whitespace). Reject unknown attribute names with `InvalidArgument`
@@ -67,7 +67,7 @@ In `crates/server/src/http/mod.rs`:
 
 ### 4. Response builder
 
-In `crates/server/src/http/response.rs`:
+In `crates/server-http/src/http/response.rs`:
 
 - Add `S3Response::get_object_attributes()` method that takes the XML body
   string and result metadata (last_modified, version_id) and builds a 200

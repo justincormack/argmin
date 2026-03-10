@@ -1,7 +1,7 @@
 # Object Concurrency Invariants
 
 This guide defines the lock and read/write rules for object operations in
-`crates/server/src/coordinator.rs`.
+`crates/server-core/src/coordinator.rs`.
 
 ## Scope
 

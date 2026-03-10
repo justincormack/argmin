@@ -118,7 +118,7 @@ The territory map should be updated.
 
 ### Step 1: PG derivation for shards
 
-**`crates/server/src/pg.rs`**
+**`crates/server-core/src/pg.rs`**
 
 Add a new function for shard PG derivation:
 
@@ -190,7 +190,7 @@ Add to `GlobalService`:
 
 ### Step 5: Coordinator versioning logic
 
-**`crates/server/src/coordinator.rs`**
+**`crates/server-core/src/coordinator.rs`**
 
 This is the largest change. Key modifications:
 
@@ -229,7 +229,7 @@ This is the largest change. Key modifications:
 
 ### Step 6: HTTP routing and dispatch
 
-**`crates/server/src/http/router.rs`**
+**`crates/server-http/src/http/router.rs`**
 
 Add to S3Operation enum:
 - `PutBucketVersioning { bucket }`
@@ -237,32 +237,32 @@ Add to S3Operation enum:
 
 Route `PUT /<bucket>?versioning` and `GET /<bucket>?versioning`.
 
-**`crates/server/src/http/mod.rs`**
+**`crates/server-http/src/http/mod.rs`**
 
 - Dispatch new operations to coordinator
 - Pass `versionId` query param to get_object, head_object, delete_object
 - Update ListObjectVersions dispatch to use new coordinator method
 
-**`crates/server/src/http/request.rs`**
+**`crates/server-http/src/http/request.rs`**
 
 - Update `parse_copy_source` to return optional versionId (currently stripped)
 
 ### Step 7: XML and response
 
-**`crates/server/src/http/xml.rs`**
+**`crates/server-http/src/http/xml.rs`**
 
 - `parse_versioning_config_xml`: Parse PutBucketVersioning request body
 - `get_bucket_versioning_xml`: Generate GetBucketVersioning response
 - Update `list_object_versions_xml`: Real version IDs, `<IsLatest>`, `<DeleteMarker>`
   elements separate from `<Version>` elements, pagination markers
 
-**`crates/server/src/http/response.rs`**
+**`crates/server-http/src/http/response.rs`**
 
 - New: `get_bucket_versioning`, `put_bucket_versioning` response builders
 - Add `x-amz-version-id` header to put_object, get_object, head_object, delete_object responses
 - Add `x-amz-delete-marker: true` header when applicable
 
-**`crates/server/src/error.rs`**
+**`crates/server-core/src/error.rs`**
 
 - Add `DeleteMarkerFound { version_id: u64 }` error variant (or extend ObjectNotFound)
   for proper `x-amz-delete-marker` header in 404 responses
@@ -301,7 +301,7 @@ Route `PUT /<bucket>?versioning` and `GET /<bucket>?versioning`.
 
 | File | Change |
 |---|---|
-| `crates/server/src/pg.rs` | Add `derive_pg_shards()` |
+| `crates/server-core/src/pg.rs` | Add `derive_pg_shards()` |
 | `crates/storage/src/types.rs` | version_id String→u64, add status to PutObjectMetaReq, new list types |
 | `crates/storage/src/schema.rs` | version_id TEXT→INTEGER, add version index |
 | `crates/storage/src/error.rs` | Add InvalidVersioningTransition |
@@ -309,13 +309,13 @@ Route `PUT /<bucket>?versioning` and `GET /<bucket>?versioning`.
 | `crates/storage/src/pg_store.rs` | SQL implementation of all new methods |
 | `crates/storage/src/memory_store.rs` | Update in-memory store |
 | `crates/storage/src/bucket_db.rs` | put_bucket_versioning |
-| `crates/server/src/coordinator.rs` | Split meta/shard PG routing, version-aware put/get/delete/list |
-| `crates/server/src/error.rs` | DeleteMarkerFound variant |
-| `crates/server/src/http/router.rs` | PutBucketVersioning, GetBucketVersioning routes |
-| `crates/server/src/http/mod.rs` | Dispatch + pass versionId param |
-| `crates/server/src/http/request.rs` | parse_copy_source returns versionId |
-| `crates/server/src/http/response.rs` | Version headers, new response builders |
-| `crates/server/src/http/xml.rs` | Versioning XML parse/generate |
+| `crates/server-core/src/coordinator.rs` | Split meta/shard PG routing, version-aware put/get/delete/list |
+| `crates/server-core/src/error.rs` | DeleteMarkerFound variant |
+| `crates/server-http/src/http/router.rs` | PutBucketVersioning, GetBucketVersioning routes |
+| `crates/server-http/src/http/mod.rs` | Dispatch + pass versionId param |
+| `crates/server-http/src/http/request.rs` | parse_copy_source returns versionId |
+| `crates/server-http/src/http/response.rs` | Version headers, new response builders |
+| `crates/server-http/src/http/xml.rs` | Versioning XML parse/generate |
 
 ## Verification
 
