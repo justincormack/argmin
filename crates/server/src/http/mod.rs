@@ -697,13 +697,15 @@ impl HttpFrontend {
                 let cond = read_condition_from_headers(req);
                 let vid = parse_version_id(req)?;
                 let result = self.coordinator.get_object_attributes(
-                    &bucket,
-                    &key,
-                    vid,
-                    &cond,
-                    want_parts,
-                    part_number_marker,
-                    max_parts,
+                    &crate::coordinator::GetObjectAttributesRequest {
+                        bucket: &bucket,
+                        key: &key,
+                        version_id: vid,
+                        cond: &cond,
+                        want_parts,
+                        part_number_marker,
+                        max_parts,
+                    },
                 )?;
                 let checksum_entries: Vec<(&str, &str)> = result
                     .metadata
@@ -1072,12 +1074,14 @@ impl HttpFrontend {
                     let claimed_checksum = extract_checksum_header(req)?;
 
                     let result = self.coordinator.upload_part(
-                        &bucket,
-                        &key,
-                        &upload_id,
-                        part_number,
-                        &req.body,
-                        claimed_checksum.as_ref(),
+                        &crate::coordinator::UploadPartRequest {
+                            bucket: &bucket,
+                            key: &key,
+                            upload_id: &upload_id,
+                            part_number,
+                            data: &req.body,
+                            claimed_checksum: claimed_checksum.as_ref(),
+                        },
                     )?;
                     Ok(S3Response::upload_part(
                         &result.etag,
@@ -1101,11 +1105,13 @@ impl HttpFrontend {
                     .as_ref()
                     .map(|(algo, val)| (*algo, val.as_str()));
                 let result = self.coordinator.complete_multipart_upload(
-                    &bucket,
-                    &key,
-                    &upload_id,
-                    &parts,
-                    claimed_ref,
+                    &crate::coordinator::CompleteMultipartUploadRequest {
+                        bucket: &bucket,
+                        key: &key,
+                        upload_id: &upload_id,
+                        parts: &parts,
+                        claimed_checksum: claimed_ref,
+                    },
                 )?;
                 Ok(S3Response::complete_multipart_upload(
                     &bucket,
