@@ -339,6 +339,7 @@ pub struct GetObjectRequest<'a> {
     pub key: &'a str,
     pub version_id: Option<VersionId>,
     pub cond: &'a ReadCondition,
+    pub requester: Requester<'a>,
 }
 
 /// Request for a GetObjectPart or HeadObjectPart operation.
@@ -349,6 +350,7 @@ pub struct GetObjectPartRequest<'a> {
     pub version_id: Option<VersionId>,
     pub part_number: u32,
     pub cond: &'a ReadCondition,
+    pub requester: Requester<'a>,
 }
 
 /// Request for a GetObjectRange operation.
@@ -359,6 +361,7 @@ pub struct GetObjectRangeRequest<'a> {
     pub version_id: Option<VersionId>,
     pub range: ByteRange,
     pub cond: &'a ReadCondition,
+    pub requester: Requester<'a>,
 }
 
 /// Request for a DeleteObject operation.
@@ -463,6 +466,7 @@ pub struct GetObjectAttributesRequest<'a> {
     pub want_parts: bool,
     pub part_number_marker: Option<u32>,
     pub max_parts: u32,
+    pub requester: Requester<'a>,
 }
 
 /// Request for a CompleteMultipartUpload operation.
@@ -757,6 +761,36 @@ impl Coordinator {
 
     fn effective_public_read(bucket: &BucketSummary) -> bool {
         bucket.public_read && !Self::ignores_public_acls(bucket.public_access_block.as_deref())
+    }
+
+    fn authorize_bucket_read_requester(
+        &self,
+        requester: Requester<'_>,
+        bucket: &str,
+    ) -> Result<BucketSummary, ServerError> {
+        let info = self.head_bucket(bucket)?;
+        if Self::requester_can_read_bucket(
+            requester,
+            &info.owner_principal,
+            Self::effective_public_read(&info),
+        ) {
+            Ok(info)
+        } else {
+            Err(ServerError::AccessDenied)
+        }
+    }
+
+    fn authorize_bucket_write_requester(
+        &self,
+        requester: Requester<'_>,
+        bucket: &str,
+    ) -> Result<BucketSummary, ServerError> {
+        let info = self.head_bucket(bucket)?;
+        if Self::requester_can_write_bucket(requester, &info.owner_principal) {
+            Ok(info)
+        } else {
+            Err(ServerError::AccessDenied)
+        }
     }
 
     fn bucket_summary(info: BucketInfo) -> BucketSummary {
@@ -1336,10 +1370,7 @@ impl Coordinator {
         }
 
         // 1. Verify bucket exists and get versioning state
-        let bucket_info = self.head_bucket(bucket)?;
-        if !Self::requester_can_write_bucket(requester, &bucket_info.owner_principal) {
-            return Err(ServerError::AccessDenied);
-        }
+        let bucket_info = self.authorize_bucket_write_requester(requester, bucket)?;
 
         let ownership_controls = self.get_bucket_ownership_controls(bucket)?;
         if Self::is_bucket_owner_enforced(ownership_controls.as_deref())
@@ -2100,10 +2131,7 @@ impl Coordinator {
         let acl = req.acl;
         let _bucket_guard = self.storage_node.lock_bucket(dst_bucket);
 
-        let dst_bucket_info = self.head_bucket(dst_bucket)?;
-        if !Self::requester_can_write_bucket(requester, &dst_bucket_info.owner_principal) {
-            return Err(ServerError::AccessDenied);
-        }
+        let dst_bucket_info = self.authorize_bucket_write_requester(requester, dst_bucket)?;
 
         let ownership_controls = self.get_bucket_ownership_controls(dst_bucket)?;
         if Self::is_bucket_owner_enforced(ownership_controls.as_deref())
@@ -2115,14 +2143,7 @@ impl Coordinator {
             return Err(ServerError::AccessControlListNotSupported);
         }
 
-        let src_bucket_info = self.head_bucket(src_bucket)?;
-        if !Self::requester_can_read_bucket(
-            requester,
-            &src_bucket_info.owner_principal,
-            Self::effective_public_read(&src_bucket_info),
-        ) {
-            return Err(ServerError::AccessDenied);
-        }
+        let _src_bucket_info = self.authorize_bucket_read_requester(requester, src_bucket)?;
 
         // Phase 1: Read source object
         let (src_metadata, user_data) = {
@@ -3038,6 +3059,8 @@ impl Coordinator {
         let key = req.key;
         let version_id = req.version_id;
         let cond = req.cond;
+        let requester = req.requester;
+        let _bucket_info = self.authorize_bucket_read_requester(requester, bucket)?;
         let LockedReadObject {
             record: stored,
             pgs,
@@ -3186,6 +3209,8 @@ impl Coordinator {
         let version_id = req.version_id;
         let part_number = req.part_number;
         let cond = req.cond;
+        let requester = req.requester;
+        let _bucket_info = self.authorize_bucket_read_requester(requester, bucket)?;
         let LockedReadObject {
             record: stored,
             pgs,
@@ -3382,6 +3407,8 @@ impl Coordinator {
         let version_id = req.version_id;
         let part_number = req.part_number;
         let cond = req.cond;
+        let requester = req.requester;
+        let _bucket_info = self.authorize_bucket_read_requester(requester, bucket)?;
         let LockedReadObject {
             record: stored,
             pgs,
@@ -3485,6 +3512,8 @@ impl Coordinator {
         let key = req.key;
         let version_id = req.version_id;
         let cond = req.cond;
+        let requester = req.requester;
+        let _bucket_info = self.authorize_bucket_read_requester(requester, bucket)?;
         let LockedReadObject { record: stored, .. } =
             self.lock_object_pgs_for_read(bucket, key, version_id)?;
 
@@ -3533,6 +3562,8 @@ impl Coordinator {
         let want_parts = req.want_parts;
         let part_number_marker = req.part_number_marker;
         let max_parts = req.max_parts;
+        let requester = req.requester;
+        let _bucket_info = self.authorize_bucket_read_requester(requester, bucket)?;
         let LockedReadObject {
             record: stored,
             pgs,
@@ -3651,6 +3682,8 @@ impl Coordinator {
         let version_id = req.version_id;
         let range = req.range;
         let cond = req.cond;
+        let requester = req.requester;
+        let _bucket_info = self.authorize_bucket_read_requester(requester, bucket)?;
         let LockedReadObject {
             record: stored,
             pgs,
@@ -4375,19 +4408,8 @@ impl Coordinator {
         let copy_source_range = req.copy_source_range;
         let requester = req.requester;
 
-        let dst_bucket_info = self.head_bucket(dst_bucket)?;
-        if !Self::requester_can_write_bucket(requester, &dst_bucket_info.owner_principal) {
-            return Err(ServerError::AccessDenied);
-        }
-
-        let src_bucket_info = self.head_bucket(src_bucket)?;
-        if !Self::requester_can_read_bucket(
-            requester,
-            &src_bucket_info.owner_principal,
-            Self::effective_public_read(&src_bucket_info),
-        ) {
-            return Err(ServerError::AccessDenied);
-        }
+        let _dst_bucket_info = self.authorize_bucket_write_requester(requester, dst_bucket)?;
+        let _src_bucket_info = self.authorize_bucket_read_requester(requester, src_bucket)?;
 
         // Phase 1: Read source object (only the needed range)
         let source_data = {
@@ -5733,6 +5755,7 @@ mod tests {
                 key: "hello.txt",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(obj.data, b"Hello, world!");
@@ -5770,6 +5793,7 @@ mod tests {
                 key: "obj",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(obj.data, b"{}");
@@ -5802,6 +5826,7 @@ mod tests {
                 key: "key",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(head.size, 4);
@@ -5843,6 +5868,7 @@ mod tests {
                 key: "key",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(obj.data, b"v2");
@@ -5872,6 +5898,7 @@ mod tests {
                 key: "empty",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(obj.data, b"");
@@ -5910,6 +5937,7 @@ mod tests {
                 key: "key",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
@@ -6130,6 +6158,7 @@ mod tests {
                 key: "folder/",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(obj.data, b"data");
@@ -6226,6 +6255,7 @@ mod tests {
                 key: "resilient",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(obj.data, data);
@@ -6258,6 +6288,7 @@ mod tests {
                 key: "obj1",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(obj.data, data);
@@ -6293,6 +6324,7 @@ mod tests {
                 key: "obj2",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(obj.data, data);
@@ -6329,6 +6361,7 @@ mod tests {
                 key: "obj3",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
@@ -6362,6 +6395,7 @@ mod tests {
                 key: "obj4",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(obj.data, data);
@@ -6397,6 +6431,7 @@ mod tests {
                 version_id: None,
                 range: ByteRange::Range { start: 0, end: 4 },
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(result.data, b"Hello");
@@ -6431,6 +6466,7 @@ mod tests {
                 key: "obj6",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(obj.data, data);
@@ -6467,6 +6503,7 @@ mod tests {
                 key: "no-such-key",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
@@ -6496,6 +6533,7 @@ mod tests {
                 key: "key",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(result.etag, obj.etag);
@@ -6506,6 +6544,7 @@ mod tests {
                 key: "key",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(result.etag, head.etag);
@@ -7018,7 +7057,8 @@ mod tests {
                 bucket: "bucket",
                 key: "key1",
                 version_id: None,
-                cond: NO_READ
+                cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .is_err());
         assert!(coord
@@ -7026,7 +7066,8 @@ mod tests {
                 bucket: "bucket",
                 key: "key2",
                 version_id: None,
-                cond: NO_READ
+                cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .is_err());
     }
@@ -7194,6 +7235,7 @@ mod tests {
                 version_id: None,
                 range: ByteRange::Range { start: 0, end: 4 },
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(result.data, b"Hello");
@@ -7228,6 +7270,7 @@ mod tests {
                 version_id: None,
                 range: ByteRange::Suffix { length: 6 },
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(result.data, b"World!");
@@ -7261,6 +7304,7 @@ mod tests {
                 version_id: None,
                 range: ByteRange::FromStart { start: 7 },
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(result.data, b"World!");
@@ -7292,6 +7336,7 @@ mod tests {
                 version_id: None,
                 range: ByteRange::FromStart { start: 100 },
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidRange { total_size: 5 }));
@@ -7326,6 +7371,7 @@ mod tests {
                     end: 99999,
                 },
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(result.data, b"Hello");
@@ -7425,6 +7471,7 @@ mod tests {
                 key: "key",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(obj.data, b"v2");
@@ -7522,6 +7569,68 @@ mod tests {
     }
 
     #[test]
+    fn get_object_rejects_private_read_for_non_owner() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        coord
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"secret",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+                requester: Requester::principal("owner-a"),
+                acl: NO_PUT_OBJECT_ACL,
+            })
+            .unwrap();
+
+        let err = coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: NO_READ,
+                requester: Requester::principal("other-user"),
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn get_object_allows_public_read_for_anonymous() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", true)
+            .unwrap();
+        coord
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"public",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+                requester: Requester::principal("owner-a"),
+                acl: NO_PUT_OBJECT_ACL,
+            })
+            .unwrap();
+
+        let obj = coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: NO_READ,
+                requester: Requester::anonymous(),
+            })
+            .unwrap();
+        assert_eq!(obj.data, b"public");
+    }
+
+    #[test]
     fn get_if_match_returns_object() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
@@ -7548,6 +7657,7 @@ mod tests {
                 key: "key",
                 version_id: None,
                 cond: &cond,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(obj.data, b"data");
@@ -7580,6 +7690,7 @@ mod tests {
                 key: "key",
                 version_id: None,
                 cond: &cond,
+                requester: TEST_REQUESTER,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::PreconditionFailed));
@@ -7612,6 +7723,7 @@ mod tests {
                 key: "key",
                 version_id: None,
                 cond: &cond,
+                requester: TEST_REQUESTER,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::NotModified { .. }));
@@ -7644,6 +7756,7 @@ mod tests {
                 key: "key",
                 version_id: None,
                 cond: &cond,
+                requester: TEST_REQUESTER,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::NotModified { .. }));
@@ -7680,7 +7793,8 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
-                cond: NO_READ
+                cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .is_err());
     }
@@ -7796,6 +7910,7 @@ mod tests {
                 version_id: None,
                 range: ByteRange::Range { start: 0, end: 4 },
                 cond: &cond,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(result.data, b"Hello");
@@ -7846,6 +7961,7 @@ mod tests {
                 key: "dst",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(obj.data, b"hello copy");
@@ -7980,6 +8096,7 @@ mod tests {
                 key: "dst",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(obj.metadata.get("content-type"), Some("image/png"));
@@ -8036,6 +8153,7 @@ mod tests {
                 key: "dst",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(obj.data, b"data");
@@ -8092,6 +8210,7 @@ mod tests {
                 key: "key",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(obj.data, b"data");
@@ -8147,6 +8266,7 @@ mod tests {
                 key: "dst",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(obj.data, b"hello");
@@ -8203,6 +8323,7 @@ mod tests {
                 key: "dst",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(obj.data, data);
@@ -8433,6 +8554,7 @@ mod tests {
                 key: "dst",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(obj.data, b"new data");
@@ -8481,6 +8603,7 @@ mod tests {
                 key: "key",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(obj.data, b"cross bucket data");
@@ -8493,6 +8616,7 @@ mod tests {
                 key: "key",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(src.data, b"cross bucket data");
@@ -8633,6 +8757,7 @@ mod tests {
                 key: "key",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(obj.version_id, VersionId::Null);
@@ -8661,6 +8786,7 @@ mod tests {
                 key: "key",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(head.version_id, VersionId::Null);
@@ -8801,6 +8927,7 @@ mod tests {
                     key: "key",
                     version_id: None,
                     cond: NO_READ,
+                    requester: TEST_REQUESTER,
                 })
             });
 
@@ -8909,6 +9036,7 @@ mod tests {
                 key: "key",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             });
             match check {
                 Ok(obj) => {
@@ -10899,6 +11027,7 @@ mod tests {
                 key: "key",
                 version_id: None,
                 cond: &ReadCondition::default(),
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(obj.data, expected);
@@ -10921,6 +11050,7 @@ mod tests {
                 key: "key",
                 version_id: None,
                 cond: &ReadCondition::default(),
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(obj.data, b"only-part");
@@ -10945,6 +11075,7 @@ mod tests {
                 key: "key",
                 version_id: None,
                 cond: &ReadCondition::default(),
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(head.size, total_size as u64);
@@ -10971,6 +11102,7 @@ mod tests {
                 version_id: None,
                 range: ByteRange::Range { start: 10, end: 19 },
                 cond: &ReadCondition::default(),
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(range.data, vec![0xAA; 10]);
@@ -11007,6 +11139,7 @@ mod tests {
                     end: boundary + 3,
                 },
                 cond: &ReadCondition::default(),
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         let mut expected = vec![0xAA; 4];
@@ -11033,6 +11166,7 @@ mod tests {
                 version_id: None,
                 range: ByteRange::Suffix { length: 50 },
                 cond: &ReadCondition::default(),
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(range.data, vec![0xBB; 50]);
@@ -11076,6 +11210,7 @@ mod tests {
                 key: "dst-key",
                 version_id: None,
                 cond: &ReadCondition::default(),
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(dst.data, expected);
@@ -11095,6 +11230,7 @@ mod tests {
                 key: "key",
                 version_id: None,
                 cond: &ReadCondition::default(),
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert!(obj.data.is_empty());
@@ -11118,6 +11254,7 @@ mod tests {
                 key: "key",
                 version_id: None,
                 cond: &ReadCondition::default(),
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(obj.data, expected);
@@ -11139,6 +11276,7 @@ mod tests {
                 version_id: None,
                 part_number: 1,
                 cond: &ReadCondition::default(),
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert!(result.data.is_empty());
@@ -11165,6 +11303,7 @@ mod tests {
                 version_id: None,
                 part_number: 1,
                 cond: &ReadCondition::default(),
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(result.data, part1);
@@ -11179,6 +11318,7 @@ mod tests {
                 version_id: None,
                 part_number: 2,
                 cond: &ReadCondition::default(),
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert!(result.data.is_empty());
@@ -11213,6 +11353,7 @@ mod tests {
                 version_id: None,
                 part_number: 1,
                 cond: &ReadCondition::default(),
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(result.part_size, 11);
@@ -11228,6 +11369,7 @@ mod tests {
                 version_id: None,
                 part_number: 2,
                 cond: &ReadCondition::default(),
+                requester: TEST_REQUESTER,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidPart { part_number: 2 }));
@@ -11258,6 +11400,7 @@ mod tests {
                 version_id: None,
                 part_number: 1,
                 cond: &ReadCondition::default(),
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(result.part_size, 0);
@@ -11279,6 +11422,7 @@ mod tests {
                 key: "key",
                 version_id: None,
                 cond: &ReadCondition::default(),
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(head.size, 0);
@@ -11316,6 +11460,7 @@ mod tests {
                 key: "key",
                 version_id: None,
                 cond: &ReadCondition::default(),
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert!(dst.data.is_empty());
@@ -11353,6 +11498,7 @@ mod tests {
                 key: "key",
                 version_id: None,
                 cond: &ReadCondition::default(),
+                requester: TEST_REQUESTER,
             })
             .unwrap_err();
         assert!(
@@ -11770,6 +11916,7 @@ mod tests {
                 key: "mykey",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(head.size, full_data.len() as u64);
@@ -11808,6 +11955,7 @@ mod tests {
                 key: "mykey",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(head.size, 0);
@@ -11836,6 +11984,7 @@ mod tests {
                 key: "mykey",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
@@ -12020,6 +12169,7 @@ mod tests {
                 key: "key",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(head.size, new_data.len() as u64);
@@ -12198,6 +12348,7 @@ mod tests {
                 key: "key",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(head.size, 5);
@@ -12209,6 +12360,7 @@ mod tests {
                 key: "key",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(result.data, b"hello");
@@ -12253,6 +12405,7 @@ mod tests {
                 key: "key",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(result.data, full_data);
@@ -12296,6 +12449,7 @@ mod tests {
                 version_id: None,
                 range: ByteRange::Range { start: 0, end: 3 },
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(r1.data, b"AAAA");
@@ -12308,6 +12462,7 @@ mod tests {
                 version_id: None,
                 range: ByteRange::Range { start: 2, end: 5 },
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(r2.data, b"AABB");
@@ -12320,6 +12475,7 @@ mod tests {
                 version_id: None,
                 range: ByteRange::Range { start: 4, end: 7 },
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(r3.data, b"BBBB");
@@ -12332,6 +12488,7 @@ mod tests {
                 version_id: None,
                 range: ByteRange::Suffix { length: 3 },
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(r4.data, b"BBB");
@@ -12386,6 +12543,7 @@ mod tests {
                 key: "dst",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(result.data, b"copy-me");
@@ -12418,6 +12576,7 @@ mod tests {
                 key: "empty",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(result.data, b"");
@@ -12455,6 +12614,7 @@ mod tests {
                 version_id: None,
                 part_number: 1,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(result.data, b"partdata");
@@ -12492,6 +12652,7 @@ mod tests {
                 key: "key",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(r1.data, b"stream-data");
@@ -12516,6 +12677,7 @@ mod tests {
                 key: "key",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(r2.data, b"normal-data");
@@ -12562,6 +12724,7 @@ mod tests {
                 key: "key",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
@@ -12995,6 +13158,7 @@ mod tests {
                 version_id: None,
                 part_number: 1,
                 cond: &ReadCondition::default(),
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(
@@ -13021,6 +13185,7 @@ mod tests {
                 version_id: None,
                 part_number: 1,
                 cond: &ReadCondition::default(),
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(
@@ -13205,6 +13370,7 @@ mod tests {
                 key: "key",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(result.data, b"safe-data");
@@ -13229,6 +13395,7 @@ mod tests {
                 key: "new-key",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
@@ -13240,6 +13407,7 @@ mod tests {
                 key: "new-key",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
@@ -13297,6 +13465,7 @@ mod tests {
                 key: "verify",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(result.data, full);
@@ -13360,6 +13529,7 @@ mod tests {
                 key: "cycle",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(result.data, b"v2-normal");
@@ -13412,6 +13582,7 @@ mod tests {
                 key: "key",
                 version_id: None,
                 cond: NO_READ,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(result.data, b"new-data");

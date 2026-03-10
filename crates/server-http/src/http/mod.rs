@@ -526,9 +526,10 @@ impl HttpFrontend {
                 }
             }
             S3Operation::GetObject { bucket, key } => {
-                self.authorize_bucket_read(auth, &bucket)?;
                 let cond = read_condition_from_headers(req);
                 let vid = parse_version_id(req)?;
+                let requester =
+                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
                 // partNumber takes precedence over Range header (AWS behavior)
                 if let Some(pn_str) = req.query_param("partNumber") {
                     let part_number: u32 =
@@ -548,6 +549,7 @@ impl HttpFrontend {
                             version_id: vid,
                             part_number,
                             cond: &cond,
+                            requester,
                         })
                         .map_err(|e| match e {
                             ServerError::InvalidPart { .. } => {
@@ -575,6 +577,7 @@ impl HttpFrontend {
                             version_id: vid,
                             range: byte_range,
                             cond: &cond,
+                            requester,
                         },
                     ) {
                         Ok(result) => {
@@ -604,6 +607,7 @@ impl HttpFrontend {
                                 key: &key,
                                 version_id: vid,
                                 cond: &cond,
+                                requester,
                             })?;
                     let checksum_mode = req.header("x-amz-checksum-mode");
                     let tags = result.tags.clone();
@@ -635,9 +639,10 @@ impl HttpFrontend {
                 Ok(S3Response::delete_object(&result))
             }
             S3Operation::HeadObject { bucket, key } => {
-                self.authorize_bucket_read(auth, &bucket)?;
                 let cond = read_condition_from_headers(req);
                 let vid = parse_version_id(req)?;
+                let requester =
+                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
                 if let Some(pn_str) = req.query_param("partNumber") {
                     let part_number: u32 =
                         pn_str.parse().map_err(|_| ServerError::InvalidArgument {
@@ -656,6 +661,7 @@ impl HttpFrontend {
                             version_id: vid,
                             part_number,
                             cond: &cond,
+                            requester,
                         })
                         .map_err(|e| match e {
                             ServerError::InvalidPart { .. } => {
@@ -680,6 +686,7 @@ impl HttpFrontend {
                                 key: &key,
                                 version_id: vid,
                                 cond: &cond,
+                                requester,
                             })?;
                     let checksum_mode = req.header("x-amz-checksum-mode");
                     let mut resp = S3Response::head_object(&result, checksum_mode);
@@ -694,7 +701,6 @@ impl HttpFrontend {
                 }
             }
             S3Operation::GetObjectAttributes { bucket, key } => {
-                self.authorize_bucket_read(auth, &bucket)?;
                 // Parse x-amz-object-attributes header (required, comma-separated).
                 // The AWS Rust SDK may send one header per list element; accept both
                 // repeated headers and comma-delimited header values.
@@ -748,6 +754,8 @@ impl HttpFrontend {
 
                 let cond = read_condition_from_headers(req);
                 let vid = parse_version_id(req)?;
+                let requester_ctx =
+                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
                 let result = self.coordinator.get_object_attributes(
                     &crate::coordinator::GetObjectAttributesRequest {
                         bucket: &bucket,
@@ -757,6 +765,7 @@ impl HttpFrontend {
                         want_parts,
                         part_number_marker,
                         max_parts,
+                        requester: requester_ctx,
                     },
                 )?;
                 let checksum_entries: Vec<(&str, &str)> = result
