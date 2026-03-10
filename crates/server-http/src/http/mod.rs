@@ -490,22 +490,6 @@ impl HttpFrontend {
                     Ok(S3Response::copy_object(&result))
                 } else {
                     // Normal PutObject path
-                    self.authorize_bucket_write(auth, &bucket)?;
-                    // Enforce BucketOwnerEnforced: reject x-amz-acl unless bucket-owner-full-control or private
-                    if let Some(acl_value) = req.header("x-amz-acl") {
-                        if let Some(ref oc_xml) =
-                            self.coordinator.get_bucket_ownership_controls(&bucket)?
-                        {
-                            if let Ok(val) = xml::parse_ownership_controls_xml(oc_xml.as_bytes()) {
-                                if val == "BucketOwnerEnforced"
-                                    && acl_value != "bucket-owner-full-control"
-                                    && acl_value != "private"
-                                {
-                                    return Err(ServerError::AccessControlListNotSupported);
-                                }
-                            }
-                        }
-                    }
                     validate_checksum_headers(req, true)?;
                     // Parse inline tags before writing so invalid tags don't leave orphan objects
                     let inline_tags_xml = if let Some(tagging_header) = req.header("x-amz-tagging")
@@ -526,6 +510,9 @@ impl HttpFrontend {
                         .collect();
                     let metadata_blob = MetadataBlob::from_headers(&header_pairs)?;
                     let cond = write_condition_from_headers(req)?;
+                    let requester =
+                        crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                    let acl = parse_put_object_acl(req.header("x-amz-acl"));
                     let result =
                         self.coordinator
                             .put_object(&crate::coordinator::PutObjectRequest {
@@ -534,6 +521,8 @@ impl HttpFrontend {
                                 data: &req.body,
                                 metadata: &metadata_blob,
                                 cond: &cond,
+                                requester,
+                                acl,
                             })?;
                     if let Some(tags_xml) = inline_tags_xml {
                         self.coordinator.put_object_tags(
@@ -1727,6 +1716,10 @@ impl HttpFrontend {
                 data: &form.file_data,
                 metadata: &metadata_blob,
                 cond: &cond,
+                requester: crate::coordinator::Requester::from_principal(
+                    effective_auth.principal.as_deref(),
+                ),
+                acl: parse_put_object_acl(form.field("acl")),
             })?;
 
         // Build response based on success_action_status
@@ -2333,6 +2326,17 @@ fn parse_bucket_acl(req: &S3Request) -> Result<BucketAcl, ServerError> {
         Some(other) => Err(ServerError::InvalidArgument {
             reason: format!("unsupported x-amz-acl value: {other}"),
         }),
+    }
+}
+
+fn parse_put_object_acl(value: Option<&str>) -> crate::coordinator::PutObjectAcl<'_> {
+    match value {
+        None => crate::coordinator::PutObjectAcl::None,
+        Some("private") => crate::coordinator::PutObjectAcl::Private,
+        Some("bucket-owner-full-control") => {
+            crate::coordinator::PutObjectAcl::BucketOwnerFullControl
+        }
+        Some(other) => crate::coordinator::PutObjectAcl::Other(other),
     }
 }
 

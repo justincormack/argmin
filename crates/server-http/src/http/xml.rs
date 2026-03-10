@@ -1668,7 +1668,7 @@ mod tests {
     use crate::coordinator::ListEntry;
     use crate::coordinator::{
         Coordinator, DeleteEntry, DeleteObjectsRequest, ListObjectVersionsRequest,
-        ListObjectsV2Request, PutObjectRequest,
+        ListObjectsV2Request, PutObjectAcl, PutObjectRequest, Requester,
     };
     use crate::metadata_blob::MetadataBlob;
     use ec::EcConfig;
@@ -1684,6 +1684,8 @@ mod tests {
 
     const NO_WRITE: &WriteCondition = &WriteCondition::None;
     const NO_DELETE: &DeleteCondition = &DeleteCondition::None;
+    const TEST_REQUESTER: Requester<'static> = Requester::principal("default-owner");
+    const NO_PUT_OBJECT_ACL: PutObjectAcl<'static> = PutObjectAcl::None;
 
     #[test]
     fn error_xml_format() {
@@ -3406,6 +3408,8 @@ mod tests {
                 data: b"hello",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
         coord
@@ -3415,6 +3419,8 @@ mod tests {
                 data: b"world",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
         coord
@@ -3424,6 +3430,8 @@ mod tests {
                 data: b"root",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -3513,6 +3521,8 @@ mod tests {
                     data: b"data",
                     metadata: &MetadataBlob::new(),
                     cond: NO_WRITE,
+                    requester: TEST_REQUESTER,
+                    acl: NO_PUT_OBJECT_ACL,
                 })
                 .unwrap();
         }

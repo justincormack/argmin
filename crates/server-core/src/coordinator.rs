@@ -264,6 +264,69 @@ pub struct PutObjectRequest<'a> {
     pub data: &'a [u8],
     pub metadata: &'a MetadataBlob,
     pub cond: &'a WriteCondition,
+    pub requester: Requester<'a>,
+    pub acl: PutObjectAcl<'a>,
+}
+
+/// Authenticated requester context needed by core-side authorization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Requester<'a> {
+    principal: Option<&'a str>,
+    #[cfg(test)]
+    is_system: bool,
+}
+
+impl<'a> Requester<'a> {
+    #[must_use]
+    pub const fn anonymous() -> Self {
+        Self {
+            principal: None,
+            #[cfg(test)]
+            is_system: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn principal(principal: &'a str) -> Self {
+        Self {
+            principal: Some(principal),
+            #[cfg(test)]
+            is_system: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn from_principal(principal: Option<&'a str>) -> Self {
+        Self {
+            principal,
+            #[cfg(test)]
+            is_system: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn principal_opt(self) -> Option<&'a str> {
+        self.principal
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    const fn system() -> Self {
+        Self {
+            principal: None,
+            is_system: true,
+        }
+    }
+}
+
+/// Parsed x-amz-acl value relevant to PutObject authorization rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PutObjectAcl<'a> {
+    #[default]
+    None,
+    Private,
+    BucketOwnerFullControl,
+    Other(&'a str),
 }
 
 /// Request for a GetObject or HeadObject operation.
@@ -655,6 +718,22 @@ pub struct Coordinator {
 }
 
 impl Coordinator {
+    fn requester_can_write_bucket(requester: Requester<'_>, owner_principal: &str) -> bool {
+        #[cfg(test)]
+        if requester.is_system {
+            return true;
+        }
+
+        requester.principal_opt() == Some(owner_principal)
+    }
+
+    // Ownership-controls XML is stored in canonical form by the HTTP layer.
+    fn is_bucket_owner_enforced(config_xml: Option<&str>) -> bool {
+        config_xml.is_some_and(|xml| {
+            xml.contains("<ObjectOwnership>BucketOwnerEnforced</ObjectOwnership>")
+        })
+    }
+
     fn bucket_summary(info: BucketInfo) -> BucketSummary {
         BucketSummary {
             name: info.name.into_string(),
@@ -1220,6 +1299,8 @@ impl Coordinator {
         let data = req.data;
         let metadata_blob = req.metadata;
         let cond = req.cond;
+        let requester = req.requester;
+        let acl = req.acl;
         let _bucket_guard = self.storage_node.lock_bucket(bucket);
 
         if data.len() as u64 > MAX_OBJECT_SIZE {
@@ -1231,6 +1312,20 @@ impl Coordinator {
 
         // 1. Verify bucket exists and get versioning state
         let bucket_info = self.head_bucket(bucket)?;
+        if !Self::requester_can_write_bucket(requester, &bucket_info.owner_principal) {
+            return Err(ServerError::AccessDenied);
+        }
+
+        let ownership_controls = self.get_bucket_ownership_controls(bucket)?;
+        if Self::is_bucket_owner_enforced(ownership_controls.as_deref())
+            && !matches!(
+                acl,
+                PutObjectAcl::None | PutObjectAcl::Private | PutObjectAcl::BucketOwnerFullControl
+            )
+        {
+            return Err(ServerError::AccessControlListNotSupported);
+        }
+
         let LockedWriteObject { version_id, pgs } =
             self.lock_object_pgs_for_write(bucket, key, bucket_info.versioning)?;
         let meta_pg = pgs.meta();
@@ -5244,6 +5339,8 @@ mod tests {
     };
     const NO_WRITE: &WriteCondition = &WriteCondition::None;
     const NO_DELETE: &DeleteCondition = &DeleteCondition::None;
+    const TEST_REQUESTER: Requester<'static> = Requester::system();
+    const NO_PUT_OBJECT_ACL: PutObjectAcl<'static> = PutObjectAcl::None;
 
     fn setup_coordinator(dir: &Path) -> Coordinator {
         let pg_ids: Vec<u32> = (0..4).collect();
@@ -5446,6 +5543,8 @@ mod tests {
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -5483,6 +5582,8 @@ mod tests {
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             });
             tx.send(res).unwrap();
         });
@@ -5554,6 +5655,8 @@ mod tests {
                 data: b"Hello, world!",
                 metadata: &MetadataBlob::from_headers(&headers).unwrap(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
         assert!(!result.etag.is_empty());
@@ -5590,6 +5693,8 @@ mod tests {
                 data: b"{}",
                 metadata: &MetadataBlob::from_headers(&headers).unwrap(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -5620,6 +5725,8 @@ mod tests {
                 data: b"data",
                 metadata: &MetadataBlob::from_headers(&[("Content-Type", "text/plain")]).unwrap(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -5648,6 +5755,8 @@ mod tests {
                 data: b"v1",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
         coord
@@ -5657,6 +5766,8 @@ mod tests {
                 data: b"v2",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -5684,6 +5795,8 @@ mod tests {
                 data: b"",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -5712,6 +5825,8 @@ mod tests {
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
         coord
@@ -5764,6 +5879,8 @@ mod tests {
                 data: b"1",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
         coord
@@ -5773,6 +5890,8 @@ mod tests {
                 data: b"2",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
         coord
@@ -5782,6 +5901,8 @@ mod tests {
                 data: b"3",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -5814,6 +5935,8 @@ mod tests {
                 data: b"cat",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
         coord
@@ -5823,6 +5946,8 @@ mod tests {
                 data: b"dog",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
         coord
@@ -5832,6 +5957,8 @@ mod tests {
                 data: b"md",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -5860,6 +5987,8 @@ mod tests {
                 data: b"cat",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
         coord
@@ -5869,6 +5998,8 @@ mod tests {
                 data: b"dog",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
         coord
@@ -5878,6 +6009,8 @@ mod tests {
                 data: b"md",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
         coord
@@ -5887,6 +6020,8 @@ mod tests {
                 data: b"root",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -5918,6 +6053,8 @@ mod tests {
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -6008,6 +6145,8 @@ mod tests {
                 data,
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -6040,6 +6179,8 @@ mod tests {
                 data,
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -6071,6 +6212,8 @@ mod tests {
                 data,
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -6104,6 +6247,8 @@ mod tests {
                 data,
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -6138,6 +6283,8 @@ mod tests {
                 data,
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -6168,6 +6315,8 @@ mod tests {
                 data,
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -6202,6 +6351,8 @@ mod tests {
                 data,
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -6231,6 +6382,8 @@ mod tests {
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
@@ -6266,6 +6419,8 @@ mod tests {
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -6303,6 +6458,8 @@ mod tests {
                 data: b"1",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
         coord
@@ -6312,6 +6469,8 @@ mod tests {
                 data: b"2",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
         coord
@@ -6321,6 +6480,8 @@ mod tests {
                 data: b"3",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
         coord
@@ -6330,6 +6491,8 @@ mod tests {
                 data: b"4",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
         coord
@@ -6339,6 +6502,8 @@ mod tests {
                 data: b"5",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -6393,6 +6558,8 @@ mod tests {
                     data: b"data",
                     metadata: &MetadataBlob::new(),
                     cond: NO_WRITE,
+                    requester: TEST_REQUESTER,
+                    acl: NO_PUT_OBJECT_ACL,
                 })
                 .unwrap();
         }
@@ -6424,6 +6591,8 @@ mod tests {
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
@@ -6453,6 +6622,8 @@ mod tests {
                     data: b"data",
                     metadata: &MetadataBlob::new(),
                     cond: NO_WRITE,
+                    requester: TEST_REQUESTER,
+                    acl: NO_PUT_OBJECT_ACL,
                 })
                 .unwrap();
         }
@@ -6487,6 +6658,8 @@ mod tests {
                     data: b"data",
                     metadata: &MetadataBlob::new(),
                     cond: NO_WRITE,
+                    requester: TEST_REQUESTER,
+                    acl: NO_PUT_OBJECT_ACL,
                 })
                 .unwrap();
         }
@@ -6547,6 +6720,8 @@ mod tests {
                 data: b"j",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
         coord
@@ -6556,6 +6731,8 @@ mod tests {
                 data: b"f",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
         coord
@@ -6565,6 +6742,8 @@ mod tests {
                 data: b"m",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
         coord
@@ -6574,6 +6753,8 @@ mod tests {
                 data: b"t",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -6609,6 +6790,8 @@ mod tests {
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -6639,6 +6822,8 @@ mod tests {
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -6670,6 +6855,8 @@ mod tests {
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -6717,6 +6904,8 @@ mod tests {
                 data: b"data1",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
         coord
@@ -6726,6 +6915,8 @@ mod tests {
                 data: b"data2",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -6924,6 +7115,8 @@ mod tests {
                 data: b"Hello, World!",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -6956,6 +7149,8 @@ mod tests {
                 data: b"Hello, World!",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -6987,6 +7182,8 @@ mod tests {
                 data: b"Hello, World!",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -7016,6 +7213,8 @@ mod tests {
                 data: b"Hello",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -7045,6 +7244,8 @@ mod tests {
                 data: b"Hello",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -7082,6 +7283,8 @@ mod tests {
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 cond: &cond,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
         assert!(!result.etag.is_empty());
@@ -7099,6 +7302,8 @@ mod tests {
                 data: b"v1",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -7110,6 +7315,8 @@ mod tests {
                 data: b"v2",
                 metadata: &MetadataBlob::new(),
                 cond: &cond,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::PreconditionFailed));
@@ -7128,6 +7335,8 @@ mod tests {
                 data: b"v1",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
         let cond = WriteCondition::IfMatch(SpecificEtag::new(r1.etag.clone()).unwrap());
@@ -7138,6 +7347,8 @@ mod tests {
                 data: b"v2",
                 metadata: &MetadataBlob::new(),
                 cond: &cond,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
         assert_ne!(r1.etag, r2.etag);
@@ -7166,6 +7377,8 @@ mod tests {
                 data: b"v1",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
         // Overwrite so etag changes
@@ -7176,6 +7389,8 @@ mod tests {
                 data: b"v2",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -7187,9 +7402,57 @@ mod tests {
                 data: b"v3",
                 metadata: &MetadataBlob::new(),
                 cond: &cond,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::PreconditionFailed));
+    }
+
+    #[test]
+    fn put_object_rejects_non_owner_requester() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let err = coord
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+                requester: Requester::principal("other-user"),
+                acl: NO_PUT_OBJECT_ACL,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn put_object_rejects_acl_on_bucket_owner_enforced_bucket() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+        coord
+            .put_bucket_ownership_controls(
+                "bucket",
+                "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
+            )
+            .unwrap();
+
+        let err = coord
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: PutObjectAcl::Other("public-read"),
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessControlListNotSupported));
     }
 
     #[test]
@@ -7205,6 +7468,8 @@ mod tests {
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
         let cond = ReadCondition {
@@ -7234,6 +7499,8 @@ mod tests {
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -7265,6 +7532,8 @@ mod tests {
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
         let cond = ReadCondition {
@@ -7295,6 +7564,8 @@ mod tests {
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
         let cond = ReadCondition {
@@ -7325,6 +7596,8 @@ mod tests {
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
         let cond = DeleteCondition::IfMatch(put.etag);
@@ -7358,6 +7631,8 @@ mod tests {
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -7386,6 +7661,8 @@ mod tests {
                 data: b"data1",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
         coord
@@ -7395,6 +7672,8 @@ mod tests {
                 data: b"data2",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -7436,6 +7715,8 @@ mod tests {
                 data: b"Hello, World!",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
         let cond = ReadCondition {
@@ -7470,6 +7751,8 @@ mod tests {
                 data: b"hello copy",
                 metadata: &MetadataBlob::from_headers(&headers).unwrap(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -7517,6 +7800,8 @@ mod tests {
                 data: b"data",
                 metadata: &MetadataBlob::from_headers(&headers).unwrap(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -7564,6 +7849,8 @@ mod tests {
                 data: b"data",
                 metadata: &MetadataBlob::from_headers(&headers).unwrap(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -7616,6 +7903,8 @@ mod tests {
                 data: b"data",
                 metadata: &MetadataBlob::from_headers(&headers).unwrap(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -7666,6 +7955,8 @@ mod tests {
                 data: b"hello",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -7720,6 +8011,8 @@ mod tests {
                 data,
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -7809,6 +8102,8 @@ mod tests {
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -7841,6 +8136,8 @@ mod tests {
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -7878,6 +8175,8 @@ mod tests {
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
         coord
@@ -7887,6 +8186,8 @@ mod tests {
                 data: b"existing",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -7921,6 +8222,8 @@ mod tests {
                 data: b"new data",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
         let existing = coord
@@ -7930,6 +8233,8 @@ mod tests {
                 data: b"old data",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -7976,6 +8281,8 @@ mod tests {
                 data: b"cross bucket data",
                 metadata: &MetadataBlob::from_headers(&headers).unwrap(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -8122,6 +8429,8 @@ mod tests {
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
         assert_eq!(result.version_id, VersionId::Null);
@@ -8140,6 +8449,8 @@ mod tests {
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
         let obj = coord
@@ -8166,6 +8477,8 @@ mod tests {
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
         let head = coord
@@ -8221,6 +8534,8 @@ mod tests {
                     data: b"v1",
                     metadata: &MetadataBlob::new(),
                     cond: NO_WRITE,
+                    requester: TEST_REQUESTER,
+                    acl: NO_PUT_OBJECT_ACL,
                 })
             });
             let t2 = thread::spawn(move || {
@@ -8231,6 +8546,8 @@ mod tests {
                     data: b"v2",
                     metadata: &MetadataBlob::new(),
                     cond: NO_WRITE,
+                    requester: TEST_REQUESTER,
+                    acl: NO_PUT_OBJECT_ACL,
                 })
             });
 
@@ -8275,6 +8592,8 @@ mod tests {
                 data: &vec![b'A'; object_size],
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -8297,6 +8616,8 @@ mod tests {
                     data: &new_payload,
                     metadata: &MetadataBlob::new(),
                     cond: NO_WRITE,
+                    requester: TEST_REQUESTER,
+                    acl: NO_PUT_OBJECT_ACL,
                 })
             });
             let t_read = thread::spawn(move || {
@@ -8358,6 +8679,8 @@ mod tests {
                 data: &vec![b'A'; object_size],
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -8379,6 +8702,8 @@ mod tests {
                     data: &payload,
                     metadata: &MetadataBlob::new(),
                     cond: NO_WRITE,
+                    requester: TEST_REQUESTER,
+                    acl: NO_PUT_OBJECT_ACL,
                 })
             });
             let t_delete = thread::spawn(move || {
@@ -8438,6 +8763,8 @@ mod tests {
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
         let result = coord
@@ -10697,6 +11024,8 @@ mod tests {
                 data: b"hello world",
                 metadata: &MetadataBlob::from_headers(&[("x-amz-meta-foo", "bar")]).unwrap(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -10741,6 +11070,8 @@ mod tests {
                 data: b"",
                 metadata: &MetadataBlob::new(),
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -11477,6 +11808,8 @@ mod tests {
                 data: b"old-data",
                 metadata: &MetadataBlob::new(),
                 cond: &WriteCondition::default(),
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -11528,6 +11861,8 @@ mod tests {
                 data: b"initial",
                 metadata: &MetadataBlob::new(),
                 cond: &WriteCondition::default(),
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -11989,6 +12324,8 @@ mod tests {
                 data: b"normal-data",
                 metadata: &MetadataBlob::new(),
                 cond: &WriteCondition::default(),
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -12784,6 +13121,8 @@ mod tests {
                 data: b"v2-normal",
                 metadata: &MetadataBlob::new(),
                 cond: &WriteCondition::default(),
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
