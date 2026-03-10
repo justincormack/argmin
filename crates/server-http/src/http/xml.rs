@@ -3442,6 +3442,7 @@ mod tests {
                 key_marker: None,
                 version_id_marker: None,
                 max_keys: 1000,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(versions_result.versions.len(), 3);
@@ -3462,6 +3463,7 @@ mod tests {
                 delimiter: None,
                 continuation_token: None,
                 max_keys: 1000,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(list_result.objects.len(), 3);
@@ -3501,6 +3503,7 @@ mod tests {
                 delimiter: None,
                 continuation_token: None,
                 max_keys: 1000,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert!(list_after.objects.is_empty());
@@ -3535,6 +3538,7 @@ mod tests {
                 delimiter: None,
                 continuation_token: None,
                 max_keys: 2,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(page1.objects.len(), 2);
@@ -3548,6 +3552,7 @@ mod tests {
                 delimiter: None,
                 continuation_token: Some(&token),
                 max_keys: 2,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(page2.objects.len(), 2);
@@ -3560,6 +3565,7 @@ mod tests {
                 delimiter: None,
                 continuation_token: Some(&token2),
                 max_keys: 2,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(page3.objects.len(), 1);

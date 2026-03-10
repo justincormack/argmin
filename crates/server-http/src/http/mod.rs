@@ -275,12 +275,17 @@ impl HttpFrontend {
                 Ok(S3Response::delete_bucket())
             }
             S3Operation::HeadBucket { bucket } => {
-                self.authorize_bucket_read(auth, &bucket)?;
-                let info = self.coordinator.head_bucket(&bucket)?;
+                let requester =
+                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                let info = self.coordinator.head_bucket_for_requester(
+                    &crate::coordinator::HeadBucketRequest {
+                        bucket: &bucket,
+                        requester,
+                    },
+                )?;
                 Ok(S3Response::head_bucket(&info))
             }
             S3Operation::ListObjectsV1 { bucket } => {
-                self.authorize_bucket_read(auth, &bucket)?;
                 let prefix = req.query_param("prefix");
                 let delimiter = req.query_param("delimiter").filter(|d| !d.is_empty());
                 let marker = req.query_param("marker");
@@ -292,6 +297,8 @@ impl HttpFrontend {
                     });
                 }
                 let max_keys: u32 = parse_max_keys(req.query_param("max-keys"))?;
+                let requester =
+                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
 
                 let result = self.coordinator.list_objects_v2(
                     &crate::coordinator::ListObjectsV2Request {
@@ -300,6 +307,7 @@ impl HttpFrontend {
                         delimiter: delimiter.as_deref(),
                         continuation_token: marker.as_deref(),
                         max_keys,
+                        requester,
                     },
                 )?;
                 Ok(S3Response::list_objects_v1(
@@ -313,7 +321,6 @@ impl HttpFrontend {
                 ))
             }
             S3Operation::ListObjectsV2 { bucket } => {
-                self.authorize_bucket_read(auth, &bucket)?;
                 let prefix = req.query_param("prefix");
                 let delimiter = req.query_param("delimiter").filter(|d| !d.is_empty());
                 let encoding_type = req.query_param("encoding-type");
@@ -342,6 +349,8 @@ impl HttpFrontend {
                     .or(start_after_raw.as_deref())
                     .filter(|v| !v.is_empty());
                 let max_keys: u32 = parse_max_keys(req.query_param("max-keys"))?;
+                let requester =
+                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
 
                 let result = self.coordinator.list_objects_v2(
                     &crate::coordinator::ListObjectsV2Request {
@@ -350,6 +359,7 @@ impl HttpFrontend {
                         delimiter: delimiter.as_deref(),
                         continuation_token,
                         max_keys,
+                        requester,
                     },
                 )?;
                 Ok(S3Response::list_objects_v2(
@@ -1207,7 +1217,6 @@ impl HttpFrontend {
                 Ok(S3Response::abort_multipart_upload())
             }
             S3Operation::ListMultipartUploads { bucket } => {
-                self.authorize_bucket_read(auth, &bucket)?;
                 let prefix = req.query_param("prefix");
                 let key_marker = req.query_param("key-marker");
                 let upload_id_marker = req.query_param("upload-id-marker");
@@ -1217,6 +1226,8 @@ impl HttpFrontend {
                         reason: "invalid max-uploads".to_string(),
                     })?,
                 };
+                let requester =
+                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
                 let result = self.coordinator.list_multipart_uploads(
                     &crate::coordinator::ListMultipartUploadsRequest {
                         bucket: &bucket,
@@ -1224,6 +1235,7 @@ impl HttpFrontend {
                         key_marker: key_marker.as_deref(),
                         upload_id_marker: upload_id_marker.as_deref(),
                         max_uploads,
+                        requester,
                     },
                 )?;
                 Ok(S3Response::list_multipart_uploads(
@@ -1236,7 +1248,6 @@ impl HttpFrontend {
                 ))
             }
             S3Operation::ListParts { bucket, key } => {
-                self.authorize_bucket_read(auth, &bucket)?;
                 let upload_id =
                     req.query_param("uploadId")
                         .ok_or_else(|| ServerError::InvalidRequest {
@@ -1256,6 +1267,8 @@ impl HttpFrontend {
                         reason: "invalid max-parts".to_string(),
                     })?,
                 };
+                let requester =
+                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
                 let result =
                     self.coordinator
                         .list_parts(&crate::coordinator::ListPartsRequest {
@@ -1264,6 +1277,7 @@ impl HttpFrontend {
                             upload_id: &upload_id,
                             part_number_marker,
                             max_parts,
+                            requester,
                         })?;
                 Ok(S3Response::list_parts(
                     &bucket,
@@ -1279,7 +1293,6 @@ impl HttpFrontend {
                 unreachable!("OPTIONS handled before dispatch")
             }
             S3Operation::ListObjectVersions { bucket } => {
-                self.authorize_bucket_read(auth, &bucket)?;
                 let prefix = req.query_param("prefix");
                 let key_marker = req.query_param("key-marker");
                 let version_id_marker = match req.query_param("version-id-marker") {
@@ -1295,6 +1308,8 @@ impl HttpFrontend {
                     .query_param("max-keys")
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(1000);
+                let requester =
+                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
 
                 let result = self.coordinator.list_object_versions(
                     &crate::coordinator::ListObjectVersionsRequest {
@@ -1303,6 +1318,7 @@ impl HttpFrontend {
                         key_marker: key_marker.as_deref(),
                         version_id_marker,
                         max_keys,
+                        requester,
                     },
                 )?;
                 Ok(S3Response::list_object_versions(

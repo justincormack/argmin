@@ -342,6 +342,13 @@ pub struct GetObjectRequest<'a> {
     pub requester: Requester<'a>,
 }
 
+/// Request for a HeadBucket operation.
+#[derive(Debug)]
+pub struct HeadBucketRequest<'a> {
+    pub bucket: &'a str,
+    pub requester: Requester<'a>,
+}
+
 /// Request for a GetObjectPart or HeadObjectPart operation.
 #[derive(Debug)]
 pub struct GetObjectPartRequest<'a> {
@@ -382,6 +389,7 @@ pub struct ListObjectsV2Request<'a> {
     pub delimiter: Option<&'a str>,
     pub continuation_token: Option<&'a str>,
     pub max_keys: u32,
+    pub requester: Requester<'a>,
 }
 
 /// Request for a ListObjectVersions operation.
@@ -392,6 +400,7 @@ pub struct ListObjectVersionsRequest<'a> {
     pub key_marker: Option<&'a str>,
     pub version_id_marker: Option<VersionId>,
     pub max_keys: u32,
+    pub requester: Requester<'a>,
 }
 
 /// Request for a ListParts operation.
@@ -402,6 +411,7 @@ pub struct ListPartsRequest<'a> {
     pub upload_id: &'a str,
     pub part_number_marker: Option<u32>,
     pub max_parts: u32,
+    pub requester: Requester<'a>,
 }
 
 /// Request for a ListMultipartUploads operation.
@@ -412,6 +422,7 @@ pub struct ListMultipartUploadsRequest<'a> {
     pub key_marker: Option<&'a str>,
     pub upload_id_marker: Option<&'a str>,
     pub max_uploads: u32,
+    pub requester: Requester<'a>,
 }
 
 /// A single entry in a batch-delete request, with an already-parsed version ID.
@@ -934,6 +945,13 @@ impl Coordinator {
                 },
                 other => ServerError::Metadata(other),
             })
+    }
+
+    pub fn head_bucket_for_requester(
+        &self,
+        req: &HeadBucketRequest<'_>,
+    ) -> Result<BucketSummary, ServerError> {
+        self.authorize_bucket_read_requester(req.requester, req.bucket)
     }
 
     pub fn list_buckets(&self) -> Result<Vec<BucketSummary>, ServerError> {
@@ -4045,8 +4063,7 @@ impl Coordinator {
         let delimiter = req.delimiter;
         let continuation_token = req.continuation_token;
         let max_keys = req.max_keys;
-        // Verify bucket exists
-        let bucket_info = self.head_bucket(bucket)?;
+        let bucket_info = self.authorize_bucket_read_requester(req.requester, bucket)?;
 
         // MaxKeys=0 is valid per S3 spec: return empty result
         if max_keys == 0 {
@@ -4205,7 +4222,7 @@ impl Coordinator {
         let key_marker = req.key_marker;
         let version_id_marker = req.version_id_marker;
         let max_keys = req.max_keys;
-        let _bucket_info = self.head_bucket(bucket)?;
+        let _bucket_info = self.authorize_bucket_read_requester(req.requester, bucket)?;
 
         if max_keys == 0 {
             return Ok(ListObjectVersionsResult {
@@ -5253,6 +5270,7 @@ impl Coordinator {
         let upload_id = req.upload_id;
         let part_number_marker = req.part_number_marker;
         let max_parts = req.max_parts;
+        let _bucket_info = self.authorize_bucket_read_requester(req.requester, bucket)?;
         // 1. Lock meta PG and validate upload.
         let meta_pg_id = self.object_pg_id(bucket, key);
         let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
@@ -5321,7 +5339,7 @@ impl Coordinator {
         let key_marker = req.key_marker;
         let upload_id_marker = req.upload_id_marker;
         let max_uploads = req.max_uploads;
-        self.head_bucket(bucket)?;
+        let _bucket_info = self.authorize_bucket_read_requester(req.requester, bucket)?;
 
         if max_uploads == 0 {
             return Ok(ListMultipartUploadsResult {
@@ -5566,6 +5584,7 @@ mod tests {
                 delimiter: None,
                 continuation_token: None,
                 max_keys: 1000,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert!(resp.objects.is_empty());
@@ -5587,6 +5606,7 @@ mod tests {
                 key_marker: None,
                 version_id_marker: None,
                 max_keys: 1000,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert!(resp.versions.is_empty());
@@ -5617,6 +5637,7 @@ mod tests {
                 key_marker: None,
                 upload_id_marker: None,
                 max_uploads: 1000,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(resp.uploads.len(), 1);
@@ -6014,6 +6035,7 @@ mod tests {
                 delimiter: None,
                 continuation_token: None,
                 max_keys: 1000,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(result.objects.len(), 3);
@@ -6070,6 +6092,7 @@ mod tests {
                 delimiter: None,
                 continuation_token: None,
                 max_keys: 1000,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(result.objects.len(), 2);
@@ -6133,6 +6156,7 @@ mod tests {
                 delimiter: Some("/"),
                 continuation_token: None,
                 max_keys: 1000,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(result.objects.len(), 1);
@@ -6627,6 +6651,7 @@ mod tests {
                 delimiter: Some("/"),
                 continuation_token: None,
                 max_keys: 2,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(
@@ -6646,6 +6671,7 @@ mod tests {
                 delimiter: Some("/"),
                 continuation_token: Some(&token),
                 max_keys: 2,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert!(
@@ -6683,6 +6709,7 @@ mod tests {
                 delimiter: Some("/"),
                 continuation_token: None,
                 max_keys: 3,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         // With delimiter "/", all entries become common prefixes
@@ -6748,6 +6775,7 @@ mod tests {
                 delimiter: None,
                 continuation_token: None,
                 max_keys: 3,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(result.objects.len(), 3);
@@ -6784,6 +6812,7 @@ mod tests {
                 delimiter: None,
                 continuation_token: None,
                 max_keys: 2,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(page1.objects.len(), 2);
@@ -6798,6 +6827,7 @@ mod tests {
                 delimiter: None,
                 continuation_token: Some(token),
                 max_keys: 2,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(page2.objects.len(), 2);
@@ -6812,6 +6842,7 @@ mod tests {
                 delimiter: None,
                 continuation_token: Some(token2),
                 max_keys: 2,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(page3.objects.len(), 1);
@@ -6878,6 +6909,7 @@ mod tests {
                 delimiter: Some("/"),
                 continuation_token: None,
                 max_keys: 1000,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         // top.jpg is a direct child, 2024/ and 2025/ are common prefixes
@@ -6914,6 +6946,7 @@ mod tests {
                 delimiter: None,
                 continuation_token: None,
                 max_keys: 1000,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(result.objects.len(), 1);
@@ -6946,6 +6979,7 @@ mod tests {
                 delimiter: None,
                 continuation_token: None,
                 max_keys: 0,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert!(result.objects.is_empty());
@@ -6979,6 +7013,7 @@ mod tests {
                 delimiter: Some("/"),
                 continuation_token: None,
                 max_keys: 0,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert!(result.objects.is_empty());
@@ -6998,6 +7033,7 @@ mod tests {
                 delimiter: None,
                 continuation_token: None,
                 max_keys: 1000,
+                requester: TEST_REQUESTER,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
@@ -7691,6 +7727,72 @@ mod tests {
             })
             .unwrap();
         assert_eq!(obj.data, b"public");
+    }
+
+    #[test]
+    fn head_bucket_rejects_non_owner_requester() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+
+        let err = coord
+            .head_bucket_for_requester(&HeadBucketRequest {
+                bucket: "bucket",
+                requester: Requester::principal("other-user"),
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn head_bucket_allows_public_read_for_anonymous() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", true)
+            .unwrap();
+
+        let info = coord
+            .head_bucket_for_requester(&HeadBucketRequest {
+                bucket: "bucket",
+                requester: Requester::anonymous(),
+            })
+            .unwrap();
+        assert_eq!(info.name, "bucket");
+    }
+
+    #[test]
+    fn list_objects_rejects_non_owner_requester() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        coord
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                cond: NO_WRITE,
+                requester: Requester::principal("owner-a"),
+                acl: NO_PUT_OBJECT_ACL,
+            })
+            .unwrap();
+
+        let err = coord
+            .list_objects_v2(&ListObjectsV2Request {
+                bucket: "bucket",
+                prefix: None,
+                delimiter: None,
+                continuation_token: None,
+                max_keys: 1000,
+                requester: Requester::principal("other-user"),
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
     }
 
     #[test]
@@ -9228,6 +9330,7 @@ mod tests {
                 key_marker: None,
                 upload_id_marker: None,
                 max_uploads: 1000,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert!(result.uploads.is_empty());
@@ -9265,6 +9368,7 @@ mod tests {
                 key_marker: None,
                 upload_id_marker: None,
                 max_uploads: 1000,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(result.uploads.len(), 2);
@@ -9309,6 +9413,7 @@ mod tests {
                 key_marker: None,
                 upload_id_marker: None,
                 max_uploads: 1000,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(result.uploads.len(), 2);
@@ -9366,6 +9471,7 @@ mod tests {
                 key_marker: None,
                 upload_id_marker: None,
                 max_uploads: 2,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(page1.uploads.len(), 2);
@@ -9383,6 +9489,7 @@ mod tests {
                 key_marker: page1.next_key_marker.as_deref(),
                 upload_id_marker: page1.next_upload_id_marker.as_deref(),
                 max_uploads: 2,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(page2.uploads.len(), 1);
@@ -9429,6 +9536,7 @@ mod tests {
                 key_marker: None,
                 upload_id_marker: None,
                 max_uploads: 1000,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(result.uploads.len(), 2);
@@ -9458,6 +9566,7 @@ mod tests {
                 key_marker: None,
                 upload_id_marker: None,
                 max_uploads: 0,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert!(result.uploads.is_empty());
@@ -9476,6 +9585,7 @@ mod tests {
                 key_marker: None,
                 upload_id_marker: None,
                 max_uploads: 1000,
+                requester: TEST_REQUESTER,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
@@ -9580,6 +9690,7 @@ mod tests {
                 key_marker: None,
                 upload_id_marker: None,
                 max_uploads: 2,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(page1.uploads.len(), 2);
@@ -9597,6 +9708,7 @@ mod tests {
                 key_marker: page1.next_key_marker.as_deref(),
                 upload_id_marker: page1.next_upload_id_marker.as_deref(),
                 max_uploads: 2,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(page2.uploads.len(), 1);
@@ -10449,6 +10561,7 @@ mod tests {
                 delimiter: None,
                 continuation_token: None,
                 max_keys: 100,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(list.objects.len(), 1);
@@ -10488,6 +10601,7 @@ mod tests {
                 key_marker: None,
                 version_id_marker: None,
                 max_keys: 100,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(versions.versions.len(), 1);
@@ -10542,6 +10656,7 @@ mod tests {
                 key_marker: None,
                 upload_id_marker: None,
                 max_uploads: 100,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert!(uploads.uploads.is_empty());
@@ -10675,6 +10790,7 @@ mod tests {
                 delimiter: None,
                 continuation_token: None,
                 max_keys: 100,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(list.objects.len(), 1);
@@ -10753,6 +10869,7 @@ mod tests {
                 upload_id: &upload_id,
                 part_number_marker: None,
                 max_parts: 100,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(result.parts.len(), 3);
@@ -10785,6 +10902,7 @@ mod tests {
                 upload_id: &upload_id,
                 part_number_marker: None,
                 max_parts: 2,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(page1.parts.len(), 2);
@@ -10801,6 +10919,7 @@ mod tests {
                 upload_id: &upload_id,
                 part_number_marker: page1.next_part_number_marker,
                 max_parts: 2,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(page2.parts.len(), 2);
@@ -10825,6 +10944,7 @@ mod tests {
                 upload_id: &upload_id,
                 part_number_marker: None,
                 max_parts: 100,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(result.parts.len(), 1);
@@ -10856,6 +10976,7 @@ mod tests {
                 upload_id: &create.upload_id,
                 part_number_marker: None,
                 max_parts: 100,
+                requester: TEST_REQUESTER,
             })
             .unwrap_err();
         assert!(
@@ -10877,6 +10998,7 @@ mod tests {
                 upload_id: "no-such-upload",
                 part_number_marker: None,
                 max_parts: 100,
+                requester: TEST_REQUESTER,
             })
             .unwrap_err();
         assert!(
@@ -10930,6 +11052,7 @@ mod tests {
                 upload_id: &create.upload_id,
                 part_number_marker: None,
                 max_parts: 100,
+                requester: TEST_REQUESTER,
             })
             .unwrap();
         assert_eq!(result.parts.len(), 1);
@@ -10977,6 +11100,7 @@ mod tests {
                 upload_id: &create.upload_id,
                 part_number_marker: None,
                 max_parts: 100,
+                requester: TEST_REQUESTER,
             })
             .unwrap_err();
         assert!(
