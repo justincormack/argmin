@@ -2143,3 +2143,171 @@ fn test_post_object_tags_anonymous_request() {
 fn test_post_object_tags_authenticated_request() {
     s3_tests::run(async {});
 }
+
+// ── Coverage tests for multipart parser edge cases ──────────────────────
+
+/// POST Object with wrong Content-Type (not multipart/form-data).
+/// AWS returns 412 Precondition Failed.
+#[test]
+fn test_post_object_wrong_content_type() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let url = format!("{}/{}", CTX.endpoint(), bucket);
+        let mut resp = agent()
+            .post(&url)
+            .header("Content-Type", "text/plain")
+            .send(b"hello" as &[u8])
+            .expect("HTTP transport error");
+        let status = resp.status().as_u16();
+        let body = resp.body_mut().read_to_string().unwrap_or_default();
+        assert_eq!(status, 412);
+        assert!(
+            body.contains("<Code>PreconditionFailed</Code>"),
+            "expected PreconditionFailed error, got: {body}"
+        );
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+/// POST Object with multipart/form-data but no boundary parameter.
+/// AWS returns MalformedPOSTRequest.
+#[test]
+fn test_post_object_missing_boundary() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let url = format!("{}/{}", CTX.endpoint(), bucket);
+        let mut resp = agent()
+            .post(&url)
+            .header("Content-Type", "multipart/form-data")
+            .send(b"data" as &[u8])
+            .expect("HTTP transport error");
+        let status = resp.status().as_u16();
+        let body = resp.body_mut().read_to_string().unwrap_or_default();
+        assert_eq!(status, 400);
+        assert!(
+            body.contains("<Code>MalformedPOSTRequest</Code>"),
+            "expected MalformedPOSTRequest, got: {body}"
+        );
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+/// POST Object with empty boundary value (boundary="").
+/// AWS may return MalformedPOSTRequest or InvalidArgument.
+#[test]
+fn test_post_object_empty_boundary() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let url = format!("{}/{}", CTX.endpoint(), bucket);
+        let mut resp = agent()
+            .post(&url)
+            .header("Content-Type", "multipart/form-data; boundary=\"\"")
+            .send(b"data" as &[u8])
+            .expect("HTTP transport error");
+        let status = resp.status().as_u16();
+        let body = resp.body_mut().read_to_string().unwrap_or_default();
+        assert_eq!(status, 400);
+        assert!(
+            body.contains("<Code>MalformedPOSTRequest</Code>")
+                || body.contains("<Code>InvalidArgument</Code>"),
+            "expected MalformedPOSTRequest or InvalidArgument, got: {body}"
+        );
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+/// POST Object with a multipart part whose Content-Disposition has no name=.
+/// Exercises parse_content_disposition missing name error.
+/// AWS returns InvalidArgument ("POST requires exactly one file upload").
+#[test]
+fn test_post_object_part_missing_name() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let url = format!("{}/{}", CTX.endpoint(), bucket);
+        let boundary = "TestBoundary";
+        let mut body = Vec::new();
+        // Part with no name= in Content-Disposition
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(b"Content-Disposition: form-data\r\n\r\n");
+        body.extend_from_slice(b"value\r\n");
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+
+        let content_type = format!("multipart/form-data; boundary={boundary}");
+        let mut resp = agent()
+            .post(&url)
+            .header("Content-Type", &content_type)
+            .send(&body[..])
+            .expect("HTTP transport error");
+        let status = resp.status().as_u16();
+        let body = resp.body_mut().read_to_string().unwrap_or_default();
+        assert_eq!(status, 400);
+        assert!(
+            body.contains("<Code>MalformedPOSTRequest</Code>")
+                || body.contains("<Code>InvalidArgument</Code>"),
+            "expected MalformedPOSTRequest or InvalidArgument, got: {body}"
+        );
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+/// POST Object with unquoted name= values in Content-Disposition.
+/// Exercises the unquote non-quoted path.
+#[test]
+fn test_post_object_unquoted_field_names() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+
+        let fields = sigv4_fields(&bucket, "test.txt", &[]);
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+
+        // Build multipart body with unquoted name= values
+        let boundary = "----TestBoundary7MA4YWxkTrZu0gW";
+        let mut body = Vec::new();
+        for (name, value) in &field_refs {
+            body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+            // Unquoted name= value
+            body.extend_from_slice(
+                format!("Content-Disposition: form-data; name={name}\r\n\r\n").as_bytes(),
+            );
+            body.extend_from_slice(value.as_bytes());
+            body.extend_from_slice(b"\r\n");
+        }
+        // File field with unquoted name
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            b"Content-Disposition: form-data; name=file; filename=\"test.txt\"\r\n",
+        );
+        body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
+        body.extend_from_slice(b"hello");
+        body.extend_from_slice(b"\r\n");
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+
+        let content_type = format!("multipart/form-data; boundary={boundary}");
+        let url = format!("{}/{}", CTX.endpoint(), bucket);
+        let mut resp = agent()
+            .post(&url)
+            .header("Content-Type", &content_type)
+            .send(&body[..])
+            .expect("HTTP transport error");
+        let status = resp.status().as_u16();
+        let _body = resp.body_mut().read_to_string().unwrap_or_default();
+        assert_eq!(status, 204);
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key("test.txt")
+            .send()
+            .await
+            .unwrap();
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}

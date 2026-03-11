@@ -661,16 +661,25 @@ async fn handle_streaming_post_object(
     let content_type = match req_arc.header("content-type") {
         Some(v) => v,
         None => {
-            return error_response(&ServerError::InvalidRequest {
-                reason: "POST Object requires Content-Type: multipart/form-data".to_string(),
-            });
+            // AWS returns 412 for missing/wrong Content-Type on POST Object.
+            return error_response(&ServerError::PreconditionFailed);
         }
     };
+    // Check if this is actually multipart/form-data before looking for boundary.
+    // AWS returns 412 for wrong content-type, 400 for missing boundary.
+    let is_multipart = content_type
+        .split(';')
+        .next()
+        .is_some_and(|t| t.trim().eq_ignore_ascii_case("multipart/form-data"));
+    if !is_multipart {
+        return error_response(&ServerError::PreconditionFailed);
+    }
     let boundary = match super::multipart::extract_boundary(content_type) {
         Some(b) => b,
         None => {
-            return error_response(&ServerError::InvalidRequest {
-                reason: "POST Object requires multipart/form-data with boundary".to_string(),
+            return error_response(&ServerError::MalformedPOSTRequest {
+                reason: "The body of your POST request is not well-formed multipart/form-data."
+                    .to_string(),
             });
         }
     };

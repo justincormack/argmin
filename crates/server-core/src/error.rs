@@ -118,6 +118,9 @@ pub enum ServerError {
         server_hash: String,
     },
 
+    #[error("malformed POST request: {reason}")]
+    MalformedPOSTRequest { reason: String },
+
     #[error("malformed chunked body: {reason}")]
     MalformedChunkedBody { reason: String },
 
@@ -190,6 +193,7 @@ impl ServerError {
             Self::InvalidPart { .. } => "InvalidPart",
             Self::InvalidPartOrder => "InvalidPartOrder",
             Self::EntityTooSmall { .. } => "EntityTooSmall",
+            Self::MalformedPOSTRequest { .. } => "MalformedPOSTRequest",
             Self::MalformedChunkedBody { .. } => "InvalidRequest",
             Self::IncompleteBody => "IncompleteBody",
             Self::MissingContentLength => "MissingContentLength",
@@ -232,6 +236,7 @@ impl ServerError {
             Self::AccessControlListNotSupported
             | Self::InvalidBucketAclWithObjectOwnership
             | Self::XAmzContentSHA256Mismatch { .. }
+            | Self::MalformedPOSTRequest { .. }
             | Self::MalformedChunkedBody { .. }
             | Self::IncompleteBody
             | Self::MalformedTrailerError { .. } => 400,
