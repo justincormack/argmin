@@ -1290,6 +1290,20 @@ impl HttpFrontend {
     }
 
     fn authenticate(&self, req: &S3Request) -> Result<AuthContext, ServerError> {
+        self.authenticate_with_payload_check(req, true)
+    }
+
+    /// Authenticate a request, optionally skipping x-amz-content-sha256 body
+    /// verification.
+    ///
+    /// Streaming write setup passes `verify_payload_hash = false` because the
+    /// body is consumed incrementally in `serve.rs`. Buffered request handling
+    /// must pass `true`.
+    fn authenticate_with_payload_check(
+        &self,
+        req: &S3Request,
+        verify_payload_hash: bool,
+    ) -> Result<AuthContext, ServerError> {
         let header_pairs = req.header_pairs();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1348,14 +1362,16 @@ impl HttpFrontend {
         // (not UNSIGNED-PAYLOAD and not STREAMING-*), recompute and compare to
         // detect transit corruption. STREAMING-* bodies are verified by the
         // chunked decoder.
-        if let Some(claimed) = req.header("x-amz-content-sha256") {
-            if claimed != "UNSIGNED-PAYLOAD" && !claimed.starts_with("STREAMING-") {
-                let actual = auth::canonical::sha256_hex(&req.body);
-                if actual != claimed {
-                    return Err(ServerError::XAmzContentSHA256Mismatch {
-                        client_hash: claimed.to_string(),
-                        server_hash: actual,
-                    });
+        if verify_payload_hash {
+            if let Some(claimed) = req.header("x-amz-content-sha256") {
+                if claimed != "UNSIGNED-PAYLOAD" && !claimed.starts_with("STREAMING-") {
+                    let actual = auth::canonical::sha256_hex(&req.body);
+                    if actual != claimed {
+                        return Err(ServerError::XAmzContentSHA256Mismatch {
+                            client_hash: claimed.to_string(),
+                            server_hash: actual,
+                        });
+                    }
                 }
             }
         }
@@ -1737,7 +1753,7 @@ impl HttpFrontend {
         bucket: &str,
         key: &str,
     ) -> Result<StreamingPutContext, ServerError> {
-        let auth = self.authenticate(req)?;
+        let auth = self.authenticate_with_payload_check(req, false)?;
 
         validate_checksum_headers(req, false)?;
 
@@ -1910,7 +1926,7 @@ impl HttpFrontend {
         upload_id: &str,
         part_number: u32,
     ) -> Result<StreamingPartContext, ServerError> {
-        let auth = self.authenticate(req)?;
+        let auth = self.authenticate_with_payload_check(req, false)?;
 
         let claimed_checksum = extract_checksum_header(req)?;
 

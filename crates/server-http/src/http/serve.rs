@@ -354,7 +354,8 @@ async fn handle(
 ///
 /// Returns a `StreamingWriteOp` for `PutObject` and `UploadPart` requests that:
 /// - Are not `CopyObject` (no `x-amz-copy-source` header)
-/// - Use UNSIGNED-PAYLOAD or a STREAMING-* aws-chunked content hash
+/// - Use UNSIGNED-PAYLOAD, a fixed payload SHA256, or a supported
+///   STREAMING-* aws-chunked content hash
 ///
 fn is_streaming_write(parts: &http::request::Parts) -> Option<StreamingWriteOp> {
     if parts.method != http::Method::PUT {
@@ -408,9 +409,12 @@ fn is_streaming_write(parts: &http::request::Parts) -> Option<StreamingWriteOp> 
                 _ => ChunkedMode::UnsignedTrailer { expected_len },
             }
         }
-        // STREAMING-UNSIGNED-PAYLOAD is intentionally rejected (AWS rejects it too).
-        Some(_) => return None, // Real SHA256 hash — need full body for verification
-        None => return None,    // No header — need full body for auth
+        // STREAMING-UNSIGNED-PAYLOAD (without -TRAILER) and unknown streaming
+        // tokens are rejected by AWS.
+        Some(v) if v.starts_with("STREAMING-") => return None,
+        // Fixed payload hash (hex SHA256): verify incrementally in the streaming loop.
+        Some(_) => ChunkedMode::None,
+        None => return None, // No header — need full body for auth
     };
 
     let path = parts.uri.path();
@@ -489,6 +493,10 @@ async fn handle_streaming_put(
 
     // Build chunked decoder if needed.
     let mut decoder = make_chunked_decoder(&chunked, ctx.streaming_signing.as_ref());
+    let claimed_payload_sha256 = claimed_payload_sha256_from_parts(&parts);
+    let mut payload_sha256_hasher = claimed_payload_sha256
+        .as_ref()
+        .map(|_| ring::digest::Context::new(&ring::digest::SHA256));
 
     // If a trailing checksum is declared, prepare an incremental hasher for validation.
     // Otherwise, if an inline checksum header is present, prepare a hasher for that
@@ -532,6 +540,9 @@ async fn handle_streaming_put(
                     }
 
                     hasher.update(&payload);
+                    if let Some(ref mut h) = payload_sha256_hasher {
+                        h.update(&payload);
+                    }
                     if let Some(ref mut th) = trailing_hasher {
                         th.update(&payload);
                     }
@@ -606,6 +617,17 @@ async fn handle_streaming_put(
                 abort_streaming(&state, &ctx).await;
                 return error_response(&err);
             }
+        }
+    }
+
+    if let (Some(claimed), Some(h)) = (claimed_payload_sha256.as_ref(), payload_sha256_hasher) {
+        let actual = sha256_hex_from_digest(h.finish().as_ref());
+        if &actual != claimed {
+            abort_streaming(&state, &ctx).await;
+            return error_response(&ServerError::XAmzContentSHA256Mismatch {
+                client_hash: claimed.clone(),
+                server_hash: actual,
+            });
         }
     }
 
@@ -739,6 +761,10 @@ async fn handle_streaming_part(
 
     // Build chunked decoder if needed.
     let mut decoder = make_chunked_decoder(&chunked, ctx.streaming_signing.as_ref());
+    let claimed_payload_sha256 = claimed_payload_sha256_from_parts(&parts);
+    let mut payload_sha256_hasher = claimed_payload_sha256
+        .as_ref()
+        .map(|_| ring::digest::Context::new(&ring::digest::SHA256));
 
     // If a trailing checksum is declared, prepare an incremental hasher for validation.
     // Otherwise, if an inline checksum header is present, prepare a hasher for that
@@ -780,6 +806,9 @@ async fn handle_streaming_part(
                     }
 
                     hasher.update(&payload);
+                    if let Some(ref mut h) = payload_sha256_hasher {
+                        h.update(&payload);
+                    }
                     if let Some(ref mut th) = trailing_hasher {
                         th.update(&payload);
                     }
@@ -853,6 +882,17 @@ async fn handle_streaming_part(
                 abort_streaming_part_ctx(&state, &ctx).await;
                 return error_response(&err);
             }
+        }
+    }
+
+    if let (Some(claimed), Some(h)) = (claimed_payload_sha256.as_ref(), payload_sha256_hasher) {
+        let actual = sha256_hex_from_digest(h.finish().as_ref());
+        if &actual != claimed {
+            abort_streaming_part_ctx(&state, &ctx).await;
+            return error_response(&ServerError::XAmzContentSHA256Mismatch {
+                client_hash: claimed.clone(),
+                server_hash: actual,
+            });
         }
     }
 
@@ -1110,6 +1150,30 @@ fn inline_checksum_hasher_from_parts(
     None
 }
 
+/// Return the claimed fixed payload SHA256 (hex) from `x-amz-content-sha256`.
+///
+/// Excludes UNSIGNED-PAYLOAD and STREAMING-* sentinel values.
+fn claimed_payload_sha256_from_parts(parts: &http::request::Parts) -> Option<String> {
+    let value = parts
+        .headers
+        .get("x-amz-content-sha256")
+        .and_then(|v| v.to_str().ok())?;
+    if value == "UNSIGNED-PAYLOAD" || value.starts_with("STREAMING-") {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+fn sha256_hex_from_digest(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
 /// Create an incremental chunked decoder for the given mode, or None for plain bodies.
 fn make_chunked_decoder(
     mode: &ChunkedMode,
@@ -1265,7 +1329,7 @@ mod tests {
     }
 
     #[test]
-    fn streaming_put_real_sha256_excluded() {
+    fn streaming_put_real_sha256_routed() {
         let parts = make_parts(
             "PUT",
             "/mybucket/mykey",
@@ -1274,7 +1338,12 @@ mod tests {
                 "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
             )],
         );
-        assert_eq!(is_streaming_write(&parts), None);
+        let result = is_streaming_write(&parts);
+        assert!(matches!(
+            result,
+            Some(StreamingWriteOp::PutObject { ref bucket, ref key, .. })
+            if bucket == "mybucket" && key == "mykey"
+        ));
     }
 
     #[test]
@@ -1433,6 +1502,29 @@ mod tests {
     }
 
     #[test]
+    fn streaming_upload_part_real_sha256_routed() {
+        let parts = make_parts(
+            "PUT",
+            "/mybucket/mykey?partNumber=3&uploadId=abc123",
+            &[(
+                "x-amz-content-sha256",
+                "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+            )],
+        );
+        let result = is_streaming_write(&parts);
+        assert!(matches!(
+            result,
+            Some(StreamingWriteOp::UploadPart {
+                ref bucket,
+                ref key,
+                ref upload_id,
+                part_number: 3,
+                chunked: ChunkedMode::None,
+            }) if bucket == "mybucket" && key == "mykey" && upload_id == "abc123"
+        ));
+    }
+
+    #[test]
     fn streaming_upload_part_copy_excluded() {
         let parts = make_parts(
             "PUT",
@@ -1526,6 +1618,33 @@ mod tests {
     fn trailing_hasher_from_parts_none_when_no_header() {
         let parts = make_parts("PUT", "/mybucket/mykey", &[]);
         assert!(trailing_hasher_from_parts(&parts).is_none());
+    }
+
+    #[test]
+    fn claimed_payload_sha256_from_parts_recognizes_fixed_hash() {
+        let fixed = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+        let parts = make_parts("PUT", "/mybucket/mykey", &[("x-amz-content-sha256", fixed)]);
+        assert_eq!(
+            claimed_payload_sha256_from_parts(&parts).as_deref(),
+            Some(fixed)
+        );
+    }
+
+    #[test]
+    fn claimed_payload_sha256_from_parts_ignores_sentinel_values() {
+        let parts = make_parts(
+            "PUT",
+            "/mybucket/mykey",
+            &[("x-amz-content-sha256", "UNSIGNED-PAYLOAD")],
+        );
+        assert!(claimed_payload_sha256_from_parts(&parts).is_none());
+
+        let parts = make_parts(
+            "PUT",
+            "/mybucket/mykey",
+            &[("x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")],
+        );
+        assert!(claimed_payload_sha256_from_parts(&parts).is_none());
     }
 
     #[test]
