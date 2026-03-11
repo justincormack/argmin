@@ -564,8 +564,13 @@ impl HttpFrontend {
                         }
                     }
                     Ok(resp)
-                } else if let Some(range_header) = req.header("range") {
-                    let byte_range = crate::range::ByteRange::parse(range_header)?;
+                } else if let Some(byte_range) = req
+                    .header("range")
+                    // AWS ignores malformed Range headers and returns 200 with
+                    // the full object. We mirror this by silently falling
+                    // through to the non-range GET path on parse failure.
+                    .and_then(|h| crate::range::ByteRange::parse(h).ok())
+                {
                     match self.coordinator.get_object_range(
                         &crate::coordinator::GetObjectRangeRequest {
                             bucket: &bucket,

@@ -47,11 +47,6 @@ impl ByteRange {
                     .map_err(|_| ServerError::InvalidRequest {
                         reason: "invalid suffix range".to_string(),
                     })?;
-                if length == 0 {
-                    return Err(ServerError::InvalidRequest {
-                        reason: "suffix range length must be non-zero".to_string(),
-                    });
-                }
                 Ok(ByteRange::Suffix { length })
             }
             // bytes=start-
@@ -111,6 +106,9 @@ impl ByteRange {
                 Some((start, object_size - 1))
             }
             ByteRange::Suffix { length } => {
+                if length == 0 {
+                    return None;
+                }
                 if length >= object_size {
                     Some((0, object_size - 1))
                 } else {
@@ -189,8 +187,17 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_zero_suffix() {
-        assert!(ByteRange::parse("bytes=-0").is_err());
+    fn parse_zero_suffix() {
+        assert_eq!(
+            ByteRange::parse("bytes=-0").unwrap(),
+            ByteRange::Suffix { length: 0 }
+        );
+    }
+
+    #[test]
+    fn resolve_zero_suffix_unsatisfiable() {
+        let r = ByteRange::Suffix { length: 0 };
+        assert_eq!(r.resolve(100), None);
     }
 
     #[test]
