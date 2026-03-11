@@ -368,7 +368,7 @@ These groups from test_s3.py are well covered by existing tests:
 - Remaining ignored tests: UploadPartCopy (8), PartNumber GET (2), multi-user (1),
   multipart per-part checksums in checksums.rs (6), per-part checksums in
   object_attributes.rs (1), multipart tagging in tagging.rs (1).
-- Detailed implementation plan: `plans/multipart-upload-core-design.md`.
+- Detailed implementation plan: `plans/completed/multipart-upload-core-design.md`.
 
 **Full ACL system (~41 tests)**
 - Per-object and per-bucket ACL grants (read, write, read-acp, write-acp) to specific

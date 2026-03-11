@@ -1,7 +1,7 @@
 //! Integration tests for the placement crate.
 //!
 //! Tests the full pipeline: ClusterMap → PlacementConfig → Placer → place().
-//! Test numbers refer to the test plan in plans/placement-api.md.
+//! Test numbers refer to the test plan in plans/completed/placement-api.md.
 
 use crate::*;
 

@@ -1509,6 +1509,6 @@ pub struct PgMetadataConfig {
 - **Storage Node Design**: `plans/storage-node-design.md` — Architecture C (embedded
   metadata), shard immutability, C2 prepend design.
 - **Territory Map**: `plans/territory-map.md` — subsystem 4 definition, build sequence.
-- **Placement API**: `plans/placement-api.md` — rendezvous hashing, ClusterMap,
+- **Placement API**: `plans/completed/placement-api.md` — rendezvous hashing, ClusterMap,
   deterministic placement.
-- **EC Engine API**: `plans/ec-engine-api.md` — systematic encoding, stripe size.
+- **EC Engine API**: `plans/completed/ec-engine-api.md` — systematic encoding, stripe size.
