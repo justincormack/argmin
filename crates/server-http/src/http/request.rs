@@ -1,9 +1,10 @@
 /// Parse HTTP requests into structured S3 request data.
 use crate::error::ServerError;
 
-/// Maximum request body size (256 MB + headroom for metadata blob).
-/// Used by the serve layer for body size limiting.
-pub(crate) const MAX_BODY_SIZE: usize = 256 * 1024 * 1024 + 64 * 1024;
+/// Maximum size for non-streaming request bodies (XML payloads such as
+/// CompleteMultipartUpload, DeleteObjects, lifecycle configs, etc.).
+/// Object data is handled via the streaming path and is not subject to this limit.
+pub(crate) const MAX_XML_BODY_SIZE: usize = 10 * 1024 * 1024;
 
 /// Validate a Content-Length header value. Rejects negative and non-numeric values.
 fn validate_content_length(value: &str) -> Result<u64, ServerError> {
