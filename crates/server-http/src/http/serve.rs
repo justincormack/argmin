@@ -37,20 +37,6 @@ enum TrailingChecksumHasher {
 }
 
 impl TrailingChecksumHasher {
-    fn from_checksum_algorithm(algo: ChecksumAlgorithm) -> Self {
-        match algo {
-            ChecksumAlgorithm::Crc32 => Self::Crc32(0),
-            ChecksumAlgorithm::Crc32c => Self::Crc32c(checksum::crc32c::Hasher::new()),
-            ChecksumAlgorithm::Crc64nvme => Self::Crc64(checksum::crc64::Hasher::new()),
-            ChecksumAlgorithm::Sha256 => {
-                Self::Sha256(ring::digest::Context::new(&ring::digest::SHA256))
-            }
-            ChecksumAlgorithm::Sha1 => Self::Sha1(ring::digest::Context::new(
-                &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
-            )),
-        }
-    }
-
     /// Create a hasher from a trailer header name (e.g. `x-amz-checksum-crc32`).
     ///
     /// Matches case-insensitively since HTTP header names are case-insensitive.
@@ -765,12 +751,6 @@ async fn handle_streaming_part(
             inline_checksum_claim = Some(claimed);
         }
     }
-    if trailing_hasher.is_none() {
-        if let Some(algo) = ctx.upload_checksum_algorithm {
-            trailing_hasher = Some(TrailingChecksumHasher::from_checksum_algorithm(algo));
-        }
-    }
-
     // 2. Stream body frames, accumulating into STREAM_CHUNK_SIZE buffers.
     let ctx = Arc::new(ctx);
     let mut hasher = checksum::crc64::Hasher::new();

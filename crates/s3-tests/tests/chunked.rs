@@ -2380,14 +2380,14 @@ fn test_inline_plus_trailing_checksum_rejected_mixed_case() {
 }
 
 #[test]
-fn test_streaming_upload_part_fallback_checksum_from_upload_algorithm() {
+fn test_streaming_upload_part_with_inline_checksum() {
     s3_tests::run(async {
         use aws_sdk_s3::types::ChecksumAlgorithm;
         use base64::Engine;
 
         let client = CTX.client();
         let bucket = setup_bucket().await;
-        let key = "streaming-upload-part-fallback";
+        let key = "streaming-upload-part-inline-cksum";
 
         let create = client
             .create_multipart_upload()
@@ -2399,9 +2399,11 @@ fn test_streaming_upload_part_fallback_checksum_from_upload_algorithm() {
             .unwrap();
         let upload_id = create.upload_id().unwrap().to_string();
 
-        // No x-amz-checksum-* headers and no x-amz-trailer: this must still
-        // compute/store part checksum from the MPU checksum algorithm.
-        let data = b"streaming upload part fallback path";
+        // Upload a part with an inline checksum header (required by AWS when
+        // the MPU was created with a checksum algorithm).
+        let data = b"streaming upload part with checksum";
+        let expected_crc = base64::engine::general_purpose::STANDARD
+            .encode(checksum::crc32::checksum(data).to_be_bytes());
         let path = format!("/{}/{}", bucket, key);
         let encoded_upload_id: String =
             url::form_urlencoded::byte_serialize(upload_id.as_bytes()).collect();
@@ -2413,7 +2415,7 @@ fn test_streaming_upload_part_fallback_checksum_from_upload_algorithm() {
             &request_uri,
             "UNSIGNED-PAYLOAD",
             data.len(),
-            &[],
+            &[("x-amz-checksum-crc32", &expected_crc)],
             true, // not aws-chunked
             true, // not aws-chunked
         );
@@ -2424,14 +2426,13 @@ fn test_streaming_upload_part_fallback_checksum_from_upload_algorithm() {
             .header("Authorization", &sign.authorization)
             .header("x-amz-date", &sign.amz_date)
             .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+            .header("x-amz-checksum-crc32", &expected_crc)
             .send(&data[..])
             .expect("transport error");
         let status = resp.status().as_u16();
         let body_str = resp.body_mut().read_to_string().unwrap_or_default();
         assert_eq!(status, 200, "expected 200, got {}: {}", status, body_str);
 
-        let expected_crc = base64::engine::general_purpose::STANDARD
-            .encode(checksum::crc32::checksum(data).to_be_bytes());
         let listed = client
             .list_parts()
             .bucket(&bucket)
@@ -2454,6 +2455,232 @@ fn test_streaming_upload_part_fallback_checksum_from_upload_algorithm() {
             .send()
             .await
             .unwrap();
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+// ── Malformed chunked body error path tests ─────────────────────────────
+
+/// Send a PUT with a manually crafted malformed chunked body (invalid hex chunk size).
+/// This exercises the `parse_chunk_header` invalid-hex error closure.
+#[test]
+fn test_chunked_malformed_invalid_hex_chunk_size() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let path = format!("/{}/malformed-hex", bucket);
+        let content_sha256 = "STREAMING-UNSIGNED-PAYLOAD-TRAILER";
+
+        let sign = sign_streaming_request(
+            "PUT",
+            &path,
+            content_sha256,
+            5,
+            &[("x-amz-trailer", "x-amz-checksum-crc32")],
+        );
+
+        // Malformed wire: "zz" is not valid hex for chunk size.
+        let wire = b"zz\r\nhello\r\n0\r\n\r\n";
+
+        let url = format!("{}{}", CTX.endpoint(), path);
+        let mut resp = agent()
+            .put(&url)
+            .header("Authorization", &sign.authorization)
+            .header("x-amz-date", &sign.amz_date)
+            .header("x-amz-content-sha256", content_sha256)
+            .header("content-encoding", "aws-chunked")
+            .header("x-amz-decoded-content-length", "5")
+            .header("x-amz-trailer", "x-amz-checksum-crc32")
+            .header("content-length", &wire.len().to_string())
+            .send(&wire[..])
+            .expect("transport error");
+        let status = resp.status().as_u16();
+        let body_str = resp.body_mut().read_to_string().unwrap_or_default();
+        // Server should reject with 400 for malformed chunk header.
+        assert_eq!(status, 400, "expected 400, got {}: {}", status, body_str);
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+/// Send a PUT with a non-UTF8 chunk header line.
+/// This exercises the `parse_chunk_header` non-UTF8 error closure.
+#[test]
+fn test_chunked_malformed_non_utf8_chunk_header() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let path = format!("/{}/malformed-utf8", bucket);
+        let content_sha256 = "STREAMING-UNSIGNED-PAYLOAD-TRAILER";
+
+        let sign = sign_streaming_request(
+            "PUT",
+            &path,
+            content_sha256,
+            5,
+            &[("x-amz-trailer", "x-amz-checksum-crc32")],
+        );
+
+        // Wire with non-UTF8 bytes in the chunk header line.
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&[0xff, 0xfe]); // non-UTF8 bytes
+        wire.extend_from_slice(b"\r\nhello\r\n0\r\n\r\n");
+
+        let url = format!("{}{}", CTX.endpoint(), path);
+        let mut resp = agent()
+            .put(&url)
+            .header("Authorization", &sign.authorization)
+            .header("x-amz-date", &sign.amz_date)
+            .header("x-amz-content-sha256", content_sha256)
+            .header("content-encoding", "aws-chunked")
+            .header("x-amz-decoded-content-length", "5")
+            .header("x-amz-trailer", "x-amz-checksum-crc32")
+            .header("content-length", &wire.len().to_string())
+            .send(&wire[..])
+            .expect("transport error");
+        let status = resp.status().as_u16();
+        let body_str = resp.body_mut().read_to_string().unwrap_or_default();
+        assert_eq!(status, 400, "expected 400, got {}: {}", status, body_str);
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+/// Send a signed chunked body with valid chunk signatures but a missing trailer
+/// signature. This exercises the `verify_trailer_signature` missing-signature
+/// error closure.
+#[test]
+fn test_signed_chunked_missing_trailer_signature() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let data = b"Hello";
+        let path = format!("/{}/missing-trailer-sig", bucket);
+        let content_sha256 = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER";
+
+        let sign = sign_streaming_request(
+            "PUT",
+            &path,
+            content_sha256,
+            data.len(),
+            &[("x-amz-trailer", "x-amz-checksum-crc32")],
+        );
+
+        // Build signed body with valid chunk sigs but NO trailer signature.
+        let chunk_sig = chunk_signature(
+            &sign.signing_key,
+            &sign.timestamp,
+            &sign.scope,
+            &sign.seed_signature,
+            data,
+        );
+        let terminal_sig = chunk_signature(
+            &sign.signing_key,
+            &sign.timestamp,
+            &sign.scope,
+            &chunk_sig,
+            b"",
+        );
+
+        let mut wire = Vec::new();
+        wire.extend_from_slice(
+            format!("{:x};chunk-signature={}\r\n", data.len(), chunk_sig).as_bytes(),
+        );
+        wire.extend_from_slice(data);
+        wire.extend_from_slice(b"\r\n");
+        wire.extend_from_slice(format!("0;chunk-signature={}\r\n", terminal_sig).as_bytes());
+        // Trailer header present but NO x-amz-trailer-signature line.
+        wire.extend_from_slice(b"x-amz-checksum-crc32:AAAA\r\n");
+        wire.extend_from_slice(b"\r\n");
+
+        let url = format!("{}{}", CTX.endpoint(), path);
+        let mut resp = agent()
+            .put(&url)
+            .header("Authorization", &sign.authorization)
+            .header("x-amz-date", &sign.amz_date)
+            .header("x-amz-content-sha256", content_sha256)
+            .header("content-encoding", "aws-chunked")
+            .header("x-amz-decoded-content-length", &data.len().to_string())
+            .header("x-amz-trailer", "x-amz-checksum-crc32")
+            .header("content-length", &wire.len().to_string())
+            .send(&wire[..])
+            .expect("transport error");
+        let status = resp.status().as_u16();
+        let body_str = resp.body_mut().read_to_string().unwrap_or_default();
+        assert_eq!(status, 400, "expected 400, got {}: {}", status, body_str);
+        assert_error_code(&body_str, "IncompleteBody");
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+/// Send a signed chunked body with valid chunk signatures but an incorrect
+/// trailer signature. Uses two trailers to exercise the sort_by comparator
+/// in `verify_trailer_signature`.
+#[test]
+fn test_signed_chunked_bad_trailer_signature() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let data = b"Hello";
+        let path = format!("/{}/bad-trailer-sig", bucket);
+        let content_sha256 = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER";
+
+        let sign = sign_streaming_request(
+            "PUT",
+            &path,
+            content_sha256,
+            data.len(),
+            &[("x-amz-trailer", "x-amz-checksum-crc32")],
+        );
+
+        // Build signed body manually with two content trailers and a bad
+        // trailer signature. Two trailers are needed to exercise the sort_by
+        // comparator in verify_trailer_signature.
+        let chunk_sig = chunk_signature(
+            &sign.signing_key,
+            &sign.timestamp,
+            &sign.scope,
+            &sign.seed_signature,
+            data,
+        );
+        let terminal_sig = chunk_signature(
+            &sign.signing_key,
+            &sign.timestamp,
+            &sign.scope,
+            &chunk_sig,
+            b"",
+        );
+
+        let bad_trailer_sig = "0".repeat(64);
+        let mut wire = Vec::new();
+        wire.extend_from_slice(
+            format!("{:x};chunk-signature={}\r\n", data.len(), chunk_sig).as_bytes(),
+        );
+        wire.extend_from_slice(data);
+        wire.extend_from_slice(b"\r\n");
+        wire.extend_from_slice(format!("0;chunk-signature={}\r\n", terminal_sig).as_bytes());
+        // Two content trailers (sorted order doesn't matter — verify_trailer_signature sorts them)
+        wire.extend_from_slice(b"x-amz-checksum-crc32:AAAA\r\n");
+        wire.extend_from_slice(b"another-trailer:value\r\n");
+        wire.extend_from_slice(
+            format!("x-amz-trailer-signature:{}\r\n", bad_trailer_sig).as_bytes(),
+        );
+        wire.extend_from_slice(b"\r\n");
+
+        let url = format!("{}{}", CTX.endpoint(), path);
+        let mut resp = agent()
+            .put(&url)
+            .header("Authorization", &sign.authorization)
+            .header("x-amz-date", &sign.amz_date)
+            .header("x-amz-content-sha256", content_sha256)
+            .header("content-encoding", "aws-chunked")
+            .header("x-amz-decoded-content-length", &data.len().to_string())
+            .header("x-amz-trailer", "x-amz-checksum-crc32")
+            .header("content-length", &wire.len().to_string())
+            .send(&wire[..])
+            .expect("transport error");
+        let status = resp.status().as_u16();
+        let body_str = resp.body_mut().read_to_string().unwrap_or_default();
+        assert_eq!(status, 403, "expected 403, got {}: {}", status, body_str);
+        assert_error_code(&body_str, "SignatureDoesNotMatch");
+
         cleanup(&bucket, &[]).await;
     });
 }

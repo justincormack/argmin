@@ -2104,7 +2104,16 @@ impl Coordinator {
                     ),
                 });
             }
-            (Some(algo), _) => Some(algo),
+            (Some(algo), Some(_)) => Some(algo),
+            // AWS rejects parts without a checksum when the upload requires one.
+            (Some(upload_algo), None) => {
+                return Err(ServerError::InvalidRequest {
+                    reason: format!(
+                        "Checksum Type mismatch occurred, expected checksum Type: {}, actual checksum Type: null",
+                        upload_algo.as_str().to_lowercase()
+                    ),
+                });
+            }
             (None, Some(part_algo)) => Some(part_algo),
             (None, None) => None,
         };
@@ -4904,7 +4913,16 @@ impl Coordinator {
                     ),
                 });
             }
-            (Some(algo), _) => Some(algo),
+            (Some(algo), Some(_)) => Some(algo),
+            // AWS rejects parts without a checksum when the upload requires one.
+            (Some(upload_algo), None) => {
+                return Err(ServerError::InvalidRequest {
+                    reason: format!(
+                        "Checksum Type mismatch occurred, expected checksum Type: {}, actual checksum Type: null",
+                        upload_algo.as_str().to_lowercase()
+                    ),
+                });
+            }
             // AWS SDK v2+ sends CRC32 by default on all requests. Accept the
             // checksum for verification even when the upload has no algorithm;
             // it won't contribute to the object-level checksum.

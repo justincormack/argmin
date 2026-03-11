@@ -471,8 +471,16 @@ mod unit_tests {
         placer.place(b"key", &mut out).unwrap();
         // Verify that zero-weight nodes (1 and 3) were not selected
         for &node_id in &out {
-            assert_ne!(node_id, NodeId::new(1), "zero-weight node 1 should not be placed");
-            assert_ne!(node_id, NodeId::new(3), "zero-weight node 3 should not be placed");
+            assert_ne!(
+                node_id,
+                NodeId::new(1),
+                "zero-weight node 1 should not be placed"
+            );
+            assert_ne!(
+                node_id,
+                NodeId::new(3),
+                "zero-weight node 3 should not be placed"
+            );
         }
     }
 
@@ -486,27 +494,21 @@ mod unit_tests {
         // This happens when rack_cap is 0: the rack is immediately at capacity,
         // so admit returns Constrained, but there's no same-group candidate to
         // replace (find_worst_in_group returns None).
-        let nodes = vec![
-            node(0, 0, 1.0),
-            node(1, 1, 1.0),
-            node(2, 2, 1.0),
-        ];
+        let nodes = vec![node(0, 0, 1.0), node(1, 1, 1.0), node(2, 2, 1.0)];
         let map = ClusterMap::new(&nodes).unwrap();
         // rack_cap(0) means no nodes from any rack can be selected via Global admission
         // When a node arrives, same_group_count=0 >= max=0, so Constrained is returned,
         // but find_worst_in_group returns None since no rack is represented yet.
         let constraint = PlacementConstraint::rack_cap(0);
-        let placer = Placer::new(
-            PlacementConfig::new(2).unwrap(),
-            &map,
-            constraint,
-        )
-        .unwrap();
+        let placer = Placer::new(PlacementConfig::new(2).unwrap(), &map, constraint).unwrap();
         let mut out = [NodeId::new(0); 2];
         // All nodes return Constrained with no same-group candidate to replace,
         // so no nodes can be placed
         let result = placer.place(b"key", &mut out);
-        assert!(matches!(result, Err(PlacementError::ConstraintUnsatisfiable { .. })));
+        assert!(matches!(
+            result,
+            Err(PlacementError::ConstraintUnsatisfiable { .. })
+        ));
     }
 
     // ── Admission::Excluded ──────────────────────────────────────────────────
@@ -538,18 +540,21 @@ mod unit_tests {
             node(5, 2, 1.0),
         ];
         let map = ClusterMap::new(&nodes).unwrap();
-        let placer = Placer::new(
-            PlacementConfig::new(4).unwrap(),
-            &map,
-            constraint,
-        )
-        .unwrap();
+        let placer = Placer::new(PlacementConfig::new(4).unwrap(), &map, constraint).unwrap();
         let mut out = [NodeId::new(0); 4];
         placer.place(b"key", &mut out).unwrap();
         // Verify excluded nodes were not selected
         for &node_id in &out {
-            assert_ne!(node_id, NodeId::new(1), "excluded node 1 should not be placed");
-            assert_ne!(node_id, NodeId::new(3), "excluded node 3 should not be placed");
+            assert_ne!(
+                node_id,
+                NodeId::new(1),
+                "excluded node 1 should not be placed"
+            );
+            assert_ne!(
+                node_id,
+                NodeId::new(3),
+                "excluded node 3 should not be placed"
+            );
         }
     }
 }

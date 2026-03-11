@@ -23,14 +23,18 @@ pub struct DecodedBody {
     pub trailers: Vec<(String, String)>,
 }
 
+/// Minimum chunk size for non-final chunks (matches AWS S3 behavior).
+const MIN_CHUNK_SIZE: usize = 8192;
+
 /// Decode an aws-chunked body, optionally verifying per-chunk signatures.
 ///
 /// `streaming` must be `Some` for STREAMING-AWS4-HMAC-SHA256-* modes
 /// and `None` for STREAMING-UNSIGNED-PAYLOAD-* modes.
-/// Minimum chunk size for non-final chunks (matches AWS S3 behavior).
-const MIN_CHUNK_SIZE: usize = 8192;
-
-pub fn decode_chunked_body(
+///
+/// Used only in unit tests — production uses `IncrementalChunkedDecoder`
+/// via the streaming path in serve.rs.
+#[cfg(test)]
+pub(super) fn decode_chunked_body(
     wire: &[u8],
     streaming: Option<&StreamingSigningContext>,
     trailer_mode: bool,
@@ -168,6 +172,10 @@ fn parse_chunk_header(line: &[u8]) -> Result<(usize, Option<String>), ServerErro
 }
 
 /// Parse trailing headers after the terminal chunk.
+///
+/// Used only by `decode_chunked_body` (test-only batch decoder).
+/// The incremental decoder handles trailers inline in its state machine.
+#[cfg(test)]
 fn parse_trailers(wire: &[u8], pos: &mut usize) -> Result<Vec<(String, String)>, ServerError> {
     let mut trailers = Vec::new();
     loop {
@@ -263,8 +271,8 @@ fn verify_trailer_signature(
     }
 
     // If there are content trailers but no signature, reject.
-    let claimed_sig =
-        claimed_sig.ok_or_else(|| ServerError::Auth(auth::AuthError::SignatureMismatch))?;
+    // AWS returns IncompleteBody for a missing trailer signature.
+    let claimed_sig = claimed_sig.ok_or(ServerError::IncompleteBody)?;
 
     // Build canonical trailer string: sorted by key, each line as "key:value\n".
     let mut sorted_trailers = content_trailers;

@@ -317,10 +317,7 @@ mod tests {
             ChecksumAlgorithm::Crc32c.header_name(),
             "x-amz-checksum-crc32c"
         );
-        assert_eq!(
-            ChecksumAlgorithm::Sha1.header_name(),
-            "x-amz-checksum-sha1"
-        );
+        assert_eq!(ChecksumAlgorithm::Sha1.header_name(), "x-amz-checksum-sha1");
         assert_eq!(
             ChecksumAlgorithm::Sha256.header_name(),
             "x-amz-checksum-sha256"
@@ -334,9 +331,15 @@ mod tests {
     #[test]
     fn checksum_algorithm_xml_element_name() {
         assert_eq!(ChecksumAlgorithm::Crc32.xml_element_name(), "ChecksumCRC32");
-        assert_eq!(ChecksumAlgorithm::Crc32c.xml_element_name(), "ChecksumCRC32C");
+        assert_eq!(
+            ChecksumAlgorithm::Crc32c.xml_element_name(),
+            "ChecksumCRC32C"
+        );
         assert_eq!(ChecksumAlgorithm::Sha1.xml_element_name(), "ChecksumSHA1");
-        assert_eq!(ChecksumAlgorithm::Sha256.xml_element_name(), "ChecksumSHA256");
+        assert_eq!(
+            ChecksumAlgorithm::Sha256.xml_element_name(),
+            "ChecksumSHA256"
+        );
         assert_eq!(
             ChecksumAlgorithm::Crc64nvme.xml_element_name(),
             "ChecksumCRC64NVME"
@@ -369,17 +372,14 @@ mod tests {
     #[test]
     fn multipart_checksum_config_valid_combinations() {
         // SHA256 + COMPOSITE (default)
-        let config =
-            MultipartChecksumConfig::new(ChecksumAlgorithm::Sha256, None).unwrap();
+        let config = MultipartChecksumConfig::new(ChecksumAlgorithm::Sha256, None).unwrap();
         assert_eq!(config.algorithm(), ChecksumAlgorithm::Sha256);
         assert_eq!(config.checksum_type(), ChecksumType::Composite);
 
         // SHA1 + COMPOSITE (explicit)
-        let config = MultipartChecksumConfig::new(
-            ChecksumAlgorithm::Sha1,
-            Some(ChecksumType::Composite),
-        )
-        .unwrap();
+        let config =
+            MultipartChecksumConfig::new(ChecksumAlgorithm::Sha1, Some(ChecksumType::Composite))
+                .unwrap();
         assert_eq!(config.algorithm(), ChecksumAlgorithm::Sha1);
         assert_eq!(config.checksum_type(), ChecksumType::Composite);
 
@@ -389,17 +389,14 @@ mod tests {
         assert_eq!(config.checksum_type(), ChecksumType::Composite);
 
         // CRC32C + FULL_OBJECT (explicit)
-        let config = MultipartChecksumConfig::new(
-            ChecksumAlgorithm::Crc32c,
-            Some(ChecksumType::FullObject),
-        )
-        .unwrap();
+        let config =
+            MultipartChecksumConfig::new(ChecksumAlgorithm::Crc32c, Some(ChecksumType::FullObject))
+                .unwrap();
         assert_eq!(config.algorithm(), ChecksumAlgorithm::Crc32c);
         assert_eq!(config.checksum_type(), ChecksumType::FullObject);
 
         // CRC64NVME + FULL_OBJECT (default)
-        let config =
-            MultipartChecksumConfig::new(ChecksumAlgorithm::Crc64nvme, None).unwrap();
+        let config = MultipartChecksumConfig::new(ChecksumAlgorithm::Crc64nvme, None).unwrap();
         assert_eq!(config.algorithm(), ChecksumAlgorithm::Crc64nvme);
         assert_eq!(config.checksum_type(), ChecksumType::FullObject);
     }
@@ -407,20 +404,16 @@ mod tests {
     #[test]
     fn multipart_checksum_config_invalid_combinations() {
         // SHA256 + FULL_OBJECT is invalid
-        let result = MultipartChecksumConfig::new(
-            ChecksumAlgorithm::Sha256,
-            Some(ChecksumType::FullObject),
-        );
+        let result =
+            MultipartChecksumConfig::new(ChecksumAlgorithm::Sha256, Some(ChecksumType::FullObject));
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.reason.contains("FULL_OBJECT"));
         assert!(err.reason.contains("SHA256"));
 
         // SHA1 + FULL_OBJECT is invalid
-        let result = MultipartChecksumConfig::new(
-            ChecksumAlgorithm::Sha1,
-            Some(ChecksumType::FullObject),
-        );
+        let result =
+            MultipartChecksumConfig::new(ChecksumAlgorithm::Sha1, Some(ChecksumType::FullObject));
         assert!(result.is_err());
 
         // CRC64NVME + COMPOSITE is invalid
@@ -443,26 +436,17 @@ mod tests {
 
         // CRC64NVME: 8 bytes
         let checksum =
-            RawChecksum::new(ChecksumAlgorithm::Crc64nvme, vec![1, 2, 3, 4, 5, 6, 7, 8])
-                .unwrap();
+            RawChecksum::new(ChecksumAlgorithm::Crc64nvme, vec![1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
         assert_eq!(checksum.algorithm(), ChecksumAlgorithm::Crc64nvme);
         assert_eq!(checksum.bytes(), &[1, 2, 3, 4, 5, 6, 7, 8]);
 
         // SHA1: 20 bytes
-        let checksum = RawChecksum::new(
-            ChecksumAlgorithm::Sha1,
-            vec![0; 20],
-        )
-        .unwrap();
+        let checksum = RawChecksum::new(ChecksumAlgorithm::Sha1, vec![0; 20]).unwrap();
         assert_eq!(checksum.algorithm(), ChecksumAlgorithm::Sha1);
         assert_eq!(checksum.bytes().len(), 20);
 
         // SHA256: 32 bytes
-        let checksum = RawChecksum::new(
-            ChecksumAlgorithm::Sha256,
-            vec![0; 32],
-        )
-        .unwrap();
+        let checksum = RawChecksum::new(ChecksumAlgorithm::Sha256, vec![0; 32]).unwrap();
         assert_eq!(checksum.algorithm(), ChecksumAlgorithm::Sha256);
         assert_eq!(checksum.bytes().len(), 32);
     }

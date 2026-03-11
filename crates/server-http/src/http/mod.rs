@@ -85,13 +85,17 @@ impl HttpFrontend {
 
         let auth = self.authenticate(s3req);
         let result = match auth {
-            Ok(auth) => match self.maybe_decode_chunked(s3req, &auth) {
-                Ok(decoded_opt) => {
-                    let req = decoded_opt.as_ref().unwrap_or(s3req);
-                    self.dispatch_routed(req, &auth, operation)
+            Ok(auth) => {
+                // Streaming requests (STREAMING-*) should be handled by serve.rs's
+                // streaming path. If one reaches here, it means is_streaming_write
+                // rejected it (missing content-encoding, invalid decoded length, etc.)
+                // — reject it rather than processing raw chunked wire data.
+                if let Err(err) = self.reject_streaming_fallthrough(s3req) {
+                    Err(err)
+                } else {
+                    self.dispatch_routed(s3req, &auth, operation)
                 }
-                Err(err) => Err(err),
-            },
+            }
             Err(err) => Err(err),
         };
 
@@ -1359,8 +1363,65 @@ impl HttpFrontend {
         Ok(auth)
     }
 
+    /// Reject streaming requests that fell through `is_streaming_write` in serve.rs.
+    ///
+    /// Valid streaming requests are handled by the streaming path in serve.rs.
+    /// If a request with `x-amz-content-sha256: STREAMING-*` reaches the
+    /// non-streaming path, it means preconditions were missing (content-encoding,
+    /// decoded-content-length, etc.). Reject rather than processing raw wire data.
+    fn reject_streaming_fallthrough(&self, req: &S3Request) -> Result<(), ServerError> {
+        let content_sha = match req.header("x-amz-content-sha256") {
+            Some(v) if v.starts_with("STREAMING-") => v,
+            _ => return Ok(()),
+        };
+
+        // Whitelist allowed streaming tokens — reject unknown ones.
+        match content_sha {
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
+            | "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"
+            | "STREAMING-UNSIGNED-PAYLOAD-TRAILER" => {}
+            _ => {
+                return Err(ServerError::InvalidArgument {
+                    reason: format!("unsupported streaming token: {content_sha}"),
+                });
+            }
+        }
+
+        // Require content-encoding contains aws-chunked.
+        let has_aws_chunked = req.header("content-encoding").is_some_and(|ce| {
+            ce.split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case("aws-chunked"))
+        });
+        if !has_aws_chunked {
+            return Err(ServerError::MalformedTrailerError {
+                reason: "content-encoding must contain aws-chunked for streaming uploads"
+                    .to_string(),
+            });
+        }
+
+        // Require x-amz-decoded-content-length.
+        let expected_str = req
+            .header("x-amz-decoded-content-length")
+            .ok_or(ServerError::MissingContentLength)?;
+        expected_str
+            .parse::<usize>()
+            .map_err(|_| ServerError::InvalidRequest {
+                reason: format!("invalid x-amz-decoded-content-length: {expected_str}"),
+            })?;
+
+        // If all preconditions are met, the request should have gone through the
+        // streaming path. If it didn't (e.g. non-PUT operation), reject it.
+        Err(ServerError::InvalidRequest {
+            reason: "streaming upload not supported for this operation".to_string(),
+        })
+    }
+
     /// If the request uses aws-chunked encoding, decode the body and return
     /// a new `S3Request` with the decoded payload. Returns None for non-chunked requests.
+    ///
+    /// Used only in unit tests — production uses `IncrementalChunkedDecoder`
+    /// via the streaming path in serve.rs.
+    #[cfg(test)]
     fn maybe_decode_chunked(
         &self,
         req: &S3Request,
@@ -2531,12 +2592,16 @@ mod tests {
 
         let upload_id = create_upload_with_checksum(&fe, "mybucket", "k", Some("CRC32"));
         // Upload a part so complete has something to work with.
+        use base64::Engine;
+        let part_data = vec![0u8; 1024];
+        let part_crc = checksum::crc32::checksum(&part_data);
+        let part_crc_b64 = base64::engine::general_purpose::STANDARD.encode(part_crc.to_be_bytes());
         let req = S3Request {
             method: String::new(),
             path: String::new(),
             query_string: format!("partNumber=1&uploadId={upload_id}"),
-            headers: vec![],
-            body: vec![0u8; 1024],
+            headers: vec![("x-amz-checksum-crc32".to_string(), part_crc_b64)],
+            body: part_data,
         };
         let op = S3Operation::UploadPart {
             bucket: "mybucket".to_string(),
@@ -3197,9 +3262,9 @@ mod tests {
     }
 
     #[test]
-    fn upload_part_no_header_upload_algo_computes_checksum() {
-        // Upload has checksum algorithm but part doesn't send a header.
-        // Coordinator should compute the checksum from data.
+    fn upload_part_no_header_upload_algo_rejected() {
+        // Upload has checksum algorithm but part doesn't send a checksum header.
+        // AWS rejects this with "Checksum Type mismatch".
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         fe.coordinator
@@ -3220,15 +3285,16 @@ mod tests {
             bucket: "mybucket".to_string(),
             key: "k".to_string(),
         };
-        let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
-        assert_eq!(resp.status_code, 200);
-
-        // Response should include the computed checksum header.
-        let resp_crc = resp
-            .headers
-            .iter()
-            .find(|(k, _)| k == "x-amz-checksum-crc32");
-        assert!(resp_crc.is_some(), "missing checksum header in response");
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::InvalidRequest { reason }) => {
+                assert!(
+                    reason.contains("Checksum Type mismatch"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            Err(e) => panic!("expected InvalidRequest, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
     }
 
     #[test]
@@ -3350,9 +3416,9 @@ mod tests {
     }
 
     #[test]
-    fn upload_part_algorithm_header_only_no_value_header() {
-        // x-amz-checksum-algorithm without a value header is fine —
-        // treated as no claimed checksum; coordinator computes from upload config.
+    fn upload_part_algorithm_header_only_no_value_header_rejected() {
+        // x-amz-checksum-algorithm without a value header is treated as no
+        // claimed checksum. AWS rejects this when the upload requires a checksum.
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         fe.coordinator
@@ -3371,15 +3437,16 @@ mod tests {
             bucket: "mybucket".to_string(),
             key: "k".to_string(),
         };
-        let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
-        assert_eq!(resp.status_code, 200);
-
-        // Checksum should still be computed and returned from the upload config.
-        let has_crc = resp
-            .headers
-            .iter()
-            .any(|(k, _)| k == "x-amz-checksum-crc32");
-        assert!(has_crc, "expected checksum header in response");
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::InvalidRequest { reason }) => {
+                assert!(
+                    reason.contains("Checksum Type mismatch"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            Err(e) => panic!("expected InvalidRequest, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
     }
 
     #[test]
