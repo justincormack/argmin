@@ -15,7 +15,7 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 
-use super::request::{S3Request, MAX_XML_BODY_SIZE};
+use super::request::{S3Request, MAX_BODY_SIZE};
 use super::response::S3Response;
 use super::router::{route, S3Operation};
 use super::s3_response_to_hyper;
@@ -1152,7 +1152,7 @@ fn acquire_frontend(state: &ServerState) -> MutexGuard<'_, HttpFrontend> {
 /// every chunk. A client sending data steadily (even slowly) will never be
 /// timed out; only truly stalled connections are killed.
 async fn collect_body(body: Incoming, idle_timeout: Duration) -> Result<Bytes, ServerError> {
-    let mut limited = Limited::new(body, MAX_XML_BODY_SIZE);
+    let mut limited = Limited::new(body, MAX_BODY_SIZE);
     let mut data = Vec::new();
 
     loop {
@@ -1168,7 +1168,7 @@ async fn collect_body(body: Incoming, idle_timeout: Duration) -> Result<Bytes, S
                 if e.downcast_ref::<LengthLimitError>().is_some() {
                     return Err(ServerError::ObjectTooLarge {
                         size: 0,
-                        max: MAX_XML_BODY_SIZE as u64,
+                        max: MAX_BODY_SIZE as u64,
                     });
                 }
                 return Err(ServerError::InvalidRequest {
