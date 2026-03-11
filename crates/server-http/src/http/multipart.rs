@@ -153,7 +153,9 @@ fn parse_part(
 }
 
 /// Parse the Content-Disposition header to extract the field name and optional filename.
-fn parse_content_disposition(headers: &str) -> Result<(String, Option<String>), ServerError> {
+pub(crate) fn parse_content_disposition(
+    headers: &str,
+) -> Result<(String, Option<String>), ServerError> {
     let mut name = None;
     let mut filename = None;
 

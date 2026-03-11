@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use checksum::{ChecksumAlgorithm, RawChecksum};
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::Incoming;
@@ -316,6 +316,11 @@ async fn handle(
         return Ok(s3_response_to_hyper(resp));
     }
 
+    if let Some(bucket) = post_object_bucket(&parts) {
+        let resp = handle_streaming_post_object(Arc::clone(&state), parts, body, bucket).await;
+        return Ok(s3_response_to_hyper(resp));
+    }
+
     // Non-streaming path: collect full body, parse, dispatch.
     let body_bytes = match collect_body(body, state.config.body_idle_timeout).await {
         Ok(bytes) => bytes,
@@ -453,6 +458,432 @@ fn parse_chunked_mode(parts: &http::request::Parts) -> Result<ChunkedMode, Serve
         }),
         // Fixed payload hash (hex SHA256): verify incrementally in streaming loop.
         _ => Ok(ChunkedMode::None),
+    }
+}
+
+fn post_object_bucket(parts: &http::request::Parts) -> Option<String> {
+    route(
+        parts.method.as_str(),
+        parts.uri.path(),
+        parts.uri.query().unwrap_or(""),
+    )
+    .ok()
+    .and_then(|op| match op {
+        S3Operation::PostObject { bucket } => Some(bucket),
+        _ => None,
+    })
+}
+
+#[derive(Debug)]
+enum PostMultipartEvent {
+    Field { name: String, value: String },
+    FileStart { file_name: Option<String> },
+    FileChunk(Bytes),
+    FileEnd,
+}
+
+#[derive(Debug)]
+enum PostMultipartState {
+    Start,
+    Headers,
+    Data { name: String, is_file: bool },
+    AfterBoundary,
+    Done,
+}
+
+struct PostMultipartParser {
+    boundary: Vec<u8>,
+    delimiter: Vec<u8>,
+    buf: BytesMut,
+    state: PostMultipartState,
+}
+
+impl PostMultipartParser {
+    fn new(boundary: &str) -> Self {
+        let boundary_bytes = format!("--{boundary}").into_bytes();
+        let delimiter = format!("\r\n--{boundary}").into_bytes();
+        Self {
+            boundary: boundary_bytes,
+            delimiter,
+            buf: BytesMut::new(),
+            state: PostMultipartState::Start,
+        }
+    }
+
+    fn is_done(&self) -> bool {
+        matches!(self.state, PostMultipartState::Done)
+    }
+
+    fn feed(&mut self, data: &[u8]) -> Result<Vec<PostMultipartEvent>, ServerError> {
+        self.buf.extend_from_slice(data);
+        let mut events = Vec::new();
+
+        loop {
+            match &mut self.state {
+                PostMultipartState::Start => {
+                    let Some(pos) = find_subslice(&self.buf, &self.boundary) else {
+                        // Keep a small suffix to detect boundary across chunk splits.
+                        if self.buf.len() > self.boundary.len() {
+                            let drop_len = self.buf.len() - self.boundary.len();
+                            let _ = self.buf.split_to(drop_len);
+                        }
+                        break;
+                    };
+                    if pos > 0 {
+                        let _ = self.buf.split_to(pos);
+                    }
+                    if self.buf.len() < self.boundary.len() + 2 {
+                        break;
+                    }
+                    let _ = self.buf.split_to(self.boundary.len());
+                    if self.buf.starts_with(b"--") {
+                        return Err(ServerError::InvalidRequest {
+                            reason: "empty multipart form".to_string(),
+                        });
+                    }
+                    if self.buf.starts_with(b"\r\n") {
+                        let _ = self.buf.split_to(2);
+                        self.state = PostMultipartState::Headers;
+                        continue;
+                    }
+                    return Err(ServerError::InvalidRequest {
+                        reason: "malformed multipart: boundary not followed by CRLF".to_string(),
+                    });
+                }
+                PostMultipartState::Headers => {
+                    let Some(end) = find_subslice(&self.buf, b"\r\n\r\n") else {
+                        break;
+                    };
+                    let header_block = self.buf.split_to(end + 4);
+                    let header_bytes = &header_block[..end];
+                    let header_str = std::str::from_utf8(header_bytes).map_err(|_| {
+                        ServerError::InvalidRequest {
+                            reason: "invalid UTF-8 in multipart headers".to_string(),
+                        }
+                    })?;
+                    let (name, file_name) =
+                        super::multipart::parse_content_disposition(header_str)?;
+                    let is_file = name.eq_ignore_ascii_case("file");
+                    if is_file {
+                        events.push(PostMultipartEvent::FileStart { file_name });
+                    }
+                    self.state = PostMultipartState::Data { name, is_file };
+                    continue;
+                }
+                PostMultipartState::Data { name, is_file } => {
+                    if let Some(idx) = find_subslice(&self.buf, &self.delimiter) {
+                        let content = self.buf.split_to(idx).freeze();
+                        if *is_file {
+                            if !content.is_empty() {
+                                events.push(PostMultipartEvent::FileChunk(content));
+                            }
+                            events.push(PostMultipartEvent::FileEnd);
+                        } else {
+                            let value = std::str::from_utf8(&content).map_err(|_| {
+                                ServerError::InvalidRequest {
+                                    reason: format!("invalid UTF-8 in form field '{name}'"),
+                                }
+                            })?;
+                            events.push(PostMultipartEvent::Field {
+                                name: name.clone(),
+                                value: value.to_string(),
+                            });
+                        }
+                        let _ = self.buf.split_to(self.delimiter.len());
+                        self.state = PostMultipartState::AfterBoundary;
+                        continue;
+                    }
+
+                    if *is_file {
+                        let keep = self.delimiter.len().saturating_sub(1);
+                        if self.buf.len() > keep {
+                            let flush_len = self.buf.len() - keep;
+                            let chunk = self.buf.split_to(flush_len).freeze();
+                            if !chunk.is_empty() {
+                                events.push(PostMultipartEvent::FileChunk(chunk));
+                            }
+                            continue;
+                        }
+                    }
+                    break;
+                }
+                PostMultipartState::AfterBoundary => {
+                    if self.buf.len() < 2 {
+                        break;
+                    }
+                    if self.buf.starts_with(b"--") {
+                        let _ = self.buf.split_to(2);
+                        self.state = PostMultipartState::Done;
+                        continue;
+                    }
+                    if self.buf.starts_with(b"\r\n") {
+                        let _ = self.buf.split_to(2);
+                        self.state = PostMultipartState::Headers;
+                        continue;
+                    }
+                    return Err(ServerError::InvalidRequest {
+                        reason: "malformed multipart: bad boundary terminator".to_string(),
+                    });
+                }
+                PostMultipartState::Done => break,
+            }
+        }
+
+        Ok(events)
+    }
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+async fn handle_streaming_post_object(
+    state: Arc<ServerState>,
+    parts: http::request::Parts,
+    body: Incoming,
+    bucket: String,
+) -> S3Response {
+    use base64::Engine;
+
+    let idle_timeout = state.config.body_idle_timeout;
+
+    let s3req = match S3Request::from_hyper_headers(&parts) {
+        Ok(req) => req,
+        Err(err) => return S3Response::error(&err, ""),
+    };
+    let req_arc = Arc::new(s3req);
+
+    let content_type = match req_arc.header("content-type") {
+        Some(v) => v,
+        None => {
+            return error_response(&ServerError::InvalidRequest {
+                reason: "POST Object requires Content-Type: multipart/form-data".to_string(),
+            });
+        }
+    };
+    let boundary = match super::multipart::extract_boundary(content_type) {
+        Some(b) => b,
+        None => {
+            return error_response(&ServerError::InvalidRequest {
+                reason: "POST Object requires multipart/form-data with boundary".to_string(),
+            });
+        }
+    };
+
+    let mut parser = PostMultipartParser::new(boundary);
+    let mut fields: Vec<(String, String)> = Vec::new();
+    let mut ctx: Option<Arc<super::StreamingPostContext>> = None;
+    let mut seen_file = false;
+    let mut file_ended = false;
+
+    let mut crc64 = checksum::crc64::Hasher::new();
+    let mut sha256 = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut total_size: u64 = 0;
+    let mut chunk_index: u32 = 0;
+    let mut upload_buf = Vec::with_capacity(STREAM_CHUNK_SIZE);
+
+    let mut body = body;
+    loop {
+        match tokio::time::timeout(idle_timeout, body.frame()).await {
+            Ok(Some(Ok(frame))) => {
+                if let Some(chunk) = frame.data_ref() {
+                    let events = match parser.feed(chunk) {
+                        Ok(v) => v,
+                        Err(err) => {
+                            if let Some(ref c) = ctx {
+                                abort_streaming_post_object(&state, c).await;
+                            }
+                            return error_response(&err);
+                        }
+                    };
+                    for event in events {
+                        match event {
+                            PostMultipartEvent::Field { name, value } => {
+                                if seen_file {
+                                    if let Some(ref c) = ctx {
+                                        abort_streaming_post_object(&state, c).await;
+                                    }
+                                    return error_response(&ServerError::InvalidRequest {
+                                        reason: "file field must be the final multipart part"
+                                            .to_string(),
+                                    });
+                                }
+                                fields.push((name, value));
+                            }
+                            PostMultipartEvent::FileStart { file_name } => {
+                                if seen_file {
+                                    if let Some(ref c) = ctx {
+                                        abort_streaming_post_object(&state, c).await;
+                                    }
+                                    return error_response(&ServerError::InvalidRequest {
+                                        reason: "multiple file fields are not supported"
+                                            .to_string(),
+                                    });
+                                }
+                                seen_file = true;
+                                let st = Arc::clone(&state);
+                                let req = Arc::clone(&req_arc);
+                                let bucket_clone = bucket.clone();
+                                let fields_clone = fields.clone();
+                                let ctx_res = tokio::task::spawn_blocking(move || {
+                                    let frontend = acquire_frontend(&st);
+                                    frontend.prepare_streaming_post_object(
+                                        &req,
+                                        &bucket_clone,
+                                        &fields_clone,
+                                        file_name.as_deref(),
+                                    )
+                                })
+                                .await;
+                                match ctx_res {
+                                    Ok(Ok(c)) => ctx = Some(Arc::new(c)),
+                                    Ok(Err(err)) => return error_response(&err),
+                                    Err(_) => return internal_error_response(),
+                                }
+                            }
+                            PostMultipartEvent::FileChunk(data) => {
+                                let Some(ref c) = ctx else {
+                                    return error_response(&ServerError::InvalidRequest {
+                                        reason: "missing file field in multipart form".to_string(),
+                                    });
+                                };
+                                crc64.update(&data);
+                                sha256.update(&data);
+                                total_size += data.len() as u64;
+                                if total_size > MAX_OBJECT_SIZE {
+                                    abort_streaming_post_object(&state, c).await;
+                                    return error_response(&ServerError::ObjectTooLarge {
+                                        size: total_size,
+                                        max: MAX_OBJECT_SIZE,
+                                    });
+                                }
+
+                                upload_buf.extend_from_slice(&data);
+                                while upload_buf.len() >= STREAM_CHUNK_SIZE {
+                                    let flush_data: Vec<u8> =
+                                        upload_buf.drain(..STREAM_CHUNK_SIZE).collect();
+                                    let idx = chunk_index;
+                                    chunk_index += 1;
+                                    let ctx_ref = Arc::clone(c);
+                                    let st = Arc::clone(&state);
+                                    match tokio::task::spawn_blocking(move || {
+                                        let frontend = acquire_frontend(&st);
+                                        frontend.streaming_append_post_chunk(
+                                            &ctx_ref,
+                                            idx,
+                                            &flush_data,
+                                        )
+                                    })
+                                    .await
+                                    {
+                                        Ok(Ok(())) => {}
+                                        Ok(Err(err)) => {
+                                            abort_streaming_post_object(&state, c).await;
+                                            return error_response(&err);
+                                        }
+                                        Err(_) => {
+                                            abort_streaming_post_object(&state, c).await;
+                                            return internal_error_response();
+                                        }
+                                    }
+                                }
+                            }
+                            PostMultipartEvent::FileEnd => {
+                                file_ended = true;
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(Some(Err(_))) => {
+                if let Some(ref c) = ctx {
+                    abort_streaming_post_object(&state, c).await;
+                }
+                return error_response(&ServerError::InvalidRequest {
+                    reason: "failed to read request body".to_string(),
+                });
+            }
+            Ok(None) => break,
+            Err(_) => {
+                if let Some(ref c) = ctx {
+                    abort_streaming_post_object(&state, c).await;
+                }
+                return error_response(&ServerError::InvalidRequest {
+                    reason: "request body read timed out".to_string(),
+                });
+            }
+        }
+    }
+
+    if !parser.is_done() {
+        if let Some(ref c) = ctx {
+            abort_streaming_post_object(&state, c).await;
+        }
+        return error_response(&ServerError::IncompleteBody);
+    }
+    if !seen_file {
+        return error_response(&ServerError::InvalidRequest {
+            reason: "missing file field in multipart form".to_string(),
+        });
+    }
+    if !file_ended {
+        if let Some(ref c) = ctx {
+            abort_streaming_post_object(&state, c).await;
+        }
+        return error_response(&ServerError::IncompleteBody);
+    }
+
+    let Some(ctx) = ctx else {
+        return error_response(&ServerError::InvalidRequest {
+            reason: "missing file field in multipart form".to_string(),
+        });
+    };
+
+    if !upload_buf.is_empty() {
+        let idx = chunk_index;
+        let st = Arc::clone(&state);
+        let ctx_ref = Arc::clone(&ctx);
+        match tokio::task::spawn_blocking(move || {
+            let frontend = acquire_frontend(&st);
+            frontend.streaming_append_post_chunk(&ctx_ref, idx, &upload_buf)
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                abort_streaming_post_object(&state, &ctx).await;
+                return error_response(&err);
+            }
+            Err(_) => {
+                abort_streaming_post_object(&state, &ctx).await;
+                return internal_error_response();
+            }
+        }
+    }
+
+    let actual_sha256_b64 =
+        base64::engine::general_purpose::STANDARD.encode(sha256.finish().as_ref());
+    let crc64 = crc64.finalize();
+    let st = Arc::clone(&state);
+    let ctx_ref = Arc::clone(&ctx);
+    match tokio::task::spawn_blocking(move || {
+        let frontend = acquire_frontend(&st);
+        frontend.finalize_streaming_post_object(&ctx_ref, crc64, total_size, &actual_sha256_b64)
+    })
+    .await
+    {
+        Ok(Ok(resp)) => resp,
+        Ok(Err(err)) => {
+            abort_streaming_post_object(&state, &ctx).await;
+            error_response(&err)
+        }
+        Err(_) => {
+            abort_streaming_post_object(&state, &ctx).await;
+            internal_error_response()
+        }
     }
 }
 
@@ -725,6 +1156,19 @@ async fn abort_streaming(state: &Arc<ServerState>, ctx: &Arc<super::StreamingPut
     let _ = tokio::task::spawn_blocking(move || {
         let frontend = acquire_frontend(&st);
         frontend.abort_streaming_put(&ctx);
+    })
+    .await;
+}
+
+async fn abort_streaming_post_object(
+    state: &Arc<ServerState>,
+    ctx: &Arc<super::StreamingPostContext>,
+) {
+    let st = Arc::clone(state);
+    let ctx = Arc::clone(ctx);
+    let _ = tokio::task::spawn_blocking(move || {
+        let frontend = acquire_frontend(&st);
+        frontend.abort_streaming_post_object(&ctx);
     })
     .await;
 }
@@ -1228,7 +1672,15 @@ fn acquire_frontend(state: &ServerState) -> MutexGuard<'_, HttpFrontend> {
 /// every chunk. A client sending data steadily (even slowly) will never be
 /// timed out; only truly stalled connections are killed.
 async fn collect_body(body: Incoming, idle_timeout: Duration) -> Result<Bytes, ServerError> {
-    let mut limited = Limited::new(body, MAX_BODY_SIZE);
+    collect_body_with_limit(body, idle_timeout, MAX_BODY_SIZE).await
+}
+
+async fn collect_body_with_limit(
+    body: Incoming,
+    idle_timeout: Duration,
+    max_size: usize,
+) -> Result<Bytes, ServerError> {
+    let mut limited = Limited::new(body, max_size);
     let mut data = Vec::new();
 
     loop {
@@ -1244,7 +1696,7 @@ async fn collect_body(body: Incoming, idle_timeout: Duration) -> Result<Bytes, S
                 if e.downcast_ref::<LengthLimitError>().is_some() {
                     return Err(ServerError::ObjectTooLarge {
                         size: 0,
-                        max: MAX_BODY_SIZE as u64,
+                        max: max_size as u64,
                     });
                 }
                 return Err(ServerError::InvalidRequest {
@@ -1542,6 +1994,18 @@ mod tests {
             ],
         );
         assert!(is_streaming_write(&parts).is_none());
+    }
+
+    #[test]
+    fn post_object_detected() {
+        let parts = make_parts("POST", "/mybucket", &[]);
+        assert_eq!(post_object_bucket(&parts).as_deref(), Some("mybucket"));
+    }
+
+    #[test]
+    fn post_delete_objects_not_detected_as_post_object() {
+        let parts = make_parts("POST", "/mybucket?delete", &[]);
+        assert!(post_object_bucket(&parts).is_none());
     }
 
     // ── Regression tests for P0–P2 security fixes ────────────────────

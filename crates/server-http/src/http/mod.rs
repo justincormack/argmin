@@ -1743,6 +1743,222 @@ impl HttpFrontend {
 
     // ── Streaming write helpers ─────────────────────────────────────
 
+    /// Prepare a streaming `PostObject` session after multipart field parsing.
+    ///
+    /// `form_fields` are non-file multipart fields parsed in order.
+    pub fn prepare_streaming_post_object(
+        &self,
+        req: &S3Request,
+        bucket: &str,
+        form_fields: &[(String, String)],
+        file_name: Option<&str>,
+    ) -> Result<StreamingPostContext, ServerError> {
+        let header_auth = self.authenticate_with_payload_check(req, false)?;
+
+        let field = |name: &str| -> Option<&str> {
+            form_fields
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.as_str())
+        };
+
+        // Authenticate using SigV4 POST form fields only.
+        let algo = field("x-amz-algorithm").ok_or_else(|| ServerError::InvalidRequest {
+            reason: "missing x-amz-algorithm".to_string(),
+        })?;
+        let post_auth = auth::authenticate_post_sigv4(
+            algo,
+            field("x-amz-credential").ok_or_else(|| ServerError::InvalidRequest {
+                reason: "missing x-amz-credential".to_string(),
+            })?,
+            field("x-amz-date").ok_or_else(|| ServerError::InvalidRequest {
+                reason: "missing x-amz-date".to_string(),
+            })?,
+            field("policy").ok_or_else(|| ServerError::InvalidRequest {
+                reason: "missing policy".to_string(),
+            })?,
+            field("x-amz-signature").ok_or_else(|| ServerError::InvalidRequest {
+                reason: "missing x-amz-signature".to_string(),
+            })?,
+            &self.credentials,
+        )
+        .map_err(|e| match e {
+            auth::AuthError::MissingAuth => ServerError::InvalidRequest {
+                reason: "missing required POST authentication fields".to_string(),
+            },
+            other => ServerError::Auth(other),
+        })?;
+
+        // Resolve object key (with ${filename} substitution).
+        let pseudo_form = multipart::PostFormData {
+            fields: form_fields.to_vec(),
+            file_data: Vec::new(),
+            file_name: file_name.map(|s| s.to_string()),
+        };
+        let key = pseudo_form.resolve_key()?;
+
+        // Use POST auth context if authenticated, otherwise fall back to header auth.
+        let effective_auth = if post_auth.mode == AuthMode::Anonymous {
+            &header_auth
+        } else {
+            &post_auth
+        };
+
+        // Build metadata headers from form fields.
+        let mut header_pairs: Vec<(String, String)> = Vec::new();
+        if let Some(ct) = field("Content-Type") {
+            header_pairs.push(("content-type".to_string(), ct.to_string()));
+        }
+        // Pass through x-amz-meta-* fields.
+        for (k, v) in form_fields {
+            if k.to_ascii_lowercase().starts_with("x-amz-meta-") {
+                header_pairs.push((k.to_ascii_lowercase(), v.clone()));
+            }
+        }
+        // Also pass cache-control, content-disposition, etc.
+        for name in &[
+            "cache-control",
+            "content-disposition",
+            "content-encoding",
+            "content-language",
+            "expires",
+        ] {
+            if let Some(val) = field(name) {
+                header_pairs.push((name.to_string(), val.to_string()));
+            }
+        }
+        let hp_refs: Vec<(&str, &str)> = header_pairs
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let metadata_blob = MetadataBlob::from_headers(&hp_refs)?;
+
+        let requester =
+            crate::coordinator::Requester::from_principal(effective_auth.principal.as_deref());
+        let acl = parse_put_object_acl(field("acl"));
+        let session_id = self.coordinator.begin_stream_put(&BeginStreamPutRequest {
+            bucket,
+            key: &key,
+            requester,
+            acl,
+        })?;
+
+        let success_status = field("success_action_status")
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(204);
+
+        Ok(StreamingPostContext {
+            session_id,
+            bucket: bucket.to_string(),
+            key,
+            metadata_blob,
+            requester_principal: effective_auth.principal.clone(),
+            success_status,
+            form_fields: form_fields.to_vec(),
+            policy_b64: field("policy").map(|v| v.to_string()),
+            checksum_sha256_b64: field("x-amz-checksum-sha256").map(|v| v.to_string()),
+        })
+    }
+
+    /// Finalize a streaming `PostObject` session and return a POST response.
+    pub fn finalize_streaming_post_object(
+        &self,
+        ctx: &StreamingPostContext,
+        crc64: u64,
+        total_size: u64,
+        actual_sha256_b64: &str,
+    ) -> Result<S3Response, ServerError> {
+        // Validate policy (if present) with the actual uploaded file size.
+        if let Some(policy_b64) = ctx.policy_b64.as_deref() {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let file_size =
+                usize::try_from(total_size).map_err(|_| ServerError::ObjectTooLarge {
+                    size: total_size,
+                    max: crate::coordinator::MAX_OBJECT_SIZE,
+                })?;
+
+            let mut field_pairs: Vec<(&str, &str)> = ctx
+                .form_fields
+                .iter()
+                .filter(|(k, _)| !k.eq_ignore_ascii_case("key"))
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            field_pairs.push(("key", &ctx.key));
+
+            auth::validate_post_policy(policy_b64, &field_pairs, file_size, &ctx.bucket, now)
+                .map_err(|e| match &e {
+                    // Structural/format errors → 400
+                    auth::PostPolicyError::Malformed(_) => ServerError::InvalidRequest {
+                        reason: e.to_string(),
+                    },
+                    // content-length-range violations → 400
+                    auth::PostPolicyError::ConditionFailed("content-length-range") => {
+                        ServerError::InvalidRequest {
+                            reason: e.to_string(),
+                        }
+                    }
+                    // Other condition failures and expiration → 403
+                    auth::PostPolicyError::Expired | auth::PostPolicyError::ConditionFailed(_) => {
+                        ServerError::Auth(auth::AuthError::AccessDenied)
+                    }
+                })?;
+        }
+
+        // Validate optional x-amz-checksum-sha256 form field.
+        if let Some(claimed) = ctx.checksum_sha256_b64.as_deref() {
+            if claimed != actual_sha256_b64 {
+                return Err(ServerError::InvalidRequest {
+                    reason: "checksum mismatch".to_string(),
+                });
+            }
+        }
+
+        let result = self
+            .coordinator
+            .finalize_stream_put(&FinalizeStreamPutRequest {
+                bucket: &ctx.bucket,
+                key: &ctx.key,
+                session_id: &ctx.session_id,
+                crc64,
+                total_size,
+                metadata_blob: &ctx.metadata_blob,
+                cond: &crate::conditional::WriteCondition::default(),
+            })?;
+
+        Ok(S3Response::post_object(
+            &result,
+            &ctx.bucket,
+            &ctx.key,
+            ctx.success_status,
+        ))
+    }
+
+    /// Append a chunk to a streaming POST session.
+    pub fn streaming_append_post_chunk(
+        &self,
+        ctx: &StreamingPostContext,
+        chunk_index: u32,
+        data: &[u8],
+    ) -> Result<(), ServerError> {
+        self.coordinator.append_stream_chunk(
+            &ctx.bucket,
+            &ctx.key,
+            &ctx.session_id,
+            chunk_index,
+            data,
+        )
+    }
+
+    /// Abort a streaming POST session (best-effort cleanup).
+    pub fn abort_streaming_post_object(&self, ctx: &StreamingPostContext) {
+        let _ = self
+            .coordinator
+            .abort_stream_put(&ctx.bucket, &ctx.key, &ctx.session_id);
+    }
+
     /// Prepare a streaming `PutObject`: authenticate, validate, begin session.
     ///
     /// Returns a context struct that the async streaming loop uses to drive
@@ -2067,6 +2283,19 @@ pub struct StreamingPutContext {
     pub checksum_response: Vec<(String, String)>,
     /// Signing context for aws-chunked modes, None for unsigned/plain.
     pub streaming_signing: Option<auth::StreamingSigningContext>,
+}
+
+/// Context for an in-progress streaming `PostObject`.
+pub struct StreamingPostContext {
+    pub session_id: String,
+    pub bucket: String,
+    pub key: String,
+    pub metadata_blob: crate::metadata_blob::MetadataBlob,
+    pub requester_principal: Option<String>,
+    pub success_status: u16,
+    pub form_fields: Vec<(String, String)>,
+    pub policy_b64: Option<String>,
+    pub checksum_sha256_b64: Option<String>,
 }
 
 /// Context for an in-progress streaming `UploadPart`.
