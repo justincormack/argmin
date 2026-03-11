@@ -1271,6 +1271,33 @@ fn test_put_wrong_service() {
     });
 }
 
+// ── Group: request.rs error paths ──────────────────────────────────────
+
+/// PUT with invalid percent-encoded UTF-8 in the object key should fail.
+/// e.g. `%80` is not valid UTF-8 (it's a continuation byte without a leader).
+#[test]
+fn test_put_invalid_percent_encoding_in_key() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        // %80 is an invalid UTF-8 byte — percent_decode_strict should reject it.
+        let path = format!("/{}/bad%80key", bucket);
+        let s = Signer::new("PUT", &path).body_hash(&sha256_hex(b"")).sign();
+        let url = format!("{}{}", CTX.endpoint(), path);
+        let mut resp = agent()
+            .put(&url)
+            .header("Authorization", &s.authorization)
+            .header("x-amz-date", &s.amz_date)
+            .header("x-amz-content-sha256", &s.amz_content_sha256)
+            .send(b"".as_ref())
+            .expect("transport error");
+        let status = resp.status().as_u16();
+        let body = resp.body_mut().read_to_string().unwrap_or_default();
+        assert_eq!(status, 400, "expected 400 for invalid percent-encoding, got {status}");
+        assert_error_code(&body, "InvalidURI");
+        cleanup(&bucket, &[]).await;
+    });
+}
+
 #[test]
 #[ignore = "not implemented: duplicate Authorization header rejection"]
 fn test_put_duplicate_authorization() {

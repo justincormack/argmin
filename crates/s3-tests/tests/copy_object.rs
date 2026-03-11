@@ -946,6 +946,56 @@ fn test_copy_object_replace_checksum_algorithm_recomputes() {
     });
 }
 
+// ── Malformed copy source ─────────────────────────────────────────────
+
+/// CopyObject with source that has no key (just bucket name) should fail.
+#[test]
+fn test_copy_object_source_missing_key() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        put_object(&bucket, "src", b"data").await;
+
+        // copy_source = "bucket" (no slash, no key)
+        let result = CTX
+            .client()
+            .copy_object()
+            .bucket(&bucket)
+            .key("dst")
+            .copy_source(&bucket)
+            .send()
+            .await;
+        assert!(result.is_err(), "expected error for copy source without key");
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "InvalidArgument");
+
+        cleanup(&bucket, &["src"]).await;
+    });
+}
+
+/// CopyObject with source that has an empty key (bucket/) should fail.
+#[test]
+fn test_copy_object_source_empty_key() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        put_object(&bucket, "src", b"data").await;
+
+        // copy_source = "bucket/" (slash but empty key)
+        let result = CTX
+            .client()
+            .copy_object()
+            .bucket(&bucket)
+            .key("dst")
+            .copy_source(format!("{}/", bucket))
+            .send()
+            .await;
+        assert!(result.is_err(), "expected error for copy source with empty key");
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "InvalidArgument");
+
+        cleanup(&bucket, &["src"]).await;
+    });
+}
+
 #[test]
 #[ignore = "not implemented: multi-user ACL"]
 fn test_object_copy_not_owned_object_bucket() {

@@ -95,22 +95,12 @@ impl S3Request {
             .map(|(_, v)| v.as_str())
     }
 
-    /// Get the body hash for `SigV4` canonical request.
-    ///
-    /// If the client sends `x-amz-content-sha256: UNSIGNED-PAYLOAD`, the literal
-    /// string "UNSIGNED-PAYLOAD" is used in the canonical request (not the actual
-    /// body hash). Otherwise, use the provided hash or compute from body.
-    #[must_use]
-    pub fn body_hash(&self) -> String {
-        match self.header("x-amz-content-sha256") {
-            Some("UNSIGNED-PAYLOAD") => "UNSIGNED-PAYLOAD".to_string(),
-            Some(hash) => hash.to_string(),
-            None => auth::canonical::sha256_hex(&self.body),
-        }
-    }
-
     /// Create a new `S3Request` with a decoded body and trailer headers,
     /// stripping `aws-chunked` from Content-Encoding.
+    ///
+    /// Only used by the `#[cfg(test)]` batch chunked decoder path.
+    /// Production streaming writes don't reassemble into S3Request.
+    #[cfg(test)]
     #[must_use]
     pub fn with_decoded_body(&self, body: Vec<u8>, trailers: Vec<(String, String)>) -> Self {
         let mut headers: Vec<(String, String)> = self
@@ -209,7 +199,7 @@ pub(crate) fn percent_decode_bytes(s: &str) -> Vec<u8> {
 /// Percent-decode a string (RFC 3986) into UTF-8, rejecting invalid sequences.
 pub(crate) fn percent_decode_strict(s: &str) -> Result<String, ServerError> {
     let bytes = percent_decode_bytes(s);
-    String::from_utf8(bytes).map_err(|_| ServerError::InvalidRequest {
+    String::from_utf8(bytes).map_err(|_| ServerError::InvalidURI {
         reason: "Couldn't parse the specified URI.".to_string(),
     })
 }
@@ -244,16 +234,20 @@ pub(crate) fn parse_copy_source(
     };
 
     // Split into bucket/key at first '/'
-    let slash_pos = s.find('/').ok_or_else(|| ServerError::InvalidRequest {
-        reason: "x-amz-copy-source must contain bucket/key".to_string(),
+    let slash_pos = s.find('/').ok_or_else(|| ServerError::InvalidArgument {
+        reason: "Invalid copy source object key".to_string(),
     })?;
 
-    let bucket = percent_decode(&s[..slash_pos]);
-    let key = percent_decode(&s[slash_pos + 1..]);
+    let bucket = percent_decode_strict(&s[..slash_pos]).map_err(|_| ServerError::InvalidArgument {
+        reason: "Invalid copy source object key".to_string(),
+    })?;
+    let key = percent_decode_strict(&s[slash_pos + 1..]).map_err(|_| ServerError::InvalidArgument {
+        reason: "Invalid copy source object key".to_string(),
+    })?;
 
     if key.is_empty() {
-        return Err(ServerError::InvalidRequest {
-            reason: "x-amz-copy-source key must not be empty".to_string(),
+        return Err(ServerError::InvalidArgument {
+            reason: "Invalid copy source object key".to_string(),
         });
     }
 
@@ -272,49 +266,6 @@ fn hex_val(b: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn body_hash_unsigned_payload() {
-        let req = S3Request {
-            method: "PUT".to_string(),
-            path: "/bucket/key".to_string(),
-            query_string: String::new(),
-            headers: vec![(
-                "x-amz-content-sha256".to_string(),
-                "UNSIGNED-PAYLOAD".to_string(),
-            )],
-            body: b"some data".to_vec(),
-        };
-        assert_eq!(req.body_hash(), "UNSIGNED-PAYLOAD");
-    }
-
-    #[test]
-    fn body_hash_with_explicit_hash() {
-        let req = S3Request {
-            method: "PUT".to_string(),
-            path: "/bucket/key".to_string(),
-            query_string: String::new(),
-            headers: vec![("x-amz-content-sha256".to_string(), "abc123".to_string())],
-            body: b"data".to_vec(),
-        };
-        assert_eq!(req.body_hash(), "abc123");
-    }
-
-    #[test]
-    fn body_hash_computed_when_no_header() {
-        let req = S3Request {
-            method: "GET".to_string(),
-            path: "/".to_string(),
-            query_string: String::new(),
-            headers: vec![],
-            body: vec![],
-        };
-        // SHA-256 of empty string
-        assert_eq!(
-            req.body_hash(),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        );
-    }
 
     #[test]
     fn percent_decode_basic() {
@@ -528,8 +479,39 @@ mod tests {
 
     #[test]
     fn parse_copy_source_missing_key() {
-        assert!(parse_copy_source("/bucket").is_err());
-        assert!(parse_copy_source("bucket").is_err());
+        match parse_copy_source("/bucket") {
+            Err(ServerError::InvalidArgument { reason }) => {
+                assert_eq!(reason, "Invalid copy source object key");
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+        match parse_copy_source("bucket") {
+            Err(ServerError::InvalidArgument { reason }) => {
+                assert_eq!(reason, "Invalid copy source object key");
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_copy_source_empty_key() {
+        match parse_copy_source("/bucket/") {
+            Err(ServerError::InvalidArgument { reason }) => {
+                assert_eq!(reason, "Invalid copy source object key");
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_copy_source_invalid_utf8() {
+        // %80 is not valid UTF-8
+        match parse_copy_source("/bucket/key%80name") {
+            Err(ServerError::InvalidArgument { reason }) => {
+                assert_eq!(reason, "Invalid copy source object key");
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
     }
 
     #[test]

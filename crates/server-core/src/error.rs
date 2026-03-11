@@ -36,6 +36,9 @@ pub enum ServerError {
     #[error("invalid argument: {reason}")]
     InvalidArgument { reason: String },
 
+    #[error("invalid URI: {reason}")]
+    InvalidURI { reason: String },
+
     #[error("invalid bucket name: {reason}")]
     InvalidBucketName { reason: String },
     #[error("metadata blob error: {reason}")]
@@ -171,6 +174,7 @@ impl ServerError {
             Self::NotModified { .. } => "NotModified",
             Self::InvalidRequest { .. } => "InvalidRequest",
             Self::InvalidArgument { .. } => "InvalidArgument",
+            Self::InvalidURI { .. } => "InvalidURI",
             Self::InvalidBucketName { .. } => "InvalidBucketName",
             Self::MetadataBlobError { .. } => "InternalError",
             Self::ObjectTooLarge { .. } => "EntityTooLarge",
@@ -225,6 +229,7 @@ impl ServerError {
             Self::Auth(_) => 403,
             Self::InvalidRequest { .. }
             | Self::InvalidArgument { .. }
+            | Self::InvalidURI { .. }
             | Self::InvalidBucketName { .. }
             | Self::BadDigest => 400,
             Self::InvalidChunkSize { .. } => 403,
