@@ -35,7 +35,6 @@ pub fn extract_boundary(content_type: &str) -> Option<&str> {
     None
 }
 
-
 /// Parse the Content-Disposition header to extract the field name and optional filename.
 pub(crate) fn parse_content_disposition(
     headers: &str,
@@ -60,8 +59,7 @@ pub(crate) fn parse_content_disposition(
     }
 
     let name = name.ok_or_else(|| ServerError::MalformedPOSTRequest {
-        reason: "The body of your POST request is not well-formed multipart/form-data."
-            .to_string(),
+        reason: "The body of your POST request is not well-formed multipart/form-data.".to_string(),
     })?;
 
     Ok((name, filename))
@@ -176,5 +174,4 @@ mod tests {
         };
         assert_eq!(data.resolve_key().unwrap(), "photo.jpg");
     }
-
 }
