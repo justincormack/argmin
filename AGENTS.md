@@ -13,6 +13,12 @@ plan detail needs correcting.
 
 Under tmp/ but not committed to repo are clones of dependencies so we can read code
 
+## Stability of interfaces and backwards compatibility
+
+We are in pre-release state. That means no code needs to be added to migrate database schemas at present, as
+there are no existing users. The public API can be changed as necessary, there are no external consumers outside
+this repository.
+
 ## Dependencies
 
 We are trying to not have too many dependencies and to keep code simple and understandable. Ask before adding
