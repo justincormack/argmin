@@ -1,4 +1,7 @@
+## Overall guidance
 
+We are building a server that much exactly match AWS S3 behaviour at all times. Do not work around this, always
+fix non conforming behaviour.
 
 ## Repository structure
 
