@@ -295,13 +295,13 @@ pub struct DeleteObjectEntry {
 pub fn parse_delete_objects_xml(
     data: &[u8],
 ) -> Result<(Vec<DeleteObjectEntry>, bool), ServerError> {
-    let text = std::str::from_utf8(data).map_err(|_| ServerError::InvalidRequest {
+    let text = std::str::from_utf8(data).map_err(|_| ServerError::MalformedXML {
         reason: "invalid UTF-8 in delete XML body".to_string(),
     })?;
 
     // Require <Delete> wrapper
     if !text.contains("<Delete") {
-        return Err(ServerError::InvalidRequest {
+        return Err(ServerError::MalformedXML {
             reason: "missing <Delete> element".to_string(),
         });
     }
@@ -317,12 +317,12 @@ pub fn parse_delete_objects_xml(
         let end =
             text[abs_start..]
                 .find("</Object>")
-                .ok_or_else(|| ServerError::InvalidRequest {
+                .ok_or_else(|| ServerError::MalformedXML {
                     reason: "unclosed <Object> element".to_string(),
                 })?;
         let block = &text[abs_start..abs_start + end];
 
-        let key = extract_tag_content(block, "Key").ok_or_else(|| ServerError::InvalidRequest {
+        let key = extract_tag_content(block, "Key").ok_or_else(|| ServerError::MalformedXML {
             reason: "Object missing <Key> element".to_string(),
         })?;
         let key = xml_unescape(key);
@@ -334,7 +334,7 @@ pub fn parse_delete_objects_xml(
     }
 
     if entries.len() > 1000 {
-        return Err(ServerError::InvalidRequest {
+        return Err(ServerError::MalformedXML {
             reason: "delete objects list too large (max 1000)".to_string(),
         });
     }
@@ -409,7 +409,7 @@ pub fn delete_objects_result_xml(
 ///
 /// Returns the versioning state as a `BucketVersioningState` enum.
 pub fn parse_versioning_config_xml(data: &[u8]) -> Result<BucketVersioningState, ServerError> {
-    let text = std::str::from_utf8(data).map_err(|_| ServerError::InvalidRequest {
+    let text = std::str::from_utf8(data).map_err(|_| ServerError::MalformedXML {
         reason: "invalid UTF-8 in versioning XML body".to_string(),
     })?;
 
@@ -417,13 +417,13 @@ pub fn parse_versioning_config_xml(data: &[u8]) -> Result<BucketVersioningState,
         match status {
             "Enabled" => Ok(BucketVersioningState::Enabled),
             "Suspended" => Ok(BucketVersioningState::Suspended),
-            other => Err(ServerError::InvalidRequest {
-                reason: format!("invalid versioning status: {other}"),
+            _other => Err(ServerError::MalformedXML {
+                reason: "The XML you provided was not well-formed or did not validate against our published schema".to_string(),
             }),
         }
     } else {
-        Err(ServerError::InvalidRequest {
-            reason: "missing <Status> element in versioning configuration".to_string(),
+        Err(ServerError::IllegalVersioningConfiguration {
+            reason: "The Versioning element must be specified".to_string(),
         })
     }
 }
@@ -622,12 +622,12 @@ fn xml_unescape(s: &str) -> String {
 /// </CORSConfiguration>
 /// ```
 pub fn parse_cors_config_xml(data: &[u8]) -> Result<crate::cors::CorsConfiguration, ServerError> {
-    let text = std::str::from_utf8(data).map_err(|_| ServerError::InvalidRequest {
+    let text = std::str::from_utf8(data).map_err(|_| ServerError::MalformedXML {
         reason: "invalid UTF-8 in CORS XML body".to_string(),
     })?;
 
     if !text.contains("<CORSConfiguration") {
-        return Err(ServerError::InvalidRequest {
+        return Err(ServerError::MalformedXML {
             reason: "missing <CORSConfiguration> element".to_string(),
         });
     }
@@ -641,7 +641,7 @@ pub fn parse_cors_config_xml(data: &[u8]) -> Result<crate::cors::CorsConfigurati
         let end =
             text[abs_start..]
                 .find("</CORSRule>")
-                .ok_or_else(|| ServerError::InvalidRequest {
+                .ok_or_else(|| ServerError::MalformedXML {
                     reason: "unclosed <CORSRule> element".to_string(),
                 })?;
         let block = &text[abs_start..abs_start + end];
@@ -652,7 +652,7 @@ pub fn parse_cors_config_xml(data: &[u8]) -> Result<crate::cors::CorsConfigurati
             .map(|s| xml_unescape(&s))
             .collect();
         if allowed_origins.is_empty() {
-            return Err(ServerError::InvalidRequest {
+            return Err(ServerError::MalformedXML {
                 reason: "CORSRule missing <AllowedOrigin> element".to_string(),
             });
         }
@@ -663,14 +663,16 @@ pub fn parse_cors_config_xml(data: &[u8]) -> Result<crate::cors::CorsConfigurati
             .map(|s| xml_unescape(&s))
             .collect();
         if allowed_methods.is_empty() {
-            return Err(ServerError::InvalidRequest {
+            return Err(ServerError::MalformedXML {
                 reason: "CORSRule missing <AllowedMethod> element".to_string(),
             });
         }
         for m in &allowed_methods {
             if !valid_methods.contains(&m.as_str()) {
                 return Err(ServerError::InvalidRequest {
-                    reason: format!("invalid CORS method: {m}"),
+                    reason: format!(
+                        "Found unsupported HTTP method in CORS config. Unsupported method is {m}"
+                    ),
                 });
             }
         }
@@ -690,7 +692,7 @@ pub fn parse_cors_config_xml(data: &[u8]) -> Result<crate::cors::CorsConfigurati
         // Parse MaxAgeSeconds (0 or 1)
         let max_age_seconds = extract_tag_content(block, "MaxAgeSeconds")
             .map(|s| {
-                s.parse::<u32>().map_err(|_| ServerError::InvalidRequest {
+                s.parse::<u32>().map_err(|_| ServerError::MalformedXML {
                     reason: format!("invalid MaxAgeSeconds: {s}"),
                 })
             })
@@ -708,12 +710,12 @@ pub fn parse_cors_config_xml(data: &[u8]) -> Result<crate::cors::CorsConfigurati
     }
 
     if rules.is_empty() {
-        return Err(ServerError::InvalidRequest {
+        return Err(ServerError::MalformedXML {
             reason: "CORS configuration must contain at least one rule".to_string(),
         });
     }
     if rules.len() > 100 {
-        return Err(ServerError::InvalidRequest {
+        return Err(ServerError::MalformedXML {
             reason: "CORS configuration must contain at most 100 rules".to_string(),
         });
     }
@@ -857,17 +859,17 @@ pub fn parse_tagging_xml(
     data: &[u8],
     max_tags: usize,
 ) -> Result<Vec<(String, String)>, ServerError> {
-    let text = std::str::from_utf8(data).map_err(|_| ServerError::InvalidRequest {
+    let text = std::str::from_utf8(data).map_err(|_| ServerError::MalformedXML {
         reason: "invalid UTF-8 in tagging XML body".to_string(),
     })?;
 
     // Require both wrapper elements
     let tagging_block =
-        extract_tag_content(text, "Tagging").ok_or(ServerError::InvalidRequest {
+        extract_tag_content(text, "Tagging").ok_or(ServerError::MalformedXML {
             reason: "missing <Tagging> element in tagging XML".to_string(),
         })?;
     let tag_set =
-        extract_tag_content(tagging_block, "TagSet").ok_or(ServerError::InvalidRequest {
+        extract_tag_content(tagging_block, "TagSet").ok_or(ServerError::MalformedXML {
             reason: "missing <TagSet> element in tagging XML".to_string(),
         })?;
 
@@ -1023,14 +1025,14 @@ fn percent_decode_tag(input: &str) -> Result<String, ServerError> {
         if b == b'+' {
             bytes.push(b' ');
         } else if b == b'%' {
-            let hi = iter.next().ok_or(ServerError::InvalidTag {
-                reason: "incomplete percent-encoding in tag".to_string(),
+            let hi = iter.next().ok_or(ServerError::InvalidArgument {
+                reason: "invalid percent-encoding in tagging header".to_string(),
             })?;
-            let lo = iter.next().ok_or(ServerError::InvalidTag {
-                reason: "incomplete percent-encoding in tag".to_string(),
+            let lo = iter.next().ok_or(ServerError::InvalidArgument {
+                reason: "invalid percent-encoding in tagging header".to_string(),
             })?;
-            let byte = decode_hex_pair(hi, lo).ok_or(ServerError::InvalidTag {
-                reason: "invalid percent-encoding in tag".to_string(),
+            let byte = decode_hex_pair(hi, lo).ok_or(ServerError::InvalidArgument {
+                reason: "invalid percent-encoding in tagging header".to_string(),
             })?;
             bytes.push(byte);
         } else {
@@ -1038,7 +1040,7 @@ fn percent_decode_tag(input: &str) -> Result<String, ServerError> {
         }
     }
     String::from_utf8(bytes).map_err(|_| ServerError::InvalidTag {
-        reason: "invalid UTF-8 in percent-decoded tag".to_string(),
+        reason: "The TagValue you have provided is invalid".to_string(),
     })
 }
 
@@ -1072,11 +1074,11 @@ pub struct PublicAccessBlockConfig {
 ///
 /// Missing boolean elements default to `false`.
 pub fn parse_public_access_block_xml(data: &[u8]) -> Result<PublicAccessBlockConfig, ServerError> {
-    let text = std::str::from_utf8(data).map_err(|_| ServerError::InvalidRequest {
+    let text = std::str::from_utf8(data).map_err(|_| ServerError::MalformedXML {
         reason: "invalid UTF-8 in public access block XML body".to_string(),
     })?;
     let inner = extract_tag_content(text, "PublicAccessBlockConfiguration").ok_or_else(|| {
-        ServerError::InvalidRequest {
+        ServerError::MalformedXML {
             reason: "missing PublicAccessBlockConfiguration element".to_string(),
         }
     })?;
@@ -1133,19 +1135,19 @@ pub fn get_public_access_block_xml(config: &PublicAccessBlockConfig) -> String {
 /// `<OwnershipControls><Rule><ObjectOwnership>VALUE</ObjectOwnership></Rule></OwnershipControls>`.
 /// Validates VALUE is one of `BucketOwnerEnforced`, `BucketOwnerPreferred`, or `ObjectWriter`.
 pub fn parse_ownership_controls_xml(data: &[u8]) -> Result<String, ServerError> {
-    let text = std::str::from_utf8(data).map_err(|_| ServerError::InvalidRequest {
+    let text = std::str::from_utf8(data).map_err(|_| ServerError::MalformedXML {
         reason: "invalid UTF-8 in ownership controls XML body".to_string(),
     })?;
     let inner = extract_tag_content(text, "OwnershipControls").ok_or_else(|| {
-        ServerError::InvalidRequest {
+        ServerError::MalformedXML {
             reason: "missing OwnershipControls element".to_string(),
         }
     })?;
-    let rule = extract_tag_content(inner, "Rule").ok_or_else(|| ServerError::InvalidRequest {
+    let rule = extract_tag_content(inner, "Rule").ok_or_else(|| ServerError::MalformedXML {
         reason: "missing Rule element in OwnershipControls".to_string(),
     })?;
     let value = extract_tag_content(rule, "ObjectOwnership")
-        .ok_or_else(|| ServerError::InvalidRequest {
+        .ok_or_else(|| ServerError::MalformedXML {
             reason: "missing ObjectOwnership element in Rule".to_string(),
         })?
         .trim();
@@ -1579,7 +1581,7 @@ fn extract_checksum_element(
         let close = format!("</{elem}>");
         if let Some(start) = part_content.find(&open) {
             if found.is_some() {
-                return Err(ServerError::InvalidRequest {
+                return Err(ServerError::MalformedXML {
                     reason: "multiple checksum elements in a single Part".to_string(),
                 });
             }
@@ -1588,7 +1590,7 @@ fn extract_checksum_element(
                 // Reject duplicate of the same element type.
                 let after_close = val_start + end + close.len();
                 if part_content[after_close..].contains(&open) {
-                    return Err(ServerError::InvalidRequest {
+                    return Err(ServerError::MalformedXML {
                         reason: "multiple checksum elements in a single Part".to_string(),
                     });
                 }
@@ -1612,7 +1614,7 @@ fn extract_checksum_element(
 /// </CompleteMultipartUpload>
 /// ```
 pub fn parse_complete_multipart_upload_xml(body: &[u8]) -> Result<Vec<CompletePart>, ServerError> {
-    let malformed = || ServerError::InvalidRequest {
+    let malformed = || ServerError::MalformedXML {
         reason: "malformed CompleteMultipartUpload XML".to_string(),
     };
 
@@ -2389,14 +2391,14 @@ mod tests {
     fn parse_tagging_xml_missing_tagging_element() {
         let xml = b"<TagSet><Tag><Key>k</Key><Value>v</Value></Tag></TagSet>";
         let err = parse_tagging_xml(xml, 10).unwrap_err();
-        assert!(matches!(err, ServerError::InvalidRequest { .. }));
+        assert!(matches!(err, ServerError::MalformedXML { .. }));
     }
 
     #[test]
     fn parse_tagging_xml_missing_tagset_element() {
         let xml = b"<Tagging><Tag><Key>k</Key><Value>v</Value></Tag></Tagging>";
         let err = parse_tagging_xml(xml, 10).unwrap_err();
-        assert!(matches!(err, ServerError::InvalidRequest { .. }));
+        assert!(matches!(err, ServerError::MalformedXML { .. }));
     }
 
     #[test]
@@ -2927,8 +2929,8 @@ mod tests {
             </CompleteMultipartUpload>";
         let err = parse_complete_multipart_upload_xml(body).unwrap_err();
         assert!(
-            matches!(err, ServerError::InvalidRequest { .. }),
-            "expected InvalidRequest, got {err:?}"
+            matches!(err, ServerError::MalformedXML { .. }),
+            "expected MalformedXML, got {err:?}"
         );
     }
 
@@ -2942,8 +2944,8 @@ mod tests {
             </CompleteMultipartUpload>";
         let err = parse_complete_multipart_upload_xml(body).unwrap_err();
         assert!(
-            matches!(err, ServerError::InvalidRequest { .. }),
-            "expected InvalidRequest, got {err:?}"
+            matches!(err, ServerError::MalformedXML { .. }),
+            "expected MalformedXML, got {err:?}"
         );
     }
 

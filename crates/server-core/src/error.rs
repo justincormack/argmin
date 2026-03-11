@@ -121,6 +121,12 @@ pub enum ServerError {
         server_hash: String,
     },
 
+    #[error("malformed XML: {reason}")]
+    MalformedXML { reason: String },
+
+    #[error("illegal versioning configuration: {reason}")]
+    IllegalVersioningConfiguration { reason: String },
+
     #[error("malformed POST request: {reason}")]
     MalformedPOSTRequest { reason: String },
 
@@ -197,6 +203,10 @@ impl ServerError {
             Self::InvalidPart { .. } => "InvalidPart",
             Self::InvalidPartOrder => "InvalidPartOrder",
             Self::EntityTooSmall { .. } => "EntityTooSmall",
+            Self::MalformedXML { .. } => "MalformedXML",
+            Self::IllegalVersioningConfiguration { .. } => {
+                "IllegalVersioningConfigurationException"
+            }
             Self::MalformedPOSTRequest { .. } => "MalformedPOSTRequest",
             Self::MalformedChunkedBody { .. } => "InvalidRequest",
             Self::IncompleteBody => "IncompleteBody",
@@ -241,6 +251,8 @@ impl ServerError {
             Self::AccessControlListNotSupported
             | Self::InvalidBucketAclWithObjectOwnership
             | Self::XAmzContentSHA256Mismatch { .. }
+            | Self::MalformedXML { .. }
+            | Self::IllegalVersioningConfiguration { .. }
             | Self::MalformedPOSTRequest { .. }
             | Self::MalformedChunkedBody { .. }
             | Self::IncompleteBody
