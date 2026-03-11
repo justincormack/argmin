@@ -131,13 +131,13 @@ async fn read_http_response(stream: &mut TcpStream, timeout: Duration) -> String
 async fn slow_down_when_request_slot_held_by_slow_body() {
     let (addr, _guard, _dir) = start_server(1, 8).await;
 
-    // Connection 1: send valid HTTP headers with a large Content-Length but
-    // never send the body. This holds the request permit while the server
+    // Connection 1: send a non-streaming request with a large Content-Length
+    // but never send the body. This holds the request permit while the server
     // waits for body data (up to BODY_IDLE_TIMEOUT per frame).
     let mut slow_conn = TcpStream::connect(&addr).await.unwrap();
     slow_conn
         .write_all(
-            b"PUT /test-bucket/slow-key HTTP/1.1\r\n\
+            b"POST /test-bucket/slow-key HTTP/1.1\r\n\
               Host: localhost\r\n\
               Content-Length: 999999\r\n\r\n",
         )
