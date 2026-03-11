@@ -37,6 +37,8 @@ We are using the Ceph test suite and porting these to native tests 1:1, these te
 Use `./scripts/coverage` to measure integration test coverage, which is the main measure we want to improve,
 not unit test coverage.
 
+Always run the full test suite before comitting in case something unexpected breaks.
+
 ## Running tests against AWS
 
 AWS credentials are in `.env` (not committed) with `AWS_ACCESS_KEY` and `AWS_SECRET_KEY`.
