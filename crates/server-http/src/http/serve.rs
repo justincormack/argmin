@@ -2019,6 +2019,96 @@ mod tests {
         assert!(post_object_bucket(&parts).is_none());
     }
 
+    #[test]
+    fn post_multipart_parser_boundary_and_header_split_across_feeds() {
+        let boundary = "BoundaryX";
+        let mut parser = PostMultipartParser::new(boundary);
+
+        let c1 = b"--Bound";
+        let c2 = b"aryX\r\nContent-Disposition: form-data; name=\"key\"\r\n\r\nvalue\r\n--BoundaryX\r\nContent-Disposition: form-data; name=\"file\"; filename=\"x\"\r\nContent-Type: application/octet-stream\r\n\r";
+        let c3 = b"\nhello-world\r\n--BoundaryX--\r\n";
+
+        let ev1 = parser.feed(c1).unwrap();
+        assert!(ev1.is_empty());
+
+        let ev2 = parser.feed(c2).unwrap();
+        assert_eq!(ev2.len(), 1);
+        match &ev2[0] {
+            PostMultipartEvent::Field { name, value } => {
+                assert_eq!(name, "key");
+                assert_eq!(value, "value");
+            }
+            _ => panic!("expected a single field event"),
+        }
+
+        let ev3 = parser.feed(c3).unwrap();
+        let mut saw_start = false;
+        let mut saw_end = false;
+        let mut file = Vec::new();
+        for ev in ev3 {
+            match ev {
+                PostMultipartEvent::FileStart { file_name } => {
+                    saw_start = true;
+                    assert_eq!(file_name.as_deref(), Some("x"));
+                }
+                PostMultipartEvent::FileChunk(bytes) => file.extend_from_slice(&bytes),
+                PostMultipartEvent::FileEnd => saw_end = true,
+                PostMultipartEvent::Field { .. } => panic!("unexpected field event"),
+            }
+        }
+        assert!(saw_start);
+        assert!(saw_end);
+        assert_eq!(file, b"hello-world");
+        assert!(parser.is_done());
+    }
+
+    #[test]
+    fn post_multipart_parser_file_data_integrity_with_split_delimiter() {
+        let boundary = "BoundaryY";
+        let delimiter = format!("\r\n--{boundary}--\r\n");
+
+        let file_data: Vec<u8> = (0_u8..=127).cycle().take(1024).collect();
+        let mut body = Vec::new();
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            b"Content-Disposition: form-data; name=\"file\"; filename=\"blob.bin\"\r\n",
+        );
+        body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
+        body.extend_from_slice(&file_data);
+        body.extend_from_slice(delimiter.as_bytes());
+
+        let marker_pos = body
+            .windows(delimiter.len())
+            .position(|w| w == delimiter.as_bytes())
+            .unwrap();
+        // Split in the middle of the final delimiter to force cross-feed detection.
+        let split_at = marker_pos + 3;
+
+        let mut parser = PostMultipartParser::new(boundary);
+        let ev1 = parser.feed(&body[..split_at]).unwrap();
+        let ev2 = parser.feed(&body[split_at..]).unwrap();
+
+        let mut saw_start = false;
+        let mut saw_end = false;
+        let mut reconstructed = Vec::new();
+        for ev in ev1.into_iter().chain(ev2) {
+            match ev {
+                PostMultipartEvent::FileStart { file_name } => {
+                    saw_start = true;
+                    assert_eq!(file_name.as_deref(), Some("blob.bin"));
+                }
+                PostMultipartEvent::FileChunk(bytes) => reconstructed.extend_from_slice(&bytes),
+                PostMultipartEvent::FileEnd => saw_end = true,
+                PostMultipartEvent::Field { .. } => panic!("unexpected field event"),
+            }
+        }
+
+        assert!(saw_start);
+        assert!(saw_end);
+        assert_eq!(reconstructed, file_data);
+        assert!(parser.is_done());
+    }
+
     // ── Regression tests for P0–P2 security fixes ────────────────────
 
     #[test]
