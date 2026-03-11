@@ -140,14 +140,12 @@ enum StreamingWriteOp {
     PutObject {
         bucket: String,
         key: String,
-        chunked: ChunkedMode,
     },
     UploadPart {
         bucket: String,
         key: String,
         upload_id: String,
         part_number: u32,
-        chunked: ChunkedMode,
     },
 }
 
@@ -262,9 +260,9 @@ pub async fn serve(
 
 /// Handle a single HTTP request: collect body, parse, dispatch, return response.
 ///
-/// For streaming-eligible writes (PutObject/UploadPart with UNSIGNED-PAYLOAD
-/// and no copy source), body frames are consumed incrementally and fed to
-/// coordinator chunk appends. All other requests collect the full body first.
+/// For `PutObject`/`UploadPart` (except copy-source variants), body frames are
+/// consumed incrementally and fed to coordinator chunk appends. All other
+/// requests collect the full body first.
 ///
 /// Errors are always converted to S3 XML error responses.
 async fn handle(
@@ -288,18 +286,19 @@ async fn handle(
 
     // Check if this request should use the streaming write path.
     if let Some(op) = is_streaming_write(&parts) {
+        let chunked = match parse_chunked_mode(&parts) {
+            Ok(mode) => mode,
+            Err(err) => return Ok(s3_response_to_hyper(S3Response::error(&err, ""))),
+        };
         let resp = match op {
-            StreamingWriteOp::PutObject {
-                bucket,
-                key,
-                chunked,
-            } => handle_streaming_put(Arc::clone(&state), parts, body, bucket, key, chunked).await,
+            StreamingWriteOp::PutObject { bucket, key } => {
+                handle_streaming_put(Arc::clone(&state), parts, body, bucket, key, chunked).await
+            }
             StreamingWriteOp::UploadPart {
                 bucket,
                 key,
                 upload_id,
                 part_number,
-                chunked,
             } => {
                 handle_streaming_part(
                     Arc::clone(&state),
@@ -352,10 +351,8 @@ async fn handle(
 
 /// Check if a PUT request should use the streaming write path.
 ///
-/// Returns a `StreamingWriteOp` for `PutObject` and `UploadPart` requests that:
-/// - Are not `CopyObject` (no `x-amz-copy-source` header)
-/// - Use UNSIGNED-PAYLOAD, a fixed payload SHA256, or a supported
-///   STREAMING-* aws-chunked content hash
+/// Returns a `StreamingWriteOp` target for `PutObject` and `UploadPart`
+/// requests that are not `CopyObject` (no `x-amz-copy-source` header).
 ///
 fn is_streaming_write(parts: &http::request::Parts) -> Option<StreamingWriteOp> {
     if parts.method != http::Method::PUT {
@@ -368,19 +365,47 @@ fn is_streaming_write(parts: &http::request::Parts) -> Option<StreamingWriteOp> 
         return None;
     }
 
+    let path = parts.uri.path();
+    let query = parts.uri.query().unwrap_or("");
+    let method = parts.method.as_str();
+
+    let op = route(method, path, query).ok()?;
+    match op {
+        S3Operation::PutObject { bucket, key } => Some(StreamingWriteOp::PutObject { bucket, key }),
+        S3Operation::UploadPart { bucket, key } => {
+            let upload_id = extract_query_param(query, "uploadId")?;
+            let part_number: u32 =
+                extract_query_param(query, "partNumber").and_then(|s| s.parse().ok())?;
+            Some(StreamingWriteOp::UploadPart {
+                bucket,
+                key,
+                upload_id,
+                part_number,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Parse aws-chunked mode from request headers.
+///
+/// Returns `ChunkedMode::None` for plain PUT bodies (including missing
+/// `x-amz-content-sha256`, `UNSIGNED-PAYLOAD`, and fixed SHA256 hashes).
+fn parse_chunked_mode(parts: &http::request::Parts) -> Result<ChunkedMode, ServerError> {
     let content_sha256 = parts
         .headers
         .get("x-amz-content-sha256")
         .and_then(|v| v.to_str().ok());
 
-    let chunked = match content_sha256 {
-        Some("UNSIGNED-PAYLOAD") => ChunkedMode::None,
-        Some(
-            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
-            | "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"
-            | "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
-        ) => {
-            // Validate aws-chunked preconditions before routing to streaming path.
+    let Some(content_sha256) = content_sha256 else {
+        return Ok(ChunkedMode::None);
+    };
+
+    match content_sha256 {
+        "UNSIGNED-PAYLOAD" => Ok(ChunkedMode::None),
+        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
+        | "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"
+        | "STREAMING-UNSIGNED-PAYLOAD-TRAILER" => {
             // content-encoding must contain aws-chunked.
             let has_aws_chunked = parts
                 .headers
@@ -391,56 +416,43 @@ fn is_streaming_write(parts: &http::request::Parts) -> Option<StreamingWriteOp> 
                         .any(|part| part.trim().eq_ignore_ascii_case("aws-chunked"))
                 });
             if !has_aws_chunked {
-                return None; // Will fall through to buffered path which returns proper error
+                return Err(ServerError::MalformedTrailerError {
+                    reason: "content-encoding must contain aws-chunked for streaming uploads"
+                        .to_string(),
+                });
             }
 
             // x-amz-decoded-content-length must be present and valid.
-            let expected_len = parts
+            let expected_len_str = parts
                 .headers
                 .get("x-amz-decoded-content-length")
                 .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())?;
+                .ok_or(ServerError::MissingContentLength)?;
+            let expected_len =
+                expected_len_str
+                    .parse::<u64>()
+                    .map_err(|_| ServerError::InvalidRequest {
+                        reason: format!("invalid x-amz-decoded-content-length: {expected_len_str}"),
+                    })?;
 
-            match content_sha256.unwrap() {
-                "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" => ChunkedMode::Signed { expected_len },
+            match content_sha256 {
+                "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" => Ok(ChunkedMode::Signed { expected_len }),
                 "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER" => {
-                    ChunkedMode::SignedTrailer { expected_len }
+                    Ok(ChunkedMode::SignedTrailer { expected_len })
                 }
-                _ => ChunkedMode::UnsignedTrailer { expected_len },
+                "STREAMING-UNSIGNED-PAYLOAD-TRAILER" => {
+                    Ok(ChunkedMode::UnsignedTrailer { expected_len })
+                }
+                _ => unreachable!(),
             }
         }
         // STREAMING-UNSIGNED-PAYLOAD (without -TRAILER) and unknown streaming
         // tokens are rejected by AWS.
-        Some(v) if v.starts_with("STREAMING-") => return None,
-        // Fixed payload hash (hex SHA256): verify incrementally in the streaming loop.
-        Some(_) => ChunkedMode::None,
-        None => return None, // No header — need full body for auth
-    };
-
-    let path = parts.uri.path();
-    let query = parts.uri.query().unwrap_or("");
-    let method = parts.method.as_str();
-
-    let op = route(method, path, query).ok()?;
-    match op {
-        S3Operation::PutObject { bucket, key } => Some(StreamingWriteOp::PutObject {
-            bucket,
-            key,
-            chunked: chunked.clone(),
+        v if v.starts_with("STREAMING-") => Err(ServerError::InvalidArgument {
+            reason: format!("unsupported streaming token: {v}"),
         }),
-        S3Operation::UploadPart { bucket, key } => {
-            let upload_id = extract_query_param(query, "uploadId")?;
-            let part_number: u32 =
-                extract_query_param(query, "partNumber").and_then(|s| s.parse().ok())?;
-            Some(StreamingWriteOp::UploadPart {
-                bucket,
-                key,
-                upload_id,
-                part_number,
-                chunked: chunked.clone(),
-            })
-        }
-        _ => None,
+        // Fixed payload hash (hex SHA256): verify incrementally in streaming loop.
+        _ => Ok(ChunkedMode::None),
     }
 }
 
@@ -1347,13 +1359,18 @@ mod tests {
     }
 
     #[test]
-    fn streaming_put_no_sha256_header_excluded() {
+    fn streaming_put_no_sha256_header_routed() {
         let parts = make_parts("PUT", "/mybucket/mykey", &[]);
-        assert_eq!(is_streaming_write(&parts), None);
+        let result = is_streaming_write(&parts);
+        assert!(matches!(
+            result,
+            Some(StreamingWriteOp::PutObject { ref bucket, ref key, .. })
+            if bucket == "mybucket" && key == "mykey"
+        ));
     }
 
     #[test]
-    fn streaming_put_signed_chunked_routed() {
+    fn parse_chunked_mode_signed_chunked() {
         let parts = make_parts(
             "PUT",
             "/mybucket/mykey",
@@ -1363,18 +1380,12 @@ mod tests {
                 ("x-amz-decoded-content-length", "100"),
             ],
         );
-        let result = is_streaming_write(&parts);
-        assert!(matches!(
-            result,
-            Some(StreamingWriteOp::PutObject {
-                chunked: ChunkedMode::Signed { .. },
-                ..
-            })
-        ));
+        let mode = parse_chunked_mode(&parts).unwrap();
+        assert!(matches!(mode, ChunkedMode::Signed { expected_len: 100 }));
     }
 
     #[test]
-    fn streaming_put_signed_trailer_chunked_routed() {
+    fn parse_chunked_mode_signed_trailer_chunked() {
         let parts = make_parts(
             "PUT",
             "/mybucket/mykey",
@@ -1387,18 +1398,15 @@ mod tests {
                 ("x-amz-decoded-content-length", "100"),
             ],
         );
-        let result = is_streaming_write(&parts);
+        let mode = parse_chunked_mode(&parts).unwrap();
         assert!(matches!(
-            result,
-            Some(StreamingWriteOp::PutObject {
-                chunked: ChunkedMode::SignedTrailer { .. },
-                ..
-            })
+            mode,
+            ChunkedMode::SignedTrailer { expected_len: 100 }
         ));
     }
 
     #[test]
-    fn streaming_put_unsigned_trailer_chunked_routed() {
+    fn parse_chunked_mode_unsigned_trailer_chunked() {
         let parts = make_parts(
             "PUT",
             "/mybucket/mykey",
@@ -1408,29 +1416,27 @@ mod tests {
                 ("x-amz-decoded-content-length", "100"),
             ],
         );
-        let result = is_streaming_write(&parts);
+        let mode = parse_chunked_mode(&parts).unwrap();
         assert!(matches!(
-            result,
-            Some(StreamingWriteOp::PutObject {
-                chunked: ChunkedMode::UnsignedTrailer { .. },
-                ..
-            })
+            mode,
+            ChunkedMode::UnsignedTrailer { expected_len: 100 }
         ));
     }
 
     #[test]
-    fn streaming_put_unsigned_payload_alone_rejected() {
+    fn parse_chunked_mode_unsigned_payload_alone_rejected() {
         // STREAMING-UNSIGNED-PAYLOAD (without -TRAILER) is rejected by AWS.
         let parts = make_parts(
             "PUT",
             "/mybucket/mykey",
             &[("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD")],
         );
-        assert_eq!(is_streaming_write(&parts), None);
+        let err = parse_chunked_mode(&parts).unwrap_err();
+        assert!(matches!(err, ServerError::InvalidArgument { .. }));
     }
 
     #[test]
-    fn streaming_chunked_missing_content_encoding_falls_through() {
+    fn parse_chunked_mode_missing_content_encoding_rejected() {
         let parts = make_parts(
             "PUT",
             "/mybucket/mykey",
@@ -1439,11 +1445,12 @@ mod tests {
                 ("x-amz-decoded-content-length", "100"),
             ],
         );
-        assert_eq!(is_streaming_write(&parts), None);
+        let err = parse_chunked_mode(&parts).unwrap_err();
+        assert!(matches!(err, ServerError::MalformedTrailerError { .. }));
     }
 
     #[test]
-    fn streaming_chunked_missing_decoded_length_falls_through() {
+    fn parse_chunked_mode_missing_decoded_length_rejected() {
         let parts = make_parts(
             "PUT",
             "/mybucket/mykey",
@@ -1452,7 +1459,8 @@ mod tests {
                 ("content-encoding", "aws-chunked"),
             ],
         );
-        assert_eq!(is_streaming_write(&parts), None);
+        let err = parse_chunked_mode(&parts).unwrap_err();
+        assert!(matches!(err, ServerError::MissingContentLength));
     }
 
     #[test]
@@ -1519,7 +1527,6 @@ mod tests {
                 ref key,
                 ref upload_id,
                 part_number: 3,
-                chunked: ChunkedMode::None,
             }) if bucket == "mybucket" && key == "mykey" && upload_id == "abc123"
         ));
     }
