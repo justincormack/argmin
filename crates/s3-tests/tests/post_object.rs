@@ -1979,6 +1979,49 @@ fn test_post_object_upload_larger_than_chunk() {
     });
 }
 
+#[test]
+fn test_post_object_upload_16mb_non_chunked() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "post-16mb";
+        let file_data = vec![0x2a_u8; 16 * 1024 * 1024];
+
+        let fields = sigv4_fields(
+            &bucket,
+            key,
+            &[serde_json::json!(["content-length-range", 0, 20_971_520])], // 20 MiB
+        );
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+
+        let (status, body) = post_object(&bucket, &field_refs, &file_data, "large16mb.bin");
+        assert_eq!(status, 204, "expected 204, got {}: {}", status, body);
+
+        let resp = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let data = resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(data.len(), file_data.len());
+        assert_eq!(&data[..], &file_data[..]);
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
 // ── Additional Ceph tests ──────────────────────────────────────────────
 
 #[test]

@@ -2140,6 +2140,33 @@ fn unsigned_payload_put_with_checksum(
 }
 
 #[test]
+fn test_non_chunked_put_16mb_bypasses_buffered_body_limit() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "non-chunked-put-16mb";
+        let data = vec![0x5a_u8; 16 * 1024 * 1024];
+        let path = format!("/{}/{}", bucket, key);
+
+        let (status, body_str) = unsigned_payload_put_with_checksum(&path, &data, None);
+        assert_eq!(status, 200, "expected 200, got {}: {}", status, body_str);
+
+        let resp = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let got = resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(got.len(), data.len());
+        assert_eq!(&got[..], &data[..]);
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
 fn test_streaming_inline_checksum_crc32_valid() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;

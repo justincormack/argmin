@@ -1,9 +1,14 @@
 /// Parse HTTP requests into structured S3 request data.
 use crate::error::ServerError;
 
-/// Maximum request body size (256 MB + headroom for metadata blob).
-/// Used by the serve layer for body size limiting.
-pub(crate) const MAX_BODY_SIZE: usize = 256 * 1024 * 1024 + 64 * 1024;
+/// Maximum body size for the buffered request path.
+///
+/// The buffered path is used for control-plane style requests (primarily XML
+/// payloads such as `DeleteObjects`, versioning/CORS config, and
+/// `CompleteMultipartUpload`). Data-plane writes (`PutObject`, `UploadPart`,
+/// and POST Object file uploads) are routed through streaming handlers and are
+/// not limited by this constant.
+pub(crate) const MAX_BUFFERED_CONTROL_BODY_SIZE: usize = 10 * 1024 * 1024;
 
 /// Validate a Content-Length header value. Rejects negative and non-numeric values.
 fn validate_content_length(value: &str) -> Result<u64, ServerError> {

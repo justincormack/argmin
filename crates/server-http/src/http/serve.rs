@@ -15,7 +15,7 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 
-use super::request::{S3Request, MAX_BODY_SIZE};
+use super::request::{S3Request, MAX_BUFFERED_CONTROL_BODY_SIZE};
 use super::response::S3Response;
 use super::router::{route, S3Operation};
 use super::s3_response_to_hyper;
@@ -258,7 +258,8 @@ pub async fn serve(
     }
 }
 
-/// Handle a single HTTP request: collect body, parse, dispatch, return response.
+/// Handle a single HTTP request: parse, route streaming writes, or buffer body
+/// for control-plane dispatch.
 ///
 /// For `PutObject`/`UploadPart` (except copy-source variants), body frames are
 /// consumed incrementally and fed to coordinator chunk appends. All other
@@ -321,7 +322,8 @@ async fn handle(
         return Ok(s3_response_to_hyper(resp));
     }
 
-    // Non-streaming path: collect full body, parse, dispatch.
+    // Non-streaming path: collect the full body for buffered control-plane
+    // style requests (mostly XML payloads).
     let body_bytes = match collect_body(body, state.config.body_idle_timeout).await {
         Ok(bytes) => bytes,
         Err(err) => {
@@ -1672,7 +1674,7 @@ fn acquire_frontend(state: &ServerState) -> MutexGuard<'_, HttpFrontend> {
 /// every chunk. A client sending data steadily (even slowly) will never be
 /// timed out; only truly stalled connections are killed.
 async fn collect_body(body: Incoming, idle_timeout: Duration) -> Result<Bytes, ServerError> {
-    collect_body_with_limit(body, idle_timeout, MAX_BODY_SIZE).await
+    collect_body_with_limit(body, idle_timeout, MAX_BUFFERED_CONTROL_BODY_SIZE).await
 }
 
 async fn collect_body_with_limit(
