@@ -307,8 +307,8 @@ mod tests {
     #[test]
     fn credential_store_lookup() {
         let store = example_store();
-        assert!(store.get("AKIAIOSFODNN7EXAMPLE").is_some());
-        assert!(store.get("NONEXISTENT").is_none());
+        assert!(store.get_record("AKIAIOSFODNN7EXAMPLE").is_some());
+        assert!(store.get_record("NONEXISTENT").is_none());
     }
 
     // AWS SigV4 test: GET object

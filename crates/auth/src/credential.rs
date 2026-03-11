@@ -69,11 +69,6 @@ impl CredentialStore {
         self.keys.insert(record.access_key_id.clone(), record);
     }
 
-    /// Look up a secret key by access key ID.
-    pub fn get(&self, access_key_id: &str) -> Option<&SecretKey> {
-        self.keys.get(access_key_id).map(|r| &r.secret_key)
-    }
-
     /// Look up a full credential record by access key ID.
     pub fn get_record(&self, access_key_id: &str) -> Option<&CredentialRecord> {
         self.keys.get(access_key_id)
@@ -93,16 +88,15 @@ mod tests {
     #[test]
     fn get_missing_key() {
         let store = CredentialStore::new();
-        assert!(store.get("nonexistent").is_none());
+        assert!(store.get_record("nonexistent").is_none());
     }
 
     #[test]
     fn add_then_get() {
         let mut store = CredentialStore::new();
         store.add("AKID".into(), SecretKey::new("secret123".into()));
-        let key = store.get("AKID").unwrap();
-        assert_eq!(key.as_str(), "secret123");
         let record = store.get_record("AKID").unwrap();
+        assert_eq!(record.secret_key.as_str(), "secret123");
         assert_eq!(record.principal, "AKID");
         assert!(record.enabled);
     }
@@ -112,8 +106,8 @@ mod tests {
         let mut store = CredentialStore::new();
         store.add("AKID".into(), SecretKey::new("first".into()));
         store.add("AKID".into(), SecretKey::new("second".into()));
-        let key = store.get("AKID").unwrap();
-        assert_eq!(key.as_str(), "second");
+        let record = store.get_record("AKID").unwrap();
+        assert_eq!(record.secret_key.as_str(), "second");
     }
 
     #[test]
@@ -136,6 +130,6 @@ mod tests {
     #[test]
     fn default_is_empty() {
         let store = CredentialStore::default();
-        assert!(store.get("anything").is_none());
+        assert!(store.get_record("anything").is_none());
     }
 }

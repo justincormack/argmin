@@ -65,7 +65,7 @@ impl TestServer {
                 )
                 .expect("create coordinator");
 
-                let mut credentials = auth::CredentialStore::new();
+                let mut credentials = auth::CredentialStore::default();
                 credentials.add(
                     TEST_ACCESS_KEY.to_string(),
                     auth::SecretKey::new(TEST_SECRET_KEY.to_string()),
