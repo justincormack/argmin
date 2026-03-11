@@ -1,6 +1,4 @@
 #!/bin/env bash
 
 source <(cargo llvm-cov show-env --sh)
-cargo llvm-cov clean --workspace
-cargo +nightly test -p s3-tests
-cargo +nightly llvm-cov report
+cargo llvm-cov clean --workspace && cargo +nightly test -p s3-tests && cargo +nightly llvm-cov report
