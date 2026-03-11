@@ -1,17 +1,17 @@
 /// Server configuration, loaded from environment variables.
 /// Configuration for the S3 server.
 #[derive(Debug, Clone)]
-pub struct ServerConfig {
-    pub listen_addr: String,
-    pub data_dir: String,
-    pub pg_count: u32,
-    pub ec_k: u8,
-    pub ec_m: u8,
-    pub access_key_id: String,
-    pub secret_access_key: String,
-    pub region: String,
-    pub workers: u32,
-    pub max_connections: u32,
+pub(crate) struct ServerConfig {
+    pub(crate) listen_addr: String,
+    pub(crate) data_dir: String,
+    pub(crate) pg_count: u32,
+    pub(crate) ec_k: u8,
+    pub(crate) ec_m: u8,
+    pub(crate) access_key_id: String,
+    pub(crate) secret_access_key: String,
+    pub(crate) region: String,
+    pub(crate) workers: u32,
+    pub(crate) max_connections: u32,
 }
 
 impl ServerConfig {
@@ -27,7 +27,7 @@ impl ServerConfig {
     ///   `ARGMIN_REGION` (us-east-1)
     ///   `ARGMIN_WORKERS` (4)
     ///   `ARGMIN_MAX_CONNECTIONS` (512)
-    pub fn from_env() -> Result<Self, String> {
+    pub(crate) fn from_env() -> Result<Self, String> {
         Self::from_lookup(|key| std::env::var(key).ok())
     }
 

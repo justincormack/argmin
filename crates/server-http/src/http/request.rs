@@ -102,7 +102,11 @@ impl S3Request {
     /// Production streaming writes don't reassemble into S3Request.
     #[cfg(test)]
     #[must_use]
-    pub fn with_decoded_body(&self, body: Vec<u8>, trailers: Vec<(String, String)>) -> Self {
+    pub(crate) fn with_decoded_body(
+        &self,
+        body: Vec<u8>,
+        trailers: Vec<(String, String)>,
+    ) -> Self {
         let mut headers: Vec<(String, String)> = self
             .headers
             .iter()
