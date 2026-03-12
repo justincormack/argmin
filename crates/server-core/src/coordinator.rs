@@ -108,10 +108,206 @@ pub struct BeginStreamPartResult {
     pub checksum_algorithm: Option<ChecksumAlgorithm>,
 }
 
+#[derive(Clone)]
+struct ReadRuntime {
+    storage_node: Arc<SharedStorageNode>,
+    ec_codec: Arc<ErasureCodec>,
+    ec_config: EcConfig,
+}
+
+#[derive(Debug, Clone)]
+struct ChunkPayloadRecord {
+    size: u64,
+    chunk_okh: [u8; 16],
+    chunk_vid: u64,
+    shard_pg_id: u32,
+    ec_k: u8,
+    ec_m: u8,
+}
+
+struct PartShardReader {
+    runtime: ReadRuntime,
+    bucket: String,
+    key: String,
+    record: ObjectPartRecord,
+    next_offset: usize,
+}
+
+struct ChunkListReader {
+    runtime: ReadRuntime,
+    bucket: String,
+    key: String,
+    chunks: Vec<ChunkPayloadRecord>,
+    next_chunk_index: usize,
+    loaded_chunk: Option<(Vec<u8>, usize)>,
+}
+
+enum MultipartPartReader {
+    Shard(PartShardReader),
+    Chunks(ChunkListReader),
+}
+
+struct MultipartReader {
+    runtime: ReadRuntime,
+    bucket: String,
+    key: String,
+    parts: Vec<SnapshottedMultipartPart>,
+    next_part_index: usize,
+    current_part: Option<MultipartPartReader>,
+}
+
+enum ReadHandleInner {
+    ChunkManifest(ChunkListReader),
+    Multipart(MultipartReader),
+    TestBuffered(Option<Vec<u8>>),
+}
+
+/// Core-owned streaming object body.
+pub struct ReadHandle {
+    bucket: String,
+    key: String,
+    inner: ReadHandleInner,
+    expected_size: usize,
+    bytes_emitted: usize,
+    expected_crc64: Option<u64>,
+    crc64: checksum::crc64::Hasher,
+}
+
+impl std::fmt::Debug for ReadHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadHandle")
+            .field("bucket", &self.bucket)
+            .field("key", &self.key)
+            .field("expected_size", &self.expected_size)
+            .field("bytes_emitted", &self.bytes_emitted)
+            .field("expected_crc64", &self.expected_crc64)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ReadHandle {
+    fn from_chunk_manifest(
+        runtime: ReadRuntime,
+        bucket: &str,
+        key: &str,
+        chunks: Vec<ChunkPayloadRecord>,
+        expected_size: usize,
+        expected_crc64: Option<u64>,
+    ) -> Self {
+        Self {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            expected_size,
+            bytes_emitted: 0,
+            expected_crc64,
+            crc64: checksum::crc64::Hasher::new(),
+            inner: ReadHandleInner::ChunkManifest(ChunkListReader {
+                runtime,
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                chunks,
+                next_chunk_index: 0,
+                loaded_chunk: None,
+            }),
+        }
+    }
+
+    fn from_multipart(
+        runtime: ReadRuntime,
+        bucket: &str,
+        key: &str,
+        parts: Vec<SnapshottedMultipartPart>,
+        expected_size: usize,
+    ) -> Self {
+        Self {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            expected_size,
+            bytes_emitted: 0,
+            expected_crc64: None,
+            crc64: checksum::crc64::Hasher::new(),
+            inner: ReadHandleInner::Multipart(MultipartReader {
+                runtime,
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                parts,
+                next_part_index: 0,
+                current_part: None,
+            }),
+        }
+    }
+
+    pub fn from_buffered_bytes(data: Vec<u8>) -> Self {
+        let len = data.len();
+        Self {
+            bucket: "<buffered>".to_string(),
+            key: "<buffered>".to_string(),
+            inner: ReadHandleInner::TestBuffered(Some(data)),
+            expected_size: len,
+            bytes_emitted: 0,
+            expected_crc64: None,
+            crc64: checksum::crc64::Hasher::new(),
+        }
+    }
+
+    pub fn next_chunk(&mut self, target_size: usize) -> Result<Option<Vec<u8>>, ServerError> {
+        if target_size == 0 {
+            return Ok(Some(Vec::new()));
+        }
+
+        let next = match &mut self.inner {
+            ReadHandleInner::ChunkManifest(reader) => reader.next_chunk(target_size),
+            ReadHandleInner::Multipart(reader) => reader.next_chunk(target_size),
+            ReadHandleInner::TestBuffered(data) => Ok(data.take()),
+        }?;
+
+        if let Some(chunk) = next {
+            self.bytes_emitted += chunk.len();
+            self.crc64.update(&chunk);
+            Ok(Some(chunk))
+        } else {
+            if self.bytes_emitted != self.expected_size {
+                return Err(ServerError::IntegrityError {
+                    bucket: self.bucket.clone(),
+                    key: self.key.clone(),
+                    expected: self.expected_size as u64,
+                    actual: self.bytes_emitted as u64,
+                });
+            }
+            if let Some(expected_crc64) = self.expected_crc64 {
+                let actual_crc64 = self.crc64.finalize();
+                if actual_crc64 != expected_crc64 {
+                    return Err(ServerError::IntegrityError {
+                        bucket: self.bucket.clone(),
+                        key: self.key.clone(),
+                        expected: expected_crc64,
+                        actual: actual_crc64,
+                    });
+                }
+            }
+            Ok(None)
+        }
+    }
+
+    pub fn into_bytes(mut self) -> Result<Vec<u8>, ServerError> {
+        const TEST_READ_CHUNK_SIZE: usize = 1024 * 1024;
+
+        let mut out = Vec::with_capacity(self.expected_size);
+        while let Some(chunk) = self.next_chunk(TEST_READ_CHUNK_SIZE)? {
+            out.extend_from_slice(&chunk);
+        }
+        Ok(out)
+    }
+
+    pub fn from_test_bytes(data: Vec<u8>) -> Self {
+        Self::from_buffered_bytes(data)
+    }
+}
+
 /// Result of a GetObject operation.
 #[derive(Debug)]
 pub struct GetObjectResult {
-    pub data: Vec<u8>,
+    pub body: ReadHandle,
     pub metadata: MetadataBlob,
     pub etag: String,
     pub size: u64,
@@ -847,7 +1043,7 @@ impl Drop for ReclamationTestHookGuard {
 pub struct Coordinator {
     storage_node: Arc<SharedStorageNode>,
     pg_topology: PgTopology,
-    ec_codec: ErasureCodec,
+    ec_codec: Arc<ErasureCodec>,
     ec_config: EcConfig,
     region: String,
 }
@@ -893,6 +1089,339 @@ fn maybe_run_multipart_delete_metadata_hook(bucket: &str, key: &str) {
             hook();
         }
     }
+}
+
+impl ReadRuntime {
+    fn read_part_range(
+        &self,
+        part: &ObjectPartRecord,
+        start: usize,
+        end: usize,
+    ) -> Result<Vec<u8>, ServerError> {
+        let pg = self.storage_node.get_pg(part.shard_pg_id)?;
+        let shard_size = compute_shard_size(part.size, part.ec_k);
+        if shard_size == 0 {
+            return Ok(vec![]);
+        }
+
+        let needed = shards_for_byte_range(start, end, shard_size, part.ec_k);
+        if needed.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let k = part.ec_k as usize;
+        let m = part.ec_m as usize;
+        let mut result_shards: Vec<Option<Vec<u8>>> = Vec::with_capacity(needed.len());
+        let mut all_present = true;
+        let mut shard_len = 0;
+
+        for &idx in &needed {
+            let shard_key = ShardKey::new(&part.part_okh, part.part_vid, idx as u8);
+            if let Ok(sd) = pg.read_shard(&shard_key) {
+                shard_len = sd.data.len();
+                result_shards.push(Some(sd.data));
+            } else {
+                all_present = false;
+                result_shards.push(None);
+            }
+        }
+
+        let shard_data = if all_present {
+            result_shards
+                .into_iter()
+                .map(Option::unwrap)
+                .collect::<Vec<_>>()
+        } else {
+            let mut all_shards: Vec<Option<Vec<u8>>> = Vec::with_capacity(k + m);
+            let mut present_count = 0;
+
+            for i in 0..(k + m) {
+                let shard_key = ShardKey::new(&part.part_okh, part.part_vid, i as u8);
+                match pg.read_shard(&shard_key) {
+                    Ok(sd) => {
+                        shard_len = sd.data.len();
+                        all_shards.push(Some(sd.data));
+                        present_count += 1;
+                    }
+                    Err(_) => all_shards.push(None),
+                }
+            }
+
+            if present_count < k {
+                return Err(ServerError::Store(storage::StoreError::NotFound));
+            }
+
+            let missing_needed: Vec<usize> = needed
+                .iter()
+                .copied()
+                .filter(|&i| all_shards[i].is_none())
+                .collect();
+
+            if !missing_needed.is_empty() {
+                let present_indices: Vec<usize> =
+                    (0..(k + m)).filter(|&i| all_shards[i].is_some()).collect();
+                let present_refs: Vec<&[u8]> = present_indices
+                    .iter()
+                    .map(|&i| all_shards[i].as_ref().unwrap().as_slice())
+                    .collect();
+
+                let tmp_codec;
+                let codec = if part.ec_k == self.ec_config.data_shards
+                    && part.ec_m == self.ec_config.parity_shards
+                {
+                    self.ec_codec.as_ref()
+                } else {
+                    let ec_config = EcConfig::new(part.ec_k, part.ec_m)?;
+                    tmp_codec = ErasureCodec::new(ec_config)?;
+                    &tmp_codec
+                };
+
+                let mut outputs: Vec<Vec<u8>> = missing_needed
+                    .iter()
+                    .map(|_| vec![0u8; shard_len])
+                    .collect();
+                let mut output_refs: Vec<&mut [u8]> = outputs
+                    .iter_mut()
+                    .map(std::vec::Vec::as_mut_slice)
+                    .collect();
+
+                codec.reconstruct(
+                    &present_indices,
+                    &present_refs,
+                    &missing_needed,
+                    &mut output_refs,
+                )?;
+
+                for (idx, &missing_idx) in missing_needed.iter().enumerate() {
+                    all_shards[missing_idx] = Some(outputs[idx].clone());
+                }
+            }
+
+            needed
+                .iter()
+                .map(|&i| all_shards[i].take().unwrap())
+                .collect::<Vec<_>>()
+        };
+
+        let first_shard = needed[0];
+        let buf_start = first_shard * shard_size;
+        let mut buf = Vec::with_capacity(shard_data.len() * shard_size);
+        for shard in &shard_data {
+            buf.extend_from_slice(shard);
+        }
+
+        let local_start = start - buf_start;
+        let local_end = (end - buf_start).min(buf.len() - 1);
+        Ok(buf[local_start..=local_end].to_vec())
+    }
+
+    fn read_chunk_payload(&self, chunk: &ChunkPayloadRecord) -> Result<Vec<u8>, ServerError> {
+        let pg = self.storage_node.get_pg(chunk.shard_pg_id)?;
+        let k = chunk.ec_k as usize;
+        let m = chunk.ec_m as usize;
+        let padded = (chunk.size as usize).div_ceil(k) * k;
+        let shard_size = padded / k;
+
+        if shard_size == 0 {
+            return Ok(vec![]);
+        }
+
+        let needed: Vec<usize> = (0..k).collect();
+        let mut all_shards: Vec<Option<Vec<u8>>> = Vec::with_capacity(k + m);
+        let mut present_count = 0;
+
+        for i in 0..(k + m) {
+            let shard_key = ShardKey::new(&chunk.chunk_okh, chunk.chunk_vid, i as u8);
+            match pg.read_shard(&shard_key) {
+                Ok(sd) => {
+                    all_shards.push(Some(sd.data));
+                    present_count += 1;
+                }
+                Err(_) => all_shards.push(None),
+            }
+        }
+
+        if present_count < k {
+            return Err(ServerError::Store(storage::StoreError::NotFound));
+        }
+
+        if !(0..k).all(|i| all_shards[i].is_some()) {
+            let missing_needed: Vec<usize> = needed
+                .iter()
+                .copied()
+                .filter(|&i| all_shards[i].is_none())
+                .collect();
+
+            let present_indices: Vec<usize> =
+                (0..(k + m)).filter(|&i| all_shards[i].is_some()).collect();
+            let present_refs: Vec<&[u8]> = present_indices
+                .iter()
+                .map(|&i| all_shards[i].as_ref().unwrap().as_slice())
+                .collect();
+
+            let tmp_codec;
+            let codec = if chunk.ec_k == self.ec_config.data_shards
+                && chunk.ec_m == self.ec_config.parity_shards
+            {
+                self.ec_codec.as_ref()
+            } else {
+                let ec_config = EcConfig::new(chunk.ec_k, chunk.ec_m)?;
+                tmp_codec = ErasureCodec::new(ec_config)?;
+                &tmp_codec
+            };
+
+            let mut outputs: Vec<Vec<u8>> = missing_needed
+                .iter()
+                .map(|_| vec![0u8; shard_size])
+                .collect();
+            let mut output_refs: Vec<&mut [u8]> = outputs
+                .iter_mut()
+                .map(std::vec::Vec::as_mut_slice)
+                .collect();
+
+            codec.reconstruct(
+                &present_indices,
+                &present_refs,
+                &missing_needed,
+                &mut output_refs,
+            )?;
+
+            for (idx, &missing_idx) in missing_needed.iter().enumerate() {
+                all_shards[missing_idx] = Some(outputs[idx].clone());
+            }
+        }
+
+        let mut buf = Vec::with_capacity(padded);
+        for shard in all_shards.iter().take(k) {
+            buf.extend_from_slice(shard.as_ref().unwrap());
+        }
+        buf.truncate(chunk.size as usize);
+        Ok(buf)
+    }
+}
+
+impl PartShardReader {
+    fn next_chunk(&mut self, target_size: usize) -> Result<Option<Vec<u8>>, ServerError> {
+        let size = self.record.size as usize;
+        if self.next_offset >= size {
+            return Ok(None);
+        }
+        let end = (self.next_offset + target_size).min(size) - 1;
+        let chunk = self
+            .runtime
+            .read_part_range(&self.record, self.next_offset, end)
+            .map_err(|e| match e {
+                ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
+                    bucket: self.bucket.clone(),
+                    key: self.key.clone(),
+                },
+                other => other,
+            })?;
+        self.next_offset = end + 1;
+        Ok(Some(chunk))
+    }
+}
+
+impl ChunkListReader {
+    fn next_chunk(&mut self, target_size: usize) -> Result<Option<Vec<u8>>, ServerError> {
+        loop {
+            if let Some((loaded, offset)) = &mut self.loaded_chunk {
+                if *offset < loaded.len() {
+                    let end = (*offset + target_size).min(loaded.len());
+                    let out = loaded[*offset..end].to_vec();
+                    *offset = end;
+                    return Ok(Some(out));
+                }
+                self.loaded_chunk = None;
+            }
+
+            if self.next_chunk_index >= self.chunks.len() {
+                return Ok(None);
+            }
+
+            let data = self
+                .runtime
+                .read_chunk_payload(&self.chunks[self.next_chunk_index])
+                .map_err(|e| match e {
+                    ServerError::Store(storage::StoreError::NotFound) => {
+                        ServerError::ObjectNotFound {
+                            bucket: self.bucket.clone(),
+                            key: self.key.clone(),
+                        }
+                    }
+                    other => other,
+                })?;
+            self.next_chunk_index += 1;
+            self.loaded_chunk = Some((data, 0));
+        }
+    }
+}
+
+impl MultipartReader {
+    fn next_chunk(&mut self, target_size: usize) -> Result<Option<Vec<u8>>, ServerError> {
+        loop {
+            if let Some(current) = &mut self.current_part {
+                let chunk = match current {
+                    MultipartPartReader::Shard(reader) => reader.next_chunk(target_size)?,
+                    MultipartPartReader::Chunks(reader) => reader.next_chunk(target_size)?,
+                };
+                if chunk.is_some() {
+                    return Ok(chunk);
+                }
+                self.current_part = None;
+            }
+
+            if self.next_part_index >= self.parts.len() {
+                return Ok(None);
+            }
+
+            let part = self.parts[self.next_part_index].clone();
+            self.next_part_index += 1;
+            self.current_part = Some(if let Some(chunks) = part.streaming_chunks {
+                MultipartPartReader::Chunks(ChunkListReader {
+                    runtime: self.runtime.clone(),
+                    bucket: self.bucket.clone(),
+                    key: self.key.clone(),
+                    chunks: chunks
+                        .into_iter()
+                        .map(|chunk| ChunkPayloadRecord {
+                            size: chunk.size,
+                            chunk_okh: chunk.chunk_okh,
+                            chunk_vid: chunk.chunk_vid,
+                            shard_pg_id: chunk.shard_pg_id,
+                            ec_k: chunk.ec_k,
+                            ec_m: chunk.ec_m,
+                        })
+                        .collect(),
+                    next_chunk_index: 0,
+                    loaded_chunk: None,
+                })
+            } else {
+                MultipartPartReader::Shard(PartShardReader {
+                    runtime: self.runtime.clone(),
+                    bucket: self.bucket.clone(),
+                    key: self.key.clone(),
+                    record: part.record,
+                    next_offset: 0,
+                })
+            });
+        }
+    }
+}
+
+fn compute_shard_size(size: u64, ec_k: u8) -> usize {
+    let k = u64::from(ec_k);
+    let padded = size.div_ceil(k) * k;
+    (padded / k) as usize
+}
+
+fn shards_for_byte_range(start: usize, end: usize, shard_size: usize, ec_k: u8) -> Vec<usize> {
+    if shard_size == 0 {
+        return vec![];
+    }
+    let first = start / shard_size;
+    let last = (end / shard_size).min(ec_k as usize - 1);
+    (first..=last).collect()
 }
 
 impl Coordinator {
@@ -996,7 +1525,7 @@ impl Coordinator {
         ec_config: EcConfig,
         region: String,
     ) -> Result<Self, ServerError> {
-        let ec_codec = ErasureCodec::new(ec_config)?;
+        let ec_codec = Arc::new(ErasureCodec::new(ec_config)?);
         let pg_topology = PgTopology::new(storage_node.pg_ids()).map_err(|reason| {
             ServerError::InternalError {
                 reason: reason.to_string(),
@@ -1009,6 +1538,14 @@ impl Coordinator {
             ec_config,
             region,
         })
+    }
+
+    fn read_runtime(&self) -> ReadRuntime {
+        ReadRuntime {
+            storage_node: Arc::clone(&self.storage_node),
+            ec_codec: Arc::clone(&self.ec_codec),
+            ec_config: self.ec_config,
+        }
     }
 
     pub fn region(&self) -> &str {
@@ -3481,21 +4018,6 @@ impl Coordinator {
             #[cfg(test)]
             maybe_run_multipart_snapshot_hook(bucket, key);
 
-            let data = if record.size == 0 {
-                vec![]
-            } else {
-                self.read_multipart_range(bucket, key, &obj_parts, 0, record.size as usize - 1)
-                    .map_err(|e| match e {
-                        ServerError::Store(storage::StoreError::NotFound) => {
-                            ServerError::ObjectNotFound {
-                                bucket: bucket.to_string(),
-                                key: key.to_string(),
-                            }
-                        }
-                        other => other,
-                    })?
-            };
-
             let metadata = record
                 .metadata_blob
                 .as_ref()
@@ -3503,8 +4025,16 @@ impl Coordinator {
                 .transpose()?
                 .unwrap_or_default();
 
+            let body = ReadHandle::from_multipart(
+                self.read_runtime(),
+                bucket,
+                key,
+                obj_parts,
+                record.size as usize,
+            );
+
             Ok(GetObjectResult {
-                data,
+                body,
                 metadata,
                 etag: etag_str,
                 size: record.size,
@@ -3523,27 +4053,40 @@ impl Coordinator {
                 .get_stream_object_chunks(bucket, key, record.version_id)
                 .map_err(ServerError::Metadata)?;
 
-            let user_data = if user_size == 0 {
+            let metadata = record
+                .metadata_blob
+                .as_ref()
+                .map(|b| MetadataBlob::deserialize(b).map(|(m, _)| m))
+                .transpose()?
+                .unwrap_or_default();
+
+            let body = if user_size == 0 {
                 drop(pgs);
-                vec![]
+                ReadHandle::from_buffered_bytes(vec![])
             } else if !chunks.is_empty() {
-                // Chunk-manifest object: read from per-chunk shard sets.
                 drop(pgs);
-                self.read_chunk_manifest_range(bucket, key, &chunks, 0, user_size - 1)
-                    .map_err(|e| match e {
-                        ServerError::Store(storage::StoreError::NotFound) => {
-                            ServerError::ObjectNotFound {
-                                bucket: bucket.to_string(),
-                                key: key.to_string(),
-                            }
-                        }
-                        other => other,
-                    })?
+                ReadHandle::from_chunk_manifest(
+                    self.read_runtime(),
+                    bucket,
+                    key,
+                    chunks
+                        .into_iter()
+                        .map(|chunk| ChunkPayloadRecord {
+                            size: chunk.size,
+                            chunk_okh: chunk.chunk_okh,
+                            chunk_vid: chunk.chunk_vid,
+                            shard_pg_id: chunk.shard_pg_id,
+                            ec_k: chunk.ec_k,
+                            ec_m: chunk.ec_m,
+                        })
+                        .collect(),
+                    user_size,
+                    Some(etag_crc),
+                )
             } else {
-                // Single shard set (non-streamed write).
                 let okh = object_key_hash(bucket, key);
                 let shard_pg = pgs.shard();
-                let data = self
+                let user_data = self
                     .read_range(shard_pg, &okh, record.version_id, &record, 0, user_size - 1)
                     .map_err(|e| match e {
                         ServerError::Store(storage::StoreError::NotFound) => {
@@ -3555,29 +4098,22 @@ impl Coordinator {
                         other => other,
                     })?;
                 drop(pgs);
-                data
+
+                let actual_crc = checksum::crc64::checksum(&user_data);
+                if actual_crc != etag_crc {
+                    return Err(ServerError::IntegrityError {
+                        bucket: bucket.to_string(),
+                        key: key.to_string(),
+                        expected: etag_crc,
+                        actual: actual_crc,
+                    });
+                }
+
+                ReadHandle::from_buffered_bytes(user_data)
             };
 
-            // Verify CRC against stored etag (user data only).
-            let actual_crc = checksum::crc64::checksum(&user_data);
-            if actual_crc != etag_crc {
-                return Err(ServerError::IntegrityError {
-                    bucket: bucket.to_string(),
-                    key: key.to_string(),
-                    expected: etag_crc,
-                    actual: actual_crc,
-                });
-            }
-
-            let metadata = record
-                .metadata_blob
-                .as_ref()
-                .map(|b| MetadataBlob::deserialize(b).map(|(m, _)| m))
-                .transpose()?
-                .unwrap_or_default();
-
             Ok(GetObjectResult {
-                data: user_data,
+                body,
                 metadata,
                 etag: etag_str,
                 size: record.size,
@@ -6338,7 +6874,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.data, b"Hello, world!");
+        assert_eq!(obj.body.into_bytes().unwrap(), b"Hello, world!");
         assert_eq!(obj.size, 13);
         assert_eq!(obj.metadata.get("content-type"), Some("text/plain"));
     }
@@ -6377,7 +6913,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.data, b"{}");
+        assert_eq!(obj.body.into_bytes().unwrap(), b"{}");
         assert_eq!(obj.metadata.get("content-type"), Some("application/json"));
         assert_eq!(obj.metadata.get("x-amz-meta-author"), Some("alice"));
         assert_eq!(obj.metadata.get("x-amz-meta-version"), Some("42"));
@@ -6455,7 +6991,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.data, b"v2");
+        assert_eq!(obj.body.into_bytes().unwrap(), b"v2");
     }
 
     #[test]
@@ -6486,7 +7022,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.data, b"");
+        assert_eq!(obj.body.into_bytes().unwrap(), b"");
         assert_eq!(obj.size, 0);
     }
 
@@ -6763,7 +7299,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.data, b"data");
+        assert_eq!(obj.body.into_bytes().unwrap(), b"data");
         assert_eq!(obj.size, 4);
     }
 
@@ -6861,7 +7397,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.data, data);
+        assert_eq!(obj.body.into_bytes().unwrap(), data);
     }
 
     #[test]
@@ -6895,7 +7431,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.data, data);
+        assert_eq!(obj.body.into_bytes().unwrap(), data);
     }
 
     #[test]
@@ -6932,7 +7468,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.data, data);
+        assert_eq!(obj.body.into_bytes().unwrap(), data);
     }
 
     #[test]
@@ -7005,7 +7541,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.data, data);
+        assert_eq!(obj.body.into_bytes().unwrap(), data);
     }
 
     #[test]
@@ -7078,7 +7614,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.data, data);
+        assert_eq!(obj.body.into_bytes().unwrap(), data);
     }
 
     #[test]
@@ -8131,7 +8667,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.data, b"v2");
+        assert_eq!(obj.body.into_bytes().unwrap(), b"v2");
     }
 
     #[test]
@@ -8419,7 +8955,7 @@ mod tests {
                 requester: Requester::anonymous(),
             })
             .unwrap();
-        assert_eq!(obj.data, b"public");
+        assert_eq!(obj.body.into_bytes().unwrap(), b"public");
     }
 
     #[test]
@@ -8724,7 +9260,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.data, b"data");
+        assert_eq!(obj.body.into_bytes().unwrap(), b"data");
     }
 
     #[test]
@@ -9041,7 +9577,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.data, b"hello copy");
+        assert_eq!(obj.body.into_bytes().unwrap(), b"hello copy");
     }
 
     #[test]
@@ -9242,7 +9778,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.data, b"data");
+        assert_eq!(obj.body.into_bytes().unwrap(), b"data");
         assert_eq!(obj.metadata.get("content-type"), Some("text/html"));
         assert_eq!(obj.metadata.get("x-amz-meta-version"), Some("2"));
         // Old metadata should be gone
@@ -9301,7 +9837,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.data, b"data");
+        assert_eq!(obj.body.into_bytes().unwrap(), b"data");
         assert_eq!(obj.metadata.get("content-type"), Some("application/json"));
     }
 
@@ -9463,7 +9999,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.data, b"hello");
+        assert_eq!(obj.body.into_bytes().unwrap(), b"hello");
         // No checksum should be present since none was requested.
         assert_eq!(obj.metadata.get("x-amz-checksum-crc32c"), None);
     }
@@ -9522,7 +10058,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.data, data);
+        assert_eq!(obj.body.into_bytes().unwrap(), data);
         // Checksum should be the real CRC32C of "hello", not missing.
         let expected_crc = checksum::crc32c::checksum(data);
         let expected_b64 =
@@ -9764,7 +10300,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.data, b"new data");
+        assert_eq!(obj.body.into_bytes().unwrap(), b"new data");
     }
 
     #[test]
@@ -9815,7 +10351,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.data, b"cross bucket data");
+        assert_eq!(obj.body.into_bytes().unwrap(), b"cross bucket data");
         assert_eq!(obj.metadata.get("content-type"), Some("text/plain"));
 
         // Source should still exist
@@ -9828,7 +10364,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(src.data, b"cross bucket data");
+        assert_eq!(src.body.into_bytes().unwrap(), b"cross bucket data");
     }
 
     // ── Bucket versioning tests ──────────────────────────────────────
@@ -10183,9 +10719,9 @@ mod tests {
 
             let read_res = t_read.join().unwrap();
             let obj = read_res.expect("get_object must not fail during overwrite");
-            assert_eq!(obj.data.len(), object_size);
-            let uniform =
-                obj.data.iter().all(|&b| b == current) || obj.data.iter().all(|&b| b == next);
+            let data = obj.body.into_bytes().unwrap();
+            assert_eq!(data.len(), object_size);
+            let uniform = data.iter().all(|&b| b == current) || data.iter().all(|&b| b == next);
             assert!(
                 uniform,
                 "read must return a complete old or new object image"
@@ -10285,9 +10821,10 @@ mod tests {
             });
             match check {
                 Ok(obj) => {
-                    assert_eq!(obj.data.len(), object_size);
+                    let data = obj.body.into_bytes().unwrap();
+                    assert_eq!(data.len(), object_size);
                     assert!(
-                        obj.data.iter().all(|&b| b == expected_byte),
+                        data.iter().all(|&b| b == expected_byte),
                         "if object exists after put/delete race, it must be a full new image"
                     );
                 }
@@ -10323,13 +10860,15 @@ mod tests {
         let deleter = make_coord();
 
         let t_read = thread::spawn(move || {
-            reader.get_object(&GetObjectRequest {
-                bucket: "race-bucket",
-                key: "race-key-get",
-                version_id: None,
-                cond: NO_READ,
-                requester: TEST_REQUESTER,
-            })
+            reader
+                .get_object(&GetObjectRequest {
+                    bucket: "race-bucket",
+                    key: "race-key-get",
+                    version_id: None,
+                    cond: NO_READ,
+                    requester: TEST_REQUESTER,
+                })
+                .and_then(|result| result.body.into_bytes())
         });
         sync.snapshot_reached.wait();
 
@@ -10351,7 +10890,7 @@ mod tests {
         assert!(delete_res.is_ok(), "delete failed: {delete_res:?}");
         let read_res = read_res
             .expect("multipart get_object should succeed once source part metadata is snapshotted");
-        assert_eq!(read_res.data, expected);
+        assert_eq!(read_res, expected);
     }
 
     #[test]
@@ -12745,7 +13284,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.data, expected);
+        assert_eq!(obj.body.into_bytes().unwrap(), expected);
         assert_eq!(obj.etag, result.etag);
         assert_eq!(obj.size, expected.len() as u64);
         assert!(obj.etag.ends_with("-2\""), "etag = {}", obj.etag);
@@ -12768,7 +13307,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.data, b"only-part");
+        assert_eq!(obj.body.into_bytes().unwrap(), b"only-part");
     }
 
     #[test]
@@ -12929,7 +13468,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(dst.data, expected);
+        assert_eq!(dst.body.into_bytes().unwrap(), expected);
     }
 
     #[test]
@@ -12949,7 +13488,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert!(obj.data.is_empty());
+        assert!(obj.body.into_bytes().unwrap().is_empty());
         assert_eq!(obj.size, 0);
     }
 
@@ -12973,7 +13512,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.data, expected);
+        assert_eq!(obj.body.into_bytes().unwrap(), expected);
         assert_eq!(obj.size, MIN_PART as u64);
     }
 
@@ -13182,7 +13721,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert!(dst.data.is_empty());
+        assert!(dst.body.into_bytes().unwrap().is_empty());
     }
 
     #[test]
@@ -13219,6 +13758,9 @@ mod tests {
                 cond: &ReadCondition::default(),
                 requester: TEST_REQUESTER,
             })
+            .unwrap()
+            .body
+            .into_bytes()
             .unwrap_err();
         assert!(
             matches!(err, ServerError::IntegrityError { .. }),
@@ -14152,7 +14694,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(result.data, b"hello");
+        assert_eq!(result.body.into_bytes().unwrap(), b"hello");
         assert_eq!(result.size, 5);
     }
 
@@ -14198,7 +14740,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(result.data, full_data);
+        assert_eq!(result.body.into_bytes().unwrap(), full_data);
         assert_eq!(result.size, 10);
     }
 
@@ -14339,7 +14881,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(result.data, b"copy-me");
+        assert_eq!(result.body.into_bytes().unwrap(), b"copy-me");
     }
 
     #[test]
@@ -14373,7 +14915,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(result.data, b"");
+        assert_eq!(result.body.into_bytes().unwrap(), b"");
         assert_eq!(result.size, 0);
     }
 
@@ -14451,7 +14993,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(r1.data, b"stream-data");
+        assert_eq!(r1.body.into_bytes().unwrap(), b"stream-data");
 
         // Overwrite with a normal PUT.
         coord
@@ -14477,7 +15019,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(r2.data, b"normal-data");
+        assert_eq!(r2.body.into_bytes().unwrap(), b"normal-data");
     }
 
     #[test]
@@ -15190,7 +15732,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(result.data, b"safe-data");
+        assert_eq!(result.body.into_bytes().unwrap(), b"safe-data");
     }
 
     #[test]
@@ -15286,10 +15828,11 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(result.data, full);
+        let data = result.body.into_bytes().unwrap();
+        assert_eq!(data, full);
 
         // Verify CRC matches.
-        assert_eq!(checksum::crc64::checksum(&result.data), crc);
+        assert_eq!(checksum::crc64::checksum(&data), crc);
     }
 
     #[test]
@@ -15353,7 +15896,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(result.data, b"v2-normal");
+        assert_eq!(result.body.into_bytes().unwrap(), b"v2-normal");
     }
 
     #[test]
@@ -15408,6 +15951,6 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(result.data, b"new-data");
+        assert_eq!(result.body.into_bytes().unwrap(), b"new-data");
     }
 }

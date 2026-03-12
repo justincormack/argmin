@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use checksum::{ChecksumAlgorithm, RawChecksum};
-use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
+use http_body_util::{BodyExt, LengthLimitError, Limited};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -19,7 +19,7 @@ use super::request::{S3Request, MAX_BUFFERED_CONTROL_BODY_SIZE};
 use super::response::S3Response;
 use super::router::{route, S3Operation};
 use super::s3_response_to_hyper;
-use super::HttpFrontend;
+use super::{HttpFrontend, S3HyperBody};
 use crate::coordinator::MAX_OBJECT_SIZE;
 use crate::error::ServerError;
 
@@ -181,7 +181,7 @@ impl Default for ServeConfig {
 struct ServerState {
     pool: Vec<Mutex<HttpFrontend>>,
     counter: AtomicUsize,
-    request_semaphore: Semaphore,
+    request_semaphore: Arc<Semaphore>,
     config: ServeConfig,
 }
 
@@ -208,7 +208,7 @@ pub async fn serve(
     let state = Arc::new(ServerState {
         pool: frontends.into_iter().map(Mutex::new).collect(),
         counter: AtomicUsize::new(0),
-        request_semaphore: Semaphore::new(pool_size),
+        request_semaphore: Arc::new(Semaphore::new(pool_size)),
         config,
     });
 
@@ -269,18 +269,18 @@ pub async fn serve(
 async fn handle(
     state: Arc<ServerState>,
     req: Request<Incoming>,
-) -> Result<http::Response<Full<Bytes>>, Infallible> {
+) -> Result<http::Response<S3HyperBody>, Infallible> {
     // Acquire request permit before body collection to bound memory.
-    let _req_permit = if let Ok(Ok(permit)) = tokio::time::timeout(
+    let req_permit = if let Ok(Ok(permit)) = tokio::time::timeout(
         state.config.request_wait_timeout,
-        state.request_semaphore.acquire(),
+        Arc::clone(&state.request_semaphore).acquire_owned(),
     )
     .await
     {
         permit
     } else {
         let resp = S3Response::error(&ServerError::SlowDown, "");
-        return Ok(s3_response_to_hyper(resp));
+        return Ok(s3_response_to_hyper(resp, None));
     };
 
     let (parts, body) = req.into_parts();
@@ -289,7 +289,12 @@ async fn handle(
     if let Some(op) = is_streaming_write(&parts) {
         let chunked = match parse_chunked_mode(&parts) {
             Ok(mode) => mode,
-            Err(err) => return Ok(s3_response_to_hyper(S3Response::error(&err, ""))),
+            Err(err) => {
+                return Ok(s3_response_to_hyper(
+                    S3Response::error(&err, ""),
+                    Some(req_permit),
+                ))
+            }
         };
         let resp = match op {
             StreamingWriteOp::PutObject { bucket, key } => {
@@ -314,12 +319,12 @@ async fn handle(
                 .await
             }
         };
-        return Ok(s3_response_to_hyper(resp));
+        return Ok(s3_response_to_hyper(resp, Some(req_permit)));
     }
 
     if let Some(bucket) = post_object_bucket(&parts) {
         let resp = handle_streaming_post_object(Arc::clone(&state), parts, body, bucket).await;
-        return Ok(s3_response_to_hyper(resp));
+        return Ok(s3_response_to_hyper(resp, Some(req_permit)));
     }
 
     // Non-streaming path: collect the full body for buffered control-plane
@@ -327,14 +332,20 @@ async fn handle(
     let body_bytes = match collect_body(body, state.config.body_idle_timeout).await {
         Ok(bytes) => bytes,
         Err(err) => {
-            return Ok(s3_response_to_hyper(S3Response::error(&err, "")));
+            return Ok(s3_response_to_hyper(
+                S3Response::error(&err, ""),
+                Some(req_permit),
+            ));
         }
     };
 
     let s3req = match S3Request::from_hyper(&parts, body_bytes) {
         Ok(req) => req,
         Err(err) => {
-            return Ok(s3_response_to_hyper(S3Response::error(&err, "")));
+            return Ok(s3_response_to_hyper(
+                S3Response::error(&err, ""),
+                Some(req_permit),
+            ));
         }
     };
 
@@ -353,7 +364,7 @@ async fn handle(
         )
     });
 
-    Ok(s3_response_to_hyper(resp))
+    Ok(s3_response_to_hyper(resp, Some(req_permit)))
 }
 
 /// Check if a PUT request should use the streaming write path.

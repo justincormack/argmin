@@ -9,10 +9,14 @@ pub mod serve;
 pub mod xml;
 
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use auth::{authenticate_request, AuthContext, AuthMode, CredentialStore};
 use bytes::Bytes;
-use http_body_util::Full;
+use hyper::body::{Body, Frame, SizeHint};
 
 use crate::coordinator::BeginStreamPartRequest;
 use crate::coordinator::BeginStreamPutRequest;
@@ -36,6 +40,7 @@ use request::S3Request;
 use response::S3Response;
 use router::{route, S3Operation};
 use s3_types::VersionId;
+use tokio::sync::{mpsc, OwnedSemaphorePermit};
 
 /// Parse versionId query parameter from an S3 request.
 /// Returns `Ok(None)` if the parameter is absent, `Ok(Some(id))` if valid,
@@ -64,6 +69,92 @@ fn parse_version_id(req: &S3Request) -> Result<Option<VersionId>, ServerError> {
 pub struct HttpFrontend {
     pub coordinator: Coordinator,
     pub credentials: CredentialStore,
+}
+
+enum S3HyperBodyState {
+    Buffered(Option<Bytes>),
+    Streaming(mpsc::Receiver<Result<Bytes, ServerError>>),
+}
+
+pub struct S3HyperBody {
+    state: S3HyperBodyState,
+    _permit: Option<OwnedSemaphorePermit>,
+}
+
+impl S3HyperBody {
+    fn buffered(body: Vec<u8>, permit: Option<OwnedSemaphorePermit>) -> Self {
+        Self {
+            state: S3HyperBodyState::Buffered(Some(Bytes::from(body))),
+            _permit: permit,
+        }
+    }
+
+    fn streaming(body: crate::coordinator::ReadHandle, permit: OwnedSemaphorePermit) -> Self {
+        const STREAM_READ_CHUNK_SIZE: usize = 1024 * 1024;
+
+        let (tx, rx) = mpsc::channel(2);
+        tokio::task::spawn_blocking(move || {
+            let mut body = body;
+            loop {
+                match body.next_chunk(STREAM_READ_CHUNK_SIZE) {
+                    Ok(Some(chunk)) => {
+                        if tx.blocking_send(Ok(Bytes::from(chunk))).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(err) => {
+                        let _ = tx.blocking_send(Err(err));
+                        break;
+                    }
+                }
+            }
+        });
+
+        Self {
+            state: S3HyperBodyState::Streaming(rx),
+            _permit: Some(permit),
+        }
+    }
+}
+
+impl Body for S3HyperBody {
+    type Data = Bytes;
+    type Error = ServerError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        match &mut this.state {
+            S3HyperBodyState::Buffered(bytes) => match bytes.take() {
+                Some(bytes) if !bytes.is_empty() => Poll::Ready(Some(Ok(Frame::data(bytes)))),
+                _ => Poll::Ready(None),
+            },
+            S3HyperBodyState::Streaming(rx) => match Pin::new(rx).poll_recv(cx) {
+                Poll::Ready(Some(Ok(bytes))) => Poll::Ready(Some(Ok(Frame::data(bytes)))),
+                Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(err))),
+                Poll::Ready(None) => Poll::Ready(None),
+                Poll::Pending => Poll::Pending,
+            },
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        match &self.state {
+            S3HyperBodyState::Buffered(bytes) => bytes.is_none(),
+            S3HyperBodyState::Streaming(_) => false,
+        }
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        match &self.state {
+            S3HyperBodyState::Buffered(Some(bytes)) => SizeHint::with_exact(bytes.len() as u64),
+            S3HyperBodyState::Buffered(None) => SizeHint::with_exact(0),
+            S3HyperBodyState::Streaming(_) => SizeHint::default(),
+        }
+    }
 }
 
 impl HttpFrontend {
@@ -2120,13 +2211,23 @@ pub struct StreamingPartContext {
 
 /// Convert an `S3Response` into a hyper-compatible HTTP response.
 #[must_use]
-pub fn s3_response_to_hyper(resp: S3Response) -> http::Response<Full<Bytes>> {
+pub fn s3_response_to_hyper(
+    resp: S3Response,
+    permit: Option<OwnedSemaphorePermit>,
+) -> http::Response<S3HyperBody> {
     let mut builder = http::Response::builder().status(resp.status_code);
     for (name, value) in &resp.headers {
         builder = builder.header(name.as_str(), value.as_str());
     }
+    let body = match resp.stream {
+        Some(stream) => S3HyperBody::streaming(
+            stream,
+            permit.expect("streaming response requires request permit"),
+        ),
+        None => S3HyperBody::buffered(resp.body, permit),
+    };
     builder
-        .body(Full::new(Bytes::from(resp.body)))
+        .body(body)
         .expect("response builder should not fail")
 }
 

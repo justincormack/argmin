@@ -3,7 +3,7 @@ use crate::coordinator::{
     BucketSummary, CopyObjectResult, DeleteObjectResult, DeleteObjectsResult, GetObjectPartResult,
     GetObjectRangeResult, GetObjectResult, HeadObjectPartResult, HeadObjectResult,
     ListMultipartUploadsResult, ListObjectVersionsResult, ListObjectsResult, ListPartsResult,
-    PutObjectResult,
+    PutObjectResult, ReadHandle,
 };
 use crate::error::ServerError;
 use checksum::{ChecksumAlgorithm, ChecksumType, RawChecksum};
@@ -54,6 +54,7 @@ pub struct S3Response {
     pub status_code: u16,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    pub stream: Option<ReadHandle>,
 }
 
 impl S3Response {
@@ -62,6 +63,7 @@ impl S3Response {
             status_code,
             headers: Vec::new(),
             body: Vec::new(),
+            stream: None,
         }
     }
 
@@ -82,6 +84,7 @@ impl S3Response {
 
     fn xml_body(mut self, xml: String) -> Self {
         self.body = xml.into_bytes();
+        self.stream = None;
         self.headers
             .push(("Content-Type".to_string(), "application/xml".to_string()));
         self.headers
@@ -93,6 +96,15 @@ impl S3Response {
         self.headers
             .push(("Content-Length".to_string(), data.len().to_string()));
         self.body = data;
+        self.stream = None;
+        self
+    }
+
+    fn streaming_body(mut self, body: ReadHandle, content_length: u64) -> Self {
+        self.headers
+            .push(("Content-Length".to_string(), content_length.to_string()));
+        self.body = Vec::new();
+        self.stream = Some(body);
         self
     }
 
@@ -200,7 +212,15 @@ impl S3Response {
             }
         }
 
-        resp.data_body(result.data)
+        resp.streaming_body(result.body, result.size)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_test_body_bytes(self) -> Result<Vec<u8>, ServerError> {
+        match self.stream {
+            Some(stream) => stream.into_bytes(),
+            None => Ok(self.body),
+        }
     }
 
     /// Build a response for a successful `HeadObject`.
@@ -1068,7 +1088,7 @@ mod tests {
     #[test]
     fn get_object_with_content_type() {
         let result = GetObjectResult {
-            data: b"hello".to_vec(),
+            body: ReadHandle::from_test_bytes(b"hello".to_vec()),
             metadata: MetadataBlob::from_pairs(&[("content-type", "text/plain")]),
             etag: "\"etag\"".into(),
             size: 5,
@@ -1079,13 +1099,13 @@ mod tests {
         let resp = S3Response::get_object(result, None);
         assert_eq!(resp.status_code, 200);
         assert_eq!(find_header(&resp, "Content-Type"), Some("text/plain"));
-        assert_eq!(resp.body, b"hello");
+        assert_eq!(resp.into_test_body_bytes().unwrap(), b"hello");
     }
 
     #[test]
     fn get_object_default_content_type() {
         let result = GetObjectResult {
-            data: b"data".to_vec(),
+            body: ReadHandle::from_test_bytes(b"data".to_vec()),
             metadata: MetadataBlob::new(),
             etag: "\"etag\"".into(),
             size: 4,
@@ -1103,7 +1123,7 @@ mod tests {
     #[test]
     fn get_object_with_amz_meta_headers() {
         let result = GetObjectResult {
-            data: vec![],
+            body: ReadHandle::from_test_bytes(vec![]),
             metadata: MetadataBlob::from_pairs(&[("x-amz-meta-author", "alice")]),
             etag: "\"e\"".into(),
             size: 0,
@@ -1118,7 +1138,7 @@ mod tests {
     #[test]
     fn get_object_with_all_standard_metadata() {
         let result = GetObjectResult {
-            data: vec![],
+            body: ReadHandle::from_test_bytes(vec![]),
             metadata: MetadataBlob::from_pairs(&[
                 ("content-type", "text/html"),
                 ("content-encoding", "gzip"),
@@ -1151,7 +1171,7 @@ mod tests {
     #[test]
     fn get_object_checksum_type_with_checksum_mode_enabled() {
         let result = GetObjectResult {
-            data: vec![],
+            body: ReadHandle::from_test_bytes(vec![]),
             metadata: MetadataBlob::from_pairs(&[
                 ("x-amz-checksum-crc32", "AAAAAA=="),
                 ("x-amz-checksum-type", "FULL_OBJECT"),
@@ -1173,7 +1193,7 @@ mod tests {
     #[test]
     fn get_object_checksum_type_omitted_without_checksum_mode() {
         let result = GetObjectResult {
-            data: vec![],
+            body: ReadHandle::from_test_bytes(vec![]),
             metadata: MetadataBlob::from_pairs(&[
                 ("x-amz-checksum-crc32", "AAAAAA=="),
                 ("x-amz-checksum-type", "FULL_OBJECT"),

@@ -251,6 +251,64 @@ Status:
 2. this is now the next required phase before deferred reclamation design is
    finalized
 
+Proposed implementation shape:
+
+1. replace `GetObjectResult.data`, `GetObjectRangeResult.data`, and
+   `GetObjectPartResult.data` with a core-owned streaming body handle
+2. keep that handle in `server-core`; do not return Hyper or HTTP body types
+   from core
+3. adapt the core handle to the concrete HTTP response body in `server-http`
+4. let the handle own the snapshotted payload description, so the same handle
+   can later also own the retained-payload lease from Phase 4
+
+Suggested core shape:
+
+1. a `ReadHandle` type exposed by `server-core`
+2. explicit internal variants rather than a generic async trait hierarchy:
+   - `ShardSetReader`
+   - `ChunkManifestReader`
+   - `MultipartReader`
+3. a bounded stepping API such as `next_chunk(target_size) ->
+   Result<Option<Vec<u8>>, ServerError>`
+4. existing full-buffer helpers such as multipart and chunk-manifest range reads
+   should be refactored underneath this into incremental stepping logic
+
+Suggested HTTP shape:
+
+1. `S3Response` should stop requiring `body: Vec<u8>` for object reads
+2. introduce a response body enum so control-plane responses can remain buffered
+   while object reads become streaming
+3. `server-http` should own the concrete Hyper body adaptation and the lifecycle
+   of any request permit needed for the in-flight response
+
+Request admission / lifetime:
+
+1. the request semaphore permit should remain held for the full response-body
+   lifetime, not only until headers are produced
+2. that preserves the current "in-flight request" admission semantics and avoids
+   letting many slow downloads bypass backpressure
+3. when the streaming body finishes or is dropped, the permit is released
+
+Integrity behavior:
+
+1. full-object reads currently verify CRC after reconstructing the entire body
+2. once reads are streamed, integrity checking must become incremental
+3. the streaming reader should maintain rolling integrity state and verify at
+   end of stream
+4. if the final integrity check fails after some bytes were already sent, the
+   body must terminate as a failed stream rather than attempting to send a late
+   S3 XML error
+
+Recommended rollout inside Phase 3:
+
+1. introduce the new core `ReadHandle` and HTTP body enum without changing
+   reclamation yet
+2. convert `GetObject`
+3. convert `GetObjectRange`
+4. convert `GetObjectPart`
+5. move copy-source internal readers onto the same stepping primitives
+6. only after this, finalize the retained-payload lease design in Phase 4
+
 ### Phase 4: Retained payloads and deferred reclamation
 
 Change delete and overwrite paths so they stop deleting old shard data
