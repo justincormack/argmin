@@ -536,10 +536,11 @@ pub struct GetObjectRangeResult {
 /// Result of a part-level GetObject operation (206 Partial Content).
 #[derive(Debug)]
 pub struct GetObjectPartResult {
-    pub data: Vec<u8>,
+    pub body: ReadHandle,
     pub metadata: MetadataBlob,
     pub etag: String,
     pub size: u64,
+    pub part_size: u64,
     pub last_modified: u64,
     pub part_start: u64,
     pub part_end: u64,
@@ -4306,18 +4307,6 @@ impl Coordinator {
                 .find(|p| p.record.part_number == part_number)
                 .ok_or(ServerError::InvalidPart { part_number })?;
 
-            let data = self
-                .read_snapshotted_multipart_part_data(bucket, key, part)
-                .map_err(|e| match e {
-                    ServerError::Store(storage::StoreError::NotFound) => {
-                        ServerError::ObjectNotFound {
-                            bucket: bucket.to_string(),
-                            key: key.to_string(),
-                        }
-                    }
-                    other => other,
-                })?;
-
             // Compute byte offset of this part within the full object
             let part_start: u64 = obj_parts
                 .iter()
@@ -4357,10 +4346,17 @@ impl Coordinator {
             };
 
             Ok(GetObjectPartResult {
-                data,
+                body: ReadHandle::from_multipart(
+                    self.read_runtime(),
+                    bucket,
+                    key,
+                    vec![part.clone()],
+                    part.record.size as usize,
+                ),
                 metadata,
                 etag: etag_str,
                 size: record.size,
+                part_size: part.record.size,
                 last_modified: record.last_modified,
                 part_start,
                 part_end,
@@ -4384,21 +4380,29 @@ impl Coordinator {
                 .get_stream_object_chunks(bucket, key, record.version_id)
                 .map_err(ServerError::Metadata)?;
 
-            let user_data = if user_size == 0 {
+            let body = if user_size == 0 {
                 drop(pgs);
-                vec![]
+                ReadHandle::from_buffered_bytes(vec![])
             } else if !chunks.is_empty() {
                 drop(pgs);
-                self.read_chunk_manifest_range(bucket, key, &chunks, 0, user_size - 1)
-                    .map_err(|e| match e {
-                        ServerError::Store(storage::StoreError::NotFound) => {
-                            ServerError::ObjectNotFound {
-                                bucket: bucket.to_string(),
-                                key: key.to_string(),
-                            }
-                        }
-                        other => other,
-                    })?
+                ReadHandle::from_chunk_manifest(
+                    self.read_runtime(),
+                    bucket,
+                    key,
+                    chunks
+                        .into_iter()
+                        .map(|chunk| ChunkPayloadRecord {
+                            size: chunk.size,
+                            chunk_okh: chunk.chunk_okh,
+                            chunk_vid: chunk.chunk_vid,
+                            shard_pg_id: chunk.shard_pg_id,
+                            ec_k: chunk.ec_k,
+                            ec_m: chunk.ec_m,
+                        })
+                        .collect(),
+                    user_size,
+                    Some(etag_crc),
+                )
             } else {
                 let okh = object_key_hash(bucket, key);
                 let shard_pg = pgs.shard();
@@ -4414,18 +4418,17 @@ impl Coordinator {
                         other => other,
                     })?;
                 drop(pgs);
-                data
+                let actual_crc = checksum::crc64::checksum(&data);
+                if actual_crc != etag_crc {
+                    return Err(ServerError::IntegrityError {
+                        bucket: bucket.to_string(),
+                        key: key.to_string(),
+                        expected: etag_crc,
+                        actual: actual_crc,
+                    });
+                }
+                ReadHandle::from_buffered_bytes(data)
             };
-
-            let actual_crc = checksum::crc64::checksum(&user_data);
-            if actual_crc != etag_crc {
-                return Err(ServerError::IntegrityError {
-                    bucket: bucket.to_string(),
-                    key: key.to_string(),
-                    expected: etag_crc,
-                    actual: actual_crc,
-                });
-            }
 
             let metadata = record
                 .metadata_blob
@@ -4435,10 +4438,11 @@ impl Coordinator {
                 .unwrap_or_default();
 
             Ok(GetObjectPartResult {
-                data: user_data,
+                body,
                 metadata,
                 etag: etag_str,
                 size: record.size,
+                part_size: record.size,
                 last_modified: record.last_modified,
                 part_start: 0,
                 part_end: record.size.saturating_sub(1),
@@ -11067,14 +11071,20 @@ mod tests {
         let deleter = make_coord();
 
         let t_read = thread::spawn(move || {
-            reader.get_object_part(&GetObjectPartRequest {
-                bucket: "race-bucket",
-                key: "race-key-part",
-                version_id: None,
-                part_number: 2,
-                cond: NO_READ,
-                requester: TEST_REQUESTER,
-            })
+            reader
+                .get_object_part(&GetObjectPartRequest {
+                    bucket: "race-bucket",
+                    key: "race-key-part",
+                    version_id: None,
+                    part_number: 2,
+                    cond: NO_READ,
+                    requester: TEST_REQUESTER,
+                })
+                .and_then(|res| {
+                    let part_start = res.part_start;
+                    let body = res.body.into_bytes()?;
+                    Ok((part_start, body))
+                })
         });
         sync.snapshot_reached.wait();
 
@@ -11094,11 +11104,11 @@ mod tests {
         sync.delete_resume.wait();
         let delete_res = t_delete.join().unwrap();
         assert!(delete_res.is_ok(), "delete failed: {delete_res:?}");
-        let read_res = read_res.expect(
+        let (part_start, body) = read_res.expect(
             "multipart get_object_part should succeed once part chunk metadata is snapshotted",
         );
-        assert_eq!(read_res.data, expected_tail);
-        assert_eq!(read_res.part_start, MIN_PART as u64);
+        assert_eq!(body, expected_tail);
+        assert_eq!(part_start, MIN_PART as u64);
     }
 
     #[test]
@@ -13677,7 +13687,8 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert!(result.data.is_empty());
+        assert!(result.body.into_bytes().unwrap().is_empty());
+        assert_eq!(result.part_size, 0);
         assert_eq!(result.size, 0);
         assert_eq!(result.parts_count, 1);
         assert_eq!(result.part_start, 0);
@@ -13704,7 +13715,8 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(result.data, part1);
+        assert_eq!(result.body.into_bytes().unwrap(), part1);
+        assert_eq!(result.part_size, MIN_PART as u64);
         assert_eq!(result.part_start, 0);
         assert_eq!(result.part_end, MIN_PART as u64 - 1);
 
@@ -13719,7 +13731,8 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert!(result.data.is_empty());
+        assert!(result.body.into_bytes().unwrap().is_empty());
+        assert_eq!(result.part_size, 0);
         assert_eq!(result.parts_count, 2);
         assert_eq!(result.part_start, MIN_PART as u64);
         assert_eq!(result.part_end, MIN_PART as u64);
@@ -15097,7 +15110,8 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(result.data, b"partdata");
+        assert_eq!(result.body.into_bytes().unwrap(), b"partdata");
+        assert_eq!(result.part_size, 8);
     }
 
     #[test]
@@ -15658,7 +15672,8 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            obj_a.data, data_a,
+            obj_a.body.into_bytes().unwrap(),
+            data_a,
             "after completing A, reading part 1 should return A's data"
         );
 
@@ -15687,7 +15702,8 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            obj_b.data, data_b,
+            obj_b.body.into_bytes().unwrap(),
+            data_b,
             "after completing B, reading part 1 should return B's data"
         );
 

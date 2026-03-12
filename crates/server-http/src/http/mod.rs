@@ -3751,9 +3751,6 @@ mod tests {
         let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
         assert_eq!(resp.status_code, 206);
 
-        // Verify data
-        assert_eq!(resp.body, part2);
-
         // Verify Content-Range
         let content_range = resp
             .headers
@@ -3774,6 +3771,9 @@ mod tests {
             .map(|(_, v)| v.as_str())
             .unwrap();
         assert_eq!(parts_count, "3");
+
+        // Verify data
+        assert_eq!(resp.into_test_body_bytes().unwrap(), part2);
     }
 
     #[test]
@@ -3873,7 +3873,6 @@ mod tests {
         };
         let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
         assert_eq!(resp.status_code, 206);
-        assert_eq!(resp.body, data);
 
         let parts_count = resp
             .headers
@@ -3893,6 +3892,8 @@ mod tests {
             content_range,
             format!("bytes 0-{}/{}", data.len() - 1, data.len())
         );
+
+        assert_eq!(resp.into_test_body_bytes().unwrap(), data);
     }
 
     #[test]

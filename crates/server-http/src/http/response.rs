@@ -92,14 +92,6 @@ impl S3Response {
         self
     }
 
-    fn data_body(mut self, data: Vec<u8>) -> Self {
-        self.headers
-            .push(("Content-Length".to_string(), data.len().to_string()));
-        self.body = data;
-        self.stream = None;
-        self
-    }
-
     fn streaming_body(mut self, body: ReadHandle, content_length: u64) -> Self {
         self.headers
             .push(("Content-Length".to_string(), content_length.to_string()));
@@ -388,10 +380,11 @@ impl S3Response {
             .header("ETag", &result.etag)
             .header("Last-Modified", &format_http_date(result.last_modified))
             .header("Accept-Ranges", "bytes")
+            .header("Content-Length", &result.part_size.to_string())
             .header("x-amz-mp-parts-count", &result.parts_count.to_string());
         // Only emit Content-Range for non-empty parts; a zero-byte part has
         // no valid byte range to express.
-        if !result.data.is_empty() {
+        if result.part_size != 0 {
             let content_range = format!(
                 "bytes {}-{}/{}",
                 result.part_start, result.part_end, result.size
@@ -441,7 +434,7 @@ impl S3Response {
             resp = resp.header("x-amz-checksum-type", ct);
         }
 
-        resp.data_body(result.data)
+        resp.streaming_body(result.body, result.part_size)
     }
 
     /// Build a 416 Range Not Satisfiable response.
