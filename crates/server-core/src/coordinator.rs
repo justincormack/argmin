@@ -6926,7 +6926,7 @@ mod tests {
     use std::sync::mpsc;
     use std::sync::Barrier;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     const NO_READ: &ReadCondition = &ReadCondition {
         if_match: None,
@@ -7681,6 +7681,51 @@ mod tests {
     }
 
     #[test]
+    fn delete_object_eventually_reclaims_simple_shards() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+
+        coord.create_bucket("bucket").unwrap();
+        coord
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"simple-data",
+                metadata: &MetadataBlob::new(),
+                tags: None,
+                cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
+            })
+            .unwrap();
+
+        let (generation_id, ec) = {
+            let meta_pg_id = coord.object_pg_id("bucket", "key");
+            let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
+            match pg.get_object_meta("bucket", "key").unwrap() {
+                StoredObject::Live(record) => (record.generation_id, record.ec),
+                other @ StoredObject::DeleteMarker(_) => {
+                    panic!("expected live object, got {other:?}")
+                }
+            }
+        };
+        let shard_pg_id = coord.shard_pg_id("bucket", "key", generation_id);
+        let okh = object_key_hash("bucket", "key");
+
+        coord
+            .delete_object(&DeleteObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: NO_DELETE,
+                requester: TEST_REQUESTER,
+            })
+            .unwrap();
+
+        wait_for_shard_set_deletion(&coord, shard_pg_id, &okh, generation_id, ec);
+    }
+
+    #[test]
     fn delete_nonexistent_object_is_ok() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
@@ -7974,6 +8019,39 @@ mod tests {
         assert!(!data.is_empty(), "shard file is empty");
         data[0] ^= 0xFF;
         std::fs::write(&path, &data).unwrap();
+    }
+
+    fn wait_until(description: &str, timeout: Duration, mut predicate: impl FnMut() -> bool) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if predicate() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {description}"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn wait_for_shard_set_deletion(
+        coord: &Coordinator,
+        shard_pg_id: u32,
+        okh: &[u8; 16],
+        generation_id: GenerationId,
+        ec: EcShape,
+    ) {
+        wait_until("shard-set reclaim", Duration::from_secs(1), || -> bool {
+            let pg = coord.storage_node.get_pg(shard_pg_id).unwrap();
+            (0..(ec.k as usize + ec.m as usize)).all(|i| {
+                let shard_key = ShardKey::new(okh, generation_id.get(), i as u8);
+                matches!(
+                    pg.stat_shard(&shard_key),
+                    Err(storage::StoreError::NotFound)
+                )
+            })
+        });
     }
 
     // ── EC fault injection tests ────────────────────────────────────
@@ -13303,6 +13381,56 @@ mod tests {
     }
 
     #[test]
+    fn delete_multipart_object_eventually_reclaims_part_shards() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let (upload_id, parts) = create_upload_with_parts(&coord, "bucket", "key", &[(1, b"part")]);
+        let result = coord
+            .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload_id,
+                parts: &parts,
+                claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
+            })
+            .unwrap();
+
+        let parts_to_reclaim = {
+            let meta_pg_id = coord.object_pg_id("bucket", "key");
+            let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
+            pg.get_object_parts("bucket", "key", result.version_id)
+                .unwrap()
+        };
+
+        coord
+            .delete_object(&DeleteObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: NO_DELETE,
+                requester: TEST_REQUESTER,
+            })
+            .unwrap();
+
+        for part in parts_to_reclaim {
+            wait_for_shard_set_deletion(
+                &coord,
+                part.shard_pg_id,
+                &part.part_okh,
+                part.part_vid,
+                EcShape {
+                    k: part.ec_k,
+                    m: part.ec_m,
+                },
+            );
+        }
+    }
+
+    #[test]
     fn complete_multipart_upload_missing_part() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
@@ -16224,6 +16352,61 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
+    }
+
+    #[test]
+    fn stream_put_delete_eventually_reclaims_chunk_shards() {
+        let dir = test_util::tempdir();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
+        coord
+            .append_stream_chunk("bucket", "key", &session_id, 0, b"delete-me")
+            .unwrap();
+        let crc = checksum::crc64::checksum(b"delete-me");
+        let result = coord
+            .finalize_stream_put(&FinalizeStreamPutRequest {
+                bucket: "bucket",
+                key: "key",
+                session_id: &session_id,
+                crc64: crc,
+                total_size: 9,
+                metadata_blob: &MetadataBlob::new(),
+                tags: None,
+                cond: &WriteCondition::default(),
+            })
+            .unwrap();
+
+        let chunks = {
+            let meta_pg_id = coord.object_pg_id("bucket", "key");
+            let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
+            pg.get_stream_object_chunks("bucket", "key", result.version_id)
+                .unwrap()
+        };
+
+        coord
+            .delete_object(&DeleteObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: NO_DELETE,
+                requester: TEST_REQUESTER,
+            })
+            .unwrap();
+
+        for chunk in chunks {
+            wait_for_shard_set_deletion(
+                &coord,
+                chunk.shard_pg_id,
+                &chunk.chunk_okh,
+                chunk.chunk_vid,
+                EcShape {
+                    k: chunk.ec_k,
+                    m: chunk.ec_m,
+                },
+            );
+        }
     }
 
     #[test]

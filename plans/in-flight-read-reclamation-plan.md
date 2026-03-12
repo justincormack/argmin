@@ -576,6 +576,10 @@ Status:
    - once the bucket is namespace-empty, it waits for bucket-scoped payload
      leases to drain and sweeps any remaining durable reclaim roots before
      removing the bucket row
+6. focused regression coverage now exists for eventual payload cleanup:
+   - simple single-shard-set delete eventually removes stale shards
+   - chunk-manifest delete eventually removes stale chunk shards
+   - multipart delete eventually removes stale part shard sets
 
 Required coordinator/storage changes for this design:
 
