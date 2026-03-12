@@ -441,25 +441,6 @@ pub fn parse_delete_objects_xml(
     }
 }
 
-/// Extract the text content of a simple XML tag (no attributes, no nesting).
-fn extract_tag_content<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
-    let close = format!("</{tag}>");
-    // Try exact match first: <Tag>
-    let open_exact = format!("<{tag}>");
-    if let Some(pos) = xml.find(&open_exact) {
-        let start = pos + open_exact.len();
-        let end = xml[start..].find(&close)? + start;
-        return Some(&xml[start..end]);
-    }
-    // Try match with attributes: <Tag ...>
-    let open_prefix = format!("<{tag} ");
-    let pos = xml.find(&open_prefix)?;
-    let gt = xml[pos..].find('>')? + pos;
-    let start = gt + 1;
-    let end = xml[start..].find(&close)? + start;
-    Some(&xml[start..end])
-}
-
 /// Format a `DeleteResult` XML response.
 #[must_use]
 pub fn delete_objects_result_xml(
@@ -1045,24 +1026,6 @@ pub fn get_cors_config_xml(config: &crate::cors::CorsConfiguration) -> String {
     xml
 }
 
-/// Extract all occurrences of a simple XML tag's text content.
-fn extract_all_tag_contents(xml: &str, tag: &str) -> Vec<String> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let mut results = Vec::new();
-    let mut search_from = 0;
-    while let Some(start_pos) = xml[search_from..].find(&open) {
-        let abs_start = search_from + start_pos + open.len();
-        if let Some(end_pos) = xml[abs_start..].find(&close) {
-            results.push(xml[abs_start..abs_start + end_pos].to_string());
-            search_from = abs_start + end_pos + close.len();
-        } else {
-            break;
-        }
-    }
-    results
-}
-
 fn malformed_tagging_xml(reason: &str) -> ServerError {
     ServerError::MalformedXML {
         reason: reason.to_string(),
@@ -1406,11 +1369,9 @@ pub fn parse_url_encoded_tags(input: &str) -> Result<Vec<(String, String)>, Serv
     Ok(tags)
 }
 
-/// Count the number of tags in a stored tagging XML string.
-#[must_use]
-pub fn count_tags_in_xml(xml: &str) -> usize {
-    let tag_set = extract_tag_content(xml, "TagSet").unwrap_or("");
-    extract_all_tag_contents(tag_set, "Tag").len()
+/// Count tags in canonical stored tagging XML.
+pub fn count_tags_in_xml(xml: &str) -> Result<usize, ServerError> {
+    parse_tagging_xml(xml.as_bytes(), 10).map(|tags| tags.len())
 }
 
 /// Percent-decode a tag key or value from URL-encoded form.
@@ -3243,13 +3204,15 @@ mod tests {
             ("a".to_string(), "1".to_string()),
             ("b".to_string(), "2".to_string()),
         ]);
-        assert_eq!(count_tags_in_xml(&xml), 2);
+        let tags = parse_tagging_xml(xml.as_bytes(), 10).unwrap();
+        assert_eq!(tags.len(), 2);
     }
 
     #[test]
     fn count_tags_empty() {
         let xml = get_tagging_xml(&[]);
-        assert_eq!(count_tags_in_xml(&xml), 0);
+        let tags = parse_tagging_xml(xml.as_bytes(), 10).unwrap();
+        assert_eq!(tags.len(), 0);
     }
 
     // ── PublicAccessBlock XML ──────────────────────────────────────────

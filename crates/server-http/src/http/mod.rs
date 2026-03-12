@@ -10,7 +10,7 @@ pub mod xml;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use auth::{AuthContext, AuthMode, CredentialStore, authenticate_request};
+use auth::{authenticate_request, AuthContext, AuthMode, CredentialStore};
 use bytes::Bytes;
 use http_body_util::Full;
 
@@ -34,7 +34,7 @@ use conditional::{
 };
 use request::S3Request;
 use response::S3Response;
-use router::{S3Operation, route};
+use router::{route, S3Operation};
 use s3_types::VersionId;
 
 /// Parse versionId query parameter from an S3 request.
@@ -541,11 +541,7 @@ impl HttpFrontend {
                     let mut resp = S3Response::get_object_part(result);
                     apply_response_overrides(&mut resp, req);
                     if let Some(tags_xml) = tags {
-                        let count = xml::count_tags_in_xml(&tags_xml);
-                        if count > 0 {
-                            resp.headers
-                                .push(("x-amz-tagging-count".to_string(), count.to_string()));
-                        }
+                        add_tagging_count_header(&mut resp, &tags_xml)?;
                     }
                     Ok(resp)
                 } else if let Some(byte_range) = req
@@ -569,13 +565,7 @@ impl HttpFrontend {
                             let tags = result.tags.clone();
                             let mut resp = S3Response::get_object_range(result);
                             if let Some(tags_xml) = tags {
-                                let count = xml::count_tags_in_xml(&tags_xml);
-                                if count > 0 {
-                                    resp.headers.push((
-                                        "x-amz-tagging-count".to_string(),
-                                        count.to_string(),
-                                    ));
-                                }
+                                add_tagging_count_header(&mut resp, &tags_xml)?;
                             }
                             Ok(resp)
                         }
@@ -600,11 +590,7 @@ impl HttpFrontend {
                     apply_response_overrides(&mut resp, req);
                     // Add x-amz-tagging-count if the object has tags
                     if let Some(tags_xml) = tags {
-                        let count = xml::count_tags_in_xml(&tags_xml);
-                        if count > 0 {
-                            resp.headers
-                                .push(("x-amz-tagging-count".to_string(), count.to_string()));
-                        }
+                        add_tagging_count_header(&mut resp, &tags_xml)?;
                     }
                     Ok(resp)
                 }
@@ -658,11 +644,7 @@ impl HttpFrontend {
                         })?;
                     let mut resp = S3Response::head_object_part(&result);
                     if let Some(tags_xml) = &result.tags {
-                        let count = xml::count_tags_in_xml(tags_xml);
-                        if count > 0 {
-                            resp.headers
-                                .push(("x-amz-tagging-count".to_string(), count.to_string()));
-                        }
+                        add_tagging_count_header(&mut resp, tags_xml)?;
                     }
                     Ok(resp)
                 } else {
@@ -678,11 +660,7 @@ impl HttpFrontend {
                     let checksum_mode = req.header("x-amz-checksum-mode");
                     let mut resp = S3Response::head_object(&result, checksum_mode);
                     if let Some(tags_xml) = &result.tags {
-                        let count = xml::count_tags_in_xml(tags_xml);
-                        if count > 0 {
-                            resp.headers
-                                .push(("x-amz-tagging-count".to_string(), count.to_string()));
-                        }
+                        add_tagging_count_header(&mut resp, tags_xml)?;
                     }
                     Ok(resp)
                 }
@@ -2365,6 +2343,17 @@ fn apply_response_overrides(resp: &mut S3Response, req: &S3Request) {
             resp.headers.push((header_name.to_string(), value));
         }
     }
+}
+
+fn add_tagging_count_header(resp: &mut S3Response, tags_xml: &str) -> Result<(), ServerError> {
+    let count = xml::count_tags_in_xml(tags_xml).map_err(|err| ServerError::InternalError {
+        reason: format!("invalid stored object tags: {err}"),
+    })?;
+    if count > 0 {
+        resp.headers
+            .push(("x-amz-tagging-count".to_string(), count.to_string()));
+    }
+    Ok(())
 }
 
 fn parse_bucket_acl(req: &S3Request) -> Result<crate::coordinator::BucketAcl, ServerError> {
