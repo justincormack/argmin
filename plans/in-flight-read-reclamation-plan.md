@@ -202,6 +202,7 @@ Status:
    - multipart `GetObject`
    - multipart `GetObjectPart` for a streamed part
    - multipart copy-source via `UploadPartCopy`
+   - multipart copy-source via `CopyObject`
 4. the remaining physical shard lifetime race is intentionally left for
    deferred reclamation work below
 
@@ -220,7 +221,7 @@ This fixes the metadata-half of the race.
 
 Status:
 
-1. completed for multipart-manifest reads and multipart copy-source reads
+1. completed
 2. `GetObject`, `GetObjectRange`, `GetObjectPart`, `CopyObject`, and
    `UploadPartCopy` now snapshot streaming-part chunk manifests before dropping
    metadata guards
@@ -257,7 +258,7 @@ Important current nuance:
 
 Status:
 
-1. in progress
+1. completed for the current read and copy-source surfaces
 2. `GetObject`, `GetObjectRange`, and `GetObjectPart` now use the core-owned
    `ReadHandle`
 3. `server-http` now adapts `ReadHandle` to a streaming Hyper body and holds
@@ -349,7 +350,8 @@ Model:
 
 1. metadata snapshot for the read stays in memory only
 2. active read leases are in-memory only
-3. reclaim records for old payloads are durable
+3. reclaim records for old payloads are durable and live in the existing
+   SQLite metadata DB
 
 This phase deliberately comes after true streaming reads, because the streaming
 body abstraction determines:
@@ -374,11 +376,12 @@ Likely pieces:
 3. durable reclaim queue/table scanned by foreground cleanup or a background
    sweeper
 
-Possible implementations:
+Implementation decision:
 
-1. a small durable cleanup queue in metadata storage
-2. tombstoned reclaim records scanned by a background sweeper
-3. a simpler best-effort local journal if durability requirements are looser
+1. keep reclaim records in the existing metadata DB
+2. represent each reclaimable payload as a durable metadata row
+3. allow both opportunistic foreground cleanup and a later background sweeper
+   to consume the same records
 
 The important property is:
 
@@ -427,7 +430,7 @@ Suggested rollout after Phase 3:
 
 Status:
 
-1. in progress
+1. partially completed
 2. `GenerationId` now exists as a distinct internal type
 3. multipart/stream chunk payload records already use `GenerationId`
 4. live object rows now also carry `generation_id`, and normal live writes,
@@ -492,17 +495,14 @@ Add focused regression tests for:
 
 ## Open Questions
 
-1. whether reclamation records should live in the existing SQLite metadata DB or
-   in a separate local queue
-2. what the streaming read interface between `server-core` and `server-http`
-   should be
-3. whether cleanup should run opportunistically on foreground requests, in a
+1. whether cleanup should run opportunistically on foreground requests, in a
    background thread, or both
-4. whether any current tests already assume immediate physical deletion of old
+2. whether any current tests already assume immediate physical deletion of old
    shards and will need to be adjusted
-5. how to assign stable reclaim identities for old unversioned generations
-6. whether the initial streaming read abstraction should be a bespoke internal
-   iterator/reader type or an HTTP-body-oriented stream adapter
+3. how multipart-manifest and chunk-manifest reclaim records should describe
+   retained payloads
+4. how to assign stable reclaim identities for old multipart/chunk payload
+   graphs if a single `GenerationId` is not sufficient
 
 ## Recommendation Summary
 
