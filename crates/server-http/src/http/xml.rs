@@ -1,4 +1,4 @@
-/// Hand-formatted XML for S3 responses. No XML library dependency.
+/// Hand-formatted XML for S3 responses with lightweight request XML parsing.
 use crate::coordinator::{
     BucketSummary, CompletePart, DeleteError, DeletedObject, ListMultipartUploadsResult,
     ListObjectVersionsResult, ListObjectsResult, ListPartsResult, ObjectPartsInfo,
@@ -6,6 +6,7 @@ use crate::coordinator::{
 use crate::error::ServerError;
 use auth::canonical::uri_encode_path;
 use checksum::ChecksumAlgorithm;
+use quick_xml::{escape::unescape, events::Event, Reader};
 use s3_types::BucketVersioningState;
 #[cfg(test)]
 use s3_types::VersionId;
@@ -788,29 +789,18 @@ fn extract_all_tag_contents(xml: &str, tag: &str) -> Vec<String> {
     results
 }
 
-fn extract_tag_blocks_in_tag_set(tag_set: &str) -> Result<Vec<String>, ServerError> {
-    let open = "<Tag>";
-    let close = "</Tag>";
-    let mut results = Vec::new();
-    let mut remaining = tag_set.trim();
-
-    while !remaining.is_empty() {
-        let Some(rest) = remaining.strip_prefix(open) else {
-            return Err(ServerError::MalformedXML {
-                reason: "unexpected content in <TagSet> element".to_string(),
-            });
-        };
-        let Some(end_pos) = rest.find(close) else {
-            return Err(ServerError::MalformedXML {
-                reason: "unclosed <Tag> element in tagging XML".to_string(),
-            });
-        };
-
-        results.push(rest[..end_pos].to_string());
-        remaining = rest[end_pos + close.len()..].trim_start();
+fn malformed_tagging_xml(reason: &str) -> ServerError {
+    ServerError::MalformedXML {
+        reason: reason.to_string(),
     }
+}
 
-    Ok(results)
+fn decode_tagging_text(bytes: &[u8]) -> Result<String, ServerError> {
+    let raw = std::str::from_utf8(bytes)
+        .map_err(|_| malformed_tagging_xml("invalid UTF-8 in tagging XML body"))?;
+    unescape(raw)
+        .map(std::borrow::Cow::into_owned)
+        .map_err(|_| malformed_tagging_xml("invalid XML entity in tagging XML body"))
 }
 
 /// Format a `CopyObjectResult` XML response.
@@ -883,73 +873,170 @@ pub fn parse_tagging_xml(
     data: &[u8],
     max_tags: usize,
 ) -> Result<Vec<(String, String)>, ServerError> {
-    let text = std::str::from_utf8(data).map_err(|_| ServerError::MalformedXML {
-        reason: "invalid UTF-8 in tagging XML body".to_string(),
-    })?;
-
-    // Require both wrapper elements
-    let tagging_block = extract_tag_content(text, "Tagging").ok_or(ServerError::MalformedXML {
-        reason: "missing <Tagging> element in tagging XML".to_string(),
-    })?;
-    let tag_set =
-        extract_tag_content(tagging_block, "TagSet").ok_or(ServerError::MalformedXML {
-            reason: "missing <TagSet> element in tagging XML".to_string(),
-        })?;
-
-    // Extract all <Tag> blocks and reject malformed or unexpected nested content.
-    let tag_blocks = extract_tag_blocks_in_tag_set(tag_set)?;
-
-    if tag_blocks.len() > max_tags {
-        return Err(ServerError::InvalidTag {
-            reason: format!(
-                "tags cannot be greater than {}, got {}",
-                max_tags,
-                tag_blocks.len()
-            ),
-        });
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum State {
+        Start,
+        InTagging,
+        InTagSet,
+        InTag,
+        InKey,
+        InValue,
+        Done,
     }
 
-    let mut tags = Vec::with_capacity(tag_blocks.len());
+    let mut reader = Reader::from_reader(data);
+    let mut buf = Vec::new();
+    let mut state = State::Start;
+    let mut tags = Vec::new();
     let mut seen_keys = std::collections::HashSet::new();
+    let mut current_key: Option<String> = None;
+    let mut current_value: Option<String> = None;
+    let mut current_text = String::new();
 
-    for block in &tag_blocks {
-        let key = extract_tag_content(block, "Key").ok_or(ServerError::InvalidTag {
-            reason: "missing <Key> element in <Tag>".to_string(),
-        })?;
-        let key = xml_unescape(key);
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => match (state, e.name().as_ref()) {
+                (State::Start, b"Tagging") => state = State::InTagging,
+                (State::InTagging, b"TagSet") => state = State::InTagSet,
+                (State::InTagSet, b"Tag") => {
+                    current_key = None;
+                    current_value = None;
+                    state = State::InTag;
+                }
+                (State::InTag, b"Key") => {
+                    current_text.clear();
+                    state = State::InKey;
+                }
+                (State::InTag, b"Value") => {
+                    current_text.clear();
+                    state = State::InValue;
+                }
+                _ => {
+                    return Err(malformed_tagging_xml("unexpected element in tagging XML"));
+                }
+            },
+            Ok(Event::Empty(e)) => match (state, e.name().as_ref()) {
+                (State::InTagging, b"TagSet") => {}
+                (State::InTagSet, b"Tag") => {
+                    return Err(ServerError::InvalidTag {
+                        reason: "missing <Key> element in <Tag>".to_string(),
+                    });
+                }
+                (State::InTag, b"Key") => {
+                    current_key = Some(String::new());
+                }
+                (State::InTag, b"Value") => {
+                    current_value = Some(String::new());
+                }
+                _ => {
+                    return Err(malformed_tagging_xml(
+                        "unexpected empty element in tagging XML",
+                    ));
+                }
+            },
+            Ok(Event::End(e)) => match (state, e.name().as_ref()) {
+                (State::InTagging, b"Tagging") => state = State::Done,
+                (State::InTagSet, b"TagSet") => state = State::InTagging,
+                (State::InTag, b"Tag") => {
+                    let key = current_key.take().ok_or(ServerError::InvalidTag {
+                        reason: "missing <Key> element in <Tag>".to_string(),
+                    })?;
+                    let value = current_value.take().unwrap_or_default();
 
-        let key_chars = key.chars().count();
-        if key_chars == 0 || key_chars > 128 {
-            return Err(ServerError::InvalidTag {
-                reason: format!("tag key must be 1-128 characters, got {key_chars}"),
-            });
+                    let key_chars = key.chars().count();
+                    if key_chars == 0 || key_chars > 128 {
+                        return Err(ServerError::InvalidTag {
+                            reason: format!("tag key must be 1-128 characters, got {key_chars}"),
+                        });
+                    }
+                    if key.starts_with("aws:") {
+                        return Err(ServerError::InvalidTag {
+                            reason: "tag key must not start with 'aws:'".to_string(),
+                        });
+                    }
+
+                    let value_chars = value.chars().count();
+                    if value_chars > 256 {
+                        return Err(ServerError::InvalidTag {
+                            reason: format!(
+                                "tag value must be 0-256 characters, got {value_chars}"
+                            ),
+                        });
+                    }
+
+                    if !seen_keys.insert(key.clone()) {
+                        return Err(ServerError::InvalidTag {
+                            reason: format!("duplicate tag key: {key}"),
+                        });
+                    }
+
+                    tags.push((key, value));
+                    if tags.len() > max_tags {
+                        return Err(ServerError::InvalidTag {
+                            reason: format!(
+                                "tags cannot be greater than {}, got {}",
+                                max_tags,
+                                tags.len()
+                            ),
+                        });
+                    }
+
+                    state = State::InTagSet;
+                }
+                (State::InKey, b"Key") => {
+                    current_key = Some(std::mem::take(&mut current_text));
+                    state = State::InTag;
+                }
+                (State::InValue, b"Value") => {
+                    current_value = Some(std::mem::take(&mut current_text));
+                    state = State::InTag;
+                }
+                _ => {
+                    return Err(malformed_tagging_xml(
+                        "unexpected closing element in tagging XML",
+                    ));
+                }
+            },
+            Ok(Event::Text(t)) => {
+                let text = decode_tagging_text(t.as_ref())?;
+                match state {
+                    State::InKey | State::InValue => current_text.push_str(&text),
+                    _ if text.trim().is_empty() => {}
+                    _ => {
+                        return Err(malformed_tagging_xml("unexpected text in tagging XML"));
+                    }
+                }
+            }
+            Ok(Event::CData(t)) => {
+                let text = std::str::from_utf8(t.as_ref())
+                    .map_err(|_| malformed_tagging_xml("invalid UTF-8 in tagging XML body"))?;
+                match state {
+                    State::InKey | State::InValue => current_text.push_str(text),
+                    _ if text.trim().is_empty() => {}
+                    _ => {
+                        return Err(malformed_tagging_xml("unexpected CDATA in tagging XML"));
+                    }
+                }
+            }
+            Ok(Event::Comment(_) | Event::Decl(_) | Event::PI(_) | Event::DocType(_)) => {}
+            Ok(Event::Eof) => {
+                return match state {
+                    State::Done => Ok(tags),
+                    State::Start => Err(malformed_tagging_xml(
+                        "missing <Tagging> element in tagging XML",
+                    )),
+                    State::InTagging => Err(malformed_tagging_xml(
+                        "missing <TagSet> element in tagging XML",
+                    )),
+                    _ => Err(malformed_tagging_xml("unexpected end of tagging XML")),
+                };
+            }
+            Err(_) => {
+                return Err(malformed_tagging_xml("malformed tagging XML"));
+            }
         }
-        if key.starts_with("aws:") {
-            return Err(ServerError::InvalidTag {
-                reason: "tag key must not start with 'aws:'".to_string(),
-            });
-        }
-
-        let value = extract_tag_content(block, "Value").unwrap_or("");
-        let value = xml_unescape(value);
-
-        let value_chars = value.chars().count();
-        if value_chars > 256 {
-            return Err(ServerError::InvalidTag {
-                reason: format!("tag value must be 0-256 characters, got {value_chars}"),
-            });
-        }
-
-        if !seen_keys.insert(key.clone()) {
-            return Err(ServerError::InvalidTag {
-                reason: format!("duplicate tag key: {key}"),
-            });
-        }
-
-        tags.push((key, value));
+        buf.clear();
     }
-
-    Ok(tags)
 }
 
 /// Serialize a list of (key, value) tag pairs into S3 tagging XML.
