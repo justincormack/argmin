@@ -140,6 +140,16 @@ The right abstraction is therefore not "keep object metadata alive". It is:
 2. retained payload lease that prevents physical reclamation while a read is
    still using that old generation
 
+This also exposes a structural gap in the current model:
+
+1. external `VersionId` is an S3-facing namespace concept
+2. retained payload identity is an internal immutable-generation concept
+3. for versioned objects those happen to align today
+4. for unversioned overwrite they do not
+
+So the final design should not keep treating visible `VersionId` and physical
+payload identity as the same thing.
+
 The desired semantics are like `unlink` on a Unix file:
 
 1. namespace entry disappears immediately
@@ -376,8 +386,42 @@ One key design point:
 
 1. versioned objects already have a usable generation identity
 2. unversioned overwrites do not
-3. so retained payloads for old unversioned incarnations likely need an
-   internal reclaim ID or generation ID distinct from the visible `VersionId`
+3. so retained payloads for old unversioned incarnations need an internal
+   immutable generation ID distinct from the visible `VersionId`
+
+Recommended direction:
+
+1. keep `VersionId` as the external S3-facing concept
+2. introduce a separate internal `GenerationId` for physical payload identity
+3. allocate a fresh `GenerationId` for every live object write, including
+   unversioned overwrites
+4. let visible object metadata point at the current live `GenerationId`
+5. let deferred reclamation operate on old `GenerationId`s, not on visible
+   `(bucket, key, version_id)` names
+
+This avoids a bad compromise where unversioned overwrite keeps reusing the
+same physical identity just because the external S3 API exposes the null
+version.
+
+Implications:
+
+1. simple single-shard-set streaming reads should ultimately pin a
+   `GenerationId`, not "whatever currently lives at null version"
+2. overwrite can replace the visible current object immediately while the old
+   `GenerationId` remains retained
+3. manifest rows, chunk rows, and shard keys should move toward being keyed by
+   internal generation identity rather than visible version identity
+4. delete markers remain a namespace-level concept; they do not require payload
+   retention
+
+Suggested rollout after Phase 3:
+
+1. introduce `GenerationId` as a distinct internal type
+2. thread it through storage records and shard/manifests where payload identity
+   matters
+3. update unversioned write paths to allocate fresh generations instead of
+   reusing `VersionId::Null` as the physical identity
+4. only then finalize the retained-payload lease and reclaim-record design
 
 ### Phase 5: Expand reclamation coverage
 
