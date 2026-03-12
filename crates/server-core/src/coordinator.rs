@@ -3659,19 +3659,16 @@ impl Coordinator {
                     .map_err(not_found)?
                 } else {
                     let src_okh = object_key_hash(src_bucket, src_key);
-                    let src_shard_pg = pgs.shard();
-                    let data = self
-                        .read_range(
-                            src_shard_pg,
-                            &src_okh,
-                            src_record.generation_id,
-                            &src_record,
-                            0,
-                            user_size - 1,
-                        )
-                        .map_err(not_found)?;
                     drop(pgs);
-                    data
+                    ReadHandle::from_shard_set(
+                        &self.read_runtime(),
+                        src_bucket,
+                        src_key,
+                        src_okh,
+                        &src_record,
+                    )
+                    .into_bytes()
+                    .map_err(not_found)?
                 };
 
                 // Verify CRC against stored etag (user data only).
@@ -3918,191 +3915,6 @@ impl Coordinator {
                 pgs: TwoPgGuards::new(meta_guard, shard_guard),
             });
         }
-    }
-
-    /// Read specific data shard indices from a PG, falling back to EC reconstruction
-    /// if any are missing. Always reads whole shards — each shard is CRC64-verified
-    /// by the underlying `read_shard()` call.
-    ///
-    /// Returns (shard_data_vec, shard_size) where shard_data_vec contains one Vec<u8>
-    /// per requested index in `needed`, in the same order.
-    fn read_data_shards(
-        &self,
-        pg: &storage::PgStore,
-        okh: &[u8; 16],
-        generation_id: GenerationId,
-        record: &LiveObjectRecord,
-        needed: &[usize],
-    ) -> Result<(Vec<Vec<u8>>, usize), ServerError> {
-        let k = record.ec.k as usize;
-        let m = record.ec.m as usize;
-
-        // Try reading just the needed shards first
-        let mut result_shards: Vec<Option<Vec<u8>>> = Vec::with_capacity(needed.len());
-        let mut all_present = true;
-        let mut shard_size = 0;
-
-        for &idx in needed {
-            let shard_key = ShardKey::new(okh, generation_id.get(), idx as u8);
-            if let Ok(sd) = pg.read_shard(&shard_key) {
-                shard_size = sd.data.len();
-                result_shards.push(Some(sd.data));
-            } else {
-                all_present = false;
-                result_shards.push(None);
-            }
-        }
-
-        // Happy path: all needed shards present
-        if all_present {
-            let shards: Vec<Vec<u8>> = result_shards.into_iter().map(|s| s.unwrap()).collect();
-            if shards.is_empty() {
-                return Ok((shards, 0));
-            }
-            return Ok((shards, shard_size));
-        }
-
-        // Fallback: read all k+m shards for EC reconstruction
-        let mut all_shards: Vec<Option<Vec<u8>>> = Vec::with_capacity(k + m);
-        let mut present_count = 0;
-
-        for i in 0..(k + m) {
-            let shard_key = ShardKey::new(okh, generation_id.get(), i as u8);
-            match pg.read_shard(&shard_key) {
-                Ok(sd) => {
-                    shard_size = sd.data.len();
-                    all_shards.push(Some(sd.data));
-                    present_count += 1;
-                }
-                Err(_) => {
-                    all_shards.push(None);
-                }
-            }
-        }
-
-        if present_count < k {
-            return Err(ServerError::Store(storage::StoreError::NotFound));
-        }
-
-        // Find which of the needed data shards are missing
-        let missing_needed: Vec<usize> = needed
-            .iter()
-            .copied()
-            .filter(|&i| all_shards[i].is_none())
-            .collect();
-
-        if !missing_needed.is_empty() {
-            let present_indices: Vec<usize> =
-                (0..(k + m)).filter(|&i| all_shards[i].is_some()).collect();
-            let present_refs: Vec<&[u8]> = present_indices
-                .iter()
-                .map(|&i| all_shards[i].as_ref().unwrap().as_slice())
-                .collect();
-
-            let tmp_codec;
-            let codec = if record.ec.k == self.ec_config.data_shards
-                && record.ec.m == self.ec_config.parity_shards
-            {
-                &self.ec_codec
-            } else {
-                let ec_config = EcConfig::new(record.ec.k, record.ec.m)?;
-                tmp_codec = ErasureCodec::new(ec_config)?;
-                &tmp_codec
-            };
-
-            let mut outputs: Vec<Vec<u8>> = missing_needed
-                .iter()
-                .map(|_| vec![0u8; shard_size])
-                .collect();
-            let mut output_refs: Vec<&mut [u8]> = outputs
-                .iter_mut()
-                .map(std::vec::Vec::as_mut_slice)
-                .collect();
-
-            codec.reconstruct(
-                &present_indices,
-                &present_refs,
-                &missing_needed,
-                &mut output_refs,
-            )?;
-
-            for (idx, &missing_idx) in missing_needed.iter().enumerate() {
-                all_shards[missing_idx] = Some(outputs[idx].clone());
-            }
-        }
-
-        // Extract just the needed shards in order
-        let shards: Vec<Vec<u8>> = needed
-            .iter()
-            .map(|&i| all_shards[i].take().unwrap())
-            .collect();
-
-        Ok((shards, shard_size))
-    }
-
-    /// Compute shard_size from object size and EC k.
-    ///
-    /// `size` is the pre-padding user-data size.
-    /// Returns the per-shard size after padding to a multiple of k.
-    fn compute_shard_size(size: u64, ec_k: u8) -> usize {
-        let k = u64::from(ec_k);
-        let padded = size.div_ceil(k) * k;
-        (padded / k) as usize
-    }
-
-    /// Compute data shard indices covering byte range [start, end] (inclusive) in the stored blob.
-    fn shards_for_byte_range(start: usize, end: usize, shard_size: usize, ec_k: u8) -> Vec<usize> {
-        if shard_size == 0 {
-            return vec![];
-        }
-        let first = start / shard_size;
-        let last = (end / shard_size).min(ec_k as usize - 1);
-        (first..=last).collect()
-    }
-
-    /// Read a byte range [start, end] (inclusive) from the stored user data.
-    ///
-    /// Returns the requested bytes. Reads only the shards covering the range,
-    /// falling back to EC reconstruction if any are missing.
-    ///
-    /// **Integrity note:** Each shard is CRC64-verified on read by `read_shard()`.
-    /// There are no sub-shard checksums, so we must always read *whole* shards
-    /// and discard bytes outside the requested range after verification. This
-    /// means range requests that don't align to shard boundaries read more data
-    /// than strictly necessary — this is unavoidable without finer-grained checksums.
-    fn read_range(
-        &self,
-        pg: &storage::PgStore,
-        okh: &[u8; 16],
-        generation_id: GenerationId,
-        record: &LiveObjectRecord,
-        start: usize,
-        end: usize,
-    ) -> Result<Vec<u8>, ServerError> {
-        let shard_size = Self::compute_shard_size(record.size, record.ec.k);
-        if shard_size == 0 {
-            return Ok(vec![]);
-        }
-
-        let needed = Self::shards_for_byte_range(start, end, shard_size, record.ec.k);
-        if needed.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let (shard_data, _) = self.read_data_shards(pg, okh, generation_id, record, &needed)?;
-
-        // Assemble the buffer covering the needed shards
-        let first_shard = needed[0];
-        let buf_start = first_shard * shard_size;
-        let mut buf = Vec::with_capacity(shard_data.len() * shard_size);
-        for shard in &shard_data {
-            buf.extend_from_slice(shard);
-        }
-
-        // Extract the requested range from the buffer
-        let local_start = start - buf_start;
-        let local_end = (end - buf_start).min(buf.len() - 1);
-        Ok(buf[local_start..=local_end].to_vec())
     }
 
     fn snapshot_multipart_parts(
@@ -5742,17 +5554,18 @@ impl Coordinator {
                     .map_err(ServerError::Metadata)?;
 
                 if chunks.is_empty() {
-                    let src_shard_pg = pgs.shard();
                     let src_okh = object_key_hash(src_bucket, src_key);
-
-                    self.read_range(
-                        src_shard_pg,
-                        &src_okh,
-                        src_record.generation_id,
+                    drop(pgs);
+                    ReadHandle::from_shard_set_range(
+                        &self.read_runtime(),
+                        src_bucket,
+                        src_key,
+                        src_okh,
                         &src_record,
                         read_start as usize,
                         read_end as usize,
                     )
+                    .into_bytes()
                     .map_err(not_found)?
                 } else {
                     drop(pgs);
@@ -8676,67 +8489,61 @@ mod tests {
     #[test]
     fn compute_shard_size_exact_multiple() {
         // 100 bytes, k=4 → no padding needed → 25 per shard
-        assert_eq!(Coordinator::compute_shard_size(100, 4), 25);
+        assert_eq!(compute_shard_size(100, 4), 25);
     }
 
     #[test]
     fn compute_shard_size_needs_padding() {
         // 101 bytes, k=4 → pad to 104 → 26 per shard
-        assert_eq!(Coordinator::compute_shard_size(101, 4), 26);
+        assert_eq!(compute_shard_size(101, 4), 26);
     }
 
     #[test]
     fn compute_shard_size_small() {
         // 1 byte, k=4 → pad to 4 → 1 per shard
-        assert_eq!(Coordinator::compute_shard_size(1, 4), 1);
+        assert_eq!(compute_shard_size(1, 4), 1);
     }
 
     #[test]
     fn compute_shard_size_zero() {
         // 0 bytes, k=4 → 0 per shard
-        assert_eq!(Coordinator::compute_shard_size(0, 4), 0);
+        assert_eq!(compute_shard_size(0, 4), 0);
     }
 
     #[test]
     fn shards_for_byte_range_single_shard() {
         // shard_size=25, range [0,24] → shard 0
-        assert_eq!(Coordinator::shards_for_byte_range(0, 24, 25, 4), vec![0]);
+        assert_eq!(shards_for_byte_range(0, 24, 25, 4), vec![0]);
     }
 
     #[test]
     fn shards_for_byte_range_spans_two() {
         // shard_size=25, range [20,30] → shards 0,1
-        assert_eq!(
-            Coordinator::shards_for_byte_range(20, 30, 25, 4),
-            vec![0, 1]
-        );
+        assert_eq!(shards_for_byte_range(20, 30, 25, 4), vec![0, 1]);
     }
 
     #[test]
     fn shards_for_byte_range_all_shards() {
         // shard_size=25, range [0,99] → shards 0,1,2,3
-        assert_eq!(
-            Coordinator::shards_for_byte_range(0, 99, 25, 4),
-            vec![0, 1, 2, 3]
-        );
+        assert_eq!(shards_for_byte_range(0, 99, 25, 4), vec![0, 1, 2, 3]);
     }
 
     #[test]
     fn shards_for_byte_range_last_shard_only() {
         // shard_size=25, range [75,99] → shard 3
-        assert_eq!(Coordinator::shards_for_byte_range(75, 99, 25, 4), vec![3]);
+        assert_eq!(shards_for_byte_range(75, 99, 25, 4), vec![3]);
     }
 
     #[test]
     fn shards_for_byte_range_clamped_to_k() {
         // end falls past last shard → clamp to k-1
-        assert_eq!(Coordinator::shards_for_byte_range(75, 200, 25, 4), vec![3]);
+        assert_eq!(shards_for_byte_range(75, 200, 25, 4), vec![3]);
     }
 
     #[test]
     fn shards_for_byte_range_zero_shard_size() {
         let empty: Vec<usize> = vec![];
-        assert_eq!(Coordinator::shards_for_byte_range(0, 10, 0, 4), empty);
+        assert_eq!(shards_for_byte_range(0, 10, 0, 4), empty);
     }
 
     // ── range GET tests ────────────────────────────────────────────────
@@ -11009,7 +10816,7 @@ mod tests {
         let admin = make_coord();
         admin.create_bucket("bucket").unwrap();
 
-        let object_size = 512 * 1024;
+        let object_size = (2 * 1024 * 1024) + 137;
         admin
             .put_object(&PutObjectRequest {
                 bucket: "bucket",
@@ -11024,7 +10831,7 @@ mod tests {
             .unwrap();
 
         let mut current = b'A';
-        for _ in 0..50 {
+        for _ in 0..20 {
             let next = if current == b'A' { b'B' } else { b'A' };
             let new_payload = vec![next; object_size];
 
@@ -11074,6 +10881,254 @@ mod tests {
             assert!(
                 uniform,
                 "read must return a complete old or new object image"
+            );
+
+            current = next;
+        }
+    }
+
+    #[test]
+    fn copy_object_is_consistent_during_concurrent_overwrite() {
+        let tmp = test_util::tempdir();
+        let pg_ids: Vec<u32> = (0..4).collect();
+        let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
+        let ec_config = EcConfig::new(4, 2).unwrap();
+
+        let make_coord = || {
+            Coordinator::new(
+                Arc::clone(&storage_node),
+                ec_config,
+                "us-east-1".to_string(),
+            )
+            .unwrap()
+        };
+
+        let admin = make_coord();
+        admin.create_bucket("src-bucket").unwrap();
+        admin.create_bucket("dst-bucket").unwrap();
+
+        let object_size = (2 * 1024 * 1024) + 137;
+        admin
+            .put_object(&PutObjectRequest {
+                bucket: "src-bucket",
+                key: "src",
+                data: &vec![b'A'; object_size],
+                metadata: &MetadataBlob::new(),
+                tags: None,
+                cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
+            })
+            .unwrap();
+
+        let mut current = b'A';
+        for i in 0..12 {
+            let next = if current == b'A' { b'B' } else { b'A' };
+            let new_payload = vec![next; object_size];
+            let dst_key = format!("dst-{i}");
+            let dst_key_for_copy = dst_key.clone();
+
+            let writer = make_coord();
+            let copier = make_coord();
+            let barrier = Arc::new(Barrier::new(3));
+            let b1 = Arc::clone(&barrier);
+            let b2 = Arc::clone(&barrier);
+
+            let t_write = thread::spawn(move || {
+                b1.wait();
+                writer.put_object(&PutObjectRequest {
+                    bucket: "src-bucket",
+                    key: "src",
+                    data: &new_payload,
+                    metadata: &MetadataBlob::new(),
+                    tags: None,
+                    cond: NO_WRITE,
+                    requester: TEST_REQUESTER,
+                    acl: NO_PUT_OBJECT_ACL,
+                })
+            });
+            let t_copy = thread::spawn(move || {
+                b2.wait();
+                copier.copy_object(&CopyObjectRequest {
+                    source: CopySource {
+                        bucket: "src-bucket",
+                        key: "src",
+                        version_id: None,
+                        condition: NO_READ,
+                    },
+                    dst_bucket: "dst-bucket",
+                    dst_key: &dst_key_for_copy,
+                    dst_condition: NO_WRITE,
+                    directive: MetadataDirective::Copy,
+                    tagging: TaggingDirective::Copy,
+                    requester: TEST_REQUESTER,
+                    acl: NO_PUT_OBJECT_ACL,
+                })
+            });
+
+            barrier.wait();
+
+            let write_res = t_write.join().unwrap();
+            assert!(
+                write_res.is_ok(),
+                "concurrent overwrite failed: {write_res:?}"
+            );
+
+            let copy_res = t_copy.join().unwrap();
+            assert!(
+                copy_res.is_ok(),
+                "copy_object must not fail during overwrite: {copy_res:?}"
+            );
+
+            let copied_obj = admin
+                .get_object(&GetObjectRequest {
+                    bucket: "dst-bucket",
+                    key: &dst_key,
+                    version_id: None,
+                    cond: NO_READ,
+                    requester: TEST_REQUESTER,
+                })
+                .unwrap();
+            let data = copied_obj.body.into_bytes().unwrap();
+            assert_eq!(data.len(), object_size);
+            let uniform = data.iter().all(|&b| b == current) || data.iter().all(|&b| b == next);
+            assert!(
+                uniform,
+                "copied object must contain a complete old or new source image"
+            );
+
+            current = next;
+        }
+    }
+
+    #[test]
+    fn upload_part_copy_is_consistent_during_concurrent_overwrite() {
+        let tmp = test_util::tempdir();
+        let pg_ids: Vec<u32> = (0..4).collect();
+        let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
+        let ec_config = EcConfig::new(4, 2).unwrap();
+
+        let make_coord = || {
+            Coordinator::new(
+                Arc::clone(&storage_node),
+                ec_config,
+                "us-east-1".to_string(),
+            )
+            .unwrap()
+        };
+
+        let admin = make_coord();
+        admin.create_bucket("bucket").unwrap();
+
+        let object_size = (2 * 1024 * 1024) + 137;
+        admin
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "src",
+                data: &vec![b'A'; object_size],
+                metadata: &MetadataBlob::new(),
+                tags: None,
+                cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
+            })
+            .unwrap();
+
+        let mut current = b'A';
+        for i in 0..8 {
+            let next = if current == b'A' { b'B' } else { b'A' };
+            let new_payload = vec![next; object_size];
+            let dst_key = format!("dst-{i}");
+            let upload = admin
+                .create_multipart_upload(&CreateMultipartUploadRequest {
+                    bucket: "bucket",
+                    key: &dst_key,
+                    metadata: &MetadataBlob::new(),
+                    checksum: None,
+                    requester: TEST_REQUESTER,
+                })
+                .unwrap();
+            let dst_key_for_copy = dst_key.clone();
+            let upload_id_for_copy = upload.upload_id.clone();
+
+            let writer = make_coord();
+            let copier = make_coord();
+            let barrier = Arc::new(Barrier::new(3));
+            let b1 = Arc::clone(&barrier);
+            let b2 = Arc::clone(&barrier);
+
+            let t_write = thread::spawn(move || {
+                b1.wait();
+                writer.put_object(&PutObjectRequest {
+                    bucket: "bucket",
+                    key: "src",
+                    data: &new_payload,
+                    metadata: &MetadataBlob::new(),
+                    tags: None,
+                    cond: NO_WRITE,
+                    requester: TEST_REQUESTER,
+                    acl: NO_PUT_OBJECT_ACL,
+                })
+            });
+            let t_copy = thread::spawn(move || {
+                b2.wait();
+                copier.upload_part_copy(&UploadPartCopyRequest {
+                    source: CopySource {
+                        bucket: "bucket",
+                        key: "src",
+                        version_id: None,
+                        condition: NO_READ,
+                    },
+                    dst_bucket: "bucket",
+                    dst_key: &dst_key_for_copy,
+                    upload_id: &upload_id_for_copy,
+                    part_number: 1,
+                    copy_source_range: None,
+                    requester: TEST_REQUESTER,
+                })
+            });
+
+            barrier.wait();
+
+            let write_res = t_write.join().unwrap();
+            assert!(
+                write_res.is_ok(),
+                "concurrent overwrite failed: {write_res:?}"
+            );
+
+            let copy_res = t_copy.join().unwrap();
+            let copy_res = copy_res.expect("upload_part_copy must not fail during overwrite");
+
+            admin
+                .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                    bucket: "bucket",
+                    key: &dst_key,
+                    upload_id: &upload.upload_id,
+                    parts: &[CompletePart {
+                        part_number: 1,
+                        etag: copy_res.etag,
+                        checksum: None,
+                    }],
+                    claimed_checksum: None,
+                    requester: TEST_REQUESTER,
+                })
+                .unwrap();
+
+            let copied_obj = admin
+                .get_object(&GetObjectRequest {
+                    bucket: "bucket",
+                    key: &dst_key,
+                    version_id: None,
+                    cond: NO_READ,
+                    requester: TEST_REQUESTER,
+                })
+                .unwrap();
+            let data = copied_obj.body.into_bytes().unwrap();
+            assert_eq!(data.len(), object_size);
+            let uniform = data.iter().all(|&b| b == current) || data.iter().all(|&b| b == next);
+            assert!(
+                uniform,
+                "uploaded copied part must contain a complete old or new source image"
             );
 
             current = next;

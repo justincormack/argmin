@@ -268,9 +268,11 @@ Status:
    the `ReadHandle` lifetime, so overwrite/delete cannot reclaim the current
    generation while the body is still being read
 6. `CopyObject` and `UploadPartCopy` now reuse the same stepped reader
-   foundation for multipart-manifest and chunk-manifest source reads; simple
-   single-shard-set sources remain buffered until the same lease model is
-   applied there too
+   foundation for multipart-manifest, chunk-manifest, and simple
+   single-shard-set source reads
+7. simple single-shard-set copy sources now acquire the same retained-payload
+   lease model as `GET`, so source overwrite/delete cannot reclaim the current
+   generation while the copy is still draining bytes
 
 Proposed implementation shape:
 
