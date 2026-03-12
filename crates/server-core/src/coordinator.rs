@@ -1,5 +1,7 @@
 /// Coordinator: orchestrates S3 operations across EC, storage, and metadata layers.
 use std::sync::{Arc, MutexGuard};
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 
 use checksum::{ChecksumAlgorithm, ChecksumType, MultipartChecksumConfig, RawChecksum};
 use ec::{EcConfig, ErasureCodec};
@@ -810,6 +812,37 @@ struct LockedWriteObject<'a> {
     pgs: TwoPgGuards<'a>,
 }
 
+#[derive(Debug, Clone)]
+struct SnapshottedMultipartPart {
+    record: ObjectPartRecord,
+    streaming_chunks: Option<Vec<MultipartPartChunkRecord>>,
+}
+
+#[cfg(test)]
+#[derive(Default, Clone)]
+struct ReclamationTestHooks {
+    target: Option<(String, String)>,
+    after_multipart_snapshot: Option<Arc<dyn Fn() + Send + Sync>>,
+    after_multipart_delete_metadata: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+#[cfg(test)]
+static RECLAMATION_TEST_HOOKS: OnceLock<Mutex<ReclamationTestHooks>> = OnceLock::new();
+#[cfg(test)]
+static RECLAMATION_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
+
+#[cfg(test)]
+struct ReclamationTestHookGuard;
+
+#[cfg(test)]
+impl Drop for ReclamationTestHookGuard {
+    fn drop(&mut self) {
+        let hooks =
+            RECLAMATION_TEST_HOOKS.get_or_init(|| Mutex::new(ReclamationTestHooks::default()));
+        *hooks.lock().unwrap() = ReclamationTestHooks::default();
+    }
+}
+
 /// The coordinator ties together EC, storage, and metadata.
 pub struct Coordinator {
     storage_node: Arc<SharedStorageNode>,
@@ -817,6 +850,49 @@ pub struct Coordinator {
     ec_codec: ErasureCodec,
     ec_config: EcConfig,
     region: String,
+}
+
+#[cfg(test)]
+fn install_reclamation_test_hooks(hooks: ReclamationTestHooks) -> ReclamationTestHookGuard {
+    let slot = RECLAMATION_TEST_HOOKS.get_or_init(|| Mutex::new(ReclamationTestHooks::default()));
+    *slot.lock().unwrap() = hooks;
+    ReclamationTestHookGuard
+}
+
+#[cfg(test)]
+fn maybe_run_multipart_snapshot_hook(bucket: &str, key: &str) {
+    let hooks = RECLAMATION_TEST_HOOKS
+        .get_or_init(|| Mutex::new(ReclamationTestHooks::default()))
+        .lock()
+        .unwrap()
+        .clone();
+    if hooks
+        .target
+        .as_ref()
+        .is_some_and(|(b, k)| b == bucket && k == key)
+    {
+        if let Some(hook) = hooks.after_multipart_snapshot {
+            hook();
+        }
+    }
+}
+
+#[cfg(test)]
+fn maybe_run_multipart_delete_metadata_hook(bucket: &str, key: &str) {
+    let hooks = RECLAMATION_TEST_HOOKS
+        .get_or_init(|| Mutex::new(ReclamationTestHooks::default()))
+        .lock()
+        .unwrap()
+        .clone();
+    if hooks
+        .target
+        .as_ref()
+        .is_some_and(|(b, k)| b == bucket && k == key)
+    {
+        if let Some(hook) = hooks.after_multipart_delete_metadata {
+            hook();
+        }
+    }
 }
 
 impl Coordinator {
@@ -2461,10 +2537,15 @@ impl Coordinator {
             if matches!(src_record.layout, ObjectLayout::MultipartManifest { .. }) {
                 // Multipart source: metadata from row, data from parts.
                 let meta_pg = pgs.meta();
-                let obj_parts = meta_pg
-                    .get_object_parts(src_bucket, src_key, src_record.version_id)
-                    .map_err(ServerError::Metadata)?;
+                let obj_parts = Self::snapshot_multipart_parts(
+                    meta_pg,
+                    src_bucket,
+                    src_key,
+                    src_record.version_id,
+                )?;
                 drop(pgs);
+                #[cfg(test)]
+                maybe_run_multipart_snapshot_hook(src_bucket, src_key);
 
                 let data = if src_record.size == 0 {
                     vec![]
@@ -3031,6 +3112,50 @@ impl Coordinator {
     ///
     /// Maps [start, end] (inclusive) to the relevant chunks, reads each,
     /// and concatenates the needed slices.
+    fn snapshot_multipart_parts(
+        meta_pg: &storage::PgStore,
+        bucket: &str,
+        key: &str,
+        version_id: VersionId,
+    ) -> Result<Vec<SnapshottedMultipartPart>, ServerError> {
+        let parts = meta_pg
+            .get_object_parts(bucket, key, version_id)
+            .map_err(ServerError::Metadata)?;
+        let mut snapshotted = Vec::with_capacity(parts.len());
+        for part in parts {
+            let streaming_chunks = if part.part_okh == [0u8; 16] {
+                Some(
+                    meta_pg
+                        .get_multipart_part_chunks(bucket, key, version_id, part.part_number)
+                        .map_err(ServerError::Metadata)?,
+                )
+            } else {
+                None
+            };
+            snapshotted.push(SnapshottedMultipartPart {
+                record: part,
+                streaming_chunks,
+            });
+        }
+        Ok(snapshotted)
+    }
+
+    fn read_snapshotted_multipart_part_data(
+        &self,
+        bucket: &str,
+        key: &str,
+        part: &SnapshottedMultipartPart,
+    ) -> Result<Vec<u8>, ServerError> {
+        if part.record.size == 0 {
+            return Ok(vec![]);
+        }
+        if let Some(chunks) = &part.streaming_chunks {
+            self.read_streaming_part_data(bucket, key, chunks, 0, part.record.size as usize - 1)
+        } else {
+            self.read_part_data(&part.record)
+        }
+    }
+
     fn read_chunk_manifest_range(
         &self,
         bucket: &str,
@@ -3274,7 +3399,7 @@ impl Coordinator {
         &self,
         bucket: &str,
         key: &str,
-        parts: &[ObjectPartRecord],
+        parts: &[SnapshottedMultipartPart],
         start: usize,
         end: usize,
     ) -> Result<Vec<u8>, ServerError> {
@@ -3282,17 +3407,14 @@ impl Coordinator {
         let mut result = Vec::with_capacity(total_len);
         let mut offset: usize = 0;
 
-        // Metadata PG for looking up chunk manifests of streaming parts.
-        let meta_pg_id = self.object_pg_id(bucket, key);
-
         for part in parts {
             let part_start = offset;
-            let part_end = offset + part.size as usize; // exclusive
+            let part_end = offset + part.record.size as usize; // exclusive
 
             if part_start > end {
                 break; // Past the requested range.
             }
-            if part.size == 0 || part_end <= start {
+            if part.record.size == 0 || part_end <= start {
                 offset = part_end;
                 continue; // Zero-size or before the requested range.
             }
@@ -3302,21 +3424,10 @@ impl Coordinator {
             let slice_end = if end < part_end - 1 {
                 end - part_start
             } else {
-                part.size as usize - 1
+                part.record.size as usize - 1
             };
 
-            let data = if part.part_okh == [0u8; 16] {
-                // Streaming part: read via chunk manifest from metadata PG.
-                let chunks = {
-                    let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
-                    meta_pg
-                        .get_multipart_part_chunks(bucket, key, part.version_id, part.part_number)
-                        .map_err(ServerError::Metadata)?
-                };
-                self.read_streaming_part_data(bucket, key, &chunks, 0, part.size as usize - 1)?
-            } else {
-                self.read_part_data(part)?
-            };
+            let data = self.read_snapshotted_multipart_part_data(bucket, key, part)?;
             result.extend_from_slice(&data[slice_start..=slice_end]);
             offset = part_end;
         }
@@ -3364,10 +3475,11 @@ impl Coordinator {
         if matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
             // Multipart: metadata is in object row, data spans multiple parts.
             let meta_pg = pgs.meta();
-            let obj_parts = meta_pg
-                .get_object_parts(bucket, key, record.version_id)
-                .map_err(ServerError::Metadata)?;
+            let obj_parts =
+                Self::snapshot_multipart_parts(meta_pg, bucket, key, record.version_id)?;
             drop(pgs);
+            #[cfg(test)]
+            maybe_run_multipart_snapshot_hook(bucket, key);
 
             let data = if record.size == 0 {
                 vec![]
@@ -3512,47 +3624,37 @@ impl Coordinator {
 
         if matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
             let meta_pg = pgs.meta();
-            let obj_parts = meta_pg
-                .get_object_parts(bucket, key, record.version_id)
-                .map_err(ServerError::Metadata)?;
+            let obj_parts =
+                Self::snapshot_multipart_parts(meta_pg, bucket, key, record.version_id)?;
             drop(pgs);
+            #[cfg(test)]
+            maybe_run_multipart_snapshot_hook(bucket, key);
 
             // Find the requested part
             let part = obj_parts
                 .iter()
-                .find(|p| p.part_number == part_number)
+                .find(|p| p.record.part_number == part_number)
                 .ok_or(ServerError::InvalidPart { part_number })?;
 
-            let data = if part.size == 0 {
-                Ok(vec![])
-            } else if part.part_okh == [0u8; 16] {
-                // Streaming part: read via chunk manifest from metadata PG.
-                let meta_pg_id = self.object_pg_id(bucket, key);
-                let chunks = {
-                    let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
-                    meta_pg
-                        .get_multipart_part_chunks(bucket, key, record.version_id, part.part_number)
-                        .map_err(ServerError::Metadata)?
-                };
-                self.read_streaming_part_data(bucket, key, &chunks, 0, part.size as usize - 1)
-            } else {
-                self.read_part_data(part)
-            }
-            .map_err(|e| match e {
-                ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
-                    bucket: bucket.to_string(),
-                    key: key.to_string(),
-                },
-                other => other,
-            })?;
+            let data = self
+                .read_snapshotted_multipart_part_data(bucket, key, part)
+                .map_err(|e| match e {
+                    ServerError::Store(storage::StoreError::NotFound) => {
+                        ServerError::ObjectNotFound {
+                            bucket: bucket.to_string(),
+                            key: key.to_string(),
+                        }
+                    }
+                    other => other,
+                })?;
 
             // Compute byte offset of this part within the full object
             let part_start: u64 = obj_parts
                 .iter()
-                .take_while(|p| p.part_number < part_number)
-                .map(|p| p.size)
+                .take_while(|p| p.record.part_number < part_number)
+                .map(|p| p.record.size)
                 .sum();
-            let part_end = part_start + part.size.saturating_sub(1);
+            let part_end = part_start + part.record.size.saturating_sub(1);
 
             // Decode per-part checksum
             let metadata = record
@@ -3562,7 +3664,7 @@ impl Coordinator {
                 .transpose()?
                 .unwrap_or_default();
 
-            let checksum = if let Some(raw) = &part.checksum {
+            let checksum = if let Some(raw) = &part.record.checksum {
                 // Look up algorithm from object metadata and validate byte length.
                 match metadata
                     .get("x-amz-checksum-algorithm")
@@ -4004,10 +4106,11 @@ impl Coordinator {
             if matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
                 // Multipart: metadata from object row, data spans parts.
                 let meta_pg = pgs.meta();
-                let obj_parts = meta_pg
-                    .get_object_parts(bucket, key, record.version_id)
-                    .map_err(ServerError::Metadata)?;
+                let obj_parts =
+                    Self::snapshot_multipart_parts(meta_pg, bucket, key, record.version_id)?;
                 drop(pgs);
+                #[cfg(test)]
+                maybe_run_multipart_snapshot_hook(bucket, key);
 
                 let data = self
                     .read_multipart_range(
@@ -4166,6 +4269,8 @@ impl Coordinator {
                     meta_pg.delete_object_parts(bucket, key, record.version_id)?;
                     meta_pg.delete_object_meta(bucket, key)?;
                     drop(pgs);
+                    #[cfg(test)]
+                    maybe_run_multipart_delete_metadata_hook(bucket, key);
                     self.delete_part_shards(&obj_parts)?;
                     if !streaming_chunks.is_empty() {
                         self.delete_chunk_shards_generic(&streaming_chunks)?;
@@ -4248,6 +4353,8 @@ impl Coordinator {
                         meta_pg.delete_object_parts(bucket, key, vid)?;
                         meta_pg.delete_object_version(bucket, key, vid)?;
                         drop(pgs);
+                        #[cfg(test)]
+                        maybe_run_multipart_delete_metadata_hook(bucket, key);
                         self.delete_part_shards(&obj_parts)?;
                         if !streaming_chunks.is_empty() {
                             self.delete_chunk_shards_generic(&streaming_chunks)?;
@@ -4751,10 +4858,15 @@ impl Coordinator {
                 vec![]
             } else if matches!(src_record.layout, ObjectLayout::MultipartManifest { .. }) {
                 let meta_pg = pgs.meta();
-                let obj_parts = meta_pg
-                    .get_object_parts(src_bucket, src_key, src_record.version_id)
-                    .map_err(ServerError::Metadata)?;
+                let obj_parts = Self::snapshot_multipart_parts(
+                    meta_pg,
+                    src_bucket,
+                    src_key,
+                    src_record.version_id,
+                )?;
                 drop(pgs);
+                #[cfg(test)]
+                maybe_run_multipart_snapshot_hook(src_bucket, src_key);
 
                 self.read_multipart_range(
                     src_bucket,
@@ -5766,6 +5878,49 @@ mod tests {
             part_number,
             requester: TEST_REQUESTER,
         })
+    }
+
+    struct MultipartMetadataRaceSync {
+        snapshot_reached: Arc<Barrier>,
+        snapshot_resume: Arc<Barrier>,
+        delete_reached: Arc<Barrier>,
+        delete_resume: Arc<Barrier>,
+        _serial_guard: MutexGuard<'static, ()>,
+        _guard: ReclamationTestHookGuard,
+    }
+
+    fn install_multipart_metadata_race_hooks(bucket: &str, key: &str) -> MultipartMetadataRaceSync {
+        let serial = RECLAMATION_TEST_SERIAL
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap();
+        let snapshot_reached = Arc::new(Barrier::new(2));
+        let snapshot_resume = Arc::new(Barrier::new(2));
+        let delete_reached = Arc::new(Barrier::new(2));
+        let delete_resume = Arc::new(Barrier::new(2));
+        let snapshot_reached_hook = Arc::clone(&snapshot_reached);
+        let snapshot_resume_hook = Arc::clone(&snapshot_resume);
+        let delete_reached_hook = Arc::clone(&delete_reached);
+        let delete_resume_hook = Arc::clone(&delete_resume);
+        let guard = install_reclamation_test_hooks(ReclamationTestHooks {
+            target: Some((bucket.to_string(), key.to_string())),
+            after_multipart_snapshot: Some(Arc::new(move || {
+                snapshot_reached_hook.wait();
+                snapshot_resume_hook.wait();
+            })),
+            after_multipart_delete_metadata: Some(Arc::new(move || {
+                delete_reached_hook.wait();
+                delete_resume_hook.wait();
+            })),
+        });
+        MultipartMetadataRaceSync {
+            snapshot_reached,
+            snapshot_resume,
+            delete_reached,
+            delete_resume,
+            _serial_guard: serial,
+            _guard: guard,
+        }
     }
 
     #[test]
@@ -10143,6 +10298,202 @@ mod tests {
     }
 
     #[test]
+    fn multipart_get_object_survives_metadata_delete_mid_read() {
+        let tmp = test_util::tempdir();
+        let pg_ids: Vec<u32> = (0..4).collect();
+        let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
+        let ec_config = EcConfig::new(4, 2).unwrap();
+
+        let make_coord = || {
+            Coordinator::new(
+                Arc::clone(&storage_node),
+                ec_config,
+                "us-east-1".to_string(),
+            )
+            .unwrap()
+        };
+
+        let admin = make_coord();
+        admin.create_bucket("race-bucket").unwrap();
+        let (_, expected) =
+            create_completed_multipart_with_streamed_tail(&admin, "race-bucket", "race-key-get");
+
+        let sync = install_multipart_metadata_race_hooks("race-bucket", "race-key-get");
+        let reader = make_coord();
+        let deleter = make_coord();
+
+        let t_read = thread::spawn(move || {
+            reader.get_object(&GetObjectRequest {
+                bucket: "race-bucket",
+                key: "race-key-get",
+                version_id: None,
+                cond: NO_READ,
+                requester: TEST_REQUESTER,
+            })
+        });
+        sync.snapshot_reached.wait();
+
+        let t_delete = thread::spawn(move || {
+            deleter.delete_object(&DeleteObjectRequest {
+                bucket: "race-bucket",
+                key: "race-key-get",
+                version_id: None,
+                cond: NO_DELETE,
+                requester: TEST_REQUESTER,
+            })
+        });
+        sync.delete_reached.wait();
+
+        sync.snapshot_resume.wait();
+        let read_res = t_read.join().unwrap();
+        sync.delete_resume.wait();
+        let delete_res = t_delete.join().unwrap();
+        assert!(delete_res.is_ok(), "delete failed: {delete_res:?}");
+        let read_res = read_res
+            .expect("multipart get_object should succeed once source part metadata is snapshotted");
+        assert_eq!(read_res.data, expected);
+    }
+
+    #[test]
+    fn multipart_get_object_part_survives_metadata_delete_mid_read() {
+        let tmp = test_util::tempdir();
+        let pg_ids: Vec<u32> = (0..4).collect();
+        let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
+        let ec_config = EcConfig::new(4, 2).unwrap();
+
+        let make_coord = || {
+            Coordinator::new(
+                Arc::clone(&storage_node),
+                ec_config,
+                "us-east-1".to_string(),
+            )
+            .unwrap()
+        };
+
+        let admin = make_coord();
+        admin.create_bucket("race-bucket").unwrap();
+        let (_, expected) =
+            create_completed_multipart_with_streamed_tail(&admin, "race-bucket", "race-key-part");
+        let expected_tail = b"streamed-tail-data".to_vec();
+        assert_eq!(
+            &expected[expected.len() - expected_tail.len()..],
+            expected_tail.as_slice()
+        );
+
+        let sync = install_multipart_metadata_race_hooks("race-bucket", "race-key-part");
+        let reader = make_coord();
+        let deleter = make_coord();
+
+        let t_read = thread::spawn(move || {
+            reader.get_object_part(&GetObjectPartRequest {
+                bucket: "race-bucket",
+                key: "race-key-part",
+                version_id: None,
+                part_number: 2,
+                cond: NO_READ,
+                requester: TEST_REQUESTER,
+            })
+        });
+        sync.snapshot_reached.wait();
+
+        let t_delete = thread::spawn(move || {
+            deleter.delete_object(&DeleteObjectRequest {
+                bucket: "race-bucket",
+                key: "race-key-part",
+                version_id: None,
+                cond: NO_DELETE,
+                requester: TEST_REQUESTER,
+            })
+        });
+        sync.delete_reached.wait();
+
+        sync.snapshot_resume.wait();
+        let read_res = t_read.join().unwrap();
+        sync.delete_resume.wait();
+        let delete_res = t_delete.join().unwrap();
+        assert!(delete_res.is_ok(), "delete failed: {delete_res:?}");
+        let read_res = read_res.expect(
+            "multipart get_object_part should succeed once part chunk metadata is snapshotted",
+        );
+        assert_eq!(read_res.data, expected_tail);
+        assert_eq!(read_res.part_start, MIN_PART as u64);
+    }
+
+    #[test]
+    fn upload_part_copy_survives_source_metadata_delete_mid_read() {
+        let tmp = test_util::tempdir();
+        let pg_ids: Vec<u32> = (0..4).collect();
+        let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
+        let ec_config = EcConfig::new(4, 2).unwrap();
+
+        let make_coord = || {
+            Coordinator::new(
+                Arc::clone(&storage_node),
+                ec_config,
+                "us-east-1".to_string(),
+            )
+            .unwrap()
+        };
+
+        let admin = make_coord();
+        admin.create_bucket("race-bucket").unwrap();
+        create_completed_multipart_with_streamed_tail(&admin, "race-bucket", "race-key-copy");
+        let upload = admin
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "race-bucket",
+                key: "dst",
+                metadata: &MetadataBlob::new(),
+                checksum: None,
+
+                requester: TEST_REQUESTER,
+            })
+            .unwrap();
+
+        let sync = install_multipart_metadata_race_hooks("race-bucket", "race-key-copy");
+        let copier = make_coord();
+        let deleter = make_coord();
+
+        let t_copy = thread::spawn(move || {
+            copier.upload_part_copy(&UploadPartCopyRequest {
+                source: CopySource {
+                    bucket: "race-bucket",
+                    key: "race-key-copy",
+                    version_id: None,
+                    condition: NO_READ,
+                },
+                dst_bucket: "race-bucket",
+                dst_key: "dst",
+                upload_id: &upload.upload_id,
+                part_number: 1,
+                copy_source_range: None,
+                requester: TEST_REQUESTER,
+            })
+        });
+        sync.snapshot_reached.wait();
+
+        let t_delete = thread::spawn(move || {
+            deleter.delete_object(&DeleteObjectRequest {
+                bucket: "race-bucket",
+                key: "race-key-copy",
+                version_id: None,
+                cond: NO_DELETE,
+                requester: TEST_REQUESTER,
+            })
+        });
+        sync.delete_reached.wait();
+
+        sync.snapshot_resume.wait();
+        let copy_res = t_copy.join().unwrap();
+        sync.delete_resume.wait();
+        let delete_res = t_delete.join().unwrap();
+        assert!(delete_res.is_ok(), "delete failed: {delete_res:?}");
+        assert!(
+            copy_res.is_ok(),
+            "upload_part_copy should succeed once source multipart metadata is snapshotted: {copy_res:?}"
+        );
+    }
+
+    #[test]
     fn delete_object_returns_result() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
@@ -12292,6 +12643,84 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap()
+    }
+
+    fn create_completed_multipart_with_streamed_tail(
+        coord: &Coordinator,
+        bucket: &str,
+        key: &str,
+    ) -> (CompleteMultipartUploadResult, Vec<u8>) {
+        let metadata = MetadataBlob::new();
+        let create = coord
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket,
+                key,
+                metadata: &metadata,
+                checksum: None,
+
+                requester: TEST_REQUESTER,
+            })
+            .unwrap();
+
+        let part1 = make_part(0xAA, MIN_PART);
+        let part1_result = coord
+            .upload_part(&UploadPartRequest {
+                bucket,
+                key,
+                upload_id: &create.upload_id,
+                part_number: 1,
+                data: &part1,
+                claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
+            })
+            .unwrap();
+
+        let session = begin_stream_part_test(coord, bucket, key, &create.upload_id, 2).unwrap();
+        let part2 = b"streamed-tail-data".to_vec();
+        coord
+            .append_stream_chunk(bucket, key, &session.session_id, 0, &part2)
+            .unwrap();
+        let part2_crc = checksum::crc64::checksum(&part2);
+        let part2_result = coord
+            .finalize_stream_part(FinalizeStreamPartRequest {
+                bucket,
+                key,
+                session_id: &session.session_id,
+                upload_id: &create.upload_id,
+                part_number: 2,
+                crc64: part2_crc,
+                total_size: part2.len() as u64,
+                claimed_checksum: None,
+                computed_checksum: None,
+            })
+            .unwrap();
+
+        let complete = coord
+            .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                bucket,
+                key,
+                upload_id: &create.upload_id,
+                parts: &[
+                    CompletePart {
+                        part_number: 1,
+                        etag: part1_result.etag,
+                        checksum: None,
+                    },
+                    CompletePart {
+                        part_number: 2,
+                        etag: part2_result.etag,
+                        checksum: None,
+                    },
+                ],
+                claimed_checksum: None,
+
+                requester: TEST_REQUESTER,
+            })
+            .unwrap();
+
+        let expected = [part1, part2].concat();
+        (complete, expected)
     }
 
     #[test]

@@ -150,6 +150,19 @@ Target cases:
 
 The point is to prove the current behavior and then lock in the intended fix.
 
+Status:
+
+1. completed for the metadata-follow-on race on multipart-manifest reads
+2. covered by deterministic coordinator tests that pause after the read-side
+   multipart metadata snapshot and after delete-side metadata removal, but
+   before shard reclamation
+3. current focused coverage:
+   - multipart `GetObject`
+   - multipart `GetObjectPart` for a streamed part
+   - multipart copy-source via `UploadPartCopy`
+4. the remaining physical shard lifetime race is intentionally left for
+   deferred reclamation work below
+
 ### Phase 2: Snapshot completeness
 
 Change read paths so they collect all metadata needed for the current read
@@ -162,6 +175,16 @@ This likely means:
 3. copy-source helpers reuse the same fully snapshotted internal representation
 
 This fixes the metadata-half of the race.
+
+Status:
+
+1. completed for multipart-manifest reads and multipart copy-source reads
+2. `GetObject`, `GetObjectRange`, `GetObjectPart`, `CopyObject`, and
+   `UploadPartCopy` now snapshot streaming-part chunk manifests before dropping
+   metadata guards
+3. chunk-manifest object reads were already snapshotting their full
+   `stream_object_chunks` list before this pass, so no behavior change was
+   needed there
 
 ### Phase 3: Deferred reclamation
 
