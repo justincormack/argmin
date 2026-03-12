@@ -472,6 +472,95 @@ all old-generation cleanup sites:
 This should end with one consistent old-generation reclamation mechanism, not a
 mix of deferred and immediate cleanup.
 
+Chosen design for multipart-manifest and chunk-manifest payloads:
+
+1. use mirrored reclaim tables in the existing metadata DB rather than
+   tombstoning live rows or introducing a generic polymorphic reclaim table
+2. use the object's `generation_id` as the reclaim-root identity for the old
+   object generation
+3. store child reclaim rows for the physical payloads that actually need later
+   shard deletion
+4. keep leases keyed by the reclaim root `(bucket, key, generation_id)`, not by
+   individual parts or chunks
+
+Concrete reclaim shapes:
+
+1. chunk-manifest payloads:
+   - `chunk_manifest_reclaims`
+     - `bucket`
+     - `key`
+     - `generation_id`
+     - `created_at`
+   - `chunk_manifest_reclaim_chunks`
+     - `bucket`
+     - `key`
+     - `generation_id`
+     - `chunk_index`
+     - `chunk_okh`
+     - `chunk_vid`
+     - `shard_pg_id`
+     - `ec_k`
+     - `ec_m`
+2. multipart-manifest payloads:
+   - `multipart_reclaims`
+     - `bucket`
+     - `key`
+     - `generation_id`
+     - `created_at`
+   - `multipart_reclaim_parts`
+     - `bucket`
+     - `key`
+     - `generation_id`
+     - `part_number`
+     - `storage_kind` (`ShardSet` or `ChunkManifest`)
+     - `part_okh`
+     - `part_vid`
+     - `shard_pg_id`
+     - `ec_k`
+     - `ec_m`
+   - `multipart_reclaim_part_chunks`
+     - `bucket`
+     - `key`
+     - `generation_id`
+     - `part_number`
+     - `chunk_index`
+     - `chunk_okh`
+     - `chunk_vid`
+     - `shard_pg_id`
+     - `ec_k`
+     - `ec_m`
+
+Important design notes:
+
+1. reclaim rows should be more explicit than the current live multipart
+   manifest rows; in particular, reclaim rows should not reuse the live-table
+   "all-zero `part_okh` means streamed part" sentinel
+2. chunk and part child payload identities are already stable enough for later
+   shard deletion because they are addressed by immutable `chunk_okh/chunk_vid`
+   and `part_okh/part_vid` pairs
+3. the allocator uniqueness requirement is primarily on the reclaim root
+   `generation_id`, so `next_generation_id()` must include the new reclaim root
+   tables the same way it already includes `simple_payload_reclaims`
+
+Required coordinator/storage changes for this design:
+
+1. extend `StaleObjectPayload::ChunkManifest` and `StaleObjectPayload::Multipart`
+   to carry the root object `generation_id`
+2. add storage APIs to insert, fetch, list, and delete reclaim roots plus child
+   rows for chunk-manifest and multipart payloads
+3. change stale-payload metadata deletion to:
+   - insert reclaim root + child rows
+   - delete live `stream_object_chunks`, `object_parts`, and
+     `multipart_part_chunks`
+   - commit that metadata transaction
+4. change the background sweeper to:
+   - enumerate reclaim roots
+   - skip roots with active leases
+   - delete child shard sets idempotently
+   - delete child reclaim rows and then the root row
+5. change chunk-manifest and multipart `ReadHandle` construction to acquire the
+   same root lease model already used by simple single-shard-set payloads
+
 ## Design Constraints
 
 1. do not hold bucket locks for the full duration of large reads
