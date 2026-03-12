@@ -964,7 +964,10 @@ fn test_copy_object_source_missing_key() {
             .copy_source(&bucket)
             .send()
             .await;
-        assert!(result.is_err(), "expected error for copy source without key");
+        assert!(
+            result.is_err(),
+            "expected error for copy source without key"
+        );
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "InvalidArgument");
 
@@ -988,7 +991,10 @@ fn test_copy_object_source_empty_key() {
             .copy_source(format!("{}/", bucket))
             .send()
             .await;
-        assert!(result.is_err(), "expected error for copy source with empty key");
+        assert!(
+            result.is_err(),
+            "expected error for copy source with empty key"
+        );
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "InvalidArgument");
 

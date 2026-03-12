@@ -1292,7 +1292,10 @@ fn test_put_invalid_percent_encoding_in_key() {
             .expect("transport error");
         let status = resp.status().as_u16();
         let body = resp.body_mut().read_to_string().unwrap_or_default();
-        assert_eq!(status, 400, "expected 400 for invalid percent-encoding, got {status}");
+        assert_eq!(
+            status, 400,
+            "expected 400 for invalid percent-encoding, got {status}"
+        );
         assert_error_code(&body, "InvalidURI");
         cleanup(&bucket, &[]).await;
     });

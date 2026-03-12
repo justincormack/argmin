@@ -167,7 +167,10 @@ fn send_signed(
     let scope = format!("{date_stamp}/{region}/{service}/aws4_request");
     let string_to_sign = format!("AWS4-HMAC-SHA256\n{dt}\n{scope}\n{cr_hash}");
 
-    let k_date = hmac_sha256(format!("AWS4{secret_key}").as_bytes(), date_stamp.as_bytes());
+    let k_date = hmac_sha256(
+        format!("AWS4{secret_key}").as_bytes(),
+        date_stamp.as_bytes(),
+    );
     let k_region = hmac_sha256(&k_date, region.as_bytes());
     let k_service = hmac_sha256(&k_region, service.as_bytes());
     let k_signing = hmac_sha256(&k_service, b"aws4_request");
@@ -204,7 +207,10 @@ fn send_signed(
 /// Compute base64-encoded CRC32 checksum for AWS x-amz-checksum-crc32 header.
 fn crc32_b64(data: &[u8]) -> String {
     let crc = checksum::crc32::checksum(data);
-    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, crc.to_be_bytes())
+    base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        crc.to_be_bytes(),
+    )
 }
 
 /// Convenience: send signed PUT.
@@ -301,7 +307,8 @@ fn test_put_cors_unclosed_rule() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;
         let url = format!("{}/{}?cors", CTX.endpoint(), bucket);
-        let body = b"<CORSConfiguration><CORSRule><AllowedOrigin>*</AllowedOrigin></CORSConfiguration>";
+        let body =
+            b"<CORSConfiguration><CORSRule><AllowedOrigin>*</AllowedOrigin></CORSConfiguration>";
         let (status, body_text) = signed_put_with_checksum(&url, body, &[]);
         assert_eq!(status, 400, "body: {body_text}");
         assert_error_code(&body_text, "MalformedXML");
@@ -392,11 +399,7 @@ fn test_put_bucket_tagging_malformed_xml() {
 fn test_put_public_access_block_malformed_xml() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;
-        let url = format!(
-            "{}/{}?publicAccessBlock",
-            CTX.endpoint(),
-            bucket
-        );
+        let url = format!("{}/{}?publicAccessBlock", CTX.endpoint(), bucket);
         let body = b"<BlockPublicAcls>true</BlockPublicAcls>";
         let (status, body_text) = signed_put(&url, body, &[]);
         assert_eq!(status, 400, "body: {body_text}");
@@ -412,11 +415,7 @@ fn test_put_public_access_block_malformed_xml() {
 fn test_put_ownership_controls_missing_wrapper() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;
-        let url = format!(
-            "{}/{}?ownershipControls",
-            CTX.endpoint(),
-            bucket
-        );
+        let url = format!("{}/{}?ownershipControls", CTX.endpoint(), bucket);
         let body = b"<Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule>";
         let (status, body_text) = signed_put(&url, body, &[]);
         assert_eq!(status, 400, "body: {body_text}");
@@ -430,11 +429,7 @@ fn test_put_ownership_controls_missing_wrapper() {
 fn test_put_ownership_controls_missing_rule() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;
-        let url = format!(
-            "{}/{}?ownershipControls",
-            CTX.endpoint(),
-            bucket
-        );
+        let url = format!("{}/{}?ownershipControls", CTX.endpoint(), bucket);
         let body = b"<OwnershipControls></OwnershipControls>";
         let (status, body_text) = signed_put(&url, body, &[]);
         assert_eq!(status, 400, "body: {body_text}");
@@ -448,11 +443,7 @@ fn test_put_ownership_controls_missing_rule() {
 fn test_put_ownership_controls_missing_value() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;
-        let url = format!(
-            "{}/{}?ownershipControls",
-            CTX.endpoint(),
-            bucket
-        );
+        let url = format!("{}/{}?ownershipControls", CTX.endpoint(), bucket);
         let body = b"<OwnershipControls><Rule></Rule></OwnershipControls>";
         let (status, body_text) = signed_put(&url, body, &[]);
         assert_eq!(status, 400, "body: {body_text}");
@@ -653,11 +644,7 @@ fn test_put_tagging_non_utf8() {
 fn test_put_public_access_block_non_utf8() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;
-        let url = format!(
-            "{}/{}?publicAccessBlock",
-            CTX.endpoint(),
-            bucket
-        );
+        let url = format!("{}/{}?publicAccessBlock", CTX.endpoint(), bucket);
         let body: &[u8] = &[0xFF, 0xFE, 0x80, 0x81];
         let (status, body_text) = signed_put(&url, body, &[]);
         assert_eq!(status, 400, "body: {body_text}");
@@ -671,11 +658,7 @@ fn test_put_public_access_block_non_utf8() {
 fn test_put_ownership_controls_non_utf8() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;
-        let url = format!(
-            "{}/{}?ownershipControls",
-            CTX.endpoint(),
-            bucket
-        );
+        let url = format!("{}/{}?ownershipControls", CTX.endpoint(), bucket);
         let body: &[u8] = &[0xFF, 0xFE, 0x80, 0x81];
         let (status, body_text) = signed_put(&url, body, &[]);
         assert_eq!(status, 400, "body: {body_text}");
@@ -735,8 +718,7 @@ fn test_put_object_tagging_header_non_utf8_decoded() {
         let url = format!("{}/{}/{}", CTX.endpoint(), bucket, key);
         let body = b"hello";
         // %FF decodes to byte 0xFF which is not valid UTF-8
-        let (status, body_text) =
-            send_signed("PUT", &url, body, &[("x-amz-tagging", "foo=%FF")]);
+        let (status, body_text) = send_signed("PUT", &url, body, &[("x-amz-tagging", "foo=%FF")]);
         assert_eq!(status, 400, "body: {body_text}");
         assert_error_code(&body_text, "InvalidTag");
         cleanup(&bucket).await;
@@ -797,8 +779,7 @@ fn test_put_object_tagging_header_bad_percent_encoding() {
         let url = format!("{}/{}/{}", CTX.endpoint(), bucket, key);
         let body = b"hello";
         // %ZZ is not valid hex
-        let (status, body_text) =
-            send_signed("PUT", &url, body, &[("x-amz-tagging", "foo=%ZZ")]);
+        let (status, body_text) = send_signed("PUT", &url, body, &[("x-amz-tagging", "foo=%ZZ")]);
         assert_eq!(status, 400, "body: {body_text}");
         assert_error_code(&body_text, "InvalidArgument");
         // Clean up: key was not created, just delete bucket
@@ -815,8 +796,7 @@ fn test_put_object_tagging_header_truncated_percent() {
         let url = format!("{}/{}/{}", CTX.endpoint(), bucket, key);
         let body = b"hello";
         // %A is incomplete (needs two hex digits)
-        let (status, body_text) =
-            send_signed("PUT", &url, body, &[("x-amz-tagging", "foo=%A")]);
+        let (status, body_text) = send_signed("PUT", &url, body, &[("x-amz-tagging", "foo=%A")]);
         assert_eq!(status, 400, "body: {body_text}");
         assert_error_code(&body_text, "InvalidArgument");
         cleanup(&bucket).await;

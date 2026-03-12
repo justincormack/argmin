@@ -102,11 +102,7 @@ impl S3Request {
     /// Production streaming writes don't reassemble into S3Request.
     #[cfg(test)]
     #[must_use]
-    pub(crate) fn with_decoded_body(
-        &self,
-        body: Vec<u8>,
-        trailers: Vec<(String, String)>,
-    ) -> Self {
+    pub(crate) fn with_decoded_body(&self, body: Vec<u8>, trailers: Vec<(String, String)>) -> Self {
         let mut headers: Vec<(String, String)> = self
             .headers
             .iter()
@@ -242,12 +238,14 @@ pub(crate) fn parse_copy_source(
         reason: "Invalid copy source object key".to_string(),
     })?;
 
-    let bucket = percent_decode_strict(&s[..slash_pos]).map_err(|_| ServerError::InvalidArgument {
-        reason: "Invalid copy source object key".to_string(),
-    })?;
-    let key = percent_decode_strict(&s[slash_pos + 1..]).map_err(|_| ServerError::InvalidArgument {
-        reason: "Invalid copy source object key".to_string(),
-    })?;
+    let bucket =
+        percent_decode_strict(&s[..slash_pos]).map_err(|_| ServerError::InvalidArgument {
+            reason: "Invalid copy source object key".to_string(),
+        })?;
+    let key =
+        percent_decode_strict(&s[slash_pos + 1..]).map_err(|_| ServerError::InvalidArgument {
+            reason: "Invalid copy source object key".to_string(),
+        })?;
 
     if key.is_empty() {
         return Err(ServerError::InvalidArgument {

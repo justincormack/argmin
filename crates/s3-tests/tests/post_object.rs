@@ -1,7 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ring::hmac;
-use s3_tests::{CTX, unique_bucket};
+use s3_tests::{unique_bucket, CTX};
 
 /// Create a bucket, returning its name.
 async fn setup_bucket() -> String {
@@ -2183,16 +2183,12 @@ fn test_post_object_tags_authenticated_request() {
 
         let tag_set = result.tag_set();
         assert_eq!(tag_set.len(), 2);
-        assert!(
-            tag_set
-                .iter()
-                .any(|t| t.key() == "env" && t.value() == "staging")
-        );
-        assert!(
-            tag_set
-                .iter()
-                .any(|t| t.key() == "cost-center" && t.value() == "123")
-        );
+        assert!(tag_set
+            .iter()
+            .any(|t| t.key() == "env" && t.value() == "staging"));
+        assert!(tag_set
+            .iter()
+            .any(|t| t.key() == "cost-center" && t.value() == "123"));
 
         client
             .delete_object()
