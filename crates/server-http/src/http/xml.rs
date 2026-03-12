@@ -314,12 +314,11 @@ pub fn parse_delete_objects_xml(
     let mut search_from = 0;
     while let Some(start) = text[search_from..].find("<Object>") {
         let abs_start = search_from + start + "<Object>".len();
-        let end =
-            text[abs_start..]
-                .find("</Object>")
-                .ok_or_else(|| ServerError::MalformedXML {
-                    reason: "unclosed <Object> element".to_string(),
-                })?;
+        let end = text[abs_start..]
+            .find("</Object>")
+            .ok_or_else(|| ServerError::MalformedXML {
+                reason: "unclosed <Object> element".to_string(),
+            })?;
         let block = &text[abs_start..abs_start + end];
 
         let key = extract_tag_content(block, "Key").ok_or_else(|| ServerError::MalformedXML {
@@ -789,6 +788,31 @@ fn extract_all_tag_contents(xml: &str, tag: &str) -> Vec<String> {
     results
 }
 
+fn extract_tag_blocks_in_tag_set(tag_set: &str) -> Result<Vec<String>, ServerError> {
+    let open = "<Tag>";
+    let close = "</Tag>";
+    let mut results = Vec::new();
+    let mut remaining = tag_set.trim();
+
+    while !remaining.is_empty() {
+        let Some(rest) = remaining.strip_prefix(open) else {
+            return Err(ServerError::MalformedXML {
+                reason: "unexpected content in <TagSet> element".to_string(),
+            });
+        };
+        let Some(end_pos) = rest.find(close) else {
+            return Err(ServerError::MalformedXML {
+                reason: "unclosed <Tag> element in tagging XML".to_string(),
+            });
+        };
+
+        results.push(rest[..end_pos].to_string());
+        remaining = rest[end_pos + close.len()..].trim_start();
+    }
+
+    Ok(results)
+}
+
 /// Format a `CopyObjectResult` XML response.
 #[must_use]
 pub fn copy_object_result_xml(etag: &str, last_modified: u64) -> String {
@@ -864,17 +888,16 @@ pub fn parse_tagging_xml(
     })?;
 
     // Require both wrapper elements
-    let tagging_block =
-        extract_tag_content(text, "Tagging").ok_or(ServerError::MalformedXML {
-            reason: "missing <Tagging> element in tagging XML".to_string(),
-        })?;
+    let tagging_block = extract_tag_content(text, "Tagging").ok_or(ServerError::MalformedXML {
+        reason: "missing <Tagging> element in tagging XML".to_string(),
+    })?;
     let tag_set =
         extract_tag_content(tagging_block, "TagSet").ok_or(ServerError::MalformedXML {
             reason: "missing <TagSet> element in tagging XML".to_string(),
         })?;
 
-    // Extract all <Tag> blocks
-    let tag_blocks = extract_all_tag_contents(tag_set, "Tag");
+    // Extract all <Tag> blocks and reject malformed or unexpected nested content.
+    let tag_blocks = extract_tag_blocks_in_tag_set(tag_set)?;
 
     if tag_blocks.len() > max_tags {
         return Err(ServerError::InvalidTag {
@@ -2397,6 +2420,13 @@ mod tests {
     #[test]
     fn parse_tagging_xml_missing_tagset_element() {
         let xml = b"<Tagging><Tag><Key>k</Key><Value>v</Value></Tag></Tagging>";
+        let err = parse_tagging_xml(xml, 10).unwrap_err();
+        assert!(matches!(err, ServerError::MalformedXML { .. }));
+    }
+
+    #[test]
+    fn parse_tagging_xml_unclosed_tag_rejected() {
+        let xml = b"<Tagging><TagSet><Tag><Key>env</Key><Value>staging</Value></TagSet></Tagging>";
         let err = parse_tagging_xml(xml, 10).unwrap_err();
         assert!(matches!(err, ServerError::MalformedXML { .. }));
     }

@@ -245,6 +245,14 @@ fn post_object(
     (status, body_str)
 }
 
+fn assert_error_code(body: &str, code: &str) {
+    let expected = format!("<Code>{code}</Code>");
+    assert!(
+        body.contains(&expected),
+        "expected {expected} in body: {body}"
+    );
+}
+
 // ── Basic upload ────────────────────────────────────────────────────────
 
 #[test]
@@ -2193,6 +2201,75 @@ fn test_post_object_tags_authenticated_request() {
             .send()
             .await
             .unwrap();
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_post_object_tags_malformed_xml() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "post-tagged-malformed";
+        let malformed_tagging_xml =
+            "<Tagging><TagSet><Tag><Key>env</Key><Value>staging</Value></TagSet></Tagging>";
+
+        let mut fields = sigv4_fields(
+            &bucket,
+            key,
+            &[serde_json::json!(["starts-with", "$tagging", ""])],
+        );
+        fields.push(("tagging".to_string(), malformed_tagging_xml.to_string()));
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+
+        let (status, body) = post_object(&bucket, &field_refs, b"data", "test.txt");
+        assert_eq!(status, 400, "expected 400, got {status}: {body}");
+        assert_error_code(&body, "MalformedXML");
+
+        let head = client.head_object().bucket(&bucket).key(key).send().await;
+        assert!(
+            head.is_err(),
+            "malformed tagging POST should not create object"
+        );
+
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_post_object_tags_duplicate_keys_rejected() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "post-tagged-duplicate";
+        let duplicate_tagging_xml = concat!(
+            "<Tagging><TagSet>",
+            "<Tag><Key>env</Key><Value>staging</Value></Tag>",
+            "<Tag><Key>env</Key><Value>prod</Value></Tag>",
+            "</TagSet></Tagging>"
+        );
+
+        let mut fields = sigv4_fields(
+            &bucket,
+            key,
+            &[serde_json::json!(["starts-with", "$tagging", ""])],
+        );
+        fields.push(("tagging".to_string(), duplicate_tagging_xml.to_string()));
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+
+        let (status, body) = post_object(&bucket, &field_refs, b"data", "test.txt");
+        assert_eq!(status, 400, "expected 400, got {status}: {body}");
+        assert_error_code(&body, "InvalidTag");
+
+        let head = client.head_object().bucket(&bucket).key(key).send().await;
+        assert!(head.is_err(), "duplicate-tag POST should not create object");
+
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
 }
