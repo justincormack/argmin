@@ -149,6 +149,18 @@ CREATE TABLE IF NOT EXISTS stream_object_chunks (
     PRIMARY KEY (bucket, key, version_id, chunk_index)
 )";
 
+/// Durable reclaim queue for simple single-shard-set payload generations.
+const CREATE_SIMPLE_PAYLOAD_RECLAIMS_TABLE: &str = "\
+CREATE TABLE IF NOT EXISTS simple_payload_reclaims (
+    bucket        TEXT NOT NULL,
+    key           TEXT NOT NULL,
+    generation_id INTEGER NOT NULL CHECK (generation_id > 0),
+    ec_k          INTEGER NOT NULL,
+    ec_m          INTEGER NOT NULL,
+    created_at    INTEGER NOT NULL,
+    PRIMARY KEY (bucket, key, generation_id)
+)";
+
 /// Committed chunk manifest for multipart parts.
 const CREATE_MULTIPART_PART_CHUNKS_TABLE: &str = "\
 CREATE TABLE IF NOT EXISTS multipart_part_chunks (
@@ -222,6 +234,7 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(CREATE_STREAM_UPLOADS_TABLE, [])?;
     conn.execute(CREATE_STREAM_UPLOAD_CHUNKS_TABLE, [])?;
     conn.execute(CREATE_STREAM_OBJECT_CHUNKS_TABLE, [])?;
+    conn.execute(CREATE_SIMPLE_PAYLOAD_RECLAIMS_TABLE, [])?;
     conn.execute(CREATE_MULTIPART_PART_CHUNKS_TABLE, [])?;
     conn.execute(CREATE_MULTIPART_PART_CHUNKS_VERSION_INDEX, [])?;
     conn.execute(CREATE_BUCKETS_TABLE, [])?;

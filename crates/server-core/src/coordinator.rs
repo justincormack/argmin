@@ -12,9 +12,9 @@ use storage::{
     CreateStreamUploadReq, EcShape, GenerationId, ListMultipartUploadsReq, ListObjectVersionsReq,
     ListObjectsReq, ListPartsReq, LiveObjectRecord, MultipartPartChunkRecord, MultipartPartRecord,
     MultipartUploadRecord, ObjectKey, ObjectLayout, ObjectPartRecord, PutDeleteMarkerReq,
-    PutLiveObjectReq, PutObjectReq, SessionId, ShardKey, SharedStorageNode, StoredObject,
-    StreamObjectChunkRecord, StreamUploadChunkRecord, StreamUploadState, StreamUploadTarget,
-    UploadId, UploadState,
+    PutLiveObjectReq, PutObjectReq, SessionId, ShardKey, SharedStorageNode,
+    SimplePayloadReclaimRecord, StoredObject, StreamObjectChunkRecord, StreamUploadChunkRecord,
+    StreamUploadState, StreamUploadTarget, UploadId, UploadState,
 };
 
 use crate::conditional::{
@@ -113,6 +113,7 @@ struct ReadRuntime {
     storage_node: Arc<SharedStorageNode>,
     ec_codec: Arc<ErasureCodec>,
     ec_config: EcConfig,
+    pg_topology: PgTopology,
 }
 
 #[derive(Debug, Clone)]
@@ -137,6 +138,17 @@ struct PartShardReader {
     bucket: String,
     key: String,
     record: ObjectPartRecord,
+    next_offset: usize,
+    end_offset: usize,
+}
+
+struct ShardSetReader {
+    runtime: ReadRuntime,
+    bucket: String,
+    key: String,
+    okh: [u8; 16],
+    generation_id: GenerationId,
+    record: LiveObjectRecord,
     next_offset: usize,
     end_offset: usize,
 }
@@ -173,9 +185,40 @@ struct MultipartReader {
 }
 
 enum ReadHandleInner {
+    Shard(ShardSetReader),
     ChunkManifest(ChunkListReader),
     Multipart(MultipartReader),
     TestBuffered(Option<Vec<u8>>),
+}
+
+struct SimplePayloadLease {
+    runtime: ReadRuntime,
+    bucket: String,
+    key: String,
+    generation_id: GenerationId,
+}
+
+impl Drop for SimplePayloadLease {
+    fn drop(&mut self) {
+        if self.storage_node().release_simple_payload_lease(
+            &self.bucket,
+            &self.key,
+            self.generation_id,
+        ) == 0
+        {
+            let _ = self.runtime.try_reclaim_simple_payload(
+                &self.bucket,
+                &self.key,
+                self.generation_id,
+            );
+        }
+    }
+}
+
+impl SimplePayloadLease {
+    fn storage_node(&self) -> &SharedStorageNode {
+        &self.runtime.storage_node
+    }
 }
 
 /// Core-owned streaming object body.
@@ -183,6 +226,7 @@ pub struct ReadHandle {
     bucket: String,
     key: String,
     inner: ReadHandleInner,
+    lease: Option<SimplePayloadLease>,
     expected_size: usize,
     bytes_emitted: usize,
     expected_crc64: Option<u64>,
@@ -194,6 +238,7 @@ impl std::fmt::Debug for ReadHandle {
         f.debug_struct("ReadHandle")
             .field("bucket", &self.bucket)
             .field("key", &self.key)
+            .field("has_lease", &self.lease.is_some())
             .field("expected_size", &self.expected_size)
             .field("bytes_emitted", &self.bytes_emitted)
             .field("expected_crc64", &self.expected_crc64)
@@ -286,6 +331,7 @@ impl ReadHandle {
         Self {
             bucket: bucket.to_string(),
             key: key.to_string(),
+            lease: None,
             expected_size,
             bytes_emitted: 0,
             expected_crc64,
@@ -313,6 +359,7 @@ impl ReadHandle {
         Self {
             bucket: bucket.to_string(),
             key: key.to_string(),
+            lease: None,
             expected_size,
             bytes_emitted: 0,
             expected_crc64: None,
@@ -338,6 +385,7 @@ impl ReadHandle {
         Self {
             bucket: bucket.to_string(),
             key: key.to_string(),
+            lease: None,
             expected_size,
             bytes_emitted: 0,
             expected_crc64: None,
@@ -365,6 +413,7 @@ impl ReadHandle {
         Self {
             bucket: bucket.to_string(),
             key: key.to_string(),
+            lease: None,
             expected_size,
             bytes_emitted: 0,
             expected_crc64: None,
@@ -386,7 +435,69 @@ impl ReadHandle {
             bucket: "<buffered>".to_string(),
             key: "<buffered>".to_string(),
             inner: ReadHandleInner::TestBuffered(Some(data)),
+            lease: None,
             expected_size: len,
+            bytes_emitted: 0,
+            expected_crc64: None,
+            crc64: checksum::crc64::Hasher::new(),
+        }
+    }
+
+    fn from_shard_set(
+        runtime: &ReadRuntime,
+        bucket: &str,
+        key: &str,
+        okh: [u8; 16],
+        record: &LiveObjectRecord,
+    ) -> Self {
+        let generation_id = record.generation_id;
+        let expected_size = record.size as usize;
+        Self {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            inner: ReadHandleInner::Shard(ShardSetReader {
+                runtime: runtime.clone(),
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                okh,
+                generation_id,
+                record: record.clone(),
+                next_offset: 0,
+                end_offset: expected_size,
+            }),
+            lease: Some(runtime.acquire_simple_payload_lease(bucket, key, generation_id)),
+            expected_size,
+            bytes_emitted: 0,
+            expected_crc64: Some(record.etag.crc64()),
+            crc64: checksum::crc64::Hasher::new(),
+        }
+    }
+
+    fn from_shard_set_range(
+        runtime: &ReadRuntime,
+        bucket: &str,
+        key: &str,
+        okh: [u8; 16],
+        record: &LiveObjectRecord,
+        start: usize,
+        end: usize,
+    ) -> Self {
+        let generation_id = record.generation_id;
+        Self {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            inner: ReadHandleInner::Shard(ShardSetReader {
+                runtime: runtime.clone(),
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                okh,
+                generation_id,
+                record: record.clone(),
+                next_offset: start,
+                end_offset: end + 1,
+            }),
+            lease: Some(runtime.acquire_simple_payload_lease(bucket, key, generation_id)),
+            expected_size: end - start + 1,
             bytes_emitted: 0,
             expected_crc64: None,
             crc64: checksum::crc64::Hasher::new(),
@@ -399,6 +510,7 @@ impl ReadHandle {
         }
 
         let next = match &mut self.inner {
+            ReadHandleInner::Shard(reader) => reader.next_chunk(target_size),
             ReadHandleInner::ChunkManifest(reader) => reader.next_chunk(target_size),
             ReadHandleInner::Multipart(reader) => reader.next_chunk(target_size),
             ReadHandleInner::TestBuffered(data) => Ok(data.take()),
@@ -1268,6 +1380,178 @@ fn maybe_run_multipart_delete_metadata_hook(bucket: &str, key: &str) {
 }
 
 impl ReadRuntime {
+    fn acquire_simple_payload_lease(
+        &self,
+        bucket: &str,
+        key: &str,
+        generation_id: GenerationId,
+    ) -> SimplePayloadLease {
+        self.storage_node
+            .acquire_simple_payload_lease(bucket, key, generation_id);
+        SimplePayloadLease {
+            runtime: self.clone(),
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            generation_id,
+        }
+    }
+
+    fn try_reclaim_simple_payload(
+        &self,
+        bucket: &str,
+        key: &str,
+        generation_id: GenerationId,
+    ) -> Result<(), ServerError> {
+        if self
+            .storage_node
+            .simple_payload_lease_count(bucket, key, generation_id)
+            != 0
+        {
+            return Ok(());
+        }
+
+        let meta_pg_id = self.pg_topology.object_pg(bucket, key);
+        let reclaim = {
+            let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
+            meta_pg.get_simple_payload_reclaim(bucket, key, generation_id)?
+        };
+
+        let Some(reclaim) = reclaim else {
+            return Ok(());
+        };
+
+        let shard_pg_id = self.pg_topology.shard_pg(bucket, key, generation_id.get());
+        let (meta_guard, shard_guard) = self.storage_node.lock_two_pgs(meta_pg_id, shard_pg_id)?;
+        let meta_pg: &storage::PgStore = &meta_guard;
+        let shard_pg: &storage::PgStore = shard_guard.as_deref().unwrap_or(meta_pg);
+
+        if self
+            .storage_node
+            .simple_payload_lease_count(bucket, key, generation_id)
+            != 0
+        {
+            return Ok(());
+        }
+
+        if meta_pg
+            .get_simple_payload_reclaim(bucket, key, generation_id)?
+            .is_none()
+        {
+            return Ok(());
+        }
+
+        let okh = object_key_hash(bucket, key);
+        let total = reclaim.ec.k as usize + reclaim.ec.m as usize;
+        for i in 0..total {
+            let shard_key = ShardKey::new(&okh, generation_id.get(), i as u8);
+            shard_pg.delete_shard(&shard_key)?;
+        }
+        meta_pg.delete_simple_payload_reclaim(bucket, key, generation_id)?;
+        Ok(())
+    }
+
+    fn read_data_shards(
+        &self,
+        pg: &storage::PgStore,
+        okh: &[u8; 16],
+        generation_id: GenerationId,
+        record: &LiveObjectRecord,
+        needed: &[usize],
+    ) -> Result<(Vec<Vec<u8>>, usize), ServerError> {
+        let k = record.ec.k as usize;
+        let m = record.ec.m as usize;
+
+        let mut result_shards: Vec<Option<Vec<u8>>> = Vec::with_capacity(needed.len());
+        let mut all_present = true;
+        let mut shard_size = 0;
+
+        for &idx in needed {
+            let shard_key = ShardKey::new(okh, generation_id.get(), idx as u8);
+            if let Ok(sd) = pg.read_shard(&shard_key) {
+                shard_size = sd.data.len();
+                result_shards.push(Some(sd.data));
+            } else {
+                all_present = false;
+                result_shards.push(None);
+            }
+        }
+
+        if all_present {
+            let shards: Vec<Vec<u8>> = result_shards.into_iter().map(Option::unwrap).collect();
+            if shards.is_empty() {
+                return Ok((shards, 0));
+            }
+            return Ok((shards, shard_size));
+        }
+
+        let mut all_shards: Vec<Option<Vec<u8>>> = Vec::with_capacity(k + m);
+        let mut present_count = 0;
+        for i in 0..(k + m) {
+            let shard_key = ShardKey::new(okh, generation_id.get(), i as u8);
+            match pg.read_shard(&shard_key) {
+                Ok(sd) => {
+                    shard_size = sd.data.len();
+                    all_shards.push(Some(sd.data));
+                    present_count += 1;
+                }
+                Err(_) => all_shards.push(None),
+            }
+        }
+
+        if present_count < k {
+            return Err(ServerError::Store(storage::StoreError::NotFound));
+        }
+
+        let missing_needed: Vec<usize> = needed
+            .iter()
+            .copied()
+            .filter(|&i| all_shards[i].is_none())
+            .collect();
+        if !missing_needed.is_empty() {
+            let present_indices: Vec<usize> =
+                (0..(k + m)).filter(|&i| all_shards[i].is_some()).collect();
+            let present_refs: Vec<&[u8]> = present_indices
+                .iter()
+                .map(|&i| all_shards[i].as_ref().unwrap().as_slice())
+                .collect();
+
+            let tmp_codec;
+            let codec = if record.ec.k == self.ec_config.data_shards
+                && record.ec.m == self.ec_config.parity_shards
+            {
+                &self.ec_codec
+            } else {
+                let ec_config = EcConfig::new(record.ec.k, record.ec.m)?;
+                tmp_codec = ErasureCodec::new(ec_config)?;
+                &tmp_codec
+            };
+
+            let mut outputs: Vec<Vec<u8>> = missing_needed
+                .iter()
+                .map(|_| vec![0u8; shard_size])
+                .collect();
+            let mut output_refs: Vec<&mut [u8]> = outputs
+                .iter_mut()
+                .map(std::vec::Vec::as_mut_slice)
+                .collect();
+            codec.reconstruct(
+                &present_indices,
+                &present_refs,
+                &missing_needed,
+                &mut output_refs,
+            )?;
+            for (idx, &missing_idx) in missing_needed.iter().enumerate() {
+                all_shards[missing_idx] = Some(outputs[idx].clone());
+            }
+        }
+
+        let shards: Vec<Vec<u8>> = needed
+            .iter()
+            .map(|&i| all_shards[i].take().unwrap())
+            .collect();
+        Ok((shards, shard_size))
+    }
+
     fn read_part_range(
         &self,
         part: &ObjectPartRecord,
@@ -1476,6 +1760,43 @@ impl ReadRuntime {
     }
 }
 
+impl ShardSetReader {
+    fn next_chunk(&mut self, target_size: usize) -> Result<Option<Vec<u8>>, ServerError> {
+        if self.next_offset >= self.end_offset {
+            return Ok(None);
+        }
+        let end = (self.next_offset + target_size).min(self.end_offset) - 1;
+        let shard_pg_id =
+            self.runtime
+                .pg_topology
+                .shard_pg(&self.bucket, &self.key, self.generation_id.get());
+        let pg = self.runtime.storage_node.get_pg(shard_pg_id)?;
+        let shard_size = compute_shard_size(self.record.size, self.record.ec.k);
+        let needed = shards_for_byte_range(self.next_offset, end, shard_size, self.record.ec.k);
+        let (shard_data, _) = self
+            .runtime
+            .read_data_shards(&pg, &self.okh, self.generation_id, &self.record, &needed)
+            .map_err(|e| match e {
+                ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
+                    bucket: self.bucket.clone(),
+                    key: self.key.clone(),
+                },
+                other => other,
+            })?;
+        let first_shard = needed[0];
+        let buf_start = first_shard * shard_size;
+        let mut buf = Vec::with_capacity(shard_data.len() * shard_size);
+        for shard in &shard_data {
+            buf.extend_from_slice(shard);
+        }
+        let local_start = self.next_offset - buf_start;
+        let local_end = (end - buf_start).min(buf.len() - 1);
+        let out = buf[local_start..=local_end].to_vec();
+        self.next_offset = end + 1;
+        Ok(Some(out))
+    }
+}
+
 impl PartShardReader {
     fn next_chunk(&mut self, target_size: usize) -> Result<Option<Vec<u8>>, ServerError> {
         if self.next_offset >= self.end_offset {
@@ -1645,6 +1966,13 @@ impl Coordinator {
         )
     }
 
+    fn now_millis() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    }
+
     fn authorize_bucket_read_requester(
         &self,
         requester: Requester<'_>,
@@ -1712,6 +2040,7 @@ impl Coordinator {
             storage_node: Arc::clone(&self.storage_node),
             ec_codec: Arc::clone(&self.ec_codec),
             ec_config: self.ec_config,
+            pg_topology: self.pg_topology.clone(),
         }
     }
 
@@ -2773,6 +3102,11 @@ impl Coordinator {
             VersionId::Null
         };
         let generation_id = meta_guard.next_generation_id(bucket, key)?;
+        let stale_payload = if version_id.is_null() {
+            Self::snapshot_overwritten_null_version_payload(&meta_guard, bucket, key)?
+        } else {
+            None
+        };
 
         // Build committed chunk manifest from staging rows and validate total_size.
         let staging_chunks = meta_guard
@@ -2823,6 +3157,21 @@ impl Coordinator {
                 &committed_chunks,
             )
             .map_err(ServerError::Metadata)?;
+
+        if let Some(StaleObjectPayload::Simple { .. }) = stale_payload.as_ref() {
+            Self::delete_stale_object_payload_metadata(
+                &meta_guard,
+                bucket,
+                key,
+                version_id,
+                stale_payload.as_ref().unwrap(),
+            )?;
+        }
+
+        drop(meta_guard);
+        if let Some(StaleObjectPayload::Simple { .. }) = stale_payload.as_ref() {
+            let _ = self.delete_stale_object_payload(bucket, key, stale_payload.as_ref().unwrap());
+        }
 
         Ok(PutObjectResult {
             etag: format_etag(crc64),
@@ -3847,7 +4196,15 @@ impl Coordinator {
         payload: &StaleObjectPayload,
     ) -> Result<(), ServerError> {
         match payload {
-            StaleObjectPayload::Simple { .. } => Ok(()),
+            StaleObjectPayload::Simple { generation_id, ec } => meta_pg
+                .put_simple_payload_reclaim(&SimplePayloadReclaimRecord {
+                    bucket: BucketName::from(bucket),
+                    key: ObjectKey::from(key),
+                    generation_id: *generation_id,
+                    ec: *ec,
+                    created_at: Self::now_millis(),
+                })
+                .map_err(ServerError::Metadata),
             StaleObjectPayload::ChunkManifest { .. } => meta_pg
                 .delete_stream_object_chunks(bucket, key, version_id)
                 .map_err(ServerError::Metadata),
@@ -3873,17 +4230,9 @@ impl Coordinator {
         payload: &StaleObjectPayload,
     ) -> Result<(), ServerError> {
         match payload {
-            StaleObjectPayload::Simple { generation_id, ec } => {
-                let okh = object_key_hash(bucket, key);
-                let shard_pg_id = self.shard_pg_id(bucket, key, *generation_id);
-                let pg = self.storage_node.get_pg(shard_pg_id)?;
-                let total = ec.k as usize + ec.m as usize;
-                for i in 0..total {
-                    let shard_key = ShardKey::new(&okh, generation_id.get(), i as u8);
-                    pg.delete_shard(&shard_key)?;
-                }
-                Ok(())
-            }
+            StaleObjectPayload::Simple { generation_id, .. } => self
+                .read_runtime()
+                .try_reclaim_simple_payload(bucket, key, *generation_id),
             StaleObjectPayload::ChunkManifest { chunks } => self.delete_chunk_shards(chunks),
             StaleObjectPayload::Multipart {
                 parts,
@@ -3896,6 +4245,24 @@ impl Coordinator {
                 Ok(())
             }
         }
+    }
+
+    fn enqueue_simple_payload_reclaim(
+        meta_pg: &storage::PgStore,
+        bucket: &str,
+        key: &str,
+        generation_id: GenerationId,
+        ec: EcShape,
+    ) -> Result<(), ServerError> {
+        meta_pg
+            .put_simple_payload_reclaim(&SimplePayloadReclaimRecord {
+                bucket: BucketName::from(bucket),
+                key: ObjectKey::from(key),
+                generation_id,
+                ec,
+                created_at: Self::now_millis(),
+            })
+            .map_err(ServerError::Metadata)
     }
 
     /// Delete all shards for a list of object parts.
@@ -4061,38 +4428,10 @@ impl Coordinator {
                 )
             } else {
                 let okh = object_key_hash(bucket, key);
-                let shard_pg = pgs.shard();
-                let user_data = self
-                    .read_range(
-                        shard_pg,
-                        &okh,
-                        record.generation_id,
-                        &record,
-                        0,
-                        user_size - 1,
-                    )
-                    .map_err(|e| match e {
-                        ServerError::Store(storage::StoreError::NotFound) => {
-                            ServerError::ObjectNotFound {
-                                bucket: bucket.to_string(),
-                                key: key.to_string(),
-                            }
-                        }
-                        other => other,
-                    })?;
+                let runtime = self.read_runtime();
+                let body = ReadHandle::from_shard_set(&runtime, bucket, key, okh, &record);
                 drop(pgs);
-
-                let actual_crc = checksum::crc64::checksum(&user_data);
-                if actual_crc != etag_crc {
-                    return Err(ServerError::IntegrityError {
-                        bucket: bucket.to_string(),
-                        key: key.to_string(),
-                        expected: etag_crc,
-                        actual: actual_crc,
-                    });
-                }
-
-                ReadHandle::from_buffered_bytes(user_data)
+                body
             };
 
             Ok(GetObjectResult {
@@ -4253,36 +4592,10 @@ impl Coordinator {
                 )
             } else {
                 let okh = object_key_hash(bucket, key);
-                let shard_pg = pgs.shard();
-                let data = self
-                    .read_range(
-                        shard_pg,
-                        &okh,
-                        record.generation_id,
-                        &record,
-                        0,
-                        user_size - 1,
-                    )
-                    .map_err(|e| match e {
-                        ServerError::Store(storage::StoreError::NotFound) => {
-                            ServerError::ObjectNotFound {
-                                bucket: bucket.to_string(),
-                                key: key.to_string(),
-                            }
-                        }
-                        other => other,
-                    })?;
+                let runtime = self.read_runtime();
+                let body = ReadHandle::from_shard_set(&runtime, bucket, key, okh, &record);
                 drop(pgs);
-                let actual_crc = checksum::crc64::checksum(&data);
-                if actual_crc != etag_crc {
-                    return Err(ServerError::IntegrityError {
-                        bucket: bucket.to_string(),
-                        key: key.to_string(),
-                        expected: etag_crc,
-                        actual: actual_crc,
-                    });
-                }
-                ReadHandle::from_buffered_bytes(data)
+                body
             };
 
             let metadata = record
@@ -4623,14 +4936,6 @@ impl Coordinator {
                     total_size: record.size,
                 })?;
 
-        let not_found = |e: ServerError| match e {
-            ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-            },
-            other => other,
-        };
-
         let (metadata, body) = if matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
             // Multipart: metadata from object row, data spans parts.
             let meta_pg = pgs.meta();
@@ -4675,19 +4980,18 @@ impl Coordinator {
 
             let body = if chunks.is_empty() {
                 let okh = object_key_hash(bucket, key);
-                let shard_pg = pgs.shard();
-                let d = self
-                    .read_range(
-                        shard_pg,
-                        &okh,
-                        record.generation_id,
-                        &record,
-                        user_start as usize,
-                        user_end as usize,
-                    )
-                    .map_err(not_found)?;
+                let runtime = self.read_runtime();
+                let body = ReadHandle::from_shard_set_range(
+                    &runtime,
+                    bucket,
+                    key,
+                    okh,
+                    &record,
+                    user_start as usize,
+                    user_end as usize,
+                );
                 drop(pgs);
-                ReadHandle::from_buffered_bytes(d)
+                body
             } else {
                 drop(pgs);
                 ReadHandle::from_chunk_manifest_range(
@@ -4770,7 +5074,6 @@ impl Coordinator {
                 };
 
                 let meta_pg = pgs.meta();
-                let shard_pg = pgs.shard();
 
                 // Check delete conditions
                 if !cond.is_empty() {
@@ -4822,16 +5125,20 @@ impl Coordinator {
                         .map_err(ServerError::Metadata)?;
 
                     if chunks.is_empty() {
-                        let okh = object_key_hash(bucket, key);
-                        let total = record.ec.k as usize + record.ec.m as usize;
-
-                        for i in 0..total {
-                            let shard_key =
-                                ShardKey::new(&okh, record.generation_id.get(), i as u8);
-                            shard_pg.delete_shard(&shard_key)?;
-                        }
-
+                        Self::enqueue_simple_payload_reclaim(
+                            meta_pg,
+                            bucket,
+                            key,
+                            record.generation_id,
+                            record.ec,
+                        )?;
                         meta_pg.delete_object_meta(bucket, key)?;
+                        drop(pgs);
+                        let _ = self.read_runtime().try_reclaim_simple_payload(
+                            bucket,
+                            key,
+                            record.generation_id,
+                        );
                     } else {
                         meta_pg
                             .delete_stream_object_chunks(bucket, key, vid)
@@ -4865,7 +5172,6 @@ impl Coordinator {
                 };
 
                 let meta_pg = pgs.meta();
-                let shard_pg = pgs.shard();
                 let is_delete_marker = stored.is_delete_marker();
 
                 // Delete shards if it's a live object (not a delete marker)
@@ -4924,13 +5230,24 @@ impl Coordinator {
                         });
                     }
 
-                    let okh = object_key_hash(bucket, key);
-                    let total = record.ec.k as usize + record.ec.m as usize;
-
-                    for i in 0..total {
-                        let shard_key = ShardKey::new(&okh, record.generation_id.get(), i as u8);
-                        shard_pg.delete_shard(&shard_key)?;
-                    }
+                    Self::enqueue_simple_payload_reclaim(
+                        meta_pg,
+                        bucket,
+                        key,
+                        record.generation_id,
+                        record.ec,
+                    )?;
+                    meta_pg.delete_object_version(bucket, key, vid)?;
+                    drop(pgs);
+                    let _ = self.read_runtime().try_reclaim_simple_payload(
+                        bucket,
+                        key,
+                        record.generation_id,
+                    );
+                    return Ok(DeleteObjectResult {
+                        version_id: vid,
+                        delete_marker: false,
+                    });
                 }
 
                 meta_pg.delete_object_version(bucket, key, vid)?;
@@ -5886,6 +6203,11 @@ impl Coordinator {
             VersionId::Null
         };
         let generation_id = meta_pg.next_generation_id(bucket, key)?;
+        let stale_payload = if version_id.is_null() {
+            Self::snapshot_overwritten_null_version_payload(&meta_pg, bucket, key)?
+        } else {
+            None
+        };
 
         // 7. Compute composite multipart ETag.
         let part_etags: Vec<&[u8]> = part_records.iter().map(|p| p.etag.as_slice()).collect();
@@ -6085,6 +6407,21 @@ impl Coordinator {
         meta_pg
             .complete_multipart_commit(upload_id, &obj_req, &object_parts)
             .map_err(ServerError::Metadata)?;
+
+        if let Some(StaleObjectPayload::Simple { .. }) = stale_payload.as_ref() {
+            Self::delete_stale_object_payload_metadata(
+                &meta_pg,
+                bucket,
+                key,
+                version_id,
+                stale_payload.as_ref().unwrap(),
+            )?;
+        }
+
+        drop(meta_pg);
+        if let Some(StaleObjectPayload::Simple { .. }) = stale_payload.as_ref() {
+            let _ = self.delete_stale_object_payload(bucket, key, stale_payload.as_ref().unwrap());
+        }
 
         Ok(CompleteMultipartUploadResult {
             etag: etag_str,
@@ -7508,7 +7845,7 @@ mod tests {
         delete_shard_on_disk(tmp.path(), "bucket", "obj3", 1, 4);
         delete_shard_on_disk(tmp.path(), "bucket", "obj3", 2, 4);
 
-        let err = coord
+        let obj = coord
             .get_object(&GetObjectRequest {
                 bucket: "bucket",
                 key: "obj3",
@@ -7516,7 +7853,8 @@ mod tests {
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
             })
-            .unwrap_err();
+            .unwrap();
+        let err = obj.body.into_bytes().unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
     }
 

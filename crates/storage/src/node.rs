@@ -6,6 +6,7 @@ use std::sync::{Mutex, MutexGuard};
 use crate::error::StoreError;
 use crate::pg_store::PgStore;
 use crate::traits::{ShardStore, StorageNode};
+use crate::types::GenerationId;
 
 /// A local storage node managing multiple PG stores.
 ///
@@ -84,6 +85,7 @@ pub struct SharedStorageNode {
     pg_id_list: Vec<u32>,
     data_dir: PathBuf,
     bucket_locks: Vec<Mutex<()>>,
+    simple_payload_leases: Mutex<HashMap<(String, String, GenerationId), usize>>,
 }
 
 const BUCKET_LOCK_STRIPES: usize = 256;
@@ -118,6 +120,7 @@ impl SharedStorageNode {
             pg_id_list,
             data_dir: data_dir.to_path_buf(),
             bucket_locks,
+            simple_payload_leases: Mutex::new(HashMap::new()),
         })
     }
 
@@ -155,6 +158,63 @@ impl SharedStorageNode {
             .get(&pg_id)
             .ok_or(StoreError::PgNotFound { pg_id })?;
         Ok(mutex.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Acquire an in-memory lease on a simple payload generation.
+    pub fn acquire_simple_payload_lease(
+        &self,
+        bucket: &str,
+        key: &str,
+        generation_id: GenerationId,
+    ) {
+        let mut leases = self
+            .simple_payload_leases
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *leases
+            .entry((bucket.to_string(), key.to_string(), generation_id))
+            .or_insert(0) += 1;
+    }
+
+    /// Release an in-memory lease on a simple payload generation.
+    ///
+    /// Returns the remaining active lease count after release.
+    pub fn release_simple_payload_lease(
+        &self,
+        bucket: &str,
+        key: &str,
+        generation_id: GenerationId,
+    ) -> usize {
+        let mut leases = self
+            .simple_payload_leases
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let entry = leases
+            .get_mut(&(bucket.to_string(), key.to_string(), generation_id))
+            .expect("simple payload lease release without acquire");
+        *entry -= 1;
+        let remaining = *entry;
+        if remaining == 0 {
+            leases.remove(&(bucket.to_string(), key.to_string(), generation_id));
+        }
+        remaining
+    }
+
+    /// Return the number of active simple-payload leases for a generation.
+    pub fn simple_payload_lease_count(
+        &self,
+        bucket: &str,
+        key: &str,
+        generation_id: GenerationId,
+    ) -> usize {
+        let leases = self
+            .simple_payload_leases
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        leases
+            .get(&(bucket.to_string(), key.to_string(), generation_id))
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Lock two PGs for operations that span a metadata PG and a shard PG.

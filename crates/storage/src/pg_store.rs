@@ -1407,7 +1407,11 @@ impl PgMetadataStore for PgStore {
         let max: Option<i64> = self
             .conn
             .query_row(
-                "SELECT MAX(generation_id) FROM objects WHERE bucket = ?1 AND key = ?2",
+                "SELECT MAX(generation_id) FROM (
+                     SELECT generation_id FROM objects WHERE bucket = ?1 AND key = ?2
+                     UNION ALL
+                     SELECT generation_id FROM simple_payload_reclaims WHERE bucket = ?1 AND key = ?2
+                 )",
                 params![bucket, key],
                 |row| row.get(0),
             )
@@ -1447,6 +1451,86 @@ impl PgMetadataStore for PgStore {
                 Box::from("next generation id must be nonzero"),
             ),
         })
+    }
+
+    fn put_simple_payload_reclaim(
+        &self,
+        reclaim: &SimplePayloadReclaimRecord,
+    ) -> Result<(), MetadataError> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO simple_payload_reclaims \
+                 (bucket, key, generation_id, ec_k, ec_m, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    reclaim.bucket,
+                    reclaim.key,
+                    reclaim.generation_id.get() as i64,
+                    reclaim.ec.k,
+                    reclaim.ec.m,
+                    reclaim.created_at as i64,
+                ],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "put simple payload reclaim",
+                source: e,
+            })?;
+        Ok(())
+    }
+
+    fn get_simple_payload_reclaim(
+        &self,
+        bucket: &str,
+        key: &str,
+        generation_id: GenerationId,
+    ) -> Result<Option<SimplePayloadReclaimRecord>, MetadataError> {
+        self.conn
+            .query_row(
+                "SELECT bucket, key, generation_id, ec_k, ec_m, created_at \
+                 FROM simple_payload_reclaims \
+                 WHERE bucket = ?1 AND key = ?2 AND generation_id = ?3",
+                params![bucket, key, generation_id.get() as i64],
+                |row| {
+                    Ok(SimplePayloadReclaimRecord {
+                        bucket: row.get(0)?,
+                        key: row.get(1)?,
+                        generation_id: Self::parse_generation_id(
+                            row.get::<_, i64>(2)?,
+                            2,
+                            "generation_id",
+                        )?,
+                        ec: EcShape {
+                            k: row.get(3)?,
+                            m: row.get(4)?,
+                        },
+                        created_at: row.get::<_, i64>(5)? as u64,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| MetadataError::Db {
+                context: "get simple payload reclaim",
+                source: e,
+            })
+    }
+
+    fn delete_simple_payload_reclaim(
+        &self,
+        bucket: &str,
+        key: &str,
+        generation_id: GenerationId,
+    ) -> Result<(), MetadataError> {
+        self.conn
+            .execute(
+                "DELETE FROM simple_payload_reclaims \
+                 WHERE bucket = ?1 AND key = ?2 AND generation_id = ?3",
+                params![bucket, key, generation_id.get() as i64],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "delete simple payload reclaim",
+                source: e,
+            })?;
+        Ok(())
     }
 
     fn put_object_tags(

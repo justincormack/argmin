@@ -160,6 +160,28 @@ pub trait PgMetadataStore {
     /// Returns 1 if no live object generations exist.
     fn next_generation_id(&self, bucket: &str, key: &str) -> Result<GenerationId, MetadataError>;
 
+    /// Insert a durable reclaim record for a simple single-shard-set payload.
+    fn put_simple_payload_reclaim(
+        &self,
+        reclaim: &SimplePayloadReclaimRecord,
+    ) -> Result<(), MetadataError>;
+
+    /// Look up a durable reclaim record for a simple payload generation.
+    fn get_simple_payload_reclaim(
+        &self,
+        bucket: &str,
+        key: &str,
+        generation_id: GenerationId,
+    ) -> Result<Option<SimplePayloadReclaimRecord>, MetadataError>;
+
+    /// Delete a durable reclaim record for a simple payload generation.
+    fn delete_simple_payload_reclaim(
+        &self,
+        bucket: &str,
+        key: &str,
+        generation_id: GenerationId,
+    ) -> Result<(), MetadataError>;
+
     /// Store tags for an object version (serialized XML string).
     fn put_object_tags(
         &self,

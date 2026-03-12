@@ -262,15 +262,15 @@ Status:
    `ReadHandle`
 3. `server-http` now adapts `ReadHandle` to a streaming Hyper body and holds
    the request permit for the full response lifetime
-4. important current nuance:
-   - multipart-manifest and chunk-manifest reads stream
-   - simple single-shard-set reads and ranges remain buffered for now
-   - this is intentional because chunked streaming of unversioned single-shard
-     objects exposed a real overwrite-consistency hole
-5. `CopyObject` and `UploadPartCopy` now reuse the same stepped reader
+4. all `GET` body paths now stream through `ReadHandle`, including simple
+   single-shard-set objects
+5. simple single-shard-set reads now acquire a retained-payload lease tied to
+   the `ReadHandle` lifetime, so overwrite/delete cannot reclaim the current
+   generation while the body is still being read
+6. `CopyObject` and `UploadPartCopy` now reuse the same stepped reader
    foundation for multipart-manifest and chunk-manifest source reads; simple
-   single-shard-set sources remain buffered for the same retained-generation
-   reason
+   single-shard-set sources remain buffered until the same lease model is
+   applied there too
 
 Proposed implementation shape:
 
@@ -433,9 +433,16 @@ Status:
    generation per write
 5. simple single-shard-set shard placement and shard keys now use
    `generation_id` rather than visible `VersionId`
-6. unversioned overwrite currently still performs immediate best-effort cleanup
-   of the displaced payload after install of the new current generation; lease-
-   based retention and deferred reclamation remain the next design step
+6. simple single-shard-set payloads now have:
+   - in-memory active leases in `SharedStorageNode`
+   - a durable `simple_payload_reclaims` table in metadata storage
+   - opportunistic foreground cleanup when the last lease drops
+7. normal `PutObject`, `CopyObject`, unversioned/simple `DeleteObject`,
+   version-specific simple deletes, and simple stale payloads displaced by
+   stream finalization or multipart completion now enqueue reclaim records
+   instead of deleting simple shard sets inline
+8. multipart-manifest and chunk-manifest payload reclamation are still on the
+   older immediate or leak-prone paths and remain the next design step
 
 ### Phase 5: Expand reclamation coverage
 
