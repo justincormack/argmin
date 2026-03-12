@@ -390,11 +390,10 @@ The important property is:
 Bucket-delete interaction:
 
 1. normal payload reclamation should happen in the background
-2. `DeleteBucket` should remain synchronous for now
-3. `DeleteBucket` should explicitly drain bucket-local reclaim work before
-   removing bucket metadata
-4. a bucket-lifecycle `Deleting` state is not required unless bucket deletion
-   itself later becomes asynchronous
+2. `DeleteBucket` should hide the bucket from users immediately and return
+   before background reclaim fully drains
+3. the bucket name must remain reserved until final background bucket removal
+4. this requires a durable bucket-lifecycle `Deleting` state
 
 One key design point:
 
@@ -571,15 +570,25 @@ Status:
    - reclaim roots remain durable in the metadata DB; only the scheduling path
      moved into the background
 4. the old mixed lock-order foreground reclaim path is gone
-5. `DeleteBucket` now synchronously drains bucket-scoped reclaim work:
+5. `DeleteBucket` is now asynchronous after the namespace-emptiness check:
    - it still rejects buckets with visible objects or in-progress uploads
-   - once the bucket is namespace-empty, it waits for bucket-scoped payload
-     leases to drain and sweeps any remaining durable reclaim roots before
-     removing the bucket row
-6. focused regression coverage now exists for eventual payload cleanup:
+   - it marks the bucket `Deleting`, making it immediately unavailable to
+     normal bucket and object operations
+   - it queues background bucket finalization rather than draining reclaim work
+     on the request path
+   - same-name bucket creation stays blocked while the `Deleting` row remains
+6. background bucket finalization now:
+   - enqueues any bucket-scoped reclaim roots it finds
+   - waits for reclaim roots and active payload leases to drain
+   - only then removes the bucket row
+7. focused regression coverage now exists for eventual payload cleanup:
    - simple single-shard-set delete eventually removes stale shards
    - chunk-manifest delete eventually removes stale chunk shards
    - multipart delete eventually removes stale part shard sets
+8. bucket lifecycle regression coverage now exists for:
+   - `DeleteBucket` returning before payload leases drain
+   - bucket invisibility during background deletion
+   - same-name bucket creation blocked while deletion is pending
 
 Required coordinator/storage changes for this design:
 
@@ -621,24 +630,24 @@ Add focused regression tests for:
 
 1. whether reclaim workers should remain per-coordinator or be consolidated to
    a single worker per shared storage node
-2. if bucket deletion is later made asynchronous, what the bucket lifecycle
-   state machine and user-visible semantics should be
 
 Resolved decisions:
 
 1. cleanup should run in a background thread by default
 2. tests should not assume immediate physical deletion of old shards; if they
    do, that is a test bug rather than intended behavior
-3. `DeleteBucket` should stay synchronous for now and drain bucket-local
-   reclaim work rather than becoming an asynchronous bucket lifecycle
+3. `DeleteBucket` now hides the bucket immediately, returns success before
+   reclaim fully drains, and keeps the bucket name reserved until background
+   finalization removes the row
 
 Additional follow-up:
 
 1. recent AWS behavior around bucket deletion while uploads still exist is a
    reminder that bucket lifecycle semantics are less tightly coupled than
    object lifecycle semantics and need explicit drain rules
-2. if bucket deletion is ever made asynchronous later, an explicit
-   bucket-lifecycle `Deleting` state will be required to block new operations
+2. AWS same-name bucket reuse timing may differ from the current local model,
+   so reuse-blocking should be validated as a local semantic guarantee rather
+   than assumed to be cross-compatible
 
 ## Recommendation Summary
 
@@ -646,5 +655,3 @@ Recommended next move:
 
 1. reassess whether the per-coordinator reclaim workers should be folded
    into a single worker per shared storage node
-2. if bucket deletion is later made asynchronous, introduce an explicit
-   bucket-lifecycle state before exposing that behavior

@@ -701,6 +701,25 @@ pub struct MultipartReclaimRecord {
     pub parts: Vec<MultipartReclaimPartRecord>,
 }
 
+/// Bucket lifecycle state.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BucketState {
+    Active = 0,
+    Deleting = 1,
+}
+
+impl BucketState {
+    #[must_use]
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Active),
+            1 => Some(Self::Deleting),
+            _ => None,
+        }
+    }
+}
+
 /// Bucket metadata.
 #[derive(Debug, Clone)]
 pub struct BucketInfo {
@@ -709,6 +728,7 @@ pub struct BucketInfo {
     /// Creation timestamp (unix milliseconds).
     pub created_at: u64,
     pub region: u16,
+    pub state: BucketState,
     pub versioning: BucketVersioningState,
     pub public_read: bool,
     /// Serialized CORS configuration XML (None = no CORS config).

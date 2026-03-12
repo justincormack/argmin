@@ -254,6 +254,27 @@ impl PgStore {
             .transpose()
     }
 
+    fn row_to_bucket_info(row: &rusqlite::Row<'_>) -> Result<BucketInfo, rusqlite::Error> {
+        Ok(BucketInfo {
+            name: row.get(0)?,
+            owner_principal: row.get(1)?,
+            created_at: row.get::<_, i64>(2)? as u64,
+            region: row.get::<_, i64>(3)? as u16,
+            state: Self::parse_enum(row.get::<_, u8>(4)?, 4, "state", BucketState::from_u8)?,
+            versioning: Self::parse_enum(
+                row.get::<_, u8>(5)?,
+                5,
+                "versioning",
+                BucketVersioningState::from_u8,
+            )?,
+            public_read: row.get::<_, i64>(6)? != 0,
+            cors_config: row.get(7)?,
+            tags: row.get(8)?,
+            public_access_block: row.get(9)?,
+            ownership_controls: row.get(10)?,
+        })
+    }
+
     /// Map a row with columns (bucket, key, version_id, generation_id, size,
     /// etag, etag_kind, last_modified, storage_class, ec_k, ec_m, status,
     /// tags, data_layout, parts_count, metadata_blob) to a StoredObject.
@@ -618,8 +639,14 @@ impl PgMetadataStore for PgStore {
     ) -> Result<(), MetadataError> {
         let now = PgStore::now_millis() as i64;
         let result = self.conn.execute(
-            "INSERT INTO buckets (name, owner_principal, created_at, public_read) VALUES (?1, ?2, ?3, ?4)",
-            params![name, owner_principal, now, i32::from(public_read)],
+            "INSERT INTO buckets (name, owner_principal, created_at, state, public_read) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                name,
+                owner_principal,
+                now,
+                BucketState::Active as u8,
+                i32::from(public_read)
+            ],
         );
         match result {
             Ok(_) => Ok(()),
@@ -652,29 +679,26 @@ impl PgMetadataStore for PgStore {
     }
 
     fn head_bucket(&self, name: &str) -> Result<BucketInfo, MetadataError> {
+        let info = self.head_bucket_raw(name)?;
+        if info.state != BucketState::Active {
+            return Err(MetadataError::BucketNotFound {
+                name: BucketName::from(name),
+            });
+        }
+        Ok(info)
+    }
+
+    fn head_bucket_raw(&self, name: &str) -> Result<BucketInfo, MetadataError> {
         self.conn
             .query_row(
-                "SELECT name, owner_principal, created_at, region, versioning, public_read, cors_config, tags, public_access_block, ownership_controls \
+                "SELECT name, owner_principal, created_at, region, state, versioning, public_read, cors_config, tags, public_access_block, ownership_controls \
                  FROM buckets WHERE name = ?1",
                 params![name],
-                |row| {
-                    Ok(BucketInfo {
-                        name: row.get(0)?,
-                        owner_principal: row.get(1)?,
-                        created_at: row.get::<_, i64>(2)? as u64,
-                        region: row.get::<_, i64>(3)? as u16,
-                        versioning: PgStore::parse_enum(row.get::<_, u8>(4)?, 4, "versioning", BucketVersioningState::from_u8)?,
-                        public_read: row.get::<_, i64>(5)? != 0,
-                        cors_config: row.get(6)?,
-                        tags: row.get(7)?,
-                        public_access_block: row.get(8)?,
-                        ownership_controls: row.get(9)?,
-                    })
-                },
+                Self::row_to_bucket_info,
             )
             .optional()
             .map_err(|e| MetadataError::Db {
-                context: "head bucket",
+                context: "head bucket raw",
                 source: e,
             })?
             .ok_or(MetadataError::BucketNotFound {
@@ -686,33 +710,18 @@ impl PgMetadataStore for PgStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT name, owner_principal, created_at, region, versioning, public_read, cors_config, tags, public_access_block, ownership_controls \
-                 FROM buckets WHERE owner_principal = ?1 ORDER BY name ASC",
+                "SELECT name, owner_principal, created_at, region, state, versioning, public_read, cors_config, tags, public_access_block, ownership_controls \
+                 FROM buckets WHERE owner_principal = ?1 AND state = ?2 ORDER BY name ASC",
             )
             .map_err(|e| MetadataError::Db {
                 context: "prepare list buckets",
                 source: e,
             })?;
         let rows = stmt
-            .query_map(params![owner_principal], |row| {
-                Ok(BucketInfo {
-                    name: row.get(0)?,
-                    owner_principal: row.get(1)?,
-                    created_at: row.get::<_, i64>(2)? as u64,
-                    region: row.get::<_, i64>(3)? as u16,
-                    versioning: PgStore::parse_enum(
-                        row.get::<_, u8>(4)?,
-                        4,
-                        "versioning",
-                        BucketVersioningState::from_u8,
-                    )?,
-                    public_read: row.get::<_, i64>(5)? != 0,
-                    cors_config: row.get(6)?,
-                    tags: row.get(7)?,
-                    public_access_block: row.get(8)?,
-                    ownership_controls: row.get(9)?,
-                })
-            })
+            .query_map(
+                params![owner_principal, BucketState::Active as u8],
+                Self::row_to_bucket_info,
+            )
             .map_err(|e| MetadataError::Db {
                 context: "list buckets query",
                 source: e,
@@ -726,6 +735,25 @@ impl PgMetadataStore for PgStore {
             })?);
         }
         Ok(buckets)
+    }
+
+    fn mark_bucket_deleting(&self, name: &str) -> Result<(), MetadataError> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE buckets SET state = ?1 WHERE name = ?2 AND state = ?3",
+                params![BucketState::Deleting as u8, name, BucketState::Active as u8],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "mark bucket deleting",
+                source: e,
+            })?;
+        if updated == 0 {
+            return Err(MetadataError::BucketNotFound {
+                name: BucketName::from(name),
+            });
+        }
+        Ok(())
     }
 
     fn put_bucket_versioning(

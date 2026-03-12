@@ -52,8 +52,15 @@ pub trait PgMetadataStore {
     /// Get bucket metadata.
     fn head_bucket(&self, name: &str) -> Result<BucketInfo, MetadataError>;
 
+    /// Get bucket metadata including non-active lifecycle states.
+    fn head_bucket_raw(&self, name: &str) -> Result<BucketInfo, MetadataError>;
+
     /// List all buckets owned by the given owner within this PG.
     fn list_buckets(&self, owner_principal: &str) -> Result<Vec<BucketInfo>, MetadataError>;
+
+    /// Mark a bucket as deleting so it is hidden from normal operations while
+    /// background cleanup drains outstanding reclaim work.
+    fn mark_bucket_deleting(&self, name: &str) -> Result<(), MetadataError>;
 
     /// Set bucket versioning state.
     ///

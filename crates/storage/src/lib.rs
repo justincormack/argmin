@@ -33,7 +33,7 @@ pub mod traits;
 pub mod types;
 
 pub use error::{MetadataError, StoreError};
-pub use node::{LocalStorageNode, SharedStorageNode};
+pub use node::{LocalStorageNode, ReclaimWorkItem, SharedStorageNode};
 pub use pg_store::PgStore;
 pub use traits::{PgMetadataStore, ShardStore, StorageNode};
 pub use types::*;

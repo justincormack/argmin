@@ -279,6 +279,7 @@ CREATE TABLE IF NOT EXISTS buckets (
     owner_principal  TEXT NOT NULL,
     created_at       INTEGER NOT NULL,
     region           INTEGER NOT NULL DEFAULT 0,
+    state            INTEGER NOT NULL DEFAULT 0 CHECK (state IN (0, 1)),
     versioning       INTEGER NOT NULL DEFAULT 0 CHECK (versioning IN (0, 1, 2)),
     public_read      INTEGER NOT NULL DEFAULT 0,
     cors_config      TEXT,

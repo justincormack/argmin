@@ -92,9 +92,16 @@ pub struct SharedStorageNode {
 
 type ReclaimRoot = (String, String, GenerationId);
 
+pub enum ReclaimWorkItem {
+    ObjectPayload(ReclaimRoot),
+    BucketDelete(String),
+}
+
 struct ReclaimQueueState {
-    queue: VecDeque<ReclaimRoot>,
-    queued: HashSet<ReclaimRoot>,
+    object_queue: VecDeque<ReclaimRoot>,
+    queued_objects: HashSet<ReclaimRoot>,
+    bucket_delete_queue: VecDeque<String>,
+    queued_bucket_deletes: HashSet<String>,
 }
 
 const BUCKET_LOCK_STRIPES: usize = 256;
@@ -132,8 +139,10 @@ impl SharedStorageNode {
             object_payload_leases: Mutex::new(HashMap::new()),
             reclaim_queue: (
                 Mutex::new(ReclaimQueueState {
-                    queue: VecDeque::new(),
-                    queued: HashSet::new(),
+                    object_queue: VecDeque::new(),
+                    queued_objects: HashSet::new(),
+                    bucket_delete_queue: VecDeque::new(),
+                    queued_bucket_deletes: HashSet::new(),
                 }),
                 Condvar::new(),
             ),
@@ -256,28 +265,43 @@ impl SharedStorageNode {
         let root = (bucket.to_string(), key.to_string(), generation_id);
         let (state_lock, cv) = &self.reclaim_queue;
         let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
-        if state.queued.insert(root.clone()) {
-            state.queue.push_back(root);
+        if state.queued_objects.insert(root.clone()) {
+            state.object_queue.push_back(root);
+            cv.notify_one();
+        }
+    }
+
+    /// Queue a bucket for deferred final deletion once reclaim is drained.
+    pub fn enqueue_bucket_delete_finalize(&self, bucket: &str) {
+        let (state_lock, cv) = &self.reclaim_queue;
+        let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let bucket = bucket.to_string();
+        if state.queued_bucket_deletes.insert(bucket.clone()) {
+            state.bucket_delete_queue.push_back(bucket);
             cv.notify_one();
         }
     }
 
     /// Block until reclaim work is available, or stop has been requested.
-    pub fn wait_for_object_payload_reclaim(
-        &self,
-        stop: &AtomicBool,
-    ) -> Option<(String, String, GenerationId)> {
+    pub fn wait_for_reclaim_work(&self, stop: &AtomicBool) -> Option<ReclaimWorkItem> {
         let (state_lock, cv) = &self.reclaim_queue;
         let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
-        while state.queue.is_empty() && !stop.load(Ordering::SeqCst) {
+        while state.object_queue.is_empty()
+            && state.bucket_delete_queue.is_empty()
+            && !stop.load(Ordering::SeqCst)
+        {
             state = cv.wait(state).unwrap_or_else(|e| e.into_inner());
         }
         if stop.load(Ordering::SeqCst) {
             return None;
         }
-        let root = state.queue.pop_front()?;
-        state.queued.remove(&root);
-        Some(root)
+        if let Some(root) = state.object_queue.pop_front() {
+            state.queued_objects.remove(&root);
+            return Some(ReclaimWorkItem::ObjectPayload(root));
+        }
+        let bucket = state.bucket_delete_queue.pop_front()?;
+        state.queued_bucket_deletes.remove(&bucket);
+        Some(ReclaimWorkItem::BucketDelete(bucket))
     }
 
     /// Wake reclaim workers so they can observe shutdown or new work.
