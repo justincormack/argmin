@@ -161,6 +161,34 @@ CREATE TABLE IF NOT EXISTS simple_payload_reclaims (
     PRIMARY KEY (bucket, key, generation_id)
 )";
 
+/// Durable reclaim queue for chunk-manifest payload generations.
+const CREATE_CHUNK_MANIFEST_RECLAIMS_TABLE: &str = "\
+CREATE TABLE IF NOT EXISTS chunk_manifest_reclaims (
+    bucket        TEXT NOT NULL,
+    key           TEXT NOT NULL,
+    generation_id INTEGER NOT NULL CHECK (generation_id > 0),
+    created_at    INTEGER NOT NULL,
+    PRIMARY KEY (bucket, key, generation_id)
+)";
+
+/// Child chunk rows for chunk-manifest reclaim generations.
+const CREATE_CHUNK_MANIFEST_RECLAIM_CHUNKS_TABLE: &str = "\
+CREATE TABLE IF NOT EXISTS chunk_manifest_reclaim_chunks (
+    bucket        TEXT NOT NULL,
+    key           TEXT NOT NULL,
+    generation_id INTEGER NOT NULL CHECK (generation_id > 0),
+    chunk_index   INTEGER NOT NULL,
+    chunk_okh     BLOB NOT NULL,
+    chunk_vid     INTEGER NOT NULL CHECK (chunk_vid > 0),
+    shard_pg_id   INTEGER NOT NULL,
+    ec_k          INTEGER NOT NULL,
+    ec_m          INTEGER NOT NULL,
+    PRIMARY KEY (bucket, key, generation_id, chunk_index),
+    FOREIGN KEY (bucket, key, generation_id)
+        REFERENCES chunk_manifest_reclaims(bucket, key, generation_id)
+        ON DELETE CASCADE
+)";
+
 /// Committed chunk manifest for multipart parts.
 const CREATE_MULTIPART_PART_CHUNKS_TABLE: &str = "\
 CREATE TABLE IF NOT EXISTS multipart_part_chunks (
@@ -235,6 +263,8 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(CREATE_STREAM_UPLOAD_CHUNKS_TABLE, [])?;
     conn.execute(CREATE_STREAM_OBJECT_CHUNKS_TABLE, [])?;
     conn.execute(CREATE_SIMPLE_PAYLOAD_RECLAIMS_TABLE, [])?;
+    conn.execute(CREATE_CHUNK_MANIFEST_RECLAIMS_TABLE, [])?;
+    conn.execute(CREATE_CHUNK_MANIFEST_RECLAIM_CHUNKS_TABLE, [])?;
     conn.execute(CREATE_MULTIPART_PART_CHUNKS_TABLE, [])?;
     conn.execute(CREATE_MULTIPART_PART_CHUNKS_VERSION_INDEX, [])?;
     conn.execute(CREATE_BUCKETS_TABLE, [])?;

@@ -182,6 +182,28 @@ pub trait PgMetadataStore {
         generation_id: GenerationId,
     ) -> Result<(), MetadataError>;
 
+    /// Insert a durable reclaim record for a chunk-manifest payload.
+    fn put_chunk_manifest_reclaim(
+        &self,
+        reclaim: &ChunkManifestReclaimRecord,
+    ) -> Result<(), MetadataError>;
+
+    /// Look up a durable reclaim record for a chunk-manifest payload generation.
+    fn get_chunk_manifest_reclaim(
+        &self,
+        bucket: &str,
+        key: &str,
+        generation_id: GenerationId,
+    ) -> Result<Option<ChunkManifestReclaimRecord>, MetadataError>;
+
+    /// Delete a durable reclaim record for a chunk-manifest payload generation.
+    fn delete_chunk_manifest_reclaim(
+        &self,
+        bucket: &str,
+        key: &str,
+        generation_id: GenerationId,
+    ) -> Result<(), MetadataError>;
+
     /// Store tags for an object version (serialized XML string).
     fn put_object_tags(
         &self,

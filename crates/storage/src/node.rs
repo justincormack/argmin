@@ -85,7 +85,7 @@ pub struct SharedStorageNode {
     pg_id_list: Vec<u32>,
     data_dir: PathBuf,
     bucket_locks: Vec<Mutex<()>>,
-    simple_payload_leases: Mutex<HashMap<(String, String, GenerationId), usize>>,
+    object_payload_leases: Mutex<HashMap<(String, String, GenerationId), usize>>,
 }
 
 const BUCKET_LOCK_STRIPES: usize = 256;
@@ -120,7 +120,7 @@ impl SharedStorageNode {
             pg_id_list,
             data_dir: data_dir.to_path_buf(),
             bucket_locks,
-            simple_payload_leases: Mutex::new(HashMap::new()),
+            object_payload_leases: Mutex::new(HashMap::new()),
         })
     }
 
@@ -160,15 +160,15 @@ impl SharedStorageNode {
         Ok(mutex.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
-    /// Acquire an in-memory lease on a simple payload generation.
-    pub fn acquire_simple_payload_lease(
+    /// Acquire an in-memory lease on an object payload generation.
+    pub fn acquire_object_payload_lease(
         &self,
         bucket: &str,
         key: &str,
         generation_id: GenerationId,
     ) {
         let mut leases = self
-            .simple_payload_leases
+            .object_payload_leases
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         *leases
@@ -176,22 +176,22 @@ impl SharedStorageNode {
             .or_insert(0) += 1;
     }
 
-    /// Release an in-memory lease on a simple payload generation.
+    /// Release an in-memory lease on an object payload generation.
     ///
     /// Returns the remaining active lease count after release.
-    pub fn release_simple_payload_lease(
+    pub fn release_object_payload_lease(
         &self,
         bucket: &str,
         key: &str,
         generation_id: GenerationId,
     ) -> usize {
         let mut leases = self
-            .simple_payload_leases
+            .object_payload_leases
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let entry = leases
             .get_mut(&(bucket.to_string(), key.to_string(), generation_id))
-            .expect("simple payload lease release without acquire");
+            .expect("object payload lease release without acquire");
         *entry -= 1;
         let remaining = *entry;
         if remaining == 0 {
@@ -200,15 +200,15 @@ impl SharedStorageNode {
         remaining
     }
 
-    /// Return the number of active simple-payload leases for a generation.
-    pub fn simple_payload_lease_count(
+    /// Return the number of active object-payload leases for a generation.
+    pub fn object_payload_lease_count(
         &self,
         bucket: &str,
         key: &str,
         generation_id: GenerationId,
     ) -> usize {
         let leases = self
-            .simple_payload_leases
+            .object_payload_leases
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         leases

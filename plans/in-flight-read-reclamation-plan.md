@@ -456,8 +456,13 @@ Status:
    version-specific simple deletes, and simple stale payloads displaced by
    stream finalization or multipart completion now enqueue reclaim records
    instead of deleting simple shard sets inline
-8. multipart-manifest and chunk-manifest payload reclamation are still on the
-   older immediate or leak-prone paths and remain the next design step
+8. chunk-manifest payloads now also have:
+   - a durable `chunk_manifest_reclaims` root table plus child chunk rows
+   - a root-generation lease model on chunk-manifest `ReadHandle`s
+   - reclaim-on-drop behavior for current delete, version-specific delete, and
+     stale chunk-manifest payloads displaced by simple writes
+9. multipart-manifest payload reclamation is still on the older immediate or
+   leak-prone paths and remains the next design step
 
 ### Phase 5: Expand reclamation coverage
 
@@ -542,6 +547,16 @@ Important design notes:
    `generation_id`, so `next_generation_id()` must include the new reclaim root
    tables the same way it already includes `simple_payload_reclaims`
 
+Status:
+
+1. chunk-manifest reclaim is now implemented:
+   - reclaim tables exist in the metadata DB
+   - `next_generation_id()` includes chunk-manifest reclaim roots
+   - chunk-manifest reads acquire root-generation payload leases
+   - direct delete and stale simple-write displacement now enqueue
+     chunk-manifest reclaim records instead of deleting chunk shards inline
+2. multipart-manifest reclaim is still pending
+
 Required coordinator/storage changes for this design:
 
 1. extend `StaleObjectPayload::ChunkManifest` and `StaleObjectPayload::Multipart`
@@ -594,10 +609,10 @@ Add focused regression tests for:
 
 ## Open Questions
 
-1. how multipart-manifest and chunk-manifest reclaim records should describe
-   retained payloads
-2. how to assign stable reclaim identities for old multipart/chunk payload
-   graphs if a single `GenerationId` is not sufficient
+1. the exact multipart-manifest reclaim record shape, especially for streamed
+   parts
+2. whether multipart reclaim needs any identity beyond the root object
+   `generation_id`
 
 Resolved decisions:
 

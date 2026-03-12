@@ -8,9 +8,10 @@ use ec::{EcConfig, ErasureCodec};
 use s3_types::{BucketVersioningState, VersionId};
 use storage::traits::{PgMetadataStore, ShardStore};
 use storage::{
-    BucketInfo, BucketName, CommitMultipartReq, CommitStreamPutReq, CreateMultipartUploadReq,
-    CreateStreamUploadReq, EcShape, GenerationId, ListMultipartUploadsReq, ListObjectVersionsReq,
-    ListObjectsReq, ListPartsReq, LiveObjectRecord, MultipartPartChunkRecord, MultipartPartRecord,
+    BucketInfo, BucketName, ChunkManifestReclaimChunkRecord, ChunkManifestReclaimRecord,
+    CommitMultipartReq, CommitStreamPutReq, CreateMultipartUploadReq, CreateStreamUploadReq,
+    EcShape, GenerationId, ListMultipartUploadsReq, ListObjectVersionsReq, ListObjectsReq,
+    ListPartsReq, LiveObjectRecord, MultipartPartChunkRecord, MultipartPartRecord,
     MultipartUploadRecord, ObjectKey, ObjectLayout, ObjectPartRecord, PutDeleteMarkerReq,
     PutLiveObjectReq, PutObjectReq, SessionId, ShardKey, SharedStorageNode,
     SimplePayloadReclaimRecord, StoredObject, StreamObjectChunkRecord, StreamUploadChunkRecord,
@@ -191,22 +192,22 @@ enum ReadHandleInner {
     TestBuffered(Option<Vec<u8>>),
 }
 
-struct SimplePayloadLease {
+struct PayloadLease {
     runtime: ReadRuntime,
     bucket: String,
     key: String,
     generation_id: GenerationId,
 }
 
-impl Drop for SimplePayloadLease {
+impl Drop for PayloadLease {
     fn drop(&mut self) {
-        if self.storage_node().release_simple_payload_lease(
+        if self.storage_node().release_object_payload_lease(
             &self.bucket,
             &self.key,
             self.generation_id,
         ) == 0
         {
-            let _ = self.runtime.try_reclaim_simple_payload(
+            let _ = self.runtime.try_reclaim_object_payload(
                 &self.bucket,
                 &self.key,
                 self.generation_id,
@@ -215,7 +216,7 @@ impl Drop for SimplePayloadLease {
     }
 }
 
-impl SimplePayloadLease {
+impl PayloadLease {
     fn storage_node(&self) -> &SharedStorageNode {
         &self.runtime.storage_node
     }
@@ -226,7 +227,7 @@ pub struct ReadHandle {
     bucket: String,
     key: String,
     inner: ReadHandleInner,
-    lease: Option<SimplePayloadLease>,
+    lease: Option<PayloadLease>,
     expected_size: usize,
     bytes_emitted: usize,
     expected_crc64: Option<u64>,
@@ -324,6 +325,7 @@ impl ReadHandle {
         runtime: ReadRuntime,
         bucket: &str,
         key: &str,
+        generation_id: GenerationId,
         chunks: Vec<ChunkPayloadRecord>,
         expected_size: usize,
         expected_crc64: Option<u64>,
@@ -331,7 +333,7 @@ impl ReadHandle {
         Self {
             bucket: bucket.to_string(),
             key: key.to_string(),
-            lease: None,
+            lease: Some(runtime.acquire_object_payload_lease(bucket, key, generation_id)),
             expected_size,
             bytes_emitted: 0,
             expected_crc64,
@@ -351,6 +353,7 @@ impl ReadHandle {
         runtime: ReadRuntime,
         bucket: &str,
         key: &str,
+        generation_id: GenerationId,
         chunks: Vec<ChunkPayloadRecord>,
         start: usize,
         end: usize,
@@ -359,7 +362,7 @@ impl ReadHandle {
         Self {
             bucket: bucket.to_string(),
             key: key.to_string(),
-            lease: None,
+            lease: Some(runtime.acquire_object_payload_lease(bucket, key, generation_id)),
             expected_size,
             bytes_emitted: 0,
             expected_crc64: None,
@@ -465,7 +468,7 @@ impl ReadHandle {
                 next_offset: 0,
                 end_offset: expected_size,
             }),
-            lease: Some(runtime.acquire_simple_payload_lease(bucket, key, generation_id)),
+            lease: Some(runtime.acquire_object_payload_lease(bucket, key, generation_id)),
             expected_size,
             bytes_emitted: 0,
             expected_crc64: Some(record.etag.crc64()),
@@ -496,7 +499,7 @@ impl ReadHandle {
                 next_offset: start,
                 end_offset: end + 1,
             }),
-            lease: Some(runtime.acquire_simple_payload_lease(bucket, key, generation_id)),
+            lease: Some(runtime.acquire_object_payload_lease(bucket, key, generation_id)),
             expected_size: end - start + 1,
             bytes_emitted: 0,
             expected_crc64: None,
@@ -1294,6 +1297,7 @@ enum StaleObjectPayload {
         ec: EcShape,
     },
     ChunkManifest {
+        generation_id: GenerationId,
         chunks: Vec<StreamObjectChunkRecord>,
     },
     Multipart {
@@ -1308,6 +1312,8 @@ struct ReclamationTestHooks {
     target: Option<(String, String)>,
     after_multipart_snapshot: Option<Arc<dyn Fn() + Send + Sync>>,
     after_multipart_delete_metadata: Option<Arc<dyn Fn() + Send + Sync>>,
+    after_chunk_manifest_first_chunk: Option<Arc<dyn Fn() + Send + Sync>>,
+    after_chunk_manifest_delete_metadata: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 #[cfg(test)]
@@ -1379,16 +1385,52 @@ fn maybe_run_multipart_delete_metadata_hook(bucket: &str, key: &str) {
     }
 }
 
+#[cfg(test)]
+fn maybe_run_chunk_manifest_first_chunk_hook(bucket: &str, key: &str) {
+    let hooks = RECLAMATION_TEST_HOOKS
+        .get_or_init(|| Mutex::new(ReclamationTestHooks::default()))
+        .lock()
+        .unwrap()
+        .clone();
+    if hooks
+        .target
+        .as_ref()
+        .is_some_and(|(b, k)| b == bucket && k == key)
+    {
+        if let Some(hook) = hooks.after_chunk_manifest_first_chunk {
+            hook();
+        }
+    }
+}
+
+#[cfg(test)]
+fn maybe_run_chunk_manifest_delete_metadata_hook(bucket: &str, key: &str) {
+    let hooks = RECLAMATION_TEST_HOOKS
+        .get_or_init(|| Mutex::new(ReclamationTestHooks::default()))
+        .lock()
+        .unwrap()
+        .clone();
+    if hooks
+        .target
+        .as_ref()
+        .is_some_and(|(b, k)| b == bucket && k == key)
+    {
+        if let Some(hook) = hooks.after_chunk_manifest_delete_metadata {
+            hook();
+        }
+    }
+}
+
 impl ReadRuntime {
-    fn acquire_simple_payload_lease(
+    fn acquire_object_payload_lease(
         &self,
         bucket: &str,
         key: &str,
         generation_id: GenerationId,
-    ) -> SimplePayloadLease {
+    ) -> PayloadLease {
         self.storage_node
-            .acquire_simple_payload_lease(bucket, key, generation_id);
-        SimplePayloadLease {
+            .acquire_object_payload_lease(bucket, key, generation_id);
+        PayloadLease {
             runtime: self.clone(),
             bucket: bucket.to_string(),
             key: key.to_string(),
@@ -1396,7 +1438,7 @@ impl ReadRuntime {
         }
     }
 
-    fn try_reclaim_simple_payload(
+    fn try_reclaim_object_payload(
         &self,
         bucket: &str,
         key: &str,
@@ -1404,49 +1446,65 @@ impl ReadRuntime {
     ) -> Result<(), ServerError> {
         if self
             .storage_node
-            .simple_payload_lease_count(bucket, key, generation_id)
+            .object_payload_lease_count(bucket, key, generation_id)
             != 0
         {
             return Ok(());
         }
 
         let meta_pg_id = self.pg_topology.object_pg(bucket, key);
-        let reclaim = {
-            let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
-            meta_pg.get_simple_payload_reclaim(bucket, key, generation_id)?
-        };
-
-        let Some(reclaim) = reclaim else {
-            return Ok(());
-        };
-
-        let shard_pg_id = self.pg_topology.shard_pg(bucket, key, generation_id.get());
-        let (meta_guard, shard_guard) = self.storage_node.lock_two_pgs(meta_pg_id, shard_pg_id)?;
+        let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
         let meta_pg: &storage::PgStore = &meta_guard;
-        let shard_pg: &storage::PgStore = shard_guard.as_deref().unwrap_or(meta_pg);
 
         if self
             .storage_node
-            .simple_payload_lease_count(bucket, key, generation_id)
+            .object_payload_lease_count(bucket, key, generation_id)
             != 0
         {
             return Ok(());
         }
 
-        if meta_pg
-            .get_simple_payload_reclaim(bucket, key, generation_id)?
-            .is_none()
-        {
+        if let Some(reclaim) = meta_pg.get_simple_payload_reclaim(bucket, key, generation_id)? {
+            let shard_pg_id = self.pg_topology.shard_pg(bucket, key, generation_id.get());
+            let total = reclaim.ec.k as usize + reclaim.ec.m as usize;
+            if shard_pg_id == meta_pg_id {
+                for i in 0..total {
+                    let shard_key =
+                        ShardKey::new(&object_key_hash(bucket, key), generation_id.get(), i as u8);
+                    meta_pg.delete_shard(&shard_key)?;
+                }
+            } else {
+                let shard_pg = self.storage_node.get_pg(shard_pg_id)?;
+                for i in 0..total {
+                    let shard_key =
+                        ShardKey::new(&object_key_hash(bucket, key), generation_id.get(), i as u8);
+                    shard_pg.delete_shard(&shard_key)?;
+                }
+            }
+            meta_pg.delete_simple_payload_reclaim(bucket, key, generation_id)?;
             return Ok(());
         }
 
-        let okh = object_key_hash(bucket, key);
-        let total = reclaim.ec.k as usize + reclaim.ec.m as usize;
-        for i in 0..total {
-            let shard_key = ShardKey::new(&okh, generation_id.get(), i as u8);
-            shard_pg.delete_shard(&shard_key)?;
+        let Some(reclaim) = meta_pg.get_chunk_manifest_reclaim(bucket, key, generation_id)? else {
+            return Ok(());
+        };
+
+        for chunk in &reclaim.chunks {
+            let total = chunk.ec.k as usize + chunk.ec.m as usize;
+            if chunk.shard_pg_id == meta_pg_id {
+                for i in 0..total {
+                    let shard_key = ShardKey::new(&chunk.chunk_okh, chunk.chunk_vid.get(), i as u8);
+                    meta_pg.delete_shard(&shard_key)?;
+                }
+            } else {
+                let shard_pg = self.storage_node.get_pg(chunk.shard_pg_id)?;
+                for i in 0..total {
+                    let shard_key = ShardKey::new(&chunk.chunk_okh, chunk.chunk_vid.get(), i as u8);
+                    shard_pg.delete_shard(&shard_key)?;
+                }
+            }
         }
-        meta_pg.delete_simple_payload_reclaim(bucket, key, generation_id)?;
+        meta_pg.delete_chunk_manifest_reclaim(bucket, key, generation_id)?;
         Ok(())
     }
 
@@ -1850,6 +1908,10 @@ impl ChunkListReader {
             let slice = &self.chunks[self.next_chunk_index];
             self.next_chunk_index += 1;
             self.loaded_chunk = Some((data, slice.start_offset, slice.end_offset));
+            #[cfg(test)]
+            if self.next_chunk_index == 1 {
+                maybe_run_chunk_manifest_first_chunk_hook(&self.bucket, &self.key);
+            }
         }
     }
 }
@@ -3158,19 +3220,37 @@ impl Coordinator {
             )
             .map_err(ServerError::Metadata)?;
 
-        if let Some(StaleObjectPayload::Simple { .. }) = stale_payload.as_ref() {
-            Self::delete_stale_object_payload_metadata(
-                &meta_guard,
-                bucket,
-                key,
-                version_id,
-                stale_payload.as_ref().unwrap(),
-            )?;
+        if let Some(ref payload) = stale_payload {
+            match payload {
+                StaleObjectPayload::ChunkManifest {
+                    generation_id,
+                    chunks,
+                } => {
+                    // `commit_stream_put` already replaced the live chunk manifest rows
+                    // for VersionId::Null, so only enqueue reclaim for the old payload.
+                    Self::enqueue_chunk_manifest_reclaim(
+                        &meta_guard,
+                        bucket,
+                        key,
+                        *generation_id,
+                        chunks,
+                    )?;
+                }
+                _ => {
+                    Self::delete_stale_object_payload_metadata(
+                        &meta_guard,
+                        bucket,
+                        key,
+                        version_id,
+                        payload,
+                    )?;
+                }
+            }
         }
 
         drop(meta_guard);
-        if let Some(StaleObjectPayload::Simple { .. }) = stale_payload.as_ref() {
-            let _ = self.delete_stale_object_payload(bucket, key, stale_payload.as_ref().unwrap());
+        if let Some(ref payload) = stale_payload {
+            let _ = self.delete_stale_object_payload(bucket, key, payload);
         }
 
         Ok(PutObjectResult {
@@ -3646,29 +3726,29 @@ impl Coordinator {
                     drop(pgs);
                     vec![]
                 } else if !chunks.is_empty() {
-                    drop(pgs);
-                    ReadHandle::from_chunk_manifest(
+                    let body = ReadHandle::from_chunk_manifest(
                         self.read_runtime(),
                         src_bucket,
                         src_key,
+                        src_record.generation_id,
                         chunk_payloads_from_stream_object_chunks(chunks),
                         user_size,
                         Some(src_etag_crc),
-                    )
-                    .into_bytes()
-                    .map_err(not_found)?
+                    );
+                    drop(pgs);
+                    body.into_bytes().map_err(not_found)?
                 } else {
                     let src_okh = object_key_hash(src_bucket, src_key);
-                    drop(pgs);
-                    ReadHandle::from_shard_set(
-                        &self.read_runtime(),
+                    let runtime = self.read_runtime();
+                    let body = ReadHandle::from_shard_set(
+                        &runtime,
                         src_bucket,
                         src_key,
                         src_okh,
                         &src_record,
-                    )
-                    .into_bytes()
-                    .map_err(not_found)?
+                    );
+                    drop(pgs);
+                    body.into_bytes().map_err(not_found)?
                 };
 
                 // Verify CRC against stored etag (user data only).
@@ -3994,7 +4074,10 @@ impl Coordinator {
                         ec: record.ec,
                     }))
                 } else {
-                    Ok(Some(StaleObjectPayload::ChunkManifest { chunks }))
+                    Ok(Some(StaleObjectPayload::ChunkManifest {
+                        generation_id: record.generation_id,
+                        chunks,
+                    }))
                 }
             }
         }
@@ -4017,9 +4100,15 @@ impl Coordinator {
                     created_at: Self::now_millis(),
                 })
                 .map_err(ServerError::Metadata),
-            StaleObjectPayload::ChunkManifest { .. } => meta_pg
-                .delete_stream_object_chunks(bucket, key, version_id)
-                .map_err(ServerError::Metadata),
+            StaleObjectPayload::ChunkManifest {
+                generation_id,
+                chunks,
+            } => {
+                Self::enqueue_chunk_manifest_reclaim(meta_pg, bucket, key, *generation_id, chunks)?;
+                meta_pg
+                    .delete_stream_object_chunks(bucket, key, version_id)
+                    .map_err(ServerError::Metadata)
+            }
             StaleObjectPayload::Multipart {
                 streaming_chunks, ..
             } => {
@@ -4042,10 +4131,10 @@ impl Coordinator {
         payload: &StaleObjectPayload,
     ) -> Result<(), ServerError> {
         match payload {
-            StaleObjectPayload::Simple { generation_id, .. } => self
+            StaleObjectPayload::Simple { generation_id, .. }
+            | StaleObjectPayload::ChunkManifest { generation_id, .. } => self
                 .read_runtime()
-                .try_reclaim_simple_payload(bucket, key, *generation_id),
-            StaleObjectPayload::ChunkManifest { chunks } => self.delete_chunk_shards(chunks),
+                .try_reclaim_object_payload(bucket, key, *generation_id),
             StaleObjectPayload::Multipart {
                 parts,
                 streaming_chunks,
@@ -4077,6 +4166,36 @@ impl Coordinator {
             .map_err(ServerError::Metadata)
     }
 
+    fn enqueue_chunk_manifest_reclaim(
+        meta_pg: &storage::PgStore,
+        bucket: &str,
+        key: &str,
+        generation_id: GenerationId,
+        chunks: &[StreamObjectChunkRecord],
+    ) -> Result<(), ServerError> {
+        meta_pg
+            .put_chunk_manifest_reclaim(&ChunkManifestReclaimRecord {
+                bucket: BucketName::from(bucket),
+                key: ObjectKey::from(key),
+                generation_id,
+                created_at: Self::now_millis(),
+                chunks: chunks
+                    .iter()
+                    .map(|chunk| ChunkManifestReclaimChunkRecord {
+                        chunk_index: chunk.chunk_index,
+                        chunk_okh: chunk.chunk_okh,
+                        chunk_vid: chunk.chunk_vid,
+                        shard_pg_id: chunk.shard_pg_id,
+                        ec: EcShape {
+                            k: chunk.ec_k,
+                            m: chunk.ec_m,
+                        },
+                    })
+                    .collect(),
+            })
+            .map_err(ServerError::Metadata)
+    }
+
     /// Delete all shards for a list of object parts.
     fn delete_part_shards(&self, parts: &[ObjectPartRecord]) -> Result<(), ServerError> {
         for part in parts {
@@ -4086,20 +4205,6 @@ impl Coordinator {
                 let shard_key = ShardKey::new(&part.part_okh, part.part_vid.get(), i as u8);
                 pg.delete_shard(&shard_key)?;
             }
-        }
-        Ok(())
-    }
-
-    /// Delete all shards for a list of stream object chunks.
-    fn delete_chunk_shards(&self, chunks: &[StreamObjectChunkRecord]) -> Result<(), ServerError> {
-        for chunk in chunks {
-            self.delete_chunk_shard_set(
-                chunk.shard_pg_id,
-                &chunk.chunk_okh,
-                chunk.chunk_vid,
-                chunk.ec_k,
-                chunk.ec_m,
-            )?;
         }
         Ok(())
     }
@@ -4219,11 +4324,11 @@ impl Coordinator {
                 drop(pgs);
                 ReadHandle::from_buffered_bytes(vec![])
             } else if !chunks.is_empty() {
-                drop(pgs);
-                ReadHandle::from_chunk_manifest(
+                let body = ReadHandle::from_chunk_manifest(
                     self.read_runtime(),
                     bucket,
                     key,
+                    record.generation_id,
                     chunks
                         .into_iter()
                         .map(|chunk| ChunkPayloadRecord {
@@ -4237,7 +4342,9 @@ impl Coordinator {
                         .collect(),
                     user_size,
                     Some(etag_crc),
-                )
+                );
+                drop(pgs);
+                body
             } else {
                 let okh = object_key_hash(bucket, key);
                 let runtime = self.read_runtime();
@@ -4383,11 +4490,11 @@ impl Coordinator {
                 drop(pgs);
                 ReadHandle::from_buffered_bytes(vec![])
             } else if !chunks.is_empty() {
-                drop(pgs);
-                ReadHandle::from_chunk_manifest(
+                let body = ReadHandle::from_chunk_manifest(
                     self.read_runtime(),
                     bucket,
                     key,
+                    record.generation_id,
                     chunks
                         .into_iter()
                         .map(|chunk| ChunkPayloadRecord {
@@ -4401,7 +4508,9 @@ impl Coordinator {
                         .collect(),
                     user_size,
                     Some(etag_crc),
-                )
+                );
+                drop(pgs);
+                body
             } else {
                 let okh = object_key_hash(bucket, key);
                 let runtime = self.read_runtime();
@@ -4805,11 +4914,11 @@ impl Coordinator {
                 drop(pgs);
                 body
             } else {
-                drop(pgs);
-                ReadHandle::from_chunk_manifest_range(
+                let body = ReadHandle::from_chunk_manifest_range(
                     self.read_runtime(),
                     bucket,
                     key,
+                    record.generation_id,
                     chunks
                         .into_iter()
                         .map(|chunk| ChunkPayloadRecord {
@@ -4823,7 +4932,9 @@ impl Coordinator {
                         .collect(),
                     user_start as usize,
                     user_end as usize,
-                )
+                );
+                drop(pgs);
+                body
             };
 
             (metadata, body)
@@ -4946,18 +5057,31 @@ impl Coordinator {
                         )?;
                         meta_pg.delete_object_meta(bucket, key)?;
                         drop(pgs);
-                        let _ = self.read_runtime().try_reclaim_simple_payload(
+                        let _ = self.read_runtime().try_reclaim_object_payload(
                             bucket,
                             key,
                             record.generation_id,
                         );
                     } else {
+                        Self::enqueue_chunk_manifest_reclaim(
+                            meta_pg,
+                            bucket,
+                            key,
+                            record.generation_id,
+                            &chunks,
+                        )?;
                         meta_pg
                             .delete_stream_object_chunks(bucket, key, vid)
                             .map_err(ServerError::Metadata)?;
                         meta_pg.delete_object_meta(bucket, key)?;
                         drop(pgs);
-                        let _ = self.delete_chunk_shards(&chunks);
+                        #[cfg(test)]
+                        maybe_run_chunk_manifest_delete_metadata_hook(bucket, key);
+                        let _ = self.read_runtime().try_reclaim_object_payload(
+                            bucket,
+                            key,
+                            record.generation_id,
+                        );
                     }
                 }
 
@@ -5029,12 +5153,25 @@ impl Coordinator {
                         .map_err(ServerError::Metadata)?;
 
                     if !chunks.is_empty() {
+                        Self::enqueue_chunk_manifest_reclaim(
+                            meta_pg,
+                            bucket,
+                            key,
+                            record.generation_id,
+                            &chunks,
+                        )?;
                         meta_pg
                             .delete_stream_object_chunks(bucket, key, vid)
                             .map_err(ServerError::Metadata)?;
                         meta_pg.delete_object_version(bucket, key, vid)?;
                         drop(pgs);
-                        let _ = self.delete_chunk_shards(&chunks);
+                        #[cfg(test)]
+                        maybe_run_chunk_manifest_delete_metadata_hook(bucket, key);
+                        let _ = self.read_runtime().try_reclaim_object_payload(
+                            bucket,
+                            key,
+                            record.generation_id,
+                        );
 
                         return Ok(DeleteObjectResult {
                             version_id: vid,
@@ -5051,7 +5188,7 @@ impl Coordinator {
                     )?;
                     meta_pg.delete_object_version(bucket, key, vid)?;
                     drop(pgs);
-                    let _ = self.read_runtime().try_reclaim_simple_payload(
+                    let _ = self.read_runtime().try_reclaim_object_payload(
                         bucket,
                         key,
                         record.generation_id,
@@ -5555,30 +5692,30 @@ impl Coordinator {
 
                 if chunks.is_empty() {
                     let src_okh = object_key_hash(src_bucket, src_key);
-                    drop(pgs);
-                    ReadHandle::from_shard_set_range(
-                        &self.read_runtime(),
+                    let runtime = self.read_runtime();
+                    let body = ReadHandle::from_shard_set_range(
+                        &runtime,
                         src_bucket,
                         src_key,
                         src_okh,
                         &src_record,
                         read_start as usize,
                         read_end as usize,
-                    )
-                    .into_bytes()
-                    .map_err(not_found)?
-                } else {
+                    );
                     drop(pgs);
-                    ReadHandle::from_chunk_manifest_range(
+                    body.into_bytes().map_err(not_found)?
+                } else {
+                    let body = ReadHandle::from_chunk_manifest_range(
                         self.read_runtime(),
                         src_bucket,
                         src_key,
+                        src_record.generation_id,
                         chunk_payloads_from_stream_object_chunks(chunks),
                         read_start as usize,
                         read_end as usize,
-                    )
-                    .into_bytes()
-                    .map_err(not_found)?
+                    );
+                    drop(pgs);
+                    body.into_bytes().map_err(not_found)?
                 }
             }
         }; // source locks dropped here
@@ -6221,19 +6358,23 @@ impl Coordinator {
             .complete_multipart_commit(upload_id, &obj_req, &object_parts)
             .map_err(ServerError::Metadata)?;
 
-        if let Some(StaleObjectPayload::Simple { .. }) = stale_payload.as_ref() {
-            Self::delete_stale_object_payload_metadata(
-                &meta_pg,
-                bucket,
-                key,
-                version_id,
-                stale_payload.as_ref().unwrap(),
-            )?;
+        if let Some(ref payload) = stale_payload {
+            match payload {
+                StaleObjectPayload::Multipart { .. } => {
+                    // `complete_multipart_commit` already replaced the live
+                    // object_parts rows for VersionId::Null.
+                }
+                _ => {
+                    Self::delete_stale_object_payload_metadata(
+                        &meta_pg, bucket, key, version_id, payload,
+                    )?;
+                }
+            }
         }
 
         drop(meta_pg);
-        if let Some(StaleObjectPayload::Simple { .. }) = stale_payload.as_ref() {
-            let _ = self.delete_stale_object_payload(bucket, key, stale_payload.as_ref().unwrap());
+        if let Some(ref payload) = stale_payload {
+            let _ = self.delete_stale_object_payload(bucket, key, payload);
         }
 
         Ok(CompleteMultipartUploadResult {
@@ -6609,10 +6750,58 @@ mod tests {
                 delete_reached_hook.wait();
                 delete_resume_hook.wait();
             })),
+            ..ReclamationTestHooks::default()
         });
         MultipartMetadataRaceSync {
             snapshot_reached,
             snapshot_resume,
+            delete_reached,
+            delete_resume,
+            _serial_guard: serial,
+            _guard: guard,
+        }
+    }
+
+    struct ChunkManifestDeleteRaceSync {
+        first_chunk_reached: Arc<Barrier>,
+        first_chunk_resume: Arc<Barrier>,
+        delete_reached: Arc<Barrier>,
+        delete_resume: Arc<Barrier>,
+        _serial_guard: MutexGuard<'static, ()>,
+        _guard: ReclamationTestHookGuard,
+    }
+
+    fn install_chunk_manifest_delete_race_hooks(
+        bucket: &str,
+        key: &str,
+    ) -> ChunkManifestDeleteRaceSync {
+        let serial = RECLAMATION_TEST_SERIAL
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap();
+        let first_chunk_reached = Arc::new(Barrier::new(2));
+        let first_chunk_resume = Arc::new(Barrier::new(2));
+        let delete_reached = Arc::new(Barrier::new(2));
+        let delete_resume = Arc::new(Barrier::new(2));
+        let first_chunk_reached_hook = Arc::clone(&first_chunk_reached);
+        let first_chunk_resume_hook = Arc::clone(&first_chunk_resume);
+        let delete_reached_hook = Arc::clone(&delete_reached);
+        let delete_resume_hook = Arc::clone(&delete_resume);
+        let guard = install_reclamation_test_hooks(ReclamationTestHooks {
+            target: Some((bucket.to_string(), key.to_string())),
+            after_chunk_manifest_first_chunk: Some(Arc::new(move || {
+                first_chunk_reached_hook.wait();
+                first_chunk_resume_hook.wait();
+            })),
+            after_chunk_manifest_delete_metadata: Some(Arc::new(move || {
+                delete_reached_hook.wait();
+                delete_resume_hook.wait();
+            })),
+            ..ReclamationTestHooks::default()
+        });
+        ChunkManifestDeleteRaceSync {
+            first_chunk_reached,
+            first_chunk_resume,
             delete_reached,
             delete_resume,
             _serial_guard: serial,
@@ -11366,6 +11555,95 @@ mod tests {
         );
         assert_eq!(body, expected_tail);
         assert_eq!(part_start, MIN_PART as u64);
+    }
+
+    #[test]
+    fn chunk_manifest_get_object_survives_delete_mid_read() {
+        let tmp = test_util::tempdir();
+        let pg_ids: Vec<u32> = (0..4).collect();
+        let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
+        let ec_config = EcConfig::new(4, 2).unwrap();
+
+        let make_coord = || {
+            Coordinator::new(
+                Arc::clone(&storage_node),
+                ec_config,
+                "us-east-1".to_string(),
+            )
+            .unwrap()
+        };
+
+        let admin = make_coord();
+        admin.create_bucket("race-bucket").unwrap();
+
+        let session_id = begin_stream_put_test(&admin, "race-bucket", "race-key-chunks").unwrap();
+        admin
+            .append_stream_chunk(
+                "race-bucket",
+                "race-key-chunks",
+                &session_id,
+                0,
+                b"chunk-zero-",
+            )
+            .unwrap();
+        admin
+            .append_stream_chunk(
+                "race-bucket",
+                "race-key-chunks",
+                &session_id,
+                1,
+                b"chunk-one",
+            )
+            .unwrap();
+        let expected = b"chunk-zero-chunk-one".to_vec();
+        admin
+            .finalize_stream_put(&FinalizeStreamPutRequest {
+                bucket: "race-bucket",
+                key: "race-key-chunks",
+                session_id: &session_id,
+                crc64: checksum::crc64::checksum(&expected),
+                total_size: expected.len() as u64,
+                metadata_blob: &MetadataBlob::new(),
+                tags: None,
+                cond: &WriteCondition::default(),
+            })
+            .unwrap();
+
+        let sync = install_chunk_manifest_delete_race_hooks("race-bucket", "race-key-chunks");
+        let reader = make_coord();
+        let deleter = make_coord();
+
+        let t_read = thread::spawn(move || {
+            reader
+                .get_object(&GetObjectRequest {
+                    bucket: "race-bucket",
+                    key: "race-key-chunks",
+                    version_id: None,
+                    cond: NO_READ,
+                    requester: TEST_REQUESTER,
+                })
+                .and_then(|result| result.body.into_bytes())
+        });
+        sync.first_chunk_reached.wait();
+
+        let t_delete = thread::spawn(move || {
+            deleter.delete_object(&DeleteObjectRequest {
+                bucket: "race-bucket",
+                key: "race-key-chunks",
+                version_id: None,
+                cond: NO_DELETE,
+                requester: TEST_REQUESTER,
+            })
+        });
+        sync.delete_reached.wait();
+
+        sync.first_chunk_resume.wait();
+        let read_res = t_read.join().unwrap();
+        sync.delete_resume.wait();
+        let delete_res = t_delete.join().unwrap();
+        assert!(delete_res.is_ok(), "delete failed: {delete_res:?}");
+        let body = read_res.expect("chunk-manifest get_object should survive delete mid-read");
+        assert_eq!(body, expected);
     }
 
     #[test]

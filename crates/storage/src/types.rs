@@ -613,6 +613,29 @@ pub struct SimplePayloadReclaimRecord {
     pub created_at: u64,
 }
 
+/// Chunk entry for a durable chunk-manifest reclaim record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkManifestReclaimChunkRecord {
+    pub chunk_index: u32,
+    pub chunk_okh: [u8; 16],
+    pub chunk_vid: GenerationId,
+    pub shard_pg_id: u32,
+    pub ec: EcShape,
+}
+
+/// Durable reclaim record for a chunk-manifest payload generation.
+///
+/// This is used when the namespace-visible object row is removed or replaced
+/// before the old chunk-manifest payload can be physically deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkManifestReclaimRecord {
+    pub bucket: BucketName,
+    pub key: ObjectKey,
+    pub generation_id: GenerationId,
+    pub created_at: u64,
+    pub chunks: Vec<ChunkManifestReclaimChunkRecord>,
+}
+
 /// Bucket metadata.
 #[derive(Debug, Clone)]
 pub struct BucketInfo {

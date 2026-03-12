@@ -3315,6 +3315,77 @@ fn commit_stream_put_rejects_mismatched_chunk_target() {
 }
 
 #[test]
+fn chunk_manifest_reclaim_round_trip() {
+    let (_dir, store) = make_pg_store();
+
+    let generation_id = GenerationId::new(7).unwrap();
+    let reclaim = ChunkManifestReclaimRecord {
+        bucket: "b".into(),
+        key: "k".into(),
+        generation_id,
+        created_at: 1234,
+        chunks: vec![
+            ChunkManifestReclaimChunkRecord {
+                chunk_index: 0,
+                chunk_okh: [0x11; 16],
+                chunk_vid: GenerationId::new(11).unwrap(),
+                shard_pg_id: 1,
+                ec: EcShape { k: 4, m: 2 },
+            },
+            ChunkManifestReclaimChunkRecord {
+                chunk_index: 1,
+                chunk_okh: [0x22; 16],
+                chunk_vid: GenerationId::new(12).unwrap(),
+                shard_pg_id: 2,
+                ec: EcShape { k: 6, m: 3 },
+            },
+        ],
+    };
+
+    store.put_chunk_manifest_reclaim(&reclaim).unwrap();
+
+    let got = store
+        .get_chunk_manifest_reclaim("b", "k", generation_id)
+        .unwrap()
+        .expect("chunk manifest reclaim should exist");
+    assert_eq!(got, reclaim);
+
+    store
+        .delete_chunk_manifest_reclaim("b", "k", generation_id)
+        .unwrap();
+    assert!(store
+        .get_chunk_manifest_reclaim("b", "k", generation_id)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn next_generation_id_skips_chunk_manifest_reclaim_generation() {
+    let (_dir, store) = make_pg_store();
+
+    store
+        .put_chunk_manifest_reclaim(&ChunkManifestReclaimRecord {
+            bucket: "b".into(),
+            key: "k".into(),
+            generation_id: GenerationId::new(7).unwrap(),
+            created_at: 1,
+            chunks: vec![ChunkManifestReclaimChunkRecord {
+                chunk_index: 0,
+                chunk_okh: [0x33; 16],
+                chunk_vid: GenerationId::new(13).unwrap(),
+                shard_pg_id: 0,
+                ec: EcShape { k: 4, m: 2 },
+            }],
+        })
+        .unwrap();
+
+    assert_eq!(
+        store.next_generation_id("b", "k").unwrap(),
+        GenerationId::new(8).unwrap()
+    );
+}
+
+#[test]
 fn commit_stream_part_rejects_mismatched_chunk_part_number() {
     let (_dir, store) = make_pg_store();
 

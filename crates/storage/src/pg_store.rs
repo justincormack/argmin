@@ -1411,6 +1411,8 @@ impl PgMetadataStore for PgStore {
                      SELECT generation_id FROM objects WHERE bucket = ?1 AND key = ?2
                      UNION ALL
                      SELECT generation_id FROM simple_payload_reclaims WHERE bucket = ?1 AND key = ?2
+                     UNION ALL
+                     SELECT generation_id FROM chunk_manifest_reclaims WHERE bucket = ?1 AND key = ?2
                  )",
                 params![bucket, key],
                 |row| row.get(0),
@@ -1528,6 +1530,181 @@ impl PgMetadataStore for PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "delete simple payload reclaim",
+                source: e,
+            })?;
+        Ok(())
+    }
+
+    fn put_chunk_manifest_reclaim(
+        &self,
+        reclaim: &ChunkManifestReclaimRecord,
+    ) -> Result<(), MetadataError> {
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| MetadataError::Db {
+                context: "put chunk manifest reclaim (begin txn)",
+                source: e,
+            })?;
+
+        let result: Result<(), MetadataError> = (|| {
+            self.conn
+                .execute(
+                    "INSERT OR REPLACE INTO chunk_manifest_reclaims \
+                     (bucket, key, generation_id, created_at) VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        reclaim.bucket,
+                        reclaim.key,
+                        reclaim.generation_id.get() as i64,
+                        reclaim.created_at as i64,
+                    ],
+                )
+                .map_err(|e| MetadataError::Db {
+                    context: "put chunk manifest reclaim (root)",
+                    source: e,
+                })?;
+
+            for chunk in &reclaim.chunks {
+                self.conn
+                    .execute(
+                        "INSERT OR REPLACE INTO chunk_manifest_reclaim_chunks \
+                         (bucket, key, generation_id, chunk_index, chunk_okh, chunk_vid, \
+                          shard_pg_id, ec_k, ec_m) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                        params![
+                            reclaim.bucket,
+                            reclaim.key,
+                            reclaim.generation_id.get() as i64,
+                            chunk.chunk_index as i64,
+                            &chunk.chunk_okh[..],
+                            chunk.chunk_vid.get() as i64,
+                            chunk.shard_pg_id as i64,
+                            chunk.ec.k,
+                            chunk.ec.m,
+                        ],
+                    )
+                    .map_err(|e| MetadataError::Db {
+                        context: "put chunk manifest reclaim (chunk)",
+                        source: e,
+                    })?;
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                if let Err(e) = self.conn.execute_batch("COMMIT") {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    return Err(MetadataError::Db {
+                        context: "put chunk manifest reclaim (commit txn)",
+                        source: e,
+                    });
+                }
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    fn get_chunk_manifest_reclaim(
+        &self,
+        bucket: &str,
+        key: &str,
+        generation_id: GenerationId,
+    ) -> Result<Option<ChunkManifestReclaimRecord>, MetadataError> {
+        let root = self
+            .conn
+            .query_row(
+                "SELECT bucket, key, generation_id, created_at \
+                 FROM chunk_manifest_reclaims \
+                 WHERE bucket = ?1 AND key = ?2 AND generation_id = ?3",
+                params![bucket, key, generation_id.get() as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, BucketName>(0)?,
+                        row.get::<_, ObjectKey>(1)?,
+                        Self::parse_generation_id(row.get::<_, i64>(2)?, 2, "generation_id")?,
+                        row.get::<_, i64>(3)? as u64,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| MetadataError::Db {
+                context: "get chunk manifest reclaim (root)",
+                source: e,
+            })?;
+
+        let Some((bucket_name, key_name, generation_id, created_at)) = root else {
+            return Ok(None);
+        };
+
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT chunk_index, chunk_okh, chunk_vid, shard_pg_id, ec_k, ec_m \
+                 FROM chunk_manifest_reclaim_chunks \
+                 WHERE bucket = ?1 AND key = ?2 AND generation_id = ?3 \
+                 ORDER BY chunk_index ASC",
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "get chunk manifest reclaim (prepare chunks)",
+                source: e,
+            })?;
+
+        let chunks = stmt
+            .query_map(params![bucket, key, generation_id.get() as i64], |row| {
+                Ok(ChunkManifestReclaimChunkRecord {
+                    chunk_index: row.get::<_, i64>(0)? as u32,
+                    chunk_okh: row.get_ref(1)?.as_blob()?.try_into().map_err(|_| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Blob,
+                            Box::from("chunk_okh must be 16 bytes"),
+                        )
+                    })?,
+                    chunk_vid: Self::parse_generation_id(row.get::<_, i64>(2)?, 2, "chunk_vid")?,
+                    shard_pg_id: row.get::<_, i64>(3)? as u32,
+                    ec: EcShape {
+                        k: row.get(4)?,
+                        m: row.get(5)?,
+                    },
+                })
+            })
+            .map_err(|e| MetadataError::Db {
+                context: "get chunk manifest reclaim (query chunks)",
+                source: e,
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| MetadataError::Db {
+                context: "get chunk manifest reclaim (collect chunks)",
+                source: e,
+            })?;
+
+        Ok(Some(ChunkManifestReclaimRecord {
+            bucket: bucket_name,
+            key: key_name,
+            generation_id,
+            created_at,
+            chunks,
+        }))
+    }
+
+    fn delete_chunk_manifest_reclaim(
+        &self,
+        bucket: &str,
+        key: &str,
+        generation_id: GenerationId,
+    ) -> Result<(), MetadataError> {
+        self.conn
+            .execute(
+                "DELETE FROM chunk_manifest_reclaims \
+                 WHERE bucket = ?1 AND key = ?2 AND generation_id = ?3",
+                params![bucket, key, generation_id.get() as i64],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "delete chunk manifest reclaim",
                 source: e,
             })?;
         Ok(())
