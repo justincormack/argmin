@@ -1,7 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ring::hmac;
-use s3_tests::{unique_bucket, CTX};
+use s3_tests::{CTX, unique_bucket};
 
 /// Create a bucket, returning its name.
 async fn setup_bucket() -> String {
@@ -2133,15 +2133,68 @@ fn test_post_object_missing_expires_condition() {
 }
 
 #[test]
-#[ignore = "not implemented: tagging"]
+#[ignore = "not implemented: anonymous POST"]
 fn test_post_object_tags_anonymous_request() {
     s3_tests::run(async {});
 }
 
 #[test]
-#[ignore = "not implemented: tagging"]
 fn test_post_object_tags_authenticated_request() {
-    s3_tests::run(async {});
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "post-tagged";
+        let tagging_xml = concat!(
+            "<Tagging><TagSet>",
+            "<Tag><Key>env</Key><Value>staging</Value></Tag>",
+            "<Tag><Key>cost-center</Key><Value>123</Value></Tag>",
+            "</TagSet></Tagging>"
+        );
+
+        let mut fields = sigv4_fields(
+            &bucket,
+            key,
+            &[serde_json::json!(["starts-with", "$tagging", ""])],
+        );
+        fields.push(("tagging".to_string(), tagging_xml.to_string()));
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+
+        let (status, _) = post_object(&bucket, &field_refs, b"data", "test.txt");
+        assert_eq!(status, 204, "expected 204, got {}", status);
+
+        let result = client
+            .get_object_tagging()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+
+        let tag_set = result.tag_set();
+        assert_eq!(tag_set.len(), 2);
+        assert!(
+            tag_set
+                .iter()
+                .any(|t| t.key() == "env" && t.value() == "staging")
+        );
+        assert!(
+            tag_set
+                .iter()
+                .any(|t| t.key() == "cost-center" && t.value() == "123")
+        );
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
 }
 
 // ── Coverage tests for multipart parser edge cases ──────────────────────

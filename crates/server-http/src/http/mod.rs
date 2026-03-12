@@ -10,7 +10,7 @@ pub mod xml;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use auth::{authenticate_request, AuthContext, AuthMode, CredentialStore};
+use auth::{AuthContext, AuthMode, CredentialStore, authenticate_request};
 use bytes::Bytes;
 use http_body_util::Full;
 
@@ -34,7 +34,7 @@ use conditional::{
 };
 use request::S3Request;
 use response::S3Response;
-use router::{route, S3Operation};
+use router::{S3Operation, route};
 use s3_types::VersionId;
 
 /// Parse versionId query parameter from an S3 request.
@@ -138,7 +138,7 @@ impl HttpFrontend {
                             .to_string(),
                     },
                     &req.path,
-                )
+                );
             }
         };
 
@@ -1657,6 +1657,16 @@ impl HttpFrontend {
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
         let metadata_blob = MetadataBlob::from_headers(&hp_refs)?;
+        let tags_xml = if let Some(tagging_field) = field("tagging") {
+            let tags = xml::parse_tagging_xml(tagging_field.as_bytes(), 10)?;
+            if tags.is_empty() {
+                None
+            } else {
+                Some(xml::get_tagging_xml(&tags))
+            }
+        } else {
+            None
+        };
 
         let requester =
             crate::coordinator::Requester::from_principal(effective_auth.principal.as_deref());
@@ -1682,6 +1692,7 @@ impl HttpFrontend {
             policy_b64: field("policy").map(std::string::ToString::to_string),
             checksum_sha256_b64: field("x-amz-checksum-sha256")
                 .map(std::string::ToString::to_string),
+            tags_xml,
         })
     }
 
@@ -1750,7 +1761,7 @@ impl HttpFrontend {
                 crc64,
                 total_size,
                 metadata_blob: &ctx.metadata_blob,
-                tags: None,
+                tags: ctx.tags_xml.as_deref(),
                 cond: &crate::conditional::WriteCondition::default(),
             })?;
 
@@ -2110,6 +2121,7 @@ pub struct StreamingPostContext {
     pub form_fields: Vec<(String, String)>,
     pub policy_b64: Option<String>,
     pub checksum_sha256_b64: Option<String>,
+    pub tags_xml: Option<String>,
 }
 
 /// Context for an in-progress streaming `UploadPart`.
