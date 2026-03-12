@@ -819,105 +819,215 @@ fn xml_unescape(s: &str) -> String {
 /// </CORSConfiguration>
 /// ```
 pub fn parse_cors_config_xml(data: &[u8]) -> Result<crate::cors::CorsConfiguration, ServerError> {
-    let text = std::str::from_utf8(data).map_err(|_| ServerError::MalformedXML {
-        reason: "invalid UTF-8 in CORS XML body".to_string(),
-    })?;
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum State {
+        Start,
+        InRoot,
+        InRule,
+        InAllowedOrigin,
+        InAllowedMethod,
+        InAllowedHeader,
+        InExposeHeader,
+        InMaxAgeSeconds,
+        Done,
+    }
 
-    if !text.contains("<CORSConfiguration") {
-        return Err(ServerError::MalformedXML {
-            reason: "missing <CORSConfiguration> element".to_string(),
-        });
+    fn malformed_cors_xml(reason: &str) -> ServerError {
+        ServerError::MalformedXML {
+            reason: reason.to_string(),
+        }
+    }
+
+    fn decode_cors_text(bytes: &[u8]) -> Result<String, ServerError> {
+        decode_xml_text(
+            bytes,
+            "invalid UTF-8 in CORS XML body",
+            "invalid XML entity in CORS XML body",
+        )
     }
 
     let valid_methods = ["GET", "PUT", "POST", "DELETE", "HEAD"];
-
+    let mut reader = Reader::from_reader(data);
+    let mut buf = Vec::new();
+    let mut state = State::Start;
     let mut rules = Vec::new();
-    let mut search_from = 0;
-    while let Some(start) = text[search_from..].find("<CORSRule>") {
-        let abs_start = search_from + start + "<CORSRule>".len();
-        let end =
-            text[abs_start..]
-                .find("</CORSRule>")
-                .ok_or_else(|| ServerError::MalformedXML {
-                    reason: "unclosed <CORSRule> element".to_string(),
-                })?;
-        let block = &text[abs_start..abs_start + end];
+    let mut current_rule: Option<crate::cors::CorsRule> = None;
+    let mut current_text = String::new();
 
-        // Parse AllowedOrigin (1+ required)
-        let allowed_origins: Vec<String> = extract_all_tag_contents(block, "AllowedOrigin")
-            .into_iter()
-            .map(|s| xml_unescape(&s))
-            .collect();
-        if allowed_origins.is_empty() {
-            return Err(ServerError::MalformedXML {
-                reason: "CORSRule missing <AllowedOrigin> element".to_string(),
-            });
-        }
-
-        // Parse AllowedMethod (1+ required)
-        let allowed_methods: Vec<String> = extract_all_tag_contents(block, "AllowedMethod")
-            .into_iter()
-            .map(|s| xml_unescape(&s))
-            .collect();
-        if allowed_methods.is_empty() {
-            return Err(ServerError::MalformedXML {
-                reason: "CORSRule missing <AllowedMethod> element".to_string(),
-            });
-        }
-        for m in &allowed_methods {
-            if !valid_methods.contains(&m.as_str()) {
-                return Err(ServerError::InvalidRequest {
-                    reason: format!(
-                        "Found unsupported HTTP method in CORS config. Unsupported method is {m}"
-                    ),
-                });
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => match (state, e.name().as_ref()) {
+                (State::Start, b"CORSConfiguration") => state = State::InRoot,
+                (State::InRoot, b"CORSRule") => {
+                    current_rule = Some(crate::cors::CorsRule {
+                        allowed_origins: Vec::new(),
+                        allowed_methods: Vec::new(),
+                        allowed_headers: Vec::new(),
+                        expose_headers: Vec::new(),
+                        max_age_seconds: None,
+                    });
+                    state = State::InRule;
+                }
+                (State::InRule, b"AllowedOrigin") => {
+                    current_text.clear();
+                    state = State::InAllowedOrigin;
+                }
+                (State::InRule, b"AllowedMethod") => {
+                    current_text.clear();
+                    state = State::InAllowedMethod;
+                }
+                (State::InRule, b"AllowedHeader") => {
+                    current_text.clear();
+                    state = State::InAllowedHeader;
+                }
+                (State::InRule, b"ExposeHeader") => {
+                    current_text.clear();
+                    state = State::InExposeHeader;
+                }
+                (State::InRule, b"MaxAgeSeconds") => {
+                    current_text.clear();
+                    state = State::InMaxAgeSeconds;
+                }
+                _ => return Err(malformed_cors_xml("unexpected element in CORS XML")),
+            },
+            Ok(Event::Empty(e)) => match (state, e.name().as_ref()) {
+                (State::Start, b"CORSConfiguration") => state = State::Done,
+                (State::InRoot, b"CORSRule") => {}
+                (
+                    State::InRule,
+                    b"AllowedOrigin" | b"AllowedMethod" | b"AllowedHeader" | b"ExposeHeader"
+                    | b"MaxAgeSeconds",
+                ) => {}
+                _ => return Err(malformed_cors_xml("unexpected empty element in CORS XML")),
+            },
+            Ok(Event::End(e)) => match (state, e.name().as_ref()) {
+                (State::InRoot, b"CORSConfiguration") => state = State::Done,
+                (State::InRule, b"CORSRule") => {
+                    let rule = current_rule
+                        .take()
+                        .ok_or_else(|| malformed_cors_xml("missing active CORS rule"))?;
+                    if rule.allowed_origins.is_empty() {
+                        return Err(malformed_cors_xml(
+                            "CORSRule missing <AllowedOrigin> element",
+                        ));
+                    }
+                    if rule.allowed_methods.is_empty() {
+                        return Err(malformed_cors_xml(
+                            "CORSRule missing <AllowedMethod> element",
+                        ));
+                    }
+                    rules.push(rule);
+                    state = State::InRoot;
+                }
+                (State::InAllowedOrigin, b"AllowedOrigin") => {
+                    current_rule
+                        .as_mut()
+                        .ok_or_else(|| malformed_cors_xml("missing active CORS rule"))?
+                        .allowed_origins
+                        .push(std::mem::take(&mut current_text));
+                    state = State::InRule;
+                }
+                (State::InAllowedMethod, b"AllowedMethod") => {
+                    let method = std::mem::take(&mut current_text);
+                    if !valid_methods.contains(&method.as_str()) {
+                        return Err(ServerError::InvalidRequest {
+                            reason: format!(
+                                "Found unsupported HTTP method in CORS config. Unsupported method is {method}"
+                            ),
+                        });
+                    }
+                    current_rule
+                        .as_mut()
+                        .ok_or_else(|| malformed_cors_xml("missing active CORS rule"))?
+                        .allowed_methods
+                        .push(method);
+                    state = State::InRule;
+                }
+                (State::InAllowedHeader, b"AllowedHeader") => {
+                    current_rule
+                        .as_mut()
+                        .ok_or_else(|| malformed_cors_xml("missing active CORS rule"))?
+                        .allowed_headers
+                        .push(std::mem::take(&mut current_text));
+                    state = State::InRule;
+                }
+                (State::InExposeHeader, b"ExposeHeader") => {
+                    current_rule
+                        .as_mut()
+                        .ok_or_else(|| malformed_cors_xml("missing active CORS rule"))?
+                        .expose_headers
+                        .push(std::mem::take(&mut current_text));
+                    state = State::InRule;
+                }
+                (State::InMaxAgeSeconds, b"MaxAgeSeconds") => {
+                    if current_rule
+                        .as_ref()
+                        .ok_or_else(|| malformed_cors_xml("missing active CORS rule"))?
+                        .max_age_seconds
+                        .is_none()
+                    {
+                        let max_age = current_text.parse::<u32>().map_err(|_| {
+                            malformed_cors_xml(&format!("invalid MaxAgeSeconds: {current_text}"))
+                        })?;
+                        current_rule
+                            .as_mut()
+                            .ok_or_else(|| malformed_cors_xml("missing active CORS rule"))?
+                            .max_age_seconds = Some(max_age);
+                    }
+                    current_text.clear();
+                    state = State::InRule;
+                }
+                _ => return Err(malformed_cors_xml("unexpected closing element in CORS XML")),
+            },
+            Ok(Event::Text(t)) => {
+                let text = decode_cors_text(t.as_ref())?;
+                match state {
+                    State::InAllowedOrigin
+                    | State::InAllowedMethod
+                    | State::InAllowedHeader
+                    | State::InExposeHeader
+                    | State::InMaxAgeSeconds => current_text.push_str(&text),
+                    _ if text.trim().is_empty() => {}
+                    _ => return Err(malformed_cors_xml("unexpected text in CORS XML")),
+                }
             }
+            Ok(Event::CData(t)) => {
+                let text = std::str::from_utf8(t.as_ref())
+                    .map_err(|_| malformed_cors_xml("invalid UTF-8 in CORS XML body"))?;
+                match state {
+                    State::InAllowedOrigin
+                    | State::InAllowedMethod
+                    | State::InAllowedHeader
+                    | State::InExposeHeader
+                    | State::InMaxAgeSeconds => current_text.push_str(text),
+                    _ if text.trim().is_empty() => {}
+                    _ => return Err(malformed_cors_xml("unexpected CDATA in CORS XML")),
+                }
+            }
+            Ok(Event::Comment(_) | Event::Decl(_) | Event::PI(_) | Event::DocType(_)) => {}
+            Ok(Event::Eof) => {
+                return match state {
+                    State::Done => {
+                        if rules.is_empty() {
+                            Err(malformed_cors_xml(
+                                "CORS configuration must contain at least one rule",
+                            ))
+                        } else if rules.len() > 100 {
+                            Err(malformed_cors_xml(
+                                "CORS configuration must contain at most 100 rules",
+                            ))
+                        } else {
+                            Ok(crate::cors::CorsConfiguration { rules })
+                        }
+                    }
+                    State::Start => Err(malformed_cors_xml("missing <CORSConfiguration> element")),
+                    _ => Err(malformed_cors_xml("unexpected end of CORS XML")),
+                };
+            }
+            Err(_) => return Err(malformed_cors_xml("malformed CORS XML")),
         }
-
-        // Parse AllowedHeader (0+)
-        let allowed_headers: Vec<String> = extract_all_tag_contents(block, "AllowedHeader")
-            .into_iter()
-            .map(|s| xml_unescape(&s))
-            .collect();
-
-        // Parse ExposeHeader (0+)
-        let expose_headers: Vec<String> = extract_all_tag_contents(block, "ExposeHeader")
-            .into_iter()
-            .map(|s| xml_unescape(&s))
-            .collect();
-
-        // Parse MaxAgeSeconds (0 or 1)
-        let max_age_seconds = extract_tag_content(block, "MaxAgeSeconds")
-            .map(|s| {
-                s.parse::<u32>().map_err(|_| ServerError::MalformedXML {
-                    reason: format!("invalid MaxAgeSeconds: {s}"),
-                })
-            })
-            .transpose()?;
-
-        rules.push(crate::cors::CorsRule {
-            allowed_origins,
-            allowed_methods,
-            allowed_headers,
-            expose_headers,
-            max_age_seconds,
-        });
-
-        search_from = abs_start + end + "</CORSRule>".len();
+        buf.clear();
     }
-
-    if rules.is_empty() {
-        return Err(ServerError::MalformedXML {
-            reason: "CORS configuration must contain at least one rule".to_string(),
-        });
-    }
-    if rules.len() > 100 {
-        return Err(ServerError::MalformedXML {
-            reason: "CORS configuration must contain at most 100 rules".to_string(),
-        });
-    }
-
-    Ok(crate::cors::CorsConfiguration { rules })
 }
 
 /// Serialize a CORS configuration to XML.
