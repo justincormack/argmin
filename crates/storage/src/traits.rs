@@ -223,6 +223,14 @@ pub trait PgMetadataStore {
         generation_id: GenerationId,
     ) -> Result<(), MetadataError>;
 
+    /// Return one reclaim root in the bucket, if any exist.
+    ///
+    /// Used by synchronous bucket deletion to drain deferred reclaim work.
+    fn get_bucket_payload_reclaim_root(
+        &self,
+        bucket: &str,
+    ) -> Result<Option<PayloadReclaimRoot>, MetadataError>;
+
     /// Store tags for an object version (serialized XML string).
     fn put_object_tags(
         &self,

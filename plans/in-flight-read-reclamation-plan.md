@@ -571,12 +571,15 @@ Status:
    - reclaim roots remain durable in the metadata DB; only the scheduling path
      moved into the background
 4. the old mixed lock-order foreground reclaim path is gone
+5. `DeleteBucket` now synchronously drains bucket-scoped reclaim work:
+   - it still rejects buckets with visible objects or in-progress uploads
+   - once the bucket is namespace-empty, it waits for bucket-scoped payload
+     leases to drain and sweeps any remaining durable reclaim roots before
+     removing the bucket row
 
 Required coordinator/storage changes for this design:
 
-1. teach bucket deletion to synchronously drain bucket-scoped reclaim work
-   before removing the bucket
-2. decide whether reclaim workers should remain per-coordinator or be
+1. decide whether reclaim workers should remain per-coordinator or be
    consolidated to a single worker per shared storage node
 
 ## Design Constraints
@@ -612,10 +615,10 @@ Add focused regression tests for:
 
 ## Open Questions
 
-1. the exact multipart-manifest reclaim record shape, especially for streamed
-   parts
-2. whether multipart reclaim needs any identity beyond the root object
-   `generation_id`
+1. whether reclaim workers should remain per-coordinator or be consolidated to
+   a single worker per shared storage node
+2. if bucket deletion is later made asynchronous, what the bucket lifecycle
+   state machine and user-visible semantics should be
 
 Resolved decisions:
 
@@ -637,6 +640,7 @@ Additional follow-up:
 
 Recommended next move:
 
-1. wire `DeleteBucket` to drain queued reclaim work synchronously
-2. then reassess whether the per-coordinator reclaim workers should be folded
+1. reassess whether the per-coordinator reclaim workers should be folded
    into a single worker per shared storage node
+2. if bucket deletion is later made asynchronous, introduce an explicit
+   bucket-lifecycle state before exposing that behavior

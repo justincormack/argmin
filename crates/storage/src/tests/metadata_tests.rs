@@ -3471,6 +3471,44 @@ fn next_generation_id_skips_multipart_reclaim_generation() {
 }
 
 #[test]
+fn get_bucket_payload_reclaim_root_returns_first_root() {
+    let (_dir, store) = make_pg_store();
+
+    store
+        .put_multipart_reclaim(&MultipartReclaimRecord {
+            bucket: "b".into(),
+            key: "z".into(),
+            generation_id: GenerationId::new(9).unwrap(),
+            created_at: 1,
+            parts: vec![MultipartReclaimPartRecord::ShardSet {
+                part_number: 1,
+                part_okh: [0x11; 16],
+                part_vid: GenerationId::new(21).unwrap(),
+                shard_pg_id: 0,
+                ec: EcShape { k: 4, m: 2 },
+            }],
+        })
+        .unwrap();
+    store
+        .put_simple_payload_reclaim(&SimplePayloadReclaimRecord {
+            bucket: "b".into(),
+            key: "a".into(),
+            generation_id: GenerationId::new(3).unwrap(),
+            ec: EcShape { k: 4, m: 2 },
+            created_at: 1,
+        })
+        .unwrap();
+
+    let root = store
+        .get_bucket_payload_reclaim_root("b")
+        .unwrap()
+        .expect("bucket reclaim root should exist");
+    assert_eq!(root.bucket, "b");
+    assert_eq!(root.key, "a");
+    assert_eq!(root.generation_id, GenerationId::new(3).unwrap());
+}
+
+#[test]
 fn commit_stream_part_rejects_mismatched_chunk_part_number() {
     let (_dir, store) = make_pg_store();
 

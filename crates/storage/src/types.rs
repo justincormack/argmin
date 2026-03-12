@@ -613,6 +613,14 @@ pub struct SimplePayloadReclaimRecord {
     pub created_at: u64,
 }
 
+/// Bucket-scoped reclaim root used for synchronous bucket draining.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PayloadReclaimRoot {
+    pub bucket: BucketName,
+    pub key: ObjectKey,
+    pub generation_id: GenerationId,
+}
+
 /// Chunk entry for a durable chunk-manifest reclaim record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChunkManifestReclaimChunkRecord {

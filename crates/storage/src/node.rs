@@ -233,6 +233,19 @@ impl SharedStorageNode {
             .unwrap_or(0)
     }
 
+    /// Return the number of active object-payload leases for a bucket.
+    pub fn bucket_object_payload_lease_count(&self, bucket: &str) -> usize {
+        let leases = self
+            .object_payload_leases
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        leases
+            .iter()
+            .filter(|((lease_bucket, _, _), _)| lease_bucket == bucket)
+            .map(|(_, count)| *count)
+            .sum()
+    }
+
     /// Queue a payload generation for background reclaim.
     pub fn enqueue_object_payload_reclaim(
         &self,

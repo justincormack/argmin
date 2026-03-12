@@ -2364,6 +2364,8 @@ impl Coordinator {
             Ok::<(), ServerError>(())
         })?;
 
+        self.drain_bucket_payload_reclaims(name)?;
+
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg.delete_bucket(name).map_err(|e| match e {
             storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
@@ -2372,6 +2374,46 @@ impl Coordinator {
             storage::MetadataError::BucketNotEmpty => ServerError::BucketNotEmpty,
             other => ServerError::Metadata(other),
         })
+    }
+
+    fn drain_bucket_payload_reclaims(&self, bucket: &str) -> Result<(), ServerError> {
+        loop {
+            let mut reclaimed_any = false;
+            let mut found_reclaim_root = false;
+
+            self.pg_topology.for_each_pg(|pg_id| {
+                let root = {
+                    let pg = self.storage_node.get_pg(pg_id)?;
+                    pg.get_bucket_payload_reclaim_root(bucket)?
+                };
+                if let Some(root) = root {
+                    found_reclaim_root = true;
+                    if self.storage_node.object_payload_lease_count(
+                        root.bucket.as_str(),
+                        root.key.as_str(),
+                        root.generation_id,
+                    ) == 0
+                    {
+                        self.read_runtime().try_reclaim_object_payload(
+                            root.bucket.as_str(),
+                            root.key.as_str(),
+                            root.generation_id,
+                        )?;
+                        reclaimed_any = true;
+                    }
+                }
+                Ok::<(), ServerError>(())
+            })?;
+
+            let active_leases = self.storage_node.bucket_object_payload_lease_count(bucket);
+            if active_leases == 0 && !found_reclaim_root {
+                return Ok(());
+            }
+
+            if !reclaimed_any {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
     }
 
     pub fn head_bucket(&self, name: &str) -> Result<BucketSummary, ServerError> {
@@ -12478,6 +12520,127 @@ mod tests {
         // Bucket has no objects but has an in-progress MPU — should fail.
         let err = delete_bucket_test(&coord, "bucket").unwrap_err();
         assert!(matches!(err, ServerError::BucketNotEmpty));
+    }
+
+    #[test]
+    fn delete_bucket_drains_unqueued_payload_reclaim() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let generation_id = GenerationId::new(1).unwrap();
+        let meta_pg_id = coord.object_pg_id("bucket", "ghost");
+        {
+            let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
+            pg.put_simple_payload_reclaim(&SimplePayloadReclaimRecord {
+                bucket: "bucket".into(),
+                key: "ghost".into(),
+                generation_id,
+                ec: EcShape { k: 4, m: 2 },
+                created_at: 1,
+            })
+            .unwrap();
+        }
+
+        delete_bucket_test(&coord, "bucket").unwrap();
+
+        let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
+        assert!(pg
+            .get_simple_payload_reclaim("bucket", "ghost", generation_id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn delete_bucket_waits_for_payload_lease_and_reclaim() {
+        let tmp = test_util::tempdir();
+        let pg_ids: Vec<u32> = (0..4).collect();
+        let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
+        let ec_config = EcConfig::new(4, 2).unwrap();
+
+        let admin = Coordinator::new(
+            Arc::clone(&storage_node),
+            ec_config,
+            "us-east-1".to_string(),
+        )
+        .unwrap();
+        let deleter = Coordinator::new(
+            Arc::clone(&storage_node),
+            ec_config,
+            "us-east-1".to_string(),
+        )
+        .unwrap();
+        admin.create_bucket("bucket").unwrap();
+
+        let metadata = MetadataBlob::new();
+        admin
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"hello world",
+                metadata: &metadata,
+                tags: None,
+                cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
+            })
+            .unwrap();
+
+        let held_read = admin
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: NO_READ,
+                requester: TEST_REQUESTER,
+            })
+            .unwrap();
+
+        let generation_id = {
+            let meta_pg_id = admin.object_pg_id("bucket", "key");
+            let pg = admin.storage_node.get_pg(meta_pg_id).unwrap();
+            match pg.get_object_meta("bucket", "key").unwrap() {
+                StoredObject::Live(record) => record.generation_id,
+                other @ StoredObject::DeleteMarker(_) => {
+                    panic!("expected live object, got {other:?}")
+                }
+            }
+        };
+
+        admin
+            .delete_object(&DeleteObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: NO_DELETE,
+                requester: TEST_REQUESTER,
+            })
+            .unwrap();
+
+        let meta_pg_id = admin.object_pg_id("bucket", "key");
+        {
+            let pg = admin.storage_node.get_pg(meta_pg_id).unwrap();
+            assert!(pg
+                .get_simple_payload_reclaim("bucket", "key", generation_id)
+                .unwrap()
+                .is_some());
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let res = delete_bucket_test(&deleter, "bucket");
+            tx.send(res).unwrap();
+        });
+
+        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(held_read);
+
+        let res = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(
+            res.is_ok(),
+            "delete_bucket should succeed after payload lease release: {res:?}"
+        );
+        handle.join().unwrap();
     }
 
     #[test]

@@ -2058,6 +2058,41 @@ impl PgMetadataStore for PgStore {
         Ok(())
     }
 
+    fn get_bucket_payload_reclaim_root(
+        &self,
+        bucket: &str,
+    ) -> Result<Option<PayloadReclaimRoot>, MetadataError> {
+        self.conn
+            .query_row(
+                "SELECT bucket, key, generation_id FROM (
+                     SELECT bucket, key, generation_id FROM simple_payload_reclaims WHERE bucket = ?1
+                     UNION ALL
+                     SELECT bucket, key, generation_id FROM chunk_manifest_reclaims WHERE bucket = ?1
+                     UNION ALL
+                     SELECT bucket, key, generation_id FROM multipart_reclaims WHERE bucket = ?1
+                 )
+                 ORDER BY key ASC, generation_id ASC
+                 LIMIT 1",
+                params![bucket],
+                |row| {
+                    Ok(PayloadReclaimRoot {
+                        bucket: row.get(0)?,
+                        key: row.get(1)?,
+                        generation_id: Self::parse_generation_id(
+                            row.get::<_, i64>(2)?,
+                            2,
+                            "generation_id",
+                        )?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| MetadataError::Db {
+                context: "get bucket payload reclaim root",
+                source: e,
+            })
+    }
+
     fn put_object_tags(
         &self,
         bucket: &str,
