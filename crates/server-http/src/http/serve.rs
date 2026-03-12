@@ -570,7 +570,6 @@ impl PostMultipartParser {
                         events.push(PostMultipartEvent::FileStart { file_name });
                     }
                     self.state = PostMultipartState::Data { name, is_file };
-                    continue;
                 }
                 PostMultipartState::Data { name, is_file } => {
                     if let Some(idx) = find_subslice(&self.buf, &self.delimiter) {

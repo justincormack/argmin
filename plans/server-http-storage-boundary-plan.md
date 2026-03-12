@@ -65,6 +65,10 @@ Completed:
 11. `CreateBucket` and `ListBuckets` now use core-owned request types and no
     longer route owner-principal plumbing or ownership-controls semantics
     through `server-http`
+12. object-creation tagging now commits in the initial core/storage write for:
+    - `PutObject`
+    - `CopyObject`
+    - streaming `PutObject` finalize
 
 Current state:
 
@@ -74,8 +78,8 @@ Current state:
    bucket-subresource operations
 3. `storage` remains independent of both `server-core` and `server-http`
 4. the main authz boundary goal of this plan is effectively complete
-5. the remaining issues are now cleanup-level rather than layering-critical
-5. the in-flight read vs object reclamation race discovered during this work is
+5. the main HTTP/core boundary work is complete
+6. the in-flight read vs object reclamation race discovered during this work is
    tracked separately in
    [`plans/in-flight-read-reclamation-plan.md`](./in-flight-read-reclamation-plan.md)
 
@@ -101,14 +105,14 @@ The original issue has now been addressed for the main API surface:
    the operation
 3. `storage` remains policy-agnostic
 
-The remaining work is follow-on cleanup, not the original boundary bug.
+The original boundary bug is now addressed. The remaining question is whether
+the deeper `server-core -> storage` concreteness is worth abstracting further.
 
 ## Goals
 
 1. keep `server-http` responsible only for authentication and request parsing
 2. keep `storage` policy-agnostic
-3. finish any remaining cleanup that still weakens the split
-4. only revisit the deeper `server-core -> storage` concreteness after this
+3. only revisit the deeper `server-core -> storage` concreteness after the
    boundary cleanup is actually complete
 
 ## Non-goals
@@ -158,14 +162,12 @@ reclamation race is not an auth problem and is tracked separately.
 
 ## Remaining Surface
 
-### Still worth cleaning up
+The HTTP/core boundary work tracked by this plan is complete.
 
-1. successful write paths still apply tags as a second core call from
-   `server-http` in some flows (`PutObject`, `CopyObject`, `POST Object`,
-   streaming finalize), which is no longer an auth leak but is still a split
-   operation across the boundary
-2. the deeper `server-core -> storage` concreteness question remains open, but
-   is intentionally deferred
+The remaining open item is:
+
+1. the deeper `server-core -> storage` concreteness question, which remains
+   intentionally deferred
 
 ## Recommended Interface Shape
 
@@ -187,19 +189,7 @@ The rule is:
 
 ## Remaining Implementation Order
 
-### Step 1: collapse post-write tagging into core-owned flows
-
-Optional cleanup:
-
-1. `PutObject`
-2. `CopyObject`
-3. `POST Object`
-4. streaming `PutObject` finalize
-
-This would reduce boundary chatter and tighten write atomicity semantics, but
-it is separate from the authz layering problem already solved above.
-
-### Step 2: reassess the deeper core/storage boundary
+### Step 1: reassess the deeper core/storage boundary
 
 Only after the HTTP/core split is judged complete enough on its own:
 

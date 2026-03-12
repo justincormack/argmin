@@ -609,6 +609,8 @@ pub struct PutLiveObjectReq {
     pub etag: ObjectEtag,
     pub ec: EcShape,
     pub layout: ObjectLayout,
+    /// Serialized tagging XML (None = no tags).
+    pub tags: Option<String>,
     /// Serialized user metadata headers.
     pub metadata_blob: Option<Vec<u8>>,
 }
@@ -679,6 +681,8 @@ pub struct CommitStreamPutReq {
     /// CRC64-NVME of the object data.
     pub etag_crc64: u64,
     pub ec: EcShape,
+    /// Serialized tagging XML (None = no tags).
+    pub tags: Option<String>,
     /// Serialized user metadata headers.
     pub metadata_blob: Option<Vec<u8>>,
 }

@@ -226,6 +226,13 @@ pub enum MetadataDirective<'a> {
     },
 }
 
+/// Tagging handling directive for `CopyObject`.
+#[derive(Debug)]
+pub enum TaggingDirective<'a> {
+    Copy,
+    Replace(Option<&'a str>),
+}
+
 /// Parsed copy-source reference, shared by CopyObject and UploadPartCopy.
 #[derive(Debug)]
 pub struct CopySource<'a> {
@@ -243,6 +250,7 @@ pub struct CopyObjectRequest<'a> {
     pub dst_key: &'a str,
     pub dst_condition: &'a WriteCondition,
     pub directive: MetadataDirective<'a>,
+    pub tagging: TaggingDirective<'a>,
     pub requester: Requester<'a>,
     pub acl: PutObjectAcl<'a>,
 }
@@ -266,6 +274,7 @@ pub struct PutObjectRequest<'a> {
     pub key: &'a str,
     pub data: &'a [u8],
     pub metadata: &'a MetadataBlob,
+    pub tags: Option<&'a str>,
     pub cond: &'a WriteCondition,
     pub requester: Requester<'a>,
     pub acl: PutObjectAcl<'a>,
@@ -573,6 +582,7 @@ pub struct FinalizeStreamPutRequest<'a> {
     pub crc64: u64,
     pub total_size: u64,
     pub metadata_blob: &'a MetadataBlob,
+    pub tags: Option<&'a str>,
     pub cond: &'a WriteCondition,
 }
 
@@ -1478,6 +1488,7 @@ impl Coordinator {
         bucket: &str,
         key: &str,
         metadata_blob: &MetadataBlob,
+        tags: Option<&str>,
         user_data: &[u8],
         version_id: VersionId,
         meta_pg: &storage::PgStore,
@@ -1554,6 +1565,7 @@ impl Coordinator {
                 m: self.ec_config.parity_shards,
             },
             layout: ObjectLayout::ChunkManifest,
+            tags: tags.map(std::string::ToString::to_string),
             metadata_blob: Some(blob_bytes),
         }));
 
@@ -1594,6 +1606,7 @@ impl Coordinator {
         let key = req.key;
         let data = req.data;
         let metadata_blob = req.metadata;
+        let tags = req.tags;
         let cond = req.cond;
         let requester = req.requester;
         let acl = req.acl;
@@ -1645,6 +1658,7 @@ impl Coordinator {
             bucket,
             key,
             metadata_blob,
+            tags,
             data,
             version_id,
             meta_pg,
@@ -1923,6 +1937,7 @@ impl Coordinator {
         let crc64 = req.crc64;
         let total_size = req.total_size;
         let metadata_blob = req.metadata_blob;
+        let tags = req.tags;
         let cond = req.cond;
         let _bucket_guard = self.storage_node.lock_bucket(bucket);
 
@@ -2015,6 +2030,7 @@ impl Coordinator {
                         k: self.ec_config.data_shards,
                         m: self.ec_config.parity_shards,
                     },
+                    tags: tags.map(std::string::ToString::to_string),
                     metadata_blob: Some(blob_bytes),
                 },
                 &committed_chunks,
@@ -2406,7 +2422,7 @@ impl Coordinator {
         let _src_bucket_info = self.authorize_bucket_read_requester(requester, src_bucket)?;
 
         // Phase 1: Read source object
-        let (src_metadata, user_data) = {
+        let (src_metadata, src_tags, user_data) = {
             let LockedReadObject {
                 record: src_stored,
                 pgs,
@@ -2470,7 +2486,7 @@ impl Coordinator {
                     .transpose()?
                     .unwrap_or_default();
 
-                (metadata, data)
+                (metadata, src_record.tags.clone(), data)
             } else {
                 // Non-multipart source: metadata from DB row, user data from shards.
                 let src_etag_crc = src_record.etag.crc64();
@@ -2524,7 +2540,7 @@ impl Coordinator {
                     .transpose()?
                     .unwrap_or_default();
 
-                (src_metadata, user_data)
+                (src_metadata, src_record.tags.clone(), user_data)
             }
         }; // source locks dropped here
 
@@ -2549,6 +2565,10 @@ impl Coordinator {
                 blob
             }
         };
+        let tags = match &req.tagging {
+            TaggingDirective::Copy => src_tags,
+            TaggingDirective::Replace(tags) => tags.map(std::string::ToString::to_string),
+        };
 
         let LockedWriteObject {
             version_id: dst_version_id,
@@ -2571,6 +2591,7 @@ impl Coordinator {
             dst_bucket,
             dst_key,
             &metadata_blob,
+            tags.as_deref(),
             &user_data,
             dst_version_id,
             dst_meta_pg,
@@ -5998,6 +6019,7 @@ mod tests {
                 key: "key",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -6006,6 +6028,39 @@ mod tests {
 
         let err = delete_bucket_test(&coord, "bucket").unwrap_err();
         assert!(matches!(err, ServerError::BucketNotEmpty));
+    }
+
+    #[test]
+    fn put_object_persists_tags_in_initial_write() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let tags_xml =
+            "<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag></TagSet></Tagging>";
+        coord
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                tags: Some(tags_xml),
+                cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
+            })
+            .unwrap();
+
+        let obj = coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: NO_READ,
+                requester: TEST_REQUESTER,
+            })
+            .unwrap();
+        assert_eq!(obj.tags.as_deref(), Some(tags_xml));
     }
 
     #[test]
@@ -6037,6 +6092,7 @@ mod tests {
                 key: "key",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -6110,6 +6166,7 @@ mod tests {
                 key: "hello.txt",
                 data: b"Hello, world!",
                 metadata: &MetadataBlob::from_headers(&headers).unwrap(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -6149,6 +6206,7 @@ mod tests {
                 key: "obj",
                 data: b"{}",
                 metadata: &MetadataBlob::from_headers(&headers).unwrap(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -6182,6 +6240,7 @@ mod tests {
                 key: "key",
                 data: b"data",
                 metadata: &MetadataBlob::from_headers(&[("Content-Type", "text/plain")]).unwrap(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -6213,6 +6272,7 @@ mod tests {
                 key: "key",
                 data: b"v1",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -6224,6 +6284,7 @@ mod tests {
                 key: "key",
                 data: b"v2",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -6254,6 +6315,7 @@ mod tests {
                 key: "empty",
                 data: b"",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -6285,6 +6347,7 @@ mod tests {
                 key: "key",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -6342,6 +6405,7 @@ mod tests {
                 key: "a/1",
                 data: b"1",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -6353,6 +6417,7 @@ mod tests {
                 key: "a/2",
                 data: b"2",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -6364,6 +6429,7 @@ mod tests {
                 key: "b/1",
                 data: b"3",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -6399,6 +6465,7 @@ mod tests {
                 key: "photos/cat.jpg",
                 data: b"cat",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -6410,6 +6477,7 @@ mod tests {
                 key: "photos/dog.jpg",
                 data: b"dog",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -6421,6 +6489,7 @@ mod tests {
                 key: "docs/readme.md",
                 data: b"md",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -6452,6 +6521,7 @@ mod tests {
                 key: "photos/cat.jpg",
                 data: b"cat",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -6463,6 +6533,7 @@ mod tests {
                 key: "photos/dog.jpg",
                 data: b"dog",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -6474,6 +6545,7 @@ mod tests {
                 key: "docs/readme.md",
                 data: b"md",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -6485,6 +6557,7 @@ mod tests {
                 key: "root.txt",
                 data: b"root",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -6519,6 +6592,7 @@ mod tests {
                 key: "folder/",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -6612,6 +6686,7 @@ mod tests {
                 key: "resilient",
                 data,
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -6647,6 +6722,7 @@ mod tests {
                 key: "obj1",
                 data,
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -6681,6 +6757,7 @@ mod tests {
                 key: "obj2",
                 data,
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -6717,6 +6794,7 @@ mod tests {
                 key: "obj3",
                 data,
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -6754,6 +6832,7 @@ mod tests {
                 key: "obj4",
                 data,
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -6787,6 +6866,7 @@ mod tests {
                 key: "obj5",
                 data,
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -6824,6 +6904,7 @@ mod tests {
                 key: "obj6",
                 data,
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -6856,6 +6937,7 @@ mod tests {
                 key: "key",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -6894,6 +6976,7 @@ mod tests {
                 key: "key",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -6935,6 +7018,7 @@ mod tests {
                 key: "a/1",
                 data: b"1",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -6946,6 +7030,7 @@ mod tests {
                 key: "a/2",
                 data: b"2",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -6957,6 +7042,7 @@ mod tests {
                 key: "b/1",
                 data: b"3",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -6968,6 +7054,7 @@ mod tests {
                 key: "c/1",
                 data: b"4",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -6979,6 +7066,7 @@ mod tests {
                 key: "root.txt",
                 data: b"5",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -7037,6 +7125,7 @@ mod tests {
                     key: &key,
                     data: b"data",
                     metadata: &MetadataBlob::new(),
+                    tags: None,
                     cond: NO_WRITE,
                     requester: TEST_REQUESTER,
                     acl: NO_PUT_OBJECT_ACL,
@@ -7071,6 +7160,7 @@ mod tests {
                 key: "key",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -7102,6 +7192,7 @@ mod tests {
                     key: &key,
                     data: b"data",
                     metadata: &MetadataBlob::new(),
+                    tags: None,
                     cond: NO_WRITE,
                     requester: TEST_REQUESTER,
                     acl: NO_PUT_OBJECT_ACL,
@@ -7139,6 +7230,7 @@ mod tests {
                     key: &key,
                     data: b"data",
                     metadata: &MetadataBlob::new(),
+                    tags: None,
                     cond: NO_WRITE,
                     requester: TEST_REQUESTER,
                     acl: NO_PUT_OBJECT_ACL,
@@ -7204,6 +7296,7 @@ mod tests {
                 key: "photos/2024/jan.jpg",
                 data: b"j",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -7215,6 +7308,7 @@ mod tests {
                 key: "photos/2024/feb.jpg",
                 data: b"f",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -7226,6 +7320,7 @@ mod tests {
                 key: "photos/2025/mar.jpg",
                 data: b"m",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -7237,6 +7332,7 @@ mod tests {
                 key: "photos/top.jpg",
                 data: b"t",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -7275,6 +7371,7 @@ mod tests {
                 key: "only-one",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -7308,6 +7405,7 @@ mod tests {
                 key: "key1",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -7342,6 +7440,7 @@ mod tests {
                 key: "a/1",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -7393,6 +7492,7 @@ mod tests {
                 key: "key1",
                 data: b"data1",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -7404,6 +7504,7 @@ mod tests {
                 key: "key2",
                 data: b"data2",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -7612,6 +7713,7 @@ mod tests {
                 key: "key",
                 data: b"Hello, World!",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -7647,6 +7749,7 @@ mod tests {
                 key: "key",
                 data: b"Hello, World!",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -7681,6 +7784,7 @@ mod tests {
                 key: "key",
                 data: b"Hello, World!",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -7713,6 +7817,7 @@ mod tests {
                 key: "key",
                 data: b"Hello",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -7745,6 +7850,7 @@ mod tests {
                 key: "key",
                 data: b"Hello",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -7785,6 +7891,7 @@ mod tests {
                 key: "new-key",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: &cond,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -7804,6 +7911,7 @@ mod tests {
                 key: "key",
                 data: b"v1",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -7817,6 +7925,7 @@ mod tests {
                 key: "key",
                 data: b"v2",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: &cond,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -7837,6 +7946,7 @@ mod tests {
                 key: "key",
                 data: b"v1",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -7849,6 +7959,7 @@ mod tests {
                 key: "key",
                 data: b"v2",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: &cond,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -7880,6 +7991,7 @@ mod tests {
                 key: "key",
                 data: b"v1",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -7892,6 +8004,7 @@ mod tests {
                 key: "key",
                 data: b"v2",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -7905,6 +8018,7 @@ mod tests {
                 key: "key",
                 data: b"v3",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: &cond,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -7925,6 +8039,7 @@ mod tests {
                 key: "key",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: Requester::principal("other-user"),
                 acl: NO_PUT_OBJECT_ACL,
@@ -7952,6 +8067,7 @@ mod tests {
                 key: "key",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: PutObjectAcl::Other("public-read"),
@@ -8019,6 +8135,7 @@ mod tests {
                 key: "key",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
                 acl: NO_PUT_OBJECT_ACL,
@@ -8044,6 +8161,7 @@ mod tests {
                 key: "key",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
                 acl: NO_PUT_OBJECT_ACL,
@@ -8098,6 +8216,7 @@ mod tests {
                 key: "key",
                 data: b"secret",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
                 acl: NO_PUT_OBJECT_ACL,
@@ -8129,6 +8248,7 @@ mod tests {
                 key: "key",
                 data: b"public",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
                 acl: NO_PUT_OBJECT_ACL,
@@ -8194,6 +8314,7 @@ mod tests {
                 key: "key",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
                 acl: NO_PUT_OBJECT_ACL,
@@ -8429,6 +8550,7 @@ mod tests {
                 key: "key",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -8461,6 +8583,7 @@ mod tests {
                 key: "key",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -8495,6 +8618,7 @@ mod tests {
                 key: "key",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -8528,6 +8652,7 @@ mod tests {
                 key: "key",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -8561,6 +8686,7 @@ mod tests {
                 key: "key",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -8598,6 +8724,7 @@ mod tests {
                 key: "key",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -8629,6 +8756,7 @@ mod tests {
                 key: "key1",
                 data: b"data1",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -8640,6 +8768,7 @@ mod tests {
                 key: "key2",
                 data: b"data2",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -8684,6 +8813,7 @@ mod tests {
                 key: "key",
                 data: b"Hello, World!",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -8721,6 +8851,7 @@ mod tests {
                 key: "src",
                 data: b"hello copy",
                 metadata: &MetadataBlob::from_headers(&headers).unwrap(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -8739,6 +8870,7 @@ mod tests {
                 dst_key: "dst",
                 dst_condition: NO_WRITE,
                 directive: MetadataDirective::Copy,
+                tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
             })
@@ -8774,6 +8906,7 @@ mod tests {
                 key: "src",
                 data: b"private",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
                 acl: NO_PUT_OBJECT_ACL,
@@ -8792,6 +8925,7 @@ mod tests {
                 dst_key: "dst",
                 dst_condition: NO_WRITE,
                 directive: MetadataDirective::Copy,
+                tagging: TaggingDirective::Copy,
                 requester: Requester::principal("owner-b"),
                 acl: NO_PUT_OBJECT_ACL,
             })
@@ -8817,6 +8951,7 @@ mod tests {
                 key: "src",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -8835,6 +8970,7 @@ mod tests {
                 dst_key: "dst",
                 dst_condition: NO_WRITE,
                 directive: MetadataDirective::Copy,
+                tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
                 acl: PutObjectAcl::Other("public-read"),
             })
@@ -8858,6 +8994,7 @@ mod tests {
                 key: "src",
                 data: b"data",
                 metadata: &MetadataBlob::from_headers(&headers).unwrap(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -8876,6 +9013,7 @@ mod tests {
                 dst_key: "dst",
                 dst_condition: NO_WRITE,
                 directive: MetadataDirective::Copy,
+                tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
             })
@@ -8910,6 +9048,7 @@ mod tests {
                 key: "src",
                 data: b"data",
                 metadata: &MetadataBlob::from_headers(&headers).unwrap(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -8933,6 +9072,7 @@ mod tests {
                     metadata: &new_metadata,
                     checksum_algorithm: None,
                 },
+                tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
             })
@@ -8967,6 +9107,7 @@ mod tests {
                 key: "key",
                 data: b"data",
                 metadata: &MetadataBlob::from_headers(&headers).unwrap(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -8990,6 +9131,7 @@ mod tests {
                     metadata: &new_metadata,
                     checksum_algorithm: None,
                 },
+                tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
             })
@@ -9009,6 +9151,110 @@ mod tests {
     }
 
     #[test]
+    fn copy_object_tagging_copy_preserves_source_tags() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let tags_xml =
+            "<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag></TagSet></Tagging>";
+        coord
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "src",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                tags: Some(tags_xml),
+                cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
+            })
+            .unwrap();
+
+        coord
+            .copy_object(&CopyObjectRequest {
+                source: CopySource {
+                    bucket: "bucket",
+                    key: "src",
+                    version_id: None,
+                    condition: NO_READ,
+                },
+                dst_bucket: "bucket",
+                dst_key: "dst",
+                dst_condition: NO_WRITE,
+                directive: MetadataDirective::Copy,
+                tagging: TaggingDirective::Copy,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
+            })
+            .unwrap();
+
+        let obj = coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "dst",
+                version_id: None,
+                cond: NO_READ,
+                requester: TEST_REQUESTER,
+            })
+            .unwrap();
+        assert_eq!(obj.tags.as_deref(), Some(tags_xml));
+    }
+
+    #[test]
+    fn copy_object_tagging_replace_overwrites_source_tags() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let src_tags =
+            "<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag></TagSet></Tagging>";
+        let dst_tags =
+            "<Tagging><TagSet><Tag><Key>tier</Key><Value>gold</Value></Tag></TagSet></Tagging>";
+        coord
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "src",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                tags: Some(src_tags),
+                cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
+            })
+            .unwrap();
+
+        coord
+            .copy_object(&CopyObjectRequest {
+                source: CopySource {
+                    bucket: "bucket",
+                    key: "src",
+                    version_id: None,
+                    condition: NO_READ,
+                },
+                dst_bucket: "bucket",
+                dst_key: "dst",
+                dst_condition: NO_WRITE,
+                directive: MetadataDirective::Copy,
+                tagging: TaggingDirective::Replace(Some(dst_tags)),
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
+            })
+            .unwrap();
+
+        let obj = coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "dst",
+                version_id: None,
+                cond: NO_READ,
+                requester: TEST_REQUESTER,
+            })
+            .unwrap();
+        assert_eq!(obj.tags.as_deref(), Some(dst_tags));
+    }
+
+    #[test]
     fn copy_object_replace_strips_unverified_inline_checksum() {
         // Regression: CopyObject with REPLACE must not persist client-supplied
         // checksum value headers, since there is no body to verify them against.
@@ -9022,6 +9268,7 @@ mod tests {
                 key: "src",
                 data: b"hello",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -9046,6 +9293,7 @@ mod tests {
                     metadata: &new_metadata,
                     checksum_algorithm: None,
                 },
+                tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
             })
@@ -9081,6 +9329,7 @@ mod tests {
                 key: "src",
                 data,
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -9103,6 +9352,7 @@ mod tests {
                     metadata: &new_metadata,
                     checksum_algorithm: Some(ChecksumAlgorithm::Crc32c),
                 },
+                tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
             })
@@ -9159,6 +9409,7 @@ mod tests {
                 dst_key: "dst",
                 dst_condition: NO_WRITE,
                 directive: MetadataDirective::Copy,
+                tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
             })
@@ -9177,6 +9428,7 @@ mod tests {
                 key: "src",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -9195,6 +9447,7 @@ mod tests {
                 dst_key: "dst",
                 dst_condition: NO_WRITE,
                 directive: MetadataDirective::Copy,
+                tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
             })
@@ -9213,6 +9466,7 @@ mod tests {
                 key: "src",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -9235,6 +9489,7 @@ mod tests {
                 dst_key: "dst",
                 dst_condition: NO_WRITE,
                 directive: MetadataDirective::Copy,
+                tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
             })
@@ -9254,6 +9509,7 @@ mod tests {
                 key: "src",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -9265,6 +9521,7 @@ mod tests {
                 key: "dst",
                 data: b"existing",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -9284,6 +9541,7 @@ mod tests {
                 dst_key: "dst",
                 dst_condition: &dst_cond,
                 directive: MetadataDirective::Copy,
+                tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
             })
@@ -9303,6 +9561,7 @@ mod tests {
                 key: "src",
                 data: b"new data",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -9314,6 +9573,7 @@ mod tests {
                 key: "dst",
                 data: b"old data",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -9333,6 +9593,7 @@ mod tests {
                 dst_key: "dst",
                 dst_condition: &dst_cond,
                 directive: MetadataDirective::Copy,
+                tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
             })
@@ -9365,6 +9626,7 @@ mod tests {
                 key: "key",
                 data: b"cross bucket data",
                 metadata: &MetadataBlob::from_headers(&headers).unwrap(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -9383,6 +9645,7 @@ mod tests {
                 dst_key: "key",
                 dst_condition: NO_WRITE,
                 directive: MetadataDirective::Copy,
+                tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
             })
@@ -9543,6 +9806,7 @@ mod tests {
                 key: "key",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -9563,6 +9827,7 @@ mod tests {
                 key: "key",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -9592,6 +9857,7 @@ mod tests {
                 key: "key",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -9650,6 +9916,7 @@ mod tests {
                     key: &key_a,
                     data: b"v1",
                     metadata: &MetadataBlob::new(),
+                    tags: None,
                     cond: NO_WRITE,
                     requester: TEST_REQUESTER,
                     acl: NO_PUT_OBJECT_ACL,
@@ -9662,6 +9929,7 @@ mod tests {
                     key: &key_b,
                     data: b"v2",
                     metadata: &MetadataBlob::new(),
+                    tags: None,
                     cond: NO_WRITE,
                     requester: TEST_REQUESTER,
                     acl: NO_PUT_OBJECT_ACL,
@@ -9708,6 +9976,7 @@ mod tests {
                 key: "key",
                 data: &vec![b'A'; object_size],
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -9732,6 +10001,7 @@ mod tests {
                     key: "key",
                     data: &new_payload,
                     metadata: &MetadataBlob::new(),
+                    tags: None,
                     cond: NO_WRITE,
                     requester: TEST_REQUESTER,
                     acl: NO_PUT_OBJECT_ACL,
@@ -9796,6 +10066,7 @@ mod tests {
                 key: "key",
                 data: &vec![b'A'; object_size],
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -9819,6 +10090,7 @@ mod tests {
                     key: "key",
                     data: &payload,
                     metadata: &MetadataBlob::new(),
+                    tags: None,
                     cond: NO_WRITE,
                     requester: TEST_REQUESTER,
                     acl: NO_PUT_OBJECT_ACL,
@@ -9882,6 +10154,7 @@ mod tests {
                 key: "key",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -12211,6 +12484,7 @@ mod tests {
                 dst_key: "dst-key",
                 dst_condition: &WriteCondition::default(),
                 directive: MetadataDirective::Copy,
+                tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
             })
@@ -12352,6 +12626,7 @@ mod tests {
                 key: "key",
                 data: b"hello world",
                 metadata: &MetadataBlob::from_headers(&[("x-amz-meta-foo", "bar")]).unwrap(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -12400,6 +12675,7 @@ mod tests {
                 key: "key",
                 data: b"",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -12462,6 +12738,7 @@ mod tests {
                 dst_key: "key",
                 dst_condition: &WriteCondition::default(),
                 directive: MetadataDirective::Copy,
+                tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
             })
@@ -12934,6 +13211,7 @@ mod tests {
                 crc64: crc,
                 total_size: full_data.len() as u64,
                 metadata_blob: &metadata,
+                tags: None,
                 cond: &WriteCondition::default(),
             })
             .unwrap();
@@ -12975,6 +13253,7 @@ mod tests {
                 crc64: crc,
                 total_size: 0,
                 metadata_blob: &metadata,
+                tags: None,
                 cond: &WriteCondition::default(),
             })
             .unwrap();
@@ -12991,6 +13270,45 @@ mod tests {
             })
             .unwrap();
         assert_eq!(head.size, 0);
+    }
+
+    #[test]
+    fn finalize_stream_put_persists_tags_in_initial_commit() {
+        let dir = test_util::tempdir();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let session_id = begin_stream_put_test(&coord, "bucket", "mykey").unwrap();
+        coord
+            .append_stream_chunk("bucket", "mykey", &session_id, 0, b"hello")
+            .unwrap();
+
+        let tags_xml =
+            "<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag></TagSet></Tagging>";
+        let result = coord
+            .finalize_stream_put(&FinalizeStreamPutRequest {
+                bucket: "bucket",
+                key: "mykey",
+                session_id: &session_id,
+                crc64: checksum::crc64::checksum(b"hello"),
+                total_size: 5,
+                metadata_blob: &MetadataBlob::new(),
+                tags: Some(tags_xml),
+                cond: &WriteCondition::default(),
+            })
+            .unwrap();
+        assert_eq!(result.version_id, VersionId::Null);
+
+        let obj = coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "mykey",
+                version_id: None,
+                cond: NO_READ,
+                requester: TEST_REQUESTER,
+            })
+            .unwrap();
+        assert_eq!(obj.tags.as_deref(), Some(tags_xml));
     }
 
     #[test]
@@ -13039,6 +13357,7 @@ mod tests {
                 crc64: crc,
                 total_size: 0,
                 metadata_blob: &metadata,
+                tags: None,
                 cond: &WriteCondition::default(),
             })
             .unwrap();
@@ -13077,6 +13396,7 @@ mod tests {
                 crc64: crc,
                 total_size: 0,
                 metadata_blob: &metadata,
+                tags: None,
                 cond: &WriteCondition::default(),
             })
             .unwrap_err();
@@ -13131,6 +13451,7 @@ mod tests {
                 crc64: crc,
                 total_size: 0,
                 metadata_blob: &metadata,
+                tags: None,
                 cond: &WriteCondition::default(),
             })
             .unwrap_err();
@@ -13166,6 +13487,7 @@ mod tests {
                 key: "key",
                 data: b"old-data",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -13189,6 +13511,7 @@ mod tests {
                 crc64: crc,
                 total_size: new_data.len() as u64,
                 metadata_blob: &metadata,
+                tags: None,
                 cond: &WriteCondition::default(),
             })
             .unwrap();
@@ -13220,6 +13543,7 @@ mod tests {
                 key: "key",
                 data: b"initial",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -13242,6 +13566,7 @@ mod tests {
                 crc64: crc,
                 total_size: 7,
                 metadata_blob: &metadata,
+                tags: None,
                 cond: &cond,
             })
             .unwrap();
@@ -13261,6 +13586,7 @@ mod tests {
                 crc64: checksum::crc64::checksum(b"third"),
                 total_size: 5,
                 metadata_blob: &metadata,
+                tags: None,
                 cond: &bad_cond,
             })
             .unwrap_err();
@@ -13300,6 +13626,7 @@ mod tests {
                 crc64: crc,
                 total_size: full_data.len() as u64,
                 metadata_blob: &metadata,
+                tags: None,
                 cond: &WriteCondition::default(),
             })
             .unwrap();
@@ -13369,6 +13696,7 @@ mod tests {
                 crc64: crc,
                 total_size: 5,
                 metadata_blob: &metadata,
+                tags: None,
                 cond: &WriteCondition::default(),
             })
             .unwrap();
@@ -13427,6 +13755,7 @@ mod tests {
                 crc64: crc,
                 total_size: 10,
                 metadata_blob: &MetadataBlob::new(),
+                tags: None,
                 cond: &WriteCondition::default(),
             })
             .unwrap();
@@ -13469,6 +13798,7 @@ mod tests {
                 crc64: crc,
                 total_size: 8,
                 metadata_blob: &MetadataBlob::new(),
+                tags: None,
                 cond: &WriteCondition::default(),
             })
             .unwrap();
@@ -13546,6 +13876,7 @@ mod tests {
                 crc64: crc,
                 total_size: 7,
                 metadata_blob: &MetadataBlob::new(),
+                tags: None,
                 cond: &WriteCondition::default(),
             })
             .unwrap();
@@ -13563,6 +13894,7 @@ mod tests {
                 dst_key: "dst",
                 dst_condition: &WriteCondition::default(),
                 directive: MetadataDirective::Copy,
+                tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
             })
@@ -13598,6 +13930,7 @@ mod tests {
                 crc64: crc,
                 total_size: 0,
                 metadata_blob: &MetadataBlob::new(),
+                tags: None,
                 cond: &WriteCondition::default(),
             })
             .unwrap();
@@ -13635,6 +13968,7 @@ mod tests {
                 crc64: crc,
                 total_size: 8,
                 metadata_blob: &MetadataBlob::new(),
+                tags: None,
                 cond: &WriteCondition::default(),
             })
             .unwrap();
@@ -13673,6 +14007,7 @@ mod tests {
                 crc64: crc,
                 total_size: 11,
                 metadata_blob: &MetadataBlob::new(),
+                tags: None,
                 cond: &WriteCondition::default(),
             })
             .unwrap();
@@ -13696,6 +14031,7 @@ mod tests {
                 key: "key",
                 data: b"normal-data",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -13735,6 +14071,7 @@ mod tests {
                 crc64: crc,
                 total_size: 9,
                 metadata_blob: &MetadataBlob::new(),
+                tags: None,
                 cond: &WriteCondition::default(),
             })
             .unwrap();
@@ -13784,6 +14121,7 @@ mod tests {
                 crc64: crc,
                 total_size: 11,
                 metadata_blob: &MetadataBlob::new(),
+                tags: None,
                 cond: &WriteCondition::default(),
             })
             .unwrap();
@@ -13832,6 +14170,7 @@ mod tests {
                 key: "src",
                 data: b"source-data",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -13899,6 +14238,7 @@ mod tests {
                 crc64: crc,
                 total_size: 5,
                 metadata_blob: &metadata,
+                tags: None,
                 cond: &WriteCondition::default(),
             })
             .unwrap();
@@ -13926,6 +14266,7 @@ mod tests {
                 crc64: crc,
                 total_size: 999, // wrong — actual is 5
                 metadata_blob: &metadata,
+                tags: None,
                 cond: &WriteCondition::default(),
             })
             .unwrap_err();
@@ -14401,6 +14742,7 @@ mod tests {
                 crc64: crc,
                 total_size: 9,
                 metadata_blob: &MetadataBlob::new(),
+                tags: None,
                 cond: &WriteCondition::default(),
             })
             .unwrap();
@@ -14484,6 +14826,7 @@ mod tests {
                 crc64: crc,
                 total_size: 16,
                 metadata_blob: &MetadataBlob::new(),
+                tags: None,
                 cond: &WriteCondition::default(),
             })
             .unwrap();
@@ -14541,6 +14884,7 @@ mod tests {
                 crc64: crc,
                 total_size: 2,
                 metadata_blob: &MetadataBlob::new(),
+                tags: None,
                 cond: &WriteCondition::default(),
             })
             .unwrap();
@@ -14563,6 +14907,7 @@ mod tests {
                 key: "cycle",
                 data: b"v2-normal",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
@@ -14602,6 +14947,7 @@ mod tests {
                 crc64: checksum::crc64::checksum(b"old-data"),
                 total_size: 8,
                 metadata_blob: &MetadataBlob::new(),
+                tags: None,
                 cond: &WriteCondition::default(),
             })
             .unwrap();
@@ -14619,6 +14965,7 @@ mod tests {
                 crc64: checksum::crc64::checksum(b"new-data"),
                 total_size: 8,
                 metadata_blob: &MetadataBlob::new(),
+                tags: None,
                 cond: &WriteCondition::default(),
             })
             .unwrap();

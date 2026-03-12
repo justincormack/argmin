@@ -11,6 +11,7 @@ fn metadata_put_get_delete(store: &dyn PgMetadataStore) {
         size: 1024,
         etag: ObjectEtag::SinglePart([0xAB, 0xCD, 0, 0, 0, 0, 0, 0]),
         layout: ObjectLayout::ChunkManifest,
+        tags: None,
         metadata_blob: None,
     });
 
@@ -52,6 +53,7 @@ fn metadata_put_overwrites(store: &dyn PgMetadataStore) {
         size: 100,
         etag: ObjectEtag::SinglePart([1, 0, 0, 0, 0, 0, 0, 0]),
         layout: ObjectLayout::ChunkManifest,
+        tags: None,
         metadata_blob: None,
     });
     store.put_object_meta(&req1).unwrap();
@@ -64,6 +66,7 @@ fn metadata_put_overwrites(store: &dyn PgMetadataStore) {
         size: 200,
         etag: ObjectEtag::SinglePart([2, 0, 0, 0, 0, 0, 0, 0]),
         layout: ObjectLayout::ChunkManifest,
+        tags: None,
         metadata_blob: None,
     });
     store.put_object_meta(&req2).unwrap();
@@ -89,6 +92,7 @@ fn metadata_list_basic(store: &dyn PgMetadataStore) {
             etag: ObjectEtag::SinglePart([i as u8, 0, 0, 0, 0, 0, 0, 0]),
             ec: EcShape { k: 4, m: 2 },
             layout: ObjectLayout::ChunkManifest,
+            tags: None,
             metadata_blob: None,
         });
         store.put_object_meta(&req).unwrap();
@@ -121,6 +125,7 @@ fn metadata_list_with_prefix(store: &dyn PgMetadataStore) {
             size: 100,
             etag: ObjectEtag::SinglePart([0; 8]),
             layout: ObjectLayout::ChunkManifest,
+            tags: None,
             metadata_blob: None,
         });
         store.put_object_meta(&req).unwrap();
@@ -149,6 +154,7 @@ fn metadata_list_pagination(store: &dyn PgMetadataStore) {
             etag: ObjectEtag::SinglePart([0; 8]),
             ec: EcShape { k: 4, m: 2 },
             layout: ObjectLayout::ChunkManifest,
+            tags: None,
             metadata_blob: None,
         });
         store.put_object_meta(&req).unwrap();
@@ -238,6 +244,7 @@ fn metadata_empty_key(store: &dyn PgMetadataStore) {
         size: 0,
         etag: ObjectEtag::SinglePart([0; 8]),
         layout: ObjectLayout::ChunkManifest,
+        tags: None,
         metadata_blob: None,
     });
     store.put_object_meta(&req).unwrap();
@@ -257,6 +264,7 @@ fn metadata_long_key(store: &dyn PgMetadataStore) {
         size: 0,
         etag: ObjectEtag::SinglePart([0; 8]),
         layout: ObjectLayout::ChunkManifest,
+        tags: None,
         metadata_blob: None,
     });
     store.put_object_meta(&req).unwrap();
@@ -274,6 +282,7 @@ fn metadata_zero_size_object(store: &dyn PgMetadataStore) {
         size: 0,
         etag: ObjectEtag::SinglePart([0; 8]),
         layout: ObjectLayout::ChunkManifest,
+        tags: None,
         metadata_blob: None,
     });
     store.put_object_meta(&req).unwrap();
@@ -517,6 +526,7 @@ fn file_metadata_object_has_inline_legacy_layout() {
             size: 100,
             etag: ObjectEtag::SinglePart([1, 2, 3, 0, 0, 0, 0, 0]),
             layout: ObjectLayout::ChunkManifest,
+            tags: None,
             metadata_blob: None,
         }))
         .unwrap();
@@ -541,6 +551,7 @@ fn file_metadata_invalid_data_layout_returns_error() {
             size: 100,
             etag: ObjectEtag::SinglePart([1, 2, 3, 0, 0, 0, 0, 0]),
             layout: ObjectLayout::ChunkManifest,
+            tags: None,
             metadata_blob: None,
         }))
         .unwrap();
@@ -2245,6 +2256,7 @@ mod prop_tests {
                 size: 0,
                 etag: ObjectEtag::SinglePart([0; 8]),
                 layout: ObjectLayout::ChunkManifest,
+                tags: None,
                 metadata_blob: None,
             });
             store.put_object_meta(&req).unwrap();
@@ -2557,6 +2569,7 @@ fn commit_stream_put_atomic() {
         size: 6_000_000,
         etag_crc64: u64::from_le_bytes([0xAB; 8]),
         ec: EcShape { k: 4, m: 2 },
+        tags: None,
         metadata_blob: None,
     };
 
@@ -2643,6 +2656,7 @@ fn commit_stream_put_overwrite_unversioned() {
                 size: 100,
                 etag_crc64: 1u64,
                 ec: EcShape { k: 4, m: 2 },
+                tags: None,
                 metadata_blob: None,
             },
             &[StreamObjectChunkRecord {
@@ -2679,6 +2693,7 @@ fn commit_stream_put_overwrite_unversioned() {
                 size: 200,
                 etag_crc64: 2u64,
                 ec: EcShape { k: 4, m: 2 },
+                tags: None,
                 metadata_blob: None,
             },
             &[StreamObjectChunkRecord {
@@ -2731,6 +2746,7 @@ fn delete_stream_object_chunks_cleanup() {
                 size: 100,
                 etag_crc64: 1u64,
                 ec: EcShape { k: 4, m: 2 },
+                tags: None,
                 metadata_blob: None,
             },
             &[StreamObjectChunkRecord {
@@ -2792,6 +2808,7 @@ fn commit_stream_put_rejects_non_in_progress() {
                 size: 0,
                 etag_crc64: 0u64,
                 ec: EcShape { k: 4, m: 2 },
+                tags: None,
                 metadata_blob: None,
             },
             &[],
@@ -2988,6 +3005,7 @@ fn commit_stream_put_rejects_wrong_kind() {
                 size: 0,
                 etag_crc64: 0u64,
                 ec: EcShape { k: 4, m: 2 },
+                tags: None,
                 metadata_blob: None,
             },
             &[],
@@ -3026,6 +3044,7 @@ fn commit_stream_put_rejects_wrong_bucket_key() {
                 size: 0,
                 etag_crc64: 0u64,
                 ec: EcShape { k: 4, m: 2 },
+                tags: None,
                 metadata_blob: None,
             },
             &[],
@@ -3248,6 +3267,7 @@ fn commit_stream_put_rejects_mismatched_chunk_target() {
                 size: 100,
                 etag_crc64: 1u64,
                 ec: EcShape { k: 4, m: 2 },
+                tags: None,
                 metadata_blob: None,
             },
             &[StreamObjectChunkRecord {

@@ -23,6 +23,7 @@ use crate::coordinator::CopySource;
 use crate::coordinator::FinalizeStreamPartRequest;
 use crate::coordinator::FinalizeStreamPutRequest;
 use crate::coordinator::MetadataDirective;
+use crate::coordinator::TaggingDirective;
 use crate::coordinator::UploadPartCopyRequest;
 use crate::error::ServerError;
 use crate::metadata_blob::MetadataBlob;
@@ -421,11 +422,10 @@ impl HttpFrontend {
                         });
                     }
                     // Parse inline tags before writing so invalid tags don't leave orphan objects
-                    let tagging_directive = match req.header("x-amz-tagging-directive") {
-                        Some(d) if d.eq_ignore_ascii_case("REPLACE") => "REPLACE",
-                        _ => "COPY",
-                    };
-                    let inline_tags_xml = if tagging_directive == "REPLACE" {
+                    let replace_tags_xml = if req
+                        .header("x-amz-tagging-directive")
+                        .is_some_and(|d| d.eq_ignore_ascii_case("REPLACE"))
+                    {
                         if let Some(tagging_header) = req.header("x-amz-tagging") {
                             let tags = xml::parse_url_encoded_tags(tagging_header)?;
                             if tags.is_empty() {
@@ -439,6 +439,14 @@ impl HttpFrontend {
                     } else {
                         None
                     };
+                    let tagging = if req
+                        .header("x-amz-tagging-directive")
+                        .is_some_and(|d| d.eq_ignore_ascii_case("REPLACE"))
+                    {
+                        TaggingDirective::Replace(replace_tags_xml.as_deref())
+                    } else {
+                        TaggingDirective::Copy
+                    };
                     let result = self.coordinator.copy_object(&CopyObjectRequest {
                         source: CopySource {
                             bucket: &src_bucket,
@@ -450,26 +458,10 @@ impl HttpFrontend {
                         dst_key: &key,
                         dst_condition: &dst_cond,
                         directive,
+                        tagging,
                         requester,
                         acl,
                     })?;
-                    // Apply tagging based on directive
-                    let dst_vid = Some(result.version_id);
-                    if tagging_directive == "COPY" {
-                        // Copy source object's tags to destination
-                        if let Some(src_tags) = self.coordinator.get_object_tags(
-                            &src_bucket,
-                            &src_key,
-                            src_version_id,
-                            requester,
-                        )? {
-                            self.coordinator
-                                .put_object_tags(&bucket, &key, dst_vid, &src_tags, requester)?;
-                        }
-                    } else if let Some(tags_xml) = inline_tags_xml {
-                        self.coordinator
-                            .put_object_tags(&bucket, &key, dst_vid, &tags_xml, requester)?;
-                    }
                     Ok(S3Response::copy_object(&result))
                 } else {
                     // Normal PutObject path
@@ -503,19 +495,11 @@ impl HttpFrontend {
                                 key: &key,
                                 data: &req.body,
                                 metadata: &metadata_blob,
+                                tags: inline_tags_xml.as_deref(),
                                 cond: &cond,
                                 requester,
                                 acl,
                             })?;
-                    if let Some(tags_xml) = inline_tags_xml {
-                        self.coordinator.put_object_tags(
-                            &bucket,
-                            &key,
-                            Some(result.version_id),
-                            &tags_xml,
-                            requester,
-                        )?;
-                    }
                     let mut resp = S3Response::put_object(&result);
                     append_checksum_response_headers(&mut resp, req);
                     Ok(resp)
@@ -1634,7 +1618,7 @@ impl HttpFrontend {
         let pseudo_form = multipart::PostFormData {
             fields: form_fields.to_vec(),
             file_data: Vec::new(),
-            file_name: file_name.map(|s| s.to_string()),
+            file_name: file_name.map(std::string::ToString::to_string),
         };
         let key = pseudo_form.resolve_key()?;
 
@@ -1693,11 +1677,11 @@ impl HttpFrontend {
             bucket: bucket.to_string(),
             key,
             metadata_blob,
-            requester_principal: effective_auth.principal.clone(),
             success_status,
             form_fields: form_fields.to_vec(),
-            policy_b64: field("policy").map(|v| v.to_string()),
-            checksum_sha256_b64: field("x-amz-checksum-sha256").map(|v| v.to_string()),
+            policy_b64: field("policy").map(std::string::ToString::to_string),
+            checksum_sha256_b64: field("x-amz-checksum-sha256")
+                .map(std::string::ToString::to_string),
         })
     }
 
@@ -1766,6 +1750,7 @@ impl HttpFrontend {
                 crc64,
                 total_size,
                 metadata_blob: &ctx.metadata_blob,
+                tags: None,
                 cond: &crate::conditional::WriteCondition::default(),
             })?;
 
@@ -1882,7 +1867,6 @@ impl HttpFrontend {
             metadata_blob,
             cond,
             inline_tags_xml,
-            requester_principal: auth.principal.clone(),
             checksum_response,
             streaming_signing: auth.streaming,
         })
@@ -1937,18 +1921,9 @@ impl HttpFrontend {
                 crc64,
                 total_size,
                 metadata_blob: &metadata_blob,
+                tags: ctx.inline_tags_xml.as_deref(),
                 cond: &ctx.cond,
             })?;
-
-        if let Some(ref tags_xml) = ctx.inline_tags_xml {
-            self.coordinator.put_object_tags(
-                &ctx.bucket,
-                &ctx.key,
-                Some(result.version_id),
-                tags_xml,
-                crate::coordinator::Requester::from_principal(ctx.requester_principal.as_deref()),
-            )?;
-        }
 
         let mut resp = S3Response::put_object(&result);
         // Echo checksum headers. Trailer values override initial header values.
@@ -2120,7 +2095,6 @@ pub struct StreamingPutContext {
     pub metadata_blob: crate::metadata_blob::MetadataBlob,
     pub cond: crate::conditional::WriteCondition,
     pub inline_tags_xml: Option<String>,
-    pub requester_principal: Option<String>,
     pub checksum_response: Vec<(String, String)>,
     /// Signing context for aws-chunked modes, None for unsigned/plain.
     pub streaming_signing: Option<auth::StreamingSigningContext>,
@@ -2132,7 +2106,6 @@ pub struct StreamingPostContext {
     pub bucket: String,
     pub key: String,
     pub metadata_blob: crate::metadata_blob::MetadataBlob,
-    pub requester_principal: Option<String>,
     pub success_status: u16,
     pub form_fields: Vec<(String, String)>,
     pub policy_b64: Option<String>,

@@ -1010,17 +1010,18 @@ impl PgMetadataStore for PgStore {
                 let etag_kind_u8 = req.etag.etag_kind() as u8;
                 let status_u8 = ObjectState::Live as u8;
                 let parts_count = req.layout.parts_count().map(|n| n as i64);
+                let tags = req.tags.as_deref();
                 let metadata_blob: Option<&[u8]> = req.metadata_blob.as_deref();
                 let sql = if req.version_id.is_null() {
                     "INSERT OR REPLACE INTO objects \
                      (bucket, key, version_id, size, etag, etag_kind, last_modified, \
-                      storage_class, ec_k, ec_m, status, data_layout, parts_count, metadata_blob) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12, ?13)"
+                      storage_class, ec_k, ec_m, status, data_layout, parts_count, tags, metadata_blob) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
                 } else {
                     "INSERT INTO objects \
                      (bucket, key, version_id, size, etag, etag_kind, last_modified, \
-                      storage_class, ec_k, ec_m, status, data_layout, parts_count, metadata_blob) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12, ?13)"
+                      storage_class, ec_k, ec_m, status, data_layout, parts_count, tags, metadata_blob) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
                 };
                 self.conn
                     .execute(
@@ -1038,6 +1039,7 @@ impl PgMetadataStore for PgStore {
                             status_u8,
                             data_layout_u8,
                             parts_count,
+                            tags,
                             metadata_blob,
                         ],
                     )
@@ -2643,17 +2645,18 @@ impl PgMetadataStore for PgStore {
             let now = PgStore::now_millis();
             let data_layout = DataLayout::ChunkManifestInternal as u8;
             let parts_count: Option<i64> = None;
+            let tags = obj.tags.as_deref();
 
             let obj_sql = if obj.version_id.is_null() {
                 "INSERT OR REPLACE INTO objects \
                  (bucket, key, version_id, size, etag, etag_kind, last_modified, \
-                  storage_class, ec_k, ec_m, status, data_layout, parts_count, metadata_blob) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12, ?13)"
+                  storage_class, ec_k, ec_m, status, data_layout, parts_count, tags, metadata_blob) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
             } else {
                 "INSERT INTO objects \
                  (bucket, key, version_id, size, etag, etag_kind, last_modified, \
-                  storage_class, ec_k, ec_m, status, data_layout, parts_count, metadata_blob) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12, ?13)"
+                  storage_class, ec_k, ec_m, status, data_layout, parts_count, tags, metadata_blob) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
             };
             self.conn
                 .execute(
@@ -2671,6 +2674,7 @@ impl PgMetadataStore for PgStore {
                         ObjectState::Live as u8,
                         data_layout,
                         parts_count,
+                        tags,
                         obj.metadata_blob,
                     ],
                 )
@@ -3287,6 +3291,7 @@ mod tests {
                     etag: ObjectEtag::SinglePart([0; 8]),
                     ec: EcShape { k: 4, m: 2 },
                     layout: ObjectLayout::ChunkManifest,
+                    tags: None,
                     metadata_blob: None,
                 }))
                 .unwrap();
@@ -3439,6 +3444,7 @@ mod tests {
                     etag: ObjectEtag::SinglePart([0; 8]),
                     ec: EcShape { k: 4, m: 2 },
                     layout: ObjectLayout::ChunkManifest,
+                    tags: None,
                     metadata_blob: None,
                 }))
                 .unwrap();

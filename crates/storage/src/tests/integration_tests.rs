@@ -24,6 +24,7 @@ fn shard_and_metadata_roundtrip() {
         etag: ObjectEtag::single_part(ack.crc64),
         ec: EcShape { k: 4, m: 2 },
         layout: ObjectLayout::ChunkManifest,
+        tags: None,
         metadata_blob: None,
     });
     store.put_object_meta(&req).unwrap();
@@ -114,6 +115,7 @@ fn full_lifecycle() {
         etag: ObjectEtag::single_part(ack.crc64),
         ec: EcShape { k: 4, m: 2 },
         layout: ObjectLayout::ChunkManifest,
+        tags: None,
         metadata_blob: None,
     }))
     .unwrap();
@@ -163,6 +165,7 @@ fn pg_store_persistence() {
                 etag: ObjectEtag::SinglePart([1, 0, 0, 0, 0, 0, 0, 0]),
                 ec: EcShape { k: 4, m: 2 },
                 layout: ObjectLayout::ChunkManifest,
+                tags: None,
                 metadata_blob: None,
             }))
             .unwrap();
