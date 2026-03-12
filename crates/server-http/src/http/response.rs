@@ -376,7 +376,7 @@ impl S3Response {
             }
         }
 
-        resp.data_body(result.data)
+        resp.streaming_body(result.body, result.range_end - result.range_start + 1)
     }
 
     /// Build a response for a part-level `GetObject` (206 Partial Content).

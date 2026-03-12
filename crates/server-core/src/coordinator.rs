@@ -125,21 +125,37 @@ struct ChunkPayloadRecord {
     ec_m: u8,
 }
 
+#[derive(Debug, Clone)]
+struct ChunkSliceRecord {
+    payload: ChunkPayloadRecord,
+    start_offset: usize,
+    end_offset: usize,
+}
+
 struct PartShardReader {
     runtime: ReadRuntime,
     bucket: String,
     key: String,
     record: ObjectPartRecord,
     next_offset: usize,
+    end_offset: usize,
 }
 
 struct ChunkListReader {
     runtime: ReadRuntime,
     bucket: String,
     key: String,
-    chunks: Vec<ChunkPayloadRecord>,
+    chunks: Vec<ChunkSliceRecord>,
     next_chunk_index: usize,
-    loaded_chunk: Option<(Vec<u8>, usize)>,
+    loaded_chunk: Option<(Vec<u8>, usize, usize)>,
+}
+
+#[derive(Debug, Clone)]
+struct SnapshottedMultipartPartRange {
+    record: ObjectPartRecord,
+    streaming_chunks: Option<Vec<ChunkSliceRecord>>,
+    start_offset: usize,
+    end_offset: usize,
 }
 
 enum MultipartPartReader {
@@ -151,7 +167,7 @@ struct MultipartReader {
     runtime: ReadRuntime,
     bucket: String,
     key: String,
-    parts: Vec<SnapshottedMultipartPart>,
+    parts: Vec<SnapshottedMultipartPartRange>,
     next_part_index: usize,
     current_part: Option<MultipartPartReader>,
 }
@@ -186,6 +202,79 @@ impl std::fmt::Debug for ReadHandle {
 }
 
 impl ReadHandle {
+    fn chunk_slices_for_range(
+        chunks: Vec<ChunkPayloadRecord>,
+        start: usize,
+        end: usize,
+    ) -> Vec<ChunkSliceRecord> {
+        let mut slices = Vec::new();
+        let mut offset = 0usize;
+
+        for payload in chunks {
+            let chunk_end = offset + payload.size as usize;
+            if offset > end {
+                break;
+            }
+            if payload.size != 0 && chunk_end > start {
+                slices.push(ChunkSliceRecord {
+                    start_offset: start.saturating_sub(offset),
+                    end_offset: (end + 1).saturating_sub(offset).min(payload.size as usize),
+                    payload,
+                });
+            }
+            offset = chunk_end;
+        }
+
+        slices
+    }
+
+    fn multipart_ranges_for_range(
+        parts: Vec<SnapshottedMultipartPart>,
+        start: usize,
+        end: usize,
+    ) -> Vec<SnapshottedMultipartPartRange> {
+        let mut ranges = Vec::new();
+        let mut offset = 0usize;
+
+        for part in parts {
+            let part_end = offset + part.record.size as usize;
+            if offset > end {
+                break;
+            }
+            if part.record.size != 0 && part_end > start {
+                let start_offset = start.saturating_sub(offset);
+                let end_offset = (end + 1)
+                    .saturating_sub(offset)
+                    .min(part.record.size as usize);
+                ranges.push(SnapshottedMultipartPartRange {
+                    record: part.record,
+                    streaming_chunks: part.streaming_chunks.map(|chunks| {
+                        Self::chunk_slices_for_range(
+                            chunks
+                                .into_iter()
+                                .map(|chunk| ChunkPayloadRecord {
+                                    size: chunk.size,
+                                    chunk_okh: chunk.chunk_okh,
+                                    chunk_vid: chunk.chunk_vid,
+                                    shard_pg_id: chunk.shard_pg_id,
+                                    ec_k: chunk.ec_k,
+                                    ec_m: chunk.ec_m,
+                                })
+                                .collect(),
+                            start_offset,
+                            end_offset - 1,
+                        )
+                    }),
+                    start_offset,
+                    end_offset,
+                });
+            }
+            offset = part_end;
+        }
+
+        ranges
+    }
+
     fn from_chunk_manifest(
         runtime: ReadRuntime,
         bucket: &str,
@@ -205,7 +294,34 @@ impl ReadHandle {
                 runtime,
                 bucket: bucket.to_string(),
                 key: key.to_string(),
-                chunks,
+                chunks: Self::chunk_slices_for_range(chunks, 0, expected_size.saturating_sub(1)),
+                next_chunk_index: 0,
+                loaded_chunk: None,
+            }),
+        }
+    }
+
+    fn from_chunk_manifest_range(
+        runtime: ReadRuntime,
+        bucket: &str,
+        key: &str,
+        chunks: Vec<ChunkPayloadRecord>,
+        start: usize,
+        end: usize,
+    ) -> Self {
+        let expected_size = end - start + 1;
+        Self {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            expected_size,
+            bytes_emitted: 0,
+            expected_crc64: None,
+            crc64: checksum::crc64::Hasher::new(),
+            inner: ReadHandleInner::ChunkManifest(ChunkListReader {
+                runtime,
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                chunks: Self::chunk_slices_for_range(chunks, start, end),
                 next_chunk_index: 0,
                 loaded_chunk: None,
             }),
@@ -230,7 +346,34 @@ impl ReadHandle {
                 runtime,
                 bucket: bucket.to_string(),
                 key: key.to_string(),
-                parts,
+                parts: Self::multipart_ranges_for_range(parts, 0, expected_size.saturating_sub(1)),
+                next_part_index: 0,
+                current_part: None,
+            }),
+        }
+    }
+
+    fn from_multipart_range(
+        runtime: ReadRuntime,
+        bucket: &str,
+        key: &str,
+        parts: Vec<SnapshottedMultipartPart>,
+        start: usize,
+        end: usize,
+    ) -> Self {
+        let expected_size = end - start + 1;
+        Self {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            expected_size,
+            bytes_emitted: 0,
+            expected_crc64: None,
+            crc64: checksum::crc64::Hasher::new(),
+            inner: ReadHandleInner::Multipart(MultipartReader {
+                runtime,
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                parts: Self::multipart_ranges_for_range(parts, start, end),
                 next_part_index: 0,
                 current_part: None,
             }),
@@ -379,7 +522,7 @@ pub struct GetObjectAttributesResult {
 /// Result of a range GetObject operation (206 Partial Content).
 #[derive(Debug)]
 pub struct GetObjectRangeResult {
-    pub data: Vec<u8>,
+    pub body: ReadHandle,
     pub metadata: MetadataBlob,
     pub etag: String,
     pub size: u64,
@@ -1302,11 +1445,10 @@ impl ReadRuntime {
 
 impl PartShardReader {
     fn next_chunk(&mut self, target_size: usize) -> Result<Option<Vec<u8>>, ServerError> {
-        let size = self.record.size as usize;
-        if self.next_offset >= size {
+        if self.next_offset >= self.end_offset {
             return Ok(None);
         }
-        let end = (self.next_offset + target_size).min(size) - 1;
+        let end = (self.next_offset + target_size).min(self.end_offset) - 1;
         let chunk = self
             .runtime
             .read_part_range(&self.record, self.next_offset, end)
@@ -1325,9 +1467,9 @@ impl PartShardReader {
 impl ChunkListReader {
     fn next_chunk(&mut self, target_size: usize) -> Result<Option<Vec<u8>>, ServerError> {
         loop {
-            if let Some((loaded, offset)) = &mut self.loaded_chunk {
-                if *offset < loaded.len() {
-                    let end = (*offset + target_size).min(loaded.len());
+            if let Some((loaded, offset, end_offset)) = &mut self.loaded_chunk {
+                if *offset < *end_offset {
+                    let end = (*offset + target_size).min(*end_offset);
                     let out = loaded[*offset..end].to_vec();
                     *offset = end;
                     return Ok(Some(out));
@@ -1341,7 +1483,7 @@ impl ChunkListReader {
 
             let data = self
                 .runtime
-                .read_chunk_payload(&self.chunks[self.next_chunk_index])
+                .read_chunk_payload(&self.chunks[self.next_chunk_index].payload)
                 .map_err(|e| match e {
                     ServerError::Store(storage::StoreError::NotFound) => {
                         ServerError::ObjectNotFound {
@@ -1351,8 +1493,9 @@ impl ChunkListReader {
                     }
                     other => other,
                 })?;
+            let slice = &self.chunks[self.next_chunk_index];
             self.next_chunk_index += 1;
-            self.loaded_chunk = Some((data, 0));
+            self.loaded_chunk = Some((data, slice.start_offset, slice.end_offset));
         }
     }
 }
@@ -1382,17 +1525,7 @@ impl MultipartReader {
                     runtime: self.runtime.clone(),
                     bucket: self.bucket.clone(),
                     key: self.key.clone(),
-                    chunks: chunks
-                        .into_iter()
-                        .map(|chunk| ChunkPayloadRecord {
-                            size: chunk.size,
-                            chunk_okh: chunk.chunk_okh,
-                            chunk_vid: chunk.chunk_vid,
-                            shard_pg_id: chunk.shard_pg_id,
-                            ec_k: chunk.ec_k,
-                            ec_m: chunk.ec_m,
-                        })
-                        .collect(),
+                    chunks,
                     next_chunk_index: 0,
                     loaded_chunk: None,
                 })
@@ -1402,7 +1535,8 @@ impl MultipartReader {
                     bucket: self.bucket.clone(),
                     key: self.key.clone(),
                     record: part.record,
-                    next_offset: 0,
+                    next_offset: part.start_offset,
+                    end_offset: part.end_offset,
                 })
             });
         }
@@ -4638,81 +4772,90 @@ impl Coordinator {
             other => other,
         };
 
-        let (metadata, user_data) =
-            if matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
-                // Multipart: metadata from object row, data spans parts.
-                let meta_pg = pgs.meta();
-                let obj_parts =
-                    Self::snapshot_multipart_parts(meta_pg, bucket, key, record.version_id)?;
-                drop(pgs);
-                #[cfg(test)]
-                maybe_run_multipart_snapshot_hook(bucket, key);
+        let (metadata, body) = if matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
+            // Multipart: metadata from object row, data spans parts.
+            let meta_pg = pgs.meta();
+            let obj_parts =
+                Self::snapshot_multipart_parts(meta_pg, bucket, key, record.version_id)?;
+            drop(pgs);
+            #[cfg(test)]
+            maybe_run_multipart_snapshot_hook(bucket, key);
 
-                let data = self
-                    .read_multipart_range(
-                        bucket,
-                        key,
-                        &obj_parts,
+            let metadata = record
+                .metadata_blob
+                .as_ref()
+                .map(|b| MetadataBlob::deserialize(b).map(|(m, _)| m))
+                .transpose()?
+                .unwrap_or_default();
+
+            (
+                metadata,
+                ReadHandle::from_multipart_range(
+                    self.read_runtime(),
+                    bucket,
+                    key,
+                    obj_parts,
+                    user_start as usize,
+                    user_end as usize,
+                ),
+            )
+        } else {
+            // Non-multipart: metadata from DB row, user data from shards.
+            let metadata = record
+                .metadata_blob
+                .as_ref()
+                .map(|b| MetadataBlob::deserialize(b).map(|(m, _)| m))
+                .transpose()?
+                .unwrap_or_default();
+
+            // Check for chunk manifest (stream-put objects).
+            let meta_pg = pgs.meta();
+            let chunks = meta_pg
+                .get_stream_object_chunks(bucket, key, record.version_id)
+                .map_err(ServerError::Metadata)?;
+
+            let body = if chunks.is_empty() {
+                let okh = object_key_hash(bucket, key);
+                let shard_pg = pgs.shard();
+                let d = self
+                    .read_range(
+                        shard_pg,
+                        &okh,
+                        record.version_id,
+                        &record,
                         user_start as usize,
                         user_end as usize,
                     )
                     .map_err(not_found)?;
-
-                let metadata = record
-                    .metadata_blob
-                    .as_ref()
-                    .map(|b| MetadataBlob::deserialize(b).map(|(m, _)| m))
-                    .transpose()?
-                    .unwrap_or_default();
-
-                (metadata, data)
+                drop(pgs);
+                ReadHandle::from_buffered_bytes(d)
             } else {
-                // Non-multipart: metadata from DB row, user data from shards.
-                let metadata = record
-                    .metadata_blob
-                    .as_ref()
-                    .map(|b| MetadataBlob::deserialize(b).map(|(m, _)| m))
-                    .transpose()?
-                    .unwrap_or_default();
-
-                // Check for chunk manifest (stream-put objects).
-                let meta_pg = pgs.meta();
-                let chunks = meta_pg
-                    .get_stream_object_chunks(bucket, key, record.version_id)
-                    .map_err(ServerError::Metadata)?;
-
-                let data = if chunks.is_empty() {
-                    let okh = object_key_hash(bucket, key);
-                    let shard_pg = pgs.shard();
-                    let d = self
-                        .read_range(
-                            shard_pg,
-                            &okh,
-                            record.version_id,
-                            &record,
-                            user_start as usize,
-                            user_end as usize,
-                        )
-                        .map_err(not_found)?;
-                    drop(pgs);
-                    d
-                } else {
-                    drop(pgs);
-                    self.read_chunk_manifest_range(
-                        bucket,
-                        key,
-                        &chunks,
-                        user_start as usize,
-                        user_end as usize,
-                    )
-                    .map_err(not_found)?
-                };
-
-                (metadata, data)
+                drop(pgs);
+                ReadHandle::from_chunk_manifest_range(
+                    self.read_runtime(),
+                    bucket,
+                    key,
+                    chunks
+                        .into_iter()
+                        .map(|chunk| ChunkPayloadRecord {
+                            size: chunk.size,
+                            chunk_okh: chunk.chunk_okh,
+                            chunk_vid: chunk.chunk_vid,
+                            shard_pg_id: chunk.shard_pg_id,
+                            ec_k: chunk.ec_k,
+                            ec_m: chunk.ec_m,
+                        })
+                        .collect(),
+                    user_start as usize,
+                    user_end as usize,
+                )
             };
 
+            (metadata, body)
+        };
+
         Ok(GetObjectRangeResult {
-            data: user_data,
+            body,
             metadata,
             etag: etag_str,
             size: record.size,
@@ -7578,7 +7721,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(result.data, b"Hello");
+        assert_eq!(result.body.into_bytes().unwrap(), b"Hello");
     }
 
     #[test]
@@ -8422,7 +8565,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(result.data, b"Hello");
+        assert_eq!(result.body.into_bytes().unwrap(), b"Hello");
         assert_eq!(result.range_start, 0);
         assert_eq!(result.range_end, 4);
         assert_eq!(result.size, 13);
@@ -8458,7 +8601,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(result.data, b"World!");
+        assert_eq!(result.body.into_bytes().unwrap(), b"World!");
         assert_eq!(result.range_start, 7);
         assert_eq!(result.range_end, 12);
     }
@@ -8493,7 +8636,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(result.data, b"World!");
+        assert_eq!(result.body.into_bytes().unwrap(), b"World!");
     }
 
     #[test]
@@ -8562,7 +8705,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(result.data, b"Hello");
+        assert_eq!(result.body.into_bytes().unwrap(), b"Hello");
         assert_eq!(result.range_start, 0);
         assert_eq!(result.range_end, 4);
     }
@@ -9524,7 +9667,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(result.data, b"Hello");
+        assert_eq!(result.body.into_bytes().unwrap(), b"Hello");
     }
 
     // ── CopyObject tests ──────────────────────────────────────────────
@@ -13359,7 +13502,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(range.data, vec![0xAA; 10]);
+        assert_eq!(range.body.into_bytes().unwrap(), vec![0xAA; 10]);
         assert_eq!(range.range_start, 10);
         assert_eq!(range.range_end, 19);
     }
@@ -13398,7 +13541,7 @@ mod tests {
             .unwrap();
         let mut expected = vec![0xAA; 4];
         expected.extend_from_slice(&[0xBB; 4]);
-        assert_eq!(range.data, expected);
+        assert_eq!(range.body.into_bytes().unwrap(), expected);
     }
 
     #[test]
@@ -13423,7 +13566,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(range.data, vec![0xBB; 50]);
+        assert_eq!(range.body.into_bytes().unwrap(), vec![0xBB; 50]);
     }
 
     #[test]
@@ -14785,7 +14928,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(r1.data, b"AAAA");
+        assert_eq!(r1.body.into_bytes().unwrap(), b"AAAA");
 
         // Range spanning chunks.
         let r2 = coord
@@ -14798,7 +14941,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(r2.data, b"AABB");
+        assert_eq!(r2.body.into_bytes().unwrap(), b"AABB");
 
         // Range within second chunk.
         let r3 = coord
@@ -14811,7 +14954,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(r3.data, b"BBBB");
+        assert_eq!(r3.body.into_bytes().unwrap(), b"BBBB");
 
         // Suffix range.
         let r4 = coord
@@ -14824,7 +14967,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(r4.data, b"BBB");
+        assert_eq!(r4.body.into_bytes().unwrap(), b"BBB");
     }
 
     #[test]

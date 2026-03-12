@@ -247,9 +247,17 @@ Important current nuance:
 
 Status:
 
-1. not started
-2. this is now the next required phase before deferred reclamation design is
-   finalized
+1. in progress
+2. `GetObject` and `GetObjectRange` now use the core-owned `ReadHandle`
+3. `server-http` now adapts `ReadHandle` to a streaming Hyper body and holds
+   the request permit for the full response lifetime
+4. important current nuance:
+   - multipart-manifest and chunk-manifest reads stream
+   - simple single-shard-set reads and ranges remain buffered for now
+   - this is intentional because chunked streaming of unversioned single-shard
+     objects exposed a real overwrite-consistency hole
+5. `GetObjectPart` and copy-source internal readers still need to move onto the
+   same stepped read foundation
 
 Proposed implementation shape:
 
