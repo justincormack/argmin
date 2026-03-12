@@ -296,50 +296,149 @@ pub struct DeleteObjectEntry {
 pub fn parse_delete_objects_xml(
     data: &[u8],
 ) -> Result<(Vec<DeleteObjectEntry>, bool), ServerError> {
-    let text = std::str::from_utf8(data).map_err(|_| ServerError::MalformedXML {
-        reason: "invalid UTF-8 in delete XML body".to_string(),
-    })?;
-
-    // Require <Delete> wrapper
-    if !text.contains("<Delete") {
-        return Err(ServerError::MalformedXML {
-            reason: "missing <Delete> element".to_string(),
-        });
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum State {
+        Start,
+        InDelete,
+        InObject,
+        InKey,
+        InVersionId,
+        InQuiet,
+        Done,
     }
 
-    // Detect quiet mode
-    let quiet = extract_tag_content(text, "Quiet").is_some_and(|v| v == "true");
+    fn malformed_delete_xml(reason: &str) -> ServerError {
+        ServerError::MalformedXML {
+            reason: reason.to_string(),
+        }
+    }
 
-    // Parse <Object> blocks
+    let mut reader = Reader::from_reader(data);
+    let mut buf = Vec::new();
+    let mut state = State::Start;
     let mut entries = Vec::new();
-    let mut search_from = 0;
-    while let Some(start) = text[search_from..].find("<Object>") {
-        let abs_start = search_from + start + "<Object>".len();
-        let end = text[abs_start..]
-            .find("</Object>")
-            .ok_or_else(|| ServerError::MalformedXML {
-                reason: "unclosed <Object> element".to_string(),
-            })?;
-        let block = &text[abs_start..abs_start + end];
+    let mut quiet = false;
+    let mut current_key: Option<String> = None;
+    let mut current_version_id: Option<String> = None;
+    let mut current_text = String::new();
 
-        let key = extract_tag_content(block, "Key").ok_or_else(|| ServerError::MalformedXML {
-            reason: "Object missing <Key> element".to_string(),
-        })?;
-        let key = xml_unescape(key);
-        let version_id = extract_tag_content(block, "VersionId").map(xml_unescape);
-
-        entries.push(DeleteObjectEntry { key, version_id });
-
-        search_from = abs_start + end + "</Object>".len();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => match (state, e.name().as_ref()) {
+                (State::Start, b"Delete") => state = State::InDelete,
+                (State::InDelete, b"Object") => {
+                    current_key = None;
+                    current_version_id = None;
+                    state = State::InObject;
+                }
+                (State::InDelete, b"Quiet") => {
+                    current_text.clear();
+                    state = State::InQuiet;
+                }
+                (State::InObject, b"Key") => {
+                    current_text.clear();
+                    state = State::InKey;
+                }
+                (State::InObject, b"VersionId") => {
+                    current_text.clear();
+                    state = State::InVersionId;
+                }
+                _ => return Err(malformed_delete_xml("unexpected element in delete XML")),
+            },
+            Ok(Event::Empty(e)) => match (state, e.name().as_ref()) {
+                (State::Start, b"Delete") => state = State::Done,
+                (State::InDelete, b"Object") => {
+                    return Err(malformed_delete_xml("Object missing <Key> element"));
+                }
+                (State::InDelete, b"Quiet") => {}
+                (State::InObject, b"Key") => {
+                    return Err(malformed_delete_xml("Object missing <Key> element"));
+                }
+                (State::InObject, b"VersionId") => {
+                    current_version_id = Some(String::new());
+                }
+                _ => {
+                    return Err(malformed_delete_xml(
+                        "unexpected empty element in delete XML",
+                    ))
+                }
+            },
+            Ok(Event::End(e)) => match (state, e.name().as_ref()) {
+                (State::InDelete, b"Delete") => state = State::Done,
+                (State::InObject, b"Object") => {
+                    let key = current_key
+                        .take()
+                        .ok_or_else(|| malformed_delete_xml("Object missing <Key> element"))?;
+                    entries.push(DeleteObjectEntry {
+                        key,
+                        version_id: current_version_id.take(),
+                    });
+                    if entries.len() > 1000 {
+                        return Err(malformed_delete_xml(
+                            "delete objects list too large (max 1000)",
+                        ));
+                    }
+                    state = State::InDelete;
+                }
+                (State::InKey, b"Key") => {
+                    current_key = Some(std::mem::take(&mut current_text));
+                    state = State::InObject;
+                }
+                (State::InVersionId, b"VersionId") => {
+                    current_version_id = Some(std::mem::take(&mut current_text));
+                    state = State::InObject;
+                }
+                (State::InQuiet, b"Quiet") => {
+                    quiet = current_text == "true";
+                    current_text.clear();
+                    state = State::InDelete;
+                }
+                _ => {
+                    return Err(malformed_delete_xml(
+                        "unexpected closing element in delete XML",
+                    ))
+                }
+            },
+            Ok(Event::Text(t)) => {
+                let text = decode_xml_text(
+                    t.as_ref(),
+                    "invalid UTF-8 in delete XML body",
+                    "invalid XML entity in delete XML body",
+                )?;
+                match state {
+                    State::InKey | State::InVersionId | State::InQuiet => {
+                        current_text.push_str(&text);
+                    }
+                    _ if text.trim().is_empty() => {}
+                    _ => return Err(malformed_delete_xml("unexpected text in delete XML")),
+                }
+            }
+            Ok(Event::CData(t)) => {
+                let text = std::str::from_utf8(t.as_ref())
+                    .map_err(|_| malformed_delete_xml("invalid UTF-8 in delete XML body"))?;
+                match state {
+                    State::InKey | State::InVersionId | State::InQuiet => {
+                        current_text.push_str(text);
+                    }
+                    _ if text.trim().is_empty() => {}
+                    _ => return Err(malformed_delete_xml("unexpected CDATA in delete XML")),
+                }
+            }
+            Ok(Event::Comment(_) | Event::Decl(_) | Event::PI(_) | Event::DocType(_)) => {}
+            Ok(Event::Eof) => {
+                return match state {
+                    State::Done => Ok((entries, quiet)),
+                    State::Start => Err(malformed_delete_xml("missing <Delete> element")),
+                    State::InObject | State::InKey | State::InVersionId => {
+                        Err(malformed_delete_xml("unclosed <Object> element"))
+                    }
+                    _ => Err(malformed_delete_xml("unexpected end of delete XML")),
+                };
+            }
+            Err(_) => return Err(malformed_delete_xml("malformed delete XML")),
+        }
+        buf.clear();
     }
-
-    if entries.len() > 1000 {
-        return Err(ServerError::MalformedXML {
-            reason: "delete objects list too large (max 1000)".to_string(),
-        });
-    }
-
-    Ok((entries, quiet))
 }
 
 /// Extract the text content of a simple XML tag (no attributes, no nesting).
@@ -795,12 +894,27 @@ fn malformed_tagging_xml(reason: &str) -> ServerError {
     }
 }
 
-fn decode_tagging_text(bytes: &[u8]) -> Result<String, ServerError> {
-    let raw = std::str::from_utf8(bytes)
-        .map_err(|_| malformed_tagging_xml("invalid UTF-8 in tagging XML body"))?;
+fn decode_xml_text(
+    bytes: &[u8],
+    invalid_utf8_reason: &str,
+    invalid_entity_reason: &str,
+) -> Result<String, ServerError> {
+    let raw = std::str::from_utf8(bytes).map_err(|_| ServerError::MalformedXML {
+        reason: invalid_utf8_reason.to_string(),
+    })?;
     unescape(raw)
         .map(std::borrow::Cow::into_owned)
-        .map_err(|_| malformed_tagging_xml("invalid XML entity in tagging XML body"))
+        .map_err(|_| ServerError::MalformedXML {
+            reason: invalid_entity_reason.to_string(),
+        })
+}
+
+fn decode_tagging_text(bytes: &[u8]) -> Result<String, ServerError> {
+    decode_xml_text(
+        bytes,
+        "invalid UTF-8 in tagging XML body",
+        "invalid XML entity in tagging XML body",
+    )
 }
 
 /// Format a `CopyObjectResult` XML response.
