@@ -1,7 +1,9 @@
 /// Coordinator: orchestrates S3 operations across EC, storage, and metadata layers.
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, MutexGuard};
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
+use std::thread::JoinHandle;
 
 use checksum::{ChecksumAlgorithm, ChecksumType, MultipartChecksumConfig, RawChecksum};
 use ec::{EcConfig, ErasureCodec};
@@ -208,7 +210,7 @@ impl Drop for PayloadLease {
             self.generation_id,
         ) == 0
         {
-            let _ = self.runtime.try_reclaim_object_payload(
+            self.runtime.enqueue_object_payload_reclaim(
                 &self.bucket,
                 &self.key,
                 self.generation_id,
@@ -1338,12 +1340,29 @@ impl Drop for ReclamationTestHookGuard {
 }
 
 /// The coordinator ties together EC, storage, and metadata.
+struct ReclaimSweeper {
+    storage_node: Arc<SharedStorageNode>,
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl Drop for ReclaimSweeper {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        self.storage_node.wake_reclaim_workers();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 pub struct Coordinator {
     storage_node: Arc<SharedStorageNode>,
     pg_topology: PgTopology,
     ec_codec: Arc<ErasureCodec>,
     ec_config: EcConfig,
     region: String,
+    _reclaim_sweeper: ReclaimSweeper,
 }
 
 #[cfg(test)]
@@ -1426,6 +1445,11 @@ fn maybe_run_chunk_manifest_delete_metadata_hook(bucket: &str, key: &str) {
 }
 
 impl ReadRuntime {
+    fn enqueue_object_payload_reclaim(&self, bucket: &str, key: &str, generation_id: GenerationId) {
+        self.storage_node
+            .enqueue_object_payload_reclaim(bucket, key, generation_id);
+    }
+
     fn acquire_object_payload_lease(
         &self,
         bucket: &str,
@@ -2176,12 +2200,39 @@ impl Coordinator {
                 reason: reason.to_string(),
             }
         })?;
+        let read_runtime = ReadRuntime {
+            storage_node: Arc::clone(&storage_node),
+            ec_codec: Arc::clone(&ec_codec),
+            ec_config,
+            pg_topology: pg_topology.clone(),
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let worker_node = Arc::clone(&storage_node);
+        let handle = std::thread::Builder::new()
+            .name("argmin-reclaim".to_string())
+            .spawn(move || {
+                while let Some((bucket, key, generation_id)) =
+                    worker_node.wait_for_object_payload_reclaim(&worker_stop)
+                {
+                    let _ = read_runtime.try_reclaim_object_payload(&bucket, &key, generation_id);
+                }
+            })
+            .map_err(|e| ServerError::InternalError {
+                reason: format!("failed to start reclaim worker: {e}"),
+            })?;
+        let sweeper_storage_node = Arc::clone(&storage_node);
         Ok(Self {
             storage_node,
             pg_topology,
             ec_codec,
             ec_config,
             region,
+            _reclaim_sweeper: ReclaimSweeper {
+                storage_node: sweeper_storage_node,
+                stop,
+                handle: Some(handle),
+            },
         })
     }
 
@@ -2931,7 +2982,7 @@ impl Coordinator {
         drop(pgs);
 
         if let Some(stale_payload) = &stale_payload {
-            let _ = self.delete_stale_object_payload(bucket, key, stale_payload);
+            self.delete_stale_object_payload(bucket, key, stale_payload);
         }
 
         Ok(result)
@@ -3338,7 +3389,7 @@ impl Coordinator {
 
         drop(meta_guard);
         if let Some(ref payload) = stale_payload {
-            let _ = self.delete_stale_object_payload(bucket, key, payload);
+            self.delete_stale_object_payload(bucket, key, payload);
         }
 
         Ok(PutObjectResult {
@@ -3926,7 +3977,7 @@ impl Coordinator {
         drop(pgs);
 
         if let Some(stale_payload) = &stale_payload {
-            let _ = self.delete_stale_object_payload(dst_bucket, dst_key, stale_payload);
+            self.delete_stale_object_payload(dst_bucket, dst_key, stale_payload);
         }
 
         Ok(CopyObjectResult {
@@ -4225,20 +4276,15 @@ impl Coordinator {
         }
     }
 
-    fn delete_stale_object_payload(
-        &self,
-        bucket: &str,
-        key: &str,
-        payload: &StaleObjectPayload,
-    ) -> Result<(), ServerError> {
+    fn delete_stale_object_payload(&self, bucket: &str, key: &str, payload: &StaleObjectPayload) {
         match payload {
             StaleObjectPayload::Simple { generation_id, .. }
             | StaleObjectPayload::ChunkManifest { generation_id, .. } => self
                 .read_runtime()
-                .try_reclaim_object_payload(bucket, key, *generation_id),
+                .enqueue_object_payload_reclaim(bucket, key, *generation_id),
             StaleObjectPayload::Multipart { generation_id, .. } => self
                 .read_runtime()
-                .try_reclaim_object_payload(bucket, key, *generation_id),
+                .enqueue_object_payload_reclaim(bucket, key, *generation_id),
         }
     }
 
@@ -5189,7 +5235,7 @@ impl Coordinator {
                     drop(pgs);
                     #[cfg(test)]
                     maybe_run_multipart_delete_metadata_hook(bucket, key);
-                    let _ = self.read_runtime().try_reclaim_object_payload(
+                    self.read_runtime().enqueue_object_payload_reclaim(
                         bucket,
                         key,
                         record.generation_id,
@@ -5212,7 +5258,7 @@ impl Coordinator {
                         )?;
                         meta_pg.delete_object_meta(bucket, key)?;
                         drop(pgs);
-                        let _ = self.read_runtime().try_reclaim_object_payload(
+                        self.read_runtime().enqueue_object_payload_reclaim(
                             bucket,
                             key,
                             record.generation_id,
@@ -5232,7 +5278,7 @@ impl Coordinator {
                         drop(pgs);
                         #[cfg(test)]
                         maybe_run_chunk_manifest_delete_metadata_hook(bucket, key);
-                        let _ = self.read_runtime().try_reclaim_object_payload(
+                        self.read_runtime().enqueue_object_payload_reclaim(
                             bucket,
                             key,
                             record.generation_id,
@@ -5299,7 +5345,7 @@ impl Coordinator {
                         drop(pgs);
                         #[cfg(test)]
                         maybe_run_multipart_delete_metadata_hook(bucket, key);
-                        let _ = self.read_runtime().try_reclaim_object_payload(
+                        self.read_runtime().enqueue_object_payload_reclaim(
                             bucket,
                             key,
                             record.generation_id,
@@ -5331,7 +5377,7 @@ impl Coordinator {
                         drop(pgs);
                         #[cfg(test)]
                         maybe_run_chunk_manifest_delete_metadata_hook(bucket, key);
-                        let _ = self.read_runtime().try_reclaim_object_payload(
+                        self.read_runtime().enqueue_object_payload_reclaim(
                             bucket,
                             key,
                             record.generation_id,
@@ -5352,7 +5398,7 @@ impl Coordinator {
                     )?;
                     meta_pg.delete_object_version(bucket, key, vid)?;
                     drop(pgs);
-                    let _ = self.read_runtime().try_reclaim_object_payload(
+                    self.read_runtime().enqueue_object_payload_reclaim(
                         bucket,
                         key,
                         record.generation_id,
@@ -6550,7 +6596,7 @@ impl Coordinator {
 
         drop(meta_pg);
         if let Some(ref payload) = stale_payload {
-            let _ = self.delete_stale_object_payload(bucket, key, payload);
+            self.delete_stale_object_payload(bucket, key, payload);
         }
 
         Ok(CompleteMultipartUploadResult {

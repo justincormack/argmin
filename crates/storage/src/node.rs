@@ -1,7 +1,8 @@
 /// LocalStorageNode and SharedStorageNode — manage multiple PgStores on a single node.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Condvar, Mutex, MutexGuard};
 
 use crate::error::StoreError;
 use crate::pg_store::PgStore;
@@ -86,6 +87,14 @@ pub struct SharedStorageNode {
     data_dir: PathBuf,
     bucket_locks: Vec<Mutex<()>>,
     object_payload_leases: Mutex<HashMap<(String, String, GenerationId), usize>>,
+    reclaim_queue: (Mutex<ReclaimQueueState>, Condvar),
+}
+
+type ReclaimRoot = (String, String, GenerationId);
+
+struct ReclaimQueueState {
+    queue: VecDeque<ReclaimRoot>,
+    queued: HashSet<ReclaimRoot>,
 }
 
 const BUCKET_LOCK_STRIPES: usize = 256;
@@ -121,6 +130,13 @@ impl SharedStorageNode {
             data_dir: data_dir.to_path_buf(),
             bucket_locks,
             object_payload_leases: Mutex::new(HashMap::new()),
+            reclaim_queue: (
+                Mutex::new(ReclaimQueueState {
+                    queue: VecDeque::new(),
+                    queued: HashSet::new(),
+                }),
+                Condvar::new(),
+            ),
         })
     }
 
@@ -215,6 +231,45 @@ impl SharedStorageNode {
             .get(&(bucket.to_string(), key.to_string(), generation_id))
             .copied()
             .unwrap_or(0)
+    }
+
+    /// Queue a payload generation for background reclaim.
+    pub fn enqueue_object_payload_reclaim(
+        &self,
+        bucket: &str,
+        key: &str,
+        generation_id: GenerationId,
+    ) {
+        let root = (bucket.to_string(), key.to_string(), generation_id);
+        let (state_lock, cv) = &self.reclaim_queue;
+        let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if state.queued.insert(root.clone()) {
+            state.queue.push_back(root);
+            cv.notify_one();
+        }
+    }
+
+    /// Block until reclaim work is available, or stop has been requested.
+    pub fn wait_for_object_payload_reclaim(
+        &self,
+        stop: &AtomicBool,
+    ) -> Option<(String, String, GenerationId)> {
+        let (state_lock, cv) = &self.reclaim_queue;
+        let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
+        while state.queue.is_empty() && !stop.load(Ordering::SeqCst) {
+            state = cv.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+        if stop.load(Ordering::SeqCst) {
+            return None;
+        }
+        let root = state.queue.pop_front()?;
+        state.queued.remove(&root);
+        Some(root)
+    }
+
+    /// Wake reclaim workers so they can observe shutdown or new work.
+    pub fn wake_reclaim_workers(&self) {
+        self.reclaim_queue.1.notify_all();
     }
 
     /// Lock two PGs for operations that span a metadata PG and a shard PG.

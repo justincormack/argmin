@@ -562,20 +562,22 @@ Status:
      leases before metadata locks are dropped
    - direct delete and stale overwrite displacement now enqueue multipart
      reclaim records instead of deleting part/chunk shards inline
-   - immediate reclaim still exists as a transitional path, but now avoids
-     mixed PG lock ordering by snapshotting the reclaim record under the
-     metadata lock, dropping that lock, reclaiming shard data, then reacquiring
-     metadata only to delete the reclaim row
+3. background reclaim is now the default path:
+   - payload lease drop enqueues reclaim work instead of reclaiming inline
+   - delete and overwrite paths enqueue root generations for the background
+     sweeper instead of reclaiming on the request path
+   - each coordinator runs a reclaim worker that drains the shared reclaim
+     queue on the storage node
+   - reclaim roots remain durable in the metadata DB; only the scheduling path
+     moved into the background
+4. the old mixed lock-order foreground reclaim path is gone
 
 Required coordinator/storage changes for this design:
 
-1. change the background sweeper to:
-   - enumerate reclaim roots
-   - skip roots with active leases
-   - delete child shard sets idempotently
-   - delete child reclaim rows and then the root row
-2. move the current transitional foreground reclaim callers over to the
-   background sweeper once that path exists
+1. teach bucket deletion to synchronously drain bucket-scoped reclaim work
+   before removing the bucket
+2. decide whether reclaim workers should remain per-coordinator or be
+   consolidated to a single worker per shared storage node
 
 ## Design Constraints
 
@@ -635,8 +637,6 @@ Additional follow-up:
 
 Recommended next move:
 
-1. write the deterministic reproducer tests first
-2. fix metadata snapshot completeness
-3. refactor read paths to be truly streaming
-4. then finalize and implement deferred old-generation reclamation
-5. then apply that mechanism consistently to delete and overwrite paths
+1. wire `DeleteBucket` to drain queued reclaim work synchronously
+2. then reassess whether the per-coordinator reclaim workers should be folded
+   into a single worker per shared storage node
