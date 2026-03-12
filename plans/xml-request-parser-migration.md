@@ -31,42 +31,31 @@ Use `quick-xml` as a lightweight event reader.
 
 This keeps the validation logic explicit and reviewable.
 
-## Scope
+## Status
 
-### Phase 1
+Completed:
 
-Port `parse_tagging_xml(...)` to `quick-xml`.
+- `parse_tagging_xml(...)`
+- `parse_delete_objects_xml(...)`
+- `parse_versioning_config_xml(...)`
+- `parse_cors_config_xml(...)`
+- `parse_public_access_block_xml(...)`
+- `parse_ownership_controls_xml(...)`
+- `parse_complete_multipart_upload_xml(...)`
 
-Success criteria:
+All request-body XML parsing in `server-http` now goes through `quick-xml`.
 
-- all existing tagging unit tests still pass
-- the malformed POST tagging regression still passes
-- error mapping stays the same:
-  - malformed structure -> `MalformedXML`
-  - semantically invalid tags -> `InvalidTag`
+## Remaining Cleanup
 
-### Phase 2
+The old substring helpers are no longer used by request parsers. They only remain for
+non-request helpers, currently:
 
-Port the other request XML parsers one by one:
+- `count_tags_in_xml(...)` test/support code
 
-- `parse_delete_objects_xml`
-- `parse_versioning_config_xml`
-- CORS config parser
-- ownership controls parser
-- public access block parser
-- multipart complete XML parser
+So the remaining work, if any, is just local cleanup:
 
-Each parser should move in its own small cut with targeted regression coverage.
-
-### Phase 3
-
-Delete or narrow the generic substring helpers once no request parser depends on them.
-
-Candidates:
-
-- `extract_tag_content`
-- `extract_all_tag_contents`
-- ad hoc nested content scanning that only exists for request parsing
+- delete `extract_tag_content` / `extract_all_tag_contents` if the test helper is rewritten
+- or leave them in place if the small test-only use is acceptable
 
 ## Non-goals
 
@@ -78,3 +67,4 @@ Candidates:
 
 - Request XML bodies are small, so correctness matters more than parse throughput.
 - This should stay in `server-http`; XML parsing is part of the transport boundary.
+- Response XML generation remains deliberately hand-written.

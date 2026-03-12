@@ -771,39 +771,6 @@ pub fn xml_escape(s: &str) -> String {
     out
 }
 
-/// Unescape XML entity references used in S3 delete payloads.
-fn xml_unescape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch != '&' {
-            out.push(ch);
-            continue;
-        }
-        let mut entity = String::new();
-        while let Some(&c) = chars.peek() {
-            chars.next();
-            if c == ';' {
-                break;
-            }
-            entity.push(c);
-        }
-        match entity.as_str() {
-            "amp" => out.push('&'),
-            "lt" => out.push('<'),
-            "gt" => out.push('>'),
-            "quot" => out.push('"'),
-            "apos" => out.push('\''),
-            _ => {
-                out.push('&');
-                out.push_str(&entity);
-                out.push(';');
-            }
-        }
-    }
-    out
-}
-
 /// Parse a CORS configuration XML body.
 ///
 /// Expected format:
@@ -2255,42 +2222,6 @@ const CHECKSUM_ELEMENTS: &[(&str, ChecksumAlgorithm)] = &[
     ("ChecksumCRC64NVME", ChecksumAlgorithm::Crc64nvme),
 ];
 
-/// Extract the checksum element from a `<Part>` XML fragment.
-/// Returns the algorithm and base64 value. Rejects multiple checksum elements.
-fn extract_checksum_element(
-    part_content: &str,
-) -> Result<Option<(ChecksumAlgorithm, String)>, ServerError> {
-    let mut found: Option<(ChecksumAlgorithm, String)> = None;
-    // Note: ChecksumCRC32C must be checked before ChecksumCRC32 to avoid
-    // prefix-matching CRC32C as CRC32 (already ordered in CHECKSUM_ELEMENTS).
-    for &(elem, algo) in CHECKSUM_ELEMENTS {
-        let open = format!("<{elem}>");
-        let close = format!("</{elem}>");
-        if let Some(start) = part_content.find(&open) {
-            if found.is_some() {
-                return Err(ServerError::MalformedXML {
-                    reason: "multiple checksum elements in a single Part".to_string(),
-                });
-            }
-            let val_start = start + open.len();
-            if let Some(end) = part_content[val_start..].find(&close) {
-                // Reject duplicate of the same element type.
-                let after_close = val_start + end + close.len();
-                if part_content[after_close..].contains(&open) {
-                    return Err(ServerError::MalformedXML {
-                        reason: "multiple checksum elements in a single Part".to_string(),
-                    });
-                }
-                found = Some((
-                    algo,
-                    part_content[val_start..val_start + end].trim().to_string(),
-                ));
-            }
-        }
-    }
-    Ok(found)
-}
-
 /// Parse a `CompleteMultipartUpload` request XML body into a list of parts.
 ///
 /// Expected format:
@@ -2301,53 +2232,167 @@ fn extract_checksum_element(
 /// </CompleteMultipartUpload>
 /// ```
 pub fn parse_complete_multipart_upload_xml(body: &[u8]) -> Result<Vec<CompletePart>, ServerError> {
-    let malformed = || ServerError::MalformedXML {
-        reason: "malformed CompleteMultipartUpload XML".to_string(),
-    };
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum State {
+        Start,
+        InRoot,
+        InPart,
+        InPartNumber,
+        InETag,
+        InChecksum(ChecksumAlgorithm),
+        Done,
+    }
 
-    let s = std::str::from_utf8(body).map_err(|_| malformed())?;
+    fn malformed_complete_multipart_xml() -> ServerError {
+        ServerError::MalformedXML {
+            reason: "malformed CompleteMultipartUpload XML".to_string(),
+        }
+    }
 
+    fn checksum_algorithm_for_element(name: &[u8]) -> Option<ChecksumAlgorithm> {
+        CHECKSUM_ELEMENTS
+            .iter()
+            .find_map(|&(elem, algo)| (name == elem.as_bytes()).then_some(algo))
+    }
+
+    fn decode_complete_multipart_text(bytes: &[u8]) -> Result<String, ServerError> {
+        decode_xml_text(
+            bytes,
+            "malformed CompleteMultipartUpload XML",
+            "malformed CompleteMultipartUpload XML",
+        )
+    }
+
+    let mut reader = Reader::from_reader(body);
+    let mut buf = Vec::new();
+    let mut state = State::Start;
+    let mut current_text = String::new();
+    let mut current_part_number: Option<u32> = None;
+    let mut current_etag: Option<String> = None;
+    let mut current_checksum: Option<(ChecksumAlgorithm, String)> = None;
     let mut parts = Vec::new();
-    let mut pos = 0;
 
-    while let Some(i) = s[pos..].find("<Part>") {
-        let part_start = pos + i + 6;
-        let part_end = s[part_start..].find("</Part>").ok_or_else(malformed)?;
-        let part_content = &s[part_start..part_start + part_end];
-        pos = part_start + part_end + 7;
-
-        // Extract PartNumber
-        let pn_start = part_content.find("<PartNumber>").ok_or_else(malformed)? + 12;
-        let pn_end = part_content[pn_start..]
-            .find("</PartNumber>")
-            .ok_or_else(malformed)?;
-        let part_number: u32 = part_content[pn_start..pn_start + pn_end]
-            .trim()
-            .parse()
-            .map_err(|_| malformed())?;
-
-        // Extract ETag
-        let etag_start = part_content.find("<ETag>").ok_or_else(malformed)? + 6;
-        let etag_end = part_content[etag_start..]
-            .find("</ETag>")
-            .ok_or_else(malformed)?;
-        let etag = xml_unescape(part_content[etag_start..etag_start + etag_end].trim());
-
-        // Extract optional per-part checksum (ChecksumCRC32, ChecksumSHA256, etc.)
-        let checksum = extract_checksum_element(part_content)?;
-
-        parts.push(CompletePart {
-            part_number,
-            etag,
-            checksum,
-        });
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => match (state, e.name().as_ref()) {
+                (State::Start, b"CompleteMultipartUpload") => state = State::InRoot,
+                (State::InRoot, b"Part") => {
+                    current_part_number = None;
+                    current_etag = None;
+                    current_checksum = None;
+                    state = State::InPart;
+                }
+                (State::InPart, b"PartNumber") => {
+                    current_text.clear();
+                    state = State::InPartNumber;
+                }
+                (State::InPart, b"ETag") => {
+                    current_text.clear();
+                    state = State::InETag;
+                }
+                (State::InPart, name) => {
+                    if let Some(algo) = checksum_algorithm_for_element(name) {
+                        if current_checksum.is_some() {
+                            return Err(ServerError::MalformedXML {
+                                reason: "multiple checksum elements in a single Part".to_string(),
+                            });
+                        }
+                        current_text.clear();
+                        state = State::InChecksum(algo);
+                    } else {
+                        return Err(malformed_complete_multipart_xml());
+                    }
+                }
+                _ => return Err(malformed_complete_multipart_xml()),
+            },
+            Ok(Event::Empty(e)) => match (state, e.name().as_ref()) {
+                (State::InRoot, b"Part") => {}
+                (State::InPart, b"PartNumber" | b"ETag") => {}
+                (State::InPart, name) => {
+                    if checksum_algorithm_for_element(name).is_some() {
+                    } else {
+                        return Err(malformed_complete_multipart_xml());
+                    }
+                }
+                _ => return Err(malformed_complete_multipart_xml()),
+            },
+            Ok(Event::End(e)) => match (state, e.name().as_ref()) {
+                (State::InRoot, b"CompleteMultipartUpload") => state = State::Done,
+                (State::InPart, b"Part") => {
+                    let part_number =
+                        current_part_number.ok_or_else(malformed_complete_multipart_xml)?;
+                    let etag = current_etag
+                        .take()
+                        .ok_or_else(malformed_complete_multipart_xml)?;
+                    parts.push(CompletePart {
+                        part_number,
+                        etag,
+                        checksum: current_checksum.take(),
+                    });
+                    state = State::InRoot;
+                }
+                (State::InPartNumber, b"PartNumber") => {
+                    if current_part_number.is_none() {
+                        current_part_number = Some(
+                            current_text
+                                .trim()
+                                .parse()
+                                .map_err(|_| malformed_complete_multipart_xml())?,
+                        );
+                    }
+                    current_text.clear();
+                    state = State::InPart;
+                }
+                (State::InETag, b"ETag") => {
+                    if current_etag.is_none() {
+                        current_etag = Some(current_text.trim().to_string());
+                    }
+                    current_text.clear();
+                    state = State::InPart;
+                }
+                (State::InChecksum(algo), name)
+                    if checksum_algorithm_for_element(name) == Some(algo) =>
+                {
+                    if current_checksum.is_none() {
+                        current_checksum = Some((algo, current_text.trim().to_string()));
+                    }
+                    current_text.clear();
+                    state = State::InPart;
+                }
+                _ => return Err(malformed_complete_multipart_xml()),
+            },
+            Ok(Event::Text(t)) => {
+                let text = decode_complete_multipart_text(t.as_ref())?;
+                match state {
+                    State::InPartNumber | State::InETag | State::InChecksum(_) => {
+                        current_text.push_str(&text);
+                    }
+                    _ if text.trim().is_empty() => {}
+                    _ => return Err(malformed_complete_multipart_xml()),
+                }
+            }
+            Ok(Event::CData(t)) => {
+                let text = std::str::from_utf8(t.as_ref())
+                    .map_err(|_| malformed_complete_multipart_xml())?;
+                match state {
+                    State::InPartNumber | State::InETag | State::InChecksum(_) => {
+                        current_text.push_str(text);
+                    }
+                    _ if text.trim().is_empty() => {}
+                    _ => return Err(malformed_complete_multipart_xml()),
+                }
+            }
+            Ok(Event::Comment(_) | Event::Decl(_) | Event::PI(_) | Event::DocType(_)) => {}
+            Ok(Event::Eof) => {
+                return match state {
+                    State::Done if !parts.is_empty() => Ok(parts),
+                    _ => Err(malformed_complete_multipart_xml()),
+                };
+            }
+            Err(_) => return Err(malformed_complete_multipart_xml()),
+        }
+        buf.clear();
     }
-
-    if parts.is_empty() {
-        return Err(malformed());
-    }
-
-    Ok(parts)
 }
 
 #[cfg(test)]
