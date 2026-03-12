@@ -114,6 +114,91 @@ fn test_cors_set_get_delete() {
 }
 
 #[test]
+fn test_cors_get_round_trip_multiple_rules_and_headers() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let rule1 = CorsRule::builder()
+            .allowed_origins("http://example.com")
+            .allowed_origins("https://example.org")
+            .allowed_methods("GET")
+            .allowed_methods("PUT")
+            .allowed_headers("content-type")
+            .allowed_headers("x-amz-meta-*")
+            .expose_headers("etag")
+            .expose_headers("x-amz-request-id")
+            .max_age_seconds(3600)
+            .build()
+            .unwrap();
+        let rule2 = CorsRule::builder()
+            .allowed_origins("*")
+            .allowed_methods("HEAD")
+            .allowed_methods("POST")
+            .allowed_headers("authorization")
+            .expose_headers("x-amz-version-id")
+            .max_age_seconds(60)
+            .build()
+            .unwrap();
+
+        let config = CorsConfiguration::builder()
+            .cors_rules(rule1)
+            .cors_rules(rule2)
+            .build()
+            .unwrap();
+
+        client
+            .put_bucket_cors()
+            .bucket(&bucket)
+            .cors_configuration(config)
+            .send()
+            .await
+            .unwrap();
+
+        let resp = client
+            .get_bucket_cors()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        let rules = resp.cors_rules();
+        assert_eq!(rules.len(), 2);
+
+        assert_eq!(
+            rules[0].allowed_origins(),
+            ["http://example.com", "https://example.org"]
+        );
+        assert!(rules[0].allowed_methods().contains(&"GET".to_string()));
+        assert!(rules[0].allowed_methods().contains(&"PUT".to_string()));
+        assert!(rules[0]
+            .allowed_headers()
+            .contains(&"content-type".to_string()));
+        assert!(rules[0]
+            .allowed_headers()
+            .contains(&"x-amz-meta-*".to_string()));
+        assert!(rules[0].expose_headers().contains(&"etag".to_string()));
+        assert!(rules[0]
+            .expose_headers()
+            .contains(&"x-amz-request-id".to_string()));
+        assert_eq!(rules[0].max_age_seconds(), Some(3600));
+
+        assert_eq!(rules[1].allowed_origins(), ["*"]);
+        assert!(rules[1].allowed_methods().contains(&"HEAD".to_string()));
+        assert!(rules[1].allowed_methods().contains(&"POST".to_string()));
+        assert!(rules[1]
+            .allowed_headers()
+            .contains(&"authorization".to_string()));
+        assert!(rules[1]
+            .expose_headers()
+            .contains(&"x-amz-version-id".to_string()));
+        assert_eq!(rules[1].max_age_seconds(), Some(60));
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
 fn test_cors_get_no_config() {
     s3_tests::run(async {
         let client = CTX.client();

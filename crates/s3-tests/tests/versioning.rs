@@ -793,6 +793,93 @@ fn test_versioning_obj_list_marker() {
     });
 }
 
+#[test]
+fn test_versioning_list_object_versions_pagination_and_markers() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_versioned_bucket().await;
+        let key = "alpha&versions";
+        let other_key = "beta<versions";
+
+        let (mut key_versions, _) = create_multiple_versions(&bucket, key, 2).await;
+        let other_resp = client
+            .put_object()
+            .bucket(&bucket)
+            .key(other_key)
+            .body(ByteStream::from_static(b"other"))
+            .send()
+            .await
+            .unwrap();
+        let other_vid = other_resp.version_id().unwrap().to_string();
+
+        let delete_resp = client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let delete_marker_vid = delete_resp.version_id().unwrap().to_string();
+        key_versions.push(delete_marker_vid.clone());
+
+        let mut key_marker: Option<String> = None;
+        let mut version_id_marker: Option<String> = None;
+        let mut pages = 0;
+        let mut seen_delete_marker = false;
+        let mut seen_version_ids = Vec::new();
+
+        loop {
+            let mut req = client
+                .list_object_versions()
+                .bucket(&bucket)
+                .prefix("alpha")
+                .max_keys(1);
+            if let Some(ref km) = key_marker {
+                req = req.key_marker(km);
+            }
+            if let Some(ref vm) = version_id_marker {
+                req = req.version_id_marker(vm);
+            }
+
+            let resp = req.send().await.unwrap();
+            pages += 1;
+
+            if !resp.delete_markers().is_empty() {
+                seen_delete_marker = true;
+            }
+            for version in resp.versions() {
+                seen_version_ids.push(version.version_id().unwrap().to_string());
+            }
+
+            if resp.is_truncated() != Some(true) {
+                break;
+            }
+
+            key_marker = resp.next_key_marker().map(str::to_string);
+            version_id_marker = resp.next_version_id_marker().map(str::to_string);
+            assert!(key_marker.is_some());
+            assert!(version_id_marker.is_some());
+        }
+
+        assert!(pages >= 3, "expected paginated result, got {pages} page(s)");
+        assert!(seen_delete_marker);
+        assert_eq!(seen_version_ids.len(), 2);
+        assert!(seen_version_ids
+            .iter()
+            .all(|vid| key_versions.contains(vid)));
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(other_key)
+            .version_id(other_vid)
+            .send()
+            .await
+            .unwrap();
+        cleanup_versioned(&bucket, key, &key_versions).await;
+    });
+}
+
 // ── Copy specific versions ──────────────────────────────────────────
 
 #[test]

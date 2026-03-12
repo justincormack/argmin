@@ -23,6 +23,39 @@ async fn cleanup(bucket: &str, keys: &[&str]) {
     for key in keys {
         let _ = client.delete_object().bucket(bucket).key(*key).send().await;
     }
+
+    // AWS can keep failed or recently aborted multipart uploads visible briefly,
+    // causing DeleteBucket to return OperationAborted or BucketNotEmpty.
+    for _ in 0..10 {
+        let uploads = client
+            .list_multipart_uploads()
+            .bucket(bucket)
+            .send()
+            .await
+            .unwrap();
+        for upload in uploads.uploads() {
+            let _ = client
+                .abort_multipart_upload()
+                .bucket(bucket)
+                .key(upload.key().unwrap())
+                .upload_id(upload.upload_id().unwrap())
+                .send()
+                .await;
+        }
+
+        match client.delete_bucket().bucket(bucket).send().await {
+            Ok(_) => return,
+            Err(err) => {
+                let raw = format!("{err:?}");
+                if raw.contains("OperationAborted") || raw.contains("BucketNotEmpty") {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    continue;
+                }
+                panic!("delete_bucket failed unexpectedly: {raw}");
+            }
+        }
+    }
+
     client.delete_bucket().bucket(bucket).send().await.unwrap();
 }
 
@@ -326,6 +359,80 @@ fn test_list_multipart_uploads_prefix() {
     });
 }
 
+#[test]
+fn test_list_multipart_uploads_pagination_and_markers() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+
+        let uploads = ["a&upload", "b<upload", "c\"upload"];
+        let mut created = Vec::new();
+        for key in uploads {
+            let create = client
+                .create_multipart_upload()
+                .bucket(&bucket)
+                .key(key)
+                .send()
+                .await
+                .unwrap();
+            created.push((key.to_string(), create.upload_id().unwrap().to_string()));
+        }
+
+        let resp1 = client
+            .list_multipart_uploads()
+            .bucket(&bucket)
+            .max_uploads(1)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp1.uploads().len(), 1);
+        assert_eq!(resp1.uploads()[0].key().unwrap(), "a&upload");
+        assert_eq!(resp1.is_truncated(), Some(true));
+        let next_key_1 = resp1.next_key_marker().unwrap().to_string();
+        let next_upload_1 = resp1.next_upload_id_marker().unwrap().to_string();
+
+        let resp2 = client
+            .list_multipart_uploads()
+            .bucket(&bucket)
+            .key_marker(next_key_1)
+            .upload_id_marker(next_upload_1)
+            .max_uploads(1)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp2.uploads().len(), 1);
+        assert_eq!(resp2.uploads()[0].key().unwrap(), "b<upload");
+        assert_eq!(resp2.is_truncated(), Some(true));
+        let next_key_2 = resp2.next_key_marker().unwrap().to_string();
+        let next_upload_2 = resp2.next_upload_id_marker().unwrap().to_string();
+
+        let resp3 = client
+            .list_multipart_uploads()
+            .bucket(&bucket)
+            .key_marker(next_key_2)
+            .upload_id_marker(next_upload_2)
+            .max_uploads(1)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp3.uploads().len(), 1);
+        assert_eq!(resp3.uploads()[0].key().unwrap(), "c\"upload");
+        assert_eq!(resp3.is_truncated(), Some(false));
+
+        for (key, upload_id) in created {
+            client
+                .abort_multipart_upload()
+                .bucket(&bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .send()
+                .await
+                .unwrap();
+        }
+        cleanup(&bucket, &[]).await;
+    });
+}
+
 // ── ListParts ───────────────────────────────────────────────────────
 
 #[test]
@@ -388,6 +495,91 @@ fn test_list_parts() {
             .bucket(&bucket)
             .key(key)
             .upload_id(upload_id)
+            .send()
+            .await
+            .unwrap();
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_list_parts_pagination_with_checksums() {
+    use aws_sdk_s3::types::ChecksumAlgorithm;
+
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "list-parts-page";
+
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .checksum_algorithm(ChecksumAlgorithm::Crc32)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+
+        let mut expected = Vec::new();
+        for (part_number, data) in [(1, vec![b'a'; PART_SIZE]), (2, vec![b'b'; 1024])] {
+            let resp = client
+                .upload_part()
+                .bucket(&bucket)
+                .key(key)
+                .upload_id(&upload_id)
+                .part_number(part_number)
+                .body(ByteStream::from(data))
+                .checksum_algorithm(ChecksumAlgorithm::Crc32)
+                .send()
+                .await
+                .unwrap();
+            expected.push((part_number, resp.checksum_crc32().unwrap().to_string()));
+        }
+
+        let resp1 = client
+            .list_parts()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .max_parts(1)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp1.parts().len(), 1);
+        assert_eq!(resp1.parts()[0].part_number(), Some(1));
+        assert_eq!(
+            resp1.parts()[0].checksum_crc32(),
+            Some(expected[0].1.as_str())
+        );
+        assert_eq!(resp1.checksum_algorithm(), Some(&ChecksumAlgorithm::Crc32));
+        assert_eq!(resp1.is_truncated(), Some(true));
+        let next_marker = resp1.next_part_number_marker().unwrap();
+
+        let resp2 = client
+            .list_parts()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .part_number_marker(next_marker)
+            .max_parts(1)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp2.parts().len(), 1);
+        assert_eq!(resp2.parts()[0].part_number(), Some(2));
+        assert_eq!(
+            resp2.parts()[0].checksum_crc32(),
+            Some(expected[1].1.as_str())
+        );
+        assert_eq!(resp2.checksum_algorithm(), Some(&ChecksumAlgorithm::Crc32));
+        assert_eq!(resp2.is_truncated(), Some(false));
+
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
             .send()
             .await
             .unwrap();

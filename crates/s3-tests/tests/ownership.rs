@@ -517,27 +517,137 @@ fn test_put_bucket_ownership_bucket_owner_enforced() {
 // ── Ignored tests (need bucket policies or get_object_acl) ──────────
 
 #[test]
-#[ignore = "not implemented: bucket policies"]
 fn test_create_bucket_bucket_owner_preferred() {
-    s3_tests::run(async {});
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client
+            .create_bucket()
+            .bucket(&bucket)
+            .object_ownership(ObjectOwnership::BucketOwnerPreferred)
+            .send()
+            .await
+            .unwrap();
+
+        let resp = client
+            .get_bucket_ownership_controls()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        let rules = resp.ownership_controls().unwrap().rules();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(
+            rules[0].object_ownership,
+            ObjectOwnership::BucketOwnerPreferred
+        );
+
+        cleanup(&bucket).await;
+    });
 }
 
 #[test]
-#[ignore = "not implemented: bucket policies"]
 fn test_create_bucket_object_writer() {
-    s3_tests::run(async {});
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client
+            .create_bucket()
+            .bucket(&bucket)
+            .object_ownership(ObjectOwnership::ObjectWriter)
+            .send()
+            .await
+            .unwrap();
+
+        let resp = client
+            .get_bucket_ownership_controls()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        let rules = resp.ownership_controls().unwrap().rules();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].object_ownership, ObjectOwnership::ObjectWriter);
+
+        cleanup(&bucket).await;
+    });
 }
 
 #[test]
-#[ignore = "not implemented: bucket policies"]
 fn test_put_bucket_ownership_bucket_owner_preferred() {
-    s3_tests::run(async {});
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let rule = aws_sdk_s3::types::OwnershipControlsRule::builder()
+            .object_ownership(ObjectOwnership::BucketOwnerPreferred)
+            .build()
+            .unwrap();
+        let controls = aws_sdk_s3::types::OwnershipControls::builder()
+            .rules(rule)
+            .build()
+            .unwrap();
+        client
+            .put_bucket_ownership_controls()
+            .bucket(&bucket)
+            .ownership_controls(controls)
+            .send()
+            .await
+            .unwrap();
+
+        let resp = client
+            .get_bucket_ownership_controls()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        let rules = resp.ownership_controls().unwrap().rules();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(
+            rules[0].object_ownership,
+            ObjectOwnership::BucketOwnerPreferred
+        );
+
+        cleanup(&bucket).await;
+    });
 }
 
 #[test]
-#[ignore = "not implemented: bucket policies"]
 fn test_put_bucket_ownership_object_writer() {
-    s3_tests::run(async {});
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let rule = aws_sdk_s3::types::OwnershipControlsRule::builder()
+            .object_ownership(ObjectOwnership::ObjectWriter)
+            .build()
+            .unwrap();
+        let controls = aws_sdk_s3::types::OwnershipControls::builder()
+            .rules(rule)
+            .build()
+            .unwrap();
+        client
+            .put_bucket_ownership_controls()
+            .bucket(&bucket)
+            .ownership_controls(controls)
+            .send()
+            .await
+            .unwrap();
+
+        let resp = client
+            .get_bucket_ownership_controls()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        let rules = resp.ownership_controls().unwrap().rules();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].object_ownership, ObjectOwnership::ObjectWriter);
+
+        cleanup(&bucket).await;
+    });
 }
 
 // ── Helper: send a signed PUT request via raw HTTP ───────────────────
