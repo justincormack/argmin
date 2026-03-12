@@ -447,6 +447,22 @@ impl ReadHandle {
     }
 }
 
+fn chunk_payloads_from_stream_object_chunks(
+    chunks: Vec<StreamObjectChunkRecord>,
+) -> Vec<ChunkPayloadRecord> {
+    chunks
+        .into_iter()
+        .map(|chunk| ChunkPayloadRecord {
+            size: chunk.size,
+            chunk_okh: chunk.chunk_okh,
+            chunk_vid: chunk.chunk_vid,
+            shard_pg_id: chunk.shard_pg_id,
+            ec_k: chunk.ec_k,
+            ec_m: chunk.ec_m,
+        })
+        .collect()
+}
+
 /// Result of a GetObject operation.
 #[derive(Debug)]
 pub struct GetObjectResult {
@@ -3222,13 +3238,14 @@ impl Coordinator {
                 let data = if src_record.size == 0 {
                     vec![]
                 } else {
-                    self.read_multipart_range(
+                    ReadHandle::from_multipart(
+                        self.read_runtime(),
                         src_bucket,
                         src_key,
-                        &obj_parts,
-                        0,
-                        src_record.size as usize - 1,
+                        obj_parts,
+                        src_record.size as usize,
                     )
+                    .into_bytes()
                     .map_err(not_found)?
                 };
 
@@ -3256,8 +3273,16 @@ impl Coordinator {
                     vec![]
                 } else if !chunks.is_empty() {
                     drop(pgs);
-                    self.read_chunk_manifest_range(src_bucket, src_key, &chunks, 0, user_size - 1)
-                        .map_err(not_found)?
+                    ReadHandle::from_chunk_manifest(
+                        self.read_runtime(),
+                        src_bucket,
+                        src_key,
+                        chunk_payloads_from_stream_object_chunks(chunks),
+                        user_size,
+                        Some(src_etag_crc),
+                    )
+                    .into_bytes()
+                    .map_err(not_found)?
                 } else {
                     let src_okh = object_key_hash(src_bucket, src_key);
                     let src_shard_pg = pgs.shard();
@@ -3689,101 +3714,6 @@ impl Coordinator {
         Ok(buf[local_start..=local_end].to_vec())
     }
 
-    /// Read full data for a single stream object chunk from its shard PG.
-    ///
-    /// Parallel to `read_part_data` but for `StreamObjectChunkRecord`.
-    fn read_chunk_data(&self, chunk: &StreamObjectChunkRecord) -> Result<Vec<u8>, ServerError> {
-        let pg = self.storage_node.get_pg(chunk.shard_pg_id)?;
-        let k = chunk.ec_k as usize;
-        let m = chunk.ec_m as usize;
-
-        let padded = (chunk.size as usize).div_ceil(k) * k;
-        let shard_size = padded / k;
-
-        if shard_size == 0 {
-            return Ok(vec![]);
-        }
-
-        let needed: Vec<usize> = (0..k).collect();
-        let mut all_shards: Vec<Option<Vec<u8>>> = Vec::with_capacity(k + m);
-        let mut present_count = 0;
-
-        for i in 0..(k + m) {
-            let shard_key = ShardKey::new(&chunk.chunk_okh, chunk.chunk_vid, i as u8);
-            match pg.read_shard(&shard_key) {
-                Ok(sd) => {
-                    all_shards.push(Some(sd.data));
-                    present_count += 1;
-                }
-                Err(_) => {
-                    all_shards.push(None);
-                }
-            }
-        }
-
-        if present_count < k {
-            return Err(ServerError::Store(storage::StoreError::NotFound));
-        }
-
-        let all_data_present = (0..k).all(|i| all_shards[i].is_some());
-        if !all_data_present {
-            let missing_needed: Vec<usize> = needed
-                .iter()
-                .copied()
-                .filter(|&i| all_shards[i].is_none())
-                .collect();
-
-            let present_indices: Vec<usize> =
-                (0..(k + m)).filter(|&i| all_shards[i].is_some()).collect();
-            let present_refs: Vec<&[u8]> = present_indices
-                .iter()
-                .map(|&i| all_shards[i].as_ref().unwrap().as_slice())
-                .collect();
-
-            let tmp_codec;
-            let codec = if chunk.ec_k == self.ec_config.data_shards
-                && chunk.ec_m == self.ec_config.parity_shards
-            {
-                &self.ec_codec
-            } else {
-                let ec_config = EcConfig::new(chunk.ec_k, chunk.ec_m)?;
-                tmp_codec = ErasureCodec::new(ec_config)?;
-                &tmp_codec
-            };
-
-            let mut outputs: Vec<Vec<u8>> = missing_needed
-                .iter()
-                .map(|_| vec![0u8; shard_size])
-                .collect();
-            let mut output_refs: Vec<&mut [u8]> = outputs
-                .iter_mut()
-                .map(std::vec::Vec::as_mut_slice)
-                .collect();
-
-            codec.reconstruct(
-                &present_indices,
-                &present_refs,
-                &missing_needed,
-                &mut output_refs,
-            )?;
-
-            for (idx, &missing_idx) in missing_needed.iter().enumerate() {
-                all_shards[missing_idx] = Some(outputs[idx].clone());
-            }
-        }
-
-        let mut buf = Vec::with_capacity(padded);
-        for shard in all_shards.iter().take(k) {
-            buf.extend_from_slice(shard.as_ref().unwrap());
-        }
-        buf.truncate(chunk.size as usize);
-        Ok(buf)
-    }
-
-    /// Read a byte range from a chunk-manifest object by traversing its chunks.
-    ///
-    /// Maps [start, end] (inclusive) to the relevant chunks, reads each,
-    /// and concatenates the needed slices.
     fn snapshot_multipart_parts(
         meta_pg: &storage::PgStore,
         bucket: &str,
@@ -3810,100 +3740,6 @@ impl Coordinator {
             });
         }
         Ok(snapshotted)
-    }
-
-    fn read_snapshotted_multipart_part_data(
-        &self,
-        bucket: &str,
-        key: &str,
-        part: &SnapshottedMultipartPart,
-    ) -> Result<Vec<u8>, ServerError> {
-        if part.record.size == 0 {
-            return Ok(vec![]);
-        }
-        if let Some(chunks) = &part.streaming_chunks {
-            self.read_streaming_part_data(bucket, key, chunks, 0, part.record.size as usize - 1)
-        } else {
-            self.read_part_data(&part.record)
-        }
-    }
-
-    fn read_chunk_manifest_range(
-        &self,
-        bucket: &str,
-        key: &str,
-        chunks: &[StreamObjectChunkRecord],
-        start: usize,
-        end: usize,
-    ) -> Result<Vec<u8>, ServerError> {
-        let total_len = end - start + 1;
-        let mut result = Vec::with_capacity(total_len);
-        let mut offset: usize = 0;
-
-        for chunk in chunks {
-            let chunk_start = offset;
-            let chunk_end = offset + chunk.size as usize; // exclusive
-
-            if chunk_start > end {
-                break;
-            }
-            if chunk.size == 0 || chunk_end <= start {
-                offset = chunk_end;
-                continue;
-            }
-
-            let slice_start = start.saturating_sub(chunk_start);
-            let slice_end = if end < chunk_end - 1 {
-                end - chunk_start
-            } else {
-                chunk.size as usize - 1
-            };
-
-            let data = self.read_chunk_data(chunk)?;
-            result.extend_from_slice(&data[slice_start..=slice_end]);
-            offset = chunk_end;
-        }
-
-        if result.len() != total_len {
-            return Err(ServerError::IntegrityError {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-                expected: total_len as u64,
-                actual: result.len() as u64,
-            });
-        }
-
-        Ok(result)
-    }
-
-    /// Read a streaming part's data via its chunk manifest.
-    ///
-    /// Converts `MultipartPartChunkRecord`s to `StreamObjectChunkRecord`s
-    /// and delegates to `read_chunk_manifest_range`.
-    fn read_streaming_part_data(
-        &self,
-        bucket: &str,
-        key: &str,
-        chunks: &[storage::MultipartPartChunkRecord],
-        start: usize,
-        end: usize,
-    ) -> Result<Vec<u8>, ServerError> {
-        let stream_chunks: Vec<storage::StreamObjectChunkRecord> = chunks
-            .iter()
-            .map(|c| storage::StreamObjectChunkRecord {
-                bucket: c.bucket.clone(),
-                key: c.key.clone(),
-                version_id: VersionId::from_u64(c.version_id),
-                chunk_index: c.chunk_index,
-                size: c.size,
-                chunk_okh: c.chunk_okh,
-                chunk_vid: c.chunk_vid,
-                shard_pg_id: c.shard_pg_id,
-                ec_k: c.ec_k,
-                ec_m: c.ec_m,
-            })
-            .collect();
-        self.read_chunk_manifest_range(bucket, key, &stream_chunks, start, end)
     }
 
     /// Delete all shards for a list of object parts.
@@ -3964,157 +3800,6 @@ impl Coordinator {
             pg.delete_shard(&shard_key)?;
         }
         Ok(())
-    }
-
-    /// Read a full part's data from its shard PG.
-    ///
-    /// Uses the part's `shard_pg_id`, `part_okh`, `part_vid`, and EC config
-    /// to locate and reconstruct the part data.
-    fn read_part_data(&self, part: &ObjectPartRecord) -> Result<Vec<u8>, ServerError> {
-        let pg = self.storage_node.get_pg(part.shard_pg_id)?;
-        let k = part.ec_k as usize;
-        let m = part.ec_m as usize;
-
-        // Compute shard size from part size and EC config.
-        let padded = (part.size as usize).div_ceil(k) * k;
-        let shard_size = padded / k;
-
-        if shard_size == 0 {
-            return Ok(vec![]);
-        }
-
-        // Read all k data shards (indices 0..k).
-        let needed: Vec<usize> = (0..k).collect();
-        let mut all_shards: Vec<Option<Vec<u8>>> = Vec::with_capacity(k + m);
-        let mut present_count = 0;
-
-        for i in 0..(k + m) {
-            let shard_key = ShardKey::new(&part.part_okh, part.part_vid, i as u8);
-            match pg.read_shard(&shard_key) {
-                Ok(sd) => {
-                    all_shards.push(Some(sd.data));
-                    present_count += 1;
-                }
-                Err(_) => {
-                    all_shards.push(None);
-                }
-            }
-        }
-
-        if present_count < k {
-            return Err(ServerError::Store(storage::StoreError::NotFound));
-        }
-
-        // Check if all data shards are present (happy path).
-        let all_data_present = (0..k).all(|i| all_shards[i].is_some());
-        if !all_data_present {
-            // EC reconstruct missing data shards.
-            let missing_needed: Vec<usize> = needed
-                .iter()
-                .copied()
-                .filter(|&i| all_shards[i].is_none())
-                .collect();
-
-            let present_indices: Vec<usize> =
-                (0..(k + m)).filter(|&i| all_shards[i].is_some()).collect();
-            let present_refs: Vec<&[u8]> = present_indices
-                .iter()
-                .map(|&i| all_shards[i].as_ref().unwrap().as_slice())
-                .collect();
-
-            let tmp_codec;
-            let codec = if part.ec_k == self.ec_config.data_shards
-                && part.ec_m == self.ec_config.parity_shards
-            {
-                &self.ec_codec
-            } else {
-                let ec_config = EcConfig::new(part.ec_k, part.ec_m)?;
-                tmp_codec = ErasureCodec::new(ec_config)?;
-                &tmp_codec
-            };
-
-            let mut outputs: Vec<Vec<u8>> = missing_needed
-                .iter()
-                .map(|_| vec![0u8; shard_size])
-                .collect();
-            let mut output_refs: Vec<&mut [u8]> = outputs
-                .iter_mut()
-                .map(std::vec::Vec::as_mut_slice)
-                .collect();
-
-            codec.reconstruct(
-                &present_indices,
-                &present_refs,
-                &missing_needed,
-                &mut output_refs,
-            )?;
-
-            for (idx, &missing_idx) in missing_needed.iter().enumerate() {
-                all_shards[missing_idx] = Some(outputs[idx].clone());
-            }
-        }
-
-        // Concatenate data shards and truncate to actual part size.
-        let mut buf = Vec::with_capacity(padded);
-        for shard in all_shards.iter().take(k) {
-            buf.extend_from_slice(shard.as_ref().unwrap());
-        }
-        buf.truncate(part.size as usize);
-        Ok(buf)
-    }
-
-    /// Read a byte range from a multipart object by traversing its part manifest.
-    ///
-    /// Maps [start, end] (inclusive) to the relevant parts, reads each,
-    /// and concatenates the needed slices.
-    fn read_multipart_range(
-        &self,
-        bucket: &str,
-        key: &str,
-        parts: &[SnapshottedMultipartPart],
-        start: usize,
-        end: usize,
-    ) -> Result<Vec<u8>, ServerError> {
-        let total_len = end - start + 1;
-        let mut result = Vec::with_capacity(total_len);
-        let mut offset: usize = 0;
-
-        for part in parts {
-            let part_start = offset;
-            let part_end = offset + part.record.size as usize; // exclusive
-
-            if part_start > end {
-                break; // Past the requested range.
-            }
-            if part.record.size == 0 || part_end <= start {
-                offset = part_end;
-                continue; // Zero-size or before the requested range.
-            }
-
-            // This part overlaps with [start, end].
-            let slice_start = start.saturating_sub(part_start);
-            let slice_end = if end < part_end - 1 {
-                end - part_start
-            } else {
-                part.record.size as usize - 1
-            };
-
-            let data = self.read_snapshotted_multipart_part_data(bucket, key, part)?;
-            result.extend_from_slice(&data[slice_start..=slice_end]);
-            offset = part_end;
-        }
-
-        // Verify manifest covered the full requested range.
-        if result.len() != total_len {
-            return Err(ServerError::IntegrityError {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-                expected: total_len as u64,
-                actual: result.len() as u64,
-            });
-        }
-
-        Ok(result)
     }
 
     /// Get an object from storage.
@@ -5551,13 +5236,15 @@ impl Coordinator {
                 #[cfg(test)]
                 maybe_run_multipart_snapshot_hook(src_bucket, src_key);
 
-                self.read_multipart_range(
+                ReadHandle::from_multipart_range(
+                    self.read_runtime(),
                     src_bucket,
                     src_key,
-                    &obj_parts,
+                    obj_parts,
                     read_start as usize,
                     read_end as usize,
                 )
+                .into_bytes()
                 .map_err(not_found)?
             } else {
                 // Non-multipart source: check for chunk manifest first.
@@ -5581,13 +5268,15 @@ impl Coordinator {
                     .map_err(not_found)?
                 } else {
                     drop(pgs);
-                    self.read_chunk_manifest_range(
+                    ReadHandle::from_chunk_manifest_range(
+                        self.read_runtime(),
                         src_bucket,
                         src_key,
-                        &chunks,
+                        chunk_payloads_from_stream_object_chunks(chunks),
                         read_start as usize,
                         read_end as usize,
                     )
+                    .into_bytes()
                     .map_err(not_found)?
                 }
             }
@@ -11183,6 +10872,84 @@ mod tests {
             copy_res.is_ok(),
             "upload_part_copy should succeed once source multipart metadata is snapshotted: {copy_res:?}"
         );
+    }
+
+    #[test]
+    fn copy_object_survives_source_metadata_delete_mid_read() {
+        let tmp = test_util::tempdir();
+        let pg_ids: Vec<u32> = (0..4).collect();
+        let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
+        let ec_config = EcConfig::new(4, 2).unwrap();
+
+        let make_coord = || {
+            Coordinator::new(
+                Arc::clone(&storage_node),
+                ec_config,
+                "us-east-1".to_string(),
+            )
+            .unwrap()
+        };
+
+        let admin = make_coord();
+        admin.create_bucket("src-bucket").unwrap();
+        admin.create_bucket("dst-bucket").unwrap();
+        let (_, expected) =
+            create_completed_multipart_with_streamed_tail(&admin, "src-bucket", "race-key-copy");
+
+        let sync = install_multipart_metadata_race_hooks("src-bucket", "race-key-copy");
+        let copier = make_coord();
+        let deleter = make_coord();
+
+        let t_copy = thread::spawn(move || {
+            copier.copy_object(&CopyObjectRequest {
+                source: CopySource {
+                    bucket: "src-bucket",
+                    key: "race-key-copy",
+                    version_id: None,
+                    condition: NO_READ,
+                },
+                dst_bucket: "dst-bucket",
+                dst_key: "copied",
+                dst_condition: NO_WRITE,
+                directive: MetadataDirective::Copy,
+                tagging: TaggingDirective::Copy,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
+            })
+        });
+        sync.snapshot_reached.wait();
+
+        let t_delete = thread::spawn(move || {
+            deleter.delete_object(&DeleteObjectRequest {
+                bucket: "src-bucket",
+                key: "race-key-copy",
+                version_id: None,
+                cond: NO_DELETE,
+                requester: TEST_REQUESTER,
+            })
+        });
+        sync.delete_reached.wait();
+
+        sync.snapshot_resume.wait();
+        let copy_res = t_copy.join().unwrap();
+        sync.delete_resume.wait();
+        let delete_res = t_delete.join().unwrap();
+        assert!(delete_res.is_ok(), "delete failed: {delete_res:?}");
+        assert!(
+            copy_res.is_ok(),
+            "copy_object should succeed once source multipart metadata is snapshotted: {copy_res:?}"
+        );
+
+        let dst = admin
+            .get_object(&GetObjectRequest {
+                bucket: "dst-bucket",
+                key: "copied",
+                version_id: None,
+                cond: NO_READ,
+                requester: TEST_REQUESTER,
+            })
+            .unwrap();
+        assert_eq!(dst.body.into_bytes().unwrap(), expected);
     }
 
     #[test]

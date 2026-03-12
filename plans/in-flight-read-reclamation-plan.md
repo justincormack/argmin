@@ -257,8 +257,10 @@ Status:
    - simple single-shard-set reads and ranges remain buffered for now
    - this is intentional because chunked streaming of unversioned single-shard
      objects exposed a real overwrite-consistency hole
-5. copy-source internal readers still need to move onto the same stepped read
-   foundation
+5. `CopyObject` and `UploadPartCopy` now reuse the same stepped reader
+   foundation for multipart-manifest and chunk-manifest source reads; simple
+   single-shard-set sources remain buffered for the same retained-generation
+   reason
 
 Proposed implementation shape:
 
