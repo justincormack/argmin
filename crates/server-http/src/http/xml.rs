@@ -1506,25 +1506,177 @@ pub struct PublicAccessBlockConfig {
 ///
 /// Missing boolean elements default to `false`.
 pub fn parse_public_access_block_xml(data: &[u8]) -> Result<PublicAccessBlockConfig, ServerError> {
-    let text = std::str::from_utf8(data).map_err(|_| ServerError::MalformedXML {
-        reason: "invalid UTF-8 in public access block XML body".to_string(),
-    })?;
-    let inner = extract_tag_content(text, "PublicAccessBlockConfiguration").ok_or_else(|| {
-        ServerError::MalformedXML {
-            reason: "missing PublicAccessBlockConfiguration element".to_string(),
-        }
-    })?;
-
-    fn parse_bool_element(xml: &str, tag: &str) -> bool {
-        extract_tag_content(xml, tag).is_some_and(|v| v.trim().eq_ignore_ascii_case("true"))
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum State {
+        Start,
+        InRoot,
+        InBlockPublicAcls,
+        InIgnorePublicAcls,
+        InBlockPublicPolicy,
+        InRestrictPublicBuckets,
+        Done,
     }
 
-    Ok(PublicAccessBlockConfig {
-        block_public_acls: parse_bool_element(inner, "BlockPublicAcls"),
-        ignore_public_acls: parse_bool_element(inner, "IgnorePublicAcls"),
-        block_public_policy: parse_bool_element(inner, "BlockPublicPolicy"),
-        restrict_public_buckets: parse_bool_element(inner, "RestrictPublicBuckets"),
-    })
+    fn malformed_pab_xml(reason: &str) -> ServerError {
+        ServerError::MalformedXML {
+            reason: reason.to_string(),
+        }
+    }
+
+    fn decode_pab_text(bytes: &[u8]) -> Result<String, ServerError> {
+        decode_xml_text(
+            bytes,
+            "invalid UTF-8 in public access block XML body",
+            "invalid XML entity in public access block XML body",
+        )
+    }
+
+    fn parse_bool_text(text: &str) -> bool {
+        text.trim().eq_ignore_ascii_case("true")
+    }
+
+    let mut reader = Reader::from_reader(data);
+    let mut buf = Vec::new();
+    let mut state = State::Start;
+    let mut current_text = String::new();
+    let mut config = PublicAccessBlockConfig {
+        block_public_acls: false,
+        ignore_public_acls: false,
+        block_public_policy: false,
+        restrict_public_buckets: false,
+    };
+    let mut seen_block_public_acls = false;
+    let mut seen_ignore_public_acls = false;
+    let mut seen_block_public_policy = false;
+    let mut seen_restrict_public_buckets = false;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => match (state, e.name().as_ref()) {
+                (State::Start, b"PublicAccessBlockConfiguration") => state = State::InRoot,
+                (State::InRoot, b"BlockPublicAcls") => {
+                    current_text.clear();
+                    state = State::InBlockPublicAcls;
+                }
+                (State::InRoot, b"IgnorePublicAcls") => {
+                    current_text.clear();
+                    state = State::InIgnorePublicAcls;
+                }
+                (State::InRoot, b"BlockPublicPolicy") => {
+                    current_text.clear();
+                    state = State::InBlockPublicPolicy;
+                }
+                (State::InRoot, b"RestrictPublicBuckets") => {
+                    current_text.clear();
+                    state = State::InRestrictPublicBuckets;
+                }
+                _ => {
+                    return Err(malformed_pab_xml(
+                        "unexpected element in public access block XML",
+                    ))
+                }
+            },
+            Ok(Event::Empty(e)) => match (state, e.name().as_ref()) {
+                (State::InRoot, b"BlockPublicAcls") => seen_block_public_acls = true,
+                (State::InRoot, b"IgnorePublicAcls") => seen_ignore_public_acls = true,
+                (State::InRoot, b"BlockPublicPolicy") => seen_block_public_policy = true,
+                (State::InRoot, b"RestrictPublicBuckets") => {
+                    seen_restrict_public_buckets = true;
+                }
+                _ => {
+                    return Err(malformed_pab_xml(
+                        "unexpected empty element in public access block XML",
+                    ));
+                }
+            },
+            Ok(Event::End(e)) => match (state, e.name().as_ref()) {
+                (State::InRoot, b"PublicAccessBlockConfiguration") => state = State::Done,
+                (State::InBlockPublicAcls, b"BlockPublicAcls") => {
+                    if !seen_block_public_acls {
+                        config.block_public_acls = parse_bool_text(&current_text);
+                        seen_block_public_acls = true;
+                    }
+                    current_text.clear();
+                    state = State::InRoot;
+                }
+                (State::InIgnorePublicAcls, b"IgnorePublicAcls") => {
+                    if !seen_ignore_public_acls {
+                        config.ignore_public_acls = parse_bool_text(&current_text);
+                        seen_ignore_public_acls = true;
+                    }
+                    current_text.clear();
+                    state = State::InRoot;
+                }
+                (State::InBlockPublicPolicy, b"BlockPublicPolicy") => {
+                    if !seen_block_public_policy {
+                        config.block_public_policy = parse_bool_text(&current_text);
+                        seen_block_public_policy = true;
+                    }
+                    current_text.clear();
+                    state = State::InRoot;
+                }
+                (State::InRestrictPublicBuckets, b"RestrictPublicBuckets") => {
+                    if !seen_restrict_public_buckets {
+                        config.restrict_public_buckets = parse_bool_text(&current_text);
+                        seen_restrict_public_buckets = true;
+                    }
+                    current_text.clear();
+                    state = State::InRoot;
+                }
+                _ => {
+                    return Err(malformed_pab_xml(
+                        "unexpected closing element in public access block XML",
+                    ));
+                }
+            },
+            Ok(Event::Text(t)) => {
+                let text = decode_pab_text(t.as_ref())?;
+                match state {
+                    State::InBlockPublicAcls
+                    | State::InIgnorePublicAcls
+                    | State::InBlockPublicPolicy
+                    | State::InRestrictPublicBuckets => current_text.push_str(&text),
+                    _ if text.trim().is_empty() => {}
+                    _ => {
+                        return Err(malformed_pab_xml(
+                            "unexpected text in public access block XML",
+                        ))
+                    }
+                }
+            }
+            Ok(Event::CData(t)) => {
+                let text = std::str::from_utf8(t.as_ref()).map_err(|_| {
+                    malformed_pab_xml("invalid UTF-8 in public access block XML body")
+                })?;
+                match state {
+                    State::InBlockPublicAcls
+                    | State::InIgnorePublicAcls
+                    | State::InBlockPublicPolicy
+                    | State::InRestrictPublicBuckets => current_text.push_str(text),
+                    _ if text.trim().is_empty() => {}
+                    _ => {
+                        return Err(malformed_pab_xml(
+                            "unexpected CDATA in public access block XML",
+                        ));
+                    }
+                }
+            }
+            Ok(Event::Comment(_) | Event::Decl(_) | Event::PI(_) | Event::DocType(_)) => {}
+            Ok(Event::Eof) => {
+                return match state {
+                    State::Done => Ok(config),
+                    State::Start => Err(malformed_pab_xml(
+                        "missing PublicAccessBlockConfiguration element",
+                    )),
+                    _ => Err(malformed_pab_xml(
+                        "unexpected end of public access block XML",
+                    )),
+                };
+            }
+            Err(_) => return Err(malformed_pab_xml("malformed public access block XML")),
+        }
+        buf.clear();
+    }
 }
 
 /// Serialize a `PublicAccessBlockConfig` into S3 response XML.
@@ -1567,28 +1719,131 @@ pub fn get_public_access_block_xml(config: &PublicAccessBlockConfig) -> String {
 /// `<OwnershipControls><Rule><ObjectOwnership>VALUE</ObjectOwnership></Rule></OwnershipControls>`.
 /// Validates VALUE is one of `BucketOwnerEnforced`, `BucketOwnerPreferred`, or `ObjectWriter`.
 pub fn parse_ownership_controls_xml(data: &[u8]) -> Result<String, ServerError> {
-    let text = std::str::from_utf8(data).map_err(|_| ServerError::MalformedXML {
-        reason: "invalid UTF-8 in ownership controls XML body".to_string(),
-    })?;
-    let inner = extract_tag_content(text, "OwnershipControls").ok_or_else(|| {
-        ServerError::MalformedXML {
-            reason: "missing OwnershipControls element".to_string(),
-        }
-    })?;
-    let rule = extract_tag_content(inner, "Rule").ok_or_else(|| ServerError::MalformedXML {
-        reason: "missing Rule element in OwnershipControls".to_string(),
-    })?;
-    let value = extract_tag_content(rule, "ObjectOwnership")
-        .ok_or_else(|| ServerError::MalformedXML {
-            reason: "missing ObjectOwnership element in Rule".to_string(),
-        })?
-        .trim();
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum State {
+        Start,
+        InRoot,
+        InRule,
+        InObjectOwnership,
+        Done,
+    }
 
-    match value {
-        "BucketOwnerEnforced" | "BucketOwnerPreferred" | "ObjectWriter" => Ok(value.to_string()),
-        _ => Err(ServerError::InvalidArgument {
-            reason: format!("invalid ObjectOwnership value: {value}"),
-        }),
+    fn malformed_ownership_xml(reason: &str) -> ServerError {
+        ServerError::MalformedXML {
+            reason: reason.to_string(),
+        }
+    }
+
+    fn decode_ownership_text(bytes: &[u8]) -> Result<String, ServerError> {
+        decode_xml_text(
+            bytes,
+            "invalid UTF-8 in ownership controls XML body",
+            "invalid XML entity in ownership controls XML body",
+        )
+    }
+
+    let mut reader = Reader::from_reader(data);
+    let mut buf = Vec::new();
+    let mut state = State::Start;
+    let mut current_text = String::new();
+    let mut object_ownership: Option<String> = None;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => match (state, e.name().as_ref()) {
+                (State::Start, b"OwnershipControls") => state = State::InRoot,
+                (State::InRoot, b"Rule") => state = State::InRule,
+                (State::InRule, b"ObjectOwnership") => {
+                    current_text.clear();
+                    state = State::InObjectOwnership;
+                }
+                _ => {
+                    return Err(malformed_ownership_xml(
+                        "unexpected element in ownership controls XML",
+                    ))
+                }
+            },
+            Ok(Event::Empty(e)) => match (state, e.name().as_ref()) {
+                (State::InRule, b"ObjectOwnership") => object_ownership = Some(String::new()),
+                _ => {
+                    return Err(malformed_ownership_xml(
+                        "unexpected empty element in ownership controls XML",
+                    ));
+                }
+            },
+            Ok(Event::End(e)) => match (state, e.name().as_ref()) {
+                (State::InRoot, b"OwnershipControls") => state = State::Done,
+                (State::InRule, b"Rule") => {
+                    if object_ownership.is_none() {
+                        return Err(malformed_ownership_xml(
+                            "missing ObjectOwnership element in Rule",
+                        ));
+                    }
+                    state = State::InRoot;
+                }
+                (State::InObjectOwnership, b"ObjectOwnership") => {
+                    object_ownership = Some(std::mem::take(&mut current_text));
+                    state = State::InRule;
+                }
+                _ => {
+                    return Err(malformed_ownership_xml(
+                        "unexpected closing element in ownership controls XML",
+                    ));
+                }
+            },
+            Ok(Event::Text(t)) => {
+                let text = decode_ownership_text(t.as_ref())?;
+                match state {
+                    State::InObjectOwnership => current_text.push_str(&text),
+                    _ if text.trim().is_empty() => {}
+                    _ => {
+                        return Err(malformed_ownership_xml(
+                            "unexpected text in ownership controls XML",
+                        ))
+                    }
+                }
+            }
+            Ok(Event::CData(t)) => {
+                let text = std::str::from_utf8(t.as_ref()).map_err(|_| {
+                    malformed_ownership_xml("invalid UTF-8 in ownership controls XML body")
+                })?;
+                match state {
+                    State::InObjectOwnership => current_text.push_str(text),
+                    _ if text.trim().is_empty() => {}
+                    _ => {
+                        return Err(malformed_ownership_xml(
+                            "unexpected CDATA in ownership controls XML",
+                        ));
+                    }
+                }
+            }
+            Ok(Event::Comment(_) | Event::Decl(_) | Event::PI(_) | Event::DocType(_)) => {}
+            Ok(Event::Eof) => {
+                return match state {
+                    State::Done => match object_ownership.as_deref().map(str::trim) {
+                        Some(
+                            value @ ("BucketOwnerEnforced"
+                            | "BucketOwnerPreferred"
+                            | "ObjectWriter"),
+                        ) => Ok(value.to_string()),
+                        Some(value) => Err(ServerError::InvalidArgument {
+                            reason: format!("invalid ObjectOwnership value: {value}"),
+                        }),
+                        None => Err(malformed_ownership_xml(
+                            "missing Rule element in OwnershipControls",
+                        )),
+                    },
+                    State::Start => {
+                        Err(malformed_ownership_xml("missing OwnershipControls element"))
+                    }
+                    _ => Err(malformed_ownership_xml(
+                        "unexpected end of ownership controls XML",
+                    )),
+                };
+            }
+            Err(_) => return Err(malformed_ownership_xml("malformed ownership controls XML")),
+        }
+        buf.clear();
     }
 }
 
@@ -3052,6 +3307,13 @@ mod tests {
     fn parse_ownership_controls_xml_invalid_value() {
         let xml = b"<OwnershipControls><Rule><ObjectOwnership>Invalid</ObjectOwnership></Rule></OwnershipControls>";
         assert!(parse_ownership_controls_xml(xml).is_err());
+    }
+
+    #[test]
+    fn parse_ownership_controls_xml_trims_value() {
+        let xml = b"<OwnershipControls><Rule><ObjectOwnership> BucketOwnerEnforced </ObjectOwnership></Rule></OwnershipControls>";
+        let parsed = parse_ownership_controls_xml(xml).unwrap();
+        assert_eq!(parsed, "BucketOwnerEnforced");
     }
 
     #[test]
