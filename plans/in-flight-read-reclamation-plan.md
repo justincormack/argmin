@@ -29,6 +29,14 @@ That creates a race:
 3. delete or overwrite removes metadata and reclaims remaining shard sets for N
 4. later steps of the read fail even though the operation had already started
 
+There is also a separate but related implementation problem:
+
+1. current `GET` paths materialize the full response body in memory inside
+   `Coordinator`
+2. that is not acceptable for full-object `GET`, which can be up to 50 TB
+3. the final reclamation design needs to match the eventual streaming read
+   lifetime, not the current `Vec<u8>` lifetime
+
 ## Affected Surface
 
 The risk is clearest for read paths that do not consume all needed shard data
@@ -115,6 +123,28 @@ reclaim old shard sets immediately after dropping metadata guards.
 So a read that has already decided which old generation it is reading can still
 fail on a later shard read.
 
+## Retention Model
+
+The metadata snapshot and the retained payload are different things.
+
+1. read metadata can be copied into memory for the request
+2. once copied, object metadata rows can be deleted immediately
+3. what must stay alive is the old payload:
+   - normal object shard set
+   - stream-put chunk list and chunk shard sets
+   - multipart part shard sets plus any streamed-part chunk shard sets
+
+The right abstraction is therefore not "keep object metadata alive". It is:
+
+1. in-memory request snapshot of metadata
+2. retained payload lease that prevents physical reclamation while a read is
+   still using that old generation
+
+The desired semantics are like `unlink` on a Unix file:
+
+1. namespace entry disappears immediately
+2. already-open handle keeps the underlying payload alive
+
 ## Recommendation
 
 Do not solve this by holding bucket locks across large reads.
@@ -122,16 +152,18 @@ Do not solve this by holding bucket locks across large reads.
 That is too coarse and ties correctness to a lock that is not really about
 underlying shard lifetime.
 
-Instead, solve it in two layers:
+Instead, solve it in three layers:
 
 1. snapshot all metadata needed for the read before releasing metadata guards
-2. stop reclaiming old shard data synchronously on delete and overwrite
+2. make read paths truly streaming so the payload-retention lifetime is the real
+   request lifetime, not an intermediate in-memory buffer
+3. only then finalize and implement deferred reclamation of old payloads
 
 That gives a cleaner model:
 
 1. metadata visibility changes immediately
-2. physical reclamation becomes deferred cleanup
-3. already-started reads that snapped a manifest can finish
+2. payload is retained while a read lease exists
+3. physical reclamation becomes deferred cleanup after the lease is gone
 
 ## Proposed Implementation Phases
 
@@ -186,7 +218,40 @@ Status:
    `stream_object_chunks` list before this pass, so no behavior change was
    needed there
 
-### Phase 3: Deferred reclamation
+### Phase 3: True streaming reads
+
+Refactor read paths so `GET` does not materialize full object bodies in memory
+inside `Coordinator`.
+
+This should happen before the deferred-reclamation design is finalized, because
+the final payload-retention lifetime needs to match the real response lifetime.
+
+Target shape:
+
+1. `server-core` returns a streaming read handle or iterator-like body source,
+   not a full `Vec<u8>`
+2. `server-http` turns that into the response body and releases it on normal
+   completion or cancellation
+3. range and part reads use the same streaming foundation where practical
+4. copy-source reads can continue to be internal consumers of the same
+   snapshotted payload representation
+
+Important current nuance:
+
+1. today a read lease would only need to live until `Coordinator` finishes
+   reconstruction, because the full body is already in memory
+2. after this phase, the lease must live until response completion or
+   cancellation
+3. this is not only a cleanup; it is required for correctness of the external
+   interface because full-object `GET` can be vastly larger than memory
+
+Status:
+
+1. not started
+2. this is now the next required phase before deferred reclamation design is
+   finalized
+
+### Phase 4: Retained payloads and deferred reclamation
 
 Change delete and overwrite paths so they stop deleting old shard data
 synchronously in the foreground operation.
@@ -194,10 +259,39 @@ synchronously in the foreground operation.
 The current write or delete should:
 
 1. remove namespace visibility or install the new current generation
-2. record the old shard sets or chunk manifests as reclaimable
+2. persist a reclaim record describing the old payload
 3. return success without physically removing those shards inline
 
-Then a later cleanup path can reclaim the data.
+Then a later cleanup path can reclaim the data once there are no active leases.
+
+Model:
+
+1. metadata snapshot for the read stays in memory only
+2. active read leases are in-memory only
+3. reclaim records for old payloads are durable
+
+This phase deliberately comes after true streaming reads, because the streaming
+body abstraction determines:
+
+1. where read leases are acquired
+2. where they are released on normal completion
+3. what cancellation or dropped-response cleanup has to do
+
+The in-memory/durable split is intentional:
+
+1. active reads do not survive process crash
+2. reclaimable old payloads do survive crash
+3. so lease counts do not need durable storage, but reclaim records do
+
+Likely pieces:
+
+1. retained payload descriptor for:
+   - single shard set
+   - stream chunk list
+   - multipart part/chunk payload
+2. in-memory active lease table keyed by retained payload or reclaim ID
+3. durable reclaim queue/table scanned by foreground cleanup or a background
+   sweeper
 
 Possible implementations:
 
@@ -209,7 +303,14 @@ The important property is:
 
 1. foreground reads do not depend on immediate physical reclamation
 
-### Phase 4: Expand reclamation coverage
+One key design point:
+
+1. versioned objects already have a usable generation identity
+2. unversioned overwrites do not
+3. so retained payloads for old unversioned incarnations likely need an
+   internal reclaim ID or generation ID distinct from the visible `VersionId`
+
+### Phase 5: Expand reclamation coverage
 
 After the first delete/read fix, apply the same deferred-reclamation model to
 all old-generation cleanup sites:
@@ -229,6 +330,12 @@ mix of deferred and immediate cleanup.
 3. do not reintroduce user-visible namespace visibility after delete
 4. keep cleanup idempotent and restart-safe
 5. preserve the current correctness of versioned delete semantics
+6. do not require object metadata rows to stay live once the read snapshot has
+   been copied
+7. final retention semantics must match the true streaming response lifetime,
+   not the current fully-buffered implementation
+8. do not keep whole-object `GET` responses in memory; full-object `GET` can be
+   up to 50 TB
 
 ## Validation
 
@@ -251,12 +358,15 @@ Add focused regression tests for:
 
 1. whether reclamation records should live in the existing SQLite metadata DB or
    in a separate local queue
-2. whether cleanup should run opportunistically on foreground requests, in a
+2. what the streaming read interface between `server-core` and `server-http`
+   should be
+3. whether cleanup should run opportunistically on foreground requests, in a
    background thread, or both
-3. whether any current tests already assume immediate physical deletion of old
+4. whether any current tests already assume immediate physical deletion of old
    shards and will need to be adjusted
-4. whether some read helpers should be refactored to a shared snapshotted
-   manifest type before the cleanup change lands
+5. how to assign stable reclaim identities for old unversioned generations
+6. whether the initial streaming read abstraction should be a bespoke internal
+   iterator/reader type or an HTTP-body-oriented stream adapter
 
 ## Recommendation Summary
 
@@ -264,5 +374,6 @@ Recommended next move:
 
 1. write the deterministic reproducer tests first
 2. fix metadata snapshot completeness
-3. then introduce deferred old-generation reclamation
-4. then apply that mechanism consistently to delete and overwrite paths
+3. refactor read paths to be truly streaming
+4. then finalize and implement deferred old-generation reclamation
+5. then apply that mechanism consistently to delete and overwrite paths
