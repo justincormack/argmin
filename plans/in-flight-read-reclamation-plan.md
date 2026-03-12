@@ -373,19 +373,28 @@ Likely pieces:
    - stream chunk list
    - multipart part/chunk payload
 2. in-memory active lease table keyed by retained payload or reclaim ID
-3. durable reclaim queue/table scanned by foreground cleanup or a background
-   sweeper
+3. durable reclaim queue/table scanned by a background sweeper
 
 Implementation decision:
 
 1. keep reclaim records in the existing metadata DB
 2. represent each reclaimable payload as a durable metadata row
-3. allow both opportunistic foreground cleanup and a later background sweeper
-   to consume the same records
+3. make a background sweeper the default reclaim path
+4. treat any current foreground reclaim-on-last-lease-drop behavior as
+   transitional rather than the intended long-term model
 
 The important property is:
 
 1. foreground reads do not depend on immediate physical reclamation
+
+Bucket-delete interaction:
+
+1. normal payload reclamation should happen in the background
+2. `DeleteBucket` should remain synchronous for now
+3. `DeleteBucket` should explicitly drain bucket-local reclaim work before
+   removing bucket metadata
+4. a bucket-lifecycle `Deleting` state is not required unless bucket deletion
+   itself later becomes asynchronous
 
 One key design point:
 
@@ -441,7 +450,8 @@ Status:
 6. simple single-shard-set payloads now have:
    - in-memory active leases in `SharedStorageNode`
    - a durable `simple_payload_reclaims` table in metadata storage
-   - opportunistic foreground cleanup when the last lease drops
+   - a working reclaim path, though the current last-lease-drop cleanup is
+     still transitional and should move to the background sweeper model
 7. normal `PutObject`, `CopyObject`, unversioned/simple `DeleteObject`,
    version-specific simple deletes, and simple stale payloads displaced by
    stream finalization or multipart completion now enqueue reclaim records
@@ -495,14 +505,26 @@ Add focused regression tests for:
 
 ## Open Questions
 
-1. whether cleanup should run opportunistically on foreground requests, in a
-   background thread, or both
-2. whether any current tests already assume immediate physical deletion of old
-   shards and will need to be adjusted
-3. how multipart-manifest and chunk-manifest reclaim records should describe
+1. how multipart-manifest and chunk-manifest reclaim records should describe
    retained payloads
-4. how to assign stable reclaim identities for old multipart/chunk payload
+2. how to assign stable reclaim identities for old multipart/chunk payload
    graphs if a single `GenerationId` is not sufficient
+
+Resolved decisions:
+
+1. cleanup should run in a background thread by default
+2. tests should not assume immediate physical deletion of old shards; if they
+   do, that is a test bug rather than intended behavior
+3. `DeleteBucket` should stay synchronous for now and drain bucket-local
+   reclaim work rather than becoming an asynchronous bucket lifecycle
+
+Additional follow-up:
+
+1. recent AWS behavior around bucket deletion while uploads still exist is a
+   reminder that bucket lifecycle semantics are less tightly coupled than
+   object lifecycle semantics and need explicit drain rules
+2. if bucket deletion is ever made asynchronous later, an explicit
+   bucket-lifecycle `Deleting` state will be required to block new operations
 
 ## Recommendation Summary
 
