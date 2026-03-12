@@ -508,22 +508,120 @@ pub fn delete_objects_result_xml(
 ///
 /// Returns the versioning state as a `BucketVersioningState` enum.
 pub fn parse_versioning_config_xml(data: &[u8]) -> Result<BucketVersioningState, ServerError> {
-    let text = std::str::from_utf8(data).map_err(|_| ServerError::MalformedXML {
-        reason: "invalid UTF-8 in versioning XML body".to_string(),
-    })?;
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum State {
+        Start,
+        InRoot,
+        InStatus,
+        Done,
+    }
 
-    if let Some(status) = extract_tag_content(text, "Status") {
-        match status {
-            "Enabled" => Ok(BucketVersioningState::Enabled),
-            "Suspended" => Ok(BucketVersioningState::Suspended),
-            _other => Err(ServerError::MalformedXML {
-                reason: "The XML you provided was not well-formed or did not validate against our published schema".to_string(),
-            }),
+    fn invalid_versioning_status() -> ServerError {
+        ServerError::MalformedXML {
+            reason:
+                "The XML you provided was not well-formed or did not validate against our published schema"
+                    .to_string(),
         }
-    } else {
-        Err(ServerError::IllegalVersioningConfiguration {
-            reason: "The Versioning element must be specified".to_string(),
-        })
+    }
+
+    let mut reader = Reader::from_reader(data);
+    let mut buf = Vec::new();
+    let mut state = State::Start;
+    let mut status_text: Option<String> = None;
+    let mut current_text = String::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => match (state, e.name().as_ref()) {
+                (State::Start, b"VersioningConfiguration") => state = State::InRoot,
+                (State::InRoot, b"Status") => {
+                    current_text.clear();
+                    state = State::InStatus;
+                }
+                _ => {
+                    return Err(ServerError::MalformedXML {
+                        reason: "unexpected element in versioning XML".to_string(),
+                    });
+                }
+            },
+            Ok(Event::Empty(e)) => match (state, e.name().as_ref()) {
+                (State::Start, b"VersioningConfiguration") => state = State::Done,
+                (State::InRoot, b"Status") => status_text = Some(String::new()),
+                _ => {
+                    return Err(ServerError::MalformedXML {
+                        reason: "unexpected empty element in versioning XML".to_string(),
+                    });
+                }
+            },
+            Ok(Event::End(e)) => match (state, e.name().as_ref()) {
+                (State::InRoot, b"VersioningConfiguration") => state = State::Done,
+                (State::InStatus, b"Status") => {
+                    status_text = Some(std::mem::take(&mut current_text));
+                    state = State::InRoot;
+                }
+                _ => {
+                    return Err(ServerError::MalformedXML {
+                        reason: "unexpected closing element in versioning XML".to_string(),
+                    });
+                }
+            },
+            Ok(Event::Text(t)) => {
+                let text = decode_xml_text(
+                    t.as_ref(),
+                    "invalid UTF-8 in versioning XML body",
+                    "invalid XML entity in versioning XML body",
+                )?;
+                match state {
+                    State::InStatus => current_text.push_str(&text),
+                    _ if text.trim().is_empty() => {}
+                    _ => {
+                        return Err(ServerError::MalformedXML {
+                            reason: "unexpected text in versioning XML".to_string(),
+                        });
+                    }
+                }
+            }
+            Ok(Event::CData(t)) => {
+                let text =
+                    std::str::from_utf8(t.as_ref()).map_err(|_| ServerError::MalformedXML {
+                        reason: "invalid UTF-8 in versioning XML body".to_string(),
+                    })?;
+                match state {
+                    State::InStatus => current_text.push_str(text),
+                    _ if text.trim().is_empty() => {}
+                    _ => {
+                        return Err(ServerError::MalformedXML {
+                            reason: "unexpected CDATA in versioning XML".to_string(),
+                        });
+                    }
+                }
+            }
+            Ok(Event::Comment(_) | Event::Decl(_) | Event::PI(_) | Event::DocType(_)) => {}
+            Ok(Event::Eof) => {
+                return match state {
+                    State::Done => match status_text.as_deref() {
+                        Some("Enabled") => Ok(BucketVersioningState::Enabled),
+                        Some("Suspended") => Ok(BucketVersioningState::Suspended),
+                        Some(_) => Err(invalid_versioning_status()),
+                        None => Err(ServerError::IllegalVersioningConfiguration {
+                            reason: "The Versioning element must be specified".to_string(),
+                        }),
+                    },
+                    State::Start => Err(ServerError::MalformedXML {
+                        reason: "missing <VersioningConfiguration> element".to_string(),
+                    }),
+                    _ => Err(ServerError::MalformedXML {
+                        reason: "unexpected end of versioning XML".to_string(),
+                    }),
+                };
+            }
+            Err(_) => {
+                return Err(ServerError::MalformedXML {
+                    reason: "malformed versioning XML".to_string(),
+                });
+            }
+        }
+        buf.clear();
     }
 }
 
@@ -2358,6 +2456,15 @@ mod tests {
     fn parse_versioning_missing_status() {
         let xml = b"<VersioningConfiguration></VersioningConfiguration>";
         assert!(parse_versioning_config_xml(xml).is_err());
+    }
+
+    #[test]
+    fn parse_versioning_missing_root_rejected() {
+        let xml = b"<Status>Enabled</Status>";
+        assert!(matches!(
+            parse_versioning_config_xml(xml),
+            Err(ServerError::MalformedXML { .. })
+        ));
     }
 
     #[test]
