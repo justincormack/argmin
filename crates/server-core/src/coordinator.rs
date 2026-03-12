@@ -1165,6 +1165,7 @@ struct LockedReadObject<'a> {
 
 struct LockedWriteObject<'a> {
     version_id: VersionId,
+    generation_id: GenerationId,
     pgs: TwoPgGuards<'a>,
 }
 
@@ -1172,6 +1173,21 @@ struct LockedWriteObject<'a> {
 struct SnapshottedMultipartPart {
     record: ObjectPartRecord,
     streaming_chunks: Option<Vec<MultipartPartChunkRecord>>,
+}
+
+#[derive(Debug, Clone)]
+enum StaleObjectPayload {
+    Simple {
+        generation_id: GenerationId,
+        ec: EcShape,
+    },
+    ChunkManifest {
+        chunks: Vec<StreamObjectChunkRecord>,
+    },
+    Multipart {
+        parts: Vec<ObjectPartRecord>,
+        streaming_chunks: Vec<MultipartPartChunkRecord>,
+    },
 }
 
 #[cfg(test)]
@@ -1715,8 +1731,8 @@ impl Coordinator {
         self.pg_topology.shard_pg(bucket, key, generation)
     }
 
-    fn shard_pg_id(&self, bucket: &str, key: &str, version_id: VersionId) -> u32 {
-        self.shard_pg_id_raw(bucket, key, version_id.to_u64())
+    fn shard_pg_id(&self, bucket: &str, key: &str, generation_id: GenerationId) -> u32 {
+        self.shard_pg_id_raw(bucket, key, generation_id.get())
     }
 
     fn get_bucket_pg(&self, bucket: &str) -> Result<MutexGuard<'_, storage::PgStore>, ServerError> {
@@ -2259,9 +2275,10 @@ impl Coordinator {
         tags: Option<&str>,
         user_data: &[u8],
         version_id: VersionId,
+        generation_id: GenerationId,
         meta_pg: &storage::PgStore,
         shard_pg: &storage::PgStore,
-    ) -> Result<(PutObjectResult, Vec<StreamObjectChunkRecord>), ServerError> {
+    ) -> Result<(PutObjectResult, Option<StaleObjectPayload>), ServerError> {
         // 1. Serialize metadata blob for DB storage (not embedded in shard data).
         let blob_bytes = metadata_blob.serialize()?;
 
@@ -2294,12 +2311,17 @@ impl Coordinator {
 
         // 6. Compute object_key_hash
         let okh = object_key_hash(bucket, key);
+        let stale_payload = if version_id.is_null() {
+            Self::snapshot_overwritten_null_version_payload(meta_pg, bucket, key)?
+        } else {
+            None
+        };
 
         // 7. Write all k+m shards, with cleanup on failure
         let mut written_shards: Vec<ShardKey> = Vec::with_capacity(k + m);
         let write_result: Result<(), ServerError> = (|| {
             for i in 0..(k + m) {
-                let shard_key = ShardKey::new(&okh, version_id.to_u64(), i as u8);
+                let shard_key = ShardKey::new(&okh, generation_id.get(), i as u8);
                 let shard_data = if i < k {
                     data_shards[i]
                 } else {
@@ -2326,6 +2348,7 @@ impl Coordinator {
             bucket: BucketName::from(bucket),
             key: ObjectKey::from(key),
             version_id,
+            generation_id,
             size: user_size,
             etag: storage::ObjectEtag::single_part(etag_crc),
             ec: EcShape {
@@ -2345,18 +2368,8 @@ impl Coordinator {
             return Err(ServerError::Metadata(e));
         }
 
-        // Clean up any stale stream_object_chunks metadata rows from a prior
-        // stream-write of this (bucket, key, version_id). Metadata deletion
-        // must succeed to prevent stale chunk manifests from shadowing the new
-        // object on subsequent reads. Shard data cleanup happens after PG locks
-        // are released by the caller.
-        let stale_chunks = meta_pg
-            .get_stream_object_chunks(bucket, key, version_id)
-            .map_err(ServerError::Metadata)?;
-        if !stale_chunks.is_empty() {
-            meta_pg
-                .delete_stream_object_chunks(bucket, key, version_id)
-                .map_err(ServerError::Metadata)?;
+        if let Some(ref payload) = stale_payload {
+            Self::delete_stale_object_payload_metadata(meta_pg, bucket, key, version_id, payload)?;
         }
 
         Ok((
@@ -2364,7 +2377,7 @@ impl Coordinator {
                 etag: format_etag(etag_crc),
                 version_id,
             },
-            stale_chunks,
+            stale_payload,
         ))
     }
 
@@ -2400,8 +2413,11 @@ impl Coordinator {
             return Err(ServerError::AccessControlListNotSupported);
         }
 
-        let LockedWriteObject { version_id, pgs } =
-            self.lock_object_pgs_for_write(bucket, key, bucket_info.versioning)?;
+        let LockedWriteObject {
+            version_id,
+            generation_id,
+            pgs,
+        } = self.lock_object_pgs_for_write(bucket, key, bucket_info.versioning)?;
         let meta_pg = pgs.meta();
         let shard_pg = pgs.shard();
 
@@ -2422,21 +2438,22 @@ impl Coordinator {
         }
 
         // 3. Write object while holding both PG locks.
-        let (result, stale_chunks) = self.write_object_inner(
+        let (result, stale_payload) = self.write_object_inner(
             bucket,
             key,
             metadata_blob,
             tags,
             data,
             version_id,
+            generation_id,
             meta_pg,
             shard_pg,
         )?;
         drop(pgs);
 
-        // Best-effort shard cleanup after releasing PG locks to avoid
-        // lock-order inversion with chunk shard PGs.
-        let _ = self.delete_chunk_shards(&stale_chunks);
+        if let Some(stale_payload) = &stale_payload {
+            let _ = self.delete_stale_object_payload(bucket, key, stale_payload);
+        }
 
         Ok(result)
     }
@@ -2755,6 +2772,7 @@ impl Coordinator {
         } else {
             VersionId::Null
         };
+        let generation_id = meta_guard.next_generation_id(bucket, key)?;
 
         // Build committed chunk manifest from staging rows and validate total_size.
         let staging_chunks = meta_guard
@@ -2792,6 +2810,7 @@ impl Coordinator {
                     bucket: BucketName::from(bucket),
                     key: ObjectKey::from(key),
                     version_id,
+                    generation_id,
                     size: total_size,
                     etag_crc64: crc64,
                     ec: EcShape {
@@ -3296,7 +3315,7 @@ impl Coordinator {
                         .read_range(
                             src_shard_pg,
                             &src_okh,
-                            src_record.version_id,
+                            src_record.generation_id,
                             &src_record,
                             0,
                             user_size - 1,
@@ -3356,6 +3375,7 @@ impl Coordinator {
 
         let LockedWriteObject {
             version_id: dst_version_id,
+            generation_id: dst_generation_id,
             pgs,
         } = self.lock_object_pgs_for_write(dst_bucket, dst_key, dst_bucket_info.versioning)?;
         let dst_meta_pg = pgs.meta();
@@ -3371,13 +3391,14 @@ impl Coordinator {
             check_write_conditions(dst_cond, existing_etag.as_deref())?;
         }
 
-        let (put_result, stale_chunks) = self.write_object_inner(
+        let (put_result, stale_payload) = self.write_object_inner(
             dst_bucket,
             dst_key,
             &metadata_blob,
             tags.as_deref(),
             &user_data,
             dst_version_id,
+            dst_generation_id,
             dst_meta_pg,
             dst_shard_pg,
         )?;
@@ -3388,8 +3409,9 @@ impl Coordinator {
             .map_err(ServerError::Metadata)?;
         drop(pgs);
 
-        // Best-effort shard cleanup after releasing PG locks.
-        let _ = self.delete_chunk_shards(&stale_chunks);
+        if let Some(stale_payload) = &stale_payload {
+            let _ = self.delete_stale_object_payload(dst_bucket, dst_key, stale_payload);
+        }
 
         Ok(CopyObjectResult {
             etag: put_result.etag,
@@ -3420,7 +3442,7 @@ impl Coordinator {
     /// Lock metadata and shard PGs for a consistent object read view.
     ///
     /// For latest-version reads (`version_id = None`), shard placement depends on
-    /// the current metadata row's version_id. If `meta_pg_id > shard_pg_id`, we
+    /// the current metadata row's payload generation. If `meta_pg_id > shard_pg_id`, we
     /// drop and relock in global ascending order, then re-read metadata to ensure
     /// the record still maps to the locked shard PG.
     fn lock_object_pgs_for_read<'a>(
@@ -3434,7 +3456,10 @@ impl Coordinator {
         loop {
             let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
             let record = Self::lookup_object_record(&meta_guard, bucket, key, version_id)?;
-            let shard_pg_id = self.shard_pg_id(bucket, key, record.version_id());
+            let shard_pg_id = match &record {
+                StoredObject::Live(r) => self.shard_pg_id(bucket, key, r.generation_id),
+                StoredObject::DeleteMarker(_) => meta_pg_id,
+            };
 
             if shard_pg_id == meta_pg_id {
                 return Ok(LockedReadObject {
@@ -3457,7 +3482,10 @@ impl Coordinator {
             let (meta_guard, shard_guard) =
                 self.storage_node.lock_two_pgs(meta_pg_id, shard_pg_id)?;
             let record = Self::lookup_object_record(&meta_guard, bucket, key, version_id)?;
-            let verify_shard_pg_id = self.shard_pg_id(bucket, key, record.version_id());
+            let verify_shard_pg_id = match &record {
+                StoredObject::Live(r) => self.shard_pg_id(bucket, key, r.generation_id),
+                StoredObject::DeleteMarker(_) => meta_pg_id,
+            };
 
             // Latest-version target changed while relocking; try again with new mapping.
             if verify_shard_pg_id != shard_pg_id {
@@ -3490,25 +3518,31 @@ impl Coordinator {
             } else {
                 VersionId::Null
             };
-            let shard_pg_id = self.shard_pg_id(bucket, key, version_id);
+            let generation_id = meta_guard.next_generation_id(bucket, key)?;
+            let shard_pg_id = self.shard_pg_id(bucket, key, generation_id);
 
             if shard_pg_id == meta_pg_id {
                 return Ok(LockedWriteObject {
                     version_id,
+                    generation_id,
                     pgs: TwoPgGuards::new(meta_guard, None),
                 });
             }
 
             if meta_pg_id < shard_pg_id {
                 let shard_guard = self.storage_node.get_pg(shard_pg_id)?;
-                if versioning_state == BucketVersioningState::Enabled {
-                    let current = meta_guard.next_version_id(bucket, key)?;
-                    if current != version_id {
-                        continue;
-                    }
+                let current_version = if versioning_state == BucketVersioningState::Enabled {
+                    meta_guard.next_version_id(bucket, key)?
+                } else {
+                    VersionId::Null
+                };
+                let current_generation = meta_guard.next_generation_id(bucket, key)?;
+                if current_version != version_id || current_generation != generation_id {
+                    continue;
                 }
                 return Ok(LockedWriteObject {
                     version_id,
+                    generation_id,
                     pgs: TwoPgGuards::new(meta_guard, Some(shard_guard)),
                 });
             }
@@ -3523,13 +3557,15 @@ impl Coordinator {
             } else {
                 VersionId::Null
             };
-            let verify_shard_pg_id = self.shard_pg_id(bucket, key, version_id);
+            let generation_id = meta_guard.next_generation_id(bucket, key)?;
+            let verify_shard_pg_id = self.shard_pg_id(bucket, key, generation_id);
             if verify_shard_pg_id != shard_pg_id {
                 continue;
             }
 
             return Ok(LockedWriteObject {
                 version_id,
+                generation_id,
                 pgs: TwoPgGuards::new(meta_guard, shard_guard),
             });
         }
@@ -3545,7 +3581,7 @@ impl Coordinator {
         &self,
         pg: &storage::PgStore,
         okh: &[u8; 16],
-        version_id: VersionId,
+        generation_id: GenerationId,
         record: &LiveObjectRecord,
         needed: &[usize],
     ) -> Result<(Vec<Vec<u8>>, usize), ServerError> {
@@ -3558,7 +3594,7 @@ impl Coordinator {
         let mut shard_size = 0;
 
         for &idx in needed {
-            let shard_key = ShardKey::new(okh, version_id.to_u64(), idx as u8);
+            let shard_key = ShardKey::new(okh, generation_id.get(), idx as u8);
             if let Ok(sd) = pg.read_shard(&shard_key) {
                 shard_size = sd.data.len();
                 result_shards.push(Some(sd.data));
@@ -3582,7 +3618,7 @@ impl Coordinator {
         let mut present_count = 0;
 
         for i in 0..(k + m) {
-            let shard_key = ShardKey::new(okh, version_id.to_u64(), i as u8);
+            let shard_key = ShardKey::new(okh, generation_id.get(), i as u8);
             match pg.read_shard(&shard_key) {
                 Ok(sd) => {
                     shard_size = sd.data.len();
@@ -3689,7 +3725,7 @@ impl Coordinator {
         &self,
         pg: &storage::PgStore,
         okh: &[u8; 16],
-        version_id: VersionId,
+        generation_id: GenerationId,
         record: &LiveObjectRecord,
         start: usize,
         end: usize,
@@ -3704,7 +3740,7 @@ impl Coordinator {
             return Ok(vec![]);
         }
 
-        let (shard_data, _) = self.read_data_shards(pg, okh, version_id, record, &needed)?;
+        let (shard_data, _) = self.read_data_shards(pg, okh, generation_id, record, &needed)?;
 
         // Assemble the buffer covering the needed shards
         let first_shard = needed[0];
@@ -3746,6 +3782,120 @@ impl Coordinator {
             });
         }
         Ok(snapshotted)
+    }
+
+    fn snapshot_overwritten_null_version_payload(
+        meta_pg: &storage::PgStore,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<StaleObjectPayload>, ServerError> {
+        let stored = match meta_pg.get_object_version(bucket, key, VersionId::Null) {
+            Ok(stored) => stored,
+            Err(storage::MetadataError::ObjectNotFound) => return Ok(None),
+            Err(e) => return Err(ServerError::Metadata(e)),
+        };
+        let record = match stored {
+            StoredObject::Live(record) => record,
+            StoredObject::DeleteMarker(_) => return Ok(None),
+        };
+
+        match record.layout {
+            ObjectLayout::MultipartManifest { .. } => {
+                let parts = meta_pg
+                    .get_object_parts(bucket, key, VersionId::Null)
+                    .map_err(ServerError::Metadata)?;
+                let mut streaming_chunks = Vec::new();
+                for part in &parts {
+                    if part.part_okh == [0u8; 16] {
+                        let chunks = meta_pg
+                            .get_multipart_part_chunks(
+                                bucket,
+                                key,
+                                VersionId::Null,
+                                part.part_number,
+                            )
+                            .map_err(ServerError::Metadata)?;
+                        streaming_chunks.extend(chunks);
+                    }
+                }
+                Ok(Some(StaleObjectPayload::Multipart {
+                    parts,
+                    streaming_chunks,
+                }))
+            }
+            ObjectLayout::ChunkManifest => {
+                let chunks = meta_pg
+                    .get_stream_object_chunks(bucket, key, VersionId::Null)
+                    .map_err(ServerError::Metadata)?;
+                if chunks.is_empty() {
+                    Ok(Some(StaleObjectPayload::Simple {
+                        generation_id: record.generation_id,
+                        ec: record.ec,
+                    }))
+                } else {
+                    Ok(Some(StaleObjectPayload::ChunkManifest { chunks }))
+                }
+            }
+        }
+    }
+
+    fn delete_stale_object_payload_metadata(
+        meta_pg: &storage::PgStore,
+        bucket: &str,
+        key: &str,
+        version_id: VersionId,
+        payload: &StaleObjectPayload,
+    ) -> Result<(), ServerError> {
+        match payload {
+            StaleObjectPayload::Simple { .. } => Ok(()),
+            StaleObjectPayload::ChunkManifest { .. } => meta_pg
+                .delete_stream_object_chunks(bucket, key, version_id)
+                .map_err(ServerError::Metadata),
+            StaleObjectPayload::Multipart {
+                streaming_chunks, ..
+            } => {
+                if !streaming_chunks.is_empty() {
+                    meta_pg
+                        .delete_multipart_part_chunks(bucket, key, version_id)
+                        .map_err(ServerError::Metadata)?;
+                }
+                meta_pg
+                    .delete_object_parts(bucket, key, version_id)
+                    .map_err(ServerError::Metadata)
+            }
+        }
+    }
+
+    fn delete_stale_object_payload(
+        &self,
+        bucket: &str,
+        key: &str,
+        payload: &StaleObjectPayload,
+    ) -> Result<(), ServerError> {
+        match payload {
+            StaleObjectPayload::Simple { generation_id, ec } => {
+                let okh = object_key_hash(bucket, key);
+                let shard_pg_id = self.shard_pg_id(bucket, key, *generation_id);
+                let pg = self.storage_node.get_pg(shard_pg_id)?;
+                let total = ec.k as usize + ec.m as usize;
+                for i in 0..total {
+                    let shard_key = ShardKey::new(&okh, generation_id.get(), i as u8);
+                    pg.delete_shard(&shard_key)?;
+                }
+                Ok(())
+            }
+            StaleObjectPayload::ChunkManifest { chunks } => self.delete_chunk_shards(chunks),
+            StaleObjectPayload::Multipart {
+                parts,
+                streaming_chunks,
+            } => {
+                self.delete_part_shards(parts)?;
+                if !streaming_chunks.is_empty() {
+                    self.delete_chunk_shards_generic(streaming_chunks)?;
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Delete all shards for a list of object parts.
@@ -3913,7 +4063,14 @@ impl Coordinator {
                 let okh = object_key_hash(bucket, key);
                 let shard_pg = pgs.shard();
                 let user_data = self
-                    .read_range(shard_pg, &okh, record.version_id, &record, 0, user_size - 1)
+                    .read_range(
+                        shard_pg,
+                        &okh,
+                        record.generation_id,
+                        &record,
+                        0,
+                        user_size - 1,
+                    )
                     .map_err(|e| match e {
                         ServerError::Store(storage::StoreError::NotFound) => {
                             ServerError::ObjectNotFound {
@@ -4098,7 +4255,14 @@ impl Coordinator {
                 let okh = object_key_hash(bucket, key);
                 let shard_pg = pgs.shard();
                 let data = self
-                    .read_range(shard_pg, &okh, record.version_id, &record, 0, user_size - 1)
+                    .read_range(
+                        shard_pg,
+                        &okh,
+                        record.generation_id,
+                        &record,
+                        0,
+                        user_size - 1,
+                    )
                     .map_err(|e| match e {
                         ServerError::Store(storage::StoreError::NotFound) => {
                             ServerError::ObjectNotFound {
@@ -4516,7 +4680,7 @@ impl Coordinator {
                     .read_range(
                         shard_pg,
                         &okh,
-                        record.version_id,
+                        record.generation_id,
                         &record,
                         user_start as usize,
                         user_end as usize,
@@ -4662,7 +4826,8 @@ impl Coordinator {
                         let total = record.ec.k as usize + record.ec.m as usize;
 
                         for i in 0..total {
-                            let shard_key = ShardKey::new(&okh, vid.to_u64(), i as u8);
+                            let shard_key =
+                                ShardKey::new(&okh, record.generation_id.get(), i as u8);
                             shard_pg.delete_shard(&shard_key)?;
                         }
 
@@ -4763,7 +4928,7 @@ impl Coordinator {
                     let total = record.ec.k as usize + record.ec.m as usize;
 
                     for i in 0..total {
-                        let shard_key = ShardKey::new(&okh, vid.to_u64(), i as u8);
+                        let shard_key = ShardKey::new(&okh, record.generation_id.get(), i as u8);
                         shard_pg.delete_shard(&shard_key)?;
                     }
                 }
@@ -5266,7 +5431,7 @@ impl Coordinator {
                     self.read_range(
                         src_shard_pg,
                         &src_okh,
-                        src_record.version_id,
+                        src_record.generation_id,
                         &src_record,
                         read_start as usize,
                         read_end as usize,
@@ -5720,6 +5885,7 @@ impl Coordinator {
         } else {
             VersionId::Null
         };
+        let generation_id = meta_pg.next_generation_id(bucket, key)?;
 
         // 7. Compute composite multipart ETag.
         let part_etags: Vec<&[u8]> = part_records.iter().map(|p| p.etag.as_slice()).collect();
@@ -5881,6 +6047,7 @@ impl Coordinator {
             bucket: BucketName::from(bucket),
             key: ObjectKey::from(key),
             version_id,
+            generation_id,
             size: total_size,
             etag_crc64,
             ec: EcShape { k: 0, m: 0 }, // per-part, not per-object
@@ -7157,10 +7324,10 @@ mod tests {
         shard_index: u8,
         pg_count: u32,
     ) -> PathBuf {
-        let version_id: u64 = 0;
-        let pg_id = derive_pg_shards(bucket, key, version_id, pg_count);
+        let generation_id = GenerationId::MIN.get();
+        let pg_id = derive_pg_shards(bucket, key, generation_id, pg_count);
         let okh = object_key_hash(bucket, key);
-        let shard_key = ShardKey::new(&okh, version_id, shard_index);
+        let shard_key = ShardKey::new(&okh, generation_id, shard_index);
         data_dir
             .join(format!("pg-{pg_id:04}"))
             .join("shards")
@@ -14560,7 +14727,7 @@ mod tests {
 
         // Record shard keys before abort for verification.
         let chunk_okh = crate::pg::chunk_key_hash(&session_id, 0);
-        let shard_pg_id = coord.shard_pg_id(&format!("chunk/{session_id}"), "0", VersionId::Null);
+        let shard_pg_id = coord.shard_pg_id(&format!("chunk/{session_id}"), "0", GenerationId::MIN);
 
         coord
             .abort_stream_put("bucket", "key", &session_id)

@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS objects (
     bucket        TEXT NOT NULL,
     key           TEXT NOT NULL,
     version_id    INTEGER NOT NULL CHECK (version_id >= 0),
+    generation_id INTEGER,
     size          INTEGER NOT NULL,
     etag          BLOB NOT NULL,
     etag_kind     INTEGER NOT NULL,
@@ -35,10 +36,11 @@ CREATE TABLE IF NOT EXISTS objects (
     CHECK (data_layout IN (0, 1)),
     CHECK (
         (status = 0 AND (
+            generation_id IS NOT NULL AND generation_id > 0 AND
             (data_layout = 0 AND parts_count IS NULL) OR
             (data_layout = 1 AND parts_count IS NOT NULL AND parts_count > 0)
         )) OR
-        (status = 1 AND data_layout = 0 AND parts_count IS NULL AND tags IS NULL AND metadata_blob IS NULL
+        (status = 1 AND generation_id IS NULL AND data_layout = 0 AND parts_count IS NULL AND tags IS NULL AND metadata_blob IS NULL
          AND size = 0 AND etag = X'' AND etag_kind = 0 AND storage_class = 0 AND ec_k = 0 AND ec_m = 0)
     ),
     PRIMARY KEY (bucket, key, version_id)

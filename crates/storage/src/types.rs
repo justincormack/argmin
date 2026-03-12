@@ -576,6 +576,7 @@ pub struct LiveObjectRecord {
     pub bucket: BucketName,
     pub key: ObjectKey,
     pub version_id: VersionId,
+    pub generation_id: GenerationId,
     pub size: u64,
     pub etag: ObjectEtag,
     /// Last modified timestamp (unix milliseconds).
@@ -634,6 +635,7 @@ pub struct PutLiveObjectReq {
     pub bucket: BucketName,
     pub key: ObjectKey,
     pub version_id: VersionId,
+    pub generation_id: GenerationId,
     pub size: u64,
     pub etag: ObjectEtag,
     pub ec: EcShape,
@@ -689,6 +691,7 @@ pub struct CommitMultipartReq {
     pub bucket: BucketName,
     pub key: ObjectKey,
     pub version_id: VersionId,
+    pub generation_id: GenerationId,
     pub size: u64,
     /// Composite CRC64-NVME bytes (CRC of concatenated per-part CRC64s).
     pub etag_crc64: [u8; 8],
@@ -706,6 +709,7 @@ pub struct CommitStreamPutReq {
     pub bucket: BucketName,
     pub key: ObjectKey,
     pub version_id: VersionId,
+    pub generation_id: GenerationId,
     pub size: u64,
     /// CRC64-NVME of the object data.
     pub etag_crc64: u64,

@@ -155,6 +155,11 @@ pub trait PgMetadataStore {
     /// Returns 1 if no versions exist.
     fn next_version_id(&self, bucket: &str, key: &str) -> Result<VersionId, MetadataError>;
 
+    /// Get the next internal payload generation_id for a key.
+    ///
+    /// Returns 1 if no live object generations exist.
+    fn next_generation_id(&self, bucket: &str, key: &str) -> Result<GenerationId, MetadataError>;
+
     /// Store tags for an object version (serialized XML string).
     fn put_object_tags(
         &self,

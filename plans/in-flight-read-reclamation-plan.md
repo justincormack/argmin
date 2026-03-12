@@ -423,6 +423,20 @@ Suggested rollout after Phase 3:
    reusing `VersionId::Null` as the physical identity
 4. only then finalize the retained-payload lease and reclaim-record design
 
+Status:
+
+1. in progress
+2. `GenerationId` now exists as a distinct internal type
+3. multipart/stream chunk payload records already use `GenerationId`
+4. live object rows now also carry `generation_id`, and normal live writes,
+   stream finalization, and multipart completion allocate a fresh internal
+   generation per write
+5. simple single-shard-set shard placement and shard keys now use
+   `generation_id` rather than visible `VersionId`
+6. unversioned overwrite currently still performs immediate best-effort cleanup
+   of the displaced payload after install of the new current generation; lease-
+   based retention and deferred reclamation remain the next design step
+
 ### Phase 5: Expand reclamation coverage
 
 After the first delete/read fix, apply the same deferred-reclamation model to
