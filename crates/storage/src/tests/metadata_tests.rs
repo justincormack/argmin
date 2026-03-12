@@ -3386,6 +3386,91 @@ fn next_generation_id_skips_chunk_manifest_reclaim_generation() {
 }
 
 #[test]
+fn multipart_reclaim_round_trip() {
+    let (_dir, store) = make_pg_store();
+
+    let generation_id = GenerationId::new(9).unwrap();
+    let reclaim = MultipartReclaimRecord {
+        bucket: "b".into(),
+        key: "k".into(),
+        generation_id,
+        created_at: 4321,
+        parts: vec![
+            MultipartReclaimPartRecord::ShardSet {
+                part_number: 1,
+                part_okh: [0x44; 16],
+                part_vid: GenerationId::new(21).unwrap(),
+                shard_pg_id: 3,
+                ec: EcShape { k: 4, m: 2 },
+            },
+            MultipartReclaimPartRecord::ChunkManifest {
+                part_number: 2,
+                chunks: vec![
+                    MultipartReclaimPartChunkRecord {
+                        part_number: 2,
+                        chunk_index: 0,
+                        chunk_okh: [0x55; 16],
+                        chunk_vid: GenerationId::new(22).unwrap(),
+                        shard_pg_id: 4,
+                        ec: EcShape { k: 6, m: 3 },
+                    },
+                    MultipartReclaimPartChunkRecord {
+                        part_number: 2,
+                        chunk_index: 1,
+                        chunk_okh: [0x66; 16],
+                        chunk_vid: GenerationId::new(23).unwrap(),
+                        shard_pg_id: 5,
+                        ec: EcShape { k: 5, m: 2 },
+                    },
+                ],
+            },
+        ],
+    };
+
+    store.put_multipart_reclaim(&reclaim).unwrap();
+
+    let got = store
+        .get_multipart_reclaim("b", "k", generation_id)
+        .unwrap()
+        .expect("multipart reclaim should exist");
+    assert_eq!(got, reclaim);
+
+    store
+        .delete_multipart_reclaim("b", "k", generation_id)
+        .unwrap();
+    assert!(store
+        .get_multipart_reclaim("b", "k", generation_id)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn next_generation_id_skips_multipart_reclaim_generation() {
+    let (_dir, store) = make_pg_store();
+
+    store
+        .put_multipart_reclaim(&MultipartReclaimRecord {
+            bucket: "b".into(),
+            key: "k".into(),
+            generation_id: GenerationId::new(11).unwrap(),
+            created_at: 1,
+            parts: vec![MultipartReclaimPartRecord::ShardSet {
+                part_number: 1,
+                part_okh: [0x77; 16],
+                part_vid: GenerationId::new(24).unwrap(),
+                shard_pg_id: 0,
+                ec: EcShape { k: 4, m: 2 },
+            }],
+        })
+        .unwrap();
+
+    assert_eq!(
+        store.next_generation_id("b", "k").unwrap(),
+        GenerationId::new(12).unwrap()
+    );
+}
+
+#[test]
 fn commit_stream_part_rejects_mismatched_chunk_part_number() {
     let (_dir, store) = make_pg_store();
 

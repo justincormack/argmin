@@ -12,6 +12,7 @@ use storage::{
     CommitMultipartReq, CommitStreamPutReq, CreateMultipartUploadReq, CreateStreamUploadReq,
     EcShape, GenerationId, ListMultipartUploadsReq, ListObjectVersionsReq, ListObjectsReq,
     ListPartsReq, LiveObjectRecord, MultipartPartChunkRecord, MultipartPartRecord,
+    MultipartReclaimPartChunkRecord, MultipartReclaimPartRecord, MultipartReclaimRecord,
     MultipartUploadRecord, ObjectKey, ObjectLayout, ObjectPartRecord, PutDeleteMarkerReq,
     PutLiveObjectReq, PutObjectReq, SessionId, ShardKey, SharedStorageNode,
     SimplePayloadReclaimRecord, StoredObject, StreamObjectChunkRecord, StreamUploadChunkRecord,
@@ -382,13 +383,14 @@ impl ReadHandle {
         runtime: ReadRuntime,
         bucket: &str,
         key: &str,
+        generation_id: GenerationId,
         parts: Vec<SnapshottedMultipartPart>,
         expected_size: usize,
     ) -> Self {
         Self {
             bucket: bucket.to_string(),
             key: key.to_string(),
-            lease: None,
+            lease: Some(runtime.acquire_object_payload_lease(bucket, key, generation_id)),
             expected_size,
             bytes_emitted: 0,
             expected_crc64: None,
@@ -408,6 +410,7 @@ impl ReadHandle {
         runtime: ReadRuntime,
         bucket: &str,
         key: &str,
+        generation_id: GenerationId,
         parts: Vec<SnapshottedMultipartPart>,
         start: usize,
         end: usize,
@@ -416,7 +419,7 @@ impl ReadHandle {
         Self {
             bucket: bucket.to_string(),
             key: key.to_string(),
-            lease: None,
+            lease: Some(runtime.acquire_object_payload_lease(bucket, key, generation_id)),
             expected_size,
             bytes_emitted: 0,
             expected_crc64: None,
@@ -1301,6 +1304,7 @@ enum StaleObjectPayload {
         chunks: Vec<StreamObjectChunkRecord>,
     },
     Multipart {
+        generation_id: GenerationId,
         parts: Vec<ObjectPartRecord>,
         streaming_chunks: Vec<MultipartPartChunkRecord>,
     },
@@ -1444,6 +1448,27 @@ impl ReadRuntime {
         key: &str,
         generation_id: GenerationId,
     ) -> Result<(), ServerError> {
+        enum ReclaimPayload {
+            Simple(storage::SimplePayloadReclaimRecord),
+            ChunkManifest(storage::ChunkManifestReclaimRecord),
+            Multipart(storage::MultipartReclaimRecord),
+        }
+
+        let delete_ec_shards = |storage_node: &Arc<SharedStorageNode>,
+                                shard_pg_id: u32,
+                                okh: &[u8; 16],
+                                generation_id: GenerationId,
+                                ec: EcShape|
+         -> Result<(), ServerError> {
+            let shard_pg = storage_node.get_pg(shard_pg_id)?;
+            let total = ec.k as usize + ec.m as usize;
+            for i in 0..total {
+                let shard_key = ShardKey::new(okh, generation_id.get(), i as u8);
+                shard_pg.delete_shard(&shard_key)?;
+            }
+            Ok(())
+        };
+
         if self
             .storage_node
             .object_payload_lease_count(bucket, key, generation_id)
@@ -1453,8 +1478,34 @@ impl ReadRuntime {
         }
 
         let meta_pg_id = self.pg_topology.object_pg(bucket, key);
-        let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
-        let meta_pg: &storage::PgStore = &meta_guard;
+        let reclaim = {
+            let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
+            let meta_pg: &storage::PgStore = &meta_guard;
+
+            if self
+                .storage_node
+                .object_payload_lease_count(bucket, key, generation_id)
+                != 0
+            {
+                return Ok(());
+            }
+
+            if let Some(reclaim) = meta_pg.get_simple_payload_reclaim(bucket, key, generation_id)? {
+                Some(ReclaimPayload::Simple(reclaim))
+            } else if let Some(reclaim) =
+                meta_pg.get_chunk_manifest_reclaim(bucket, key, generation_id)?
+            {
+                Some(ReclaimPayload::ChunkManifest(reclaim))
+            } else {
+                meta_pg
+                    .get_multipart_reclaim(bucket, key, generation_id)?
+                    .map(ReclaimPayload::Multipart)
+            }
+        };
+
+        let Some(reclaim) = reclaim else {
+            return Ok(());
+        };
 
         if self
             .storage_node
@@ -1464,47 +1515,84 @@ impl ReadRuntime {
             return Ok(());
         }
 
-        if let Some(reclaim) = meta_pg.get_simple_payload_reclaim(bucket, key, generation_id)? {
-            let shard_pg_id = self.pg_topology.shard_pg(bucket, key, generation_id.get());
-            let total = reclaim.ec.k as usize + reclaim.ec.m as usize;
-            if shard_pg_id == meta_pg_id {
-                for i in 0..total {
-                    let shard_key =
-                        ShardKey::new(&object_key_hash(bucket, key), generation_id.get(), i as u8);
-                    meta_pg.delete_shard(&shard_key)?;
-                }
-            } else {
-                let shard_pg = self.storage_node.get_pg(shard_pg_id)?;
-                for i in 0..total {
-                    let shard_key =
-                        ShardKey::new(&object_key_hash(bucket, key), generation_id.get(), i as u8);
-                    shard_pg.delete_shard(&shard_key)?;
+        match &reclaim {
+            ReclaimPayload::Simple(reclaim) => {
+                let shard_pg_id = self.pg_topology.shard_pg(bucket, key, generation_id.get());
+                let okh = object_key_hash(bucket, key);
+                delete_ec_shards(
+                    &self.storage_node,
+                    shard_pg_id,
+                    &okh,
+                    generation_id,
+                    reclaim.ec,
+                )?;
+            }
+            ReclaimPayload::ChunkManifest(reclaim) => {
+                for chunk in &reclaim.chunks {
+                    delete_ec_shards(
+                        &self.storage_node,
+                        chunk.shard_pg_id,
+                        &chunk.chunk_okh,
+                        chunk.chunk_vid,
+                        chunk.ec,
+                    )?;
                 }
             }
-            meta_pg.delete_simple_payload_reclaim(bucket, key, generation_id)?;
+            ReclaimPayload::Multipart(reclaim) => {
+                for part in &reclaim.parts {
+                    match part {
+                        MultipartReclaimPartRecord::ShardSet {
+                            part_okh,
+                            part_vid,
+                            shard_pg_id,
+                            ec,
+                            ..
+                        } => {
+                            delete_ec_shards(
+                                &self.storage_node,
+                                *shard_pg_id,
+                                part_okh,
+                                *part_vid,
+                                *ec,
+                            )?;
+                        }
+                        MultipartReclaimPartRecord::ChunkManifest { chunks, .. } => {
+                            for chunk in chunks {
+                                delete_ec_shards(
+                                    &self.storage_node,
+                                    chunk.shard_pg_id,
+                                    &chunk.chunk_okh,
+                                    chunk.chunk_vid,
+                                    chunk.ec,
+                                )?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
+        let meta_pg: &storage::PgStore = &meta_guard;
+        if self
+            .storage_node
+            .object_payload_lease_count(bucket, key, generation_id)
+            != 0
+        {
             return Ok(());
         }
 
-        let Some(reclaim) = meta_pg.get_chunk_manifest_reclaim(bucket, key, generation_id)? else {
-            return Ok(());
-        };
-
-        for chunk in &reclaim.chunks {
-            let total = chunk.ec.k as usize + chunk.ec.m as usize;
-            if chunk.shard_pg_id == meta_pg_id {
-                for i in 0..total {
-                    let shard_key = ShardKey::new(&chunk.chunk_okh, chunk.chunk_vid.get(), i as u8);
-                    meta_pg.delete_shard(&shard_key)?;
-                }
-            } else {
-                let shard_pg = self.storage_node.get_pg(chunk.shard_pg_id)?;
-                for i in 0..total {
-                    let shard_key = ShardKey::new(&chunk.chunk_okh, chunk.chunk_vid.get(), i as u8);
-                    shard_pg.delete_shard(&shard_key)?;
-                }
+        match reclaim {
+            ReclaimPayload::Simple(_) => {
+                meta_pg.delete_simple_payload_reclaim(bucket, key, generation_id)?;
+            }
+            ReclaimPayload::ChunkManifest(_) => {
+                meta_pg.delete_chunk_manifest_reclaim(bucket, key, generation_id)?;
+            }
+            ReclaimPayload::Multipart(_) => {
+                meta_pg.delete_multipart_reclaim(bucket, key, generation_id)?;
             }
         }
-        meta_pg.delete_chunk_manifest_reclaim(bucket, key, generation_id)?;
         Ok(())
     }
 
@@ -3685,22 +3773,24 @@ impl Coordinator {
                     src_key,
                     src_record.version_id,
                 )?;
-                drop(pgs);
-                #[cfg(test)]
-                maybe_run_multipart_snapshot_hook(src_bucket, src_key);
-
                 let data = if src_record.size == 0 {
+                    drop(pgs);
+                    #[cfg(test)]
+                    maybe_run_multipart_snapshot_hook(src_bucket, src_key);
                     vec![]
                 } else {
-                    ReadHandle::from_multipart(
+                    let body = ReadHandle::from_multipart(
                         self.read_runtime(),
                         src_bucket,
                         src_key,
+                        src_record.generation_id,
                         obj_parts,
                         src_record.size as usize,
-                    )
-                    .into_bytes()
-                    .map_err(not_found)?
+                    );
+                    drop(pgs);
+                    #[cfg(test)]
+                    maybe_run_multipart_snapshot_hook(src_bucket, src_key);
+                    body.into_bytes().map_err(not_found)?
                 };
 
                 let metadata = src_record
@@ -4060,6 +4150,7 @@ impl Coordinator {
                     }
                 }
                 Ok(Some(StaleObjectPayload::Multipart {
+                    generation_id: record.generation_id,
                     parts,
                     streaming_chunks,
                 }))
@@ -4110,8 +4201,18 @@ impl Coordinator {
                     .map_err(ServerError::Metadata)
             }
             StaleObjectPayload::Multipart {
-                streaming_chunks, ..
+                generation_id,
+                parts,
+                streaming_chunks,
             } => {
+                Self::enqueue_multipart_reclaim(
+                    meta_pg,
+                    bucket,
+                    key,
+                    *generation_id,
+                    parts,
+                    streaming_chunks,
+                )?;
                 if !streaming_chunks.is_empty() {
                     meta_pg
                         .delete_multipart_part_chunks(bucket, key, version_id)
@@ -4135,16 +4236,9 @@ impl Coordinator {
             | StaleObjectPayload::ChunkManifest { generation_id, .. } => self
                 .read_runtime()
                 .try_reclaim_object_payload(bucket, key, *generation_id),
-            StaleObjectPayload::Multipart {
-                parts,
-                streaming_chunks,
-            } => {
-                self.delete_part_shards(parts)?;
-                if !streaming_chunks.is_empty() {
-                    self.delete_chunk_shards_generic(streaming_chunks)?;
-                }
-                Ok(())
-            }
+            StaleObjectPayload::Multipart { generation_id, .. } => self
+                .read_runtime()
+                .try_reclaim_object_payload(bucket, key, *generation_id),
         }
     }
 
@@ -4196,17 +4290,66 @@ impl Coordinator {
             .map_err(ServerError::Metadata)
     }
 
-    /// Delete all shards for a list of object parts.
-    fn delete_part_shards(&self, parts: &[ObjectPartRecord]) -> Result<(), ServerError> {
-        for part in parts {
-            let pg = self.storage_node.get_pg(part.shard_pg_id)?;
-            let total = part.ec_k as usize + part.ec_m as usize;
-            for i in 0..total {
-                let shard_key = ShardKey::new(&part.part_okh, part.part_vid.get(), i as u8);
-                pg.delete_shard(&shard_key)?;
-            }
+    fn enqueue_multipart_reclaim(
+        meta_pg: &storage::PgStore,
+        bucket: &str,
+        key: &str,
+        generation_id: GenerationId,
+        parts: &[ObjectPartRecord],
+        streaming_chunks: &[MultipartPartChunkRecord],
+    ) -> Result<(), ServerError> {
+        use std::collections::BTreeMap;
+
+        let mut chunks_by_part: BTreeMap<u32, Vec<MultipartReclaimPartChunkRecord>> =
+            BTreeMap::new();
+        for chunk in streaming_chunks {
+            chunks_by_part.entry(chunk.part_number).or_default().push(
+                MultipartReclaimPartChunkRecord {
+                    part_number: chunk.part_number,
+                    chunk_index: chunk.chunk_index,
+                    chunk_okh: chunk.chunk_okh,
+                    chunk_vid: chunk.chunk_vid,
+                    shard_pg_id: chunk.shard_pg_id,
+                    ec: EcShape {
+                        k: chunk.ec_k,
+                        m: chunk.ec_m,
+                    },
+                },
+            );
         }
-        Ok(())
+
+        let parts = parts
+            .iter()
+            .map(|part| {
+                if part.part_okh == [0u8; 16] {
+                    MultipartReclaimPartRecord::ChunkManifest {
+                        part_number: part.part_number,
+                        chunks: chunks_by_part.remove(&part.part_number).unwrap_or_default(),
+                    }
+                } else {
+                    MultipartReclaimPartRecord::ShardSet {
+                        part_number: part.part_number,
+                        part_okh: part.part_okh,
+                        part_vid: part.part_vid,
+                        shard_pg_id: part.shard_pg_id,
+                        ec: EcShape {
+                            k: part.ec_k,
+                            m: part.ec_m,
+                        },
+                    }
+                }
+            })
+            .collect();
+
+        meta_pg
+            .put_multipart_reclaim(&MultipartReclaimRecord {
+                bucket: BucketName::from(bucket),
+                key: ObjectKey::from(key),
+                generation_id,
+                created_at: Self::now_millis(),
+                parts,
+            })
+            .map_err(ServerError::Metadata)
     }
 
     fn delete_chunk_shards_generic(
@@ -4274,9 +4417,6 @@ impl Coordinator {
             let meta_pg = pgs.meta();
             let obj_parts =
                 Self::snapshot_multipart_parts(meta_pg, bucket, key, record.version_id)?;
-            drop(pgs);
-            #[cfg(test)]
-            maybe_run_multipart_snapshot_hook(bucket, key);
 
             let metadata = record
                 .metadata_blob
@@ -4289,9 +4429,13 @@ impl Coordinator {
                 self.read_runtime(),
                 bucket,
                 key,
+                record.generation_id,
                 obj_parts,
                 record.size as usize,
             );
+            drop(pgs);
+            #[cfg(test)]
+            maybe_run_multipart_snapshot_hook(bucket, key);
 
             Ok(GetObjectResult {
                 body,
@@ -4403,9 +4547,6 @@ impl Coordinator {
             let meta_pg = pgs.meta();
             let obj_parts =
                 Self::snapshot_multipart_parts(meta_pg, bucket, key, record.version_id)?;
-            drop(pgs);
-            #[cfg(test)]
-            maybe_run_multipart_snapshot_hook(bucket, key);
 
             // Find the requested part
             let part = obj_parts
@@ -4451,14 +4592,20 @@ impl Coordinator {
                 None
             };
 
+            let body = ReadHandle::from_multipart(
+                self.read_runtime(),
+                bucket,
+                key,
+                record.generation_id,
+                vec![part.clone()],
+                part.record.size as usize,
+            );
+            drop(pgs);
+            #[cfg(test)]
+            maybe_run_multipart_snapshot_hook(bucket, key);
+
             Ok(GetObjectPartResult {
-                body: ReadHandle::from_multipart(
-                    self.read_runtime(),
-                    bucket,
-                    key,
-                    vec![part.clone()],
-                    part.record.size as usize,
-                ),
+                body,
                 metadata,
                 etag: etag_str,
                 size: record.size,
@@ -4862,9 +5009,6 @@ impl Coordinator {
             let meta_pg = pgs.meta();
             let obj_parts =
                 Self::snapshot_multipart_parts(meta_pg, bucket, key, record.version_id)?;
-            drop(pgs);
-            #[cfg(test)]
-            maybe_run_multipart_snapshot_hook(bucket, key);
 
             let metadata = record
                 .metadata_blob
@@ -4873,17 +5017,19 @@ impl Coordinator {
                 .transpose()?
                 .unwrap_or_default();
 
-            (
-                metadata,
-                ReadHandle::from_multipart_range(
-                    self.read_runtime(),
-                    bucket,
-                    key,
-                    obj_parts,
-                    user_start as usize,
-                    user_end as usize,
-                ),
-            )
+            let body = ReadHandle::from_multipart_range(
+                self.read_runtime(),
+                bucket,
+                key,
+                record.generation_id,
+                obj_parts,
+                user_start as usize,
+                user_end as usize,
+            );
+            drop(pgs);
+            #[cfg(test)]
+            maybe_run_multipart_snapshot_hook(bucket, key);
+            (metadata, body)
         } else {
             // Non-multipart: metadata from DB row, user data from shards.
             let metadata = record
@@ -5006,7 +5152,7 @@ impl Coordinator {
 
                 if matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
                     // Multipart: collect parts, delete metadata under lock,
-                    // then delete part shards after releasing the lock.
+                    // then reclaim part payloads after releasing the lock.
                     let obj_parts = meta_pg
                         .get_object_parts(bucket, key, record.version_id)
                         .map_err(ServerError::Metadata)?;
@@ -5025,6 +5171,14 @@ impl Coordinator {
                             streaming_chunks.extend(chunks);
                         }
                     }
+                    Self::enqueue_multipart_reclaim(
+                        meta_pg,
+                        bucket,
+                        key,
+                        record.generation_id,
+                        &obj_parts,
+                        &streaming_chunks,
+                    )?;
                     if !streaming_chunks.is_empty() {
                         meta_pg
                             .delete_multipart_part_chunks(bucket, key, record.version_id)
@@ -5035,10 +5189,11 @@ impl Coordinator {
                     drop(pgs);
                     #[cfg(test)]
                     maybe_run_multipart_delete_metadata_hook(bucket, key);
-                    self.delete_part_shards(&obj_parts)?;
-                    if !streaming_chunks.is_empty() {
-                        self.delete_chunk_shards_generic(&streaming_chunks)?;
-                    }
+                    let _ = self.read_runtime().try_reclaim_object_payload(
+                        bucket,
+                        key,
+                        record.generation_id,
+                    );
                 } else {
                     let vid = record.version_id;
 
@@ -5126,6 +5281,14 @@ impl Coordinator {
                                 streaming_chunks.extend(chunks);
                             }
                         }
+                        Self::enqueue_multipart_reclaim(
+                            meta_pg,
+                            bucket,
+                            key,
+                            record.generation_id,
+                            &obj_parts,
+                            &streaming_chunks,
+                        )?;
                         if !streaming_chunks.is_empty() {
                             meta_pg
                                 .delete_multipart_part_chunks(bucket, key, vid)
@@ -5136,10 +5299,11 @@ impl Coordinator {
                         drop(pgs);
                         #[cfg(test)]
                         maybe_run_multipart_delete_metadata_hook(bucket, key);
-                        self.delete_part_shards(&obj_parts)?;
-                        if !streaming_chunks.is_empty() {
-                            self.delete_chunk_shards_generic(&streaming_chunks)?;
-                        }
+                        let _ = self.read_runtime().try_reclaim_object_payload(
+                            bucket,
+                            key,
+                            record.generation_id,
+                        );
 
                         return Ok(DeleteObjectResult {
                             version_id: vid,
@@ -5669,20 +5833,19 @@ impl Coordinator {
                     src_key,
                     src_record.version_id,
                 )?;
-                drop(pgs);
-                #[cfg(test)]
-                maybe_run_multipart_snapshot_hook(src_bucket, src_key);
-
-                ReadHandle::from_multipart_range(
+                let body = ReadHandle::from_multipart_range(
                     self.read_runtime(),
                     src_bucket,
                     src_key,
+                    src_record.generation_id,
                     obj_parts,
                     read_start as usize,
                     read_end as usize,
-                )
-                .into_bytes()
-                .map_err(not_found)?
+                );
+                drop(pgs);
+                #[cfg(test)]
+                maybe_run_multipart_snapshot_hook(src_bucket, src_key);
+                body.into_bytes().map_err(not_found)?
             } else {
                 // Non-multipart source: check for chunk manifest first.
                 let meta_pg = pgs.meta();
@@ -6360,9 +6523,22 @@ impl Coordinator {
 
         if let Some(ref payload) = stale_payload {
             match payload {
-                StaleObjectPayload::Multipart { .. } => {
+                StaleObjectPayload::Multipart {
+                    generation_id,
+                    parts,
+                    streaming_chunks,
+                } => {
                     // `complete_multipart_commit` already replaced the live
-                    // object_parts rows for VersionId::Null.
+                    // object_parts rows for VersionId::Null, so only enqueue
+                    // reclaim for the old payload.
+                    Self::enqueue_multipart_reclaim(
+                        &meta_pg,
+                        bucket,
+                        key,
+                        *generation_id,
+                        parts,
+                        streaming_chunks,
+                    )?;
                 }
                 _ => {
                     Self::delete_stale_object_payload_metadata(

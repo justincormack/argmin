@@ -555,26 +555,27 @@ Status:
    - chunk-manifest reads acquire root-generation payload leases
    - direct delete and stale simple-write displacement now enqueue
      chunk-manifest reclaim records instead of deleting chunk shards inline
-2. multipart-manifest reclaim is still pending
+2. multipart-manifest reclaim is now implemented:
+   - reclaim tables exist in the metadata DB
+   - `next_generation_id()` includes multipart reclaim roots
+   - multipart reads and copy-source reads acquire root-generation payload
+     leases before metadata locks are dropped
+   - direct delete and stale overwrite displacement now enqueue multipart
+     reclaim records instead of deleting part/chunk shards inline
+   - immediate reclaim still exists as a transitional path, but now avoids
+     mixed PG lock ordering by snapshotting the reclaim record under the
+     metadata lock, dropping that lock, reclaiming shard data, then reacquiring
+     metadata only to delete the reclaim row
 
 Required coordinator/storage changes for this design:
 
-1. extend `StaleObjectPayload::ChunkManifest` and `StaleObjectPayload::Multipart`
-   to carry the root object `generation_id`
-2. add storage APIs to insert, fetch, list, and delete reclaim roots plus child
-   rows for chunk-manifest and multipart payloads
-3. change stale-payload metadata deletion to:
-   - insert reclaim root + child rows
-   - delete live `stream_object_chunks`, `object_parts`, and
-     `multipart_part_chunks`
-   - commit that metadata transaction
-4. change the background sweeper to:
+1. change the background sweeper to:
    - enumerate reclaim roots
    - skip roots with active leases
    - delete child shard sets idempotently
    - delete child reclaim rows and then the root row
-5. change chunk-manifest and multipart `ReadHandle` construction to acquire the
-   same root lease model already used by simple single-shard-set payloads
+2. move the current transitional foreground reclaim callers over to the
+   background sweeper once that path exists
 
 ## Design Constraints
 

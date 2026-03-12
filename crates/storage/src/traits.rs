@@ -204,6 +204,25 @@ pub trait PgMetadataStore {
         generation_id: GenerationId,
     ) -> Result<(), MetadataError>;
 
+    /// Insert a durable reclaim record for a multipart payload.
+    fn put_multipart_reclaim(&self, reclaim: &MultipartReclaimRecord) -> Result<(), MetadataError>;
+
+    /// Look up a durable reclaim record for a multipart payload generation.
+    fn get_multipart_reclaim(
+        &self,
+        bucket: &str,
+        key: &str,
+        generation_id: GenerationId,
+    ) -> Result<Option<MultipartReclaimRecord>, MetadataError>;
+
+    /// Delete a durable reclaim record for a multipart payload generation.
+    fn delete_multipart_reclaim(
+        &self,
+        bucket: &str,
+        key: &str,
+        generation_id: GenerationId,
+    ) -> Result<(), MetadataError>;
+
     /// Store tags for an object version (serialized XML string).
     fn put_object_tags(
         &self,

@@ -189,6 +189,58 @@ CREATE TABLE IF NOT EXISTS chunk_manifest_reclaim_chunks (
         ON DELETE CASCADE
 )";
 
+/// Durable reclaim queue for multipart payload generations.
+const CREATE_MULTIPART_RECLAIMS_TABLE: &str = "\
+CREATE TABLE IF NOT EXISTS multipart_reclaims (
+    bucket        TEXT NOT NULL,
+    key           TEXT NOT NULL,
+    generation_id INTEGER NOT NULL CHECK (generation_id > 0),
+    created_at    INTEGER NOT NULL,
+    PRIMARY KEY (bucket, key, generation_id)
+)";
+
+/// Per-part reclaim rows for multipart payload generations.
+const CREATE_MULTIPART_RECLAIM_PARTS_TABLE: &str = "\
+CREATE TABLE IF NOT EXISTS multipart_reclaim_parts (
+    bucket        TEXT NOT NULL,
+    key           TEXT NOT NULL,
+    generation_id INTEGER NOT NULL CHECK (generation_id > 0),
+    part_number   INTEGER NOT NULL,
+    storage_kind  INTEGER NOT NULL CHECK (storage_kind IN (0, 1)),
+    part_okh      BLOB,
+    part_vid      INTEGER,
+    shard_pg_id   INTEGER,
+    ec_k          INTEGER,
+    ec_m          INTEGER,
+    PRIMARY KEY (bucket, key, generation_id, part_number),
+    FOREIGN KEY (bucket, key, generation_id)
+        REFERENCES multipart_reclaims(bucket, key, generation_id)
+        ON DELETE CASCADE,
+    CHECK (
+        (storage_kind = 0 AND part_okh IS NOT NULL AND part_vid IS NOT NULL AND shard_pg_id IS NOT NULL AND ec_k IS NOT NULL AND ec_m IS NOT NULL) OR
+        (storage_kind = 1 AND part_okh IS NULL AND part_vid IS NULL AND shard_pg_id IS NULL AND ec_k IS NULL AND ec_m IS NULL)
+    )
+)";
+
+/// Child chunk rows for streamed multipart part reclaim generations.
+const CREATE_MULTIPART_RECLAIM_PART_CHUNKS_TABLE: &str = "\
+CREATE TABLE IF NOT EXISTS multipart_reclaim_part_chunks (
+    bucket        TEXT NOT NULL,
+    key           TEXT NOT NULL,
+    generation_id INTEGER NOT NULL CHECK (generation_id > 0),
+    part_number   INTEGER NOT NULL,
+    chunk_index   INTEGER NOT NULL,
+    chunk_okh     BLOB NOT NULL,
+    chunk_vid     INTEGER NOT NULL CHECK (chunk_vid > 0),
+    shard_pg_id   INTEGER NOT NULL,
+    ec_k          INTEGER NOT NULL,
+    ec_m          INTEGER NOT NULL,
+    PRIMARY KEY (bucket, key, generation_id, part_number, chunk_index),
+    FOREIGN KEY (bucket, key, generation_id, part_number)
+        REFERENCES multipart_reclaim_parts(bucket, key, generation_id, part_number)
+        ON DELETE CASCADE
+)";
+
 /// Committed chunk manifest for multipart parts.
 const CREATE_MULTIPART_PART_CHUNKS_TABLE: &str = "\
 CREATE TABLE IF NOT EXISTS multipart_part_chunks (
@@ -265,6 +317,9 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(CREATE_SIMPLE_PAYLOAD_RECLAIMS_TABLE, [])?;
     conn.execute(CREATE_CHUNK_MANIFEST_RECLAIMS_TABLE, [])?;
     conn.execute(CREATE_CHUNK_MANIFEST_RECLAIM_CHUNKS_TABLE, [])?;
+    conn.execute(CREATE_MULTIPART_RECLAIMS_TABLE, [])?;
+    conn.execute(CREATE_MULTIPART_RECLAIM_PARTS_TABLE, [])?;
+    conn.execute(CREATE_MULTIPART_RECLAIM_PART_CHUNKS_TABLE, [])?;
     conn.execute(CREATE_MULTIPART_PART_CHUNKS_TABLE, [])?;
     conn.execute(CREATE_MULTIPART_PART_CHUNKS_VERSION_INDEX, [])?;
     conn.execute(CREATE_BUCKETS_TABLE, [])?;

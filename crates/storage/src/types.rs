@@ -636,6 +636,63 @@ pub struct ChunkManifestReclaimRecord {
     pub chunks: Vec<ChunkManifestReclaimChunkRecord>,
 }
 
+/// Part storage kind for a multipart reclaim record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MultipartReclaimPartKind {
+    ShardSet = 0,
+    ChunkManifest = 1,
+}
+
+impl MultipartReclaimPartKind {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::ShardSet),
+            1 => Some(Self::ChunkManifest),
+            _ => None,
+        }
+    }
+}
+
+/// Chunk entry for a streamed multipart part reclaim record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultipartReclaimPartChunkRecord {
+    pub part_number: u32,
+    pub chunk_index: u32,
+    pub chunk_okh: [u8; 16],
+    pub chunk_vid: GenerationId,
+    pub shard_pg_id: u32,
+    pub ec: EcShape,
+}
+
+/// Part entry for a durable multipart reclaim record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MultipartReclaimPartRecord {
+    ShardSet {
+        part_number: u32,
+        part_okh: [u8; 16],
+        part_vid: GenerationId,
+        shard_pg_id: u32,
+        ec: EcShape,
+    },
+    ChunkManifest {
+        part_number: u32,
+        chunks: Vec<MultipartReclaimPartChunkRecord>,
+    },
+}
+
+/// Durable reclaim record for a multipart payload generation.
+///
+/// This is used when the namespace-visible object row is removed or replaced
+/// before the old multipart payload can be physically deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultipartReclaimRecord {
+    pub bucket: BucketName,
+    pub key: ObjectKey,
+    pub generation_id: GenerationId,
+    pub created_at: u64,
+    pub parts: Vec<MultipartReclaimPartRecord>,
+}
+
 /// Bucket metadata.
 #[derive(Debug, Clone)]
 pub struct BucketInfo {

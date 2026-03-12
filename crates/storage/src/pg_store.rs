@@ -1413,6 +1413,8 @@ impl PgMetadataStore for PgStore {
                      SELECT generation_id FROM simple_payload_reclaims WHERE bucket = ?1 AND key = ?2
                      UNION ALL
                      SELECT generation_id FROM chunk_manifest_reclaims WHERE bucket = ?1 AND key = ?2
+                     UNION ALL
+                     SELECT generation_id FROM multipart_reclaims WHERE bucket = ?1 AND key = ?2
                  )",
                 params![bucket, key],
                 |row| row.get(0),
@@ -1705,6 +1707,352 @@ impl PgMetadataStore for PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "delete chunk manifest reclaim",
+                source: e,
+            })?;
+        Ok(())
+    }
+
+    fn put_multipart_reclaim(&self, reclaim: &MultipartReclaimRecord) -> Result<(), MetadataError> {
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| MetadataError::Db {
+                context: "put multipart reclaim (begin txn)",
+                source: e,
+            })?;
+
+        let result: Result<(), MetadataError> = (|| {
+            self.conn
+                .execute(
+                    "INSERT OR REPLACE INTO multipart_reclaims \
+                     (bucket, key, generation_id, created_at) VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        reclaim.bucket,
+                        reclaim.key,
+                        reclaim.generation_id.get() as i64,
+                        reclaim.created_at as i64,
+                    ],
+                )
+                .map_err(|e| MetadataError::Db {
+                    context: "put multipart reclaim (root)",
+                    source: e,
+                })?;
+
+            for part in &reclaim.parts {
+                match part {
+                    MultipartReclaimPartRecord::ShardSet {
+                        part_number,
+                        part_okh,
+                        part_vid,
+                        shard_pg_id,
+                        ec,
+                    } => {
+                        self.conn
+                            .execute(
+                                "INSERT OR REPLACE INTO multipart_reclaim_parts \
+                                 (bucket, key, generation_id, part_number, storage_kind, part_okh, \
+                                  part_vid, shard_pg_id, ec_k, ec_m) \
+                                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                                params![
+                                    reclaim.bucket,
+                                    reclaim.key,
+                                    reclaim.generation_id.get() as i64,
+                                    *part_number as i64,
+                                    MultipartReclaimPartKind::ShardSet as u8,
+                                    &part_okh[..],
+                                    part_vid.get() as i64,
+                                    *shard_pg_id as i64,
+                                    ec.k,
+                                    ec.m,
+                                ],
+                            )
+                            .map_err(|e| MetadataError::Db {
+                                context: "put multipart reclaim (part shard set)",
+                                source: e,
+                            })?;
+                    }
+                    MultipartReclaimPartRecord::ChunkManifest {
+                        part_number,
+                        chunks,
+                    } => {
+                        self.conn
+                            .execute(
+                                "INSERT OR REPLACE INTO multipart_reclaim_parts \
+                                 (bucket, key, generation_id, part_number, storage_kind, part_okh, \
+                                  part_vid, shard_pg_id, ec_k, ec_m) \
+                                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, NULL, NULL)",
+                                params![
+                                    reclaim.bucket,
+                                    reclaim.key,
+                                    reclaim.generation_id.get() as i64,
+                                    *part_number as i64,
+                                    MultipartReclaimPartKind::ChunkManifest as u8,
+                                ],
+                            )
+                            .map_err(|e| MetadataError::Db {
+                                context: "put multipart reclaim (part chunk manifest)",
+                                source: e,
+                            })?;
+
+                        for chunk in chunks {
+                            self.conn
+                                .execute(
+                                    "INSERT OR REPLACE INTO multipart_reclaim_part_chunks \
+                                     (bucket, key, generation_id, part_number, chunk_index, \
+                                      chunk_okh, chunk_vid, shard_pg_id, ec_k, ec_m) \
+                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                                    params![
+                                        reclaim.bucket,
+                                        reclaim.key,
+                                        reclaim.generation_id.get() as i64,
+                                        chunk.part_number as i64,
+                                        chunk.chunk_index as i64,
+                                        &chunk.chunk_okh[..],
+                                        chunk.chunk_vid.get() as i64,
+                                        chunk.shard_pg_id as i64,
+                                        chunk.ec.k,
+                                        chunk.ec.m,
+                                    ],
+                                )
+                                .map_err(|e| MetadataError::Db {
+                                    context: "put multipart reclaim (part chunk)",
+                                    source: e,
+                                })?;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                if let Err(e) = self.conn.execute_batch("COMMIT") {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    return Err(MetadataError::Db {
+                        context: "put multipart reclaim (commit txn)",
+                        source: e,
+                    });
+                }
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    fn get_multipart_reclaim(
+        &self,
+        bucket: &str,
+        key: &str,
+        generation_id: GenerationId,
+    ) -> Result<Option<MultipartReclaimRecord>, MetadataError> {
+        let root = self
+            .conn
+            .query_row(
+                "SELECT bucket, key, generation_id, created_at \
+                 FROM multipart_reclaims \
+                 WHERE bucket = ?1 AND key = ?2 AND generation_id = ?3",
+                params![bucket, key, generation_id.get() as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, BucketName>(0)?,
+                        row.get::<_, ObjectKey>(1)?,
+                        Self::parse_generation_id(row.get::<_, i64>(2)?, 2, "generation_id")?,
+                        row.get::<_, i64>(3)? as u64,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| MetadataError::Db {
+                context: "get multipart reclaim (root)",
+                source: e,
+            })?;
+
+        let Some((bucket_name, key_name, generation_id, created_at)) = root else {
+            return Ok(None);
+        };
+
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT part_number, storage_kind, part_okh, part_vid, shard_pg_id, ec_k, ec_m \
+                 FROM multipart_reclaim_parts \
+                 WHERE bucket = ?1 AND key = ?2 AND generation_id = ?3 \
+                 ORDER BY part_number ASC",
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "get multipart reclaim (prepare parts)",
+                source: e,
+            })?;
+
+        let rows = stmt
+            .query_map(params![bucket, key, generation_id.get() as i64], |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u32,
+                    Self::parse_enum(
+                        row.get::<_, u8>(1)?,
+                        1,
+                        "storage_kind",
+                        MultipartReclaimPartKind::from_u8,
+                    )?,
+                    row.get::<_, Option<Vec<u8>>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<u8>>(5)?,
+                    row.get::<_, Option<u8>>(6)?,
+                ))
+            })
+            .map_err(|e| MetadataError::Db {
+                context: "get multipart reclaim (query parts)",
+                source: e,
+            })?;
+
+        let mut parts = Vec::new();
+        for row in rows {
+            let (part_number, kind, part_okh, part_vid, shard_pg_id, ec_k, ec_m) =
+                row.map_err(|e| MetadataError::Db {
+                    context: "get multipart reclaim (part row)",
+                    source: e,
+                })?;
+            match kind {
+                MultipartReclaimPartKind::ShardSet => {
+                    let part_okh = part_okh.ok_or_else(|| MetadataError::Db {
+                        context: "get multipart reclaim (missing part_okh)",
+                        source: rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Null,
+                            Box::from("shard-set reclaim part missing part_okh"),
+                        ),
+                    })?;
+                    let part_okh =
+                        Self::parse_okh_blob(&part_okh, 2).map_err(|e| MetadataError::Db {
+                            context: "get multipart reclaim (invalid part_okh)",
+                            source: e,
+                        })?;
+                    let part_vid = part_vid.ok_or_else(|| MetadataError::Db {
+                        context: "get multipart reclaim (missing part_vid)",
+                        source: rusqlite::Error::FromSqlConversionFailure(
+                            3,
+                            rusqlite::types::Type::Null,
+                            Box::from("shard-set reclaim part missing part_vid"),
+                        ),
+                    })?;
+                    let shard_pg_id = shard_pg_id.ok_or_else(|| MetadataError::Db {
+                        context: "get multipart reclaim (missing shard_pg_id)",
+                        source: rusqlite::Error::FromSqlConversionFailure(
+                            4,
+                            rusqlite::types::Type::Null,
+                            Box::from("shard-set reclaim part missing shard_pg_id"),
+                        ),
+                    })?;
+                    let ec_k = ec_k.ok_or_else(|| MetadataError::Db {
+                        context: "get multipart reclaim (missing ec_k)",
+                        source: rusqlite::Error::FromSqlConversionFailure(
+                            5,
+                            rusqlite::types::Type::Null,
+                            Box::from("shard-set reclaim part missing ec_k"),
+                        ),
+                    })?;
+                    let ec_m = ec_m.ok_or_else(|| MetadataError::Db {
+                        context: "get multipart reclaim (missing ec_m)",
+                        source: rusqlite::Error::FromSqlConversionFailure(
+                            6,
+                            rusqlite::types::Type::Null,
+                            Box::from("shard-set reclaim part missing ec_m"),
+                        ),
+                    })?;
+                    parts.push(MultipartReclaimPartRecord::ShardSet {
+                        part_number,
+                        part_okh,
+                        part_vid: Self::parse_generation_id(part_vid, 3, "part_vid").map_err(
+                            |e| MetadataError::Db {
+                                context: "get multipart reclaim (invalid part_vid)",
+                                source: e,
+                            },
+                        )?,
+                        shard_pg_id: shard_pg_id as u32,
+                        ec: EcShape { k: ec_k, m: ec_m },
+                    });
+                }
+                MultipartReclaimPartKind::ChunkManifest => {
+                    let mut chunk_stmt = self
+                        .conn
+                        .prepare(
+                            "SELECT part_number, chunk_index, chunk_okh, chunk_vid, shard_pg_id, ec_k, ec_m \
+                             FROM multipart_reclaim_part_chunks \
+                             WHERE bucket = ?1 AND key = ?2 AND generation_id = ?3 AND part_number = ?4 \
+                             ORDER BY chunk_index ASC",
+                        )
+                        .map_err(|e| MetadataError::Db {
+                            context: "get multipart reclaim (prepare part chunks)",
+                            source: e,
+                        })?;
+
+                    let chunks = chunk_stmt
+                        .query_map(
+                            params![bucket, key, generation_id.get() as i64, part_number],
+                            |row| {
+                                let chunk_okh = Self::blob_to_okh(row.get(2)?, 2)?;
+                                Ok(MultipartReclaimPartChunkRecord {
+                                    part_number: row.get::<_, i64>(0)? as u32,
+                                    chunk_index: row.get::<_, i64>(1)? as u32,
+                                    chunk_okh,
+                                    chunk_vid: Self::parse_generation_id(
+                                        row.get::<_, i64>(3)?,
+                                        3,
+                                        "chunk_vid",
+                                    )?,
+                                    shard_pg_id: row.get::<_, i64>(4)? as u32,
+                                    ec: EcShape {
+                                        k: row.get(5)?,
+                                        m: row.get(6)?,
+                                    },
+                                })
+                            },
+                        )
+                        .map_err(|e| MetadataError::Db {
+                            context: "get multipart reclaim (query part chunks)",
+                            source: e,
+                        })?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| MetadataError::Db {
+                            context: "get multipart reclaim (collect part chunks)",
+                            source: e,
+                        })?;
+
+                    parts.push(MultipartReclaimPartRecord::ChunkManifest {
+                        part_number,
+                        chunks,
+                    });
+                }
+            }
+        }
+
+        Ok(Some(MultipartReclaimRecord {
+            bucket: bucket_name,
+            key: key_name,
+            generation_id,
+            created_at,
+            parts,
+        }))
+    }
+
+    fn delete_multipart_reclaim(
+        &self,
+        bucket: &str,
+        key: &str,
+        generation_id: GenerationId,
+    ) -> Result<(), MetadataError> {
+        self.conn
+            .execute(
+                "DELETE FROM multipart_reclaims \
+                 WHERE bucket = ?1 AND key = ?2 AND generation_id = ?3",
+                params![bucket, key, generation_id.get() as i64],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "delete multipart reclaim",
                 source: e,
             })?;
         Ok(())
