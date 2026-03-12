@@ -137,7 +137,7 @@ impl PgStore {
             etag: row.get(4)?,
             etag_kind: Self::parse_enum(row.get::<_, u8>(5)?, 5, "etag_kind", EtagKind::from_u8)?,
             part_okh,
-            part_vid: row.get::<_, i64>(7)? as u64,
+            part_vid: Self::parse_generation_id(row.get::<_, i64>(7)?, 7, "part_vid")?,
             ec_k: row.get::<_, u8>(8)?,
             ec_m: row.get::<_, u8>(9)?,
             last_modified: row.get::<_, i64>(10)? as u64,
@@ -153,6 +153,27 @@ impl PgStore {
                 col_idx,
                 rusqlite::types::Type::Blob,
                 Box::from(format!("expected 16-byte chunk_okh, got {}", blob.len())),
+            )
+        })
+    }
+
+    fn parse_generation_id(
+        raw: i64,
+        col_idx: usize,
+        field_name: &'static str,
+    ) -> Result<GenerationId, rusqlite::Error> {
+        let value = u64::try_from(raw).map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                col_idx,
+                rusqlite::types::Type::Integer,
+                Box::from(format!("negative {field_name}: {raw}")),
+            )
+        })?;
+        GenerationId::new(value).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                col_idx,
+                rusqlite::types::Type::Integer,
+                Box::from(format!("invalid zero {field_name}")),
             )
         })
     }
@@ -1863,7 +1884,7 @@ impl PgMetadataStore for PgStore {
                     part.etag,
                     part.etag_kind as u8,
                     part.part_okh.as_slice(),
-                    part.part_vid as i64,
+                    part.part_vid.get() as i64,
                     part.ec_k,
                     part.ec_m,
                     part.last_modified as i64,
@@ -2036,7 +2057,7 @@ impl PgMetadataStore for PgStore {
                     part.etag,
                     part.etag_kind as u8,
                     part.part_okh.as_slice(),
-                    part.part_vid as i64,
+                    part.part_vid.get() as i64,
                     part.ec_k,
                     part.ec_m,
                     part.shard_pg_id,
@@ -2104,7 +2125,7 @@ impl PgMetadataStore for PgStore {
                         EtagKind::from_u8,
                     )?,
                     part_okh,
-                    part_vid: row.get::<_, i64>(8)? as u64,
+                    part_vid: Self::parse_generation_id(row.get::<_, i64>(8)?, 8, "part_vid")?,
                     ec_k: row.get::<_, u8>(9)?,
                     ec_m: row.get::<_, u8>(10)?,
                     shard_pg_id: row.get::<_, i64>(11)? as u32,
@@ -2268,7 +2289,7 @@ impl PgMetadataStore for PgStore {
                         part.etag,
                         part.etag_kind as u8,
                         part.part_okh.as_slice(),
-                        part.part_vid as i64,
+                        part.part_vid.get() as i64,
                         part.ec_k,
                         part.ec_m,
                         part.shard_pg_id,
@@ -2510,7 +2531,7 @@ impl PgMetadataStore for PgStore {
                     chunk.chunk_index,
                     chunk.size as i64,
                     chunk.chunk_okh.as_slice(),
-                    chunk.chunk_vid as i64,
+                    chunk.chunk_vid.get() as i64,
                     chunk.shard_pg_id,
                     chunk.ec_k,
                     chunk.ec_m,
@@ -2548,7 +2569,7 @@ impl PgMetadataStore for PgStore {
                     chunk_index: row.get(1)?,
                     size: row.get::<_, i64>(2)? as u64,
                     chunk_okh: okh,
-                    chunk_vid: row.get::<_, i64>(4)? as u64,
+                    chunk_vid: Self::parse_generation_id(row.get::<_, i64>(4)?, 4, "chunk_vid")?,
                     shard_pg_id: row.get(5)?,
                     ec_k: row.get(6)?,
                     ec_m: row.get(7)?,
@@ -2725,7 +2746,7 @@ impl PgMetadataStore for PgStore {
                         chunk.chunk_index,
                         chunk.size as i64,
                         chunk.chunk_okh.as_slice(),
-                        chunk.chunk_vid as i64,
+                        chunk.chunk_vid.get() as i64,
                         chunk.shard_pg_id,
                         chunk.ec_k,
                         chunk.ec_m,
@@ -2887,7 +2908,7 @@ impl PgMetadataStore for PgStore {
                         part.etag,
                         part.etag_kind as u8,
                         part.part_okh.as_slice(),
-                        part.part_vid as i64,
+                        part.part_vid.get() as i64,
                         part.ec_k,
                         part.ec_m,
                         part.last_modified as i64,
@@ -2947,7 +2968,7 @@ impl PgMetadataStore for PgStore {
                         chunk.chunk_index,
                         chunk.size as i64,
                         chunk.chunk_okh.as_slice(),
-                        chunk.chunk_vid as i64,
+                        chunk.chunk_vid.get() as i64,
                         chunk.shard_pg_id,
                         chunk.ec_k,
                         chunk.ec_m,
@@ -3021,7 +3042,7 @@ impl PgMetadataStore for PgStore {
                     chunk_index: row.get(3)?,
                     size: row.get::<_, i64>(4)? as u64,
                     chunk_okh: okh,
-                    chunk_vid: row.get::<_, i64>(6)? as u64,
+                    chunk_vid: Self::parse_generation_id(row.get::<_, i64>(6)?, 6, "chunk_vid")?,
                     shard_pg_id: row.get(7)?,
                     ec_k: row.get(8)?,
                     ec_m: row.get(9)?,
@@ -3096,7 +3117,11 @@ impl PgMetadataStore for PgStore {
                         chunk_index: row.get(5)?,
                         size: row.get::<_, i64>(6)? as u64,
                         chunk_okh: okh,
-                        chunk_vid: row.get::<_, i64>(8)? as u64,
+                        chunk_vid: Self::parse_generation_id(
+                            row.get::<_, i64>(8)?,
+                            8,
+                            "chunk_vid",
+                        )?,
                         shard_pg_id: row.get(9)?,
                         ec_k: row.get(10)?,
                         ec_m: row.get(11)?,
@@ -3167,7 +3192,7 @@ impl PgMetadataStore for PgStore {
                     chunk_index: row.get(5)?,
                     size: row.get::<_, i64>(6)? as u64,
                     chunk_okh,
-                    chunk_vid: row.get::<_, i64>(8)? as u64,
+                    chunk_vid: Self::parse_generation_id(row.get::<_, i64>(8)?, 8, "chunk_vid")?,
                     shard_pg_id: row.get(9)?,
                     ec_k: row.get(10)?,
                     ec_m: row.get(11)?,

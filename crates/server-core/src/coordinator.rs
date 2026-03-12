@@ -9,8 +9,8 @@ use s3_types::{BucketVersioningState, VersionId};
 use storage::traits::{PgMetadataStore, ShardStore};
 use storage::{
     BucketInfo, BucketName, CommitMultipartReq, CommitStreamPutReq, CreateMultipartUploadReq,
-    CreateStreamUploadReq, EcShape, ListMultipartUploadsReq, ListObjectVersionsReq, ListObjectsReq,
-    ListPartsReq, LiveObjectRecord, MultipartPartChunkRecord, MultipartPartRecord,
+    CreateStreamUploadReq, EcShape, GenerationId, ListMultipartUploadsReq, ListObjectVersionsReq,
+    ListObjectsReq, ListPartsReq, LiveObjectRecord, MultipartPartChunkRecord, MultipartPartRecord,
     MultipartUploadRecord, ObjectKey, ObjectLayout, ObjectPartRecord, PutDeleteMarkerReq,
     PutLiveObjectReq, PutObjectReq, SessionId, ShardKey, SharedStorageNode, StoredObject,
     StreamObjectChunkRecord, StreamUploadChunkRecord, StreamUploadState, StreamUploadTarget,
@@ -119,7 +119,7 @@ struct ReadRuntime {
 struct ChunkPayloadRecord {
     size: u64,
     chunk_okh: [u8; 16],
-    chunk_vid: u64,
+    chunk_vid: GenerationId,
     shard_pg_id: u32,
     ec_k: u8,
     ec_m: u8,
@@ -1276,7 +1276,7 @@ impl ReadRuntime {
         let mut shard_len = 0;
 
         for &idx in &needed {
-            let shard_key = ShardKey::new(&part.part_okh, part.part_vid, idx as u8);
+            let shard_key = ShardKey::new(&part.part_okh, part.part_vid.get(), idx as u8);
             if let Ok(sd) = pg.read_shard(&shard_key) {
                 shard_len = sd.data.len();
                 result_shards.push(Some(sd.data));
@@ -1296,7 +1296,7 @@ impl ReadRuntime {
             let mut present_count = 0;
 
             for i in 0..(k + m) {
-                let shard_key = ShardKey::new(&part.part_okh, part.part_vid, i as u8);
+                let shard_key = ShardKey::new(&part.part_okh, part.part_vid.get(), i as u8);
                 match pg.read_shard(&shard_key) {
                     Ok(sd) => {
                         shard_len = sd.data.len();
@@ -1391,7 +1391,7 @@ impl ReadRuntime {
         let mut present_count = 0;
 
         for i in 0..(k + m) {
-            let shard_key = ShardKey::new(&chunk.chunk_okh, chunk.chunk_vid, i as u8);
+            let shard_key = ShardKey::new(&chunk.chunk_okh, chunk.chunk_vid.get(), i as u8);
             match pg.read_shard(&shard_key) {
                 Ok(sd) => {
                     all_shards.push(Some(sd.data));
@@ -1711,8 +1711,12 @@ impl Coordinator {
         self.pg_topology.object_pg(bucket, key)
     }
 
+    fn shard_pg_id_raw(&self, bucket: &str, key: &str, generation: u64) -> u32 {
+        self.pg_topology.shard_pg(bucket, key, generation)
+    }
+
     fn shard_pg_id(&self, bucket: &str, key: &str, version_id: VersionId) -> u32 {
-        self.pg_topology.shard_pg(bucket, key, version_id.to_u64())
+        self.shard_pg_id_raw(bucket, key, version_id.to_u64())
     }
 
     fn get_bucket_pg(&self, bucket: &str) -> Result<MutexGuard<'_, storage::PgStore>, ServerError> {
@@ -2574,11 +2578,11 @@ impl Coordinator {
 
         // Derive chunk shard placement.
         let chunk_okh = chunk_key_hash(session_id, chunk_index);
-        let chunk_vid: u64 = 0;
-        let shard_pg_id = self.shard_pg_id(
+        let chunk_vid = GenerationId::MIN;
+        let shard_pg_id = self.shard_pg_id_raw(
             &format!("chunk/{session_id}"),
             &chunk_index.to_string(),
-            VersionId::Null,
+            chunk_vid.get(),
         );
 
         // Lock metadata PG + shard PG in global ascending order.
@@ -2641,7 +2645,7 @@ impl Coordinator {
         let mut written_shards: Vec<ShardKey> = Vec::with_capacity(k + m);
         let write_result: Result<(), ServerError> = (|| {
             for i in 0..(k + m) {
-                let shard_key = ShardKey::new(&chunk_okh, chunk_vid, i as u8);
+                let shard_key = ShardKey::new(&chunk_okh, chunk_vid.get(), i as u8);
                 let shard_data = if i < k {
                     data_shards[i]
                 } else {
@@ -2988,7 +2992,8 @@ impl Coordinator {
             etag: crc64_to_etag_bytes(crc64),
             etag_kind: storage::EtagKind::Crc64,
             part_okh: [0u8; 16], // no single-shard placement for streamed parts
-            part_vid: u64::from(generation),
+            part_vid: GenerationId::new(u64::from(generation) + 1)
+                .expect("multipart part generation must be nonzero"),
             ec_k: self.ec_config.data_shards,
             ec_m: self.ec_config.parity_shards,
             last_modified: now,
@@ -3008,17 +3013,18 @@ impl Coordinator {
             let old_gen = generation - 1;
             // Clean old non-streaming shards.
             let old_okh = part_key_hash(upload_id, part_number, old_gen);
-            let old_vid = u64::from(old_gen);
-            let old_shard_pg_id = self.shard_pg_id(
+            let old_vid =
+                GenerationId::new(u64::from(old_gen) + 1).expect("old generation must be nonzero");
+            let old_shard_pg_id = self.shard_pg_id_raw(
                 &format!("mpu/{upload_id}"),
                 &format!("{part_number}/{old_gen}"),
-                VersionId::from_u64(old_vid),
+                old_vid.get(),
             );
             if let Ok(old_pg) = self.storage_node.get_pg(old_shard_pg_id) {
                 let k = self.ec_config.data_shards as usize;
                 let m = self.ec_config.parity_shards as usize;
                 for i in 0..(k + m) {
-                    let old_key = ShardKey::new(&old_okh, old_vid, i as u8);
+                    let old_key = ShardKey::new(&old_okh, old_vid.get(), i as u8);
                     let _ = old_pg.delete_shard(&old_key);
                 }
             }
@@ -3029,7 +3035,7 @@ impl Coordinator {
                 if let Ok(old_chunks) = pg.get_multipart_part_chunks(
                     bucket,
                     key,
-                    VersionId::from_u64(old_vid),
+                    VersionId::from_u64(old_vid.get()),
                     part_number,
                 ) {
                     drop(pg);
@@ -3099,7 +3105,7 @@ impl Coordinator {
                 let k = chunk.ec_k as usize;
                 let m = chunk.ec_m as usize;
                 for i in 0..(k + m) {
-                    let shard_key = ShardKey::new(&chunk.chunk_okh, chunk.chunk_vid, i as u8);
+                    let shard_key = ShardKey::new(&chunk.chunk_okh, chunk.chunk_vid.get(), i as u8);
                     let _ = shard_guard.delete_shard(&shard_key);
                 }
             }
@@ -3748,7 +3754,7 @@ impl Coordinator {
             let pg = self.storage_node.get_pg(part.shard_pg_id)?;
             let total = part.ec_k as usize + part.ec_m as usize;
             for i in 0..total {
-                let shard_key = ShardKey::new(&part.part_okh, part.part_vid, i as u8);
+                let shard_key = ShardKey::new(&part.part_okh, part.part_vid.get(), i as u8);
                 pg.delete_shard(&shard_key)?;
             }
         }
@@ -3789,14 +3795,14 @@ impl Coordinator {
         &self,
         shard_pg_id: u32,
         chunk_okh: &[u8; 16],
-        chunk_vid: u64,
+        chunk_vid: GenerationId,
         ec_k: u8,
         ec_m: u8,
     ) -> Result<(), ServerError> {
         let pg = self.storage_node.get_pg(shard_pg_id)?;
         let total = ec_k as usize + ec_m as usize;
         for i in 0..total {
-            let shard_key = ShardKey::new(chunk_okh, chunk_vid, i as u8);
+            let shard_key = ShardKey::new(chunk_okh, chunk_vid.get(), i as u8);
             pg.delete_shard(&shard_key)?;
         }
         Ok(())
@@ -5344,10 +5350,10 @@ impl Coordinator {
                 Err(e) => return Err(ServerError::Metadata(e)),
             };
 
-            let shard_pg_id = self.shard_pg_id(
+            let shard_pg_id = self.shard_pg_id_raw(
                 &format!("mpu/{upload_id}"),
                 &format!("{part_number}/{generation}"),
-                VersionId::from_u64(u64::from(generation)),
+                u64::from(generation) + 1,
             );
 
             if shard_pg_id == meta_pg_id {
@@ -5389,10 +5395,10 @@ impl Coordinator {
                 Err(e) => return Err(ServerError::Metadata(e)),
             };
 
-            let verify_shard_pg_id = self.shard_pg_id(
+            let verify_shard_pg_id = self.shard_pg_id_raw(
                 &format!("mpu/{upload_id}"),
                 &format!("{part_number}/{generation}"),
-                VersionId::from_u64(u64::from(generation)),
+                u64::from(generation) + 1,
             );
 
             // Generation changed while relocking — shard PG may differ. Retry.
@@ -5448,7 +5454,8 @@ impl Coordinator {
 
         // 4. Compute part identity.
         let part_okh = part_key_hash(upload_id, part_number, generation);
-        let part_vid = u64::from(generation);
+        let part_vid = GenerationId::new(u64::from(generation) + 1)
+            .expect("multipart generation must be nonzero");
 
         // 5. EC-encode part data (no metadata blob for parts — raw data only).
         let etag_crc = checksum::crc64::checksum(data);
@@ -5477,7 +5484,7 @@ impl Coordinator {
         let mut written_shards: Vec<ShardKey> = Vec::with_capacity(k + m);
         let write_result: Result<(), ServerError> = (|| {
             for i in 0..(k + m) {
-                let shard_key = ShardKey::new(&part_okh, part_vid, i as u8);
+                let shard_key = ShardKey::new(&part_okh, part_vid.get(), i as u8);
                 let shard_data = if i < k {
                     data_shards[i]
                 } else {
@@ -5535,15 +5542,16 @@ impl Coordinator {
         drop(meta_pg);
         if let Some(old_gen) = prev_gen {
             let old_okh = part_key_hash(upload_id, part_number, old_gen);
-            let old_vid = u64::from(old_gen);
-            let old_shard_pg_id = self.shard_pg_id(
+            let old_vid =
+                GenerationId::new(u64::from(old_gen) + 1).expect("old generation must be nonzero");
+            let old_shard_pg_id = self.shard_pg_id_raw(
                 &format!("mpu/{upload_id}"),
                 &format!("{part_number}/{old_gen}"),
-                VersionId::from_u64(old_vid),
+                old_vid.get(),
             );
             if let Ok(old_pg) = self.storage_node.get_pg(old_shard_pg_id) {
                 for i in 0..(k + m) {
-                    let old_key = ShardKey::new(&old_okh, old_vid, i as u8);
+                    let old_key = ShardKey::new(&old_okh, old_vid.get(), i as u8);
                     let _ = old_pg.delete_shard(&old_key);
                 }
             }
@@ -5882,10 +5890,10 @@ impl Coordinator {
         let object_parts: Vec<ObjectPartRecord> = part_records
             .iter()
             .map(|p| {
-                let shard_pg_id = self.shard_pg_id(
+                let shard_pg_id = self.shard_pg_id_raw(
                     &format!("mpu/{}", p.upload_id),
                     &format!("{}/{}", p.part_number, p.generation),
-                    VersionId::from_u64(p.part_vid),
+                    p.part_vid.get(),
                 );
                 ObjectPartRecord {
                     bucket: BucketName::from(bucket),
@@ -5982,16 +5990,16 @@ impl Coordinator {
             if part.part_okh == [0u8; 16] {
                 continue; // streaming part — handled below
             }
-            let shard_pg_id = self.shard_pg_id(
+            let shard_pg_id = self.shard_pg_id_raw(
                 &format!("mpu/{upload_id}"),
                 &format!("{}/{}", part.part_number, part.generation),
-                VersionId::from_u64(part.part_vid),
+                part.part_vid.get(),
             );
             if let Ok(shard_pg) = self.storage_node.get_pg(shard_pg_id) {
                 let k = part.ec_k as usize;
                 let m = part.ec_m as usize;
                 for i in 0..(k + m) {
-                    let shard_key = ShardKey::new(&part.part_okh, part.part_vid, i as u8);
+                    let shard_key = ShardKey::new(&part.part_okh, part.part_vid.get(), i as u8);
                     let _ = shard_pg.delete_shard(&shard_key);
                 }
             }
@@ -15538,7 +15546,7 @@ mod tests {
             let shard_pg = coord.storage_node.get_pg(chunk.shard_pg_id).unwrap();
             let total = chunk.ec_k as usize + chunk.ec_m as usize;
             for i in 0..total {
-                let shard_key = ShardKey::new(&chunk.chunk_okh, chunk.chunk_vid, i as u8);
+                let shard_key = ShardKey::new(&chunk.chunk_okh, chunk.chunk_vid.get(), i as u8);
                 assert!(
                     shard_pg.read_shard(&shard_key).is_ok(),
                     "shard {i} should exist before abort"
@@ -15574,7 +15582,7 @@ mod tests {
             let shard_pg = coord.storage_node.get_pg(chunk.shard_pg_id).unwrap();
             let total = chunk.ec_k as usize + chunk.ec_m as usize;
             for i in 0..total {
-                let shard_key = ShardKey::new(&chunk.chunk_okh, chunk.chunk_vid, i as u8);
+                let shard_key = ShardKey::new(&chunk.chunk_okh, chunk.chunk_vid.get(), i as u8);
                 assert!(
                     shard_pg.read_shard(&shard_key).is_err(),
                     "shard {i} should be deleted after abort"

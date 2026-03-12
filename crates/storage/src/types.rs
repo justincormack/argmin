@@ -1,10 +1,39 @@
 /// Core types for the storage layer.
 use crate::error::StoreError;
+use std::num::NonZeroU64;
 
 pub use checksum::{
     ChecksumAlgorithm, ChecksumType, InvalidChecksumConfig, MultipartChecksumConfig, RawChecksum,
 };
 pub use s3_types::{BucketVersioningState, VersionId};
+
+/// Internal immutable payload generation identifier.
+///
+/// This is distinct from the external S3 `VersionId`. Every physical payload
+/// generation should eventually have a fresh `GenerationId`, even when the
+/// visible S3 version is the null version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GenerationId(NonZeroU64);
+
+impl GenerationId {
+    pub const MIN: Self = Self(NonZeroU64::MIN);
+
+    #[must_use]
+    pub fn new(v: u64) -> Option<Self> {
+        NonZeroU64::new(v).map(Self)
+    }
+
+    #[must_use]
+    pub fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+impl std::fmt::Display for GenerationId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.get())
+    }
+}
 
 // ── String newtypes ───────────────────────────────────────────────
 
@@ -768,8 +797,8 @@ pub struct MultipartPartRecord {
     pub etag_kind: EtagKind,
     /// 16-byte object key hash for shard keys.
     pub part_okh: [u8; 16],
-    /// Per-part shard key version field.
-    pub part_vid: u64,
+    /// Per-part payload generation for shard keys.
+    pub part_vid: GenerationId,
     pub ec_k: u8,
     pub ec_m: u8,
     /// Last modified timestamp (unix milliseconds).
@@ -789,7 +818,7 @@ pub struct ObjectPartRecord {
     pub etag: Vec<u8>,
     pub etag_kind: EtagKind,
     pub part_okh: [u8; 16],
-    pub part_vid: u64,
+    pub part_vid: GenerationId,
     pub ec_k: u8,
     pub ec_m: u8,
     /// PG where this part's shards are stored.
@@ -945,8 +974,8 @@ pub struct StreamUploadChunkRecord {
     pub size: u64,
     /// 16-byte object key hash for shard keys.
     pub chunk_okh: [u8; 16],
-    /// Version field for shard keys.
-    pub chunk_vid: u64,
+    /// Payload generation for shard keys.
+    pub chunk_vid: GenerationId,
     /// PG where this chunk's shards are stored.
     pub shard_pg_id: u32,
     pub ec_k: u8,
@@ -962,7 +991,7 @@ pub struct StreamObjectChunkRecord {
     pub chunk_index: u32,
     pub size: u64,
     pub chunk_okh: [u8; 16],
-    pub chunk_vid: u64,
+    pub chunk_vid: GenerationId,
     pub shard_pg_id: u32,
     pub ec_k: u8,
     pub ec_m: u8,
@@ -979,7 +1008,7 @@ pub struct MultipartPartChunkRecord {
     pub chunk_index: u32,
     pub size: u64,
     pub chunk_okh: [u8; 16],
-    pub chunk_vid: u64,
+    pub chunk_vid: GenerationId,
     pub shard_pg_id: u32,
     pub ec_k: u8,
     pub ec_m: u8,
