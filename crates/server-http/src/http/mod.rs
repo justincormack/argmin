@@ -1414,9 +1414,7 @@ impl HttpFrontend {
             },
             // Missing x-amz-date when declared as signed → AccessDenied
             // AWS: "AWS authentication requires a valid Date or x-amz-date header"
-            Err(auth::AuthError::MissingSignedHeader {
-                header: "x-amz-date",
-            }) => {
+            Err(auth::AuthError::MissingSignedHeader { header }) if header == "x-amz-date" => {
                 return Err(ServerError::Auth(auth::AuthError::AccessDenied));
             }
             Err(err) => return Err(ServerError::Auth(err)),

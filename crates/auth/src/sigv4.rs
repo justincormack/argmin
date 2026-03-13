@@ -6,6 +6,10 @@ use crate::canonical::{
 };
 use crate::credential::{CredentialScope, CredentialStore, SecretKey};
 use crate::error::AuthError;
+use crate::{
+    is_lower_hex, MAX_ACCESS_KEY_ID_LEN, MAX_CREDENTIAL_LEN, MAX_SIGNED_HEADERS_LEN,
+    MAX_SIGNED_HEADER_COUNT, SIGNATURE_HEX_LEN,
+};
 
 /// Parsed AWS SigV4 Authorization header.
 #[derive(Debug, Clone)]
@@ -50,9 +54,22 @@ pub fn parse_auth_header(value: &str) -> Result<SigV4Auth, AuthError> {
     let signed_headers_str = signed_headers_str.ok_or(AuthError::MalformedAuth)?;
     let signature_str = signature_str.ok_or(AuthError::MalformedAuth)?;
 
+    if credential_str.is_empty() || credential_str.len() > MAX_CREDENTIAL_LEN {
+        return Err(AuthError::MalformedAuth);
+    }
+    if signed_headers_str.is_empty() || signed_headers_str.len() > MAX_SIGNED_HEADERS_LEN {
+        return Err(AuthError::MalformedAuth);
+    }
+    if signature_str.len() != SIGNATURE_HEX_LEN || !is_lower_hex(signature_str) {
+        return Err(AuthError::MalformedAuth);
+    }
+
     // Parse credential: AKID/date/region/service/aws4_request
     let cred_parts: Vec<&str> = credential_str.splitn(5, '/').collect();
     if cred_parts.len() != 5 || cred_parts[4] != "aws4_request" {
+        return Err(AuthError::MalformedAuth);
+    }
+    if cred_parts[0].is_empty() || cred_parts[0].len() > MAX_ACCESS_KEY_ID_LEN {
         return Err(AuthError::MalformedAuth);
     }
 
@@ -69,7 +86,7 @@ pub fn parse_auth_header(value: &str) -> Result<SigV4Auth, AuthError> {
         .map(|s| s.to_string())
         .collect();
 
-    if signed_headers.is_empty() {
+    if signed_headers.is_empty() || signed_headers.len() > MAX_SIGNED_HEADER_COUNT {
         return Err(AuthError::MalformedAuth);
     }
 
@@ -139,21 +156,9 @@ pub fn verify_request(
             }
         }
         if !found {
-            // Required headers must be present
-            if signed_name == "host" {
-                return Err(AuthError::MissingSignedHeader { header: "host" });
-            }
-            if signed_name == "x-amz-date" {
-                return Err(AuthError::MissingSignedHeader {
-                    header: "x-amz-date",
-                });
-            }
-            if signed_name == "x-amz-content-sha256" {
-                return Err(AuthError::MissingSignedHeader {
-                    header: "x-amz-content-sha256",
-                });
-            }
-            // For other headers, skip if not present (lenient)
+            return Err(AuthError::MissingSignedHeader {
+                header: signed_name.clone(),
+            });
         }
     }
 
@@ -194,7 +199,7 @@ pub fn verify_request(
         .find(|(name, _)| *name == "x-amz-date")
         .map(|(_, v)| *v)
         .ok_or(AuthError::MissingSignedHeader {
-            header: "x-amz-date",
+            header: "x-amz-date".to_string(),
         })?;
 
     let scope = format!(
@@ -281,13 +286,13 @@ mod tests {
 
     #[test]
     fn parse_auth_header_missing_credential() {
-        let header = "AWS4-HMAC-SHA256 SignedHeaders=host, Signature=abc";
+        let header = "AWS4-HMAC-SHA256 SignedHeaders=host, Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         assert!(parse_auth_header(header).is_err());
     }
 
     #[test]
     fn parse_auth_header_bad_credential_format() {
-        let header = "AWS4-HMAC-SHA256 Credential=AKID/bad, SignedHeaders=host, Signature=abc";
+        let header = "AWS4-HMAC-SHA256 Credential=AKID/bad, SignedHeaders=host, Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         assert!(parse_auth_header(header).is_err());
     }
 
@@ -444,7 +449,7 @@ mod tests {
     #[test]
     fn parse_auth_header_wrong_suffix() {
         // 5 parts but last is not "aws4_request"
-        let header = "AWS4-HMAC-SHA256 Credential=AKID/20130524/us-east-1/s3/wrong_suffix, SignedHeaders=host, Signature=abc";
+        let header = "AWS4-HMAC-SHA256 Credential=AKID/20130524/us-east-1/s3/wrong_suffix, SignedHeaders=host, Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         assert!(matches!(
             parse_auth_header(header),
             Err(AuthError::MalformedAuth)
@@ -454,7 +459,7 @@ mod tests {
     #[test]
     fn parse_auth_header_missing_signed_headers() {
         let header =
-            "AWS4-HMAC-SHA256 Credential=AKID/20130524/us-east-1/s3/aws4_request, Signature=abc";
+            "AWS4-HMAC-SHA256 Credential=AKID/20130524/us-east-1/s3/aws4_request, Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         assert!(matches!(
             parse_auth_header(header),
             Err(AuthError::MalformedAuth)
@@ -470,18 +475,21 @@ mod tests {
 
     #[test]
     fn parse_auth_header_empty_signed_headers() {
-        let header = "AWS4-HMAC-SHA256 Credential=AKID/20130524/us-east-1/s3/aws4_request, SignedHeaders=, Signature=abc";
+        let header = "AWS4-HMAC-SHA256 Credential=AKID/20130524/us-east-1/s3/aws4_request, SignedHeaders=, Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let err = parse_auth_header(header).unwrap_err();
         assert_eq!(err.to_string(), AuthError::MalformedAuth.to_string());
     }
 
     #[test]
     fn parse_auth_header_ignores_unknown_components() {
-        let header = "AWS4-HMAC-SHA256 Credential=AKID/20130524/us-east-1/s3/aws4_request, Foo=bar, SignedHeaders=host, Signature=abc";
+        let header = "AWS4-HMAC-SHA256 Credential=AKID/20130524/us-east-1/s3/aws4_request, Foo=bar, SignedHeaders=host, Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let auth = parse_auth_header(header).unwrap();
         assert_eq!(auth.credential.access_key_id, "AKID");
         assert_eq!(auth.signed_headers, vec!["host"]);
-        assert_eq!(auth.signature, "abc");
+        assert_eq!(
+            auth.signature,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
     }
 
     #[test]
@@ -490,7 +498,7 @@ mod tests {
         let auth_header = "AWS4-HMAC-SHA256 \
             Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, \
             SignedHeaders=host;x-amz-content-sha256;x-amz-date, \
-            Signature=abc";
+            Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let auth = parse_auth_header(auth_header).unwrap();
         // Provide x-amz-date and x-amz-content-sha256 but NOT host
         let headers = [
@@ -511,7 +519,7 @@ mod tests {
         );
         assert!(matches!(
             result,
-            Err(AuthError::MissingSignedHeader { header: "host" })
+            Err(AuthError::MissingSignedHeader { header }) if header == "host"
         ));
     }
 
@@ -521,7 +529,7 @@ mod tests {
         let auth_header = "AWS4-HMAC-SHA256 \
             Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, \
             SignedHeaders=host;x-amz-content-sha256;x-amz-date, \
-            Signature=abc";
+            Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let auth = parse_auth_header(auth_header).unwrap();
         // Provide host and x-amz-content-sha256 but NOT x-amz-date
         let headers = [
@@ -542,9 +550,7 @@ mod tests {
         );
         assert!(matches!(
             result,
-            Err(AuthError::MissingSignedHeader {
-                header: "x-amz-date"
-            })
+            Err(AuthError::MissingSignedHeader { header }) if header == "x-amz-date"
         ));
     }
 
@@ -554,7 +560,7 @@ mod tests {
         let auth_header = "AWS4-HMAC-SHA256 \
             Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, \
             SignedHeaders=host;x-amz-content-sha256;x-amz-date, \
-            Signature=abc";
+            Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let auth = parse_auth_header(auth_header).unwrap();
         // Provide host and x-amz-date but NOT x-amz-content-sha256
         let headers = [("host", "example.com"), ("x-amz-date", "20130524T000000Z")];
@@ -569,21 +575,17 @@ mod tests {
         );
         assert!(matches!(
             result,
-            Err(AuthError::MissingSignedHeader {
-                header: "x-amz-content-sha256"
-            })
+            Err(AuthError::MissingSignedHeader { header }) if header == "x-amz-content-sha256"
         ));
     }
 
     #[test]
-    fn verify_request_missing_optional_header_is_lenient() {
-        // A signed header that is not host/x-amz-date/x-amz-content-sha256
-        // should be silently skipped if not present.
+    fn verify_request_missing_optional_header_is_rejected() {
         let store = example_store();
         let auth_header = "AWS4-HMAC-SHA256 \
             Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, \
             SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-custom-header, \
-            Signature=abc";
+            Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let auth = parse_auth_header(auth_header).unwrap();
         let headers = [
             ("host", "example.com"),
@@ -603,10 +605,10 @@ mod tests {
             &auth,
             &store,
         );
-        // Should NOT fail with MissingSignedHeader — it'll fail with SignatureMismatch
-        // because the signature "abc" is wrong, but it should get past the header check.
-        let err = result.unwrap_err();
-        assert_eq!(err.to_string(), AuthError::SignatureMismatch.to_string());
+        assert!(matches!(
+            result,
+            Err(AuthError::MissingSignedHeader { header }) if header == "x-custom-header"
+        ));
     }
 
     #[test]
@@ -623,7 +625,7 @@ mod tests {
         let auth_header = "AWS4-HMAC-SHA256 \
             Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, \
             SignedHeaders=host;x-amz-date, \
-            Signature=abc";
+            Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let auth = parse_auth_header(auth_header).unwrap();
         let headers = [("host", "example.com"), ("x-amz-date", "20130524T000000Z")];
         let result = verify_request(
@@ -645,7 +647,7 @@ mod tests {
         let auth_header = "AWS4-HMAC-SHA256 \
             Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, \
             SignedHeaders=host;x-amz-content-sha256;x-amz-date, \
-            Signature=abc";
+            Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let auth = parse_auth_header(auth_header).unwrap();
         // x-amz-meta-custom is present but not in SignedHeaders
         let headers = [
@@ -675,7 +677,7 @@ mod tests {
         let auth_header = "AWS4-HMAC-SHA256 \
             Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, \
             SignedHeaders=host;x-amz-content-sha256;x-amz-date, \
-            Signature=abc";
+            Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let auth = parse_auth_header(auth_header).unwrap();
         // Two instances of the same unsigned x-amz header — should only appear once in error
         let headers = [
@@ -711,7 +713,7 @@ mod tests {
         let auth_header = "AWS4-HMAC-SHA256 \
             Credential=UNKNOWNKEY123456/20130524/us-east-1/s3/aws4_request, \
             SignedHeaders=host;x-amz-date, \
-            Signature=abc";
+            Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
         let auth = parse_auth_header(auth_header).unwrap();
         let headers = [("host", "example.com"), ("x-amz-date", "20130524T000000Z")];

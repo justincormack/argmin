@@ -41,17 +41,17 @@ Implemented:
 
 ### 1. Header SigV4 Hardening
 
-Still missing:
+Completed:
 - Header SigV4 credential scope region validation
 - Header SigV4 credential scope service validation
 - Strict enforcement that every header named in `SignedHeaders` is present
-  - current behavior is still lenient for non-required signed headers
 - Explicit auth parsing size/count limits
   - `Authorization` header length
   - presigned query length
   - token length
   - signed-header count
-- Duplicate `Authorization` header rejection
+- Duplicate `Authorization` handling
+  - AWS-compatible `501 NotImplemented` for duplicate `Authorization`
 
 ### 2. Auth Error Mapping
 
@@ -127,14 +127,14 @@ Minimal intended behavior after this follow-up:
 ### Phase 1: Header Auth Hardening
 
 Deliver:
-- header region/service scope validation
-- strict signed-header enforcement
-- duplicate `Authorization` rejection
-- auth size/count limits
-- explicit error mapping for token failures
+- Completed
 
 Success criteria:
-- the currently ignored header-auth tests are enabled and passing
+- the formerly ignored header-auth tests are enabled and passing
+- targeted AWS checks match the local behavior for:
+  - wrong region
+  - wrong service
+  - duplicate `Authorization`
 
 ### Phase 2: ACL Surface Completion
 

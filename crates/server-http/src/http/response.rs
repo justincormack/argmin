@@ -879,6 +879,11 @@ impl S3Response {
                 );
                 return Self::new(403).xml_body(body);
             }
+            ServerError::Auth(auth::AuthError::DuplicateAuthorizationHeader) => {
+                let body =
+                    xml::header_not_implemented_xml("Authorization", resource, "request-id");
+                return Self::new(501).xml_body(body);
+            }
             _ => {}
         }
 

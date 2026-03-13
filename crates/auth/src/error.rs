@@ -14,6 +14,8 @@ pub enum AuthError {
     InvalidQueryParam { param: &'static str },
     #[error("unknown access key id")]
     UnknownAccessKey,
+    #[error("duplicate Authorization header")]
+    DuplicateAuthorizationHeader,
     #[error("access denied")]
     AccessDenied,
     #[error("signature mismatch")]
@@ -23,7 +25,7 @@ pub enum AuthError {
     #[error("token expired")]
     ExpiredToken,
     #[error("missing required signed header: {header}")]
-    MissingSignedHeader { header: &'static str },
+    MissingSignedHeader { header: String },
     #[error("request timestamp is too far from server time")]
     RequestExpired,
     #[error("there were headers present in the request which were not signed")]

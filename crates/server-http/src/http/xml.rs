@@ -47,6 +47,24 @@ pub fn error_xml(code: &str, message: &str, resource: &str, request_id: &str) ->
     )
 }
 
+/// Format an S3 `NotImplemented` error that identifies the header causing it.
+#[must_use]
+pub fn header_not_implemented_xml(header: &str, resource: &str, request_id: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <Error>\
+         <Code>NotImplemented</Code>\
+         <Message>A header you provided implies functionality that is not implemented</Message>\
+         <Header>{}</Header>\
+         <Resource>{}</Resource>\
+         <RequestId>{}</RequestId>\
+         </Error>",
+        xml_escape(header),
+        xml_escape(resource),
+        xml_escape(request_id),
+    )
+}
+
 /// Format a `ListAllMyBucketsResult` XML response.
 #[must_use]
 pub fn list_buckets_xml(buckets: &[BucketSummary], owner_principal: &str) -> String {

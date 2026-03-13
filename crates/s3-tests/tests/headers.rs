@@ -1216,7 +1216,6 @@ fn test_put_bad_credential_scope() {
 }
 
 #[test]
-#[ignore = "not implemented: header auth region/service scope validation"]
 fn test_put_wrong_region() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;
@@ -1237,14 +1236,13 @@ fn test_put_wrong_region() {
             .expect("transport error");
         let status = resp.status().as_u16();
         let rbody = resp.body_mut().read_to_string().unwrap();
-        assert_eq!(status, 403, "expected 403, got {}", status);
-        assert_error_code(&rbody, "AccessDenied");
+        assert_eq!(status, 400, "expected 400, got {}", status);
+        assert_error_code(&rbody, "AuthorizationHeaderMalformed");
         cleanup(&bucket, &[]).await;
     });
 }
 
 #[test]
-#[ignore = "not implemented: header auth region/service scope validation"]
 fn test_put_wrong_service() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;
@@ -1265,8 +1263,8 @@ fn test_put_wrong_service() {
             .expect("transport error");
         let status = resp.status().as_u16();
         let rbody = resp.body_mut().read_to_string().unwrap();
-        assert_eq!(status, 403, "expected 403, got {}", status);
-        assert_error_code(&rbody, "AccessDenied");
+        assert_eq!(status, 400, "expected 400, got {}", status);
+        assert_error_code(&rbody, "AuthorizationHeaderMalformed");
         cleanup(&bucket, &[]).await;
     });
 }
@@ -1302,7 +1300,6 @@ fn test_put_invalid_percent_encoding_in_key() {
 }
 
 #[test]
-#[ignore = "not implemented: duplicate Authorization header rejection"]
 fn test_put_duplicate_authorization() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;
@@ -1322,9 +1319,12 @@ fn test_put_duplicate_authorization() {
             .expect("transport error");
         let status = resp.status().as_u16();
         let rbody = resp.body_mut().read_to_string().unwrap();
-        // Duplicate auth headers should cause auth failure
-        assert_eq!(status, 403, "expected 403, got {}", status);
-        assert_error_code(&rbody, "AccessDenied");
+        assert_eq!(status, 501, "expected 501, got {}", status);
+        assert_error_code(&rbody, "NotImplemented");
+        assert!(
+            rbody.contains("<Header>Authorization</Header>"),
+            "expected Header element in response body, got {rbody}"
+        );
         cleanup(&bucket, &[]).await;
     });
 }

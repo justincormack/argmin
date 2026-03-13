@@ -167,8 +167,11 @@ impl ServerError {
             Self::Auth(auth::AuthError::MalformedAuth) => "AuthorizationHeaderMalformed",
             Self::Auth(auth::AuthError::UnsupportedAuthType) => "InvalidArgument",
             Self::Auth(auth::AuthError::UnknownAccessKey) => "InvalidAccessKeyId",
+            Self::Auth(auth::AuthError::DuplicateAuthorizationHeader) => "NotImplemented",
             Self::Auth(auth::AuthError::SignatureMismatch) => "SignatureDoesNotMatch",
             Self::Auth(auth::AuthError::RequestExpired) => "RequestTimeTooSkewed",
+            Self::Auth(auth::AuthError::ExpiredToken) => "ExpiredToken",
+            Self::Auth(auth::AuthError::InvalidToken) => "InvalidToken",
             Self::Auth(auth::AuthError::InvalidQueryParam { .. }) => {
                 "AuthorizationQueryParametersError"
             }
@@ -236,6 +239,7 @@ impl ServerError {
                 | auth::AuthError::InvalidQueryParam { .. }
                 | auth::AuthError::MissingQueryParam { .. },
             ) => 400,
+            Self::Auth(auth::AuthError::DuplicateAuthorizationHeader) => 501,
             Self::Auth(_) => 403,
             Self::InvalidRequest { .. }
             | Self::InvalidArgument { .. }
@@ -339,6 +343,12 @@ mod tests {
     }
 
     #[test]
+    fn s3_error_code_auth_duplicate_authorization() {
+        let err = ServerError::Auth(auth::AuthError::DuplicateAuthorizationHeader);
+        assert_eq!(err.s3_error_code(), "NotImplemented");
+    }
+
+    #[test]
     fn s3_error_code_auth_signature_mismatch() {
         let err = ServerError::Auth(auth::AuthError::SignatureMismatch);
         assert_eq!(err.s3_error_code(), "SignatureDoesNotMatch");
@@ -352,7 +362,9 @@ mod tests {
 
     #[test]
     fn s3_error_code_auth_wildcard() {
-        let err = ServerError::Auth(auth::AuthError::MissingSignedHeader { header: "host" });
+        let err = ServerError::Auth(auth::AuthError::MissingSignedHeader {
+            header: "host".to_string(),
+        });
         assert_eq!(err.s3_error_code(), "AccessDenied");
     }
 
@@ -363,10 +375,30 @@ mod tests {
     }
 
     #[test]
+    fn s3_error_code_auth_invalid_token() {
+        let err = ServerError::Auth(auth::AuthError::InvalidToken);
+        assert_eq!(err.s3_error_code(), "InvalidToken");
+    }
+
+    #[test]
+    fn s3_error_code_auth_expired_token() {
+        let err = ServerError::Auth(auth::AuthError::ExpiredToken);
+        assert_eq!(err.s3_error_code(), "ExpiredToken");
+    }
+
+    #[test]
     fn http_status_auth_malformed_400() {
         assert_eq!(
             ServerError::Auth(auth::AuthError::MalformedAuth).http_status(),
             400
+        );
+    }
+
+    #[test]
+    fn http_status_auth_duplicate_authorization_501() {
+        assert_eq!(
+            ServerError::Auth(auth::AuthError::DuplicateAuthorizationHeader).http_status(),
+            501
         );
     }
 
