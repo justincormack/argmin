@@ -394,6 +394,48 @@ fn test_object_copy_16m() {
     });
 }
 
+#[test]
+fn test_object_copy_read_16m() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let size = 16 * 1024 * 1024;
+        let data = vec![0u8; size];
+
+        CTX.client()
+            .put_object()
+            .bucket(&bucket)
+            .key("obj1")
+            .body(ByteStream::from(data.clone()))
+            .send()
+            .await
+            .unwrap();
+
+        CTX.client()
+            .copy_object()
+            .bucket(&bucket)
+            .key("obj2")
+            .copy_source(format!("{}/obj1", bucket))
+            .send()
+            .await
+            .unwrap();
+
+        let resp = CTX
+            .client()
+            .get_object()
+            .bucket(&bucket)
+            .key("obj2")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.content_length(), Some(size as i64));
+        let body = resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(body.len(), size);
+        assert_eq!(&body[..], &data[..]);
+
+        cleanup(&bucket, &["obj1", "obj2"]).await;
+    });
+}
+
 // ── Versioned copy ──────────────────────────────────────────────────
 
 #[test]
