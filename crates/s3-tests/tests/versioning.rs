@@ -1677,6 +1677,54 @@ fn test_list_object_versions_includes_owner() {
 }
 
 #[test]
+fn test_list_object_versions_delete_marker_includes_owner() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_versioned_bucket().await;
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("owned")
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+
+        let del_resp = client
+            .delete_object()
+            .bucket(&bucket)
+            .key("owned")
+            .send()
+            .await
+            .unwrap();
+        assert!(del_resp.delete_marker().unwrap_or(false));
+
+        let resp = client
+            .list_object_versions()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+
+        let delete_marker = resp
+            .delete_markers()
+            .iter()
+            .find(|v| v.key() == Some("owned"))
+            .expect("expected delete marker entry for deleted object");
+        let owner = delete_marker
+            .owner()
+            .expect("expected owner in delete marker entry");
+        let owner_id = owner
+            .id()
+            .expect("expected owner ID in delete marker entry");
+        assert_canonical_owner_id(owner_id);
+
+        cleanup_versioned_bucket(client, &bucket).await;
+    });
+}
+
+#[test]
 fn test_versioning_bucket_multipart_upload_return_version_id() {
     s3_tests::run(async {
         use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
