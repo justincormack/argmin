@@ -6,6 +6,19 @@ use s3_tests::{cleanup_versioned_bucket, err_status, unique_bucket, CTX};
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
+fn assert_canonical_owner_id(id: &str) {
+    assert_eq!(
+        id.len(),
+        64,
+        "expected 64-char canonical owner ID, got {id}"
+    );
+    assert!(
+        id.bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+        "expected lowercase hex canonical owner ID, got {id}"
+    );
+}
+
 async fn setup_versioned_bucket() -> String {
     let client = CTX.client();
     let bucket = unique_bucket();
@@ -1625,6 +1638,41 @@ fn test_versioning_obj_create_overwrite_multipart() {
         assert_eq!(&body[..], b"original");
 
         cleanup_versioned(&bucket, key, &[v1, v2]).await;
+    });
+}
+
+#[test]
+fn test_list_object_versions_includes_owner() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_versioned_bucket().await;
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("owned")
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+
+        let resp = client
+            .list_object_versions()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+
+        let version = resp
+            .versions()
+            .iter()
+            .find(|v| v.key() == Some("owned"))
+            .expect("expected version entry for uploaded object");
+        let owner = version.owner().expect("expected owner in version entry");
+        let owner_id = owner.id().expect("expected owner ID in version entry");
+        assert_canonical_owner_id(owner_id);
+
+        cleanup_versioned_bucket(client, &bucket).await;
     });
 }
 

@@ -1137,6 +1137,8 @@ pub struct ListObjectVersionsResult {
     pub is_truncated: bool,
     pub next_key_marker: Option<String>,
     pub next_version_id_marker: Option<VersionId>,
+    pub owner_principal: String,
+    pub owner_canonical_id: CanonicalUserId,
 }
 
 /// Result of a DeleteObject operation.
@@ -5799,7 +5801,7 @@ impl Coordinator {
         let key_marker = req.key_marker;
         let version_id_marker = req.version_id_marker;
         let max_keys = req.max_keys;
-        let _bucket_info = self.authorize_bucket_read_requester(req.requester, bucket)?;
+        let bucket_info = self.authorize_bucket_read_requester(req.requester, bucket)?;
 
         if max_keys == 0 {
             return Ok(ListObjectVersionsResult {
@@ -5807,6 +5809,8 @@ impl Coordinator {
                 is_truncated: false,
                 next_key_marker: None,
                 next_version_id_marker: None,
+                owner_principal: bucket_info.owner_principal,
+                owner_canonical_id: bucket_info.owner_canonical_id,
             });
         }
 
@@ -5879,6 +5883,8 @@ impl Coordinator {
             is_truncated,
             next_key_marker,
             next_version_id_marker,
+            owner_principal: bucket_info.owner_principal,
+            owner_canonical_id: bucket_info.owner_canonical_id,
         })
     }
 

@@ -758,6 +758,9 @@ pub fn list_object_versions_xml(
         xml.push_str("</NextVersionIdMarker>");
     }
 
+    let owner_id = result.owner_canonical_id.as_str();
+    let owner_name = result.owner_principal.as_str();
+
     for entry in &result.versions {
         let vid = format_version_id(entry.version_id);
         let is_latest = if entry.is_latest { "true" } else { "false" };
@@ -776,6 +779,11 @@ pub fn list_object_versions_xml(
             xml.push_str("<LastModified>");
             xml.push_str(&format_timestamp(entry.last_modified));
             xml.push_str("</LastModified>");
+            xml.push_str("<Owner><ID>");
+            xml.push_str(&xml_escape(owner_id));
+            xml.push_str("</ID><DisplayName>");
+            xml.push_str(&xml_escape(owner_name));
+            xml.push_str("</DisplayName></Owner>");
             xml.push_str("</DeleteMarker>");
         } else {
             xml.push_str("<Version>");
@@ -798,6 +806,11 @@ pub fn list_object_versions_xml(
             xml.push_str(&entry.size.to_string());
             xml.push_str("</Size>");
             xml.push_str("<StorageClass>STANDARD</StorageClass>");
+            xml.push_str("<Owner><ID>");
+            xml.push_str(&xml_escape(owner_id));
+            xml.push_str("</ID><DisplayName>");
+            xml.push_str(&xml_escape(owner_name));
+            xml.push_str("</DisplayName></Owner>");
             xml.push_str("</Version>");
         }
     }
@@ -2841,6 +2854,8 @@ mod tests {
             is_truncated: false,
             next_key_marker: None,
             next_version_id_marker: None,
+            owner_principal: "owner".to_string(),
+            owner_canonical_id: CanonicalUserId::from_principal("owner"),
         };
         let xml = list_object_versions_xml("bucket", None, None, 1000, &result);
         assert!(xml.contains("ListVersionsResult"));
@@ -2849,6 +2864,10 @@ mod tests {
         assert!(xml.contains("<VersionId>null</VersionId>"));
         assert!(xml.contains("<IsLatest>true</IsLatest>"));
         assert!(xml.contains("<Size>42</Size>"));
+        assert!(xml.contains(&format!(
+            "<Owner><ID>{}</ID><DisplayName>owner</DisplayName></Owner>",
+            result.owner_canonical_id.as_str()
+        )));
         assert!(xml.contains("<KeyMarker/>"));
         assert!(!xml.contains("<KeyCount>"));
     }
@@ -2861,6 +2880,8 @@ mod tests {
             is_truncated: false,
             next_key_marker: None,
             next_version_id_marker: None,
+            owner_principal: "owner".to_string(),
+            owner_canonical_id: CanonicalUserId::from_principal("owner"),
         };
         let xml = list_object_versions_xml("bucket", None, None, 1000, &result);
         assert!(xml.contains("ListVersionsResult"));
@@ -2875,10 +2896,39 @@ mod tests {
             is_truncated: false,
             next_key_marker: None,
             next_version_id_marker: None,
+            owner_principal: "owner".to_string(),
+            owner_canonical_id: CanonicalUserId::from_principal("owner"),
         };
         let xml = list_object_versions_xml("bucket", Some("photos/"), Some("key1"), 100, &result);
         assert!(xml.contains("<Prefix>photos/</Prefix>"));
         assert!(xml.contains("<KeyMarker>key1</KeyMarker>"));
+    }
+
+    #[test]
+    fn list_object_versions_xml_delete_marker_includes_owner() {
+        use crate::coordinator::{ListObjectVersionsResult, VersionEntry};
+        let result = ListObjectVersionsResult {
+            versions: vec![VersionEntry {
+                key: "gone".to_string(),
+                version_id: VersionId::Null,
+                is_latest: true,
+                size: 0,
+                etag: String::new(),
+                last_modified: 1685000000000,
+                is_delete_marker: true,
+            }],
+            is_truncated: false,
+            next_key_marker: None,
+            next_version_id_marker: None,
+            owner_principal: "owner".to_string(),
+            owner_canonical_id: CanonicalUserId::from_principal("owner"),
+        };
+        let xml = list_object_versions_xml("bucket", None, None, 1000, &result);
+        assert!(xml.contains("<DeleteMarker>"));
+        assert!(xml.contains(&format!(
+            "<Owner><ID>{}</ID><DisplayName>owner</DisplayName></Owner>",
+            result.owner_canonical_id.as_str()
+        )));
     }
 
     #[test]

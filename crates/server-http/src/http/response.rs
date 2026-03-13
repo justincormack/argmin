@@ -1570,12 +1570,15 @@ mod tests {
             is_truncated: false,
             next_key_marker: None,
             next_version_id_marker: None,
+            owner_principal: "owner".into(),
+            owner_canonical_id: CanonicalUserId::from_principal("owner"),
         };
         let resp = S3Response::list_object_versions("bucket", None, None, 1000, &result);
         assert_eq!(resp.status_code, 200);
         let body = String::from_utf8(resp.body).unwrap();
         assert!(body.contains("ListVersionsResult"));
         assert!(body.contains("<VersionId>null</VersionId>"));
+        assert!(body.contains(result.owner_canonical_id.as_str()));
     }
 
     // ── parse_http_date ────────────────────────────────────────────
