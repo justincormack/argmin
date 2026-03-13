@@ -1954,7 +1954,83 @@ fn test_bucket_listv2_prefix_delimiter_basic() {
 }
 
 #[test]
-#[ignore = "not implemented: versioning"]
 fn test_bucket_list_return_data_versioning() {
-    s3_tests::run(async {});
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client
+            .create_bucket()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+
+        // Enable versioning.
+        client
+            .put_bucket_versioning()
+            .bucket(&bucket)
+            .versioning_configuration(
+                aws_sdk_s3::types::VersioningConfiguration::builder()
+                    .status(aws_sdk_s3::types::BucketVersioningStatus::Enabled)
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let key_names = ["bar", "baz", "foo"];
+        for key in &key_names {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(*key)
+                .body(aws_sdk_s3::primitives::ByteStream::from_static(b"data"))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        // Gather expected metadata from HeadObject.
+        let mut expected: std::collections::HashMap<String, (String, i64, String)> =
+            std::collections::HashMap::new();
+        for key in &key_names {
+            let head = client
+                .head_object()
+                .bucket(&bucket)
+                .key(*key)
+                .send()
+                .await
+                .unwrap();
+            let etag = head.e_tag().unwrap().to_string();
+            let size = head.content_length().unwrap();
+            let version_id = head.version_id().unwrap().to_string();
+            expected.insert(key.to_string(), (etag, size, version_id));
+        }
+
+        // List object versions and verify.
+        let resp = client
+            .list_object_versions()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        let versions = resp.versions();
+
+        assert_eq!(versions.len(), 3);
+        for v in versions {
+            let key = v.key().unwrap();
+            let (exp_etag, exp_size, exp_version_id) = expected.get(key).unwrap();
+            assert_eq!(v.e_tag().unwrap(), exp_etag);
+            assert_eq!(v.size().unwrap(), *exp_size);
+            assert_eq!(v.version_id().unwrap(), exp_version_id);
+            assert!(v.last_modified().is_some());
+            assert_eq!(v.is_latest(), Some(true));
+            // Owner must be present with a valid canonical ID (no DisplayName).
+            let owner = v.owner().expect("version should have Owner");
+            assert_canonical_owner_id(owner.id().unwrap());
+            assert_eq!(owner.display_name(), None);
+        }
+
+        s3_tests::cleanup_versioned_bucket(client, &bucket).await;
+    });
 }

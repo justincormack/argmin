@@ -759,7 +759,6 @@ pub fn list_object_versions_xml(
     }
 
     let owner_id = result.owner_canonical_id.as_str();
-    let owner_name = result.owner_principal.as_str();
 
     for entry in &result.versions {
         let vid = format_version_id(entry.version_id);
@@ -781,9 +780,7 @@ pub fn list_object_versions_xml(
             xml.push_str("</LastModified>");
             xml.push_str("<Owner><ID>");
             xml.push_str(&xml_escape(owner_id));
-            xml.push_str("</ID><DisplayName>");
-            xml.push_str(&xml_escape(owner_name));
-            xml.push_str("</DisplayName></Owner>");
+            xml.push_str("</ID></Owner>");
             xml.push_str("</DeleteMarker>");
         } else {
             xml.push_str("<Version>");
@@ -808,9 +805,7 @@ pub fn list_object_versions_xml(
             xml.push_str("<StorageClass>STANDARD</StorageClass>");
             xml.push_str("<Owner><ID>");
             xml.push_str(&xml_escape(owner_id));
-            xml.push_str("</ID><DisplayName>");
-            xml.push_str(&xml_escape(owner_name));
-            xml.push_str("</DisplayName></Owner>");
+            xml.push_str("</ID></Owner>");
             xml.push_str("</Version>");
         }
     }
@@ -2865,9 +2860,10 @@ mod tests {
         assert!(xml.contains("<IsLatest>true</IsLatest>"));
         assert!(xml.contains("<Size>42</Size>"));
         assert!(xml.contains(&format!(
-            "<Owner><ID>{}</ID><DisplayName>owner</DisplayName></Owner>",
+            "<Owner><ID>{}</ID></Owner>",
             result.owner_canonical_id.as_str()
         )));
+        assert!(!xml.contains("<DisplayName>"));
         assert!(xml.contains("<KeyMarker/>"));
         assert!(!xml.contains("<KeyCount>"));
     }
@@ -2926,9 +2922,10 @@ mod tests {
         let xml = list_object_versions_xml("bucket", None, None, 1000, &result);
         assert!(xml.contains("<DeleteMarker>"));
         assert!(xml.contains(&format!(
-            "<Owner><ID>{}</ID><DisplayName>owner</DisplayName></Owner>",
+            "<Owner><ID>{}</ID></Owner>",
             result.owner_canonical_id.as_str()
         )));
+        assert!(!xml.contains("<DisplayName>"));
     }
 
     #[test]
