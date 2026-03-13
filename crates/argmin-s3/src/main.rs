@@ -82,7 +82,7 @@ async fn main() {
     };
 
     eprintln!(
-        "argmin-s3 listening on {} (EC {},{}, {} PGs, {} workers, max {} conns, max {} in-flight, region {})",
+        "argmin-s3 listening on {} (EC {},{}, {} PGs, {} workers, max {} conns, max {} in-flight, read chunk {} bytes, region {})",
         config.listen_addr,
         config.ec_k,
         config.ec_m,
@@ -90,6 +90,7 @@ async fn main() {
         config.workers,
         config.max_connections,
         config.max_inflight_requests,
+        config.stream_read_chunk_size,
         config.region
     );
 
@@ -98,7 +99,10 @@ async fn main() {
         frontends,
         config.max_connections,
         config.max_inflight_requests,
-        server_http::http::serve::ServeConfig::default(),
+        server_http::http::serve::ServeConfig {
+            stream_read_chunk_size: config.stream_read_chunk_size,
+            ..server_http::http::serve::ServeConfig::default()
+        },
     )
     .await;
 }

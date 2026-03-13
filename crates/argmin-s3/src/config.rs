@@ -13,6 +13,7 @@ pub(crate) struct ServerConfig {
     pub(crate) workers: u32,
     pub(crate) max_connections: u32,
     pub(crate) max_inflight_requests: u32,
+    pub(crate) stream_read_chunk_size: usize,
 }
 
 impl ServerConfig {
@@ -29,6 +30,7 @@ impl ServerConfig {
     ///   `ARGMIN_WORKERS` (4)
     ///   `ARGMIN_MAX_CONNECTIONS` (512)
     ///   `ARGMIN_MAX_INFLIGHT_REQUESTS` (32)
+    ///   `ARGMIN_STREAM_READ_CHUNK_SIZE` (1048576)
     pub(crate) fn from_env() -> Result<Self, String> {
         Self::from_lookup(|key| std::env::var(key).ok())
     }
@@ -68,6 +70,10 @@ impl ServerConfig {
             .unwrap_or_else(|| "32".to_string())
             .parse()
             .map_err(|e| format!("invalid ARGMIN_MAX_INFLIGHT_REQUESTS: {e}"))?;
+        let stream_read_chunk_size: usize = get("ARGMIN_STREAM_READ_CHUNK_SIZE")
+            .unwrap_or_else(|| (1024 * 1024).to_string())
+            .parse()
+            .map_err(|e| format!("invalid ARGMIN_STREAM_READ_CHUNK_SIZE: {e}"))?;
 
         if pg_count == 0 {
             return Err("ARGMIN_PG_COUNT must be > 0".to_string());
@@ -80,6 +86,9 @@ impl ServerConfig {
         }
         if max_inflight_requests == 0 {
             return Err("ARGMIN_MAX_INFLIGHT_REQUESTS must be > 0".to_string());
+        }
+        if stream_read_chunk_size == 0 {
+            return Err("ARGMIN_STREAM_READ_CHUNK_SIZE must be > 0".to_string());
         }
 
         Ok(Self {
@@ -94,6 +103,7 @@ impl ServerConfig {
             workers,
             max_connections,
             max_inflight_requests,
+            stream_read_chunk_size,
         })
     }
 }
@@ -150,6 +160,7 @@ mod tests {
         assert_eq!(cfg.workers, 4);
         assert_eq!(cfg.max_connections, 512);
         assert_eq!(cfg.max_inflight_requests, 32);
+        assert_eq!(cfg.stream_read_chunk_size, 1024 * 1024);
         assert_eq!(cfg.access_key_id, "AKID");
         assert_eq!(cfg.secret_access_key, "SECRET");
     }
@@ -175,6 +186,7 @@ mod tests {
         assert_eq!(cfg.region, "eu-west-1");
         assert_eq!(cfg.workers, 4); // not overridden, uses default
         assert_eq!(cfg.max_inflight_requests, 32); // not overridden, uses default
+        assert_eq!(cfg.stream_read_chunk_size, 1024 * 1024);
         assert_eq!(cfg.access_key_id, "mykey");
         assert_eq!(cfg.secret_access_key, "mysecret");
     }
@@ -320,5 +332,27 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(err.contains("ARGMIN_MAX_INFLIGHT_REQUESTS"));
+    }
+
+    #[test]
+    fn custom_stream_read_chunk_size() {
+        let cfg = ServerConfig::from_lookup(make_env(&[
+            ("ARGMIN_ACCESS_KEY_ID", "a"),
+            ("ARGMIN_SECRET_ACCESS_KEY", "s"),
+            ("ARGMIN_STREAM_READ_CHUNK_SIZE", "8388608"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.stream_read_chunk_size, 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn stream_read_chunk_size_zero() {
+        let err = ServerConfig::from_lookup(make_env(&[
+            ("ARGMIN_ACCESS_KEY_ID", "a"),
+            ("ARGMIN_SECRET_ACCESS_KEY", "s"),
+            ("ARGMIN_STREAM_READ_CHUNK_SIZE", "0"),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("ARGMIN_STREAM_READ_CHUNK_SIZE must be > 0"));
     }
 }

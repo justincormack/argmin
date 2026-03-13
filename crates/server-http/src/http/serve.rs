@@ -164,6 +164,9 @@ pub struct ServeConfig {
     /// slow-but-steady uploads complete; only truly stalled connections are
     /// killed.
     pub body_idle_timeout: Duration,
+    /// Chunk size used when pulling data from core `ReadHandle`s into the HTTP
+    /// response body stream.
+    pub stream_read_chunk_size: usize,
 }
 
 impl Default for ServeConfig {
@@ -172,6 +175,7 @@ impl Default for ServeConfig {
             header_read_timeout: Duration::from_secs(30),
             request_wait_timeout: Duration::from_secs(5),
             body_idle_timeout: Duration::from_secs(30),
+            stream_read_chunk_size: 1024 * 1024,
         }
     }
 }
@@ -281,7 +285,11 @@ async fn handle(
         permit
     } else {
         let resp = S3Response::error(&ServerError::SlowDown, "");
-        return Ok(s3_response_to_hyper(resp, None));
+        return Ok(s3_response_to_hyper(
+            resp,
+            None,
+            state.config.stream_read_chunk_size,
+        ));
     };
 
     let (parts, body) = req.into_parts();
@@ -294,6 +302,7 @@ async fn handle(
                 return Ok(s3_response_to_hyper(
                     S3Response::error(&err, ""),
                     Some(req_permit),
+                    state.config.stream_read_chunk_size,
                 ))
             }
         };
@@ -320,12 +329,20 @@ async fn handle(
                 .await
             }
         };
-        return Ok(s3_response_to_hyper(resp, Some(req_permit)));
+        return Ok(s3_response_to_hyper(
+            resp,
+            Some(req_permit),
+            state.config.stream_read_chunk_size,
+        ));
     }
 
     if let Some(bucket) = post_object_bucket(&parts) {
         let resp = handle_streaming_post_object(Arc::clone(&state), parts, body, bucket).await;
-        return Ok(s3_response_to_hyper(resp, Some(req_permit)));
+        return Ok(s3_response_to_hyper(
+            resp,
+            Some(req_permit),
+            state.config.stream_read_chunk_size,
+        ));
     }
 
     // Non-streaming path: collect the full body for buffered control-plane
@@ -336,6 +353,7 @@ async fn handle(
             return Ok(s3_response_to_hyper(
                 S3Response::error(&err, ""),
                 Some(req_permit),
+                state.config.stream_read_chunk_size,
             ));
         }
     };
@@ -346,6 +364,7 @@ async fn handle(
             return Ok(s3_response_to_hyper(
                 S3Response::error(&err, ""),
                 Some(req_permit),
+                state.config.stream_read_chunk_size,
             ));
         }
     };
@@ -365,7 +384,11 @@ async fn handle(
         )
     });
 
-    Ok(s3_response_to_hyper(resp, Some(req_permit)))
+    Ok(s3_response_to_hyper(
+        resp,
+        Some(req_permit),
+        state.config.stream_read_chunk_size,
+    ))
 }
 
 /// Check if a PUT request should use the streaming write path.

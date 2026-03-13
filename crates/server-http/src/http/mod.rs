@@ -89,14 +89,16 @@ impl S3HyperBody {
         }
     }
 
-    fn streaming(body: crate::coordinator::ReadHandle, permit: OwnedSemaphorePermit) -> Self {
-        const STREAM_READ_CHUNK_SIZE: usize = 1024 * 1024;
-
+    fn streaming(
+        body: crate::coordinator::ReadHandle,
+        permit: OwnedSemaphorePermit,
+        read_chunk_size: usize,
+    ) -> Self {
         let (tx, rx) = mpsc::channel(2);
         tokio::task::spawn_blocking(move || {
             let mut body = body;
             loop {
-                match body.next_chunk(STREAM_READ_CHUNK_SIZE) {
+                match body.next_chunk(read_chunk_size) {
                     Ok(Some(chunk)) => {
                         if tx.blocking_send(Ok(Bytes::from(chunk))).is_err() {
                             break;
@@ -2237,6 +2239,7 @@ pub struct StreamingPartContext {
 pub fn s3_response_to_hyper(
     resp: S3Response,
     permit: Option<OwnedSemaphorePermit>,
+    stream_read_chunk_size: usize,
 ) -> http::Response<S3HyperBody> {
     let mut builder = http::Response::builder().status(resp.status_code);
     for (name, value) in &resp.headers {
@@ -2246,6 +2249,7 @@ pub fn s3_response_to_hyper(
         Some(stream) => S3HyperBody::streaming(
             stream,
             permit.expect("streaming response requires request permit"),
+            stream_read_chunk_size,
         ),
         None => S3HyperBody::buffered(resp.body, permit),
     };
