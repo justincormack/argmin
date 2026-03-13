@@ -10,8 +10,6 @@ remaining is limited and should be treated as a follow-up plan, not a greenfield
 auth design.
 
 This follow-up covers:
-- header SigV4 hardening gaps
-- remaining auth error mapping gaps
 - remaining ACL/authz gaps
 - owner identity compatibility gaps
 - full object ownership compatibility gaps
@@ -59,11 +57,10 @@ Completed:
 
 ### 2. Auth Error Mapping
 
-Still missing or incomplete:
-- `ExpiredToken` should map explicitly, not collapse to generic `AccessDenied`
-- `InvalidToken` should map explicitly, not collapse to generic `AccessDenied`
-- `AuthorizationHeaderMalformed` remains coarse; the remaining region/service
-  scope failures should map through it consistently once implemented
+Completed:
+- `ExpiredToken` maps explicitly
+- `InvalidToken` maps explicitly
+- malformed header scope failures route through `AuthorizationHeaderMalformed`
 
 ### 3. ACL and Authorization Surface
 
@@ -104,10 +101,14 @@ Notes:
 ### 6. Conformance and Integration Coverage
 
 Still missing:
-- unignore and pass the header-auth wrong-region test
-- unignore and pass the header-auth wrong-service test
-- unignore and pass duplicate `Authorization` header rejection
 - a documented auth/public-access compatibility subset against AWS
+- a short written record of the confirmed AWS ownership behavior for anonymous
+  public-write uploads
+
+Completed:
+- header-auth wrong-region coverage
+- header-auth wrong-service coverage
+- duplicate `Authorization` rejection coverage
 - AWS validation for bucket-level public write and admin-operation denial
 
 ## Target Behavior
