@@ -7,7 +7,7 @@ use std::thread::JoinHandle;
 
 use checksum::{ChecksumAlgorithm, ChecksumType, MultipartChecksumConfig, RawChecksum};
 use ec::{EcConfig, ErasureCodec};
-use s3_types::{BucketVersioningState, VersionId};
+use s3_types::{BucketVersioningState, CanonicalUserId, VersionId};
 use storage::traits::{PgMetadataStore, ShardStore};
 use storage::{
     BucketInfo, BucketName, BucketState, ChunkManifestReclaimChunkRecord,
@@ -99,6 +99,7 @@ pub struct PutObjectResult {
 pub struct BucketSummary {
     pub name: String,
     pub owner_principal: String,
+    pub owner_canonical_id: CanonicalUserId,
     pub created_at: u64,
     pub public_read: bool,
     pub public_write: bool,
@@ -111,6 +112,7 @@ pub struct BucketSummary {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GetBucketAclResult {
     pub owner_principal: String,
+    pub owner_canonical_id: CanonicalUserId,
     pub acl: BucketAcl,
 }
 
@@ -1113,6 +1115,7 @@ pub struct ListObjectsResult {
     pub is_truncated: bool,
     pub next_continuation_token: Option<String>,
     pub owner_principal: String,
+    pub owner_canonical_id: CanonicalUserId,
 }
 
 /// Entry in a ListObjectVersions result.
@@ -2308,6 +2311,7 @@ impl Coordinator {
         BucketSummary {
             name: info.name.into_string(),
             owner_principal: info.owner_principal,
+            owner_canonical_id: info.owner_canonical_id,
             created_at: info.created_at,
             public_read: info.public_read,
             public_write: info.public_write,
@@ -2467,7 +2471,14 @@ impl Coordinator {
     ) -> Result<(), ServerError> {
         let _bucket_guard = self.storage_node.lock_bucket(name);
         let bucket_pg = self.get_bucket_pg(name)?;
-        match bucket_pg.create_bucket(name, owner_principal, public_read, public_write) {
+        let owner_canonical_id = CanonicalUserId::from_principal(owner_principal);
+        match bucket_pg.create_bucket(
+            name,
+            owner_principal,
+            &owner_canonical_id,
+            public_read,
+            public_write,
+        ) {
             Ok(()) => Ok(()),
             Err(storage::MetadataError::BucketAlreadyExists) => {
                 let existing = bucket_pg.head_bucket_raw(name).map_err(|e| match e {
@@ -2822,6 +2833,7 @@ impl Coordinator {
         };
         Ok(GetBucketAclResult {
             owner_principal: bucket.owner_principal,
+            owner_canonical_id: bucket.owner_canonical_id,
             acl,
         })
     }
@@ -5636,6 +5648,7 @@ impl Coordinator {
                 is_truncated: false,
                 next_continuation_token: None,
                 owner_principal: bucket_info.owner_principal,
+                owner_canonical_id: bucket_info.owner_canonical_id,
             });
         }
 
@@ -5772,6 +5785,7 @@ impl Coordinator {
             is_truncated,
             next_continuation_token: next_token,
             owner_principal: bucket_info.owner_principal,
+            owner_canonical_id: bucket_info.owner_canonical_id,
         })
     }
 

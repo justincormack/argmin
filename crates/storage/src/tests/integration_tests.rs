@@ -100,8 +100,14 @@ fn full_lifecycle() {
     // Create storage node.
     let node = crate::LocalStorageNode::open(&dir.path().join("data"), &[0]).unwrap();
     let pg = node.get_pg(0).unwrap();
-    pg.create_bucket("my-bucket", "owner-1", false, false)
-        .unwrap();
+    pg.create_bucket(
+        "my-bucket",
+        "owner-1",
+        &CanonicalUserId::from_principal("owner-1"),
+        false,
+        false,
+    )
+    .unwrap();
 
     // PutObject: write shard + metadata.
     let hash = [0xAA; 16];

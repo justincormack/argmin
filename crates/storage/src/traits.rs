@@ -41,6 +41,7 @@ pub trait PgMetadataStore {
         &self,
         name: &str,
         owner_principal: &str,
+        owner_canonical_id: &CanonicalUserId,
         public_read: bool,
         public_write: bool,
     ) -> Result<(), MetadataError>;

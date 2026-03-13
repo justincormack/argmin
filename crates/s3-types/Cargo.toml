@@ -3,6 +3,9 @@ name = "s3-types"
 version = "0.1.0"
 edition = "2021"
 
+[dependencies]
+ring = "0.17"
+
 [lib]
 name = "s3_types"
 path = "src/lib.rs"

@@ -1,6 +1,13 @@
 //! Shared S3/domain value types used across storage and server layers.
 
+use std::fmt::Write;
 use std::num::NonZeroU64;
+
+/// Maximum supported principal string length stored in metadata.
+pub const MAX_PRINCIPAL_LEN: usize = 256;
+
+/// S3 canonical user IDs are 64 lowercase hex characters.
+pub const CANONICAL_USER_ID_LEN: usize = 64;
 
 /// Bucket versioning state.
 #[repr(u8)]
@@ -76,9 +83,53 @@ impl std::fmt::Display for VersionId {
     }
 }
 
+/// Canonical S3 owner ID used in XML owner fields.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CanonicalUserId(String);
+
+impl CanonicalUserId {
+    /// Deterministically derive a canonical user id from a stable principal.
+    #[must_use]
+    pub fn from_principal(principal: &str) -> Self {
+        let digest = ring::digest::digest(&ring::digest::SHA256, principal.as_bytes());
+        let mut out = String::with_capacity(CANONICAL_USER_ID_LEN);
+        for byte in digest.as_ref() {
+            let _ = write!(out, "{byte:02x}");
+        }
+        Self(out)
+    }
+
+    /// Validate and construct from a stored canonical ID string.
+    #[must_use]
+    pub fn new(id: &str) -> Option<Self> {
+        if id.len() != CANONICAL_USER_ID_LEN || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        Some(Self(id.to_ascii_lowercase()))
+    }
+
+    /// Borrow the underlying canonical ID string.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Consume into the underlying string.
+    #[must_use]
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl std::fmt::Display for CanonicalUserId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{BucketVersioningState, VersionId};
+    use super::{BucketVersioningState, CanonicalUserId, VersionId, CANONICAL_USER_ID_LEN};
 
     #[test]
     fn bucket_versioning_state_from_u8_round_trip() {
@@ -113,5 +164,23 @@ mod tests {
         assert!(VersionId::Null.is_null());
         assert!(!VersionId::Null.is_versioned());
         assert_eq!(VersionId::Null.to_string(), "null");
+    }
+
+    #[test]
+    fn canonical_user_id_from_principal_is_deterministic() {
+        let a = CanonicalUserId::from_principal("owner-a");
+        let b = CanonicalUserId::from_principal("owner-a");
+        let c = CanonicalUserId::from_principal("owner-b");
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert_eq!(a.as_str().len(), CANONICAL_USER_ID_LEN);
+    }
+
+    #[test]
+    fn canonical_user_id_new_validates_shape() {
+        let good = "a".repeat(CANONICAL_USER_ID_LEN);
+        assert_eq!(CanonicalUserId::new(&good).unwrap().as_str(), good.as_str());
+        assert!(CanonicalUserId::new("short").is_none());
+        assert!(CanonicalUserId::new(&"z".repeat(CANONICAL_USER_ID_LEN)).is_none());
     }
 }

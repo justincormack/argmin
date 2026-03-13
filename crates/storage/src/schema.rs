@@ -55,7 +55,7 @@ CREATE TABLE IF NOT EXISTS multipart_uploads (
     initiated_at     INTEGER NOT NULL,
     state            INTEGER NOT NULL DEFAULT 0,
     metadata_blob    BLOB NOT NULL,
-    owner_principal  TEXT
+    owner_principal  TEXT CHECK (owner_principal IS NULL OR length(owner_principal) BETWEEN 1 AND 256)
 )";
 
 /// Index for listing multipart uploads by bucket/key.
@@ -276,7 +276,8 @@ CREATE INDEX IF NOT EXISTS idx_objects_versions ON objects (bucket, key, version
 const CREATE_BUCKETS_TABLE: &str = "\
 CREATE TABLE IF NOT EXISTS buckets (
     name             TEXT PRIMARY KEY,
-    owner_principal  TEXT NOT NULL,
+    owner_principal  TEXT NOT NULL CHECK (length(owner_principal) BETWEEN 1 AND 256),
+    owner_canonical_id TEXT NOT NULL CHECK (length(owner_canonical_id) = 64),
     created_at       INTEGER NOT NULL,
     region           INTEGER NOT NULL DEFAULT 0,
     state            INTEGER NOT NULL DEFAULT 0 CHECK (state IN (0, 1)),
@@ -327,6 +328,7 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(CREATE_BUCKETS_TABLE, [])?;
     conn.execute(CREATE_BUCKETS_OWNER_LIST_INDEX, [])?;
     migrate_checksum_columns(conn)?;
+    migrate_owner_identity_columns(conn)?;
     Ok(())
 }
 
@@ -385,6 +387,45 @@ fn migrate_checksum_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
              WHERE NEW.checksum_algorithm = 4 AND NEW.checksum_type = 0;
          END;",
     )?;
+
+    Ok(())
+}
+
+fn migrate_owner_identity_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let has_owner_canonical_id = {
+        let mut stmt = conn.prepare("PRAGMA table_info(buckets)")?;
+        let cols = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        let mut found = false;
+        for col in cols {
+            if col? == "owner_canonical_id" {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
+
+    if !has_owner_canonical_id {
+        conn.execute("ALTER TABLE buckets ADD COLUMN owner_canonical_id TEXT", [])?;
+        let mut stmt = conn.prepare("SELECT name, owner_principal FROM buckets")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut updates = Vec::new();
+        for row in rows {
+            let (name, owner_principal) = row?;
+            updates.push((
+                name,
+                s3_types::CanonicalUserId::from_principal(&owner_principal).into_string(),
+            ));
+        }
+        for (name, owner_canonical_id) in updates {
+            conn.execute(
+                "UPDATE buckets SET owner_canonical_id = ?1 WHERE name = ?2",
+                [&owner_canonical_id, &name],
+            )?;
+        }
+    }
 
     Ok(())
 }

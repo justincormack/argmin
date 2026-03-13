@@ -255,24 +255,36 @@ impl PgStore {
     }
 
     fn row_to_bucket_info(row: &rusqlite::Row<'_>) -> Result<BucketInfo, rusqlite::Error> {
+        let owner_canonical_id_raw: String = row.get(2)?;
+        let owner_canonical_id =
+            CanonicalUserId::new(&owner_canonical_id_raw).ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    rusqlite::types::Type::Text,
+                    Box::from(format!(
+                        "invalid owner_canonical_id: {owner_canonical_id_raw}"
+                    )),
+                )
+            })?;
         Ok(BucketInfo {
             name: row.get(0)?,
             owner_principal: row.get(1)?,
-            created_at: row.get::<_, i64>(2)? as u64,
-            region: row.get::<_, i64>(3)? as u16,
-            state: Self::parse_enum(row.get::<_, u8>(4)?, 4, "state", BucketState::from_u8)?,
+            owner_canonical_id,
+            created_at: row.get::<_, i64>(3)? as u64,
+            region: row.get::<_, i64>(4)? as u16,
+            state: Self::parse_enum(row.get::<_, u8>(5)?, 5, "state", BucketState::from_u8)?,
             versioning: Self::parse_enum(
-                row.get::<_, u8>(5)?,
-                5,
+                row.get::<_, u8>(6)?,
+                6,
                 "versioning",
                 BucketVersioningState::from_u8,
             )?,
-            public_read: row.get::<_, i64>(6)? != 0,
-            public_write: row.get::<_, i64>(7)? != 0,
-            cors_config: row.get(8)?,
-            tags: row.get(9)?,
-            public_access_block: row.get(10)?,
-            ownership_controls: row.get(11)?,
+            public_read: row.get::<_, i64>(7)? != 0,
+            public_write: row.get::<_, i64>(8)? != 0,
+            cors_config: row.get(9)?,
+            tags: row.get(10)?,
+            public_access_block: row.get(11)?,
+            ownership_controls: row.get(12)?,
         })
     }
 
@@ -636,15 +648,17 @@ impl PgMetadataStore for PgStore {
         &self,
         name: &str,
         owner_principal: &str,
+        owner_canonical_id: &CanonicalUserId,
         public_read: bool,
         public_write: bool,
     ) -> Result<(), MetadataError> {
         let now = PgStore::now_millis() as i64;
         let result = self.conn.execute(
-            "INSERT INTO buckets (name, owner_principal, created_at, state, public_read, public_write) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO buckets (name, owner_principal, owner_canonical_id, created_at, state, public_read, public_write) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 name,
                 owner_principal,
+                owner_canonical_id.as_str(),
                 now,
                 BucketState::Active as u8,
                 i32::from(public_read),
@@ -694,7 +708,7 @@ impl PgMetadataStore for PgStore {
     fn head_bucket_raw(&self, name: &str) -> Result<BucketInfo, MetadataError> {
         self.conn
             .query_row(
-                "SELECT name, owner_principal, created_at, region, state, versioning, public_read, public_write, cors_config, tags, public_access_block, ownership_controls \
+                "SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, public_read, public_write, cors_config, tags, public_access_block, ownership_controls \
                  FROM buckets WHERE name = ?1",
                 params![name],
                 Self::row_to_bucket_info,
@@ -713,7 +727,7 @@ impl PgMetadataStore for PgStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT name, owner_principal, created_at, region, state, versioning, public_read, public_write, cors_config, tags, public_access_block, ownership_controls \
+                "SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, public_read, public_write, cors_config, tags, public_access_block, ownership_controls \
                  FROM buckets WHERE owner_principal = ?1 AND state = ?2 ORDER BY name ASC",
             )
             .map_err(|e| MetadataError::Db {

@@ -374,15 +374,41 @@ fn file_bucket_metadata_create_head_list_delete() {
     let (_dir, store) = make_pg_store();
 
     store
-        .create_bucket("alpha", "owner-1", false, false)
+        .create_bucket(
+            "alpha",
+            "owner-1",
+            &CanonicalUserId::from_principal("owner-1"),
+            false,
+            false,
+        )
         .unwrap();
-    store.create_bucket("beta", "owner-1", true, false).unwrap();
     store
-        .create_bucket("gamma", "owner-2", false, false)
+        .create_bucket(
+            "beta",
+            "owner-1",
+            &CanonicalUserId::from_principal("owner-1"),
+            true,
+            false,
+        )
+        .unwrap();
+    store
+        .create_bucket(
+            "gamma",
+            "owner-2",
+            &CanonicalUserId::from_principal("owner-2"),
+            false,
+            false,
+        )
         .unwrap();
 
     let err = store
-        .create_bucket("alpha", "owner-1", false, false)
+        .create_bucket(
+            "alpha",
+            "owner-1",
+            &CanonicalUserId::from_principal("owner-1"),
+            false,
+            false,
+        )
         .unwrap_err();
     assert!(matches!(
         err,
@@ -392,6 +418,10 @@ fn file_bucket_metadata_create_head_list_delete() {
     let beta = store.head_bucket("beta").unwrap();
     assert_eq!(beta.name, "beta");
     assert_eq!(beta.owner_principal, "owner-1");
+    assert_eq!(
+        beta.owner_canonical_id,
+        CanonicalUserId::from_principal("owner-1")
+    );
     assert!(beta.public_read);
 
     let owner1 = store.list_buckets("owner-1").unwrap();
@@ -421,7 +451,13 @@ fn file_bucket_metadata_delete_nonexistent() {
 fn file_bucket_metadata_versioning_transitions() {
     let (_dir, store) = make_pg_store();
     store
-        .create_bucket("bucket", "owner", false, false)
+        .create_bucket(
+            "bucket",
+            "owner",
+            &CanonicalUserId::from_principal("owner"),
+            false,
+            false,
+        )
         .unwrap();
 
     store
@@ -447,7 +483,13 @@ fn file_bucket_metadata_versioning_transitions() {
 fn file_bucket_metadata_versioning_disabled_noop() {
     let (_dir, store) = make_pg_store();
     store
-        .create_bucket("bucket", "owner", false, false)
+        .create_bucket(
+            "bucket",
+            "owner",
+            &CanonicalUserId::from_principal("owner"),
+            false,
+            false,
+        )
         .unwrap();
     store
         .put_bucket_versioning("bucket", BucketVersioningState::Disabled)
@@ -462,7 +504,13 @@ fn file_bucket_metadata_versioning_disabled_noop() {
 fn file_bucket_metadata_config_roundtrip() {
     let (_dir, store) = make_pg_store();
     store
-        .create_bucket("bucket", "owner", false, false)
+        .create_bucket(
+            "bucket",
+            "owner",
+            &CanonicalUserId::from_principal("owner"),
+            false,
+            false,
+        )
         .unwrap();
 
     store.put_bucket_cors("bucket", "<Cors/>").unwrap();

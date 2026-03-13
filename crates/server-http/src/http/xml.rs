@@ -7,9 +7,9 @@ use crate::error::ServerError;
 use auth::canonical::uri_encode_path;
 use checksum::ChecksumAlgorithm;
 use quick_xml::{escape::unescape, events::Event, Reader};
-use s3_types::BucketVersioningState;
 #[cfg(test)]
 use s3_types::VersionId;
+use s3_types::{BucketVersioningState, CanonicalUserId};
 
 use super::response::format_version_id;
 
@@ -67,13 +67,17 @@ pub fn header_not_implemented_xml(header: &str, resource: &str, request_id: &str
 
 /// Format a `ListAllMyBucketsResult` XML response.
 #[must_use]
-pub fn list_buckets_xml(buckets: &[BucketSummary], owner_principal: &str) -> String {
+pub fn list_buckets_xml(
+    buckets: &[BucketSummary],
+    owner_principal: &str,
+    owner_canonical_id: &CanonicalUserId,
+) -> String {
     let mut xml = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <ListAllMyBucketsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
          <Owner><ID>",
     );
-    xml.push_str(&xml_escape(owner_principal));
+    xml.push_str(&xml_escape(owner_canonical_id.as_str()));
     xml.push_str("</ID><DisplayName>");
     xml.push_str(&xml_escape(owner_principal));
     xml.push_str("</DisplayName></Owner><Buckets>");
@@ -92,17 +96,26 @@ pub fn list_buckets_xml(buckets: &[BucketSummary], owner_principal: &str) -> Str
 
 /// Format a `GetBucketAcl` XML response.
 #[must_use]
-pub fn bucket_acl_xml(owner_principal: &str, acl: BucketAcl) -> String {
+pub fn bucket_acl_xml(
+    owner_principal: &str,
+    owner_canonical_id: &CanonicalUserId,
+    acl: BucketAcl,
+) -> String {
     let mut xml = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <AccessControlPolicy xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
          <Owner><ID>",
     );
-    xml.push_str(&xml_escape(owner_principal));
+    xml.push_str(&xml_escape(owner_canonical_id.as_str()));
     xml.push_str("</ID><DisplayName>");
     xml.push_str(&xml_escape(owner_principal));
     xml.push_str("</DisplayName></Owner><AccessControlList>");
-    append_canonical_user_grant(&mut xml, owner_principal, "FULL_CONTROL");
+    append_canonical_user_grant(
+        &mut xml,
+        owner_principal,
+        owner_canonical_id,
+        "FULL_CONTROL",
+    );
     match acl {
         BucketAcl::Private => {}
         BucketAcl::PublicRead => append_all_users_grant(&mut xml, "READ"),
@@ -116,9 +129,14 @@ pub fn bucket_acl_xml(owner_principal: &str, acl: BucketAcl) -> String {
     xml
 }
 
-fn append_canonical_user_grant(xml: &mut String, owner_principal: &str, permission: &str) {
+fn append_canonical_user_grant(
+    xml: &mut String,
+    owner_principal: &str,
+    owner_canonical_id: &CanonicalUserId,
+    permission: &str,
+) {
     xml.push_str("<Grant><Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"CanonicalUser\"><ID>");
-    xml.push_str(&xml_escape(owner_principal));
+    xml.push_str(&xml_escape(owner_canonical_id.as_str()));
     xml.push_str("</ID><DisplayName>");
     xml.push_str(&xml_escape(owner_principal));
     xml.push_str("</DisplayName></Grantee><Permission>");
@@ -205,8 +223,8 @@ pub fn list_objects_v2_xml(
         xml.push_str("</NextContinuationToken>");
     }
 
-    let owner_id = result.owner_principal.clone();
-    let owner_name = owner_id.clone();
+    let owner_id = result.owner_canonical_id.as_str();
+    let owner_name = result.owner_principal.as_str();
 
     for obj in &result.objects {
         xml.push_str("<Contents>");
@@ -225,9 +243,9 @@ pub fn list_objects_v2_xml(
         xml.push_str("<StorageClass>STANDARD</StorageClass>");
         if fetch_owner {
             xml.push_str("<Owner><ID>");
-            xml.push_str(&xml_escape(&owner_id));
+            xml.push_str(&xml_escape(owner_id));
             xml.push_str("</ID><DisplayName>");
-            xml.push_str(&xml_escape(&owner_name));
+            xml.push_str(&xml_escape(owner_name));
             xml.push_str("</DisplayName></Owner>");
         }
         xml.push_str("</Contents>");
@@ -307,8 +325,8 @@ pub fn list_objects_v1_xml(
         }
     }
 
-    let owner_id = result.owner_principal.clone();
-    let owner_name = owner_id.clone();
+    let owner_id = result.owner_canonical_id.as_str();
+    let owner_name = result.owner_principal.as_str();
 
     for obj in &result.objects {
         xml.push_str("<Contents>");
@@ -326,9 +344,9 @@ pub fn list_objects_v1_xml(
         xml.push_str("</Size>");
         xml.push_str("<StorageClass>STANDARD</StorageClass>");
         xml.push_str("<Owner><ID>");
-        xml.push_str(&xml_escape(&owner_id));
+        xml.push_str(&xml_escape(owner_id));
         xml.push_str("</ID><DisplayName>");
-        xml.push_str(&xml_escape(&owner_name));
+        xml.push_str(&xml_escape(owner_name));
         xml.push_str("</DisplayName></Owner>");
         xml.push_str("</Contents>");
     }
@@ -2460,6 +2478,7 @@ mod tests {
         let buckets = vec![BucketSummary {
             name: "test-bucket".to_string(),
             owner_principal: "owner".to_string(),
+            owner_canonical_id: CanonicalUserId::from_principal("owner"),
             created_at: 1685000000000,
             versioning: BucketVersioningState::Disabled,
             public_read: false,
@@ -2467,9 +2486,21 @@ mod tests {
             public_access_block: None,
             ownership_controls: None,
         }];
-        let xml = list_buckets_xml(&buckets, "owner");
+        let owner_canonical_id = CanonicalUserId::from_principal("owner");
+        let xml = list_buckets_xml(&buckets, "owner", &owner_canonical_id);
         assert!(xml.contains("<Name>test-bucket</Name>"));
         assert!(xml.contains("ListAllMyBucketsResult"));
+        assert!(xml.contains(&format!("<ID>{}</ID>", owner_canonical_id.as_str())));
+        assert!(xml.contains("<DisplayName>owner</DisplayName>"));
+    }
+
+    #[test]
+    fn bucket_acl_xml_uses_canonical_owner_id() {
+        let owner_canonical_id = CanonicalUserId::from_principal("owner");
+        let xml = bucket_acl_xml("owner", &owner_canonical_id, BucketAcl::PublicRead);
+        assert!(xml.contains(&format!("<Owner><ID>{}</ID>", owner_canonical_id.as_str())));
+        assert!(xml.contains("<DisplayName>owner</DisplayName>"));
+        assert!(xml.contains("CanonicalUser"));
     }
 
     #[test]
@@ -2485,11 +2516,16 @@ mod tests {
             is_truncated: false,
             next_continuation_token: None,
             owner_principal: "owner".to_string(),
+            owner_canonical_id: CanonicalUserId::from_principal("owner"),
         };
-        let xml = list_objects_v2_xml("bucket", None, None, None, None, None, false, 1000, &result);
+        let xml = list_objects_v2_xml("bucket", None, None, None, None, None, true, 1000, &result);
         assert!(xml.contains("<Key>my-key</Key>"));
         assert!(xml.contains("<Size>42</Size>"));
         assert!(xml.contains("ListBucketResult"));
+        assert!(xml.contains(&format!(
+            "<Owner><ID>{}</ID><DisplayName>owner</DisplayName></Owner>",
+            result.owner_canonical_id.as_str()
+        )));
     }
 
     #[test]
@@ -2505,6 +2541,7 @@ mod tests {
             is_truncated: true,
             next_continuation_token: Some("photos/cat.jpg".to_string()),
             owner_principal: "owner".to_string(),
+            owner_canonical_id: CanonicalUserId::from_principal("owner"),
         };
         let xml = list_objects_v2_xml(
             "bucket",
@@ -2537,6 +2574,7 @@ mod tests {
             is_truncated: false,
             next_continuation_token: None,
             owner_principal: "owner".to_string(),
+            owner_canonical_id: CanonicalUserId::from_principal("owner"),
         };
         let xml = list_objects_v2_xml(
             "bucket",
@@ -2561,6 +2599,7 @@ mod tests {
             is_truncated: false,
             next_continuation_token: None,
             owner_principal: "owner".to_string(),
+            owner_canonical_id: CanonicalUserId::from_principal("owner"),
         };
         // With prefix=None → should produce <Prefix/>
         let xml = list_objects_v2_xml("bucket", None, None, None, None, None, false, 1000, &result);
@@ -2582,11 +2621,16 @@ mod tests {
             is_truncated: false,
             next_continuation_token: None,
             owner_principal: "owner".to_string(),
+            owner_canonical_id: CanonicalUserId::from_principal("owner"),
         };
         let xml = list_objects_v1_xml("bucket", None, None, None, None, 1000, &result);
         assert!(xml.contains("<Key>my-key</Key>"));
         assert!(xml.contains("<Marker/>"));
         assert!(xml.contains("ListBucketResult"));
+        assert!(xml.contains(&format!(
+            "<Owner><ID>{}</ID><DisplayName>owner</DisplayName></Owner>",
+            result.owner_canonical_id.as_str()
+        )));
         // V1 should NOT have KeyCount or ContinuationToken
         assert!(!xml.contains("<KeyCount>"));
         assert!(!xml.contains("<ContinuationToken>"));
@@ -2605,6 +2649,7 @@ mod tests {
             is_truncated: true,
             next_continuation_token: Some("photos/cat.jpg".to_string()),
             owner_principal: "owner".to_string(),
+            owner_canonical_id: CanonicalUserId::from_principal("owner"),
         };
         let xml = list_objects_v1_xml(
             "bucket",
@@ -2634,6 +2679,7 @@ mod tests {
             is_truncated: false,
             next_continuation_token: None,
             owner_principal: "owner".to_string(),
+            owner_canonical_id: CanonicalUserId::from_principal("owner"),
         };
         let xml = list_objects_v1_xml("bucket", None, None, None, None, 1000, &result);
         assert!(xml.contains("<Prefix/>"));
@@ -2655,6 +2701,7 @@ mod tests {
             is_truncated: true,
             next_continuation_token: Some("key2".to_string()),
             owner_principal: "owner".to_string(),
+            owner_canonical_id: CanonicalUserId::from_principal("owner"),
         };
         let xml = list_objects_v1_xml("bucket", None, None, Some("key1"), None, 1, &result);
         assert!(xml.contains("<Marker>key1</Marker>"));

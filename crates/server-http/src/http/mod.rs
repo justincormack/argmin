@@ -323,7 +323,12 @@ impl HttpFrontend {
                 let buckets = self.coordinator.list_buckets_for_requester(
                     &crate::coordinator::ListBucketsRequest { requester },
                 )?;
-                Ok(S3Response::list_buckets(&buckets, owner_principal))
+                let owner_canonical_id = s3_types::CanonicalUserId::from_principal(owner_principal);
+                Ok(S3Response::list_buckets(
+                    &buckets,
+                    owner_principal,
+                    &owner_canonical_id,
+                ))
             }
             S3Operation::CreateBucket { bucket } => {
                 let acl = parse_bucket_acl(req)?;

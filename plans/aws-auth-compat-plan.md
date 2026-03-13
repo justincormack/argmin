@@ -31,11 +31,15 @@ Implemented:
 - Principal propagation from auth into request handling
 - Authorization moved into `server-core`
 - Principal-based bucket ownership (`owner_principal`)
+- Durable bucket `owner_canonical_id`
 - Owner/private/public-read authorization behavior
 - Bucket-level `PutBucketAcl` support for current public-read behavior
 - Bucket-level `GetBucketAcl` support
 - Bucket-level public write semantics for anonymous/public `PUT Object`
 - Bucket-level public write semantics for anonymous/public `POST Object`
+- S3 XML owner `<ID>` fields using canonical owner IDs for current bucket/list
+  surfaces
+- Schema-level length checks for bucket auth/identity fields
 - Public access block and ownership-controls integration
 - Auth, presigned, and public-access integration coverage
 
@@ -77,10 +81,11 @@ Notes:
 
 ### 4. Owner Identity Compatibility
 
-Still missing:
+Completed:
 - durable `owner_canonical_id`
 - S3 XML owner `<ID>` using canonical owner id instead of raw principal string
-- schema-level length checks for auth/identity fields
+  on the current bucket/list surfaces
+- schema-level length checks for bucket auth/identity fields
 
 ### 5. Full Ownership Model Compatibility
 
@@ -97,6 +102,10 @@ Notes:
   - the bucket owner can still delete it
 - Argmin does not yet model per-object owner identity for these writes, so local
   behavior still differs here.
+- Longer term, canonical owner IDs should come from durable account metadata,
+  not be derived from principal strings. That implies a real account/account-
+  metadata service during the later ownership/account design work, rather than
+  treating principal strings as the permanent identity substrate.
 
 ### 6. Conformance and Integration Coverage
 

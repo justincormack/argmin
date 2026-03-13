@@ -5,7 +5,7 @@ use std::num::NonZeroU64;
 pub use checksum::{
     ChecksumAlgorithm, ChecksumType, InvalidChecksumConfig, MultipartChecksumConfig, RawChecksum,
 };
-pub use s3_types::{BucketVersioningState, VersionId};
+pub use s3_types::{BucketVersioningState, CanonicalUserId, VersionId};
 
 /// Internal immutable payload generation identifier.
 ///
@@ -725,6 +725,7 @@ impl BucketState {
 pub struct BucketInfo {
     pub name: BucketName,
     pub owner_principal: String,
+    pub owner_canonical_id: CanonicalUserId,
     /// Creation timestamp (unix milliseconds).
     pub created_at: u64,
     pub region: u16,

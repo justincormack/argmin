@@ -7,7 +7,7 @@ use crate::coordinator::{
 };
 use crate::error::ServerError;
 use checksum::{ChecksumAlgorithm, ChecksumType, RawChecksum};
-use s3_types::{BucketVersioningState, VersionId};
+use s3_types::{BucketVersioningState, CanonicalUserId, VersionId};
 
 use super::xml;
 
@@ -500,8 +500,12 @@ impl S3Response {
 
     /// Build a response for `ListBuckets`.
     #[must_use]
-    pub fn list_buckets(buckets: &[BucketSummary], owner_principal: &str) -> Self {
-        let body = xml::list_buckets_xml(buckets, owner_principal);
+    pub fn list_buckets(
+        buckets: &[BucketSummary],
+        owner_principal: &str,
+        owner_canonical_id: &CanonicalUserId,
+    ) -> Self {
+        let body = xml::list_buckets_xml(buckets, owner_principal, owner_canonical_id);
         Self::new(200).xml_body(body)
     }
 
@@ -711,7 +715,11 @@ impl S3Response {
     /// Build a response for `GetBucketAcl`.
     #[must_use]
     pub fn get_bucket_acl(result: &GetBucketAclResult) -> Self {
-        Self::new(200).xml_body(xml::bucket_acl_xml(&result.owner_principal, result.acl))
+        Self::new(200).xml_body(xml::bucket_acl_xml(
+            &result.owner_principal,
+            &result.owner_canonical_id,
+            result.acl,
+        ))
     }
 
     /// Build a response for `CreateMultipartUpload` (200 OK, XML body).
@@ -1001,7 +1009,7 @@ fn date_to_days(year: i64, month: u32, day: u32) -> i64 {
 mod tests {
     use super::*;
     use crate::coordinator::{
-        GetObjectResult, HeadObjectResult, ListEntry, ListObjectsResult, PutObjectResult,
+        BucketAcl, GetObjectResult, HeadObjectResult, ListEntry, ListObjectsResult, PutObjectResult,
     };
     use crate::metadata_blob::MetadataBlob;
 
@@ -1370,6 +1378,7 @@ mod tests {
         let info = BucketSummary {
             name: "b".into(),
             owner_principal: "owner".into(),
+            owner_canonical_id: CanonicalUserId::from_principal("owner"),
             created_at: 0,
             versioning: BucketVersioningState::Disabled,
             public_read: false,
@@ -1388,6 +1397,7 @@ mod tests {
         let buckets = vec![BucketSummary {
             name: "test-bucket".into(),
             owner_principal: "owner".into(),
+            owner_canonical_id: CanonicalUserId::from_principal("owner"),
             created_at: 1000,
             versioning: BucketVersioningState::Disabled,
             public_read: false,
@@ -1395,13 +1405,15 @@ mod tests {
             public_access_block: None,
             ownership_controls: None,
         }];
-        let resp = S3Response::list_buckets(&buckets, "owner");
+        let owner_canonical_id = CanonicalUserId::from_principal("owner");
+        let resp = S3Response::list_buckets(&buckets, "owner", &owner_canonical_id);
         assert_eq!(resp.status_code, 200);
         assert_eq!(find_header(&resp, "Content-Type"), Some("application/xml"));
         let body = String::from_utf8(resp.body).unwrap();
         assert!(body.contains("<?xml"));
         assert!(body.contains("test-bucket"));
         assert!(body.contains("ListAllMyBucketsResult"));
+        assert!(body.contains(owner_canonical_id.as_str()));
     }
 
     // ── list_objects_v2 ───────────────────────────────────────────────
@@ -1419,6 +1431,7 @@ mod tests {
             is_truncated: false,
             next_continuation_token: None,
             owner_principal: "owner".into(),
+            owner_canonical_id: CanonicalUserId::from_principal("owner"),
         };
         let resp = S3Response::list_objects_v2(
             "bucket",
@@ -1427,7 +1440,7 @@ mod tests {
             None,
             None,
             None,
-            false,
+            true,
             1000,
             &result,
         );
@@ -1436,6 +1449,7 @@ mod tests {
         assert!(body.contains("ListBucketResult"));
         assert!(body.contains("key1"));
         assert!(body.contains("<Size>42</Size>"));
+        assert!(body.contains(result.owner_canonical_id.as_str()));
     }
 
     // ── list_objects_v1 ───────────────────────────────────────────────
@@ -1453,6 +1467,7 @@ mod tests {
             is_truncated: false,
             next_continuation_token: None,
             owner_principal: "owner".into(),
+            owner_canonical_id: CanonicalUserId::from_principal("owner"),
         };
         let resp =
             S3Response::list_objects_v1("bucket", Some("pre"), None, None, None, 1000, &result);
@@ -1461,7 +1476,23 @@ mod tests {
         assert!(body.contains("ListBucketResult"));
         assert!(body.contains("key1"));
         assert!(body.contains("<Marker/>"));
+        assert!(body.contains(result.owner_canonical_id.as_str()));
         assert!(!body.contains("<KeyCount>"));
+    }
+
+    #[test]
+    fn get_bucket_acl_response_uses_canonical_owner_id() {
+        let owner_canonical_id = CanonicalUserId::from_principal("owner");
+        let result = GetBucketAclResult {
+            owner_principal: "owner".into(),
+            owner_canonical_id: owner_canonical_id.clone(),
+            acl: BucketAcl::PublicRead,
+        };
+        let resp = S3Response::get_bucket_acl(&result);
+        assert_eq!(resp.status_code, 200);
+        let body = String::from_utf8(resp.body).unwrap();
+        assert!(body.contains(owner_canonical_id.as_str()));
+        assert!(body.contains("<DisplayName>owner</DisplayName>"));
     }
 
     // ── error ─────────────────────────────────────────────────────────
