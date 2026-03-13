@@ -34,6 +34,9 @@ Implemented:
 - Principal-based bucket ownership (`owner_principal`)
 - Owner/private/public-read authorization behavior
 - Bucket-level `PutBucketAcl` support for current public-read behavior
+- Bucket-level `GetBucketAcl` support
+- Bucket-level public write semantics for anonymous/public `PUT Object`
+- Bucket-level public write semantics for anonymous/public `POST Object`
 - Public access block and ownership-controls integration
 - Auth, presigned, and public-access integration coverage
 
@@ -64,18 +67,15 @@ Still missing or incomplete:
 ### 3. ACL and Authorization Surface
 
 Still missing:
-- `GetBucketAcl`
 - Object ACL APIs / semantics
-- Bucket-level public write semantics
-  - anonymous/public `PUT Object`
-  - anonymous/public `POST Object`
-- Any ACL-driven write authorization beyond the current owner-only write model
+- Any ACL-driven authorization beyond the current bucket-level ACL model
 - Bucket policy / IAM policy evaluation
 
 Notes:
 - `PutBucketAcl` is implemented; the old plan text saying otherwise is stale.
+- `GetBucketAcl` is now implemented.
 - Public-read is no longer create-time only; bucket ACL updates already affect it.
-- Public write is still absent and is now explicitly in scope for this follow-up.
+- Bucket-level public write for anonymous/public `PUT` and `POST` is now implemented.
 
 ### 4. Owner Identity Compatibility
 
@@ -90,10 +90,8 @@ Still missing:
 - unignore and pass the header-auth wrong-region test
 - unignore and pass the header-auth wrong-service test
 - unignore and pass duplicate `Authorization` header rejection
-- explicit integration coverage for anonymous/public write behavior once added
-  - `PUT Object`
-  - `POST Object`
 - a documented auth/public-access compatibility subset against AWS
+- AWS validation for bucket-level public write and admin-operation denial
 
 ## Target Behavior
 
@@ -139,12 +137,15 @@ Success criteria:
 ### Phase 2: ACL Surface Completion
 
 Deliver:
-- `GetBucketAcl`
-- bucket-level public write model sufficient for anonymous/public `PUT` and `POST`
-- any required core/storage representation changes for that ACL state
+- Completed
 
 Success criteria:
-- anonymous/public write behavior is explicit and integration-tested
+- `GetBucketAcl` is implemented
+- bucket-level public write for anonymous/public `PUT` and `POST` is implemented
+- integration coverage exists for:
+  - anonymous/public `PUT`
+  - anonymous/public `POST`
+  - public-write buckets still denying admin operations
 
 ### Phase 3: Owner Identity Compatibility
 

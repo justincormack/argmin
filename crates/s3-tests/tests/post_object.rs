@@ -2141,9 +2141,39 @@ fn test_post_object_missing_expires_condition() {
 }
 
 #[test]
-#[ignore = "not implemented: anonymous POST"]
-fn test_post_object_tags_anonymous_request() {
-    s3_tests::run(async {});
+fn test_post_object_anonymous_request_public_write_bucket() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = s3_tests::create_public_write_bucket(client).await;
+        let key = "post-anon";
+
+        let fields = [("key", key)];
+        let (status, body) = post_object(&bucket, &fields, b"data", "test.txt");
+        assert_eq!(
+            status, 204,
+            "expected 204 for anonymous POST on public-read-write bucket, got {} body={}",
+            status, body
+        );
+
+        let out = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let data = out.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], b"data");
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
 }
 
 #[test]

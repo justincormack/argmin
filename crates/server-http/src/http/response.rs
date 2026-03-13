@@ -1,9 +1,9 @@
 /// Build HTTP responses for S3 operations.
 use crate::coordinator::{
-    BucketSummary, CopyObjectResult, DeleteObjectResult, DeleteObjectsResult, GetObjectPartResult,
-    GetObjectRangeResult, GetObjectResult, HeadObjectPartResult, HeadObjectResult,
-    ListMultipartUploadsResult, ListObjectVersionsResult, ListObjectsResult, ListPartsResult,
-    PutObjectResult, ReadHandle,
+    BucketSummary, CopyObjectResult, DeleteObjectResult, DeleteObjectsResult, GetBucketAclResult,
+    GetObjectPartResult, GetObjectRangeResult, GetObjectResult, HeadObjectPartResult,
+    HeadObjectResult, ListMultipartUploadsResult, ListObjectVersionsResult, ListObjectsResult,
+    ListPartsResult, PutObjectResult, ReadHandle,
 };
 use crate::error::ServerError;
 use checksum::{ChecksumAlgorithm, ChecksumType, RawChecksum};
@@ -708,6 +708,12 @@ impl S3Response {
         Self::new(200)
     }
 
+    /// Build a response for `GetBucketAcl`.
+    #[must_use]
+    pub fn get_bucket_acl(result: &GetBucketAclResult) -> Self {
+        Self::new(200).xml_body(xml::bucket_acl_xml(&result.owner_principal, result.acl))
+    }
+
     /// Build a response for `CreateMultipartUpload` (200 OK, XML body).
     #[must_use]
     pub fn create_multipart_upload(
@@ -880,8 +886,7 @@ impl S3Response {
                 return Self::new(403).xml_body(body);
             }
             ServerError::Auth(auth::AuthError::DuplicateAuthorizationHeader) => {
-                let body =
-                    xml::header_not_implemented_xml("Authorization", resource, "request-id");
+                let body = xml::header_not_implemented_xml("Authorization", resource, "request-id");
                 return Self::new(501).xml_body(body);
             }
             _ => {}
@@ -1368,7 +1373,9 @@ mod tests {
             created_at: 0,
             versioning: BucketVersioningState::Disabled,
             public_read: false,
+            public_write: false,
             public_access_block: None,
+            ownership_controls: None,
         };
         let resp = S3Response::head_bucket(&info);
         assert_eq!(resp.status_code, 200);
@@ -1384,7 +1391,9 @@ mod tests {
             created_at: 1000,
             versioning: BucketVersioningState::Disabled,
             public_read: false,
+            public_write: false,
             public_access_block: None,
+            ownership_controls: None,
         }];
         let resp = S3Response::list_buckets(&buckets, "owner");
         assert_eq!(resp.status_code, 200);

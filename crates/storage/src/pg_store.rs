@@ -268,10 +268,11 @@ impl PgStore {
                 BucketVersioningState::from_u8,
             )?,
             public_read: row.get::<_, i64>(6)? != 0,
-            cors_config: row.get(7)?,
-            tags: row.get(8)?,
-            public_access_block: row.get(9)?,
-            ownership_controls: row.get(10)?,
+            public_write: row.get::<_, i64>(7)? != 0,
+            cors_config: row.get(8)?,
+            tags: row.get(9)?,
+            public_access_block: row.get(10)?,
+            ownership_controls: row.get(11)?,
         })
     }
 
@@ -636,16 +637,18 @@ impl PgMetadataStore for PgStore {
         name: &str,
         owner_principal: &str,
         public_read: bool,
+        public_write: bool,
     ) -> Result<(), MetadataError> {
         let now = PgStore::now_millis() as i64;
         let result = self.conn.execute(
-            "INSERT INTO buckets (name, owner_principal, created_at, state, public_read) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO buckets (name, owner_principal, created_at, state, public_read, public_write) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 name,
                 owner_principal,
                 now,
                 BucketState::Active as u8,
-                i32::from(public_read)
+                i32::from(public_read),
+                i32::from(public_write)
             ],
         );
         match result {
@@ -691,7 +694,7 @@ impl PgMetadataStore for PgStore {
     fn head_bucket_raw(&self, name: &str) -> Result<BucketInfo, MetadataError> {
         self.conn
             .query_row(
-                "SELECT name, owner_principal, created_at, region, state, versioning, public_read, cors_config, tags, public_access_block, ownership_controls \
+                "SELECT name, owner_principal, created_at, region, state, versioning, public_read, public_write, cors_config, tags, public_access_block, ownership_controls \
                  FROM buckets WHERE name = ?1",
                 params![name],
                 Self::row_to_bucket_info,
@@ -710,7 +713,7 @@ impl PgMetadataStore for PgStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT name, owner_principal, created_at, region, state, versioning, public_read, cors_config, tags, public_access_block, ownership_controls \
+                "SELECT name, owner_principal, created_at, region, state, versioning, public_read, public_write, cors_config, tags, public_access_block, ownership_controls \
                  FROM buckets WHERE owner_principal = ?1 AND state = ?2 ORDER BY name ASC",
             )
             .map_err(|e| MetadataError::Db {
@@ -974,12 +977,17 @@ impl PgMetadataStore for PgStore {
         Ok(())
     }
 
-    fn put_bucket_acl(&self, name: &str, public_read: bool) -> Result<(), MetadataError> {
+    fn put_bucket_acl(
+        &self,
+        name: &str,
+        public_read: bool,
+        public_write: bool,
+    ) -> Result<(), MetadataError> {
         let updated = self
             .conn
             .execute(
-                "UPDATE buckets SET public_read = ?1 WHERE name = ?2",
-                params![i32::from(public_read), name],
+                "UPDATE buckets SET public_read = ?1, public_write = ?2 WHERE name = ?3",
+                params![i32::from(public_read), i32::from(public_write), name],
             )
             .map_err(|e| MetadataError::Db {
                 context: "put bucket acl",

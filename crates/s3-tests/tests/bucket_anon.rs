@@ -15,6 +15,11 @@ async fn setup_public_bucket() -> String {
     s3_tests::create_public_bucket(CTX.client()).await
 }
 
+/// Create a public-read-write bucket, returning its name.
+async fn setup_public_write_bucket() -> String {
+    s3_tests::create_public_write_bucket(CTX.client()).await
+}
+
 /// Create a private bucket (default), returning its name.
 async fn setup_private_bucket() -> String {
     let client = CTX.client();
@@ -154,7 +159,7 @@ fn test_anon_head_bucket_private_fail() {
     });
 }
 
-// ── Anonymous PUT object (should always fail) ───────────────────────────
+// ── Anonymous PUT object ────────────────────────────────────────────────
 
 #[test]
 fn test_anon_put_object_public_bucket_fail() {
@@ -380,9 +385,88 @@ fn test_object_anon_put() {
 // ── Anonymous PUT object with write access ───────────────────────────
 
 #[test]
-#[ignore = "not implemented: public-read-write ACL"]
 fn test_object_anon_put_write_access() {
-    s3_tests::run(async {});
+    s3_tests::run(async {
+        let bucket = setup_public_write_bucket().await;
+
+        let url = format!("{}/{}/anon-upload", CTX.endpoint(), bucket);
+        let mut resp = agent()
+            .put(&url)
+            .send(b"public write" as &[u8])
+            .expect("transport error");
+        let status = resp.status().as_u16();
+        let body = resp.body_mut().read_to_string().unwrap_or_default();
+        assert_eq!(
+            status, 200,
+            "expected 200 for anon PUT on public-read-write bucket, got {} body={}",
+            status, body
+        );
+
+        let out = CTX
+            .client()
+            .get_object()
+            .bucket(&bucket)
+            .key("anon-upload")
+            .send()
+            .await
+            .unwrap();
+        let data = out.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], b"public write");
+
+        cleanup(&bucket, &["anon-upload"]).await;
+    });
+}
+
+#[test]
+fn test_anon_get_bucket_acl_public_write_bucket_fail() {
+    s3_tests::run(async {
+        let bucket = setup_public_write_bucket().await;
+
+        let url = format!("{}/{}?acl", CTX.endpoint(), bucket);
+        let mut resp = agent().get(&url).call().expect("transport error");
+        let status = resp.status().as_u16();
+        let body = resp.body_mut().read_to_string().unwrap();
+        assert_eq!(
+            status, 403,
+            "expected 403 for anon GetBucketAcl on public-read-write bucket, got {}",
+            status
+        );
+        assert!(
+            body.contains("<Code>AccessDenied</Code>"),
+            "expected AccessDenied in body: {}",
+            body
+        );
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_anon_put_bucket_acl_public_write_bucket_fail() {
+    s3_tests::run(async {
+        let bucket = setup_public_write_bucket().await;
+
+        let url = format!("{}/{}?acl", CTX.endpoint(), bucket);
+        let mut resp = agent()
+            .put(&url)
+            .header("x-amz-acl", "private")
+            .send(b"" as &[u8])
+            .expect("transport error");
+        let status = resp.status().as_u16();
+        let body = resp.body_mut().read_to_string().unwrap();
+        assert_eq!(
+            status, 403,
+            "expected 403 for anon PutBucketAcl on public-read-write bucket, got {}",
+            status
+        );
+        assert!(
+            body.contains("<Code>AccessDenied</Code>"),
+            "expected AccessDenied in body: {}",
+            body
+        );
+
+        cleanup(&bucket, &[]).await;
+    });
 }
 
 // ── Anonymous ListBuckets ────────────────────────────────────────────

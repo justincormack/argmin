@@ -1,6 +1,6 @@
 /// Hand-formatted XML for S3 responses with lightweight request XML parsing.
 use crate::coordinator::{
-    BucketSummary, CompletePart, DeleteError, DeletedObject, ListMultipartUploadsResult,
+    BucketAcl, BucketSummary, CompletePart, DeleteError, DeletedObject, ListMultipartUploadsResult,
     ListObjectVersionsResult, ListObjectsResult, ListPartsResult, ObjectPartsInfo,
 };
 use crate::error::ServerError;
@@ -88,6 +88,48 @@ pub fn list_buckets_xml(buckets: &[BucketSummary], owner_principal: &str) -> Str
 
     xml.push_str("</Buckets></ListAllMyBucketsResult>");
     xml
+}
+
+/// Format a `GetBucketAcl` XML response.
+#[must_use]
+pub fn bucket_acl_xml(owner_principal: &str, acl: BucketAcl) -> String {
+    let mut xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <AccessControlPolicy xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <Owner><ID>",
+    );
+    xml.push_str(&xml_escape(owner_principal));
+    xml.push_str("</ID><DisplayName>");
+    xml.push_str(&xml_escape(owner_principal));
+    xml.push_str("</DisplayName></Owner><AccessControlList>");
+    append_canonical_user_grant(&mut xml, owner_principal, "FULL_CONTROL");
+    match acl {
+        BucketAcl::Private => {}
+        BucketAcl::PublicRead => append_all_users_grant(&mut xml, "READ"),
+        BucketAcl::PublicReadWrite => {
+            append_all_users_grant(&mut xml, "READ");
+            append_all_users_grant(&mut xml, "WRITE");
+        }
+        BucketAcl::AuthenticatedRead => {}
+    }
+    xml.push_str("</AccessControlList></AccessControlPolicy>");
+    xml
+}
+
+fn append_canonical_user_grant(xml: &mut String, owner_principal: &str, permission: &str) {
+    xml.push_str("<Grant><Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"CanonicalUser\"><ID>");
+    xml.push_str(&xml_escape(owner_principal));
+    xml.push_str("</ID><DisplayName>");
+    xml.push_str(&xml_escape(owner_principal));
+    xml.push_str("</DisplayName></Grantee><Permission>");
+    xml.push_str(permission);
+    xml.push_str("</Permission></Grant>");
+}
+
+fn append_all_users_grant(xml: &mut String, permission: &str) {
+    xml.push_str("<Grant><Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"Group\"><URI>http://acs.amazonaws.com/groups/global/AllUsers</URI></Grantee><Permission>");
+    xml.push_str(permission);
+    xml.push_str("</Permission></Grant>");
 }
 
 /// Format a `ListBucketResult` (`ListObjectsV2`) XML response.
@@ -2421,7 +2463,9 @@ mod tests {
             created_at: 1685000000000,
             versioning: BucketVersioningState::Disabled,
             public_read: false,
+            public_write: false,
             public_access_block: None,
+            ownership_controls: None,
         }];
         let xml = list_buckets_xml(&buckets, "owner");
         assert!(xml.contains("<Name>test-bucket</Name>"));

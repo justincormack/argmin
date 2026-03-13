@@ -154,6 +154,65 @@ pub async fn create_public_bucket(client: &Client) -> String {
     bucket
 }
 
+/// Create a public-read-write bucket.
+///
+/// Disables bucket-level BlockPublicAccess, sets ObjectOwnership to
+/// BucketOwnerPreferred, then applies the public-read-write ACL.
+pub async fn create_public_write_bucket(client: &Client) -> String {
+    use aws_sdk_s3::types::{
+        BucketCannedAcl, ObjectOwnership, OwnershipControlsRule, PublicAccessBlockConfiguration,
+    };
+
+    let bucket = unique_bucket();
+
+    client
+        .create_bucket()
+        .bucket(&bucket)
+        .send()
+        .await
+        .expect("create bucket");
+
+    let pab = PublicAccessBlockConfiguration::builder()
+        .block_public_acls(false)
+        .ignore_public_acls(false)
+        .block_public_policy(false)
+        .restrict_public_buckets(false)
+        .build();
+    client
+        .put_public_access_block()
+        .bucket(&bucket)
+        .public_access_block_configuration(pab)
+        .send()
+        .await
+        .expect("disable public access block");
+
+    let ownership_rule = OwnershipControlsRule::builder()
+        .object_ownership(ObjectOwnership::BucketOwnerPreferred)
+        .build()
+        .unwrap();
+    let ownership = aws_sdk_s3::types::OwnershipControls::builder()
+        .rules(ownership_rule)
+        .build()
+        .unwrap();
+    client
+        .put_bucket_ownership_controls()
+        .bucket(&bucket)
+        .ownership_controls(ownership)
+        .send()
+        .await
+        .expect("set ownership controls");
+
+    client
+        .put_bucket_acl()
+        .bucket(&bucket)
+        .acl(BucketCannedAcl::PublicReadWrite)
+        .send()
+        .await
+        .expect("set public-read-write ACL");
+
+    bucket
+}
+
 /// Delete all listed keys from the bucket, then delete the bucket itself.
 pub async fn delete_all_and_bucket(client: &Client, bucket: &str, keys: &[String]) {
     for key in keys {

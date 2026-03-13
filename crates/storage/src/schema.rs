@@ -281,7 +281,8 @@ CREATE TABLE IF NOT EXISTS buckets (
     region           INTEGER NOT NULL DEFAULT 0,
     state            INTEGER NOT NULL DEFAULT 0 CHECK (state IN (0, 1)),
     versioning       INTEGER NOT NULL DEFAULT 0 CHECK (versioning IN (0, 1, 2)),
-    public_read      INTEGER NOT NULL DEFAULT 0,
+    public_read      INTEGER NOT NULL DEFAULT 0 CHECK (public_read IN (0, 1)),
+    public_write     INTEGER NOT NULL DEFAULT 0 CHECK (public_write IN (0, 1)),
     cors_config      TEXT,
     tags             TEXT,
     public_access_block TEXT,
@@ -338,6 +339,7 @@ fn migrate_checksum_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
         "ALTER TABLE multipart_uploads ADD COLUMN checksum_type INTEGER",
         "ALTER TABLE multipart_parts ADD COLUMN checksum BLOB",
         "ALTER TABLE object_parts ADD COLUMN checksum BLOB",
+        "ALTER TABLE buckets ADD COLUMN public_write INTEGER NOT NULL DEFAULT 0 CHECK (public_write IN (0, 1))",
     ];
     for sql in &migrations {
         match conn.execute(sql, []) {

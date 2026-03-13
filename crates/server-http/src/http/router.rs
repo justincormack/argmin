@@ -31,6 +31,7 @@ pub enum S3Operation {
     PutBucketPublicAccessBlock { bucket: String },
     GetBucketPublicAccessBlock { bucket: String },
     DeleteBucketPublicAccessBlock { bucket: String },
+    GetBucketAcl { bucket: String },
     PutBucketAcl { bucket: String },
     PutBucketOwnershipControls { bucket: String },
     GetBucketOwnershipControls { bucket: String },
@@ -262,6 +263,12 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
             // Check for ?tagging → GetBucketTagging
             if has_query_key(query, "tagging") {
                 return Ok(S3Operation::GetBucketTagging {
+                    bucket: bucket.to_string(),
+                });
+            }
+            // Check for ?acl → GetBucketAcl
+            if has_query_key(query, "acl") {
+                return Ok(S3Operation::GetBucketAcl {
                     bucket: bucket.to_string(),
                 });
             }
@@ -807,6 +814,16 @@ mod tests {
         assert_eq!(
             route("PUT", "/mybucket", "acl").unwrap(),
             S3Operation::PutBucketAcl {
+                bucket: "mybucket".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn get_bucket_acl() {
+        assert_eq!(
+            route("GET", "/mybucket", "acl").unwrap(),
+            S3Operation::GetBucketAcl {
                 bucket: "mybucket".to_string()
             }
         );

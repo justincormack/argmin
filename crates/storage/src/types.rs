@@ -731,6 +731,7 @@ pub struct BucketInfo {
     pub state: BucketState,
     pub versioning: BucketVersioningState,
     pub public_read: bool,
+    pub public_write: bool,
     /// Serialized CORS configuration XML (None = no CORS config).
     pub cors_config: Option<String>,
     /// Serialized tagging XML (None = no tags).

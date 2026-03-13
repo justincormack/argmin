@@ -1039,6 +1039,12 @@ impl HttpFrontend {
                     .delete_bucket_ownership_controls(&bucket, requester)?;
                 Ok(S3Response::delete_bucket_ownership_controls())
             }
+            S3Operation::GetBucketAcl { bucket } => {
+                let requester =
+                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                let result = self.coordinator.get_bucket_acl(&bucket, requester)?;
+                Ok(S3Response::get_bucket_acl(&result))
+            }
             S3Operation::PutBucketAcl { bucket } => {
                 let acl = parse_bucket_acl(req)?;
                 let requester =
@@ -1654,32 +1660,45 @@ impl HttpFrontend {
                 .map(|(_, v)| v.as_str())
         };
 
-        // Authenticate using SigV4 POST form fields only.
-        let algo = field("x-amz-algorithm").ok_or_else(|| ServerError::InvalidRequest {
-            reason: "missing x-amz-algorithm".to_string(),
-        })?;
-        let post_auth = auth::authenticate_post_sigv4(
-            algo,
-            field("x-amz-credential").ok_or_else(|| ServerError::InvalidRequest {
-                reason: "missing x-amz-credential".to_string(),
-            })?,
-            field("x-amz-date").ok_or_else(|| ServerError::InvalidRequest {
-                reason: "missing x-amz-date".to_string(),
-            })?,
-            field("policy").ok_or_else(|| ServerError::InvalidRequest {
-                reason: "missing policy".to_string(),
-            })?,
-            field("x-amz-signature").ok_or_else(|| ServerError::InvalidRequest {
-                reason: "missing x-amz-signature".to_string(),
-            })?,
-            &self.credentials,
-        )
-        .map_err(|e| match e {
-            auth::AuthError::MissingAuth => ServerError::InvalidRequest {
-                reason: "missing required POST authentication fields".to_string(),
-            },
-            other => ServerError::Auth(other),
-        })?;
+        let post_auth = if [
+            "x-amz-algorithm",
+            "x-amz-credential",
+            "x-amz-date",
+            "policy",
+            "x-amz-signature",
+        ]
+        .iter()
+        .any(|name| field(name).is_some())
+        {
+            let algo = field("x-amz-algorithm").ok_or_else(|| ServerError::InvalidRequest {
+                reason: "missing x-amz-algorithm".to_string(),
+            })?;
+            auth::authenticate_post_sigv4(
+                algo,
+                field("x-amz-credential").ok_or_else(|| ServerError::InvalidRequest {
+                    reason: "missing x-amz-credential".to_string(),
+                })?,
+                field("x-amz-date").ok_or_else(|| ServerError::InvalidRequest {
+                    reason: "missing x-amz-date".to_string(),
+                })?,
+                field("policy").ok_or_else(|| ServerError::InvalidRequest {
+                    reason: "missing policy".to_string(),
+                })?,
+                field("x-amz-signature").ok_or_else(|| ServerError::InvalidRequest {
+                    reason: "missing x-amz-signature".to_string(),
+                })?,
+                &self.credentials,
+            )
+            .map_err(ServerError::Auth)?
+        } else {
+            AuthContext {
+                mode: AuthMode::Anonymous,
+                access_key_id: None,
+                principal: None,
+                request_epoch_secs: None,
+                streaming: None,
+            }
+        };
 
         // Resolve object key (with ${filename} substitution).
         let pseudo_form = multipart::PostFormData {
@@ -1689,7 +1708,8 @@ impl HttpFrontend {
         };
         let key = pseudo_form.resolve_key()?;
 
-        // Use POST auth context if authenticated, otherwise fall back to header auth.
+        // Prefer explicit POST auth when present; otherwise fall back to header
+        // auth, which may be anonymous for public-write buckets.
         let effective_auth = if post_auth.mode == AuthMode::Anonymous {
             &header_auth
         } else {
@@ -2459,9 +2479,8 @@ fn parse_bucket_acl(req: &S3Request) -> Result<crate::coordinator::BucketAcl, Se
     match req.header("x-amz-acl") {
         None | Some("private") => Ok(crate::coordinator::BucketAcl::Private),
         Some("public-read") => Ok(crate::coordinator::BucketAcl::PublicRead),
-        Some("public-read-write" | "authenticated-read") => {
-            Ok(crate::coordinator::BucketAcl::UnsupportedPublic)
-        }
+        Some("public-read-write") => Ok(crate::coordinator::BucketAcl::PublicReadWrite),
+        Some("authenticated-read") => Ok(crate::coordinator::BucketAcl::AuthenticatedRead),
         Some(other) => Err(ServerError::InvalidArgument {
             reason: format!("unsupported x-amz-acl value: {other}"),
         }),

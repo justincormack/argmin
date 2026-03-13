@@ -1,4 +1,4 @@
-use aws_sdk_s3::types::{BucketCannedAcl, ObjectCannedAcl, ObjectOwnership};
+use aws_sdk_s3::types::{BucketCannedAcl, ObjectCannedAcl, ObjectOwnership, Permission};
 use s3_tests::{unique_bucket, CTX};
 
 /// Build an agent that returns all HTTP responses (including 4xx/5xx) as Ok.
@@ -214,6 +214,44 @@ fn test_block_public_put_bucket_acls() {
             .send()
             .await
             .unwrap();
+
+        cleanup(&bucket).await;
+    });
+}
+
+#[test]
+fn test_get_bucket_acl_public_read_write() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = s3_tests::create_public_write_bucket(client).await;
+
+        let resp = client
+            .get_bucket_acl()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.owner().is_some(), "expected owner in GetBucketAcl");
+
+        let grants = resp.grants();
+        assert!(
+            grants.iter().any(|grant| {
+                grant.permission() == Some(&Permission::Read)
+                    && grant.grantee().and_then(|g| g.uri())
+                        == Some("http://acs.amazonaws.com/groups/global/AllUsers")
+            }),
+            "expected READ grant for AllUsers, got {:?}",
+            grants
+        );
+        assert!(
+            grants.iter().any(|grant| {
+                grant.permission() == Some(&Permission::Write)
+                    && grant.grantee().and_then(|g| g.uri())
+                        == Some("http://acs.amazonaws.com/groups/global/AllUsers")
+            }),
+            "expected WRITE grant for AllUsers, got {:?}",
+            grants
+        );
 
         cleanup(&bucket).await;
     });

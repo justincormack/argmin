@@ -42,6 +42,7 @@ pub trait PgMetadataStore {
         name: &str,
         owner_principal: &str,
         public_read: bool,
+        public_write: bool,
     ) -> Result<(), MetadataError>;
 
     /// Delete a bucket row.
@@ -100,8 +101,13 @@ pub trait PgMetadataStore {
     /// Delete a bucket's public access block configuration. Idempotent.
     fn delete_bucket_public_access_block(&self, name: &str) -> Result<(), MetadataError>;
 
-    /// Update a bucket's public_read ACL flag.
-    fn put_bucket_acl(&self, name: &str, public_read: bool) -> Result<(), MetadataError>;
+    /// Update a bucket's public ACL flags.
+    fn put_bucket_acl(
+        &self,
+        name: &str,
+        public_read: bool,
+        public_write: bool,
+    ) -> Result<(), MetadataError>;
 
     /// Store ownership controls for a bucket.
     fn put_bucket_ownership_controls(&self, name: &str, config: &str) -> Result<(), MetadataError>;

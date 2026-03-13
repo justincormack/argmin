@@ -373,11 +373,17 @@ fn file_metadata_zero_size() {
 fn file_bucket_metadata_create_head_list_delete() {
     let (_dir, store) = make_pg_store();
 
-    store.create_bucket("alpha", "owner-1", false).unwrap();
-    store.create_bucket("beta", "owner-1", true).unwrap();
-    store.create_bucket("gamma", "owner-2", false).unwrap();
+    store
+        .create_bucket("alpha", "owner-1", false, false)
+        .unwrap();
+    store.create_bucket("beta", "owner-1", true, false).unwrap();
+    store
+        .create_bucket("gamma", "owner-2", false, false)
+        .unwrap();
 
-    let err = store.create_bucket("alpha", "owner-1", false).unwrap_err();
+    let err = store
+        .create_bucket("alpha", "owner-1", false, false)
+        .unwrap_err();
     assert!(matches!(
         err,
         crate::error::MetadataError::BucketAlreadyExists
@@ -414,7 +420,9 @@ fn file_bucket_metadata_delete_nonexistent() {
 #[test]
 fn file_bucket_metadata_versioning_transitions() {
     let (_dir, store) = make_pg_store();
-    store.create_bucket("bucket", "owner", false).unwrap();
+    store
+        .create_bucket("bucket", "owner", false, false)
+        .unwrap();
 
     store
         .put_bucket_versioning("bucket", BucketVersioningState::Enabled)
@@ -438,7 +446,9 @@ fn file_bucket_metadata_versioning_transitions() {
 #[test]
 fn file_bucket_metadata_versioning_disabled_noop() {
     let (_dir, store) = make_pg_store();
-    store.create_bucket("bucket", "owner", false).unwrap();
+    store
+        .create_bucket("bucket", "owner", false, false)
+        .unwrap();
     store
         .put_bucket_versioning("bucket", BucketVersioningState::Disabled)
         .unwrap();
@@ -451,7 +461,9 @@ fn file_bucket_metadata_versioning_disabled_noop() {
 #[test]
 fn file_bucket_metadata_config_roundtrip() {
     let (_dir, store) = make_pg_store();
-    store.create_bucket("bucket", "owner", false).unwrap();
+    store
+        .create_bucket("bucket", "owner", false, false)
+        .unwrap();
 
     store.put_bucket_cors("bucket", "<Cors/>").unwrap();
     assert_eq!(
@@ -492,9 +504,9 @@ fn file_bucket_metadata_config_roundtrip() {
     store.delete_bucket_ownership_controls("bucket").unwrap();
     assert_eq!(store.get_bucket_ownership_controls("bucket").unwrap(), None);
 
-    store.put_bucket_acl("bucket", true).unwrap();
+    store.put_bucket_acl("bucket", true, false).unwrap();
     assert!(store.head_bucket("bucket").unwrap().public_read);
-    store.put_bucket_acl("bucket", false).unwrap();
+    store.put_bucket_acl("bucket", false, false).unwrap();
     assert!(!store.head_bucket("bucket").unwrap().public_read);
 }
 
