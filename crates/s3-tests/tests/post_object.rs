@@ -19,6 +19,10 @@ fn agent() -> ureq::Agent {
         .new_agent()
 }
 
+fn is_external() -> bool {
+    std::env::var("S3_TEST_ENDPOINT").is_ok()
+}
+
 /// Derive the SigV4 signing key.
 fn derive_signing_key(secret: &str, date: &str, region: &str, service: &str) -> hmac::Tag {
     let k_secret = format!("AWS4{}", secret);
@@ -377,15 +381,36 @@ async fn assert_post_object_anonymous_public_write_bucket() {
         status, body
     );
 
-    let out = client
-        .get_object()
-        .bucket(&bucket)
-        .key(key)
-        .send()
-        .await
-        .unwrap();
-    let data = out.body.collect().await.unwrap().into_bytes();
-    assert_eq!(&data[..], b"data");
+    // Match the same behavior asserted in the anonymous PUT test:
+    // bucket-level public write allows the anonymous upload, but on AWS the
+    // uploaded object is not readable by the bucket owner. Argmin has not yet
+    // implemented per-object owner identity for anonymous writes, so local
+    // readback still succeeds there.
+    if is_external() {
+        let err = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap_err();
+        let raw = format!("{:?}", err);
+        assert!(
+            raw.contains("AccessDenied") || raw.contains("403"),
+            "expected owner readback to be denied on external S3, got: {}",
+            raw
+        );
+    } else {
+        let out = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let data = out.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], b"data");
+    }
 
     client
         .delete_object()

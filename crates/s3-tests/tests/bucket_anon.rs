@@ -10,6 +10,10 @@ fn agent() -> ureq::Agent {
         .new_agent()
 }
 
+fn is_external() -> bool {
+    std::env::var("S3_TEST_ENDPOINT").is_ok()
+}
+
 /// Create a public-read bucket, returning its name.
 async fn setup_public_bucket() -> String {
     s3_tests::create_public_bucket(CTX.client()).await
@@ -387,6 +391,7 @@ fn test_object_anon_put() {
 #[test]
 fn test_object_anon_put_write_access() {
     s3_tests::run(async {
+        let client = CTX.client();
         let bucket = setup_public_write_bucket().await;
 
         let url = format!("{}/{}/anon-upload", CTX.endpoint(), bucket);
@@ -402,18 +407,46 @@ fn test_object_anon_put_write_access() {
             status, body
         );
 
-        let out = CTX
-            .client()
-            .get_object()
+        // AWS semantics are subtle here:
+        // - bucket-level public-read-write allows the anonymous upload itself
+        // - the uploaded object is not then readable by the bucket owner
+        // Local argmin does not yet model per-object owner identity for
+        // anonymous writes, so the bucket owner can still read it back there.
+        if is_external() {
+            let err = client
+                .get_object()
+                .bucket(&bucket)
+                .key("anon-upload")
+                .send()
+                .await
+                .unwrap_err();
+            let raw = format!("{:?}", err);
+            assert!(
+                raw.contains("AccessDenied") || raw.contains("403"),
+                "expected owner readback to be denied on external S3, got: {}",
+                raw
+            );
+        } else {
+            let out = client
+                .get_object()
+                .bucket(&bucket)
+                .key("anon-upload")
+                .send()
+                .await
+                .unwrap();
+            let data = out.body.collect().await.unwrap().into_bytes();
+            assert_eq!(&data[..], b"public write");
+        }
+
+        client
+            .delete_object()
             .bucket(&bucket)
             .key("anon-upload")
             .send()
             .await
             .unwrap();
-        let data = out.body.collect().await.unwrap().into_bytes();
-        assert_eq!(&data[..], b"public write");
 
-        cleanup(&bucket, &["anon-upload"]).await;
+        cleanup(&bucket, &[]).await;
     });
 }
 

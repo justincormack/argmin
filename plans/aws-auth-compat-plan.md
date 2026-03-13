@@ -14,6 +14,7 @@ This follow-up covers:
 - remaining auth error mapping gaps
 - remaining ACL/authz gaps
 - owner identity compatibility gaps
+- full object ownership compatibility gaps
 - conformance tests for the above
 
 This still does not cover:
@@ -84,7 +85,23 @@ Still missing:
 - S3 XML owner `<ID>` using canonical owner id instead of raw principal string
 - schema-level length checks for auth/identity fields
 
-### 5. Conformance and Integration Coverage
+### 5. Full Ownership Model Compatibility
+
+Still missing:
+- durable object-level owner identity distinct from bucket owner
+- object-owner semantics for anonymous/public-write uploads
+- bucket-owner access rules that match AWS for objects written by other principals
+- object ACL semantics sufficient to express owner/grantee behavior
+
+Notes:
+- AWS behavior was confirmed directly for bucket-level `public-read-write`:
+  - anonymous `PUT`/`POST` succeeds
+  - the bucket owner cannot subsequently `HEAD`/`GET` that object
+  - the bucket owner can still delete it
+- Argmin does not yet model per-object owner identity for these writes, so local
+  behavior still differs here.
+
+### 6. Conformance and Integration Coverage
 
 Still missing:
 - unignore and pass the header-auth wrong-region test
@@ -119,6 +136,9 @@ Minimal intended behavior after this follow-up:
 - anonymous: read-only on explicitly public-read buckets
 - anonymous/public write only when explicitly enabled by the supported ACL model
 - non-owner authenticated callers remain denied unless allowed by supported ACL or later policy work
+
+This is still intentionally weaker than full AWS ownership behavior until the
+object-ownership work lands.
 
 ## Implementation Phases
 
@@ -157,7 +177,20 @@ Deliver:
 Success criteria:
 - owner XML no longer exposes raw principal strings as canonical IDs
 
-### Phase 4: Conformance Cleanup
+### Phase 4: Full Ownership Model
+
+Deliver:
+- explicit object-level owner identity
+- correct bucket-owner behavior for anonymously/publicly uploaded objects
+- enough object ACL support to make those semantics coherent
+
+Success criteria:
+- external AWS-aligned tests for anonymous public-write uploads match locally:
+  - upload succeeds
+  - bucket-owner read is denied where appropriate
+  - bucket-owner cleanup still succeeds
+
+### Phase 5: Conformance Cleanup
 
 Deliver:
 - rerun targeted auth/public-access `s3-tests`
@@ -189,6 +222,11 @@ AWS checks:
 2. Owner canonical id derivation
 - whether to store a configured/generated canonical id directly or derive it
   deterministically from an existing stable principal identity
+
+3. Object owner identity source
+- whether to persist the authenticated writer principal directly as object owner
+  first, or introduce a separate canonical object-owner identifier at the same
+  time
 
 ## Recommended Default Decisions
 
