@@ -1958,12 +1958,7 @@ fn test_bucket_list_return_data_versioning() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client
-            .create_bucket()
-            .bucket(&bucket)
-            .send()
-            .await
-            .unwrap();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
 
         // Enable versioning.
         client
