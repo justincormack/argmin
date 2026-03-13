@@ -44,6 +44,9 @@ The server is configured via environment variables:
 | `ARGMIN_EC_K` | `4` | Erasure coding data shards |
 | `ARGMIN_EC_M` | `2` | Erasure coding parity shards |
 | `ARGMIN_REGION` | `us-east-1` | AWS region for auth |
+| `ARGMIN_WORKERS` | `4` | Number of frontend workers |
+| `ARGMIN_MAX_CONNECTIONS` | `512` | Max concurrent TCP connections |
+| `ARGMIN_MAX_INFLIGHT_REQUESTS` | `32` | Max concurrent in-flight requests |
 
 Start the server:
 

@@ -12,6 +12,7 @@ pub(crate) struct ServerConfig {
     pub(crate) region: String,
     pub(crate) workers: u32,
     pub(crate) max_connections: u32,
+    pub(crate) max_inflight_requests: u32,
 }
 
 impl ServerConfig {
@@ -27,6 +28,7 @@ impl ServerConfig {
     ///   `ARGMIN_REGION` (us-east-1)
     ///   `ARGMIN_WORKERS` (4)
     ///   `ARGMIN_MAX_CONNECTIONS` (512)
+    ///   `ARGMIN_MAX_INFLIGHT_REQUESTS` (32)
     pub(crate) fn from_env() -> Result<Self, String> {
         Self::from_lookup(|key| std::env::var(key).ok())
     }
@@ -62,6 +64,10 @@ impl ServerConfig {
             .unwrap_or_else(|| "512".to_string())
             .parse()
             .map_err(|e| format!("invalid ARGMIN_MAX_CONNECTIONS: {e}"))?;
+        let max_inflight_requests: u32 = get("ARGMIN_MAX_INFLIGHT_REQUESTS")
+            .unwrap_or_else(|| "32".to_string())
+            .parse()
+            .map_err(|e| format!("invalid ARGMIN_MAX_INFLIGHT_REQUESTS: {e}"))?;
 
         if pg_count == 0 {
             return Err("ARGMIN_PG_COUNT must be > 0".to_string());
@@ -71,6 +77,9 @@ impl ServerConfig {
         }
         if max_connections == 0 {
             return Err("ARGMIN_MAX_CONNECTIONS must be > 0".to_string());
+        }
+        if max_inflight_requests == 0 {
+            return Err("ARGMIN_MAX_INFLIGHT_REQUESTS must be > 0".to_string());
         }
 
         Ok(Self {
@@ -84,6 +93,7 @@ impl ServerConfig {
             region,
             workers,
             max_connections,
+            max_inflight_requests,
         })
     }
 }
@@ -139,6 +149,7 @@ mod tests {
         assert_eq!(cfg.region, "us-east-1");
         assert_eq!(cfg.workers, 4);
         assert_eq!(cfg.max_connections, 512);
+        assert_eq!(cfg.max_inflight_requests, 32);
         assert_eq!(cfg.access_key_id, "AKID");
         assert_eq!(cfg.secret_access_key, "SECRET");
     }
@@ -163,6 +174,7 @@ mod tests {
         assert_eq!(cfg.ec_m, 4);
         assert_eq!(cfg.region, "eu-west-1");
         assert_eq!(cfg.workers, 4); // not overridden, uses default
+        assert_eq!(cfg.max_inflight_requests, 32); // not overridden, uses default
         assert_eq!(cfg.access_key_id, "mykey");
         assert_eq!(cfg.secret_access_key, "mysecret");
     }
@@ -275,5 +287,38 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(err.contains("ARGMIN_MAX_CONNECTIONS"));
+    }
+
+    #[test]
+    fn custom_max_inflight_requests() {
+        let cfg = ServerConfig::from_lookup(make_env(&[
+            ("ARGMIN_ACCESS_KEY_ID", "a"),
+            ("ARGMIN_SECRET_ACCESS_KEY", "s"),
+            ("ARGMIN_MAX_INFLIGHT_REQUESTS", "64"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.max_inflight_requests, 64);
+    }
+
+    #[test]
+    fn max_inflight_requests_zero() {
+        let err = ServerConfig::from_lookup(make_env(&[
+            ("ARGMIN_ACCESS_KEY_ID", "a"),
+            ("ARGMIN_SECRET_ACCESS_KEY", "s"),
+            ("ARGMIN_MAX_INFLIGHT_REQUESTS", "0"),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("ARGMIN_MAX_INFLIGHT_REQUESTS must be > 0"));
+    }
+
+    #[test]
+    fn invalid_max_inflight_requests() {
+        let err = ServerConfig::from_lookup(make_env(&[
+            ("ARGMIN_ACCESS_KEY_ID", "a"),
+            ("ARGMIN_SECRET_ACCESS_KEY", "s"),
+            ("ARGMIN_MAX_INFLIGHT_REQUESTS", "not_a_number"),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("ARGMIN_MAX_INFLIGHT_REQUESTS"));
     }
 }

@@ -189,7 +189,8 @@ struct ServerState {
 ///
 /// Two layers of admission control:
 /// - A connection semaphore (`max_connections`) limits concurrent TCP connections.
-/// - A request semaphore (pool size) limits concurrent in-flight requests,
+/// - A request semaphore (`max_inflight_requests`) limits concurrent
+///   in-flight requests,
 ///   acquired before body collection to bound memory.
 ///
 /// Connection-level timeouts prevent idle/slow clients from pinning slots.
@@ -199,16 +200,16 @@ pub async fn serve(
     listener: TcpListener,
     frontends: Vec<HttpFrontend>,
     max_connections: u32,
+    max_inflight_requests: u32,
     config: ServeConfig,
 ) {
     assert!(!frontends.is_empty(), "at least one frontend required");
-    let pool_size = frontends.len();
 
     let header_read_timeout = config.header_read_timeout;
     let state = Arc::new(ServerState {
         pool: frontends.into_iter().map(Mutex::new).collect(),
         counter: AtomicUsize::new(0),
-        request_semaphore: Arc::new(Semaphore::new(pool_size)),
+        request_semaphore: Arc::new(Semaphore::new(max_inflight_requests as usize)),
         config,
     });
 

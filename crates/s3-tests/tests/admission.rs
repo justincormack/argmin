@@ -27,6 +27,7 @@ impl Drop for ServerGuard {
 async fn start_server(
     pool_size: usize,
     max_connections: u32,
+    max_inflight_requests: u32,
 ) -> (String, ServerGuard, test_util::TempDir) {
     let std_listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = std_listener.local_addr().unwrap().to_string();
@@ -77,6 +78,7 @@ async fn start_server(
         listener,
         frontends,
         max_connections,
+        max_inflight_requests,
         config,
     ));
 
@@ -129,7 +131,7 @@ async fn read_http_response(stream: &mut TcpStream, timeout: Duration) -> String
 /// request should be shed with 503 SlowDown after REQUEST_WAIT_TIMEOUT (5s).
 #[tokio::test]
 async fn slow_down_when_request_slot_held_by_slow_body() {
-    let (addr, _guard, _dir) = start_server(1, 8).await;
+    let (addr, _guard, _dir) = start_server(1, 8, 1).await;
 
     // Connection 1: send a non-streaming request with a large Content-Length
     // but never send the body. This holds the request permit while the server

@@ -912,7 +912,12 @@ impl S3Response {
             }
         };
         let body = xml::error_xml(err.s3_error_code(), message, resource, "request-id");
-        Self::new(err.http_status()).xml_body(body)
+        let resp = Self::new(err.http_status()).xml_body(body);
+        if matches!(err, ServerError::SlowDown) {
+            resp.header("Retry-After", "1")
+        } else {
+            resp
+        }
     }
 }
 
@@ -1522,6 +1527,15 @@ mod tests {
         assert_eq!(resp.status_code, 500);
         let body = String::from_utf8(resp.body).unwrap();
         assert!(body.contains("InternalError"));
+    }
+
+    #[test]
+    fn slow_down_response_has_retry_after() {
+        let resp = S3Response::error(&ServerError::SlowDown, "/");
+        assert_eq!(resp.status_code, 503);
+        assert_eq!(find_header(&resp, "Retry-After"), Some("1"));
+        let body = String::from_utf8(resp.body).unwrap();
+        assert!(body.contains("SlowDown"));
     }
 
     #[test]

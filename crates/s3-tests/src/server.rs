@@ -87,6 +87,7 @@ impl TestServer {
             listener,
             frontends,
             64,
+            32,
             server_http::http::serve::ServeConfig::default(),
         ));
 

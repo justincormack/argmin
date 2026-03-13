@@ -82,12 +82,14 @@ async fn main() {
     };
 
     eprintln!(
-        "argmin-s3 listening on {} (EC {},{}, {} PGs, {} workers, region {})",
+        "argmin-s3 listening on {} (EC {},{}, {} PGs, {} workers, max {} conns, max {} in-flight, region {})",
         config.listen_addr,
         config.ec_k,
         config.ec_m,
         config.pg_count,
         config.workers,
+        config.max_connections,
+        config.max_inflight_requests,
         config.region
     );
 
@@ -95,6 +97,7 @@ async fn main() {
         listener,
         frontends,
         config.max_connections,
+        config.max_inflight_requests,
         server_http::http::serve::ServeConfig::default(),
     )
     .await;
