@@ -2,6 +2,19 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::VersioningConfiguration;
 use s3_tests::{cleanup_versioned_bucket, err_status, unique_bucket, CTX};
 
+fn assert_canonical_owner_id(id: &str) {
+    assert_eq!(
+        id.len(),
+        64,
+        "expected 64-char canonical owner ID, got {id}"
+    );
+    assert!(
+        id.bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+        "expected lowercase hex canonical owner ID, got {id}"
+    );
+}
+
 // ── CreateBucket ─────────────────────────────────────────────────────
 
 #[test]
@@ -204,6 +217,9 @@ fn test_buckets_list_contains_created() {
             bucket,
             names
         );
+        let owner = resp.owner().expect("expected owner in ListBuckets");
+        let owner_id = owner.id().expect("expected owner ID in ListBuckets");
+        assert_canonical_owner_id(owner_id);
 
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });

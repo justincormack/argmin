@@ -3,6 +3,19 @@ use s3_tests::{
     create_objects, create_objects_with_keys, delete_all_and_bucket, err_status, unique_bucket, CTX,
 };
 
+fn assert_canonical_owner_id(id: &str) {
+    assert_eq!(
+        id.len(),
+        64,
+        "expected 64-char canonical owner ID, got {id}"
+    );
+    assert!(
+        id.bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+        "expected lowercase hex canonical owner ID, got {id}"
+    );
+}
+
 // ── Test data sets ──────────────────────────────────────────────────
 
 /// Set A — 6 keys for delimiter tests.
@@ -1570,11 +1583,13 @@ fn test_bucket_listv2_fetchowner_notempty() {
             .await
             .unwrap();
         for obj in resp.contents() {
-            assert!(
-                obj.owner().is_some(),
-                "expected owner for key {:?}",
-                obj.key()
-            );
+            let owner = obj
+                .owner()
+                .unwrap_or_else(|| panic!("expected owner for key {:?}", obj.key()));
+            let owner_id = owner
+                .id()
+                .unwrap_or_else(|| panic!("expected owner ID for key {:?}", obj.key()));
+            assert_canonical_owner_id(owner_id);
         }
 
         delete_all_and_bucket(client, &bucket, &keys).await;

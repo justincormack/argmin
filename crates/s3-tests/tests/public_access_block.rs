@@ -1,6 +1,19 @@
 use aws_sdk_s3::types::{BucketCannedAcl, ObjectCannedAcl, ObjectOwnership, Permission};
 use s3_tests::{unique_bucket, CTX};
 
+fn assert_canonical_owner_id(id: &str) {
+    assert_eq!(
+        id.len(),
+        64,
+        "expected 64-char canonical owner ID, got {id}"
+    );
+    assert!(
+        id.bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+        "expected lowercase hex canonical owner ID, got {id}"
+    );
+}
+
 /// Build an agent that returns all HTTP responses (including 4xx/5xx) as Ok.
 fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
@@ -231,7 +244,9 @@ fn test_get_bucket_acl_public_read_write() {
             .send()
             .await
             .unwrap();
-        assert!(resp.owner().is_some(), "expected owner in GetBucketAcl");
+        let owner = resp.owner().expect("expected owner in GetBucketAcl");
+        let owner_id = owner.id().expect("expected owner ID in GetBucketAcl");
+        assert_canonical_owner_id(owner_id);
 
         let grants = resp.grants();
         assert!(
