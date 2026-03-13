@@ -381,12 +381,6 @@ fn test_buckets_list_ctime() {
 }
 
 #[test]
-#[ignore = "not implemented: HEAD bucket usage statistics"]
-fn test_head_bucket_usage() {
-    s3_tests::run(async {});
-}
-
-#[test]
 #[ignore = "not implemented: multi-user"]
 fn test_bucket_create_exists_nonowner() {
     s3_tests::run(async {});
