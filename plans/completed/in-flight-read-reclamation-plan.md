@@ -460,8 +460,12 @@ Status:
    - a root-generation lease model on chunk-manifest `ReadHandle`s
    - reclaim-on-drop behavior for current delete, version-specific delete, and
      stale chunk-manifest payloads displaced by simple writes
-9. multipart-manifest payload reclamation is still on the older immediate or
-   leak-prone paths and remains the next design step
+9. multipart-manifest payloads now also have:
+   - a durable `multipart_reclaims` root table plus explicit part and
+     part-chunk child rows
+   - a root-generation lease model on multipart `ReadHandle`s and copy-source
+     readers
+   - background reclaim for direct delete and stale overwrite displacement
 
 ### Phase 5: Expand reclamation coverage
 
