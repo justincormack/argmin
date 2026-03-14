@@ -335,8 +335,8 @@ impl StorageClass {
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataLayout {
-    /// Internal chunk manifest (normal PutObject writes).
-    ChunkManifestInternal = 0,
+    /// Internal segment manifest (normal PutObject writes).
+    SegmentManifestInternal = 0,
     /// Composite manifest of independent parts (S3 multipart).
     MultipartManifest = 1,
 }
@@ -344,7 +344,7 @@ pub enum DataLayout {
 impl DataLayout {
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
-            0 => Some(Self::ChunkManifestInternal),
+            0 => Some(Self::SegmentManifestInternal),
             1 => Some(Self::MultipartManifest),
             _ => None,
         }
@@ -470,8 +470,8 @@ impl ObjectEtag {
 /// Object data layout — encodes the `data_layout` column plus `parts_count`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectLayout {
-    /// Internal chunk manifest (normal PutObject writes).
-    ChunkManifest,
+    /// Internal segment manifest (normal PutObject writes).
+    SegmentManifest,
     /// Composite manifest of independent parts (S3 multipart).
     MultipartManifest { parts_count: std::num::NonZeroU32 },
 }
@@ -483,14 +483,14 @@ impl ObjectLayout {
         parts_count: Option<u32>,
     ) -> Result<Self, &'static str> {
         match (data_layout, parts_count) {
-            (DataLayout::ChunkManifestInternal, None) => Ok(Self::ChunkManifest),
+            (DataLayout::SegmentManifestInternal, None) => Ok(Self::SegmentManifest),
             (DataLayout::MultipartManifest, Some(n)) => {
                 let nz = std::num::NonZeroU32::new(n)
                     .ok_or("multipart manifest with zero parts_count")?;
                 Ok(Self::MultipartManifest { parts_count: nz })
             }
-            (DataLayout::ChunkManifestInternal, Some(_)) => {
-                Err("chunk manifest must not have parts_count")
+            (DataLayout::SegmentManifestInternal, Some(_)) => {
+                Err("segment manifest must not have parts_count")
             }
             (DataLayout::MultipartManifest, None) => Err("multipart manifest missing parts_count"),
         }
@@ -499,15 +499,15 @@ impl ObjectLayout {
     /// The underlying data layout discriminant for SQL writes.
     pub fn data_layout(self) -> DataLayout {
         match self {
-            Self::ChunkManifest => DataLayout::ChunkManifestInternal,
+            Self::SegmentManifest => DataLayout::SegmentManifestInternal,
             Self::MultipartManifest { .. } => DataLayout::MultipartManifest,
         }
     }
 
-    /// The parts count for SQL writes (None for chunk manifest).
+    /// The parts count for SQL writes (None for segment manifest).
     pub fn parts_count(self) -> Option<u32> {
         match self {
-            Self::ChunkManifest => None,
+            Self::SegmentManifest => None,
             Self::MultipartManifest { parts_count } => Some(parts_count.get()),
         }
     }
@@ -621,9 +621,9 @@ pub struct PayloadReclaimRoot {
     pub generation_id: GenerationId,
 }
 
-/// Chunk entry for a durable chunk-manifest reclaim record.
+/// Chunk entry for a durable segment-manifest reclaim record.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChunkManifestReclaimChunkRecord {
+pub struct SegmentManifestReclaimSegmentRecord {
     pub chunk_index: u32,
     pub chunk_okh: [u8; 16],
     pub chunk_vid: GenerationId,
@@ -631,31 +631,31 @@ pub struct ChunkManifestReclaimChunkRecord {
     pub ec: EcShape,
 }
 
-/// Durable reclaim record for a chunk-manifest payload generation.
+/// Durable reclaim record for a segment-manifest payload generation.
 ///
 /// This is used when the namespace-visible object row is removed or replaced
-/// before the old chunk-manifest payload can be physically deleted.
+/// before the old segment-manifest payload can be physically deleted.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChunkManifestReclaimRecord {
+pub struct SegmentManifestReclaimRecord {
     pub bucket: BucketName,
     pub key: ObjectKey,
     pub generation_id: GenerationId,
     pub created_at: u64,
-    pub chunks: Vec<ChunkManifestReclaimChunkRecord>,
+    pub chunks: Vec<SegmentManifestReclaimSegmentRecord>,
 }
 
 /// Part storage kind for a multipart reclaim record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MultipartReclaimPartKind {
     ShardSet = 0,
-    ChunkManifest = 1,
+    SegmentManifest = 1,
 }
 
 impl MultipartReclaimPartKind {
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
             0 => Some(Self::ShardSet),
-            1 => Some(Self::ChunkManifest),
+            1 => Some(Self::SegmentManifest),
             _ => None,
         }
     }
@@ -682,7 +682,7 @@ pub enum MultipartReclaimPartRecord {
         shard_pg_id: u32,
         ec: EcShape,
     },
-    ChunkManifest {
+    SegmentManifest {
         part_number: u32,
         chunks: Vec<MultipartReclaimPartChunkRecord>,
     },
@@ -752,7 +752,7 @@ pub enum PutObjectReq {
 /// Request to store a live object.
 ///
 /// Invariant: the ETag variant must match the layout — `SinglePart` with
-/// `ChunkManifest`, `MultipartComposite` with `MultipartManifest`. Use
+/// `SegmentManifest`, `MultipartComposite` with `MultipartManifest`. Use
 /// [`PutLiveObjectReq::validate`] or rely on `put_object_meta` which calls it.
 pub struct PutLiveObjectReq {
     pub bucket: BucketName,
@@ -773,7 +773,7 @@ impl PutLiveObjectReq {
     /// Validate that the etag variant is consistent with the layout.
     pub fn validate(&self) -> Result<(), &'static str> {
         match (&self.etag, &self.layout) {
-            (ObjectEtag::SinglePart(_), ObjectLayout::ChunkManifest) => Ok(()),
+            (ObjectEtag::SinglePart(_), ObjectLayout::SegmentManifest) => Ok(()),
             (
                 ObjectEtag::MultipartComposite { parts, .. },
                 ObjectLayout::MultipartManifest { parts_count },
@@ -787,8 +787,8 @@ impl PutLiveObjectReq {
             (ObjectEtag::SinglePart(_), ObjectLayout::MultipartManifest { .. }) => {
                 Err("single-part etag with multipart layout")
             }
-            (ObjectEtag::MultipartComposite { .. }, ObjectLayout::ChunkManifest) => {
-                Err("multipart composite etag with chunk manifest layout")
+            (ObjectEtag::MultipartComposite { .. }, ObjectLayout::SegmentManifest) => {
+                Err("multipart composite etag with segment manifest layout")
             }
         }
     }
@@ -825,7 +825,7 @@ pub struct CommitMultipartReq {
 
 /// Request to finalize a streaming PutObject into a live object.
 ///
-/// Layout is always `ChunkManifest` — no parts_count field.
+/// Layout is always `SegmentManifest` — no parts_count field.
 /// The ETag is a single-part CRC64; the storage layer constructs the
 /// `SinglePart` variant, so the caller cannot produce a variant mismatch.
 pub struct CommitStreamPutReq {
@@ -1170,10 +1170,10 @@ mod tests {
     // ── DataLayout enum tests ──────────────────────────────────────
 
     #[test]
-    fn data_layout_from_u8_chunk_manifest_internal() {
+    fn data_layout_from_u8_segment_manifest_internal() {
         assert_eq!(
             DataLayout::from_u8(0),
-            Some(DataLayout::ChunkManifestInternal)
+            Some(DataLayout::SegmentManifestInternal)
         );
     }
 

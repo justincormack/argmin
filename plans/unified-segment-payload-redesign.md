@@ -28,7 +28,7 @@ The result is:
 - different correctness and performance properties depending on how the object was
   uploaded
 - read-path optimization is harder because the storage model is inconsistent
-- small range reads are naturally safe on chunk-manifest objects but not on direct
+- small range reads are naturally safe on segment-manifest objects but not on direct
   shard-set objects
 - slow-writer handling does not apply uniformly to normal `PUT` and multipart part
   uploads
@@ -45,7 +45,7 @@ Adopt a single internal payload representation:
 - transfer style (`PUT`, aws-chunked, `POST`, `UploadPart`, `CopyObject`) is
   decoupled from physical segment layout
 
-This should eventually retire the current "direct shard-set vs chunk-manifest"
+This should eventually retire the current "direct shard-set vs segment-manifest"
 split as a first-class storage distinction.
 
 ## Core Model
@@ -108,7 +108,7 @@ This preserves multipart semantics directly for:
      cases by upload mode
 
 5. **The model should simplify, not multiply, object layouts**
-   - special-case `ChunkManifest` should not remain a permanent separate concept if
+   - special-case `SegmentManifest` should not remain a permanent separate concept if
      all payloads become segmented internally
 
 ## What Changes
@@ -285,19 +285,20 @@ Completed slices so far:
   `segment_vid`
 - storage staging methods are now `append_stream_segment` and
   `list_stream_segments`
+- internal object layout, reclaim, and read-side naming now use
+  `SegmentManifest` instead of `ChunkManifest`
 
 Intentional non-goals of the current Phase B work:
 
 - the external coordinator ingest API is still `append_stream_chunk(...)`
-- `ObjectLayout::ChunkManifest` is not renamed yet
 - read/write semantics are unchanged; this is a metadata convergence step only
 
 Specifically:
 
 1. choose a fixed segment size
-2. treat current chunk-manifest work as the prototype for the generic segment
+2. treat current segment-manifest work as the prototype for the generic segment
    manifest model
-3. stop treating `ChunkManifest` as a special upload-mode layout over time
+3. stop treating `SegmentManifest` as a special upload-mode layout over time
 4. unify integrity, read, reclaim, and slow-writer behavior around segments
 5. adopt the new metadata/layout model directly, without carrying compatibility
    baggage for earlier experimental internal layouts
@@ -344,7 +345,7 @@ Goals:
 ### Phase C: Route new streamed writes through generic segments
 
 Switch current streaming paths to write generic segments rather than a special
-chunk-manifest concept.
+segment-manifest concept.
 
 ### Phase D: Route normal `PUT` and non-streamed multipart through generic segments
 
@@ -358,11 +359,11 @@ This is the key convergence step:
 Once all new payloads use segments, read and copy paths should consume a unified
 manifest abstraction.
 
-### Phase F: Retire the special-case chunk-manifest model
+### Phase F: Retire the special-case segment-manifest model
 
 At that point:
 
-- `ChunkManifest` should no longer be a first-class permanent object-layout split
+- `SegmentManifest` should no longer be a first-class permanent object-layout split
 - it becomes an implementation detail of the generic segment model, or disappears
 - older experimental layouts can be removed outright rather than preserved
 

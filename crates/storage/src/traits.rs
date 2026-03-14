@@ -196,22 +196,22 @@ pub trait PgMetadataStore {
         generation_id: GenerationId,
     ) -> Result<(), MetadataError>;
 
-    /// Insert a durable reclaim record for a chunk-manifest payload.
-    fn put_chunk_manifest_reclaim(
+    /// Insert a durable reclaim record for a segment-manifest payload.
+    fn put_segment_manifest_reclaim(
         &self,
-        reclaim: &ChunkManifestReclaimRecord,
+        reclaim: &SegmentManifestReclaimRecord,
     ) -> Result<(), MetadataError>;
 
-    /// Look up a durable reclaim record for a chunk-manifest payload generation.
-    fn get_chunk_manifest_reclaim(
+    /// Look up a durable reclaim record for a segment-manifest payload generation.
+    fn get_segment_manifest_reclaim(
         &self,
         bucket: &str,
         key: &str,
         generation_id: GenerationId,
-    ) -> Result<Option<ChunkManifestReclaimRecord>, MetadataError>;
+    ) -> Result<Option<SegmentManifestReclaimRecord>, MetadataError>;
 
-    /// Delete a durable reclaim record for a chunk-manifest payload generation.
-    fn delete_chunk_manifest_reclaim(
+    /// Delete a durable reclaim record for a segment-manifest payload generation.
+    fn delete_segment_manifest_reclaim(
         &self,
         bucket: &str,
         key: &str,
@@ -412,7 +412,7 @@ pub trait PgMetadataStore {
         chunks: &[MultipartPartSegmentRecord],
     ) -> Result<(), MetadataError>;
 
-    /// Read committed chunk manifest for a ChunkManifestInternal object.
+    /// Read committed segment manifest for a SegmentManifestInternal object.
     fn get_object_segments(
         &self,
         bucket: &str,
@@ -420,7 +420,7 @@ pub trait PgMetadataStore {
         version_id: VersionId,
     ) -> Result<Vec<ObjectSegmentRecord>, MetadataError>;
 
-    /// Delete committed chunk manifest for an object version.
+    /// Delete committed segment manifest for an object version.
     fn delete_object_segments(
         &self,
         bucket: &str,
@@ -428,7 +428,7 @@ pub trait PgMetadataStore {
         version_id: VersionId,
     ) -> Result<(), MetadataError>;
 
-    /// Read committed chunk manifest for a multipart part.
+    /// Read committed segment manifest for a multipart part.
     fn get_multipart_part_segments(
         &self,
         bucket: &str,

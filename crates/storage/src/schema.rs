@@ -133,7 +133,7 @@ CREATE TABLE IF NOT EXISTS stream_upload_segments (
     FOREIGN KEY (session_id) REFERENCES stream_uploads(session_id) ON DELETE CASCADE
 )";
 
-/// Committed chunk manifest for normal PutObject.
+/// Committed segment manifest for normal PutObject.
 const CREATE_STREAM_OBJECT_CHUNKS_TABLE: &str = "\
 CREATE TABLE IF NOT EXISTS object_segments (
     bucket        TEXT NOT NULL,
@@ -161,9 +161,9 @@ CREATE TABLE IF NOT EXISTS simple_payload_reclaims (
     PRIMARY KEY (bucket, key, generation_id)
 )";
 
-/// Durable reclaim queue for chunk-manifest payload generations.
+/// Durable reclaim queue for segment-manifest payload generations.
 const CREATE_CHUNK_MANIFEST_RECLAIMS_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS chunk_manifest_reclaims (
+CREATE TABLE IF NOT EXISTS segment_manifest_reclaims (
     bucket        TEXT NOT NULL,
     key           TEXT NOT NULL,
     generation_id INTEGER NOT NULL CHECK (generation_id > 0),
@@ -171,9 +171,9 @@ CREATE TABLE IF NOT EXISTS chunk_manifest_reclaims (
     PRIMARY KEY (bucket, key, generation_id)
 )";
 
-/// Child chunk rows for chunk-manifest reclaim generations.
+/// Child chunk rows for segment-manifest reclaim generations.
 const CREATE_CHUNK_MANIFEST_RECLAIM_CHUNKS_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS chunk_manifest_reclaim_chunks (
+CREATE TABLE IF NOT EXISTS segment_manifest_reclaim_segments (
     bucket        TEXT NOT NULL,
     key           TEXT NOT NULL,
     generation_id INTEGER NOT NULL CHECK (generation_id > 0),
@@ -185,7 +185,7 @@ CREATE TABLE IF NOT EXISTS chunk_manifest_reclaim_chunks (
     ec_m          INTEGER NOT NULL,
     PRIMARY KEY (bucket, key, generation_id, chunk_index),
     FOREIGN KEY (bucket, key, generation_id)
-        REFERENCES chunk_manifest_reclaims(bucket, key, generation_id)
+        REFERENCES segment_manifest_reclaims(bucket, key, generation_id)
         ON DELETE CASCADE
 )";
 
@@ -241,7 +241,7 @@ CREATE TABLE IF NOT EXISTS multipart_reclaim_part_chunks (
         ON DELETE CASCADE
 )";
 
-/// Committed chunk manifest for multipart parts.
+/// Committed segment manifest for multipart parts.
 const CREATE_MULTIPART_PART_CHUNKS_TABLE: &str = "\
 CREATE TABLE IF NOT EXISTS multipart_part_segments (
     bucket        TEXT NOT NULL,

@@ -1462,7 +1462,7 @@ impl PgMetadataStore for PgStore {
                      UNION ALL
                      SELECT generation_id FROM simple_payload_reclaims WHERE bucket = ?1 AND key = ?2
                      UNION ALL
-                     SELECT generation_id FROM chunk_manifest_reclaims WHERE bucket = ?1 AND key = ?2
+                     SELECT generation_id FROM segment_manifest_reclaims WHERE bucket = ?1 AND key = ?2
                      UNION ALL
                      SELECT generation_id FROM multipart_reclaims WHERE bucket = ?1 AND key = ?2
                  )",
@@ -1587,21 +1587,21 @@ impl PgMetadataStore for PgStore {
         Ok(())
     }
 
-    fn put_chunk_manifest_reclaim(
+    fn put_segment_manifest_reclaim(
         &self,
-        reclaim: &ChunkManifestReclaimRecord,
+        reclaim: &SegmentManifestReclaimRecord,
     ) -> Result<(), MetadataError> {
         self.conn
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| MetadataError::Db {
-                context: "put chunk manifest reclaim (begin txn)",
+                context: "put segment manifest reclaim (begin txn)",
                 source: e,
             })?;
 
         let result: Result<(), MetadataError> = (|| {
             self.conn
                 .execute(
-                    "INSERT OR REPLACE INTO chunk_manifest_reclaims \
+                    "INSERT OR REPLACE INTO segment_manifest_reclaims \
                      (bucket, key, generation_id, created_at) VALUES (?1, ?2, ?3, ?4)",
                     params![
                         reclaim.bucket,
@@ -1611,14 +1611,14 @@ impl PgMetadataStore for PgStore {
                     ],
                 )
                 .map_err(|e| MetadataError::Db {
-                    context: "put chunk manifest reclaim (root)",
+                    context: "put segment manifest reclaim (root)",
                     source: e,
                 })?;
 
             for chunk in &reclaim.chunks {
                 self.conn
                     .execute(
-                        "INSERT OR REPLACE INTO chunk_manifest_reclaim_chunks \
+                        "INSERT OR REPLACE INTO segment_manifest_reclaim_segments \
                          (bucket, key, generation_id, chunk_index, chunk_okh, chunk_vid, \
                           shard_pg_id, ec_k, ec_m) \
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -1635,7 +1635,7 @@ impl PgMetadataStore for PgStore {
                         ],
                     )
                     .map_err(|e| MetadataError::Db {
-                        context: "put chunk manifest reclaim (chunk)",
+                        context: "put segment manifest reclaim (chunk)",
                         source: e,
                     })?;
             }
@@ -1647,7 +1647,7 @@ impl PgMetadataStore for PgStore {
                 if let Err(e) = self.conn.execute_batch("COMMIT") {
                     let _ = self.conn.execute_batch("ROLLBACK");
                     return Err(MetadataError::Db {
-                        context: "put chunk manifest reclaim (commit txn)",
+                        context: "put segment manifest reclaim (commit txn)",
                         source: e,
                     });
                 }
@@ -1660,17 +1660,17 @@ impl PgMetadataStore for PgStore {
         }
     }
 
-    fn get_chunk_manifest_reclaim(
+    fn get_segment_manifest_reclaim(
         &self,
         bucket: &str,
         key: &str,
         generation_id: GenerationId,
-    ) -> Result<Option<ChunkManifestReclaimRecord>, MetadataError> {
+    ) -> Result<Option<SegmentManifestReclaimRecord>, MetadataError> {
         let root = self
             .conn
             .query_row(
                 "SELECT bucket, key, generation_id, created_at \
-                 FROM chunk_manifest_reclaims \
+                 FROM segment_manifest_reclaims \
                  WHERE bucket = ?1 AND key = ?2 AND generation_id = ?3",
                 params![bucket, key, generation_id.get() as i64],
                 |row| {
@@ -1684,7 +1684,7 @@ impl PgMetadataStore for PgStore {
             )
             .optional()
             .map_err(|e| MetadataError::Db {
-                context: "get chunk manifest reclaim (root)",
+                context: "get segment manifest reclaim (root)",
                 source: e,
             })?;
 
@@ -1696,18 +1696,18 @@ impl PgMetadataStore for PgStore {
             .conn
             .prepare(
                 "SELECT chunk_index, chunk_okh, chunk_vid, shard_pg_id, ec_k, ec_m \
-                 FROM chunk_manifest_reclaim_chunks \
+                 FROM segment_manifest_reclaim_segments \
                  WHERE bucket = ?1 AND key = ?2 AND generation_id = ?3 \
                  ORDER BY chunk_index ASC",
             )
             .map_err(|e| MetadataError::Db {
-                context: "get chunk manifest reclaim (prepare chunks)",
+                context: "get segment manifest reclaim (prepare chunks)",
                 source: e,
             })?;
 
         let chunks = stmt
             .query_map(params![bucket, key, generation_id.get() as i64], |row| {
-                Ok(ChunkManifestReclaimChunkRecord {
+                Ok(SegmentManifestReclaimSegmentRecord {
                     chunk_index: row.get::<_, i64>(0)? as u32,
                     chunk_okh: row.get_ref(1)?.as_blob()?.try_into().map_err(|_| {
                         rusqlite::Error::FromSqlConversionFailure(
@@ -1725,16 +1725,16 @@ impl PgMetadataStore for PgStore {
                 })
             })
             .map_err(|e| MetadataError::Db {
-                context: "get chunk manifest reclaim (query chunks)",
+                context: "get segment manifest reclaim (query chunks)",
                 source: e,
             })?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| MetadataError::Db {
-                context: "get chunk manifest reclaim (collect chunks)",
+                context: "get segment manifest reclaim (collect chunks)",
                 source: e,
             })?;
 
-        Ok(Some(ChunkManifestReclaimRecord {
+        Ok(Some(SegmentManifestReclaimRecord {
             bucket: bucket_name,
             key: key_name,
             generation_id,
@@ -1743,7 +1743,7 @@ impl PgMetadataStore for PgStore {
         }))
     }
 
-    fn delete_chunk_manifest_reclaim(
+    fn delete_segment_manifest_reclaim(
         &self,
         bucket: &str,
         key: &str,
@@ -1751,12 +1751,12 @@ impl PgMetadataStore for PgStore {
     ) -> Result<(), MetadataError> {
         self.conn
             .execute(
-                "DELETE FROM chunk_manifest_reclaims \
+                "DELETE FROM segment_manifest_reclaims \
                  WHERE bucket = ?1 AND key = ?2 AND generation_id = ?3",
                 params![bucket, key, generation_id.get() as i64],
             )
             .map_err(|e| MetadataError::Db {
-                context: "delete chunk manifest reclaim",
+                context: "delete segment manifest reclaim",
                 source: e,
             })?;
         Ok(())
@@ -1820,7 +1820,7 @@ impl PgMetadataStore for PgStore {
                                 source: e,
                             })?;
                     }
-                    MultipartReclaimPartRecord::ChunkManifest {
+                    MultipartReclaimPartRecord::SegmentManifest {
                         part_number,
                         chunks,
                     } => {
@@ -1835,11 +1835,11 @@ impl PgMetadataStore for PgStore {
                                     reclaim.key,
                                     reclaim.generation_id.get() as i64,
                                     *part_number as i64,
-                                    MultipartReclaimPartKind::ChunkManifest as u8,
+                                    MultipartReclaimPartKind::SegmentManifest as u8,
                                 ],
                             )
                             .map_err(|e| MetadataError::Db {
-                                context: "put multipart reclaim (part chunk manifest)",
+                                context: "put multipart reclaim (part segment manifest)",
                                 source: e,
                             })?;
 
@@ -2026,7 +2026,7 @@ impl PgMetadataStore for PgStore {
                         ec: EcShape { k: ec_k, m: ec_m },
                     });
                 }
-                MultipartReclaimPartKind::ChunkManifest => {
+                MultipartReclaimPartKind::SegmentManifest => {
                     let mut chunk_stmt = self
                         .conn
                         .prepare(
@@ -2072,7 +2072,7 @@ impl PgMetadataStore for PgStore {
                             source: e,
                         })?;
 
-                    parts.push(MultipartReclaimPartRecord::ChunkManifest {
+                    parts.push(MultipartReclaimPartRecord::SegmentManifest {
                         part_number,
                         chunks,
                     });
@@ -2117,7 +2117,7 @@ impl PgMetadataStore for PgStore {
                 "SELECT bucket, key, generation_id FROM (
                      SELECT bucket, key, generation_id FROM simple_payload_reclaims WHERE bucket = ?1
                      UNION ALL
-                     SELECT bucket, key, generation_id FROM chunk_manifest_reclaims WHERE bucket = ?1
+                     SELECT bucket, key, generation_id FROM segment_manifest_reclaims WHERE bucket = ?1
                      UNION ALL
                      SELECT bucket, key, generation_id FROM multipart_reclaims WHERE bucket = ?1
                  )
@@ -3418,7 +3418,7 @@ impl PgMetadataStore for PgStore {
 
             // 2. Write/overwrite object metadata row.
             let now = PgStore::now_millis();
-            let data_layout = DataLayout::ChunkManifestInternal as u8;
+            let data_layout = DataLayout::SegmentManifestInternal as u8;
             let parts_count: Option<i64> = None;
             let tags = obj.tags.as_deref();
 
@@ -3471,7 +3471,7 @@ impl PgMetadataStore for PgStore {
                     source: e,
                 })?;
 
-            // 4. Insert committed chunk manifest rows.
+            // 4. Insert committed segment manifest rows.
             {
                 let mut stmt = self
                     .conn
@@ -3689,7 +3689,7 @@ impl PgMetadataStore for PgStore {
                     source: e,
                 })?;
 
-            // 4. Insert committed part chunk manifest rows.
+            // 4. Insert committed part segment manifest rows.
             {
                 let mut stmt = self
                     .conn
@@ -4079,7 +4079,7 @@ mod tests {
                     size: 10,
                     etag: ObjectEtag::SinglePart([0; 8]),
                     ec: EcShape { k: 4, m: 2 },
-                    layout: ObjectLayout::ChunkManifest,
+                    layout: ObjectLayout::SegmentManifest,
                     tags: None,
                     metadata_blob: None,
                 }))
@@ -4235,7 +4235,7 @@ mod tests {
                     size: 0,
                     etag: ObjectEtag::SinglePart([0; 8]),
                     ec: EcShape { k: 4, m: 2 },
-                    layout: ObjectLayout::ChunkManifest,
+                    layout: ObjectLayout::SegmentManifest,
                     tags: None,
                     metadata_blob: None,
                 }))
