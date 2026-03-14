@@ -29,7 +29,10 @@ use crate::conditional::{
 use crate::error::ServerError;
 use crate::etag::{compute_multipart_etag, crc64_to_etag_bytes, etag_bytes_to_crc64, format_etag};
 use crate::metadata_blob::MetadataBlob;
-use crate::pg::{chunk_key_hash, object_key_hash, part_key_hash, segment_key_hash, PgTopology};
+use crate::pg::{
+    chunk_key_hash, multipart_part_segment_key_hash, object_key_hash, part_key_hash,
+    segment_key_hash, PgTopology,
+};
 use crate::range::ByteRange;
 
 /// Maximum object size for single PUT or upload part (5 GiB, matches AWS S3).
@@ -6217,7 +6220,7 @@ impl Coordinator {
         //    if meta_pg_id > shard_pg_id, drop, relock in order, and re-read.
         let meta_pg_id = self.object_pg_id(bucket, key);
 
-        let (meta_pg, shard_guard, generation, _shard_pg_id, upload_checksum_algo) = loop {
+        let (meta_pg, shard_guard, generation, shard_pg_id, upload_checksum_algo) = loop {
             let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
 
             // Validate upload exists, belongs to this bucket/key, and is InProgress.
@@ -6343,46 +6346,75 @@ impl Coordinator {
             }
         }
 
-        // 4. Compute part identity.
-        let part_okh = part_key_hash(upload_id, part_number, generation);
-        let part_vid = GenerationId::new(u64::from(generation) + 1)
-            .expect("multipart generation must be nonzero");
+        // 4. Segmented multipart parts use the zero part_okh sentinel and store
+        //    their payload identity in multipart_part_segments rows instead.
+        let part_okh = [0u8; 16];
+        let part_vid = GenerationId::MIN;
 
         // 5. EC-encode part data (no metadata blob for parts — raw data only).
         let etag_crc = checksum::crc64::checksum(data);
 
         let k = self.ec_config.data_shards as usize;
         let m = self.ec_config.parity_shards as usize;
-        let mut padded = data.to_vec();
-        let remainder = padded.len() % k;
-        if remainder != 0 {
-            padded.resize(padded.len() + (k - remainder), 0);
-        }
-
-        let shard_size = padded.len() / k;
-        let data_shards: Vec<&[u8]> = (0..k)
-            .map(|i| &padded[i * shard_size..(i + 1) * shard_size])
-            .collect();
-        let mut parity_bufs: Vec<Vec<u8>> = (0..m).map(|_| vec![0u8; shard_size]).collect();
-        let mut parity_refs: Vec<&mut [u8]> = parity_bufs
-            .iter_mut()
-            .map(std::vec::Vec::as_mut_slice)
-            .collect();
-        self.ec_codec.encode(&data_shards, &mut parity_refs)?;
-
-        // 6. Write shards, with cleanup on failure.
         let shard_pg: &storage::PgStore = shard_guard.as_deref().unwrap_or(&meta_pg);
-        let mut written_shards: Vec<ShardKey> = Vec::with_capacity(k + m);
+        let mut written_shards: Vec<ShardKey> = Vec::new();
+        let mut committed_segments = Vec::new();
         let write_result: Result<(), ServerError> = (|| {
-            for i in 0..(k + m) {
-                let shard_key = ShardKey::new(&part_okh, part_vid.get(), i as u8);
-                let shard_data = if i < k {
-                    data_shards[i]
-                } else {
-                    &parity_bufs[i - k]
-                };
-                shard_pg.write_shard(&shard_key, shard_data)?;
-                written_shards.push(shard_key);
+            for (segment_index, segment_data) in data.chunks(INTERNAL_SEGMENT_SIZE).enumerate() {
+                let segment_index =
+                    u32::try_from(segment_index).map_err(|_| ServerError::InternalError {
+                        reason: "too many multipart part segments".to_string(),
+                    })?;
+                let segment_okh = multipart_part_segment_key_hash(
+                    upload_id,
+                    part_number,
+                    generation,
+                    segment_index,
+                );
+                let segment_vid = GenerationId::MIN;
+
+                let mut padded = segment_data.to_vec();
+                let remainder = padded.len() % k;
+                if remainder != 0 {
+                    padded.resize(padded.len() + (k - remainder), 0);
+                }
+
+                let shard_size = padded.len() / k;
+                let data_shards: Vec<&[u8]> = (0..k)
+                    .map(|i| &padded[i * shard_size..(i + 1) * shard_size])
+                    .collect();
+                let mut parity_bufs: Vec<Vec<u8>> = (0..m).map(|_| vec![0u8; shard_size]).collect();
+                let mut parity_refs: Vec<&mut [u8]> = parity_bufs
+                    .iter_mut()
+                    .map(std::vec::Vec::as_mut_slice)
+                    .collect();
+                self.ec_codec.encode(&data_shards, &mut parity_refs)?;
+
+                for i in 0..(k + m) {
+                    let shard_key = ShardKey::new(&segment_okh, segment_vid.get(), i as u8);
+                    let shard_data = if i < k {
+                        data_shards[i]
+                    } else {
+                        &parity_bufs[i - k]
+                    };
+                    shard_pg.write_shard(&shard_key, shard_data)?;
+                    written_shards.push(shard_key);
+                }
+
+                committed_segments.push(MultipartPartSegmentRecord {
+                    bucket: BucketName::from(bucket),
+                    key: ObjectKey::from(key),
+                    upload_id: UploadId::from(upload_id),
+                    version_id: storage::MULTIPART_PART_SEGMENT_STAGING_VERSION_ID.to_u64(),
+                    part_number,
+                    segment_index,
+                    size: segment_data.len() as u64,
+                    segment_okh,
+                    segment_vid,
+                    shard_pg_id,
+                    ec_k: self.ec_config.data_shards,
+                    ec_m: self.ec_config.parity_shards,
+                });
             }
             Ok(())
         })();
@@ -6400,22 +6432,25 @@ impl Coordinator {
             .unwrap_or_default()
             .as_millis() as u64;
 
-        let upsert_result = meta_pg.upsert_multipart_part(&MultipartPartRecord {
-            upload_id: UploadId::from(upload_id),
-            part_number,
-            generation,
-            size: data.len() as u64,
-            etag: crc64_to_etag_bytes(etag_crc),
-            etag_kind: storage::EtagKind::Crc64,
-            part_okh,
-            part_vid,
-            ec_k: self.ec_config.data_shards,
-            ec_m: self.ec_config.parity_shards,
-            last_modified: now,
-            checksum: checksum_bytes.clone(),
-        });
+        let upsert_result = meta_pg.upsert_multipart_part_segments(
+            &MultipartPartRecord {
+                upload_id: UploadId::from(upload_id),
+                part_number,
+                generation,
+                size: data.len() as u64,
+                etag: crc64_to_etag_bytes(etag_crc),
+                etag_kind: storage::EtagKind::Crc64,
+                part_okh,
+                part_vid,
+                ec_k: self.ec_config.data_shards,
+                ec_m: self.ec_config.parity_shards,
+                last_modified: now,
+                checksum: checksum_bytes.clone(),
+            },
+            &committed_segments,
+        );
 
-        let prev_gen = match upsert_result {
+        let (prev_gen, prev_segments) = match upsert_result {
             Ok(prev) => prev,
             Err(e) => {
                 // Best-effort cleanup of written shards.
@@ -6431,7 +6466,9 @@ impl Coordinator {
         //    old generation may map to any PG including those we hold.
         drop(shard_guard);
         drop(meta_pg);
-        if let Some(old_gen) = prev_gen {
+        if !prev_segments.is_empty() {
+            self.delete_chunk_shards_generic(&prev_segments)?;
+        } else if let Some(old_gen) = prev_gen {
             let old_okh = part_key_hash(upload_id, part_number, old_gen);
             let old_vid =
                 GenerationId::new(u64::from(old_gen) + 1).expect("old generation must be nonzero");
@@ -13103,6 +13140,16 @@ mod tests {
         assert_eq!(part.part_number, 1);
         assert_eq!(part.generation, 0);
         assert_eq!(part.size, 11); // "hello world".len()
+        assert_eq!(part.part_okh, [0u8; 16]);
+        assert_eq!(part.part_vid, GenerationId::MIN);
+
+        let segments = pg
+            .get_all_multipart_part_segments_for_upload(&create.upload_id)
+            .unwrap();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].part_number, 1);
+        assert_eq!(segments[0].segment_index, 0);
+        assert_eq!(segments[0].size, 11);
     }
 
     #[test]

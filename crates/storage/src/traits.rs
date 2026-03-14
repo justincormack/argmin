@@ -303,6 +303,16 @@ pub trait PgMetadataStore {
         part: &MultipartPartRecord,
     ) -> Result<Option<u32>, MetadataError>;
 
+    /// Atomically upsert a multipart part and replace its staged segment rows.
+    ///
+    /// Returns the previous part generation, if any, together with the prior
+    /// staged segment rows for this upload/part_number.
+    fn upsert_multipart_part_segments(
+        &self,
+        part: &MultipartPartRecord,
+        segments: &[MultipartPartSegmentRecord],
+    ) -> Result<(Option<u32>, Vec<MultipartPartSegmentRecord>), MetadataError>;
+
     /// Get a specific part of an in-progress upload.
     fn get_multipart_part(
         &self,

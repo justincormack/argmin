@@ -3078,6 +3078,78 @@ fn multipart_part_segments_crud() {
 }
 
 #[test]
+fn upsert_multipart_part_segments_replaces_prior_segments() {
+    let (_dir, store) = make_pg_store();
+
+    store
+        .create_multipart_upload(&CreateMultipartUploadReq {
+            upload_id: "mpu-1".into(),
+            bucket: "b".into(),
+            key: "k".into(),
+            metadata_blob: vec![],
+            owner_principal: None,
+            checksum: None,
+        })
+        .unwrap();
+
+    let make_part = |generation, size| MultipartPartRecord {
+        upload_id: "mpu-1".into(),
+        part_number: 1,
+        generation,
+        size,
+        etag: vec![1],
+        etag_kind: EtagKind::Crc64,
+        part_okh: [0u8; 16],
+        part_vid: GenerationId::MIN,
+        ec_k: 4,
+        ec_m: 2,
+        last_modified: 1000,
+        checksum: None,
+    };
+    let make_segment = |segment_index, size, fill| MultipartPartSegmentRecord {
+        bucket: "b".into(),
+        key: "k".into(),
+        upload_id: "mpu-1".into(),
+        version_id: MULTIPART_PART_SEGMENT_STAGING_VERSION_ID.to_u64(),
+        part_number: 1,
+        segment_index,
+        size,
+        segment_okh: [fill; 16],
+        segment_vid: GenerationId::MIN,
+        shard_pg_id: 0,
+        ec_k: 4,
+        ec_m: 2,
+    };
+
+    let (prev_gen, prev_segments) = store
+        .upsert_multipart_part_segments(
+            &make_part(0, 10),
+            &[make_segment(0, 6, 0x11), make_segment(1, 4, 0x22)],
+        )
+        .unwrap();
+    assert_eq!(prev_gen, None);
+    assert!(prev_segments.is_empty());
+
+    let (prev_gen, prev_segments) = store
+        .upsert_multipart_part_segments(&make_part(1, 7), &[make_segment(0, 7, 0x33)])
+        .unwrap();
+    assert_eq!(prev_gen, Some(0));
+    assert_eq!(prev_segments.len(), 2);
+    assert_eq!(prev_segments[0].segment_okh, [0x11; 16]);
+    assert_eq!(prev_segments[1].segment_okh, [0x22; 16]);
+
+    let part = store.get_multipart_part("mpu-1", 1).unwrap();
+    assert_eq!(part.generation, 1);
+    assert_eq!(part.part_okh, [0u8; 16]);
+
+    let segments = store
+        .get_all_multipart_part_segments_for_upload("mpu-1")
+        .unwrap();
+    assert_eq!(segments.len(), 1);
+    assert_eq!(segments[0].segment_okh, [0x33; 16]);
+}
+
+#[test]
 fn commit_stream_part_replaces_prior_chunks_on_reupload() {
     let (_dir, store) = make_pg_store();
 

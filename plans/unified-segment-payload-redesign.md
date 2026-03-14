@@ -295,7 +295,7 @@ Intentional non-goals of the current Phase B work:
 
 ### Phase D
 
-In progress.
+Completed.
 
 Completed slices so far:
 
@@ -308,11 +308,11 @@ Completed slices so far:
   path
 - unversioned buffered overwrites now enqueue reclaim for the old segment
   manifest without deleting the newly committed rows
-
-Remaining work in this phase:
-
-- route non-streamed multipart part writes through the same fixed internal
-  segment model
+- non-streamed multipart `UploadPart` writes now split into fixed `4 MiB`
+  internal segments
+- buffered multipart parts now persist staged `multipart_part_segments` rows and
+  use the existing zero-`part_okh` sentinel path through complete, read, abort,
+  and reclaim flows
 
 Specifically:
 

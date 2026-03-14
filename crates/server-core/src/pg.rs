@@ -154,6 +154,24 @@ pub fn part_key_hash(upload_id: &str, part_number: u32, generation: u32) -> [u8;
     result
 }
 
+/// Compute the 16-byte segment key hash for multipart part segment shard keys.
+///
+/// `segment_okh = SHA-256("mpu-segment/" + upload_id + "/" + part_number + "/" + generation +
+/// "/" + segment_index)[:16]`
+pub fn multipart_part_segment_key_hash(
+    upload_id: &str,
+    part_number: u32,
+    generation: u32,
+    segment_index: u32,
+) -> [u8; 16] {
+    use ring::digest;
+    let input = format!("mpu-segment/{upload_id}/{part_number}/{generation}/{segment_index}");
+    let hash = digest::digest(&digest::SHA256, input.as_bytes());
+    let mut result = [0u8; 16];
+    result.copy_from_slice(&hash.as_ref()[..16]);
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,6 +368,33 @@ mod tests {
     #[test]
     fn object_key_hash_length() {
         let hash = object_key_hash("bucket", "key");
+        assert_eq!(hash.len(), 16);
+    }
+
+    #[test]
+    fn multipart_part_segment_key_hash_deterministic() {
+        let a = multipart_part_segment_key_hash("upload", 1, 0, 0);
+        let b = multipart_part_segment_key_hash("upload", 1, 0, 0);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn multipart_part_segment_key_hash_different_segments() {
+        let a = multipart_part_segment_key_hash("upload", 1, 0, 0);
+        let b = multipart_part_segment_key_hash("upload", 1, 0, 1);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn multipart_part_segment_key_hash_different_generations() {
+        let a = multipart_part_segment_key_hash("upload", 1, 0, 0);
+        let b = multipart_part_segment_key_hash("upload", 1, 1, 0);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn multipart_part_segment_key_hash_length() {
+        let hash = multipart_part_segment_key_hash("upload", 1, 0, 0);
         assert_eq!(hash.len(), 16);
     }
 }

@@ -25,8 +25,7 @@ use crate::types::*;
 /// Part chunk rows use a sentinel version_id during staging (pre-CompleteMultipartUpload).
 /// Must differ from any real version_id (0 for unversioned, 1+ for versioned) so that
 /// in-progress staging rows are invisible to reads of completed objects.
-const PART_CHUNK_STAGING_VERSION_ID: VersionId =
-    VersionId::Versioned(std::num::NonZeroU64::new(u64::MAX).unwrap());
+const PART_CHUNK_STAGING_VERSION_ID: VersionId = MULTIPART_PART_SEGMENT_STAGING_VERSION_ID;
 type StreamSessionRow = (u8, u8, BucketName, ObjectKey, Option<UploadId>, Option<i64>);
 
 /// Per-PG store combining shard file I/O with SQLite metadata.
@@ -2664,6 +2663,174 @@ impl PgMetadataStore for PgStore {
                 }
                 Err(MetadataError::Db {
                     context: "upsert multipart part",
+                    source: e,
+                })
+            }
+        }
+    }
+
+    fn upsert_multipart_part_segments(
+        &self,
+        part: &MultipartPartRecord,
+        segments: &[MultipartPartSegmentRecord],
+    ) -> Result<(Option<u32>, Vec<MultipartPartSegmentRecord>), MetadataError> {
+        if part.part_okh != [0u8; 16] {
+            return Err(MetadataError::Db {
+                context: "upsert multipart part segments (non-segment part)",
+                source: rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Null,
+                    Box::from("segmented multipart parts must use zero part_okh sentinel"),
+                ),
+            });
+        }
+
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| MetadataError::Db {
+                context: "upsert multipart part segments (begin txn)",
+                source: e,
+            })?;
+
+        let result =
+            (|| -> Result<(Option<u32>, Vec<MultipartPartSegmentRecord>), rusqlite::Error> {
+                let prev_gen: Option<u32> = self
+                    .conn
+                    .query_row(
+                        "SELECT generation FROM multipart_parts \
+                     WHERE upload_id = ?1 AND part_number = ?2",
+                        params![part.upload_id, part.part_number],
+                        |row| row.get::<_, i64>(0).map(|v| v as u32),
+                    )
+                    .optional()?;
+
+                let mut prev_stmt = self.conn.prepare(
+                    "SELECT bucket, key, upload_id, version_id, part_number, segment_index, size, \
+                 segment_okh, segment_vid, shard_pg_id, ec_k, ec_m \
+                 FROM multipart_part_segments \
+                 WHERE upload_id = ?1 AND version_id = ?2 AND part_number = ?3 \
+                 ORDER BY segment_index ASC",
+                )?;
+                let prev_rows = prev_stmt.query_map(
+                    params![
+                        part.upload_id,
+                        PART_CHUNK_STAGING_VERSION_ID.to_u64() as i64,
+                        part.part_number
+                    ],
+                    |row| {
+                        let okh_blob: Vec<u8> = row.get(7)?;
+                        let okh = PgStore::parse_okh_blob(&okh_blob, 7)?;
+                        Ok(MultipartPartSegmentRecord {
+                            bucket: row.get(0)?,
+                            key: row.get(1)?,
+                            upload_id: row.get(2)?,
+                            version_id: row.get::<_, i64>(3)? as u64,
+                            part_number: row.get(4)?,
+                            segment_index: row.get(5)?,
+                            size: row.get::<_, i64>(6)? as u64,
+                            segment_okh: okh,
+                            segment_vid: Self::parse_generation_id(
+                                row.get::<_, i64>(8)?,
+                                8,
+                                "segment_vid",
+                            )?,
+                            shard_pg_id: row.get(9)?,
+                            ec_k: row.get(10)?,
+                            ec_m: row.get(11)?,
+                        })
+                    },
+                )?;
+                let prev_segments = prev_rows.collect::<Result<Vec<_>, _>>()?;
+
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO multipart_parts \
+                 (upload_id, part_number, generation, size, etag, etag_kind, \
+                  part_okh, part_vid, ec_k, ec_m, last_modified, checksum) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    params![
+                        part.upload_id,
+                        part.part_number,
+                        part.generation,
+                        part.size as i64,
+                        part.etag,
+                        part.etag_kind as u8,
+                        part.part_okh.as_slice(),
+                        part.part_vid.get() as i64,
+                        part.ec_k,
+                        part.ec_m,
+                        part.last_modified as i64,
+                        part.checksum,
+                    ],
+                )?;
+
+                self.conn.execute(
+                    "DELETE FROM multipart_part_segments \
+                 WHERE upload_id = ?1 AND version_id = ?2 AND part_number = ?3",
+                    params![
+                        part.upload_id,
+                        PART_CHUNK_STAGING_VERSION_ID.to_u64() as i64,
+                        part.part_number
+                    ],
+                )?;
+
+                let mut stmt = self.conn.prepare(
+                    "INSERT INTO multipart_part_segments \
+                 (bucket, key, upload_id, version_id, part_number, segment_index, size, \
+                  segment_okh, segment_vid, shard_pg_id, ec_k, ec_m) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                )?;
+                for segment in segments {
+                    if segment.upload_id != part.upload_id
+                        || segment.part_number != part.part_number
+                        || segment.version_id != PART_CHUNK_STAGING_VERSION_ID.to_u64()
+                    {
+                        return Err(rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Null,
+                            Box::from("segment row does not match multipart part identity"),
+                        ));
+                    }
+                    stmt.execute(params![
+                        segment.bucket,
+                        segment.key,
+                        segment.upload_id,
+                        segment.version_id as i64,
+                        segment.part_number,
+                        segment.segment_index,
+                        segment.size as i64,
+                        segment.segment_okh.as_slice(),
+                        segment.segment_vid.get() as i64,
+                        segment.shard_pg_id,
+                        segment.ec_k,
+                        segment.ec_m,
+                    ])?;
+                }
+
+                Ok((prev_gen, prev_segments))
+            })();
+
+        match result {
+            Ok(prev_state) => {
+                if let Err(e) = self.conn.execute_batch("COMMIT") {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    return Err(MetadataError::Db {
+                        context: "upsert multipart part segments (commit txn)",
+                        source: e,
+                    });
+                }
+                Ok(prev_state)
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                if let rusqlite::Error::SqliteFailure(ref err, _) = e {
+                    if err.code == rusqlite::ffi::ErrorCode::ConstraintViolation {
+                        return Err(MetadataError::NoSuchUpload {
+                            upload_id: part.upload_id.clone(),
+                        });
+                    }
+                }
+                Err(MetadataError::Db {
+                    context: "upsert multipart part segments",
                     source: e,
                 })
             }
