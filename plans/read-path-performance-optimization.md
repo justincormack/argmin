@@ -1,291 +1,136 @@
-# Read Path Performance Optimization
+# Segment Integrity Checksums For Bounded Range Reads
 
 ## Context
 
-After fixing full-object buffering and moving large reads onto `ReadHandle`, large
-downloads are now memory-bounded as intended, but throughput regressed materially.
-Empirically, large local reads are roughly an order of magnitude slower than the
-older fully-buffered path, while CPU and system load remain fairly low.
+The earlier broad read-path optimization plan no longer matches current reality.
+Fresh measurements on current segmented data show:
 
-This plan is post-redesign:
+- `2 GiB` GETs are back near the original expected throughput
+- `20 GiB` GETs are also strong, around `25.49s` locally
+- the severe read regression that originally motivated the plan no longer reproduces on fresh current data
 
-- the unified segmented payload redesign is complete
-- current object reads now flow through the generic segmented read path rather than
-  the earlier mixed direct-shard and streamed-chunk layouts
-- the remaining work here is storage/read-path optimization, not layout
-  convergence
+That means the immediate read-side gap is narrower:
 
-This plan captures what we measured, what we ruled out, and the recommended order
-for optimization work.
+- we want explicit logical-segment integrity metadata in SQLite
+- we want segmented reads and small ranges to validate at the segment boundary
+- we do not currently need a broader storage/read-path rewrite for throughput
 
-## What We Measured
+This plan replaces the older broad optimization scope with a focused integrity step.
 
-### 1. HTTP chunk-size sweep
+## Goal
 
-We added `ARGMIN_STREAM_READ_CHUNK_SIZE` and benchmarked cached local `GET`
-throughput on a `2 GiB` multipart object.
+Persist a CRC64 for every committed and staged logical segment, and verify it on segmented reads.
 
-Results:
+This gives us:
 
-- `1 MiB`: `1.253s`
-- `4 MiB`: `1.831s`
-- `8 MiB`: `2.120s`
+- an integrity boundary aligned with the current fixed `4 MiB` internal segment model
+- bounded validation for small range requests
+- a clean foundation if we later introduce more selective physical shard reads
 
-Conclusion:
+## Non-Goals
 
-- larger HTTP chunk sizes were worse
-- HTTP chunk size is not the main bottleneck
-- keep the default at `1 MiB`
+This work does not attempt to:
 
-### 2. Multipart part-size sweep
+- redesign the current segmented read pipeline
+- remove `fs::read()` from `read_shard`
+- optimize large-read throughput further right now
+- replace the existing shard-level CRC64 checks
 
-We uploaded the same `2 GiB` object with different multipart part sizes and measured
-`GET` throughput:
+Shard CRC64 remains in place. Segment CRC64 is an additional logical integrity layer.
 
-- `8 MiB` parts:
-  - `1.392s`
-  - `1.377s`
-  - `1.386s`
-- `64 MiB` parts:
-  - `1.377s`
-  - `1.387s`
-  - `1.375s`
-- `128 MiB` parts:
-  - `1.387s`
-  - `1.379s`
-  - `1.372s`
+## Design
 
-Conclusion:
+### Integrity unit
 
-- larger multipart parts did not materially improve throughput
-- small multipart part size is not the primary explanation for the current
-  regression in this benchmark
+- one CRC64-NVME per logical segment
+- checksum is computed over the logical segment bytes before EC encoding
+- segment size remains the fixed internal segment size (`4 MiB` today)
 
-### 3. CPU profile (`perf`)
+### Storage placement
 
-Large local `GET` profiling showed:
+Persist `segment_crc64` in SQLite on:
 
-- `read_shard` / `std::fs::read::inner` dominate the hot path
-- `memmove` is also very hot
-- socket `writev` is significant
-- EC CPU itself is not the dominant bottleneck
+- `stream_upload_segments`
+- `object_segments`
+- `multipart_part_segments`
 
-Representative results:
+This is sufficient for the current segmented read path.
 
-- `20.79%` in
-  `<storage::pg_store::PgStore as storage::traits::ShardStore>::read_shard`
-- `20.62%` in `std::fs::read::inner`
-- `44.69%` in `__memmove_avx512_unaligned_erms`
+Reclaim metadata does not need segment checksums because reclaim does not serve reads.
 
-Interpretation:
+### Read verification
 
-- we are paying heavily for repeated shard reads and copy/assembly work
-- the bottleneck is not primarily checksum calculation or SQLite lookup
+On segmented reads:
 
-### 4. Syscall profiling (`strace`)
+1. read and reconstruct the touched logical segment
+2. compute CRC64 over the reconstructed logical segment bytes
+3. compare with the stored `segment_crc64`
+4. only then slice and emit the requested subrange
 
-Large local `GET` syscall tracing showed:
+This means a small range request still reads and validates each touched logical segment in full, but it no longer depends on whole-object or whole-part integrity state.
 
-- many `openat` / `read` / `close` operations
-- many `futex` waits, but those reflect whole-process blocked time and should not
-  be treated as proof that mutex contention is the root bottleneck
+### Backward compatibility
 
-This is consistent with the CPU profile: there is substantial churn around
-repeated shard-file access.
+There are no hard backward-compatibility guarantees for old experimental layouts, but the schema change should still be tolerant of preexisting local dev data where reasonable.
 
-### 5. Read amplification
+Practical approach:
 
-We traced a `2 GiB` object `GET` and summed only shard-file read syscalls under
-`.../pg-*/shards/...`.
+- add nullable `segment_crc64` columns via migration
+- require new writes to populate them
+- verify on read only when present
 
-Results:
+That gives us the feature immediately without turning old local data into an unreadable trap.
 
-- object bytes returned: `2,147,483,648`
-- shard bytes read: `3,221,225,472`
-- read amplification: `1.500000x`
+## Implementation Steps
 
-Conclusion:
+### Phase 1: Schema and types
 
-- low-level shard reads are not over-reading beyond the expected `4+2` EC overhead
-- the main issue is not excess read amplification at the storage syscall level
+1. add nullable `segment_crc64` columns to:
+   - `stream_upload_segments`
+   - `object_segments`
+   - `multipart_part_segments`
+2. thread the field through:
+   - `StreamUploadSegmentRecord`
+   - `ObjectSegmentRecord`
+   - `MultipartPartSegmentRecord`
+   - `SegmentPayloadRecord`
+3. add migration logic for existing SQLite databases
 
-## Current Read-Shard Shape
+### Phase 2: Write paths
 
-`PgStore::read_shard()` currently does:
+Populate `segment_crc64` on all current segment-producing paths:
 
-1. SQLite metadata lookup
-2. `fs::read(shard_path)` into a fresh `Vec<u8>`
-3. CRC64 over that full buffer
-4. return `ShardData { data: Vec<u8>, ... }`
+- buffered `PutObject`
+- buffered `CopyObject` destination writes
+- streaming `PutObject`
+- buffered `UploadPart`
+- streaming `UploadPart`
 
-This shape strongly suggests two avoidable costs:
+### Phase 3: Read paths
 
-- repeated whole-file allocation and read into fresh buffers
-- repeated copy/assembly of returned shard buffers into output chunks
-
-Under the current segmented model:
-
-- logical segments are `4 MiB`
-- with the default `4+2` EC layout, data shard files are roughly `1 MiB`
-
-That matters because whole-shard validation is now bounded to a relatively small
-physical unit on the hot path. It is still not ideal for all future range-read
-goals, but it is no longer the first throughput bottleneck to attack for large
-reads.
-
-## What We Ruled Out
-
-These are not the first place to optimize:
-
-1. HTTP response chunk size
-2. Multipart part size
-3. SQLite lookup inside `read_shard`
-4. CRC64 itself as the main hot spot
-5. Storage-level over-read beyond EC overhead
-
-## Recommended Optimization Direction
-
-### Goal
-
-Reduce repeated shard-read allocation/copy overhead without regressing correctness,
-streaming semantics, or the new retained-payload lifetime model.
-
-### Stage 1: Stop using `fs::read()` on the hot path
-
-Replace the current whole-file read API with a caller-buffer or reader-based API.
-
-Recommended direction:
-
-- add a ranged read interface such as `read_shard_into(...)`
-- or add a shard-reader object that keeps an fd open and supports sequential reads
-
-Properties:
-
-- caller provides reusable buffers
-- shard reads no longer allocate a fresh `Vec` per call
-- read only the needed window for the current output chunk
-
-This is now the highest-value first optimization because the current active shard
-files are already bounded in size, but `fs::read()` still imposes avoidable
-allocation and copy cost on every segment read.
-
-### Stage 2: Reuse shard file descriptors within a reader lifetime
-
-Current traces suggest repeated open/read/close churn.
-
-Recommended direction:
-
-- keep shard files open within the generic segmented reader variants for the
-  duration of the read window or request
-- use `pread` / `read` into caller-owned buffers instead of reopening files
-
-This should reduce syscall churn and kernel-side path work.
-
-Concretely, in the current code this applies to the generic segmented read path:
+Verify `segment_crc64` on:
 
 - `ReadRuntime::read_segment_payload(...)`
-- `SegmentListReader`
-- `MultipartReader`
+- therefore all current segmented `GET`, `Range`, `Part`, and copy-source reads
 
-not to a legacy split between different object-layout families.
+For rows that do not yet have `segment_crc64`, skip logical-segment verification and continue relying on shard CRC64.
 
-### Stage 3: Reduce assembly copies
+### Phase 4: Tests
 
-Once shard data is read into reusable buffers, reduce extra movement on the
-reconstruction path.
+Add/adjust tests for:
 
-Recommended direction:
+- segment metadata round-trip in storage
+- buffered object writes populate segment CRCs
+- streaming writes populate segment CRCs
+- multipart part writes populate segment CRCs
+- read fails if segment bytes reconstruct but do not match stored segment CRC
+- small range reads still succeed and verify touched segments
 
-- reconstruct directly into the final output chunk buffer where possible
-- avoid intermediate `Vec` creation for assembled chunks
-- consider a segmented internal chunk representation only if measurement shows it
-  will reduce copying materially
+## Completion Criteria
 
-Important:
+This plan is complete when:
 
-- true zero-copy is not realistic for the normal EC path, because bytes must be
-  reconstructed into response order
-- the target is "one output buffer", not "no copies at all"
-
-### Stage 4: Re-measure before more ambitious design changes
-
-After Stages 1-3, rerun:
-
-- large local `GET` throughput benchmarks
-- `perf`
-- shard-read syscall trace
-
-Only then decide whether more invasive work is justified, such as:
-
-- segmented output chunks
-- larger internal readahead windows
-- alternative checksum placement
-
-### Stage 5: Add sub-shard integrity blocks if small-range work still needs them
-
-Today, `read_shard()` verifies integrity by reading the full shard file and checking
-its whole-shard CRC64.
-
-Under the current `4 MiB` segmented layout with default `4+2` EC, that usually
-means verifying about `1 MiB` shard files, which is acceptable for the current
-large-read throughput work.
-
-It is still not ideal if we later need:
-
-- smaller-range validation with less than whole-shard over-read
-- larger logical segments
-- different EC shapes that make shard files materially larger
-
-If that becomes important, the next integrity step should be fixed-size
-sub-shard integrity blocks.
-
-Recommended direction:
-
-- fixed integrity block size, independent of HTTP chunk size
-- keep existing whole-shard CRC64
-- add a compact checksum sidecar per shard containing one CRC64 per integrity block
-
-Why sidecar files:
-
-- avoids exploding SQLite row count
-- cheap indexed lookup by block number
-- naturally fits shard-file lifecycle
-- overhead is negligible
-
-Read semantics for ranged shard reads:
-
-1. compute touched integrity block indices
-2. read the relevant checksum entries from the sidecar
-3. read the relevant shard bytes
-4. validate the touched integrity blocks
-5. slice out the requested sub-range
-
-## Implementation Order
-
-1. Introduce a non-allocating shard-read API in `storage`
-2. Switch the generic object-segment reader path to it
-3. Switch multipart part-segment readers to it
-4. Add fd reuse inside reader lifetimes
-5. Refactor assembly to write directly into output buffers
-6. Re-profile and decide whether segmented output is worthwhile
-7. If small-range validation still needs it, add sub-shard integrity blocks and
-   ranged validation
-
-## Non-Goals For This Pass
-
-1. Changing HTTP chunk framing semantics
-2. Changing EC layout
-3. Removing shard CRC verification
-4. General mutex/lock tuning without evidence
-5. Reopening the completed payload-layout redesign
-6. Full observability work; that should be planned separately
-
-## Success Criteria
-
-We should consider this optimization successful if:
-
-1. large local `GET` throughput materially improves
-2. `perf` shows less time in `std::fs::read::inner`
-3. `memmove` share drops materially
-4. syscall counts for `openat` / `read` / `close` on shard files fall
-5. memory remains bounded under large streaming reads
+- every new segment row stores `segment_crc64`
+- all current segmented reads validate it when present
+- old rows without the field remain readable
+- tests cover both write population and read verification

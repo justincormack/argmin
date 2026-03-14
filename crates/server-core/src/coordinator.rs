@@ -140,6 +140,7 @@ struct ReadRuntime {
 #[derive(Debug, Clone)]
 struct SegmentPayloadRecord {
     size: u64,
+    segment_crc64: Option<u64>,
     segment_okh: [u8; 16],
     segment_vid: GenerationId,
     shard_pg_id: u32,
@@ -289,6 +290,7 @@ impl ReadHandle {
                             .into_iter()
                             .map(|chunk| SegmentPayloadRecord {
                                 size: chunk.size,
+                                segment_crc64: chunk.segment_crc64,
                                 segment_okh: chunk.segment_okh,
                                 segment_vid: chunk.segment_vid,
                                 shard_pg_id: chunk.shard_pg_id,
@@ -495,6 +497,7 @@ fn chunk_payloads_from_object_segments(
         .into_iter()
         .map(|chunk| SegmentPayloadRecord {
             size: chunk.size,
+            segment_crc64: chunk.segment_crc64,
             segment_okh: chunk.segment_okh,
             segment_vid: chunk.segment_vid,
             shard_pg_id: chunk.shard_pg_id,
@@ -1705,6 +1708,15 @@ impl ReadRuntime {
             buf.extend_from_slice(shard.as_ref().unwrap());
         }
         buf.truncate(chunk.size as usize);
+        if let Some(expected_crc64) = chunk.segment_crc64 {
+            let actual_crc64 = checksum::crc64::checksum(&buf);
+            if actual_crc64 != expected_crc64 {
+                return Err(ServerError::Store(storage::StoreError::IntegrityError {
+                    expected: expected_crc64,
+                    actual: actual_crc64,
+                }));
+            }
+        }
         Ok(buf)
     }
 }
@@ -2662,6 +2674,7 @@ impl Coordinator {
                     version_id,
                     segment_index,
                     size: segment_data.len() as u64,
+                    segment_crc64: Some(checksum::crc64::checksum(segment_data)),
                     segment_okh,
                     segment_vid,
                     shard_pg_id: segment_shard_pg_id,
@@ -3046,6 +3059,7 @@ impl Coordinator {
             session_id: SessionId::from(session_id),
             segment_index,
             size: data.len() as u64,
+            segment_crc64: Some(checksum::crc64::checksum(data)),
             segment_okh,
             segment_vid,
             shard_pg_id,
@@ -3159,6 +3173,7 @@ impl Coordinator {
                 version_id,
                 segment_index: segment.segment_index,
                 size: segment.size,
+                segment_crc64: segment.segment_crc64,
                 segment_okh: segment.segment_okh,
                 segment_vid: segment.segment_vid,
                 shard_pg_id: segment.shard_pg_id,
@@ -3388,6 +3403,7 @@ impl Coordinator {
                 part_number,
                 segment_index: segment.segment_index,
                 size: segment.size,
+                segment_crc64: segment.segment_crc64,
                 segment_okh: segment.segment_okh,
                 segment_vid: segment.segment_vid,
                 shard_pg_id: segment.shard_pg_id,
@@ -5834,6 +5850,7 @@ impl Coordinator {
                     part_number,
                     segment_index,
                     size: segment_data.len() as u64,
+                    segment_crc64: Some(checksum::crc64::checksum(segment_data)),
                     segment_okh,
                     segment_vid,
                     shard_pg_id,
@@ -17008,8 +17025,16 @@ mod tests {
             assert_eq!(chunks.len(), 2);
             assert_eq!(chunks[0].segment_index, 0);
             assert_eq!(chunks[0].size, 8);
+            assert_eq!(
+                chunks[0].segment_crc64,
+                Some(checksum::crc64::checksum(b"chunk-0-"))
+            );
             assert_eq!(chunks[1].segment_index, 1);
             assert_eq!(chunks[1].size, 8);
+            assert_eq!(
+                chunks[1].segment_crc64,
+                Some(checksum::crc64::checksum(b"chunk-1-"))
+            );
         } // Drop PG lock before coordinator calls.
 
         // Verify full readback via coordinator.
@@ -17027,6 +17052,73 @@ mod tests {
 
         // Verify CRC matches.
         assert_eq!(checksum::crc64::checksum(&data), crc);
+    }
+
+    #[test]
+    fn get_object_rejects_bad_segment_crc64() {
+        let dir = test_util::tempdir();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let put = coord
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "bad-segment-crc",
+                data: b"segment-data",
+                metadata: &MetadataBlob::new(),
+                tags: None,
+                cond: &WriteCondition::default(),
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
+            })
+            .unwrap();
+
+        let meta_pg_id = coord.object_pg_id("bucket", "bad-segment-crc");
+        {
+            let meta_pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
+            let record = meta_pg
+                .get_object_meta("bucket", "bad-segment-crc")
+                .unwrap();
+            let live = record.as_live().unwrap();
+            let mut segments = meta_pg
+                .get_object_segments("bucket", "bad-segment-crc", put.version_id)
+                .unwrap();
+            assert_eq!(segments.len(), 1);
+            segments[0].segment_crc64 = Some(segments[0].segment_crc64.unwrap() ^ 1);
+
+            meta_pg
+                .put_object_with_segments(
+                    &PutLiveObjectReq {
+                        bucket: live.bucket.clone(),
+                        key: live.key.clone(),
+                        version_id: live.version_id,
+                        generation_id: live.generation_id,
+                        size: live.size,
+                        etag: live.etag,
+                        ec: live.ec,
+                        layout: live.layout,
+                        tags: live.tags.clone(),
+                        metadata_blob: live.metadata_blob.clone(),
+                    },
+                    &segments,
+                )
+                .unwrap();
+        }
+
+        let result = coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "bad-segment-crc",
+                version_id: None,
+                cond: NO_READ,
+                requester: TEST_REQUESTER,
+            })
+            .unwrap();
+        let err = result.body.into_bytes().unwrap_err();
+        assert!(matches!(
+            err,
+            ServerError::Store(storage::StoreError::IntegrityError { .. })
+        ));
     }
 
     #[test]

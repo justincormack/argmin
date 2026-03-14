@@ -2540,6 +2540,7 @@ fn stream_segment_append_and_list() {
                 session_id: "sess-chunks".into(),
                 segment_index: i,
                 size: (i as u64 + 1) * 1000,
+                segment_crc64: Some((i as u64) + 10),
                 segment_okh: [i as u8; 16],
                 segment_vid: GenerationId::new(42).unwrap(),
                 shard_pg_id: i,
@@ -2557,6 +2558,8 @@ fn stream_segment_append_and_list() {
     assert_eq!(segments[1].size, 2000);
     assert_eq!(segments[2].segment_index, 2);
     assert_eq!(segments[2].size, 3000);
+    assert_eq!(segments[0].segment_crc64, Some(10));
+    assert_eq!(segments[2].segment_crc64, Some(12));
     assert_eq!(segments[0].segment_okh, [0u8; 16]);
     assert_eq!(segments[2].shard_pg_id, 2);
 }
@@ -2579,6 +2582,7 @@ fn stream_segment_cascade_delete() {
             session_id: "sess-cascade".into(),
             segment_index: 0,
             size: 4096,
+            segment_crc64: None,
             segment_okh: [0xAA; 16],
             segment_vid: GenerationId::new(1).unwrap(),
             shard_pg_id: 0,
@@ -2613,6 +2617,7 @@ fn commit_stream_put_atomic() {
             session_id: "sess-commit".into(),
             segment_index: 0,
             size: 4_000_000,
+            segment_crc64: None,
             segment_okh: [0x11; 16],
             segment_vid: GenerationId::new(1).unwrap(),
             shard_pg_id: 0,
@@ -2626,6 +2631,7 @@ fn commit_stream_put_atomic() {
             session_id: "sess-commit".into(),
             segment_index: 1,
             size: 2_000_000,
+            segment_crc64: None,
             segment_okh: [0x22; 16],
             segment_vid: GenerationId::new(1).unwrap(),
             shard_pg_id: 1,
@@ -2654,6 +2660,7 @@ fn commit_stream_put_atomic() {
             version_id: VersionId::Null,
             segment_index: 0,
             size: 4_000_000,
+            segment_crc64: Some(11),
             segment_okh: [0x11; 16],
             segment_vid: GenerationId::new(1).unwrap(),
             shard_pg_id: 0,
@@ -2666,6 +2673,7 @@ fn commit_stream_put_atomic() {
             version_id: VersionId::Null,
             segment_index: 1,
             size: 2_000_000,
+            segment_crc64: Some(22),
             segment_okh: [0x22; 16],
             segment_vid: GenerationId::new(1).unwrap(),
             shard_pg_id: 1,
@@ -2691,10 +2699,12 @@ fn commit_stream_put_atomic() {
     assert_eq!(chunks.len(), 2);
     assert_eq!(chunks[0].segment_index, 0);
     assert_eq!(chunks[0].size, 4_000_000);
+    assert_eq!(chunks[0].segment_crc64, Some(11));
     assert_eq!(chunks[0].segment_okh, [0x11; 16]);
     assert_eq!(chunks[0].shard_pg_id, 0);
     assert_eq!(chunks[1].segment_index, 1);
     assert_eq!(chunks[1].size, 2_000_000);
+    assert_eq!(chunks[1].segment_crc64, Some(22));
     assert_eq!(chunks[1].shard_pg_id, 1);
 
     // Staging rows are cleaned up
@@ -2740,6 +2750,7 @@ fn commit_stream_put_overwrite_unversioned() {
                 version_id: VersionId::Null,
                 segment_index: 0,
                 size: 100,
+                segment_crc64: None,
                 segment_okh: [1; 16],
                 segment_vid: GenerationId::new(1).unwrap(),
                 shard_pg_id: 0,
@@ -2778,6 +2789,7 @@ fn commit_stream_put_overwrite_unversioned() {
                 version_id: VersionId::Null,
                 segment_index: 0,
                 size: 200,
+                segment_crc64: None,
                 segment_okh: [2; 16],
                 segment_vid: GenerationId::new(2).unwrap(),
                 shard_pg_id: 1,
@@ -2825,6 +2837,7 @@ fn put_object_with_segments_persists_manifest() {
                     version_id: VersionId::Null,
                     segment_index: 0,
                     size: 4_000_000,
+                    segment_crc64: None,
                     segment_okh: [0x11; 16],
                     segment_vid: GenerationId::MIN,
                     shard_pg_id: 0,
@@ -2837,6 +2850,7 @@ fn put_object_with_segments_persists_manifest() {
                     version_id: VersionId::Null,
                     segment_index: 1,
                     size: 2_000_000,
+                    segment_crc64: None,
                     segment_okh: [0x22; 16],
                     segment_vid: GenerationId::MIN,
                     shard_pg_id: 0,
@@ -2884,6 +2898,7 @@ fn put_object_with_segments_overwrite_unversioned_replaces_manifest() {
                 version_id: VersionId::Null,
                 segment_index: 0,
                 size: 100,
+                segment_crc64: None,
                 segment_okh: [1; 16],
                 segment_vid: GenerationId::MIN,
                 shard_pg_id: 0,
@@ -2913,6 +2928,7 @@ fn put_object_with_segments_overwrite_unversioned_replaces_manifest() {
                 version_id: VersionId::Null,
                 segment_index: 0,
                 size: 200,
+                segment_crc64: None,
                 segment_okh: [2; 16],
                 segment_vid: GenerationId::MIN,
                 shard_pg_id: 1,
@@ -2965,6 +2981,7 @@ fn delete_object_segments_cleanup() {
                 version_id: VersionId::Null,
                 segment_index: 0,
                 size: 100,
+                segment_crc64: None,
                 segment_okh: [1; 16],
                 segment_vid: GenerationId::new(1).unwrap(),
                 shard_pg_id: 0,
@@ -3114,6 +3131,7 @@ fn upsert_multipart_part_segments_replaces_prior_segments() {
         part_number: 1,
         segment_index,
         size,
+        segment_crc64: Some(u64::from(fill) + u64::from(segment_index)),
         segment_okh: [fill; 16],
         segment_vid: GenerationId::MIN,
         shard_pg_id: 0,
@@ -3135,6 +3153,8 @@ fn upsert_multipart_part_segments_replaces_prior_segments() {
         .unwrap();
     assert_eq!(prev_gen, Some(0));
     assert_eq!(prev_segments.len(), 2);
+    assert_eq!(prev_segments[0].segment_crc64, Some(0x11));
+    assert_eq!(prev_segments[1].segment_crc64, Some(0x23));
     assert_eq!(prev_segments[0].segment_okh, [0x11; 16]);
     assert_eq!(prev_segments[1].segment_okh, [0x22; 16]);
 
@@ -3146,6 +3166,7 @@ fn upsert_multipart_part_segments_replaces_prior_segments() {
         .get_all_multipart_part_segments_for_upload("mpu-1")
         .unwrap();
     assert_eq!(segments.len(), 1);
+    assert_eq!(segments[0].segment_crc64, Some(0x33));
     assert_eq!(segments[0].segment_okh, [0x33; 16]);
 }
 
@@ -3202,6 +3223,7 @@ fn commit_stream_part_replaces_prior_chunks_on_reupload() {
             part_number: 1,
             segment_index: i,
             size: 1000,
+            segment_crc64: None,
             segment_okh: [0x11; 16],
             segment_vid: GenerationId::new(1).unwrap(),
             shard_pg_id: i,
@@ -3240,6 +3262,7 @@ fn commit_stream_part_replaces_prior_chunks_on_reupload() {
         part_number: 1,
         segment_index: 0,
         size: 5000,
+        segment_crc64: None,
         segment_okh: [0x22; 16],
         segment_vid: GenerationId::new(2).unwrap(),
         shard_pg_id: 0,
@@ -3454,6 +3477,7 @@ fn commit_stream_part_zero_chunks_clears_prior() {
                     part_number: 1,
                     segment_index: 0,
                     size: 1000,
+                    segment_crc64: None,
                     segment_okh: [0x11; 16],
                     segment_vid: GenerationId::new(1).unwrap(),
                     shard_pg_id: 0,
@@ -3468,6 +3492,7 @@ fn commit_stream_part_zero_chunks_clears_prior() {
                     part_number: 1,
                     segment_index: 1,
                     size: 1000,
+                    segment_crc64: None,
                     segment_okh: [0x22; 16],
                     segment_vid: GenerationId::new(1).unwrap(),
                     shard_pg_id: 1,
@@ -3562,6 +3587,7 @@ fn commit_stream_put_rejects_mismatched_chunk_target() {
                 version_id: VersionId::Null,
                 segment_index: 0,
                 size: 100,
+                segment_crc64: None,
                 segment_okh: [1; 16],
                 segment_vid: GenerationId::new(1).unwrap(),
                 shard_pg_id: 0,
@@ -3826,6 +3852,7 @@ fn commit_stream_part_rejects_mismatched_chunk_part_number() {
                 part_number: 99, // wrong!
                 segment_index: 0,
                 size: 100,
+                segment_crc64: None,
                 segment_okh: [1; 16],
                 segment_vid: GenerationId::new(1).unwrap(),
                 shard_pg_id: 0,
@@ -3896,6 +3923,7 @@ fn commit_stream_part_rejects_non_staging_chunk_version_id() {
                 part_number: 1,
                 segment_index: 0,
                 size: 100,
+                segment_crc64: None,
                 segment_okh: [1; 16],
                 segment_vid: GenerationId::new(1).unwrap(),
                 shard_pg_id: 0,

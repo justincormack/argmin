@@ -124,6 +124,7 @@ CREATE TABLE IF NOT EXISTS stream_upload_segments (
     session_id    TEXT NOT NULL,
     segment_index INTEGER NOT NULL,
     size          INTEGER NOT NULL,
+    segment_crc64 INTEGER,
     segment_okh   BLOB NOT NULL,
     segment_vid   INTEGER NOT NULL CHECK (segment_vid > 0),
     shard_pg_id   INTEGER NOT NULL,
@@ -141,6 +142,7 @@ CREATE TABLE IF NOT EXISTS object_segments (
     version_id    INTEGER NOT NULL CHECK (version_id >= 0),
     segment_index INTEGER NOT NULL,
     size          INTEGER NOT NULL,
+    segment_crc64 INTEGER,
     segment_okh   BLOB NOT NULL,
     segment_vid   INTEGER NOT NULL CHECK (segment_vid > 0),
     shard_pg_id   INTEGER NOT NULL,
@@ -251,6 +253,7 @@ CREATE TABLE IF NOT EXISTS multipart_part_segments (
     part_number   INTEGER NOT NULL,
     segment_index INTEGER NOT NULL,
     size          INTEGER NOT NULL,
+    segment_crc64 INTEGER,
     segment_okh   BLOB NOT NULL,
     segment_vid   INTEGER NOT NULL CHECK (segment_vid > 0),
     shard_pg_id   INTEGER NOT NULL,
@@ -328,6 +331,7 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(CREATE_BUCKETS_TABLE, [])?;
     conn.execute(CREATE_BUCKETS_OWNER_LIST_INDEX, [])?;
     migrate_checksum_columns(conn)?;
+    migrate_segment_crc_columns(conn)?;
     migrate_owner_identity_columns(conn)?;
     Ok(())
 }
@@ -388,6 +392,26 @@ fn migrate_checksum_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
          END;",
     )?;
 
+    Ok(())
+}
+
+fn migrate_segment_crc_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let migrations = [
+        "ALTER TABLE stream_upload_segments ADD COLUMN segment_crc64 INTEGER",
+        "ALTER TABLE object_segments ADD COLUMN segment_crc64 INTEGER",
+        "ALTER TABLE multipart_part_segments ADD COLUMN segment_crc64 INTEGER",
+    ];
+    for sql in &migrations {
+        match conn.execute(sql, []) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
+                if msg.contains("duplicate column name") =>
+            {
+                // Column already exists, skip.
+            }
+            Err(e) => return Err(e),
+        }
+    }
     Ok(())
 }
 

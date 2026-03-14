@@ -1104,6 +1104,8 @@ pub struct StreamUploadSegmentRecord {
     pub session_id: SessionId,
     pub segment_index: u32,
     pub size: u64,
+    /// CRC64-NVME over the logical segment bytes.
+    pub segment_crc64: Option<u64>,
     /// 16-byte object key hash for shard keys.
     pub segment_okh: [u8; 16],
     /// Payload generation for shard keys.
@@ -1122,6 +1124,8 @@ pub struct ObjectSegmentRecord {
     pub version_id: VersionId,
     pub segment_index: u32,
     pub size: u64,
+    /// CRC64-NVME over the logical segment bytes.
+    pub segment_crc64: Option<u64>,
     pub segment_okh: [u8; 16],
     pub segment_vid: GenerationId,
     pub shard_pg_id: u32,
@@ -1139,6 +1143,8 @@ pub struct MultipartPartSegmentRecord {
     pub part_number: u32,
     pub segment_index: u32,
     pub size: u64,
+    /// CRC64-NVME over the logical segment bytes.
+    pub segment_crc64: Option<u64>,
     pub segment_okh: [u8; 16],
     pub segment_vid: GenerationId,
     pub shard_pg_id: u32,
