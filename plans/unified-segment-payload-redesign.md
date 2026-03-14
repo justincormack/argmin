@@ -380,6 +380,22 @@ This is the key convergence step:
 Once all new payloads use segments, read and copy paths should consume a unified
 manifest abstraction.
 
+Completed.
+
+Completed slices so far:
+
+- non-multipart `GetObject`, `GetObjectRange`, and `GetObjectPart` no longer
+  fall back to the legacy direct shard-set reader path
+- non-multipart `CopyObject` and `UploadPartCopy` source reads now consume the
+  committed object segment manifest unconditionally
+- multipart `GetObject`, `GetObjectRange`, `GetObjectPart`, `CopyObject`, and
+  `UploadPartCopy` now consume snapshotted multipart part segment manifests
+  only; the coordinator no longer keeps a direct-part shard reader path
+- zero-byte objects and parts are treated as empty segment manifests rather than
+  a separate direct-shard layout
+- overwrite/delete stale-payload tracking no longer produces
+  `StaleObjectPayload::Simple` for current writes
+
 ### Phase F: Retire the special-case segment-manifest model
 
 At that point:

@@ -9,17 +9,18 @@ use checksum::{ChecksumAlgorithm, ChecksumType, MultipartChecksumConfig, RawChec
 use ec::{EcConfig, ErasureCodec};
 use s3_types::{BucketVersioningState, CanonicalUserId, VersionId};
 use storage::traits::{PgMetadataStore, ShardStore};
+#[cfg(test)]
+use storage::SimplePayloadReclaimRecord;
 use storage::{
     BucketInfo, BucketName, BucketState, CommitMultipartReq, CommitStreamPutReq,
     CreateMultipartUploadReq, CreateStreamUploadReq, EcShape, GenerationId,
-    ListMultipartUploadsReq, ListObjectVersionsReq, ListObjectsReq, ListPartsReq, LiveObjectRecord,
+    ListMultipartUploadsReq, ListObjectVersionsReq, ListObjectsReq, ListPartsReq,
     MultipartPartRecord, MultipartPartSegmentRecord, MultipartReclaimPartChunkRecord,
     MultipartReclaimPartRecord, MultipartReclaimRecord, MultipartUploadRecord, ObjectKey,
     ObjectLayout, ObjectPartRecord, ObjectSegmentRecord, PutDeleteMarkerReq, PutLiveObjectReq,
     PutObjectReq, ReclaimWorkItem, SegmentManifestReclaimRecord,
-    SegmentManifestReclaimSegmentRecord, SessionId, ShardKey, SharedStorageNode,
-    SimplePayloadReclaimRecord, StoredObject, StreamUploadSegmentRecord, StreamUploadState,
-    StreamUploadTarget, UploadId, UploadState,
+    SegmentManifestReclaimSegmentRecord, SessionId, ShardKey, SharedStorageNode, StoredObject,
+    StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, UploadId, UploadState,
 };
 
 use crate::conditional::{
@@ -153,26 +154,6 @@ struct SegmentSliceRecord {
     end_offset: usize,
 }
 
-struct PartShardReader {
-    runtime: ReadRuntime,
-    bucket: String,
-    key: String,
-    record: ObjectPartRecord,
-    next_offset: usize,
-    end_offset: usize,
-}
-
-struct ShardSetReader {
-    runtime: ReadRuntime,
-    bucket: String,
-    key: String,
-    okh: [u8; 16],
-    generation_id: GenerationId,
-    record: LiveObjectRecord,
-    next_offset: usize,
-    end_offset: usize,
-}
-
 struct SegmentListReader {
     runtime: ReadRuntime,
     bucket: String,
@@ -184,15 +165,7 @@ struct SegmentListReader {
 
 #[derive(Debug, Clone)]
 struct SnapshottedMultipartPartRange {
-    record: ObjectPartRecord,
-    streaming_chunks: Option<Vec<SegmentSliceRecord>>,
-    start_offset: usize,
-    end_offset: usize,
-}
-
-enum MultipartPartReader {
-    Shard(PartShardReader),
-    Chunks(SegmentListReader),
+    streaming_chunks: Vec<SegmentSliceRecord>,
 }
 
 struct MultipartReader {
@@ -201,13 +174,12 @@ struct MultipartReader {
     key: String,
     parts: Vec<SnapshottedMultipartPartRange>,
     next_part_index: usize,
-    current_part: Option<MultipartPartReader>,
+    current_part: Option<SegmentListReader>,
 }
 
 enum ReadHandleInner {
-    Shard(ShardSetReader),
     SegmentManifest(SegmentListReader),
-    Multipart(MultipartReader),
+    Multipart(Box<MultipartReader>),
     TestBuffered(Option<Vec<u8>>),
 }
 
@@ -312,26 +284,21 @@ impl ReadHandle {
                     .saturating_sub(offset)
                     .min(part.record.size as usize);
                 ranges.push(SnapshottedMultipartPartRange {
-                    record: part.record,
-                    streaming_chunks: part.streaming_chunks.map(|chunks| {
-                        Self::chunk_slices_for_range(
-                            chunks
-                                .into_iter()
-                                .map(|chunk| SegmentPayloadRecord {
-                                    size: chunk.size,
-                                    chunk_okh: chunk.segment_okh,
-                                    chunk_vid: chunk.segment_vid,
-                                    shard_pg_id: chunk.shard_pg_id,
-                                    ec_k: chunk.ec_k,
-                                    ec_m: chunk.ec_m,
-                                })
-                                .collect(),
-                            start_offset,
-                            end_offset - 1,
-                        )
-                    }),
-                    start_offset,
-                    end_offset,
+                    streaming_chunks: Self::chunk_slices_for_range(
+                        part.streaming_chunks
+                            .into_iter()
+                            .map(|chunk| SegmentPayloadRecord {
+                                size: chunk.size,
+                                chunk_okh: chunk.segment_okh,
+                                chunk_vid: chunk.segment_vid,
+                                shard_pg_id: chunk.shard_pg_id,
+                                ec_k: chunk.ec_k,
+                                ec_m: chunk.ec_m,
+                            })
+                            .collect(),
+                        start_offset,
+                        end_offset - 1,
+                    ),
                 });
             }
             offset = part_end;
@@ -413,14 +380,14 @@ impl ReadHandle {
             bytes_emitted: 0,
             expected_crc64: None,
             crc64: checksum::crc64::Hasher::new(),
-            inner: ReadHandleInner::Multipart(MultipartReader {
+            inner: ReadHandleInner::Multipart(Box::new(MultipartReader {
                 runtime,
                 bucket: bucket.to_string(),
                 key: key.to_string(),
                 parts: Self::multipart_ranges_for_range(parts, 0, expected_size.saturating_sub(1)),
                 next_part_index: 0,
                 current_part: None,
-            }),
+            })),
         }
     }
 
@@ -442,14 +409,14 @@ impl ReadHandle {
             bytes_emitted: 0,
             expected_crc64: None,
             crc64: checksum::crc64::Hasher::new(),
-            inner: ReadHandleInner::Multipart(MultipartReader {
+            inner: ReadHandleInner::Multipart(Box::new(MultipartReader {
                 runtime,
                 bucket: bucket.to_string(),
                 key: key.to_string(),
                 parts: Self::multipart_ranges_for_range(parts, start, end),
                 next_part_index: 0,
                 current_part: None,
-            }),
+            })),
         }
     }
 
@@ -467,74 +434,12 @@ impl ReadHandle {
         }
     }
 
-    fn from_shard_set(
-        runtime: &ReadRuntime,
-        bucket: &str,
-        key: &str,
-        okh: [u8; 16],
-        record: &LiveObjectRecord,
-    ) -> Self {
-        let generation_id = record.generation_id;
-        let expected_size = record.size as usize;
-        Self {
-            bucket: bucket.to_string(),
-            key: key.to_string(),
-            inner: ReadHandleInner::Shard(ShardSetReader {
-                runtime: runtime.clone(),
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-                okh,
-                generation_id,
-                record: record.clone(),
-                next_offset: 0,
-                end_offset: expected_size,
-            }),
-            lease: Some(runtime.acquire_object_payload_lease(bucket, key, generation_id)),
-            expected_size,
-            bytes_emitted: 0,
-            expected_crc64: Some(record.etag.crc64()),
-            crc64: checksum::crc64::Hasher::new(),
-        }
-    }
-
-    fn from_shard_set_range(
-        runtime: &ReadRuntime,
-        bucket: &str,
-        key: &str,
-        okh: [u8; 16],
-        record: &LiveObjectRecord,
-        start: usize,
-        end: usize,
-    ) -> Self {
-        let generation_id = record.generation_id;
-        Self {
-            bucket: bucket.to_string(),
-            key: key.to_string(),
-            inner: ReadHandleInner::Shard(ShardSetReader {
-                runtime: runtime.clone(),
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-                okh,
-                generation_id,
-                record: record.clone(),
-                next_offset: start,
-                end_offset: end + 1,
-            }),
-            lease: Some(runtime.acquire_object_payload_lease(bucket, key, generation_id)),
-            expected_size: end - start + 1,
-            bytes_emitted: 0,
-            expected_crc64: None,
-            crc64: checksum::crc64::Hasher::new(),
-        }
-    }
-
     pub fn next_chunk(&mut self, target_size: usize) -> Result<Option<Vec<u8>>, ServerError> {
         if target_size == 0 {
             return Ok(Some(Vec::new()));
         }
 
         let next = match &mut self.inner {
-            ReadHandleInner::Shard(reader) => reader.next_chunk(target_size),
             ReadHandleInner::SegmentManifest(reader) => reader.next_chunk(target_size),
             ReadHandleInner::Multipart(reader) => reader.next_chunk(target_size),
             ReadHandleInner::TestBuffered(data) => Ok(data.take()),
@@ -1312,15 +1217,11 @@ struct LockedWriteObject<'a> {
 #[derive(Debug, Clone)]
 struct SnapshottedMultipartPart {
     record: ObjectPartRecord,
-    streaming_chunks: Option<Vec<MultipartPartSegmentRecord>>,
+    streaming_chunks: Vec<MultipartPartSegmentRecord>,
 }
 
 #[derive(Debug, Clone)]
 enum StaleObjectPayload {
-    Simple {
-        generation_id: GenerationId,
-        ec: EcShape,
-    },
     SegmentManifest {
         generation_id: GenerationId,
         chunks: Vec<ObjectSegmentRecord>,
@@ -1723,231 +1624,6 @@ impl ReadRuntime {
         }
     }
 
-    fn read_data_shards(
-        &self,
-        pg: &storage::PgStore,
-        okh: &[u8; 16],
-        generation_id: GenerationId,
-        record: &LiveObjectRecord,
-        needed: &[usize],
-    ) -> Result<(Vec<Vec<u8>>, usize), ServerError> {
-        let k = record.ec.k as usize;
-        let m = record.ec.m as usize;
-
-        let mut result_shards: Vec<Option<Vec<u8>>> = Vec::with_capacity(needed.len());
-        let mut all_present = true;
-        let mut shard_size = 0;
-
-        for &idx in needed {
-            let shard_key = ShardKey::new(okh, generation_id.get(), idx as u8);
-            if let Ok(sd) = pg.read_shard(&shard_key) {
-                shard_size = sd.data.len();
-                result_shards.push(Some(sd.data));
-            } else {
-                all_present = false;
-                result_shards.push(None);
-            }
-        }
-
-        if all_present {
-            let shards: Vec<Vec<u8>> = result_shards.into_iter().map(Option::unwrap).collect();
-            if shards.is_empty() {
-                return Ok((shards, 0));
-            }
-            return Ok((shards, shard_size));
-        }
-
-        let mut all_shards: Vec<Option<Vec<u8>>> = Vec::with_capacity(k + m);
-        let mut present_count = 0;
-        for i in 0..(k + m) {
-            let shard_key = ShardKey::new(okh, generation_id.get(), i as u8);
-            match pg.read_shard(&shard_key) {
-                Ok(sd) => {
-                    shard_size = sd.data.len();
-                    all_shards.push(Some(sd.data));
-                    present_count += 1;
-                }
-                Err(_) => all_shards.push(None),
-            }
-        }
-
-        if present_count < k {
-            return Err(ServerError::Store(storage::StoreError::NotFound));
-        }
-
-        let missing_needed: Vec<usize> = needed
-            .iter()
-            .copied()
-            .filter(|&i| all_shards[i].is_none())
-            .collect();
-        if !missing_needed.is_empty() {
-            let present_indices: Vec<usize> =
-                (0..(k + m)).filter(|&i| all_shards[i].is_some()).collect();
-            let present_refs: Vec<&[u8]> = present_indices
-                .iter()
-                .map(|&i| all_shards[i].as_ref().unwrap().as_slice())
-                .collect();
-
-            let tmp_codec;
-            let codec = if record.ec.k == self.ec_config.data_shards
-                && record.ec.m == self.ec_config.parity_shards
-            {
-                &self.ec_codec
-            } else {
-                let ec_config = EcConfig::new(record.ec.k, record.ec.m)?;
-                tmp_codec = ErasureCodec::new(ec_config)?;
-                &tmp_codec
-            };
-
-            let mut outputs: Vec<Vec<u8>> = missing_needed
-                .iter()
-                .map(|_| vec![0u8; shard_size])
-                .collect();
-            let mut output_refs: Vec<&mut [u8]> = outputs
-                .iter_mut()
-                .map(std::vec::Vec::as_mut_slice)
-                .collect();
-            codec.reconstruct(
-                &present_indices,
-                &present_refs,
-                &missing_needed,
-                &mut output_refs,
-            )?;
-            for (idx, &missing_idx) in missing_needed.iter().enumerate() {
-                all_shards[missing_idx] = Some(outputs[idx].clone());
-            }
-        }
-
-        let shards: Vec<Vec<u8>> = needed
-            .iter()
-            .map(|&i| all_shards[i].take().unwrap())
-            .collect();
-        Ok((shards, shard_size))
-    }
-
-    fn read_part_range(
-        &self,
-        part: &ObjectPartRecord,
-        start: usize,
-        end: usize,
-    ) -> Result<Vec<u8>, ServerError> {
-        let pg = self.storage_node.get_pg(part.shard_pg_id)?;
-        let shard_size = compute_shard_size(part.size, part.ec_k);
-        if shard_size == 0 {
-            return Ok(vec![]);
-        }
-
-        let needed = shards_for_byte_range(start, end, shard_size, part.ec_k);
-        if needed.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let k = part.ec_k as usize;
-        let m = part.ec_m as usize;
-        let mut result_shards: Vec<Option<Vec<u8>>> = Vec::with_capacity(needed.len());
-        let mut all_present = true;
-        let mut shard_len = 0;
-
-        for &idx in &needed {
-            let shard_key = ShardKey::new(&part.part_okh, part.part_vid.get(), idx as u8);
-            if let Ok(sd) = pg.read_shard(&shard_key) {
-                shard_len = sd.data.len();
-                result_shards.push(Some(sd.data));
-            } else {
-                all_present = false;
-                result_shards.push(None);
-            }
-        }
-
-        let shard_data = if all_present {
-            result_shards
-                .into_iter()
-                .map(Option::unwrap)
-                .collect::<Vec<_>>()
-        } else {
-            let mut all_shards: Vec<Option<Vec<u8>>> = Vec::with_capacity(k + m);
-            let mut present_count = 0;
-
-            for i in 0..(k + m) {
-                let shard_key = ShardKey::new(&part.part_okh, part.part_vid.get(), i as u8);
-                match pg.read_shard(&shard_key) {
-                    Ok(sd) => {
-                        shard_len = sd.data.len();
-                        all_shards.push(Some(sd.data));
-                        present_count += 1;
-                    }
-                    Err(_) => all_shards.push(None),
-                }
-            }
-
-            if present_count < k {
-                return Err(ServerError::Store(storage::StoreError::NotFound));
-            }
-
-            let missing_needed: Vec<usize> = needed
-                .iter()
-                .copied()
-                .filter(|&i| all_shards[i].is_none())
-                .collect();
-
-            if !missing_needed.is_empty() {
-                let present_indices: Vec<usize> =
-                    (0..(k + m)).filter(|&i| all_shards[i].is_some()).collect();
-                let present_refs: Vec<&[u8]> = present_indices
-                    .iter()
-                    .map(|&i| all_shards[i].as_ref().unwrap().as_slice())
-                    .collect();
-
-                let tmp_codec;
-                let codec = if part.ec_k == self.ec_config.data_shards
-                    && part.ec_m == self.ec_config.parity_shards
-                {
-                    self.ec_codec.as_ref()
-                } else {
-                    let ec_config = EcConfig::new(part.ec_k, part.ec_m)?;
-                    tmp_codec = ErasureCodec::new(ec_config)?;
-                    &tmp_codec
-                };
-
-                let mut outputs: Vec<Vec<u8>> = missing_needed
-                    .iter()
-                    .map(|_| vec![0u8; shard_len])
-                    .collect();
-                let mut output_refs: Vec<&mut [u8]> = outputs
-                    .iter_mut()
-                    .map(std::vec::Vec::as_mut_slice)
-                    .collect();
-
-                codec.reconstruct(
-                    &present_indices,
-                    &present_refs,
-                    &missing_needed,
-                    &mut output_refs,
-                )?;
-
-                for (idx, &missing_idx) in missing_needed.iter().enumerate() {
-                    all_shards[missing_idx] = Some(outputs[idx].clone());
-                }
-            }
-
-            needed
-                .iter()
-                .map(|&i| all_shards[i].take().unwrap())
-                .collect::<Vec<_>>()
-        };
-
-        let first_shard = needed[0];
-        let buf_start = first_shard * shard_size;
-        let mut buf = Vec::with_capacity(shard_data.len() * shard_size);
-        for shard in &shard_data {
-            buf.extend_from_slice(shard);
-        }
-
-        let local_start = start - buf_start;
-        let local_end = (end - buf_start).min(buf.len() - 1);
-        Ok(buf[local_start..=local_end].to_vec())
-    }
-
     fn read_segment_payload(&self, chunk: &SegmentPayloadRecord) -> Result<Vec<u8>, ServerError> {
         let pg = self.storage_node.get_pg(chunk.shard_pg_id)?;
         let k = chunk.ec_k as usize;
@@ -2033,64 +1709,6 @@ impl ReadRuntime {
     }
 }
 
-impl ShardSetReader {
-    fn next_chunk(&mut self, target_size: usize) -> Result<Option<Vec<u8>>, ServerError> {
-        if self.next_offset >= self.end_offset {
-            return Ok(None);
-        }
-        let end = (self.next_offset + target_size).min(self.end_offset) - 1;
-        let shard_pg_id =
-            self.runtime
-                .pg_topology
-                .shard_pg(&self.bucket, &self.key, self.generation_id.get());
-        let pg = self.runtime.storage_node.get_pg(shard_pg_id)?;
-        let shard_size = compute_shard_size(self.record.size, self.record.ec.k);
-        let needed = shards_for_byte_range(self.next_offset, end, shard_size, self.record.ec.k);
-        let (shard_data, _) = self
-            .runtime
-            .read_data_shards(&pg, &self.okh, self.generation_id, &self.record, &needed)
-            .map_err(|e| match e {
-                ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
-                    bucket: self.bucket.clone(),
-                    key: self.key.clone(),
-                },
-                other => other,
-            })?;
-        let first_shard = needed[0];
-        let buf_start = first_shard * shard_size;
-        let mut buf = Vec::with_capacity(shard_data.len() * shard_size);
-        for shard in &shard_data {
-            buf.extend_from_slice(shard);
-        }
-        let local_start = self.next_offset - buf_start;
-        let local_end = (end - buf_start).min(buf.len() - 1);
-        let out = buf[local_start..=local_end].to_vec();
-        self.next_offset = end + 1;
-        Ok(Some(out))
-    }
-}
-
-impl PartShardReader {
-    fn next_chunk(&mut self, target_size: usize) -> Result<Option<Vec<u8>>, ServerError> {
-        if self.next_offset >= self.end_offset {
-            return Ok(None);
-        }
-        let end = (self.next_offset + target_size).min(self.end_offset) - 1;
-        let chunk = self
-            .runtime
-            .read_part_range(&self.record, self.next_offset, end)
-            .map_err(|e| match e {
-                ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
-                    bucket: self.bucket.clone(),
-                    key: self.key.clone(),
-                },
-                other => other,
-            })?;
-        self.next_offset = end + 1;
-        Ok(Some(chunk))
-    }
-}
-
 impl SegmentListReader {
     fn next_chunk(&mut self, target_size: usize) -> Result<Option<Vec<u8>>, ServerError> {
         loop {
@@ -2135,10 +1753,7 @@ impl MultipartReader {
     fn next_chunk(&mut self, target_size: usize) -> Result<Option<Vec<u8>>, ServerError> {
         loop {
             if let Some(current) = &mut self.current_part {
-                let chunk = match current {
-                    MultipartPartReader::Shard(reader) => reader.next_chunk(target_size)?,
-                    MultipartPartReader::Chunks(reader) => reader.next_chunk(target_size)?,
-                };
+                let chunk = current.next_chunk(target_size)?;
                 if chunk.is_some() {
                     return Ok(chunk);
                 }
@@ -2151,42 +1766,16 @@ impl MultipartReader {
 
             let part = self.parts[self.next_part_index].clone();
             self.next_part_index += 1;
-            self.current_part = Some(if let Some(chunks) = part.streaming_chunks {
-                MultipartPartReader::Chunks(SegmentListReader {
-                    runtime: self.runtime.clone(),
-                    bucket: self.bucket.clone(),
-                    key: self.key.clone(),
-                    chunks,
-                    next_chunk_index: 0,
-                    loaded_chunk: None,
-                })
-            } else {
-                MultipartPartReader::Shard(PartShardReader {
-                    runtime: self.runtime.clone(),
-                    bucket: self.bucket.clone(),
-                    key: self.key.clone(),
-                    record: part.record,
-                    next_offset: part.start_offset,
-                    end_offset: part.end_offset,
-                })
+            self.current_part = Some(SegmentListReader {
+                runtime: self.runtime.clone(),
+                bucket: self.bucket.clone(),
+                key: self.key.clone(),
+                chunks: part.streaming_chunks,
+                next_chunk_index: 0,
+                loaded_chunk: None,
             });
         }
     }
-}
-
-fn compute_shard_size(size: u64, ec_k: u8) -> usize {
-    let k = u64::from(ec_k);
-    let padded = size.div_ceil(k) * k;
-    (padded / k) as usize
-}
-
-fn shards_for_byte_range(start: usize, end: usize, shard_size: usize, ec_k: u8) -> Vec<usize> {
-    if shard_size == 0 {
-        return vec![];
-    }
-    let first = start / shard_size;
-    let last = (end / shard_size).min(ec_k as usize - 1);
-    (first..=last).collect()
 }
 
 impl Coordinator {
@@ -3134,7 +2723,7 @@ impl Coordinator {
                         chunks,
                     )?;
                 }
-                _ => {
+                StaleObjectPayload::Multipart { .. } => {
                     Self::delete_stale_object_payload_metadata(
                         meta_pg, bucket, key, version_id, payload,
                     )?;
@@ -3616,7 +3205,7 @@ impl Coordinator {
                         chunks,
                     )?;
                 }
-                _ => {
+                StaleObjectPayload::Multipart { .. } => {
                     Self::delete_stale_object_payload_metadata(
                         &meta_guard,
                         bucket,
@@ -4098,7 +3687,7 @@ impl Coordinator {
                 let src_etag_crc = src_record.etag.crc64();
                 let user_size = src_record.size as usize;
 
-                // Check for segment manifest (stream-put objects).
+                // Non-multipart payloads now read through committed segment manifests.
                 let meta_pg = pgs.meta();
                 let chunks = meta_pg
                     .get_object_segments(src_bucket, src_key, src_record.version_id)
@@ -4107,7 +3696,7 @@ impl Coordinator {
                 let user_data = if user_size == 0 {
                     drop(pgs);
                     vec![]
-                } else if !chunks.is_empty() {
+                } else {
                     let body = ReadHandle::from_segment_manifest(
                         self.read_runtime(),
                         src_bucket,
@@ -4116,18 +3705,6 @@ impl Coordinator {
                         chunk_payloads_from_object_segments(chunks),
                         user_size,
                         Some(src_etag_crc),
-                    );
-                    drop(pgs);
-                    body.into_bytes().map_err(not_found)?
-                } else {
-                    let src_okh = object_key_hash(src_bucket, src_key);
-                    let runtime = self.read_runtime();
-                    let body = ReadHandle::from_shard_set(
-                        &runtime,
-                        src_bucket,
-                        src_key,
-                        src_okh,
-                        &src_record,
                     );
                     drop(pgs);
                     body.into_bytes().map_err(not_found)?
@@ -4390,15 +3967,9 @@ impl Coordinator {
             .map_err(ServerError::Metadata)?;
         let mut snapshotted = Vec::with_capacity(parts.len());
         for part in parts {
-            let streaming_chunks = if part.part_okh == [0u8; 16] {
-                Some(
-                    meta_pg
-                        .get_multipart_part_segments(bucket, key, version_id, part.part_number)
-                        .map_err(ServerError::Metadata)?,
-                )
-            } else {
-                None
-            };
+            let streaming_chunks = meta_pg
+                .get_multipart_part_segments(bucket, key, version_id, part.part_number)
+                .map_err(ServerError::Metadata)?;
             snapshotted.push(SnapshottedMultipartPart {
                 record: part,
                 streaming_chunks,
@@ -4451,17 +4022,10 @@ impl Coordinator {
                 let chunks = meta_pg
                     .get_object_segments(bucket, key, VersionId::Null)
                     .map_err(ServerError::Metadata)?;
-                if chunks.is_empty() {
-                    Ok(Some(StaleObjectPayload::Simple {
-                        generation_id: record.generation_id,
-                        ec: record.ec,
-                    }))
-                } else {
-                    Ok(Some(StaleObjectPayload::SegmentManifest {
-                        generation_id: record.generation_id,
-                        chunks,
-                    }))
-                }
+                Ok(Some(StaleObjectPayload::SegmentManifest {
+                    generation_id: record.generation_id,
+                    chunks,
+                }))
             }
         }
     }
@@ -4474,15 +4038,6 @@ impl Coordinator {
         payload: &StaleObjectPayload,
     ) -> Result<(), ServerError> {
         match payload {
-            StaleObjectPayload::Simple { generation_id, ec } => meta_pg
-                .put_simple_payload_reclaim(&SimplePayloadReclaimRecord {
-                    bucket: BucketName::from(bucket),
-                    key: ObjectKey::from(key),
-                    generation_id: *generation_id,
-                    ec: *ec,
-                    created_at: Self::now_millis(),
-                })
-                .map_err(ServerError::Metadata),
             StaleObjectPayload::SegmentManifest {
                 generation_id,
                 chunks,
@@ -4525,32 +4080,13 @@ impl Coordinator {
 
     fn delete_stale_object_payload(&self, bucket: &str, key: &str, payload: &StaleObjectPayload) {
         match payload {
-            StaleObjectPayload::Simple { generation_id, .. }
-            | StaleObjectPayload::SegmentManifest { generation_id, .. } => self
+            StaleObjectPayload::SegmentManifest { generation_id, .. } => self
                 .read_runtime()
                 .enqueue_object_payload_reclaim(bucket, key, *generation_id),
             StaleObjectPayload::Multipart { generation_id, .. } => self
                 .read_runtime()
                 .enqueue_object_payload_reclaim(bucket, key, *generation_id),
         }
-    }
-
-    fn enqueue_simple_payload_reclaim(
-        meta_pg: &storage::PgStore,
-        bucket: &str,
-        key: &str,
-        generation_id: GenerationId,
-        ec: EcShape,
-    ) -> Result<(), ServerError> {
-        meta_pg
-            .put_simple_payload_reclaim(&SimplePayloadReclaimRecord {
-                bucket: BucketName::from(bucket),
-                key: ObjectKey::from(key),
-                generation_id,
-                ec,
-                created_at: Self::now_millis(),
-            })
-            .map_err(ServerError::Metadata)
     }
 
     fn enqueue_segment_manifest_reclaim(
@@ -4744,7 +4280,7 @@ impl Coordinator {
             let etag_crc = record.etag.crc64();
             let user_size = record.size as usize;
 
-            // Check for segment manifest (stream-put objects).
+            // Non-multipart payloads now read through committed segment manifests.
             let meta_pg = pgs.meta();
             let chunks = meta_pg
                 .get_object_segments(bucket, key, record.version_id)
@@ -4760,32 +4296,16 @@ impl Coordinator {
             let body = if user_size == 0 {
                 drop(pgs);
                 ReadHandle::from_buffered_bytes(vec![])
-            } else if !chunks.is_empty() {
+            } else {
                 let body = ReadHandle::from_segment_manifest(
                     self.read_runtime(),
                     bucket,
                     key,
                     record.generation_id,
-                    chunks
-                        .into_iter()
-                        .map(|chunk| SegmentPayloadRecord {
-                            size: chunk.size,
-                            chunk_okh: chunk.segment_okh,
-                            chunk_vid: chunk.segment_vid,
-                            shard_pg_id: chunk.shard_pg_id,
-                            ec_k: chunk.ec_k,
-                            ec_m: chunk.ec_m,
-                        })
-                        .collect(),
+                    chunk_payloads_from_object_segments(chunks),
                     user_size,
                     Some(etag_crc),
                 );
-                drop(pgs);
-                body
-            } else {
-                let okh = object_key_hash(bucket, key);
-                let runtime = self.read_runtime();
-                let body = ReadHandle::from_shard_set(&runtime, bucket, key, okh, &record);
                 drop(pgs);
                 body
             };
@@ -4920,7 +4440,7 @@ impl Coordinator {
             let etag_crc = record.etag.crc64();
             let user_size = record.size as usize;
 
-            // Check for segment manifest (stream-put objects).
+            // Non-multipart payloads now read through committed segment manifests.
             let meta_pg = pgs.meta();
             let chunks = meta_pg
                 .get_object_segments(bucket, key, record.version_id)
@@ -4929,32 +4449,16 @@ impl Coordinator {
             let body = if user_size == 0 {
                 drop(pgs);
                 ReadHandle::from_buffered_bytes(vec![])
-            } else if !chunks.is_empty() {
+            } else {
                 let body = ReadHandle::from_segment_manifest(
                     self.read_runtime(),
                     bucket,
                     key,
                     record.generation_id,
-                    chunks
-                        .into_iter()
-                        .map(|chunk| SegmentPayloadRecord {
-                            size: chunk.size,
-                            chunk_okh: chunk.segment_okh,
-                            chunk_vid: chunk.segment_vid,
-                            shard_pg_id: chunk.shard_pg_id,
-                            ec_k: chunk.ec_k,
-                            ec_m: chunk.ec_m,
-                        })
-                        .collect(),
+                    chunk_payloads_from_object_segments(chunks),
                     user_size,
                     Some(etag_crc),
                 );
-                drop(pgs);
-                body
-            } else {
-                let okh = object_key_hash(bucket, key);
-                let runtime = self.read_runtime();
-                let body = ReadHandle::from_shard_set(&runtime, bucket, key, okh, &record);
                 drop(pgs);
                 body
             };
@@ -5332,49 +4836,22 @@ impl Coordinator {
                 .transpose()?
                 .unwrap_or_default();
 
-            // Check for segment manifest (stream-put objects).
+            // Non-multipart payloads now read through committed segment manifests.
             let meta_pg = pgs.meta();
             let chunks = meta_pg
                 .get_object_segments(bucket, key, record.version_id)
                 .map_err(ServerError::Metadata)?;
 
-            let body = if chunks.is_empty() {
-                let okh = object_key_hash(bucket, key);
-                let runtime = self.read_runtime();
-                let body = ReadHandle::from_shard_set_range(
-                    &runtime,
-                    bucket,
-                    key,
-                    okh,
-                    &record,
-                    user_start as usize,
-                    user_end as usize,
-                );
-                drop(pgs);
-                body
-            } else {
-                let body = ReadHandle::from_segment_manifest_range(
-                    self.read_runtime(),
-                    bucket,
-                    key,
-                    record.generation_id,
-                    chunks
-                        .into_iter()
-                        .map(|chunk| SegmentPayloadRecord {
-                            size: chunk.size,
-                            chunk_okh: chunk.segment_okh,
-                            chunk_vid: chunk.segment_vid,
-                            shard_pg_id: chunk.shard_pg_id,
-                            ec_k: chunk.ec_k,
-                            ec_m: chunk.ec_m,
-                        })
-                        .collect(),
-                    user_start as usize,
-                    user_end as usize,
-                );
-                drop(pgs);
-                body
-            };
+            let body = ReadHandle::from_segment_manifest_range(
+                self.read_runtime(),
+                bucket,
+                key,
+                record.generation_id,
+                chunk_payloads_from_object_segments(chunks),
+                user_start as usize,
+                user_end as usize,
+            );
+            drop(pgs);
 
             (metadata, body)
         };
@@ -5490,47 +4967,30 @@ impl Coordinator {
                 } else {
                     let vid = record.version_id;
 
-                    // Check for segment manifest (stream-put objects).
+                    // Segment-manifest payloads are now the only non-multipart layout.
                     let chunks = meta_pg
                         .get_object_segments(bucket, key, vid)
                         .map_err(ServerError::Metadata)?;
 
-                    if chunks.is_empty() {
-                        Self::enqueue_simple_payload_reclaim(
-                            meta_pg,
-                            bucket,
-                            key,
-                            record.generation_id,
-                            record.ec,
-                        )?;
-                        meta_pg.delete_object_meta(bucket, key)?;
-                        drop(pgs);
-                        self.read_runtime().enqueue_object_payload_reclaim(
-                            bucket,
-                            key,
-                            record.generation_id,
-                        );
-                    } else {
-                        Self::enqueue_segment_manifest_reclaim(
-                            meta_pg,
-                            bucket,
-                            key,
-                            record.generation_id,
-                            &chunks,
-                        )?;
-                        meta_pg
-                            .delete_object_segments(bucket, key, vid)
-                            .map_err(ServerError::Metadata)?;
-                        meta_pg.delete_object_meta(bucket, key)?;
-                        drop(pgs);
-                        #[cfg(test)]
-                        maybe_run_segment_manifest_delete_metadata_hook(bucket, key);
-                        self.read_runtime().enqueue_object_payload_reclaim(
-                            bucket,
-                            key,
-                            record.generation_id,
-                        );
-                    }
+                    Self::enqueue_segment_manifest_reclaim(
+                        meta_pg,
+                        bucket,
+                        key,
+                        record.generation_id,
+                        &chunks,
+                    )?;
+                    meta_pg
+                        .delete_object_segments(bucket, key, vid)
+                        .map_err(ServerError::Metadata)?;
+                    meta_pg.delete_object_meta(bucket, key)?;
+                    drop(pgs);
+                    #[cfg(test)]
+                    maybe_run_segment_manifest_delete_metadata_hook(bucket, key);
+                    self.read_runtime().enqueue_object_payload_reclaim(
+                        bucket,
+                        key,
+                        record.generation_id,
+                    );
                 }
 
                 Ok(DeleteObjectResult {
@@ -5604,47 +5064,25 @@ impl Coordinator {
                         });
                     }
 
-                    // Check for segment manifest (stream-put objects).
+                    // Segment-manifest payloads are now the only non-multipart layout.
                     let chunks = meta_pg
                         .get_object_segments(bucket, key, vid)
                         .map_err(ServerError::Metadata)?;
 
-                    if !chunks.is_empty() {
-                        Self::enqueue_segment_manifest_reclaim(
-                            meta_pg,
-                            bucket,
-                            key,
-                            record.generation_id,
-                            &chunks,
-                        )?;
-                        meta_pg
-                            .delete_object_segments(bucket, key, vid)
-                            .map_err(ServerError::Metadata)?;
-                        meta_pg.delete_object_version(bucket, key, vid)?;
-                        drop(pgs);
-                        #[cfg(test)]
-                        maybe_run_segment_manifest_delete_metadata_hook(bucket, key);
-                        self.read_runtime().enqueue_object_payload_reclaim(
-                            bucket,
-                            key,
-                            record.generation_id,
-                        );
-
-                        return Ok(DeleteObjectResult {
-                            version_id: vid,
-                            delete_marker: false,
-                        });
-                    }
-
-                    Self::enqueue_simple_payload_reclaim(
+                    Self::enqueue_segment_manifest_reclaim(
                         meta_pg,
                         bucket,
                         key,
                         record.generation_id,
-                        record.ec,
+                        &chunks,
                     )?;
+                    meta_pg
+                        .delete_object_segments(bucket, key, vid)
+                        .map_err(ServerError::Metadata)?;
                     meta_pg.delete_object_version(bucket, key, vid)?;
                     drop(pgs);
+                    #[cfg(test)]
+                    maybe_run_segment_manifest_delete_metadata_hook(bucket, key);
                     self.read_runtime().enqueue_object_payload_reclaim(
                         bucket,
                         key,
@@ -6152,33 +5590,17 @@ impl Coordinator {
                     .get_object_segments(src_bucket, src_key, src_record.version_id)
                     .map_err(ServerError::Metadata)?;
 
-                if chunks.is_empty() {
-                    let src_okh = object_key_hash(src_bucket, src_key);
-                    let runtime = self.read_runtime();
-                    let body = ReadHandle::from_shard_set_range(
-                        &runtime,
-                        src_bucket,
-                        src_key,
-                        src_okh,
-                        &src_record,
-                        read_start as usize,
-                        read_end as usize,
-                    );
-                    drop(pgs);
-                    body.into_bytes().map_err(not_found)?
-                } else {
-                    let body = ReadHandle::from_segment_manifest_range(
-                        self.read_runtime(),
-                        src_bucket,
-                        src_key,
-                        src_record.generation_id,
-                        chunk_payloads_from_object_segments(chunks),
-                        read_start as usize,
-                        read_end as usize,
-                    );
-                    drop(pgs);
-                    body.into_bytes().map_err(not_found)?
-                }
+                let body = ReadHandle::from_segment_manifest_range(
+                    self.read_runtime(),
+                    src_bucket,
+                    src_key,
+                    src_record.generation_id,
+                    chunk_payloads_from_object_segments(chunks),
+                    read_start as usize,
+                    read_end as usize,
+                );
+                drop(pgs);
+                body.into_bytes().map_err(not_found)?
             }
         }; // source locks dropped here
 
@@ -6873,7 +6295,7 @@ impl Coordinator {
                         streaming_chunks,
                     )?;
                 }
-                _ => {
+                StaleObjectPayload::SegmentManifest { .. } => {
                     Self::delete_stale_object_payload_metadata(
                         &meta_pg, bucket, key, version_id, payload,
                     )?;
@@ -7183,6 +6605,21 @@ mod tests {
     const NO_DELETE: &DeleteCondition = &DeleteCondition::None;
     const TEST_REQUESTER: Requester<'static> = Requester::system();
     const NO_PUT_OBJECT_ACL: PutObjectAcl<'static> = PutObjectAcl::None;
+
+    fn compute_shard_size(size: u64, ec_k: u8) -> usize {
+        let k = u64::from(ec_k);
+        let padded = size.div_ceil(k) * k;
+        (padded / k) as usize
+    }
+
+    fn shards_for_byte_range(start: usize, end: usize, shard_size: usize, ec_k: u8) -> Vec<usize> {
+        if shard_size == 0 {
+            return vec![];
+        }
+        let first = start / shard_size;
+        let last = (end / shard_size).min(ec_k as usize - 1);
+        (first..=last).collect()
+    }
 
     fn setup_coordinator(dir: &Path) -> Coordinator {
         let pg_ids: Vec<u32> = (0..4).collect();
