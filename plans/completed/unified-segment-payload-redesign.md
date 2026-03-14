@@ -450,7 +450,7 @@ The remaining follow-on work around:
 - smaller-range efficient validation
 - read-path throughput tuning
 
-now belongs to [read-path-performance-optimization.md](./read-path-performance-optimization.md),
+now belongs to [segment-integrity-checks-for-bounded-reads.md](./segment-integrity-checks-for-bounded-reads.md),
 not to this redesign/convergence plan.
 
 ## Success Criteria
