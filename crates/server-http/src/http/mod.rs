@@ -1046,6 +1046,10 @@ impl HttpFrontend {
                     .delete_bucket_ownership_controls(&bucket, requester)?;
                 Ok(S3Response::delete_bucket_ownership_controls())
             }
+            S3Operation::GetBucketPolicy { bucket } => {
+                // We don't support bucket policies; always return NoSuchBucketPolicy.
+                Err(ServerError::NoSuchBucketPolicy { bucket })
+            }
             S3Operation::GetBucketAcl { bucket } => {
                 let requester =
                     crate::coordinator::Requester::from_principal(auth.principal.as_deref());

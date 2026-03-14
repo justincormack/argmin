@@ -84,6 +84,9 @@ pub enum ServerError {
     #[error("no public access block configuration: {bucket}")]
     NoSuchPublicAccessBlockConfiguration { bucket: String },
 
+    #[error("no bucket policy: {bucket}")]
+    NoSuchBucketPolicy { bucket: String },
+
     #[error("ownership controls not found: {bucket}")]
     OwnershipControlsNotFound { bucket: String },
 
@@ -198,6 +201,7 @@ impl ServerError {
             Self::NoSuchPublicAccessBlockConfiguration { .. } => {
                 "NoSuchPublicAccessBlockConfiguration"
             }
+            Self::NoSuchBucketPolicy { .. } => "NoSuchBucketPolicy",
             Self::OwnershipControlsNotFound { .. } => "OwnershipControlsNotFoundError",
             Self::AccessControlListNotSupported => "AccessControlListNotSupported",
             Self::InvalidBucketAclWithObjectOwnership => "InvalidBucketAclWithObjectOwnership",
@@ -249,7 +253,8 @@ impl ServerError {
             Self::InvalidChunkSize { .. } => 403,
             Self::NoSuchCorsConfiguration { .. } => 404,
             Self::NoSuchTagSet { .. } => 404,
-            Self::NoSuchPublicAccessBlockConfiguration { .. } => 404,
+            Self::NoSuchPublicAccessBlockConfiguration { .. }
+            | Self::NoSuchBucketPolicy { .. } => 404,
             Self::OwnershipControlsNotFound { .. } => 404,
             Self::InvalidTag { .. } => 400,
             Self::AccessControlListNotSupported

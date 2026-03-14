@@ -43,6 +43,7 @@ pub enum S3Operation {
     AbortMultipartUpload { bucket: String, key: String },
     ListMultipartUploads { bucket: String },
     ListParts { bucket: String, key: String },
+    GetBucketPolicy { bucket: String },
     OptionsRequest { bucket: String, key: Option<String> },
 }
 
@@ -263,6 +264,12 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
             // Check for ?tagging → GetBucketTagging
             if has_query_key(query, "tagging") {
                 return Ok(S3Operation::GetBucketTagging {
+                    bucket: bucket.to_string(),
+                });
+            }
+            // Check for ?policy → GetBucketPolicy
+            if has_query_key(query, "policy") {
+                return Ok(S3Operation::GetBucketPolicy {
                     bucket: bucket.to_string(),
                 });
             }
