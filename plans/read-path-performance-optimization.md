@@ -7,6 +7,14 @@ downloads are now memory-bounded as intended, but throughput regressed materiall
 Empirically, large local reads are roughly an order of magnitude slower than the
 older fully-buffered path, while CPU and system load remain fairly low.
 
+This plan is post-redesign:
+
+- the unified segmented payload redesign is complete
+- current object reads now flow through the generic segmented read path rather than
+  the earlier mixed direct-shard and streamed-chunk layouts
+- the remaining work here is storage/read-path optimization, not layout
+  convergence
+
 This plan captures what we measured, what we ruled out, and the recommended order
 for optimization work.
 
@@ -115,6 +123,16 @@ This shape strongly suggests two avoidable costs:
 - repeated whole-file allocation and read into fresh buffers
 - repeated copy/assembly of returned shard buffers into output chunks
 
+Under the current segmented model:
+
+- logical segments are `4 MiB`
+- with the default `4+2` EC layout, data shard files are roughly `1 MiB`
+
+That matters because whole-shard validation is now bounded to a relatively small
+physical unit on the hot path. It is still not ideal for all future range-read
+goals, but it is no longer the first throughput bottleneck to attack for large
+reads.
+
 ## What We Ruled Out
 
 These are not the first place to optimize:
@@ -132,48 +150,7 @@ These are not the first place to optimize:
 Reduce repeated shard-read allocation/copy overhead without regressing correctness,
 streaming semantics, or the new retained-payload lifetime model.
 
-### Stage 1: Add sub-shard integrity checksums
-
-Today, `read_shard()` verifies integrity by reading the full shard file and checking
-its whole-shard CRC64.
-
-This is acceptable for correctness, but it blocks efficient partial shard reads:
-
-- large full-object reads remain correct but pay whole-shard read cost
-- future small range reads cannot safely read only the touched bytes without either:
-  - re-reading the whole shard
-  - or weakening integrity validation
-
-So the first enabling step for further optimization is to add fixed-size per-shard
-chunk checksums.
-
-Recommended direction:
-
-- fixed integrity chunk size: `1 MiB`
-- keep existing whole-shard CRC64
-- add a compact checksum sidecar per shard containing one CRC64 per integrity chunk
-
-Why sidecar files:
-
-- avoids exploding SQLite row count
-- cheap indexed lookup by chunk number
-- naturally fits shard-file lifecycle
-- overhead is negligible (`8 bytes` per `1 MiB` integrity chunk)
-
-Read semantics for ranged shard reads:
-
-1. compute touched integrity chunk indices
-2. read the relevant checksum entries from the sidecar
-3. read the relevant shard bytes
-4. validate the touched integrity chunks
-5. slice out the requested sub-range
-
-Important:
-
-- integrity chunk size is a storage-format constant
-- it should not be conflated with the HTTP response chunk size
-
-### Stage 2: Stop using `fs::read()` on the hot path
+### Stage 1: Stop using `fs::read()` on the hot path
 
 Replace the current whole-file read API with a caller-buffer or reader-based API.
 
@@ -188,21 +165,31 @@ Properties:
 - shard reads no longer allocate a fresh `Vec` per call
 - read only the needed window for the current output chunk
 
-This becomes the highest-value reader optimization once sub-shard integrity exists.
+This is now the highest-value first optimization because the current active shard
+files are already bounded in size, but `fs::read()` still imposes avoidable
+allocation and copy cost on every segment read.
 
-### Stage 3: Reuse shard file descriptors within a reader lifetime
+### Stage 2: Reuse shard file descriptors within a reader lifetime
 
 Current traces suggest repeated open/read/close churn.
 
 Recommended direction:
 
-- keep shard files open within `ShardSetReader`, `PartShardReader`, and related
-  reader variants for the duration of the read window or request
+- keep shard files open within the generic segmented reader variants for the
+  duration of the read window or request
 - use `pread` / `read` into caller-owned buffers instead of reopening files
 
 This should reduce syscall churn and kernel-side path work.
 
-### Stage 4: Reduce assembly copies
+Concretely, in the current code this applies to the generic segmented read path:
+
+- `ReadRuntime::read_segment_payload(...)`
+- `SegmentListReader`
+- `MultipartReader`
+
+not to a legacy split between different object-layout families.
+
+### Stage 3: Reduce assembly copies
 
 Once shard data is read into reusable buffers, reduce extra movement on the
 reconstruction path.
@@ -220,7 +207,7 @@ Important:
   reconstructed into response order
 - the target is "one output buffer", not "no copies at all"
 
-### Stage 5: Re-measure before more ambitious design changes
+### Stage 4: Re-measure before more ambitious design changes
 
 After Stages 1-3, rerun:
 
@@ -234,16 +221,55 @@ Only then decide whether more invasive work is justified, such as:
 - larger internal readahead windows
 - alternative checksum placement
 
+### Stage 5: Add sub-shard integrity blocks if small-range work still needs them
+
+Today, `read_shard()` verifies integrity by reading the full shard file and checking
+its whole-shard CRC64.
+
+Under the current `4 MiB` segmented layout with default `4+2` EC, that usually
+means verifying about `1 MiB` shard files, which is acceptable for the current
+large-read throughput work.
+
+It is still not ideal if we later need:
+
+- smaller-range validation with less than whole-shard over-read
+- larger logical segments
+- different EC shapes that make shard files materially larger
+
+If that becomes important, the next integrity step should be fixed-size
+sub-shard integrity blocks.
+
+Recommended direction:
+
+- fixed integrity block size, independent of HTTP chunk size
+- keep existing whole-shard CRC64
+- add a compact checksum sidecar per shard containing one CRC64 per integrity block
+
+Why sidecar files:
+
+- avoids exploding SQLite row count
+- cheap indexed lookup by block number
+- naturally fits shard-file lifecycle
+- overhead is negligible
+
+Read semantics for ranged shard reads:
+
+1. compute touched integrity block indices
+2. read the relevant checksum entries from the sidecar
+3. read the relevant shard bytes
+4. validate the touched integrity blocks
+5. slice out the requested sub-range
+
 ## Implementation Order
 
-1. Add per-shard chunk checksums and sidecar format
-2. Add ranged shard reads that validate touched integrity chunks
-3. Introduce a non-allocating shard-read API in `storage`
-4. Switch `ShardSetReader` to it
-5. Switch multipart/chunk-manifest readers to it
-6. Add fd reuse inside reader lifetimes
-7. Refactor assembly to write directly into output buffers
-8. Re-profile and decide whether segmented output is worthwhile
+1. Introduce a non-allocating shard-read API in `storage`
+2. Switch the generic object-segment reader path to it
+3. Switch multipart part-segment readers to it
+4. Add fd reuse inside reader lifetimes
+5. Refactor assembly to write directly into output buffers
+6. Re-profile and decide whether segmented output is worthwhile
+7. If small-range validation still needs it, add sub-shard integrity blocks and
+   ranged validation
 
 ## Non-Goals For This Pass
 
@@ -251,7 +277,8 @@ Only then decide whether more invasive work is justified, such as:
 2. Changing EC layout
 3. Removing shard CRC verification
 4. General mutex/lock tuning without evidence
-5. Full observability work; that should be planned separately
+5. Reopening the completed payload-layout redesign
+6. Full observability work; that should be planned separately
 
 ## Success Criteria
 
