@@ -132,7 +132,48 @@ These are not the first place to optimize:
 Reduce repeated shard-read allocation/copy overhead without regressing correctness,
 streaming semantics, or the new retained-payload lifetime model.
 
-### Stage 1: Stop using `fs::read()` on the hot path
+### Stage 1: Add sub-shard integrity checksums
+
+Today, `read_shard()` verifies integrity by reading the full shard file and checking
+its whole-shard CRC64.
+
+This is acceptable for correctness, but it blocks efficient partial shard reads:
+
+- large full-object reads remain correct but pay whole-shard read cost
+- future small range reads cannot safely read only the touched bytes without either:
+  - re-reading the whole shard
+  - or weakening integrity validation
+
+So the first enabling step for further optimization is to add fixed-size per-shard
+chunk checksums.
+
+Recommended direction:
+
+- fixed integrity chunk size: `1 MiB`
+- keep existing whole-shard CRC64
+- add a compact checksum sidecar per shard containing one CRC64 per integrity chunk
+
+Why sidecar files:
+
+- avoids exploding SQLite row count
+- cheap indexed lookup by chunk number
+- naturally fits shard-file lifecycle
+- overhead is negligible (`8 bytes` per `1 MiB` integrity chunk)
+
+Read semantics for ranged shard reads:
+
+1. compute touched integrity chunk indices
+2. read the relevant checksum entries from the sidecar
+3. read the relevant shard bytes
+4. validate the touched integrity chunks
+5. slice out the requested sub-range
+
+Important:
+
+- integrity chunk size is a storage-format constant
+- it should not be conflated with the HTTP response chunk size
+
+### Stage 2: Stop using `fs::read()` on the hot path
 
 Replace the current whole-file read API with a caller-buffer or reader-based API.
 
@@ -147,9 +188,9 @@ Properties:
 - shard reads no longer allocate a fresh `Vec` per call
 - read only the needed window for the current output chunk
 
-This is the highest-value first optimization.
+This becomes the highest-value reader optimization once sub-shard integrity exists.
 
-### Stage 2: Reuse shard file descriptors within a reader lifetime
+### Stage 3: Reuse shard file descriptors within a reader lifetime
 
 Current traces suggest repeated open/read/close churn.
 
@@ -161,7 +202,7 @@ Recommended direction:
 
 This should reduce syscall churn and kernel-side path work.
 
-### Stage 3: Reduce assembly copies
+### Stage 4: Reduce assembly copies
 
 Once shard data is read into reusable buffers, reduce extra movement on the
 reconstruction path.
@@ -179,7 +220,7 @@ Important:
   reconstructed into response order
 - the target is "one output buffer", not "no copies at all"
 
-### Stage 4: Re-measure before more ambitious design changes
+### Stage 5: Re-measure before more ambitious design changes
 
 After Stages 1-3, rerun:
 
@@ -195,12 +236,14 @@ Only then decide whether more invasive work is justified, such as:
 
 ## Implementation Order
 
-1. Introduce a non-allocating shard-read API in `storage`
-2. Switch `ShardSetReader` to it
-3. Switch multipart/chunk-manifest readers to it
-4. Add fd reuse inside reader lifetimes
-5. Refactor assembly to write directly into output buffers
-6. Re-profile and decide whether segmented output is worthwhile
+1. Add per-shard chunk checksums and sidecar format
+2. Add ranged shard reads that validate touched integrity chunks
+3. Introduce a non-allocating shard-read API in `storage`
+4. Switch `ShardSetReader` to it
+5. Switch multipart/chunk-manifest readers to it
+6. Add fd reuse inside reader lifetimes
+7. Refactor assembly to write directly into output buffers
+8. Re-profile and decide whether segmented output is worthwhile
 
 ## Non-Goals For This Pass
 
