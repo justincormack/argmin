@@ -13,12 +13,12 @@ use storage::{
     BucketInfo, BucketName, BucketState, ChunkManifestReclaimChunkRecord,
     ChunkManifestReclaimRecord, CommitMultipartReq, CommitStreamPutReq, CreateMultipartUploadReq,
     CreateStreamUploadReq, EcShape, GenerationId, ListMultipartUploadsReq, ListObjectVersionsReq,
-    ListObjectsReq, ListPartsReq, LiveObjectRecord, MultipartPartChunkRecord, MultipartPartRecord,
-    MultipartReclaimPartChunkRecord, MultipartReclaimPartRecord, MultipartReclaimRecord,
-    MultipartUploadRecord, ObjectKey, ObjectLayout, ObjectPartRecord, PutDeleteMarkerReq,
-    PutLiveObjectReq, PutObjectReq, ReclaimWorkItem, SessionId, ShardKey, SharedStorageNode,
-    SimplePayloadReclaimRecord, StoredObject, StreamObjectChunkRecord, StreamUploadChunkRecord,
-    StreamUploadState, StreamUploadTarget, UploadId, UploadState,
+    ListObjectsReq, ListPartsReq, LiveObjectRecord, MultipartPartRecord,
+    MultipartPartSegmentRecord, MultipartReclaimPartChunkRecord, MultipartReclaimPartRecord,
+    MultipartReclaimRecord, MultipartUploadRecord, ObjectKey, ObjectLayout, ObjectPartRecord,
+    ObjectSegmentRecord, PutDeleteMarkerReq, PutLiveObjectReq, PutObjectReq, ReclaimWorkItem,
+    SessionId, ShardKey, SharedStorageNode, SimplePayloadReclaimRecord, StoredObject,
+    StreamUploadChunkRecord, StreamUploadState, StreamUploadTarget, UploadId, UploadState,
 };
 
 use crate::conditional::{
@@ -314,8 +314,8 @@ impl ReadHandle {
                                 .into_iter()
                                 .map(|chunk| ChunkPayloadRecord {
                                     size: chunk.size,
-                                    chunk_okh: chunk.chunk_okh,
-                                    chunk_vid: chunk.chunk_vid,
+                                    chunk_okh: chunk.segment_okh,
+                                    chunk_vid: chunk.segment_vid,
                                     shard_pg_id: chunk.shard_pg_id,
                                     ec_k: chunk.ec_k,
                                     ec_m: chunk.ec_m,
@@ -578,15 +578,15 @@ impl ReadHandle {
     }
 }
 
-fn chunk_payloads_from_stream_object_chunks(
-    chunks: Vec<StreamObjectChunkRecord>,
+fn chunk_payloads_from_object_segments(
+    chunks: Vec<ObjectSegmentRecord>,
 ) -> Vec<ChunkPayloadRecord> {
     chunks
         .into_iter()
         .map(|chunk| ChunkPayloadRecord {
             size: chunk.size,
-            chunk_okh: chunk.chunk_okh,
-            chunk_vid: chunk.chunk_vid,
+            chunk_okh: chunk.segment_okh,
+            chunk_vid: chunk.segment_vid,
             shard_pg_id: chunk.shard_pg_id,
             ec_k: chunk.ec_k,
             ec_m: chunk.ec_m,
@@ -1307,7 +1307,7 @@ struct LockedWriteObject<'a> {
 #[derive(Debug, Clone)]
 struct SnapshottedMultipartPart {
     record: ObjectPartRecord,
-    streaming_chunks: Option<Vec<MultipartPartChunkRecord>>,
+    streaming_chunks: Option<Vec<MultipartPartSegmentRecord>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1318,12 +1318,12 @@ enum StaleObjectPayload {
     },
     ChunkManifest {
         generation_id: GenerationId,
-        chunks: Vec<StreamObjectChunkRecord>,
+        chunks: Vec<ObjectSegmentRecord>,
     },
     Multipart {
         generation_id: GenerationId,
         parts: Vec<ObjectPartRecord>,
-        streaming_chunks: Vec<MultipartPartChunkRecord>,
+        streaming_chunks: Vec<MultipartPartSegmentRecord>,
     },
 }
 
@@ -3516,16 +3516,16 @@ impl Coordinator {
                 ),
             });
         }
-        let committed_chunks: Vec<StreamObjectChunkRecord> = staging_chunks
+        let committed_chunks: Vec<ObjectSegmentRecord> = staging_chunks
             .iter()
-            .map(|c| StreamObjectChunkRecord {
+            .map(|c| ObjectSegmentRecord {
                 bucket: BucketName::from(bucket),
                 key: ObjectKey::from(key),
                 version_id,
-                chunk_index: c.chunk_index,
+                segment_index: c.chunk_index,
                 size: c.size,
-                chunk_okh: c.chunk_okh,
-                chunk_vid: c.chunk_vid,
+                segment_okh: c.chunk_okh,
+                segment_vid: c.chunk_vid,
                 shard_pg_id: c.shard_pg_id,
                 ec_k: c.ec_k,
                 ec_m: c.ec_m,
@@ -3743,18 +3743,18 @@ impl Coordinator {
             });
         }
 
-        let committed_chunks: Vec<MultipartPartChunkRecord> = staging_chunks
+        let committed_chunks: Vec<MultipartPartSegmentRecord> = staging_chunks
             .iter()
-            .map(|c| MultipartPartChunkRecord {
+            .map(|c| MultipartPartSegmentRecord {
                 bucket: BucketName::from(bucket),
                 key: ObjectKey::from(key),
                 upload_id: UploadId::from(upload_id),
                 version_id: u64::MAX, // staging sentinel — reparented at CompleteMultipartUpload time
                 part_number,
-                chunk_index: c.chunk_index,
+                segment_index: c.chunk_index,
                 size: c.size,
-                chunk_okh: c.chunk_okh,
-                chunk_vid: c.chunk_vid,
+                segment_okh: c.chunk_okh,
+                segment_vid: c.chunk_vid,
                 shard_pg_id: c.shard_pg_id,
                 ec_k: c.ec_k,
                 ec_m: c.ec_m,
@@ -3811,10 +3811,10 @@ impl Coordinator {
                 }
             }
             // Clean old streamed-part chunks (if prior generation was streamed).
-            // commit_stream_part already handles deleting prior multipart_part_chunks
+            // commit_stream_part already handles deleting prior multipart_part_segments
             // in its transaction, but the shard data on disk needs cleanup.
             if let Ok(pg) = self.storage_node.get_pg(meta_pg_id) {
-                if let Ok(old_chunks) = pg.get_multipart_part_chunks(
+                if let Ok(old_chunks) = pg.get_multipart_part_segments(
                     bucket,
                     key,
                     VersionId::from_u64(old_vid.get()),
@@ -4054,7 +4054,7 @@ impl Coordinator {
                 // Check for chunk manifest (stream-put objects).
                 let meta_pg = pgs.meta();
                 let chunks = meta_pg
-                    .get_stream_object_chunks(src_bucket, src_key, src_record.version_id)
+                    .get_object_segments(src_bucket, src_key, src_record.version_id)
                     .map_err(ServerError::Metadata)?;
 
                 let user_data = if user_size == 0 {
@@ -4066,7 +4066,7 @@ impl Coordinator {
                         src_bucket,
                         src_key,
                         src_record.generation_id,
-                        chunk_payloads_from_stream_object_chunks(chunks),
+                        chunk_payloads_from_object_segments(chunks),
                         user_size,
                         Some(src_etag_crc),
                     );
@@ -4346,7 +4346,7 @@ impl Coordinator {
             let streaming_chunks = if part.part_okh == [0u8; 16] {
                 Some(
                     meta_pg
-                        .get_multipart_part_chunks(bucket, key, version_id, part.part_number)
+                        .get_multipart_part_segments(bucket, key, version_id, part.part_number)
                         .map_err(ServerError::Metadata)?,
                 )
             } else {
@@ -4384,7 +4384,7 @@ impl Coordinator {
                 for part in &parts {
                     if part.part_okh == [0u8; 16] {
                         let chunks = meta_pg
-                            .get_multipart_part_chunks(
+                            .get_multipart_part_segments(
                                 bucket,
                                 key,
                                 VersionId::Null,
@@ -4402,7 +4402,7 @@ impl Coordinator {
             }
             ObjectLayout::ChunkManifest => {
                 let chunks = meta_pg
-                    .get_stream_object_chunks(bucket, key, VersionId::Null)
+                    .get_object_segments(bucket, key, VersionId::Null)
                     .map_err(ServerError::Metadata)?;
                 if chunks.is_empty() {
                     Ok(Some(StaleObjectPayload::Simple {
@@ -4442,7 +4442,7 @@ impl Coordinator {
             } => {
                 Self::enqueue_chunk_manifest_reclaim(meta_pg, bucket, key, *generation_id, chunks)?;
                 meta_pg
-                    .delete_stream_object_chunks(bucket, key, version_id)
+                    .delete_object_segments(bucket, key, version_id)
                     .map_err(ServerError::Metadata)
             }
             StaleObjectPayload::Multipart {
@@ -4460,7 +4460,7 @@ impl Coordinator {
                 )?;
                 if !streaming_chunks.is_empty() {
                     meta_pg
-                        .delete_multipart_part_chunks(bucket, key, version_id)
+                        .delete_multipart_part_segments(bucket, key, version_id)
                         .map_err(ServerError::Metadata)?;
                 }
                 meta_pg
@@ -4505,7 +4505,7 @@ impl Coordinator {
         bucket: &str,
         key: &str,
         generation_id: GenerationId,
-        chunks: &[StreamObjectChunkRecord],
+        chunks: &[ObjectSegmentRecord],
     ) -> Result<(), ServerError> {
         meta_pg
             .put_chunk_manifest_reclaim(&ChunkManifestReclaimRecord {
@@ -4516,9 +4516,9 @@ impl Coordinator {
                 chunks: chunks
                     .iter()
                     .map(|chunk| ChunkManifestReclaimChunkRecord {
-                        chunk_index: chunk.chunk_index,
-                        chunk_okh: chunk.chunk_okh,
-                        chunk_vid: chunk.chunk_vid,
+                        chunk_index: chunk.segment_index,
+                        chunk_okh: chunk.segment_okh,
+                        chunk_vid: chunk.segment_vid,
                         shard_pg_id: chunk.shard_pg_id,
                         ec: EcShape {
                             k: chunk.ec_k,
@@ -4536,7 +4536,7 @@ impl Coordinator {
         key: &str,
         generation_id: GenerationId,
         parts: &[ObjectPartRecord],
-        streaming_chunks: &[MultipartPartChunkRecord],
+        streaming_chunks: &[MultipartPartSegmentRecord],
     ) -> Result<(), ServerError> {
         use std::collections::BTreeMap;
 
@@ -4546,9 +4546,9 @@ impl Coordinator {
             chunks_by_part.entry(chunk.part_number).or_default().push(
                 MultipartReclaimPartChunkRecord {
                     part_number: chunk.part_number,
-                    chunk_index: chunk.chunk_index,
-                    chunk_okh: chunk.chunk_okh,
-                    chunk_vid: chunk.chunk_vid,
+                    chunk_index: chunk.segment_index,
+                    chunk_okh: chunk.segment_okh,
+                    chunk_vid: chunk.segment_vid,
                     shard_pg_id: chunk.shard_pg_id,
                     ec: EcShape {
                         k: chunk.ec_k,
@@ -4594,13 +4594,13 @@ impl Coordinator {
 
     fn delete_chunk_shards_generic(
         &self,
-        chunks: &[MultipartPartChunkRecord],
+        chunks: &[MultipartPartSegmentRecord],
     ) -> Result<(), ServerError> {
         for chunk in chunks {
             self.delete_chunk_shard_set(
                 chunk.shard_pg_id,
-                &chunk.chunk_okh,
-                chunk.chunk_vid,
+                &chunk.segment_okh,
+                chunk.segment_vid,
                 chunk.ec_k,
                 chunk.ec_m,
             )?;
@@ -4694,7 +4694,7 @@ impl Coordinator {
             // Check for chunk manifest (stream-put objects).
             let meta_pg = pgs.meta();
             let chunks = meta_pg
-                .get_stream_object_chunks(bucket, key, record.version_id)
+                .get_object_segments(bucket, key, record.version_id)
                 .map_err(ServerError::Metadata)?;
 
             let metadata = record
@@ -4717,8 +4717,8 @@ impl Coordinator {
                         .into_iter()
                         .map(|chunk| ChunkPayloadRecord {
                             size: chunk.size,
-                            chunk_okh: chunk.chunk_okh,
-                            chunk_vid: chunk.chunk_vid,
+                            chunk_okh: chunk.segment_okh,
+                            chunk_vid: chunk.segment_vid,
                             shard_pg_id: chunk.shard_pg_id,
                             ec_k: chunk.ec_k,
                             ec_m: chunk.ec_m,
@@ -4870,7 +4870,7 @@ impl Coordinator {
             // Check for chunk manifest (stream-put objects).
             let meta_pg = pgs.meta();
             let chunks = meta_pg
-                .get_stream_object_chunks(bucket, key, record.version_id)
+                .get_object_segments(bucket, key, record.version_id)
                 .map_err(ServerError::Metadata)?;
 
             let body = if user_size == 0 {
@@ -4886,8 +4886,8 @@ impl Coordinator {
                         .into_iter()
                         .map(|chunk| ChunkPayloadRecord {
                             size: chunk.size,
-                            chunk_okh: chunk.chunk_okh,
-                            chunk_vid: chunk.chunk_vid,
+                            chunk_okh: chunk.segment_okh,
+                            chunk_vid: chunk.segment_vid,
                             shard_pg_id: chunk.shard_pg_id,
                             ec_k: chunk.ec_k,
                             ec_m: chunk.ec_m,
@@ -5282,7 +5282,7 @@ impl Coordinator {
             // Check for chunk manifest (stream-put objects).
             let meta_pg = pgs.meta();
             let chunks = meta_pg
-                .get_stream_object_chunks(bucket, key, record.version_id)
+                .get_object_segments(bucket, key, record.version_id)
                 .map_err(ServerError::Metadata)?;
 
             let body = if chunks.is_empty() {
@@ -5309,8 +5309,8 @@ impl Coordinator {
                         .into_iter()
                         .map(|chunk| ChunkPayloadRecord {
                             size: chunk.size,
-                            chunk_okh: chunk.chunk_okh,
-                            chunk_vid: chunk.chunk_vid,
+                            chunk_okh: chunk.segment_okh,
+                            chunk_vid: chunk.segment_vid,
                             shard_pg_id: chunk.shard_pg_id,
                             ec_k: chunk.ec_k,
                             ec_m: chunk.ec_m,
@@ -5397,11 +5397,11 @@ impl Coordinator {
                         .get_object_parts(bucket, key, record.version_id)
                         .map_err(ServerError::Metadata)?;
                     // Collect chunk manifests for streaming parts before deleting metadata.
-                    let mut streaming_chunks: Vec<MultipartPartChunkRecord> = Vec::new();
+                    let mut streaming_chunks: Vec<MultipartPartSegmentRecord> = Vec::new();
                     for part in &obj_parts {
                         if part.part_okh == [0u8; 16] {
                             let chunks = meta_pg
-                                .get_multipart_part_chunks(
+                                .get_multipart_part_segments(
                                     bucket,
                                     key,
                                     record.version_id,
@@ -5421,7 +5421,7 @@ impl Coordinator {
                     )?;
                     if !streaming_chunks.is_empty() {
                         meta_pg
-                            .delete_multipart_part_chunks(bucket, key, record.version_id)
+                            .delete_multipart_part_segments(bucket, key, record.version_id)
                             .map_err(ServerError::Metadata)?;
                     }
                     meta_pg.delete_object_parts(bucket, key, record.version_id)?;
@@ -5439,7 +5439,7 @@ impl Coordinator {
 
                     // Check for chunk manifest (stream-put objects).
                     let chunks = meta_pg
-                        .get_stream_object_chunks(bucket, key, vid)
+                        .get_object_segments(bucket, key, vid)
                         .map_err(ServerError::Metadata)?;
 
                     if chunks.is_empty() {
@@ -5466,7 +5466,7 @@ impl Coordinator {
                             &chunks,
                         )?;
                         meta_pg
-                            .delete_stream_object_chunks(bucket, key, vid)
+                            .delete_object_segments(bucket, key, vid)
                             .map_err(ServerError::Metadata)?;
                         meta_pg.delete_object_meta(bucket, key)?;
                         drop(pgs);
@@ -5512,11 +5512,11 @@ impl Coordinator {
                             .get_object_parts(bucket, key, vid)
                             .map_err(ServerError::Metadata)?;
                         // Collect chunk manifests for streaming parts.
-                        let mut streaming_chunks: Vec<MultipartPartChunkRecord> = Vec::new();
+                        let mut streaming_chunks: Vec<MultipartPartSegmentRecord> = Vec::new();
                         for part in &obj_parts {
                             if part.part_okh == [0u8; 16] {
                                 let chunks = meta_pg
-                                    .get_multipart_part_chunks(bucket, key, vid, part.part_number)
+                                    .get_multipart_part_segments(bucket, key, vid, part.part_number)
                                     .map_err(ServerError::Metadata)?;
                                 streaming_chunks.extend(chunks);
                             }
@@ -5531,7 +5531,7 @@ impl Coordinator {
                         )?;
                         if !streaming_chunks.is_empty() {
                             meta_pg
-                                .delete_multipart_part_chunks(bucket, key, vid)
+                                .delete_multipart_part_segments(bucket, key, vid)
                                 .map_err(ServerError::Metadata)?;
                         }
                         meta_pg.delete_object_parts(bucket, key, vid)?;
@@ -5553,7 +5553,7 @@ impl Coordinator {
 
                     // Check for chunk manifest (stream-put objects).
                     let chunks = meta_pg
-                        .get_stream_object_chunks(bucket, key, vid)
+                        .get_object_segments(bucket, key, vid)
                         .map_err(ServerError::Metadata)?;
 
                     if !chunks.is_empty() {
@@ -5565,7 +5565,7 @@ impl Coordinator {
                             &chunks,
                         )?;
                         meta_pg
-                            .delete_stream_object_chunks(bucket, key, vid)
+                            .delete_object_segments(bucket, key, vid)
                             .map_err(ServerError::Metadata)?;
                         meta_pg.delete_object_version(bucket, key, vid)?;
                         drop(pgs);
@@ -6096,7 +6096,7 @@ impl Coordinator {
                 // Non-multipart source: check for chunk manifest first.
                 let meta_pg = pgs.meta();
                 let chunks = meta_pg
-                    .get_stream_object_chunks(src_bucket, src_key, src_record.version_id)
+                    .get_object_segments(src_bucket, src_key, src_record.version_id)
                     .map_err(ServerError::Metadata)?;
 
                 if chunks.is_empty() {
@@ -6119,7 +6119,7 @@ impl Coordinator {
                         src_bucket,
                         src_key,
                         src_record.generation_id,
-                        chunk_payloads_from_stream_object_chunks(chunks),
+                        chunk_payloads_from_object_segments(chunks),
                         read_start as usize,
                         read_end as usize,
                     );
@@ -6859,7 +6859,7 @@ impl Coordinator {
 
         // 3b. Collect streaming chunk manifests for shard cleanup.
         let streaming_chunks = meta_pg
-            .get_all_multipart_part_chunks_for_upload(upload_id)
+            .get_all_multipart_part_segments_for_upload(upload_id)
             .map_err(ServerError::Metadata)?;
 
         // 4. Drop meta PG lock before shard cleanup to avoid deadlocks.
@@ -6897,7 +6897,7 @@ impl Coordinator {
         let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
         if !streaming_chunks.is_empty() {
             meta_pg
-                .delete_multipart_part_chunks_by_upload_id(upload_id)
+                .delete_multipart_part_segments_by_upload_id(upload_id)
                 .map_err(ServerError::Metadata)?;
         }
         meta_pg
@@ -16074,11 +16074,11 @@ mod tests {
         let meta_pg_id = coord.object_pg_id("bucket", "key");
         let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
         let committed = pg
-            .get_stream_object_chunks("bucket", "key", result.version_id)
+            .get_object_segments("bucket", "key", result.version_id)
             .unwrap();
         assert_eq!(committed.len(), 3);
         for (i, chunk) in committed.iter().enumerate() {
-            assert_eq!(chunk.chunk_index, i as u32);
+            assert_eq!(chunk.segment_index, i as u32);
             assert_eq!(chunk.size, 3); // "aaa", "bbb", "ccc" are all 3 bytes
         }
     }
@@ -16115,7 +16115,7 @@ mod tests {
     #[test]
     fn stream_put_get_object_readable() {
         // Stream-finalized objects use chunk manifests for shard data.
-        // GET reads from stream_object_chunks to reconstruct the object.
+        // GET reads from object_segments to reconstruct the object.
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
@@ -16492,7 +16492,7 @@ mod tests {
 
     #[test]
     fn stream_put_delete_cleans_chunks() {
-        // P1 fix: delete must clean up stream_object_chunks and their shards.
+        // P1 fix: delete must clean up object_segments and their shards.
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
@@ -16566,7 +16566,7 @@ mod tests {
         let chunks = {
             let meta_pg_id = coord.object_pg_id("bucket", "key");
             let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
-            pg.get_stream_object_chunks("bucket", "key", result.version_id)
+            pg.get_object_segments("bucket", "key", result.version_id)
                 .unwrap()
         };
 
@@ -16584,8 +16584,8 @@ mod tests {
             wait_for_shard_set_deletion(
                 &coord,
                 chunk.shard_pg_id,
-                &chunk.chunk_okh,
-                chunk.chunk_vid,
+                &chunk.segment_okh,
+                chunk.segment_vid,
                 EcShape {
                     k: chunk.ec_k,
                     m: chunk.ec_m,
@@ -17081,7 +17081,7 @@ mod tests {
     #[test]
     fn abort_streamed_mpu_cleans_chunk_manifest_and_shards() {
         // Regression: aborting an MPU with streamed parts must delete
-        // multipart_part_chunks rows and their shard data.
+        // multipart_part_segments rows and their shard data.
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
@@ -17126,7 +17126,7 @@ mod tests {
         let chunks_before = {
             let meta_pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
             let chunks = meta_pg
-                .get_all_multipart_part_chunks_for_upload(&mpu.upload_id)
+                .get_all_multipart_part_segments_for_upload(&mpu.upload_id)
                 .unwrap();
             assert!(!chunks.is_empty(), "chunks should exist before abort");
             chunks
@@ -17137,7 +17137,7 @@ mod tests {
             let shard_pg = coord.storage_node.get_pg(chunk.shard_pg_id).unwrap();
             let total = chunk.ec_k as usize + chunk.ec_m as usize;
             for i in 0..total {
-                let shard_key = ShardKey::new(&chunk.chunk_okh, chunk.chunk_vid.get(), i as u8);
+                let shard_key = ShardKey::new(&chunk.segment_okh, chunk.segment_vid.get(), i as u8);
                 assert!(
                     shard_pg.read_shard(&shard_key).is_ok(),
                     "shard {i} should exist before abort"
@@ -17160,7 +17160,7 @@ mod tests {
         {
             let meta_pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
             let chunks = meta_pg
-                .get_all_multipart_part_chunks_for_upload(&mpu.upload_id)
+                .get_all_multipart_part_segments_for_upload(&mpu.upload_id)
                 .unwrap();
             assert!(
                 chunks.is_empty(),
@@ -17173,7 +17173,7 @@ mod tests {
             let shard_pg = coord.storage_node.get_pg(chunk.shard_pg_id).unwrap();
             let total = chunk.ec_k as usize + chunk.ec_m as usize;
             for i in 0..total {
-                let shard_key = ShardKey::new(&chunk.chunk_okh, chunk.chunk_vid.get(), i as u8);
+                let shard_key = ShardKey::new(&chunk.segment_okh, chunk.segment_vid.get(), i as u8);
                 assert!(
                     shard_pg.read_shard(&shard_key).is_err(),
                     "shard {i} should be deleted after abort"
@@ -17333,13 +17333,13 @@ mod tests {
             let meta_pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
             let record = meta_pg.get_object_meta("bucket", "verify").unwrap();
             let chunks = meta_pg
-                .get_stream_object_chunks("bucket", "verify", record.version_id())
+                .get_object_segments("bucket", "verify", record.version_id())
                 .unwrap();
 
             assert_eq!(chunks.len(), 2);
-            assert_eq!(chunks[0].chunk_index, 0);
+            assert_eq!(chunks[0].segment_index, 0);
             assert_eq!(chunks[0].size, 8);
-            assert_eq!(chunks[1].chunk_index, 1);
+            assert_eq!(chunks[1].segment_index, 1);
             assert_eq!(chunks[1].size, 8);
         } // Drop PG lock before coordinator calls.
 

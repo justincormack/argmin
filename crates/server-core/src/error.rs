@@ -253,8 +253,9 @@ impl ServerError {
             Self::InvalidChunkSize { .. } => 403,
             Self::NoSuchCorsConfiguration { .. } => 404,
             Self::NoSuchTagSet { .. } => 404,
-            Self::NoSuchPublicAccessBlockConfiguration { .. }
-            | Self::NoSuchBucketPolicy { .. } => 404,
+            Self::NoSuchPublicAccessBlockConfiguration { .. } | Self::NoSuchBucketPolicy { .. } => {
+                404
+            }
             Self::OwnershipControlsNotFound { .. } => 404,
             Self::InvalidTag { .. } => 400,
             Self::AccessControlListNotSupported

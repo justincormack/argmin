@@ -258,6 +258,32 @@ Working decision:
 
 Use one fixed-segment physical payload model for all newly written object data.
 
+## Status
+
+### Phase A
+
+Completed. The semantic design decisions above are settled.
+
+### Phase B
+
+In progress.
+
+First implementation slice completed:
+
+- committed metadata paths now use generic segment naming instead of
+  object-stream-specific chunk naming
+- committed tables are now `object_segments` and `multipart_part_segments`
+- committed record types are `ObjectSegmentRecord` and
+  `MultipartPartSegmentRecord`
+- committed record fields use `segment_index`, `segment_okh`, and
+  `segment_vid`
+
+Intentional non-goals of this first slice:
+
+- staging upload chunk records remain chunk-oriented for now
+- `ObjectLayout::ChunkManifest` is not renamed yet
+- read/write semantics are unchanged; this is a metadata convergence step only
+
 Specifically:
 
 1. choose a fixed segment size

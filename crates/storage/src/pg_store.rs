@@ -3045,10 +3045,10 @@ impl PgMetadataStore for PgStore {
                 }
             }
 
-            // 5. Clean up stale multipart_part_chunks from prior uploads to
+            // 5. Clean up stale multipart_part_segments from prior uploads to
             //    the same key+version_id (e.g. overwriting in unversioned mode).
             self.conn.execute(
-                "DELETE FROM multipart_part_chunks \
+                "DELETE FROM multipart_part_segments \
                  WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 AND upload_id != ?4",
                 params![
                     obj.bucket,
@@ -3061,7 +3061,7 @@ impl PgMetadataStore for PgStore {
             // 6. Reparent this upload's chunks from staging version_id to
             //    the real object version_id so reads can find them.
             self.conn.execute(
-                "UPDATE multipart_part_chunks \
+                "UPDATE multipart_part_segments \
                  SET version_id = ?1 \
                  WHERE bucket = ?2 AND key = ?3 AND upload_id = ?4 \
                  AND version_id = ?5",
@@ -3341,7 +3341,7 @@ impl PgMetadataStore for PgStore {
         &self,
         session_id: &str,
         obj: &CommitStreamPutReq,
-        chunks: &[StreamObjectChunkRecord],
+        chunks: &[ObjectSegmentRecord],
     ) -> Result<(), MetadataError> {
         self.conn
             .execute_batch("BEGIN IMMEDIATE")
@@ -3452,10 +3452,10 @@ impl PgMetadataStore for PgStore {
                     source: e,
                 })?;
 
-            // 3. Delete any prior stream_object_chunks for this version.
+            // 3. Delete any prior object_segments for this version.
             self.conn
                 .execute(
-                    "DELETE FROM stream_object_chunks \
+                    "DELETE FROM object_segments \
                      WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
                     params![obj.bucket, obj.key, obj.version_id.to_u64() as i64],
                 )
@@ -3469,8 +3469,8 @@ impl PgMetadataStore for PgStore {
                 let mut stmt = self
                     .conn
                     .prepare(
-                        "INSERT INTO stream_object_chunks \
-                         (bucket, key, version_id, chunk_index, size, chunk_okh, chunk_vid, \
+                        "INSERT INTO object_segments \
+                         (bucket, key, version_id, segment_index, size, segment_okh, segment_vid, \
                           shard_pg_id, ec_k, ec_m) \
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                     )
@@ -3491,10 +3491,10 @@ impl PgMetadataStore for PgStore {
                         chunk.bucket,
                         chunk.key,
                         chunk.version_id.to_u64() as i64,
-                        chunk.chunk_index,
+                        chunk.segment_index,
                         chunk.size as i64,
-                        chunk.chunk_okh.as_slice(),
-                        chunk.chunk_vid.get() as i64,
+                        chunk.segment_okh.as_slice(),
+                        chunk.segment_vid.get() as i64,
                         chunk.shard_pg_id,
                         chunk.ec_k,
                         chunk.ec_m,
@@ -3542,7 +3542,7 @@ impl PgMetadataStore for PgStore {
         &self,
         session_id: &str,
         part: &MultipartPartRecord,
-        chunks: &[MultipartPartChunkRecord],
+        chunks: &[MultipartPartSegmentRecord],
     ) -> Result<(), MetadataError> {
         self.conn
             .execute_batch("BEGIN IMMEDIATE")
@@ -3672,7 +3672,7 @@ impl PgMetadataStore for PgStore {
             //    Scoped by upload_id to avoid clobbering concurrent uploads for the same key.
             self.conn
                 .execute(
-                    "DELETE FROM multipart_part_chunks \
+                    "DELETE FROM multipart_part_segments \
                      WHERE bucket = ?1 AND key = ?2 AND upload_id = ?3 \
                      AND part_number = ?4",
                     params![sess_bucket, sess_key, part.upload_id, part.part_number],
@@ -3687,9 +3687,9 @@ impl PgMetadataStore for PgStore {
                 let mut stmt = self
                     .conn
                     .prepare(
-                        "INSERT INTO multipart_part_chunks \
-                         (bucket, key, upload_id, version_id, part_number, chunk_index, size, chunk_okh, \
-                          chunk_vid, shard_pg_id, ec_k, ec_m) \
+                        "INSERT INTO multipart_part_segments \
+                         (bucket, key, upload_id, version_id, part_number, segment_index, size, segment_okh, \
+                          segment_vid, shard_pg_id, ec_k, ec_m) \
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                     )
                     .map_err(|e| MetadataError::Db {
@@ -3713,10 +3713,10 @@ impl PgMetadataStore for PgStore {
                         chunk.upload_id,
                         chunk.version_id as i64,
                         chunk.part_number,
-                        chunk.chunk_index,
+                        chunk.segment_index,
                         chunk.size as i64,
-                        chunk.chunk_okh.as_slice(),
-                        chunk.chunk_vid.get() as i64,
+                        chunk.segment_okh.as_slice(),
+                        chunk.segment_vid.get() as i64,
                         chunk.shard_pg_id,
                         chunk.ec_k,
                         chunk.ec_m,
@@ -3760,19 +3760,19 @@ impl PgMetadataStore for PgStore {
         }
     }
 
-    fn get_stream_object_chunks(
+    fn get_object_segments(
         &self,
         bucket: &str,
         key: &str,
         version_id: VersionId,
-    ) -> Result<Vec<StreamObjectChunkRecord>, MetadataError> {
+    ) -> Result<Vec<ObjectSegmentRecord>, MetadataError> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT bucket, key, version_id, chunk_index, size, chunk_okh, chunk_vid, \
-                 shard_pg_id, ec_k, ec_m FROM stream_object_chunks \
+                "SELECT bucket, key, version_id, segment_index, size, segment_okh, segment_vid, \
+                 shard_pg_id, ec_k, ec_m FROM object_segments \
                  WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 \
-                 ORDER BY chunk_index ASC",
+                 ORDER BY segment_index ASC",
             )
             .map_err(|e| MetadataError::Db {
                 context: "prepare get stream object chunks",
@@ -3783,14 +3783,18 @@ impl PgMetadataStore for PgStore {
             .query_map(params![bucket, key, version_id.to_u64() as i64], |row| {
                 let okh_blob: Vec<u8> = row.get(5)?;
                 let okh = PgStore::parse_okh_blob(&okh_blob, 5)?;
-                Ok(StreamObjectChunkRecord {
+                Ok(ObjectSegmentRecord {
                     bucket: row.get(0)?,
                     key: row.get(1)?,
                     version_id: PgStore::parse_version_id(row.get::<_, i64>(2)?, 2)?,
-                    chunk_index: row.get(3)?,
+                    segment_index: row.get(3)?,
                     size: row.get::<_, i64>(4)? as u64,
-                    chunk_okh: okh,
-                    chunk_vid: Self::parse_generation_id(row.get::<_, i64>(6)?, 6, "chunk_vid")?,
+                    segment_okh: okh,
+                    segment_vid: Self::parse_generation_id(
+                        row.get::<_, i64>(6)?,
+                        6,
+                        "segment_vid",
+                    )?,
                     shard_pg_id: row.get(7)?,
                     ec_k: row.get(8)?,
                     ec_m: row.get(9)?,
@@ -3811,7 +3815,7 @@ impl PgMetadataStore for PgStore {
         Ok(chunks)
     }
 
-    fn delete_stream_object_chunks(
+    fn delete_object_segments(
         &self,
         bucket: &str,
         key: &str,
@@ -3819,7 +3823,7 @@ impl PgMetadataStore for PgStore {
     ) -> Result<(), MetadataError> {
         self.conn
             .execute(
-                "DELETE FROM stream_object_chunks \
+                "DELETE FROM object_segments \
                  WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
                 params![bucket, key, version_id.to_u64() as i64],
             )
@@ -3830,20 +3834,20 @@ impl PgMetadataStore for PgStore {
         Ok(())
     }
 
-    fn get_multipart_part_chunks(
+    fn get_multipart_part_segments(
         &self,
         bucket: &str,
         key: &str,
         version_id: VersionId,
         part_number: u32,
-    ) -> Result<Vec<MultipartPartChunkRecord>, MetadataError> {
+    ) -> Result<Vec<MultipartPartSegmentRecord>, MetadataError> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT bucket, key, upload_id, version_id, part_number, chunk_index, size, chunk_okh, \
-                 chunk_vid, shard_pg_id, ec_k, ec_m FROM multipart_part_chunks \
+                "SELECT bucket, key, upload_id, version_id, part_number, segment_index, size, segment_okh, \
+                 segment_vid, shard_pg_id, ec_k, ec_m FROM multipart_part_segments \
                  WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 AND part_number = ?4 \
-                 ORDER BY chunk_index ASC",
+                 ORDER BY segment_index ASC",
             )
             .map_err(|e| MetadataError::Db {
                 context: "prepare get multipart part chunks",
@@ -3856,19 +3860,19 @@ impl PgMetadataStore for PgStore {
                 |row| {
                     let okh_blob: Vec<u8> = row.get(7)?;
                     let okh = PgStore::parse_okh_blob(&okh_blob, 7)?;
-                    Ok(MultipartPartChunkRecord {
+                    Ok(MultipartPartSegmentRecord {
                         bucket: row.get(0)?,
                         key: row.get(1)?,
                         upload_id: row.get(2)?,
                         version_id: row.get::<_, i64>(3)? as u64,
                         part_number: row.get(4)?,
-                        chunk_index: row.get(5)?,
+                        segment_index: row.get(5)?,
                         size: row.get::<_, i64>(6)? as u64,
-                        chunk_okh: okh,
-                        chunk_vid: Self::parse_generation_id(
+                        segment_okh: okh,
+                        segment_vid: Self::parse_generation_id(
                             row.get::<_, i64>(8)?,
                             8,
-                            "chunk_vid",
+                            "segment_vid",
                         )?,
                         shard_pg_id: row.get(9)?,
                         ec_k: row.get(10)?,
@@ -3891,7 +3895,7 @@ impl PgMetadataStore for PgStore {
         Ok(chunks)
     }
 
-    fn delete_multipart_part_chunks(
+    fn delete_multipart_part_segments(
         &self,
         bucket: &str,
         key: &str,
@@ -3899,7 +3903,7 @@ impl PgMetadataStore for PgStore {
     ) -> Result<(), MetadataError> {
         self.conn
             .execute(
-                "DELETE FROM multipart_part_chunks \
+                "DELETE FROM multipart_part_segments \
                  WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
                 params![bucket, key, version_id.to_u64() as i64],
             )
@@ -3910,18 +3914,18 @@ impl PgMetadataStore for PgStore {
         Ok(())
     }
 
-    fn get_all_multipart_part_chunks_for_upload(
+    fn get_all_multipart_part_segments_for_upload(
         &self,
         upload_id: &str,
-    ) -> Result<Vec<MultipartPartChunkRecord>, MetadataError> {
+    ) -> Result<Vec<MultipartPartSegmentRecord>, MetadataError> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT bucket, key, upload_id, version_id, part_number, chunk_index, \
-                 size, chunk_okh, chunk_vid, shard_pg_id, ec_k, ec_m \
-                 FROM multipart_part_chunks \
+                "SELECT bucket, key, upload_id, version_id, part_number, segment_index, \
+                 size, segment_okh, segment_vid, shard_pg_id, ec_k, ec_m \
+                 FROM multipart_part_segments \
                  WHERE upload_id = ?1 \
-                 ORDER BY part_number, chunk_index",
+                 ORDER BY part_number, segment_index",
             )
             .map_err(|e| MetadataError::Db {
                 context: "get all multipart part chunks for upload (prepare)",
@@ -3931,16 +3935,20 @@ impl PgMetadataStore for PgStore {
             .query_map(params![upload_id], |row| {
                 let okh_blob: Vec<u8> = row.get(7)?;
                 let chunk_okh = PgStore::parse_okh_blob(&okh_blob, 7)?;
-                Ok(MultipartPartChunkRecord {
+                Ok(MultipartPartSegmentRecord {
                     bucket: row.get(0)?,
                     key: row.get(1)?,
                     upload_id: row.get(2)?,
                     version_id: row.get::<_, i64>(3)? as u64,
                     part_number: row.get(4)?,
-                    chunk_index: row.get(5)?,
+                    segment_index: row.get(5)?,
                     size: row.get::<_, i64>(6)? as u64,
-                    chunk_okh,
-                    chunk_vid: Self::parse_generation_id(row.get::<_, i64>(8)?, 8, "chunk_vid")?,
+                    segment_okh: chunk_okh,
+                    segment_vid: Self::parse_generation_id(
+                        row.get::<_, i64>(8)?,
+                        8,
+                        "segment_vid",
+                    )?,
                     shard_pg_id: row.get(9)?,
                     ec_k: row.get(10)?,
                     ec_m: row.get(11)?,
@@ -3957,13 +3965,13 @@ impl PgMetadataStore for PgStore {
             })
     }
 
-    fn delete_multipart_part_chunks_by_upload_id(
+    fn delete_multipart_part_segments_by_upload_id(
         &self,
         upload_id: &str,
     ) -> Result<(), MetadataError> {
         self.conn
             .execute(
-                "DELETE FROM multipart_part_chunks WHERE upload_id = ?1",
+                "DELETE FROM multipart_part_segments WHERE upload_id = ?1",
                 params![upload_id],
             )
             .map_err(|e| MetadataError::Db {

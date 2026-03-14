@@ -135,18 +135,18 @@ CREATE TABLE IF NOT EXISTS stream_upload_chunks (
 
 /// Committed chunk manifest for normal PutObject.
 const CREATE_STREAM_OBJECT_CHUNKS_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS stream_object_chunks (
+CREATE TABLE IF NOT EXISTS object_segments (
     bucket        TEXT NOT NULL,
     key           TEXT NOT NULL,
     version_id    INTEGER NOT NULL CHECK (version_id >= 0),
-    chunk_index   INTEGER NOT NULL,
+    segment_index INTEGER NOT NULL,
     size          INTEGER NOT NULL,
-    chunk_okh     BLOB NOT NULL,
-    chunk_vid     INTEGER NOT NULL CHECK (chunk_vid > 0),
+    segment_okh   BLOB NOT NULL,
+    segment_vid   INTEGER NOT NULL CHECK (segment_vid > 0),
     shard_pg_id   INTEGER NOT NULL,
     ec_k          INTEGER NOT NULL,
     ec_m          INTEGER NOT NULL,
-    PRIMARY KEY (bucket, key, version_id, chunk_index)
+    PRIMARY KEY (bucket, key, version_id, segment_index)
 )";
 
 /// Durable reclaim queue for simple single-shard-set payload generations.
@@ -243,26 +243,26 @@ CREATE TABLE IF NOT EXISTS multipart_reclaim_part_chunks (
 
 /// Committed chunk manifest for multipart parts.
 const CREATE_MULTIPART_PART_CHUNKS_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS multipart_part_chunks (
+CREATE TABLE IF NOT EXISTS multipart_part_segments (
     bucket        TEXT NOT NULL,
     key           TEXT NOT NULL,
     upload_id     TEXT NOT NULL,
     version_id    INTEGER NOT NULL,
     part_number   INTEGER NOT NULL,
-    chunk_index   INTEGER NOT NULL,
+    segment_index INTEGER NOT NULL,
     size          INTEGER NOT NULL,
-    chunk_okh     BLOB NOT NULL,
-    chunk_vid     INTEGER NOT NULL CHECK (chunk_vid > 0),
+    segment_okh   BLOB NOT NULL,
+    segment_vid   INTEGER NOT NULL CHECK (segment_vid > 0),
     shard_pg_id   INTEGER NOT NULL,
     ec_k          INTEGER NOT NULL,
     ec_m          INTEGER NOT NULL,
-    PRIMARY KEY (bucket, key, upload_id, part_number, chunk_index)
+    PRIMARY KEY (bucket, key, upload_id, part_number, segment_index)
 )";
 
 /// Index for reading multipart part chunks by version_id after completion.
 const CREATE_MULTIPART_PART_CHUNKS_VERSION_INDEX: &str = "\
 CREATE INDEX IF NOT EXISTS idx_mpc_version \
-ON multipart_part_chunks (bucket, key, version_id, part_number)";
+ON multipart_part_segments (bucket, key, version_id, part_number)";
 
 /// Index for list operations: bucket + key ordering.
 const CREATE_OBJECTS_LIST_INDEX: &str = "\

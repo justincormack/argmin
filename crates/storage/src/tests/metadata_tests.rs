@@ -2648,26 +2648,26 @@ fn commit_stream_put_atomic() {
     };
 
     let committed_chunks = vec![
-        StreamObjectChunkRecord {
+        ObjectSegmentRecord {
             bucket: "b".into(),
             key: "k".into(),
             version_id: VersionId::Null,
-            chunk_index: 0,
+            segment_index: 0,
             size: 4_000_000,
-            chunk_okh: [0x11; 16],
-            chunk_vid: GenerationId::new(1).unwrap(),
+            segment_okh: [0x11; 16],
+            segment_vid: GenerationId::new(1).unwrap(),
             shard_pg_id: 0,
             ec_k: 4,
             ec_m: 2,
         },
-        StreamObjectChunkRecord {
+        ObjectSegmentRecord {
             bucket: "b".into(),
             key: "k".into(),
             version_id: VersionId::Null,
-            chunk_index: 1,
+            segment_index: 1,
             size: 2_000_000,
-            chunk_okh: [0x22; 16],
-            chunk_vid: GenerationId::new(1).unwrap(),
+            segment_okh: [0x22; 16],
+            segment_vid: GenerationId::new(1).unwrap(),
             shard_pg_id: 1,
             ec_k: 4,
             ec_m: 2,
@@ -2686,14 +2686,14 @@ fn commit_stream_put_atomic() {
 
     // Committed chunks are readable
     let chunks = store
-        .get_stream_object_chunks("b", "k", VersionId::Null)
+        .get_object_segments("b", "k", VersionId::Null)
         .unwrap();
     assert_eq!(chunks.len(), 2);
-    assert_eq!(chunks[0].chunk_index, 0);
+    assert_eq!(chunks[0].segment_index, 0);
     assert_eq!(chunks[0].size, 4_000_000);
-    assert_eq!(chunks[0].chunk_okh, [0x11; 16]);
+    assert_eq!(chunks[0].segment_okh, [0x11; 16]);
     assert_eq!(chunks[0].shard_pg_id, 0);
-    assert_eq!(chunks[1].chunk_index, 1);
+    assert_eq!(chunks[1].segment_index, 1);
     assert_eq!(chunks[1].size, 2_000_000);
     assert_eq!(chunks[1].shard_pg_id, 1);
 
@@ -2734,14 +2734,14 @@ fn commit_stream_put_overwrite_unversioned() {
                 tags: None,
                 metadata_blob: None,
             },
-            &[StreamObjectChunkRecord {
+            &[ObjectSegmentRecord {
                 bucket: "b".into(),
                 key: "k".into(),
                 version_id: VersionId::Null,
-                chunk_index: 0,
+                segment_index: 0,
                 size: 100,
-                chunk_okh: [1; 16],
-                chunk_vid: GenerationId::new(1).unwrap(),
+                segment_okh: [1; 16],
+                segment_vid: GenerationId::new(1).unwrap(),
                 shard_pg_id: 0,
                 ec_k: 4,
                 ec_m: 2,
@@ -2772,14 +2772,14 @@ fn commit_stream_put_overwrite_unversioned() {
                 tags: None,
                 metadata_blob: None,
             },
-            &[StreamObjectChunkRecord {
+            &[ObjectSegmentRecord {
                 bucket: "b".into(),
                 key: "k".into(),
                 version_id: VersionId::Null,
-                chunk_index: 0,
+                segment_index: 0,
                 size: 200,
-                chunk_okh: [2; 16],
-                chunk_vid: GenerationId::new(2).unwrap(),
+                segment_okh: [2; 16],
+                segment_vid: GenerationId::new(2).unwrap(),
                 shard_pg_id: 1,
                 ec_k: 4,
                 ec_m: 2,
@@ -2793,15 +2793,15 @@ fn commit_stream_put_overwrite_unversioned() {
 
     // Chunks replaced
     let chunks = store
-        .get_stream_object_chunks("b", "k", VersionId::Null)
+        .get_object_segments("b", "k", VersionId::Null)
         .unwrap();
     assert_eq!(chunks.len(), 1);
     assert_eq!(chunks[0].size, 200);
-    assert_eq!(chunks[0].chunk_okh, [2; 16]);
+    assert_eq!(chunks[0].segment_okh, [2; 16]);
 }
 
 #[test]
-fn delete_stream_object_chunks_cleanup() {
+fn delete_object_segments_cleanup() {
     let (_dir, store) = make_pg_store();
 
     store
@@ -2826,14 +2826,14 @@ fn delete_stream_object_chunks_cleanup() {
                 tags: None,
                 metadata_blob: None,
             },
-            &[StreamObjectChunkRecord {
+            &[ObjectSegmentRecord {
                 bucket: "b".into(),
                 key: "k".into(),
                 version_id: VersionId::Null,
-                chunk_index: 0,
+                segment_index: 0,
                 size: 100,
-                chunk_okh: [1; 16],
-                chunk_vid: GenerationId::new(1).unwrap(),
+                segment_okh: [1; 16],
+                segment_vid: GenerationId::new(1).unwrap(),
                 shard_pg_id: 0,
                 ec_k: 4,
                 ec_m: 2,
@@ -2843,16 +2843,16 @@ fn delete_stream_object_chunks_cleanup() {
 
     // Delete committed chunks
     store
-        .delete_stream_object_chunks("b", "k", VersionId::Null)
+        .delete_object_segments("b", "k", VersionId::Null)
         .unwrap();
     let chunks = store
-        .get_stream_object_chunks("b", "k", VersionId::Null)
+        .get_object_segments("b", "k", VersionId::Null)
         .unwrap();
     assert!(chunks.is_empty());
 
     // Idempotent
     store
-        .delete_stream_object_chunks("b", "k", VersionId::Null)
+        .delete_object_segments("b", "k", VersionId::Null)
         .unwrap();
 }
 
@@ -2902,23 +2902,23 @@ fn commit_stream_put_rejects_non_in_progress() {
 }
 
 #[test]
-fn multipart_part_chunks_crud() {
+fn multipart_part_segments_crud() {
     let (_dir, store) = make_pg_store();
 
     // Insert part chunks directly (simulating committed state)
     let conn = store.connection();
     conn.execute(
-        "INSERT INTO multipart_part_chunks \
-         (bucket, key, upload_id, version_id, part_number, chunk_index, size, chunk_okh, \
-          chunk_vid, shard_pg_id, ec_k, ec_m) \
+        "INSERT INTO multipart_part_segments \
+         (bucket, key, upload_id, version_id, part_number, segment_index, size, segment_okh, \
+          segment_vid, shard_pg_id, ec_k, ec_m) \
          VALUES ('b', 'k', 'uid-1', 1, 1, 0, 4000000, X'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', 10, 0, 4, 2)",
         [],
     )
     .unwrap();
     conn.execute(
-        "INSERT INTO multipart_part_chunks \
-         (bucket, key, upload_id, version_id, part_number, chunk_index, size, chunk_okh, \
-          chunk_vid, shard_pg_id, ec_k, ec_m) \
+        "INSERT INTO multipart_part_segments \
+         (bucket, key, upload_id, version_id, part_number, segment_index, size, segment_okh, \
+          segment_vid, shard_pg_id, ec_k, ec_m) \
          VALUES ('b', 'k', 'uid-1', 1, 1, 1, 2000000, X'BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB', 10, 1, 4, 2)",
         [],
     )
@@ -2926,20 +2926,20 @@ fn multipart_part_chunks_crud() {
 
     // Read back
     let chunks = store
-        .get_multipart_part_chunks("b", "k", VersionId::from_u64(1), 1)
+        .get_multipart_part_segments("b", "k", VersionId::from_u64(1), 1)
         .unwrap();
     assert_eq!(chunks.len(), 2);
-    assert_eq!(chunks[0].chunk_index, 0);
+    assert_eq!(chunks[0].segment_index, 0);
     assert_eq!(chunks[0].size, 4_000_000);
-    assert_eq!(chunks[1].chunk_index, 1);
+    assert_eq!(chunks[1].segment_index, 1);
     assert_eq!(chunks[1].size, 2_000_000);
 
     // Delete
     store
-        .delete_multipart_part_chunks("b", "k", VersionId::from_u64(1))
+        .delete_multipart_part_segments("b", "k", VersionId::from_u64(1))
         .unwrap();
     let chunks = store
-        .get_multipart_part_chunks("b", "k", VersionId::from_u64(1), 1)
+        .get_multipart_part_segments("b", "k", VersionId::from_u64(1), 1)
         .unwrap();
     assert!(chunks.is_empty());
 }
@@ -2988,17 +2988,17 @@ fn commit_stream_part_replaces_prior_chunks_on_reupload() {
         })
         .unwrap();
 
-    let chunks_v1: Vec<MultipartPartChunkRecord> = (0..3)
-        .map(|i| MultipartPartChunkRecord {
+    let chunks_v1: Vec<MultipartPartSegmentRecord> = (0..3)
+        .map(|i| MultipartPartSegmentRecord {
             bucket: "b".into(),
             key: "k".into(),
             upload_id: "mpu-1".into(),
             version_id: u64::MAX,
             part_number: 1,
-            chunk_index: i,
+            segment_index: i,
             size: 1000,
-            chunk_okh: [0x11; 16],
-            chunk_vid: GenerationId::new(1).unwrap(),
+            segment_okh: [0x11; 16],
+            segment_vid: GenerationId::new(1).unwrap(),
             shard_pg_id: i,
             ec_k: 4,
             ec_m: 2,
@@ -3010,7 +3010,7 @@ fn commit_stream_part_replaces_prior_chunks_on_reupload() {
         .unwrap();
 
     let chunks = store
-        .get_multipart_part_chunks("b", "k", VersionId::from_u64(u64::MAX), 1)
+        .get_multipart_part_segments("b", "k", VersionId::from_u64(u64::MAX), 1)
         .unwrap();
     assert_eq!(chunks.len(), 3);
 
@@ -3027,16 +3027,16 @@ fn commit_stream_part_replaces_prior_chunks_on_reupload() {
         })
         .unwrap();
 
-    let chunks_v2 = vec![MultipartPartChunkRecord {
+    let chunks_v2 = vec![MultipartPartSegmentRecord {
         bucket: "b".into(),
         key: "k".into(),
         upload_id: "mpu-1".into(),
         version_id: u64::MAX,
         part_number: 1,
-        chunk_index: 0,
+        segment_index: 0,
         size: 5000,
-        chunk_okh: [0x22; 16],
-        chunk_vid: GenerationId::new(2).unwrap(),
+        segment_okh: [0x22; 16],
+        segment_vid: GenerationId::new(2).unwrap(),
         shard_pg_id: 0,
         ec_k: 4,
         ec_m: 2,
@@ -3048,11 +3048,11 @@ fn commit_stream_part_replaces_prior_chunks_on_reupload() {
 
     // Verify: only 1 chunk (stale rows deleted)
     let chunks = store
-        .get_multipart_part_chunks("b", "k", VersionId::from_u64(u64::MAX), 1)
+        .get_multipart_part_segments("b", "k", VersionId::from_u64(u64::MAX), 1)
         .unwrap();
     assert_eq!(chunks.len(), 1);
     assert_eq!(chunks[0].size, 5000);
-    assert_eq!(chunks[0].chunk_okh, [0x22; 16]);
+    assert_eq!(chunks[0].segment_okh, [0x22; 16]);
 }
 
 #[test]
@@ -3241,30 +3241,30 @@ fn commit_stream_part_zero_chunks_clears_prior() {
                 checksum: None,
             },
             &[
-                MultipartPartChunkRecord {
+                MultipartPartSegmentRecord {
                     bucket: "b".into(),
                     key: "k".into(),
                     upload_id: "mpu-zc".into(),
                     version_id: u64::MAX,
                     part_number: 1,
-                    chunk_index: 0,
+                    segment_index: 0,
                     size: 1000,
-                    chunk_okh: [0x11; 16],
-                    chunk_vid: GenerationId::new(1).unwrap(),
+                    segment_okh: [0x11; 16],
+                    segment_vid: GenerationId::new(1).unwrap(),
                     shard_pg_id: 0,
                     ec_k: 4,
                     ec_m: 2,
                 },
-                MultipartPartChunkRecord {
+                MultipartPartSegmentRecord {
                     bucket: "b".into(),
                     key: "k".into(),
                     upload_id: "mpu-zc".into(),
                     version_id: u64::MAX,
                     part_number: 1,
-                    chunk_index: 1,
+                    segment_index: 1,
                     size: 1000,
-                    chunk_okh: [0x22; 16],
-                    chunk_vid: GenerationId::new(1).unwrap(),
+                    segment_okh: [0x22; 16],
+                    segment_vid: GenerationId::new(1).unwrap(),
                     shard_pg_id: 1,
                     ec_k: 4,
                     ec_m: 2,
@@ -3275,7 +3275,7 @@ fn commit_stream_part_zero_chunks_clears_prior() {
 
     assert_eq!(
         store
-            .get_multipart_part_chunks("b", "k", VersionId::from_u64(u64::MAX), 1)
+            .get_multipart_part_segments("b", "k", VersionId::from_u64(u64::MAX), 1)
             .unwrap()
             .len(),
         2
@@ -3315,7 +3315,7 @@ fn commit_stream_part_zero_chunks_clears_prior() {
         .unwrap();
 
     let chunks = store
-        .get_multipart_part_chunks("b", "k", VersionId::from_u64(u64::MAX), 1)
+        .get_multipart_part_segments("b", "k", VersionId::from_u64(u64::MAX), 1)
         .unwrap();
     assert!(
         chunks.is_empty(),
@@ -3351,14 +3351,14 @@ fn commit_stream_put_rejects_mismatched_chunk_target() {
                 tags: None,
                 metadata_blob: None,
             },
-            &[StreamObjectChunkRecord {
+            &[ObjectSegmentRecord {
                 bucket: "WRONG".into(),
                 key: "k".into(),
                 version_id: VersionId::Null,
-                chunk_index: 0,
+                segment_index: 0,
                 size: 100,
-                chunk_okh: [1; 16],
-                chunk_vid: GenerationId::new(1).unwrap(),
+                segment_okh: [1; 16],
+                segment_vid: GenerationId::new(1).unwrap(),
                 shard_pg_id: 0,
                 ec_k: 4,
                 ec_m: 2,
@@ -3613,16 +3613,16 @@ fn commit_stream_part_rejects_mismatched_chunk_part_number() {
                 last_modified: 1000,
                 checksum: None,
             },
-            &[MultipartPartChunkRecord {
+            &[MultipartPartSegmentRecord {
                 bucket: "b".into(),
                 key: "k".into(),
                 upload_id: "mpu-cpc".into(),
                 version_id: u64::MAX,
                 part_number: 99, // wrong!
-                chunk_index: 0,
+                segment_index: 0,
                 size: 100,
-                chunk_okh: [1; 16],
-                chunk_vid: GenerationId::new(1).unwrap(),
+                segment_okh: [1; 16],
+                segment_vid: GenerationId::new(1).unwrap(),
                 shard_pg_id: 0,
                 ec_k: 4,
                 ec_m: 2,
@@ -3683,16 +3683,16 @@ fn commit_stream_part_rejects_non_staging_chunk_version_id() {
                 last_modified: 1000,
                 checksum: None,
             },
-            &[MultipartPartChunkRecord {
+            &[MultipartPartSegmentRecord {
                 bucket: "b".into(),
                 key: "k".into(),
                 upload_id: "mpu-vid".into(),
                 version_id: 42, // wrong — must be u64::MAX (staging sentinel)
                 part_number: 1,
-                chunk_index: 0,
+                segment_index: 0,
                 size: 100,
-                chunk_okh: [1; 16],
-                chunk_vid: GenerationId::new(1).unwrap(),
+                segment_okh: [1; 16],
+                segment_vid: GenerationId::new(1).unwrap(),
                 shard_pg_id: 0,
                 ec_k: 4,
                 ec_m: 2,
@@ -3715,8 +3715,8 @@ fn malformed_chunk_okh_returns_db_error() {
     // Insert a chunk with wrong-length okh directly via SQL
     let conn = store.connection();
     conn.execute(
-        "INSERT INTO stream_object_chunks \
-         (bucket, key, version_id, chunk_index, size, chunk_okh, chunk_vid, \
+        "INSERT INTO object_segments \
+         (bucket, key, version_id, segment_index, size, segment_okh, segment_vid, \
           shard_pg_id, ec_k, ec_m) \
          VALUES ('b', 'k', 0, 0, 100, X'AABB', 1, 0, 4, 2)",
         [],
@@ -3724,7 +3724,7 @@ fn malformed_chunk_okh_returns_db_error() {
     .unwrap();
 
     let err = store
-        .get_stream_object_chunks("b", "k", VersionId::Null)
+        .get_object_segments("b", "k", VersionId::Null)
         .unwrap_err();
     assert!(
         matches!(err, crate::error::MetadataError::Db { .. }),
@@ -3739,16 +3739,16 @@ fn malformed_multipart_chunk_okh_returns_db_error() {
     // Insert a multipart part chunk with wrong-length okh directly via SQL
     let conn = store.connection();
     conn.execute(
-        "INSERT INTO multipart_part_chunks \
-         (bucket, key, upload_id, version_id, part_number, chunk_index, size, chunk_okh, \
-          chunk_vid, shard_pg_id, ec_k, ec_m) \
+        "INSERT INTO multipart_part_segments \
+         (bucket, key, upload_id, version_id, part_number, segment_index, size, segment_okh, \
+          segment_vid, shard_pg_id, ec_k, ec_m) \
          VALUES ('b', 'k', 'mpu-bad', 0, 1, 0, 100, X'AABB', 1, 0, 4, 2)",
         [],
     )
     .unwrap();
 
     let err = store
-        .get_all_multipart_part_chunks_for_upload("mpu-bad")
+        .get_all_multipart_part_segments_for_upload("mpu-bad")
         .unwrap_err();
     assert!(
         matches!(err, crate::error::MetadataError::Db { .. }),

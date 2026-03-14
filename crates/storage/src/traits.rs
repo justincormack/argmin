@@ -384,7 +384,7 @@ pub trait PgMetadataStore {
     /// In a single transaction:
     /// 1. Transition session to Completing
     /// 2. Write/overwrite the object metadata row
-    /// 3. Delete any prior stream_object_chunks for this version_id
+    /// 3. Delete any prior object_segments for this version_id
     /// 4. Insert committed chunk manifest rows
     /// 5. Delete the stream_uploads + stream_upload_chunks staging rows
     /// 6. Mark session Completed (implicitly via deletion)
@@ -392,7 +392,7 @@ pub trait PgMetadataStore {
         &self,
         session_id: &str,
         obj: &CommitStreamPutReq,
-        chunks: &[StreamObjectChunkRecord],
+        chunks: &[ObjectSegmentRecord],
     ) -> Result<(), MetadataError>;
 
     /// Atomically finalize a streaming UploadPart.
@@ -406,19 +406,19 @@ pub trait PgMetadataStore {
         &self,
         session_id: &str,
         part: &MultipartPartRecord,
-        chunks: &[MultipartPartChunkRecord],
+        chunks: &[MultipartPartSegmentRecord],
     ) -> Result<(), MetadataError>;
 
     /// Read committed chunk manifest for a ChunkManifestInternal object.
-    fn get_stream_object_chunks(
+    fn get_object_segments(
         &self,
         bucket: &str,
         key: &str,
         version_id: VersionId,
-    ) -> Result<Vec<StreamObjectChunkRecord>, MetadataError>;
+    ) -> Result<Vec<ObjectSegmentRecord>, MetadataError>;
 
     /// Delete committed chunk manifest for an object version.
-    fn delete_stream_object_chunks(
+    fn delete_object_segments(
         &self,
         bucket: &str,
         key: &str,
@@ -426,16 +426,16 @@ pub trait PgMetadataStore {
     ) -> Result<(), MetadataError>;
 
     /// Read committed chunk manifest for a multipart part.
-    fn get_multipart_part_chunks(
+    fn get_multipart_part_segments(
         &self,
         bucket: &str,
         key: &str,
         version_id: VersionId,
         part_number: u32,
-    ) -> Result<Vec<MultipartPartChunkRecord>, MetadataError>;
+    ) -> Result<Vec<MultipartPartSegmentRecord>, MetadataError>;
 
     /// Delete all committed part chunks for an object version.
-    fn delete_multipart_part_chunks(
+    fn delete_multipart_part_segments(
         &self,
         bucket: &str,
         key: &str,
@@ -444,13 +444,13 @@ pub trait PgMetadataStore {
 
     /// Get all chunk records for a given upload_id (any version_id / part_number).
     /// Used during abort to collect shard refs before deletion.
-    fn get_all_multipart_part_chunks_for_upload(
+    fn get_all_multipart_part_segments_for_upload(
         &self,
         upload_id: &str,
-    ) -> Result<Vec<MultipartPartChunkRecord>, MetadataError>;
+    ) -> Result<Vec<MultipartPartSegmentRecord>, MetadataError>;
 
     /// Delete all chunk records for a given upload_id.
-    fn delete_multipart_part_chunks_by_upload_id(
+    fn delete_multipart_part_segments_by_upload_id(
         &self,
         upload_id: &str,
     ) -> Result<(), MetadataError>;

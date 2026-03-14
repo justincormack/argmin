@@ -1111,14 +1111,14 @@ pub struct StreamUploadChunkRecord {
 
 /// Committed chunk record for a normal PutObject.
 #[derive(Debug, Clone)]
-pub struct StreamObjectChunkRecord {
+pub struct ObjectSegmentRecord {
     pub bucket: BucketName,
     pub key: ObjectKey,
     pub version_id: VersionId,
-    pub chunk_index: u32,
+    pub segment_index: u32,
     pub size: u64,
-    pub chunk_okh: [u8; 16],
-    pub chunk_vid: GenerationId,
+    pub segment_okh: [u8; 16],
+    pub segment_vid: GenerationId,
     pub shard_pg_id: u32,
     pub ec_k: u8,
     pub ec_m: u8,
@@ -1126,16 +1126,16 @@ pub struct StreamObjectChunkRecord {
 
 /// Committed chunk record for a multipart part.
 #[derive(Debug, Clone)]
-pub struct MultipartPartChunkRecord {
+pub struct MultipartPartSegmentRecord {
     pub bucket: BucketName,
     pub key: ObjectKey,
     pub upload_id: UploadId,
     pub version_id: u64,
     pub part_number: u32,
-    pub chunk_index: u32,
+    pub segment_index: u32,
     pub size: u64,
-    pub chunk_okh: [u8; 16],
-    pub chunk_vid: GenerationId,
+    pub segment_okh: [u8; 16],
+    pub segment_vid: GenerationId,
     pub shard_pg_id: u32,
     pub ec_k: u8,
     pub ec_m: u8,
