@@ -266,7 +266,7 @@ Completed. The semantic design decisions above are settled.
 
 ### Phase B
 
-In progress.
+Completed.
 
 Completed slices so far:
 
@@ -292,6 +292,20 @@ Intentional non-goals of the current Phase B work:
 
 - the external coordinator ingest API is still `append_stream_chunk(...)`
 - read/write semantics are unchanged; this is a metadata convergence step only
+
+### Phase C
+
+Completed.
+
+Completed slices so far:
+
+- streaming `PutObject` staging and commit paths now write the generic segment
+  metadata model rather than an object-stream-specific chunk model
+- streaming multipart part staging and commit paths now write the generic
+  multipart part segment model
+- the remaining external coordinator ingest API still uses
+  `append_stream_chunk(...)`, but that is now just API naming rather than a
+  distinct physical payload model
 
 ### Phase D
 
@@ -368,6 +382,8 @@ Goals:
 Switch current streaming paths to write generic segments rather than a special
 segment-manifest concept.
 
+Completed.
+
 ### Phase D: Route normal `PUT` and non-streamed multipart through generic segments
 
 This is the key convergence step:
@@ -423,6 +439,19 @@ At this point:
 2. Changing S3 versioning semantics
 3. Solving full account/ownership design here
 4. Preserving compatibility with earlier experimental internal layouts
+
+## Completion
+
+This redesign plan is complete.
+
+The remaining follow-on work around:
+
+- segment-level integrity/read optimization
+- smaller-range efficient validation
+- read-path throughput tuning
+
+now belongs to [read-path-performance-optimization.md](./read-path-performance-optimization.md),
+not to this redesign/convergence plan.
 
 ## Success Criteria
 
