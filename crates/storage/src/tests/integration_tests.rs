@@ -24,7 +24,7 @@ fn shard_and_metadata_roundtrip() {
         size: shard_data.len() as u64,
         etag: ObjectEtag::single_part(ack.crc64),
         ec: EcShape { k: 4, m: 2 },
-        layout: ObjectLayout::SegmentManifest,
+        layout: ObjectLayout::Standard,
         tags: None,
         metadata_blob: None,
     });
@@ -123,7 +123,7 @@ fn full_lifecycle() {
         size: data.len() as u64,
         etag: ObjectEtag::single_part(ack.crc64),
         ec: EcShape { k: 4, m: 2 },
-        layout: ObjectLayout::SegmentManifest,
+        layout: ObjectLayout::Standard,
         tags: None,
         metadata_blob: None,
     }))
@@ -174,7 +174,7 @@ fn pg_store_persistence() {
                 size: data.len() as u64,
                 etag: ObjectEtag::SinglePart([1, 0, 0, 0, 0, 0, 0, 0]),
                 ec: EcShape { k: 4, m: 2 },
-                layout: ObjectLayout::SegmentManifest,
+                layout: ObjectLayout::Standard,
                 tags: None,
                 metadata_blob: None,
             }))

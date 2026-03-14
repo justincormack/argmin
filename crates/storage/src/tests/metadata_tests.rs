@@ -11,7 +11,7 @@ fn metadata_put_get_delete(store: &dyn PgMetadataStore) {
         ec: EcShape { k: 4, m: 2 },
         size: 1024,
         etag: ObjectEtag::SinglePart([0xAB, 0xCD, 0, 0, 0, 0, 0, 0]),
-        layout: ObjectLayout::SegmentManifest,
+        layout: ObjectLayout::Standard,
         tags: None,
         metadata_blob: None,
     });
@@ -54,7 +54,7 @@ fn metadata_put_overwrites(store: &dyn PgMetadataStore) {
         ec: EcShape { k: 4, m: 2 },
         size: 100,
         etag: ObjectEtag::SinglePart([1, 0, 0, 0, 0, 0, 0, 0]),
-        layout: ObjectLayout::SegmentManifest,
+        layout: ObjectLayout::Standard,
         tags: None,
         metadata_blob: None,
     });
@@ -68,7 +68,7 @@ fn metadata_put_overwrites(store: &dyn PgMetadataStore) {
         ec: EcShape { k: 4, m: 2 },
         size: 200,
         etag: ObjectEtag::SinglePart([2, 0, 0, 0, 0, 0, 0, 0]),
-        layout: ObjectLayout::SegmentManifest,
+        layout: ObjectLayout::Standard,
         tags: None,
         metadata_blob: None,
     });
@@ -95,7 +95,7 @@ fn metadata_list_basic(store: &dyn PgMetadataStore) {
             size: i * 100,
             etag: ObjectEtag::SinglePart([i as u8, 0, 0, 0, 0, 0, 0, 0]),
             ec: EcShape { k: 4, m: 2 },
-            layout: ObjectLayout::SegmentManifest,
+            layout: ObjectLayout::Standard,
             tags: None,
             metadata_blob: None,
         });
@@ -129,7 +129,7 @@ fn metadata_list_with_prefix(store: &dyn PgMetadataStore) {
             ec: EcShape { k: 4, m: 2 },
             size: 100,
             etag: ObjectEtag::SinglePart([0; 8]),
-            layout: ObjectLayout::SegmentManifest,
+            layout: ObjectLayout::Standard,
             tags: None,
             metadata_blob: None,
         });
@@ -159,7 +159,7 @@ fn metadata_list_pagination(store: &dyn PgMetadataStore) {
             size: 0,
             etag: ObjectEtag::SinglePart([0; 8]),
             ec: EcShape { k: 4, m: 2 },
-            layout: ObjectLayout::SegmentManifest,
+            layout: ObjectLayout::Standard,
             tags: None,
             metadata_blob: None,
         });
@@ -250,7 +250,7 @@ fn metadata_empty_key(store: &dyn PgMetadataStore) {
         ec: EcShape { k: 4, m: 2 },
         size: 0,
         etag: ObjectEtag::SinglePart([0; 8]),
-        layout: ObjectLayout::SegmentManifest,
+        layout: ObjectLayout::Standard,
         tags: None,
         metadata_blob: None,
     });
@@ -271,7 +271,7 @@ fn metadata_long_key(store: &dyn PgMetadataStore) {
         ec: EcShape { k: 4, m: 2 },
         size: 0,
         etag: ObjectEtag::SinglePart([0; 8]),
-        layout: ObjectLayout::SegmentManifest,
+        layout: ObjectLayout::Standard,
         tags: None,
         metadata_blob: None,
     });
@@ -290,7 +290,7 @@ fn metadata_zero_size_object(store: &dyn PgMetadataStore) {
         ec: EcShape { k: 4, m: 2 },
         size: 0,
         etag: ObjectEtag::SinglePart([0; 8]),
-        layout: ObjectLayout::SegmentManifest,
+        layout: ObjectLayout::Standard,
         tags: None,
         metadata_blob: None,
     });
@@ -595,7 +595,7 @@ fn file_metadata_object_has_inline_legacy_layout() {
             ec: EcShape { k: 4, m: 2 },
             size: 100,
             etag: ObjectEtag::SinglePart([1, 2, 3, 0, 0, 0, 0, 0]),
-            layout: ObjectLayout::SegmentManifest,
+            layout: ObjectLayout::Standard,
             tags: None,
             metadata_blob: None,
         }))
@@ -603,7 +603,7 @@ fn file_metadata_object_has_inline_legacy_layout() {
 
     let obj = store.get_object_meta("b", "k").unwrap();
     let live = obj.as_live().unwrap();
-    assert_eq!(live.layout, ObjectLayout::SegmentManifest);
+    assert_eq!(live.layout, ObjectLayout::Standard);
     assert_eq!(live.metadata_blob, None);
 }
 
@@ -621,7 +621,7 @@ fn file_metadata_invalid_data_layout_returns_error() {
             ec: EcShape { k: 4, m: 2 },
             size: 100,
             etag: ObjectEtag::SinglePart([1, 2, 3, 0, 0, 0, 0, 0]),
-            layout: ObjectLayout::SegmentManifest,
+            layout: ObjectLayout::Standard,
             tags: None,
             metadata_blob: None,
         }))
@@ -642,7 +642,7 @@ fn file_metadata_invalid_data_layout_returns_error() {
 
     // Record remains readable and unchanged.
     let obj = store.get_object_meta("b", "k").unwrap();
-    assert_eq!(obj.as_live().unwrap().layout, ObjectLayout::SegmentManifest);
+    assert_eq!(obj.as_live().unwrap().layout, ObjectLayout::Standard);
 }
 
 // --- Multipart metadata tests (PgStore only — needs SQL) ---
@@ -2328,7 +2328,7 @@ mod prop_tests {
                 ec: EcShape { k: 4, m: 2 },
                 size: 0,
                 etag: ObjectEtag::SinglePart([0; 8]),
-                layout: ObjectLayout::SegmentManifest,
+                layout: ObjectLayout::Standard,
                 tags: None,
                 metadata_blob: None,
             });
@@ -2682,7 +2682,7 @@ fn commit_stream_put_atomic() {
     let record = store.get_object_meta("b", "k").unwrap();
     let live = record.as_live().unwrap();
     assert_eq!(live.size, 6_000_000);
-    assert_eq!(live.layout, ObjectLayout::SegmentManifest);
+    assert_eq!(live.layout, ObjectLayout::Standard);
 
     // Committed chunks are readable
     let chunks = store
@@ -2801,11 +2801,11 @@ fn commit_stream_put_overwrite_unversioned() {
 }
 
 #[test]
-fn put_segment_object_persists_manifest() {
+fn put_object_with_segments_persists_manifest() {
     let (_dir, store) = make_pg_store();
 
     store
-        .put_segment_object(
+        .put_object_with_segments(
             &PutLiveObjectReq {
                 bucket: "b".into(),
                 key: "k".into(),
@@ -2814,7 +2814,7 @@ fn put_segment_object_persists_manifest() {
                 size: 6_000_000,
                 etag: ObjectEtag::single_part(1),
                 ec: EcShape { k: 4, m: 2 },
-                layout: ObjectLayout::SegmentManifest,
+                layout: ObjectLayout::Standard,
                 tags: None,
                 metadata_blob: None,
             },
@@ -2850,7 +2850,7 @@ fn put_segment_object_persists_manifest() {
     let record = store.get_object_meta("b", "k").unwrap();
     let live = record.as_live().unwrap();
     assert_eq!(live.size, 6_000_000);
-    assert_eq!(live.layout, ObjectLayout::SegmentManifest);
+    assert_eq!(live.layout, ObjectLayout::Standard);
 
     let segments = store
         .get_object_segments("b", "k", VersionId::Null)
@@ -2861,11 +2861,11 @@ fn put_segment_object_persists_manifest() {
 }
 
 #[test]
-fn put_segment_object_overwrite_unversioned_replaces_manifest() {
+fn put_object_with_segments_overwrite_unversioned_replaces_manifest() {
     let (_dir, store) = make_pg_store();
 
     store
-        .put_segment_object(
+        .put_object_with_segments(
             &PutLiveObjectReq {
                 bucket: "b".into(),
                 key: "k".into(),
@@ -2874,7 +2874,7 @@ fn put_segment_object_overwrite_unversioned_replaces_manifest() {
                 size: 100,
                 etag: ObjectEtag::single_part(1),
                 ec: EcShape { k: 4, m: 2 },
-                layout: ObjectLayout::SegmentManifest,
+                layout: ObjectLayout::Standard,
                 tags: None,
                 metadata_blob: None,
             },
@@ -2894,7 +2894,7 @@ fn put_segment_object_overwrite_unversioned_replaces_manifest() {
         .unwrap();
 
     store
-        .put_segment_object(
+        .put_object_with_segments(
             &PutLiveObjectReq {
                 bucket: "b".into(),
                 key: "k".into(),
@@ -2903,7 +2903,7 @@ fn put_segment_object_overwrite_unversioned_replaces_manifest() {
                 size: 200,
                 etag: ObjectEtag::single_part(2),
                 ec: EcShape { k: 4, m: 2 },
-                layout: ObjectLayout::SegmentManifest,
+                layout: ObjectLayout::Standard,
                 tags: None,
                 metadata_blob: None,
             },
@@ -3038,7 +3038,7 @@ fn commit_stream_put_rejects_non_in_progress() {
 fn multipart_part_segments_crud() {
     let (_dir, store) = make_pg_store();
 
-    // Insert part chunks directly (simulating committed state)
+    // Insert part segments directly (simulating committed state)
     let conn = store.connection();
     conn.execute(
         "INSERT INTO multipart_part_segments \
@@ -3580,64 +3580,64 @@ fn commit_stream_put_rejects_mismatched_chunk_target() {
 }
 
 #[test]
-fn segment_manifest_reclaim_round_trip() {
+fn object_segments_reclaim_round_trip() {
     let (_dir, store) = make_pg_store();
 
     let generation_id = GenerationId::new(7).unwrap();
-    let reclaim = SegmentManifestReclaimRecord {
+    let reclaim = ObjectSegmentsReclaimRecord {
         bucket: "b".into(),
         key: "k".into(),
         generation_id,
         created_at: 1234,
-        chunks: vec![
-            SegmentManifestReclaimSegmentRecord {
-                chunk_index: 0,
-                chunk_okh: [0x11; 16],
-                chunk_vid: GenerationId::new(11).unwrap(),
+        segments: vec![
+            ObjectSegmentsReclaimSegmentRecord {
+                segment_index: 0,
+                segment_okh: [0x11; 16],
+                segment_vid: GenerationId::new(11).unwrap(),
                 shard_pg_id: 1,
                 ec: EcShape { k: 4, m: 2 },
             },
-            SegmentManifestReclaimSegmentRecord {
-                chunk_index: 1,
-                chunk_okh: [0x22; 16],
-                chunk_vid: GenerationId::new(12).unwrap(),
+            ObjectSegmentsReclaimSegmentRecord {
+                segment_index: 1,
+                segment_okh: [0x22; 16],
+                segment_vid: GenerationId::new(12).unwrap(),
                 shard_pg_id: 2,
                 ec: EcShape { k: 6, m: 3 },
             },
         ],
     };
 
-    store.put_segment_manifest_reclaim(&reclaim).unwrap();
+    store.put_object_segments_reclaim(&reclaim).unwrap();
 
     let got = store
-        .get_segment_manifest_reclaim("b", "k", generation_id)
+        .get_object_segments_reclaim("b", "k", generation_id)
         .unwrap()
-        .expect("segment manifest reclaim should exist");
+        .expect("object segments reclaim should exist");
     assert_eq!(got, reclaim);
 
     store
-        .delete_segment_manifest_reclaim("b", "k", generation_id)
+        .delete_object_segments_reclaim("b", "k", generation_id)
         .unwrap();
     assert!(store
-        .get_segment_manifest_reclaim("b", "k", generation_id)
+        .get_object_segments_reclaim("b", "k", generation_id)
         .unwrap()
         .is_none());
 }
 
 #[test]
-fn next_generation_id_skips_segment_manifest_reclaim_generation() {
+fn next_generation_id_skips_object_segments_reclaim_generation() {
     let (_dir, store) = make_pg_store();
 
     store
-        .put_segment_manifest_reclaim(&SegmentManifestReclaimRecord {
+        .put_object_segments_reclaim(&ObjectSegmentsReclaimRecord {
             bucket: "b".into(),
             key: "k".into(),
             generation_id: GenerationId::new(7).unwrap(),
             created_at: 1,
-            chunks: vec![SegmentManifestReclaimSegmentRecord {
-                chunk_index: 0,
-                chunk_okh: [0x33; 16],
-                chunk_vid: GenerationId::new(13).unwrap(),
+            segments: vec![ObjectSegmentsReclaimSegmentRecord {
+                segment_index: 0,
+                segment_okh: [0x33; 16],
+                segment_vid: GenerationId::new(13).unwrap(),
                 shard_pg_id: 0,
                 ec: EcShape { k: 4, m: 2 },
             }],
@@ -3668,22 +3668,22 @@ fn multipart_reclaim_round_trip() {
                 shard_pg_id: 3,
                 ec: EcShape { k: 4, m: 2 },
             },
-            MultipartReclaimPartRecord::SegmentManifest {
+            MultipartReclaimPartRecord::Segments {
                 part_number: 2,
-                chunks: vec![
-                    MultipartReclaimPartChunkRecord {
+                segments: vec![
+                    MultipartReclaimPartSegmentRecord {
                         part_number: 2,
-                        chunk_index: 0,
-                        chunk_okh: [0x55; 16],
-                        chunk_vid: GenerationId::new(22).unwrap(),
+                        segment_index: 0,
+                        segment_okh: [0x55; 16],
+                        segment_vid: GenerationId::new(22).unwrap(),
                         shard_pg_id: 4,
                         ec: EcShape { k: 6, m: 3 },
                     },
-                    MultipartReclaimPartChunkRecord {
+                    MultipartReclaimPartSegmentRecord {
                         part_number: 2,
-                        chunk_index: 1,
-                        chunk_okh: [0x66; 16],
-                        chunk_vid: GenerationId::new(23).unwrap(),
+                        segment_index: 1,
+                        segment_okh: [0x66; 16],
+                        segment_vid: GenerationId::new(23).unwrap(),
                         shard_pg_id: 5,
                         ec: EcShape { k: 5, m: 2 },
                     },
@@ -3914,7 +3914,7 @@ fn commit_stream_part_rejects_non_staging_chunk_version_id() {
 }
 
 #[test]
-fn malformed_chunk_okh_returns_db_error() {
+fn malformed_segment_okh_returns_db_error() {
     let (_dir, store) = make_pg_store();
 
     // Insert a chunk with wrong-length okh directly via SQL
@@ -3938,10 +3938,10 @@ fn malformed_chunk_okh_returns_db_error() {
 }
 
 #[test]
-fn malformed_multipart_chunk_okh_returns_db_error() {
+fn malformed_multipart_segment_okh_returns_db_error() {
     let (_dir, store) = make_pg_store();
 
-    // Insert a multipart part chunk with wrong-length okh directly via SQL
+    // Insert a multipart part segment with wrong-length okh directly via SQL
     let conn = store.connection();
     conn.execute(
         "INSERT INTO multipart_part_segments \
@@ -3957,6 +3957,6 @@ fn malformed_multipart_chunk_okh_returns_db_error() {
         .unwrap_err();
     assert!(
         matches!(err, crate::error::MetadataError::Db { .. }),
-        "expected Db error for malformed multipart chunk okh, got: {err:?}"
+        "expected Db error for malformed multipart segment okh, got: {err:?}"
     );
 }

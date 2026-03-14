@@ -196,22 +196,22 @@ pub trait PgMetadataStore {
         generation_id: GenerationId,
     ) -> Result<(), MetadataError>;
 
-    /// Insert a durable reclaim record for a segment-manifest payload.
-    fn put_segment_manifest_reclaim(
+    /// Insert a durable reclaim record for a standard segmented payload.
+    fn put_object_segments_reclaim(
         &self,
-        reclaim: &SegmentManifestReclaimRecord,
+        reclaim: &ObjectSegmentsReclaimRecord,
     ) -> Result<(), MetadataError>;
 
-    /// Look up a durable reclaim record for a segment-manifest payload generation.
-    fn get_segment_manifest_reclaim(
+    /// Look up a durable reclaim record for a standard segmented payload generation.
+    fn get_object_segments_reclaim(
         &self,
         bucket: &str,
         key: &str,
         generation_id: GenerationId,
-    ) -> Result<Option<SegmentManifestReclaimRecord>, MetadataError>;
+    ) -> Result<Option<ObjectSegmentsReclaimRecord>, MetadataError>;
 
-    /// Delete a durable reclaim record for a segment-manifest payload generation.
-    fn delete_segment_manifest_reclaim(
+    /// Delete a durable reclaim record for a standard segmented payload generation.
+    fn delete_object_segments_reclaim(
         &self,
         bucket: &str,
         key: &str,
@@ -398,7 +398,7 @@ pub trait PgMetadataStore {
     /// 1. Transition session to Completing
     /// 2. Write/overwrite the object metadata row
     /// 3. Delete any prior object_segments for this version_id
-    /// 4. Insert committed segment manifest rows
+    /// 4. Insert committed object segment rows
     /// 5. Delete the stream_uploads + stream_upload_segments staging rows
     /// 6. Mark session Completed (implicitly via deletion)
     fn commit_stream_put(
@@ -408,13 +408,13 @@ pub trait PgMetadataStore {
         chunks: &[ObjectSegmentRecord],
     ) -> Result<(), MetadataError>;
 
-    /// Atomically write or replace a live segment-manifest object.
+    /// Atomically write or replace a live standard segmented object.
     ///
     /// In a single transaction:
     /// 1. Write/overwrite the object metadata row
     /// 2. Delete any prior object_segments for this version_id
-    /// 3. Insert committed segment manifest rows
-    fn put_segment_object(
+    /// 3. Insert committed object segment rows
+    fn put_object_with_segments(
         &self,
         obj: &PutLiveObjectReq,
         segments: &[ObjectSegmentRecord],
@@ -425,7 +425,7 @@ pub trait PgMetadataStore {
     /// In a single transaction:
     /// 1. Transition session to Completing
     /// 2. Upsert multipart part metadata
-    /// 3. Insert committed part segment manifest rows
+    /// 3. Insert committed multipart part segment rows
     /// 4. Delete the stream_uploads + stream_upload_segments staging rows
     fn commit_stream_part(
         &self,
@@ -434,7 +434,7 @@ pub trait PgMetadataStore {
         chunks: &[MultipartPartSegmentRecord],
     ) -> Result<(), MetadataError>;
 
-    /// Read committed segment manifest for a SegmentManifestInternal object.
+    /// Read committed segments for a StandardInternal object.
     fn get_object_segments(
         &self,
         bucket: &str,
@@ -442,7 +442,7 @@ pub trait PgMetadataStore {
         version_id: VersionId,
     ) -> Result<Vec<ObjectSegmentRecord>, MetadataError>;
 
-    /// Delete committed segment manifest for an object version.
+    /// Delete committed segments for an object version.
     fn delete_object_segments(
         &self,
         bucket: &str,
@@ -450,7 +450,7 @@ pub trait PgMetadataStore {
         version_id: VersionId,
     ) -> Result<(), MetadataError>;
 
-    /// Read committed segment manifest for a multipart part.
+    /// Read committed segments for a multipart part.
     fn get_multipart_part_segments(
         &self,
         bucket: &str,
@@ -459,7 +459,7 @@ pub trait PgMetadataStore {
         part_number: u32,
     ) -> Result<Vec<MultipartPartSegmentRecord>, MetadataError>;
 
-    /// Delete all committed part chunks for an object version.
+    /// Delete all committed part segments for an object version.
     fn delete_multipart_part_segments(
         &self,
         bucket: &str,

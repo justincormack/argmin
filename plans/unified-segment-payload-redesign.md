@@ -286,7 +286,7 @@ Completed slices so far:
 - storage staging methods are now `append_stream_segment` and
   `list_stream_segments`
 - internal object layout, reclaim, and read-side naming now use
-  `SegmentManifest` instead of `ChunkManifest`
+  standard segmented naming instead of `ChunkManifest`
 
 Intentional non-goals of the current Phase B work:
 
@@ -302,12 +302,12 @@ Completed slices so far:
 - normal buffered `PutObject` writes now split into fixed `4 MiB` internal
   segments
 - buffered `CopyObject` destinations now commit through the same
-  segment-manifest path
-- newly committed buffered segment-manifest objects persist explicit
+  object-segment path
+- newly committed buffered standard-layout objects persist explicit
   `object_segments` rows instead of relying on the old implicit direct-shard-set
   path
-- unversioned buffered overwrites now enqueue reclaim for the old segment
-  manifest without deleting the newly committed rows
+- unversioned buffered overwrites now enqueue reclaim for the old object
+  segments without deleting the newly committed rows
 - non-streamed multipart `UploadPart` writes now split into fixed `4 MiB`
   internal segments
 - buffered multipart parts now persist staged `multipart_part_segments` rows and
@@ -317,9 +317,9 @@ Completed slices so far:
 Specifically:
 
 1. choose a fixed segment size
-2. treat current segment-manifest work as the prototype for the generic segment
+2. treat current segmented-write work as the prototype for the generic segment
    manifest model
-3. stop treating `SegmentManifest` as a special upload-mode layout over time
+3. stop treating segmented writes as a special upload-mode layout over time
 4. unify integrity, read, reclaim, and slow-writer behavior around segments
 5. adopt the new metadata/layout model directly, without carrying compatibility
    baggage for earlier experimental internal layouts
@@ -387,20 +387,33 @@ Completed slices so far:
 - non-multipart `GetObject`, `GetObjectRange`, and `GetObjectPart` no longer
   fall back to the legacy direct shard-set reader path
 - non-multipart `CopyObject` and `UploadPartCopy` source reads now consume the
-  committed object segment manifest unconditionally
+  committed object segments unconditionally
 - multipart `GetObject`, `GetObjectRange`, `GetObjectPart`, `CopyObject`, and
   `UploadPartCopy` now consume snapshotted multipart part segment manifests
   only; the coordinator no longer keeps a direct-part shard reader path
-- zero-byte objects and parts are treated as empty segment manifests rather than
+- zero-byte objects and parts are treated as empty object segments rather than
   a separate direct-shard layout
 - overwrite/delete stale-payload tracking no longer produces
   `StaleObjectPayload::Simple` for current writes
 
 ### Phase F: Retire the special-case segment-manifest model
 
-At that point:
+Completed.
 
-- `SegmentManifest` should no longer be a first-class permanent object-layout split
+Completed slices so far:
+
+- active storage/core code no longer uses `SegmentManifest` naming for the
+  standard segmented object path
+- object layout and data-layout naming now converge on `Standard` /
+  `StandardInternal`
+- durable reclaim records and multipart reclaim segment rows now use segment
+  terminology rather than chunk/manifest-specific names
+- read-handle and coordinator helper naming now reflect the generic segmented
+  path rather than a special-case segment-manifest path
+
+At this point:
+
+- the standard segmented layout should no longer be a first-class permanent object-layout split
 - it becomes an implementation detail of the generic segment model, or disappears
 - older experimental layouts can be removed outright rather than preserved
 

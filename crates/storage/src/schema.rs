@@ -133,7 +133,7 @@ CREATE TABLE IF NOT EXISTS stream_upload_segments (
     FOREIGN KEY (session_id) REFERENCES stream_uploads(session_id) ON DELETE CASCADE
 )";
 
-/// Committed segment manifest for normal PutObject.
+/// Committed object segments for normal PutObject.
 const CREATE_STREAM_OBJECT_CHUNKS_TABLE: &str = "\
 CREATE TABLE IF NOT EXISTS object_segments (
     bucket        TEXT NOT NULL,
@@ -161,9 +161,9 @@ CREATE TABLE IF NOT EXISTS simple_payload_reclaims (
     PRIMARY KEY (bucket, key, generation_id)
 )";
 
-/// Durable reclaim queue for segment-manifest payload generations.
+/// Durable reclaim queue for standard segmented payload generations.
 const CREATE_CHUNK_MANIFEST_RECLAIMS_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS segment_manifest_reclaims (
+CREATE TABLE IF NOT EXISTS object_segments_reclaims (
     bucket        TEXT NOT NULL,
     key           TEXT NOT NULL,
     generation_id INTEGER NOT NULL CHECK (generation_id > 0),
@@ -171,21 +171,21 @@ CREATE TABLE IF NOT EXISTS segment_manifest_reclaims (
     PRIMARY KEY (bucket, key, generation_id)
 )";
 
-/// Child chunk rows for segment-manifest reclaim generations.
+/// Child segment rows for standard segmented reclaim generations.
 const CREATE_CHUNK_MANIFEST_RECLAIM_CHUNKS_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS segment_manifest_reclaim_segments (
+CREATE TABLE IF NOT EXISTS object_segment_reclaim_segments (
     bucket        TEXT NOT NULL,
     key           TEXT NOT NULL,
     generation_id INTEGER NOT NULL CHECK (generation_id > 0),
-    chunk_index   INTEGER NOT NULL,
-    chunk_okh     BLOB NOT NULL,
-    chunk_vid     INTEGER NOT NULL CHECK (chunk_vid > 0),
+    segment_index   INTEGER NOT NULL,
+    segment_okh     BLOB NOT NULL,
+    segment_vid     INTEGER NOT NULL CHECK (segment_vid > 0),
     shard_pg_id   INTEGER NOT NULL,
     ec_k          INTEGER NOT NULL,
     ec_m          INTEGER NOT NULL,
-    PRIMARY KEY (bucket, key, generation_id, chunk_index),
+    PRIMARY KEY (bucket, key, generation_id, segment_index),
     FOREIGN KEY (bucket, key, generation_id)
-        REFERENCES segment_manifest_reclaims(bucket, key, generation_id)
+        REFERENCES object_segments_reclaims(bucket, key, generation_id)
         ON DELETE CASCADE
 )";
 
@@ -222,26 +222,26 @@ CREATE TABLE IF NOT EXISTS multipart_reclaim_parts (
     )
 )";
 
-/// Child chunk rows for streamed multipart part reclaim generations.
+/// Child segment rows for streamed multipart part reclaim generations.
 const CREATE_MULTIPART_RECLAIM_PART_CHUNKS_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS multipart_reclaim_part_chunks (
+CREATE TABLE IF NOT EXISTS multipart_reclaim_part_segments (
     bucket        TEXT NOT NULL,
     key           TEXT NOT NULL,
     generation_id INTEGER NOT NULL CHECK (generation_id > 0),
     part_number   INTEGER NOT NULL,
-    chunk_index   INTEGER NOT NULL,
-    chunk_okh     BLOB NOT NULL,
-    chunk_vid     INTEGER NOT NULL CHECK (chunk_vid > 0),
+    segment_index   INTEGER NOT NULL,
+    segment_okh     BLOB NOT NULL,
+    segment_vid     INTEGER NOT NULL CHECK (segment_vid > 0),
     shard_pg_id   INTEGER NOT NULL,
     ec_k          INTEGER NOT NULL,
     ec_m          INTEGER NOT NULL,
-    PRIMARY KEY (bucket, key, generation_id, part_number, chunk_index),
+    PRIMARY KEY (bucket, key, generation_id, part_number, segment_index),
     FOREIGN KEY (bucket, key, generation_id, part_number)
         REFERENCES multipart_reclaim_parts(bucket, key, generation_id, part_number)
         ON DELETE CASCADE
 )";
 
-/// Committed segment manifest for multipart parts.
+/// Committed multipart part segments.
 const CREATE_MULTIPART_PART_CHUNKS_TABLE: &str = "\
 CREATE TABLE IF NOT EXISTS multipart_part_segments (
     bucket        TEXT NOT NULL,
@@ -259,7 +259,7 @@ CREATE TABLE IF NOT EXISTS multipart_part_segments (
     PRIMARY KEY (bucket, key, upload_id, part_number, segment_index)
 )";
 
-/// Index for reading multipart part chunks by version_id after completion.
+/// Index for reading multipart part segments by version_id after completion.
 const CREATE_MULTIPART_PART_CHUNKS_VERSION_INDEX: &str = "\
 CREATE INDEX IF NOT EXISTS idx_mpc_version \
 ON multipart_part_segments (bucket, key, version_id, part_number)";
