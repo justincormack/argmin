@@ -118,18 +118,18 @@ CREATE TABLE IF NOT EXISTS stream_uploads (
     )
 )";
 
-/// Staging chunk records for in-progress streaming sessions.
-const CREATE_STREAM_UPLOAD_CHUNKS_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS stream_upload_chunks (
+/// Staging segment records for in-progress streaming sessions.
+const CREATE_STREAM_UPLOAD_SEGMENTS_TABLE: &str = "\
+CREATE TABLE IF NOT EXISTS stream_upload_segments (
     session_id    TEXT NOT NULL,
-    chunk_index   INTEGER NOT NULL,
+    segment_index INTEGER NOT NULL,
     size          INTEGER NOT NULL,
-    chunk_okh     BLOB NOT NULL,
-    chunk_vid     INTEGER NOT NULL CHECK (chunk_vid > 0),
+    segment_okh   BLOB NOT NULL,
+    segment_vid   INTEGER NOT NULL CHECK (segment_vid > 0),
     shard_pg_id   INTEGER NOT NULL,
     ec_k          INTEGER NOT NULL,
     ec_m          INTEGER NOT NULL,
-    PRIMARY KEY (session_id, chunk_index),
+    PRIMARY KEY (session_id, segment_index),
     FOREIGN KEY (session_id) REFERENCES stream_uploads(session_id) ON DELETE CASCADE
 )";
 
@@ -315,7 +315,7 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(CREATE_MULTIPART_PARTS_TABLE, [])?;
     conn.execute(CREATE_OBJECT_PARTS_TABLE, [])?;
     conn.execute(CREATE_STREAM_UPLOADS_TABLE, [])?;
-    conn.execute(CREATE_STREAM_UPLOAD_CHUNKS_TABLE, [])?;
+    conn.execute(CREATE_STREAM_UPLOAD_SEGMENTS_TABLE, [])?;
     conn.execute(CREATE_STREAM_OBJECT_CHUNKS_TABLE, [])?;
     conn.execute(CREATE_SIMPLE_PAYLOAD_RECLAIMS_TABLE, [])?;
     conn.execute(CREATE_CHUNK_MANIFEST_RECLAIMS_TABLE, [])?;

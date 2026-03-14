@@ -2522,7 +2522,7 @@ fn stream_upload_upload_part_kind() {
 }
 
 #[test]
-fn stream_chunk_append_and_list() {
+fn stream_segment_append_and_list() {
     let (_dir, store) = make_pg_store();
 
     store
@@ -2536,12 +2536,12 @@ fn stream_chunk_append_and_list() {
 
     for i in 0..3u32 {
         store
-            .append_stream_chunk(&StreamUploadChunkRecord {
+            .append_stream_segment(&StreamUploadSegmentRecord {
                 session_id: "sess-chunks".into(),
-                chunk_index: i,
+                segment_index: i,
                 size: (i as u64 + 1) * 1000,
-                chunk_okh: [i as u8; 16],
-                chunk_vid: GenerationId::new(42).unwrap(),
+                segment_okh: [i as u8; 16],
+                segment_vid: GenerationId::new(42).unwrap(),
                 shard_pg_id: i,
                 ec_k: 4,
                 ec_m: 2,
@@ -2549,20 +2549,20 @@ fn stream_chunk_append_and_list() {
             .unwrap();
     }
 
-    let chunks = store.list_stream_chunks("sess-chunks").unwrap();
-    assert_eq!(chunks.len(), 3);
-    assert_eq!(chunks[0].chunk_index, 0);
-    assert_eq!(chunks[0].size, 1000);
-    assert_eq!(chunks[1].chunk_index, 1);
-    assert_eq!(chunks[1].size, 2000);
-    assert_eq!(chunks[2].chunk_index, 2);
-    assert_eq!(chunks[2].size, 3000);
-    assert_eq!(chunks[0].chunk_okh, [0u8; 16]);
-    assert_eq!(chunks[2].shard_pg_id, 2);
+    let segments = store.list_stream_segments("sess-chunks").unwrap();
+    assert_eq!(segments.len(), 3);
+    assert_eq!(segments[0].segment_index, 0);
+    assert_eq!(segments[0].size, 1000);
+    assert_eq!(segments[1].segment_index, 1);
+    assert_eq!(segments[1].size, 2000);
+    assert_eq!(segments[2].segment_index, 2);
+    assert_eq!(segments[2].size, 3000);
+    assert_eq!(segments[0].segment_okh, [0u8; 16]);
+    assert_eq!(segments[2].shard_pg_id, 2);
 }
 
 #[test]
-fn stream_chunk_cascade_delete() {
+fn stream_segment_cascade_delete() {
     let (_dir, store) = make_pg_store();
 
     store
@@ -2575,12 +2575,12 @@ fn stream_chunk_cascade_delete() {
         .unwrap();
 
     store
-        .append_stream_chunk(&StreamUploadChunkRecord {
+        .append_stream_segment(&StreamUploadSegmentRecord {
             session_id: "sess-cascade".into(),
-            chunk_index: 0,
+            segment_index: 0,
             size: 4096,
-            chunk_okh: [0xAA; 16],
-            chunk_vid: GenerationId::new(1).unwrap(),
+            segment_okh: [0xAA; 16],
+            segment_vid: GenerationId::new(1).unwrap(),
             shard_pg_id: 0,
             ec_k: 4,
             ec_m: 2,
@@ -2590,8 +2590,8 @@ fn stream_chunk_cascade_delete() {
     // Deleting session cascades to chunks
     store.delete_stream_upload("sess-cascade").unwrap();
 
-    let chunks = store.list_stream_chunks("sess-cascade").unwrap();
-    assert!(chunks.is_empty());
+    let segments = store.list_stream_segments("sess-cascade").unwrap();
+    assert!(segments.is_empty());
 }
 
 #[test]
@@ -2609,12 +2609,12 @@ fn commit_stream_put_atomic() {
         .unwrap();
 
     store
-        .append_stream_chunk(&StreamUploadChunkRecord {
+        .append_stream_segment(&StreamUploadSegmentRecord {
             session_id: "sess-commit".into(),
-            chunk_index: 0,
+            segment_index: 0,
             size: 4_000_000,
-            chunk_okh: [0x11; 16],
-            chunk_vid: GenerationId::new(1).unwrap(),
+            segment_okh: [0x11; 16],
+            segment_vid: GenerationId::new(1).unwrap(),
             shard_pg_id: 0,
             ec_k: 4,
             ec_m: 2,
@@ -2622,12 +2622,12 @@ fn commit_stream_put_atomic() {
         .unwrap();
 
     store
-        .append_stream_chunk(&StreamUploadChunkRecord {
+        .append_stream_segment(&StreamUploadSegmentRecord {
             session_id: "sess-commit".into(),
-            chunk_index: 1,
+            segment_index: 1,
             size: 2_000_000,
-            chunk_okh: [0x22; 16],
-            chunk_vid: GenerationId::new(1).unwrap(),
+            segment_okh: [0x22; 16],
+            segment_vid: GenerationId::new(1).unwrap(),
             shard_pg_id: 1,
             ec_k: 4,
             ec_m: 2,
@@ -2703,7 +2703,7 @@ fn commit_stream_put_atomic() {
         err,
         crate::error::MetadataError::StreamSessionNotFound { .. }
     ));
-    let staging = store.list_stream_chunks("sess-commit").unwrap();
+    let staging = store.list_stream_segments("sess-commit").unwrap();
     assert!(staging.is_empty());
 }
 

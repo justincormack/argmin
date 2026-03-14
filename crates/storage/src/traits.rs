@@ -362,7 +362,7 @@ pub trait PgMetadataStore {
         new_state: StreamUploadState,
     ) -> Result<(), MetadataError>;
 
-    /// Delete a streaming upload session and its staging chunks (CASCADE).
+    /// Delete a streaming upload session and its staging segments (CASCADE).
     fn delete_stream_upload(&self, session_id: &str) -> Result<(), MetadataError>;
 
     /// List all streaming upload sessions on this PG.
@@ -370,14 +370,17 @@ pub trait PgMetadataStore {
     /// Used by the startup scavenger to find abandoned sessions.
     fn list_all_stream_uploads(&self) -> Result<Vec<StreamUploadRecord>, MetadataError>;
 
-    /// Append a staging chunk record to an in-progress streaming session.
-    fn append_stream_chunk(&self, chunk: &StreamUploadChunkRecord) -> Result<(), MetadataError>;
+    /// Append a staging segment record to an in-progress streaming session.
+    fn append_stream_segment(
+        &self,
+        segment: &StreamUploadSegmentRecord,
+    ) -> Result<(), MetadataError>;
 
-    /// List staging chunk records for a streaming session, ordered by chunk_index.
-    fn list_stream_chunks(
+    /// List staging segment records for a streaming session, ordered by segment_index.
+    fn list_stream_segments(
         &self,
         session_id: &str,
-    ) -> Result<Vec<StreamUploadChunkRecord>, MetadataError>;
+    ) -> Result<Vec<StreamUploadSegmentRecord>, MetadataError>;
 
     /// Atomically finalize a streaming PutObject.
     ///
@@ -385,8 +388,8 @@ pub trait PgMetadataStore {
     /// 1. Transition session to Completing
     /// 2. Write/overwrite the object metadata row
     /// 3. Delete any prior object_segments for this version_id
-    /// 4. Insert committed chunk manifest rows
-    /// 5. Delete the stream_uploads + stream_upload_chunks staging rows
+    /// 4. Insert committed segment manifest rows
+    /// 5. Delete the stream_uploads + stream_upload_segments staging rows
     /// 6. Mark session Completed (implicitly via deletion)
     fn commit_stream_put(
         &self,
@@ -400,8 +403,8 @@ pub trait PgMetadataStore {
     /// In a single transaction:
     /// 1. Transition session to Completing
     /// 2. Upsert multipart part metadata
-    /// 3. Insert committed part chunk manifest rows
-    /// 4. Delete the stream_uploads + stream_upload_chunks staging rows
+    /// 3. Insert committed part segment manifest rows
+    /// 4. Delete the stream_uploads + stream_upload_segments staging rows
     fn commit_stream_part(
         &self,
         session_id: &str,

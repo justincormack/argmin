@@ -268,7 +268,7 @@ Completed. The semantic design decisions above are settled.
 
 In progress.
 
-First implementation slice completed:
+Completed slices so far:
 
 - committed metadata paths now use generic segment naming instead of
   object-stream-specific chunk naming
@@ -277,10 +277,18 @@ First implementation slice completed:
   `MultipartPartSegmentRecord`
 - committed record fields use `segment_index`, `segment_okh`, and
   `segment_vid`
+- staging metadata paths now use generic segment naming instead of
+  object-stream-specific chunk naming
+- staging table is now `stream_upload_segments`
+- staging record type is now `StreamUploadSegmentRecord`
+- staging record fields use `segment_index`, `segment_okh`, and
+  `segment_vid`
+- storage staging methods are now `append_stream_segment` and
+  `list_stream_segments`
 
-Intentional non-goals of this first slice:
+Intentional non-goals of the current Phase B work:
 
-- staging upload chunk records remain chunk-oriented for now
+- the external coordinator ingest API is still `append_stream_chunk(...)`
 - `ObjectLayout::ChunkManifest` is not renamed yet
 - read/write semantics are unchanged; this is a metadata convergence step only
 

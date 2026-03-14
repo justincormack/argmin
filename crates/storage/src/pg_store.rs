@@ -3267,43 +3267,46 @@ impl PgMetadataStore for PgStore {
             })
     }
 
-    fn append_stream_chunk(&self, chunk: &StreamUploadChunkRecord) -> Result<(), MetadataError> {
+    fn append_stream_segment(
+        &self,
+        segment: &StreamUploadSegmentRecord,
+    ) -> Result<(), MetadataError> {
         self.conn
             .execute(
-                "INSERT INTO stream_upload_chunks \
-                 (session_id, chunk_index, size, chunk_okh, chunk_vid, shard_pg_id, ec_k, ec_m) \
+                "INSERT INTO stream_upload_segments \
+                 (session_id, segment_index, size, segment_okh, segment_vid, shard_pg_id, ec_k, ec_m) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
-                    chunk.session_id,
-                    chunk.chunk_index,
-                    chunk.size as i64,
-                    chunk.chunk_okh.as_slice(),
-                    chunk.chunk_vid.get() as i64,
-                    chunk.shard_pg_id,
-                    chunk.ec_k,
-                    chunk.ec_m,
+                    segment.session_id,
+                    segment.segment_index,
+                    segment.size as i64,
+                    segment.segment_okh.as_slice(),
+                    segment.segment_vid.get() as i64,
+                    segment.shard_pg_id,
+                    segment.ec_k,
+                    segment.ec_m,
                 ],
             )
             .map_err(|e| MetadataError::Db {
-                context: "append stream chunk",
+                context: "append stream segment",
                 source: e,
             })?;
         Ok(())
     }
 
-    fn list_stream_chunks(
+    fn list_stream_segments(
         &self,
         session_id: &str,
-    ) -> Result<Vec<StreamUploadChunkRecord>, MetadataError> {
+    ) -> Result<Vec<StreamUploadSegmentRecord>, MetadataError> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT session_id, chunk_index, size, chunk_okh, chunk_vid, shard_pg_id, \
-                 ec_k, ec_m FROM stream_upload_chunks \
-                 WHERE session_id = ?1 ORDER BY chunk_index ASC",
+                "SELECT session_id, segment_index, size, segment_okh, segment_vid, shard_pg_id, \
+                 ec_k, ec_m FROM stream_upload_segments \
+                 WHERE session_id = ?1 ORDER BY segment_index ASC",
             )
             .map_err(|e| MetadataError::Db {
-                context: "prepare list stream chunks",
+                context: "prepare list stream segments",
                 source: e,
             })?;
 
@@ -3311,30 +3314,34 @@ impl PgMetadataStore for PgStore {
             .query_map(params![session_id], |row| {
                 let okh_blob: Vec<u8> = row.get(3)?;
                 let okh = PgStore::parse_okh_blob(&okh_blob, 3)?;
-                Ok(StreamUploadChunkRecord {
+                Ok(StreamUploadSegmentRecord {
                     session_id: row.get(0)?,
-                    chunk_index: row.get(1)?,
+                    segment_index: row.get(1)?,
                     size: row.get::<_, i64>(2)? as u64,
-                    chunk_okh: okh,
-                    chunk_vid: Self::parse_generation_id(row.get::<_, i64>(4)?, 4, "chunk_vid")?,
+                    segment_okh: okh,
+                    segment_vid: Self::parse_generation_id(
+                        row.get::<_, i64>(4)?,
+                        4,
+                        "segment_vid",
+                    )?,
                     shard_pg_id: row.get(5)?,
                     ec_k: row.get(6)?,
                     ec_m: row.get(7)?,
                 })
             })
             .map_err(|e| MetadataError::Db {
-                context: "list stream chunks",
+                context: "list stream segments",
                 source: e,
             })?;
 
-        let mut chunks = Vec::new();
+        let mut segments = Vec::new();
         for row in rows {
-            chunks.push(row.map_err(|e| MetadataError::Db {
-                context: "list stream chunks row",
+            segments.push(row.map_err(|e| MetadataError::Db {
+                context: "list stream segments row",
                 source: e,
             })?);
         }
-        Ok(chunks)
+        Ok(segments)
     }
 
     fn commit_stream_put(

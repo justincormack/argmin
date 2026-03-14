@@ -1093,17 +1093,17 @@ pub struct CreateStreamUploadReq {
     pub target: StreamUploadTarget,
 }
 
-/// Staging chunk record for an in-progress streaming session.
+/// Staging segment record for an in-progress streaming session.
 #[derive(Debug, Clone)]
-pub struct StreamUploadChunkRecord {
+pub struct StreamUploadSegmentRecord {
     pub session_id: SessionId,
-    pub chunk_index: u32,
+    pub segment_index: u32,
     pub size: u64,
     /// 16-byte object key hash for shard keys.
-    pub chunk_okh: [u8; 16],
+    pub segment_okh: [u8; 16],
     /// Payload generation for shard keys.
-    pub chunk_vid: GenerationId,
-    /// PG where this chunk's shards are stored.
+    pub segment_vid: GenerationId,
+    /// PG where this segment's shards are stored.
     pub shard_pg_id: u32,
     pub ec_k: u8,
     pub ec_m: u8,

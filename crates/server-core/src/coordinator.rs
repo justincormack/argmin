@@ -18,7 +18,7 @@ use storage::{
     MultipartReclaimRecord, MultipartUploadRecord, ObjectKey, ObjectLayout, ObjectPartRecord,
     ObjectSegmentRecord, PutDeleteMarkerReq, PutLiveObjectReq, PutObjectReq, ReclaimWorkItem,
     SessionId, ShardKey, SharedStorageNode, SimplePayloadReclaimRecord, StoredObject,
-    StreamUploadChunkRecord, StreamUploadState, StreamUploadTarget, UploadId, UploadState,
+    StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, UploadId, UploadState,
 };
 
 use crate::conditional::{
@@ -3354,10 +3354,13 @@ impl Coordinator {
         }
         // Reject duplicate chunk_index — writing shards then failing on PK
         // constraint would delete the already-staged chunk's shard data.
-        let existing_chunks = meta_guard
-            .list_stream_chunks(session_id)
+        let existing_segments = meta_guard
+            .list_stream_segments(session_id)
             .map_err(ServerError::Metadata)?;
-        if existing_chunks.iter().any(|c| c.chunk_index == chunk_index) {
+        if existing_segments
+            .iter()
+            .any(|segment| segment.segment_index == chunk_index)
+        {
             return Err(ServerError::InvalidRequest {
                 reason: format!("duplicate chunk_index {chunk_index}"),
             });
@@ -3406,13 +3409,13 @@ impl Coordinator {
             return Err(e);
         }
 
-        // Record staging chunk row.
-        let chunk_result = meta_guard.append_stream_chunk(&StreamUploadChunkRecord {
+        // Record staging segment row.
+        let chunk_result = meta_guard.append_stream_segment(&StreamUploadSegmentRecord {
             session_id: SessionId::from(session_id),
-            chunk_index,
+            segment_index: chunk_index,
             size: data.len() as u64,
-            chunk_okh,
-            chunk_vid,
+            segment_okh: chunk_okh,
+            segment_vid: chunk_vid,
             shard_pg_id,
             ec_k: self.ec_config.data_shards,
             ec_m: self.ec_config.parity_shards,
@@ -3504,11 +3507,11 @@ impl Coordinator {
             None
         };
 
-        // Build committed chunk manifest from staging rows and validate total_size.
-        let staging_chunks = meta_guard
-            .list_stream_chunks(session_id)
+        // Build committed segment manifest from staging rows and validate total_size.
+        let staging_segments = meta_guard
+            .list_stream_segments(session_id)
             .map_err(ServerError::Metadata)?;
-        let chunks_total: u64 = staging_chunks.iter().map(|c| c.size).sum();
+        let chunks_total: u64 = staging_segments.iter().map(|segment| segment.size).sum();
         if chunks_total != total_size {
             return Err(ServerError::InvalidRequest {
                 reason: format!(
@@ -3516,19 +3519,19 @@ impl Coordinator {
                 ),
             });
         }
-        let committed_chunks: Vec<ObjectSegmentRecord> = staging_chunks
+        let committed_chunks: Vec<ObjectSegmentRecord> = staging_segments
             .iter()
-            .map(|c| ObjectSegmentRecord {
+            .map(|segment| ObjectSegmentRecord {
                 bucket: BucketName::from(bucket),
                 key: ObjectKey::from(key),
                 version_id,
-                segment_index: c.chunk_index,
-                size: c.size,
-                segment_okh: c.chunk_okh,
-                segment_vid: c.chunk_vid,
-                shard_pg_id: c.shard_pg_id,
-                ec_k: c.ec_k,
-                ec_m: c.ec_m,
+                segment_index: segment.segment_index,
+                size: segment.size,
+                segment_okh: segment.segment_okh,
+                segment_vid: segment.segment_vid,
+                shard_pg_id: segment.shard_pg_id,
+                ec_k: segment.ec_k,
+                ec_m: segment.ec_m,
             })
             .collect();
 
@@ -3730,11 +3733,11 @@ impl Coordinator {
             Err(e) => return Err(ServerError::Metadata(e)),
         };
 
-        // Build committed chunk manifest from staging rows.
-        let staging_chunks = meta_guard
-            .list_stream_chunks(session_id)
+        // Build committed segment manifest from staging rows.
+        let staging_segments = meta_guard
+            .list_stream_segments(session_id)
             .map_err(ServerError::Metadata)?;
-        let chunks_total: u64 = staging_chunks.iter().map(|c| c.size).sum();
+        let chunks_total: u64 = staging_segments.iter().map(|segment| segment.size).sum();
         if chunks_total != total_size {
             return Err(ServerError::InvalidRequest {
                 reason: format!(
@@ -3743,21 +3746,21 @@ impl Coordinator {
             });
         }
 
-        let committed_chunks: Vec<MultipartPartSegmentRecord> = staging_chunks
+        let committed_chunks: Vec<MultipartPartSegmentRecord> = staging_segments
             .iter()
-            .map(|c| MultipartPartSegmentRecord {
+            .map(|segment| MultipartPartSegmentRecord {
                 bucket: BucketName::from(bucket),
                 key: ObjectKey::from(key),
                 upload_id: UploadId::from(upload_id),
                 version_id: u64::MAX, // staging sentinel — reparented at CompleteMultipartUpload time
                 part_number,
-                segment_index: c.chunk_index,
-                size: c.size,
-                segment_okh: c.chunk_okh,
-                segment_vid: c.chunk_vid,
-                shard_pg_id: c.shard_pg_id,
-                ec_k: c.ec_k,
-                ec_m: c.ec_m,
+                segment_index: segment.segment_index,
+                size: segment.size,
+                segment_okh: segment.segment_okh,
+                segment_vid: segment.segment_vid,
+                shard_pg_id: segment.shard_pg_id,
+                ec_k: segment.ec_k,
+                ec_m: segment.ec_m,
             })
             .collect();
 
@@ -3864,12 +3867,12 @@ impl Coordinator {
             });
         }
 
-        // Collect staging chunks for shard cleanup before deleting session.
-        let staging_chunks = meta_guard
-            .list_stream_chunks(session_id)
+        // Collect staging segments for shard cleanup before deleting session.
+        let staging_segments = meta_guard
+            .list_stream_segments(session_id)
             .map_err(ServerError::Metadata)?;
 
-        // Set state to Aborted, then delete session (CASCADE deletes staging chunks).
+        // Set state to Aborted, then delete session (CASCADE deletes staging segments).
         meta_guard
             .set_stream_upload_state(session_id, StreamUploadState::Aborted)
             .map_err(ServerError::Metadata)?;
@@ -3881,13 +3884,14 @@ impl Coordinator {
         // to lock other PGs.
         drop(meta_guard);
 
-        // Best-effort cleanup of chunk shards.
-        for chunk in &staging_chunks {
-            if let Ok(shard_guard) = self.storage_node.get_pg(chunk.shard_pg_id) {
-                let k = chunk.ec_k as usize;
-                let m = chunk.ec_m as usize;
+        // Best-effort cleanup of staged segment shards.
+        for segment in &staging_segments {
+            if let Ok(shard_guard) = self.storage_node.get_pg(segment.shard_pg_id) {
+                let k = segment.ec_k as usize;
+                let m = segment.ec_m as usize;
                 for i in 0..(k + m) {
-                    let shard_key = ShardKey::new(&chunk.chunk_okh, chunk.chunk_vid.get(), i as u8);
+                    let shard_key =
+                        ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i as u8);
                     let _ = shard_guard.delete_shard(&shard_key);
                 }
             }
