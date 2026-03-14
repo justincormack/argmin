@@ -3545,6 +3545,159 @@ impl PgMetadataStore for PgStore {
         }
     }
 
+    fn put_segment_object(
+        &self,
+        obj: &PutLiveObjectReq,
+        segments: &[ObjectSegmentRecord],
+    ) -> Result<(), MetadataError> {
+        obj.validate().map_err(|msg| MetadataError::Db {
+            context: "put segment object (etag/layout mismatch)",
+            source: rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Null,
+                Box::from(msg),
+            ),
+        })?;
+        if obj.layout != ObjectLayout::SegmentManifest {
+            return Err(MetadataError::Db {
+                context: "put segment object (non-segment layout)",
+                source: rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Null,
+                    Box::from("put_segment_object requires SegmentManifest layout"),
+                ),
+            });
+        }
+
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| MetadataError::Db {
+                context: "put segment object (begin txn)",
+                source: e,
+            })?;
+
+        let result: Result<(), MetadataError> = (|| {
+            let now = PgStore::now_millis();
+            let data_layout = obj.layout.data_layout() as u8;
+            let etag_kind = obj.etag.etag_kind() as u8;
+            let status = ObjectState::Live as u8;
+            let parts_count = obj.layout.parts_count().map(|n| n as i64);
+            let tags = obj.tags.as_deref();
+            let metadata_blob = obj.metadata_blob.as_deref();
+
+            let obj_sql = if obj.version_id.is_null() {
+                "INSERT OR REPLACE INTO objects \
+                 (bucket, key, version_id, generation_id, size, etag, etag_kind, last_modified, \
+                  storage_class, ec_k, ec_m, status, data_layout, parts_count, tags, metadata_blob) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"
+            } else {
+                "INSERT INTO objects \
+                 (bucket, key, version_id, generation_id, size, etag, etag_kind, last_modified, \
+                  storage_class, ec_k, ec_m, status, data_layout, parts_count, tags, metadata_blob) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"
+            };
+            self.conn
+                .execute(
+                    obj_sql,
+                    params![
+                        obj.bucket,
+                        obj.key,
+                        obj.version_id.to_u64() as i64,
+                        obj.generation_id.get() as i64,
+                        obj.size as i64,
+                        obj.etag.as_bytes().as_slice(),
+                        etag_kind,
+                        now as i64,
+                        obj.ec.k,
+                        obj.ec.m,
+                        status,
+                        data_layout,
+                        parts_count,
+                        tags,
+                        metadata_blob,
+                    ],
+                )
+                .map_err(|e| MetadataError::Db {
+                    context: "put segment object (write object)",
+                    source: e,
+                })?;
+
+            self.conn
+                .execute(
+                    "DELETE FROM object_segments \
+                     WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
+                    params![obj.bucket, obj.key, obj.version_id.to_u64() as i64],
+                )
+                .map_err(|e| MetadataError::Db {
+                    context: "put segment object (delete prior segments)",
+                    source: e,
+                })?;
+
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "INSERT INTO object_segments \
+                     (bucket, key, version_id, segment_index, size, segment_okh, segment_vid, \
+                      shard_pg_id, ec_k, ec_m) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                )
+                .map_err(|e| MetadataError::Db {
+                    context: "put segment object (prepare insert segments)",
+                    source: e,
+                })?;
+            for segment in segments {
+                if segment.bucket != obj.bucket
+                    || segment.key != obj.key
+                    || segment.version_id != obj.version_id
+                {
+                    return Err(MetadataError::Db {
+                        context: "put segment object (segment object mismatch)",
+                        source: rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Null,
+                            Box::from("segment row does not match object identity"),
+                        ),
+                    });
+                }
+                stmt.execute(params![
+                    segment.bucket,
+                    segment.key,
+                    segment.version_id.to_u64() as i64,
+                    segment.segment_index,
+                    segment.size as i64,
+                    segment.segment_okh.as_slice(),
+                    segment.segment_vid.get() as i64,
+                    segment.shard_pg_id,
+                    segment.ec_k,
+                    segment.ec_m,
+                ])
+                .map_err(|e| MetadataError::Db {
+                    context: "put segment object (insert segment)",
+                    source: e,
+                })?;
+            }
+
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                if let Err(e) = self.conn.execute_batch("COMMIT") {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    return Err(MetadataError::Db {
+                        context: "put segment object (commit txn)",
+                        source: e,
+                    });
+                }
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
     fn commit_stream_part(
         &self,
         session_id: &str,

@@ -121,6 +121,27 @@ pub fn chunk_key_hash(session_id: &str, chunk_index: u32) -> [u8; 16] {
     result
 }
 
+/// Compute the 16-byte segment key hash for committed object segment shard keys.
+///
+/// `segment_okh = SHA-256("segment/" + bucket + "/" + key + "/" + generation_id + "/" +
+/// segment_index)[:16]`
+pub fn segment_key_hash(
+    bucket: &str,
+    key: &str,
+    generation_id: storage::GenerationId,
+    segment_index: u32,
+) -> [u8; 16] {
+    use ring::digest;
+    let input = format!(
+        "segment/{bucket}/{key}/{}/{segment_index}",
+        generation_id.get()
+    );
+    let hash = digest::digest(&digest::SHA256, input.as_bytes());
+    let mut result = [0u8; 16];
+    result.copy_from_slice(&hash.as_ref()[..16]);
+    result
+}
+
 /// Compute the 16-byte part key hash for multipart upload shard keys.
 ///
 /// `part_okh = SHA-256("mpu/" + upload_id + "/" + part_number + "/" + generation)[:16]`
@@ -279,6 +300,36 @@ mod tests {
     #[test]
     fn chunk_key_hash_length() {
         let hash = chunk_key_hash("session", 42);
+        assert_eq!(hash.len(), 16);
+    }
+
+    #[test]
+    fn segment_key_hash_deterministic() {
+        let generation_id = storage::GenerationId::new(7).unwrap();
+        let a = segment_key_hash("bucket", "key", generation_id, 0);
+        let b = segment_key_hash("bucket", "key", generation_id, 0);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn segment_key_hash_different_generations() {
+        let a = segment_key_hash("bucket", "key", storage::GenerationId::new(7).unwrap(), 0);
+        let b = segment_key_hash("bucket", "key", storage::GenerationId::new(8).unwrap(), 0);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn segment_key_hash_different_indices() {
+        let generation_id = storage::GenerationId::new(7).unwrap();
+        let a = segment_key_hash("bucket", "key", generation_id, 0);
+        let b = segment_key_hash("bucket", "key", generation_id, 1);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn segment_key_hash_length() {
+        let generation_id = storage::GenerationId::new(7).unwrap();
+        let hash = segment_key_hash("bucket", "key", generation_id, 42);
         assert_eq!(hash.len(), 16);
     }
 

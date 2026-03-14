@@ -2801,6 +2801,139 @@ fn commit_stream_put_overwrite_unversioned() {
 }
 
 #[test]
+fn put_segment_object_persists_manifest() {
+    let (_dir, store) = make_pg_store();
+
+    store
+        .put_segment_object(
+            &PutLiveObjectReq {
+                bucket: "b".into(),
+                key: "k".into(),
+                version_id: VersionId::Null,
+                generation_id: GenerationId::MIN,
+                size: 6_000_000,
+                etag: ObjectEtag::single_part(1),
+                ec: EcShape { k: 4, m: 2 },
+                layout: ObjectLayout::SegmentManifest,
+                tags: None,
+                metadata_blob: None,
+            },
+            &[
+                ObjectSegmentRecord {
+                    bucket: "b".into(),
+                    key: "k".into(),
+                    version_id: VersionId::Null,
+                    segment_index: 0,
+                    size: 4_000_000,
+                    segment_okh: [0x11; 16],
+                    segment_vid: GenerationId::MIN,
+                    shard_pg_id: 0,
+                    ec_k: 4,
+                    ec_m: 2,
+                },
+                ObjectSegmentRecord {
+                    bucket: "b".into(),
+                    key: "k".into(),
+                    version_id: VersionId::Null,
+                    segment_index: 1,
+                    size: 2_000_000,
+                    segment_okh: [0x22; 16],
+                    segment_vid: GenerationId::MIN,
+                    shard_pg_id: 0,
+                    ec_k: 4,
+                    ec_m: 2,
+                },
+            ],
+        )
+        .unwrap();
+
+    let record = store.get_object_meta("b", "k").unwrap();
+    let live = record.as_live().unwrap();
+    assert_eq!(live.size, 6_000_000);
+    assert_eq!(live.layout, ObjectLayout::SegmentManifest);
+
+    let segments = store
+        .get_object_segments("b", "k", VersionId::Null)
+        .unwrap();
+    assert_eq!(segments.len(), 2);
+    assert_eq!(segments[0].segment_okh, [0x11; 16]);
+    assert_eq!(segments[1].segment_okh, [0x22; 16]);
+}
+
+#[test]
+fn put_segment_object_overwrite_unversioned_replaces_manifest() {
+    let (_dir, store) = make_pg_store();
+
+    store
+        .put_segment_object(
+            &PutLiveObjectReq {
+                bucket: "b".into(),
+                key: "k".into(),
+                version_id: VersionId::Null,
+                generation_id: GenerationId::MIN,
+                size: 100,
+                etag: ObjectEtag::single_part(1),
+                ec: EcShape { k: 4, m: 2 },
+                layout: ObjectLayout::SegmentManifest,
+                tags: None,
+                metadata_blob: None,
+            },
+            &[ObjectSegmentRecord {
+                bucket: "b".into(),
+                key: "k".into(),
+                version_id: VersionId::Null,
+                segment_index: 0,
+                size: 100,
+                segment_okh: [1; 16],
+                segment_vid: GenerationId::MIN,
+                shard_pg_id: 0,
+                ec_k: 4,
+                ec_m: 2,
+            }],
+        )
+        .unwrap();
+
+    store
+        .put_segment_object(
+            &PutLiveObjectReq {
+                bucket: "b".into(),
+                key: "k".into(),
+                version_id: VersionId::Null,
+                generation_id: GenerationId::new(2).unwrap(),
+                size: 200,
+                etag: ObjectEtag::single_part(2),
+                ec: EcShape { k: 4, m: 2 },
+                layout: ObjectLayout::SegmentManifest,
+                tags: None,
+                metadata_blob: None,
+            },
+            &[ObjectSegmentRecord {
+                bucket: "b".into(),
+                key: "k".into(),
+                version_id: VersionId::Null,
+                segment_index: 0,
+                size: 200,
+                segment_okh: [2; 16],
+                segment_vid: GenerationId::MIN,
+                shard_pg_id: 1,
+                ec_k: 4,
+                ec_m: 2,
+            }],
+        )
+        .unwrap();
+
+    let record = store.get_object_meta("b", "k").unwrap();
+    assert_eq!(record.as_live().unwrap().size, 200);
+
+    let segments = store
+        .get_object_segments("b", "k", VersionId::Null)
+        .unwrap();
+    assert_eq!(segments.len(), 1);
+    assert_eq!(segments[0].size, 200);
+    assert_eq!(segments[0].segment_okh, [2; 16]);
+}
+
+#[test]
 fn delete_object_segments_cleanup() {
     let (_dir, store) = make_pg_store();
 

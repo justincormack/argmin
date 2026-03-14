@@ -293,6 +293,27 @@ Intentional non-goals of the current Phase B work:
 - the external coordinator ingest API is still `append_stream_chunk(...)`
 - read/write semantics are unchanged; this is a metadata convergence step only
 
+### Phase D
+
+In progress.
+
+Completed slices so far:
+
+- normal buffered `PutObject` writes now split into fixed `4 MiB` internal
+  segments
+- buffered `CopyObject` destinations now commit through the same
+  segment-manifest path
+- newly committed buffered segment-manifest objects persist explicit
+  `object_segments` rows instead of relying on the old implicit direct-shard-set
+  path
+- unversioned buffered overwrites now enqueue reclaim for the old segment
+  manifest without deleting the newly committed rows
+
+Remaining work in this phase:
+
+- route non-streamed multipart part writes through the same fixed internal
+  segment model
+
 Specifically:
 
 1. choose a fixed segment size

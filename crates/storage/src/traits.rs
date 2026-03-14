@@ -398,6 +398,18 @@ pub trait PgMetadataStore {
         chunks: &[ObjectSegmentRecord],
     ) -> Result<(), MetadataError>;
 
+    /// Atomically write or replace a live segment-manifest object.
+    ///
+    /// In a single transaction:
+    /// 1. Write/overwrite the object metadata row
+    /// 2. Delete any prior object_segments for this version_id
+    /// 3. Insert committed segment manifest rows
+    fn put_segment_object(
+        &self,
+        obj: &PutLiveObjectReq,
+        segments: &[ObjectSegmentRecord],
+    ) -> Result<(), MetadataError>;
+
     /// Atomically finalize a streaming UploadPart.
     ///
     /// In a single transaction:

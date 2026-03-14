@@ -29,13 +29,14 @@ use crate::conditional::{
 use crate::error::ServerError;
 use crate::etag::{compute_multipart_etag, crc64_to_etag_bytes, etag_bytes_to_crc64, format_etag};
 use crate::metadata_blob::MetadataBlob;
-#[cfg(test)]
-use crate::pg::derive_pg_shards;
-use crate::pg::{chunk_key_hash, object_key_hash, part_key_hash, PgTopology};
+use crate::pg::{chunk_key_hash, object_key_hash, part_key_hash, segment_key_hash, PgTopology};
 use crate::range::ByteRange;
 
 /// Maximum object size for single PUT or upload part (5 GiB, matches AWS S3).
 pub const MAX_OBJECT_SIZE: u64 = 5 * 1024 * 1024 * 1024;
+
+/// Fixed internal segment size for newly committed segment-manifest payloads.
+const INTERNAL_SEGMENT_SIZE: usize = 4 * 1024 * 1024;
 
 /// A checksum claim parsed from HTTP headers or trailers.
 ///
@@ -3012,51 +3013,69 @@ impl Coordinator {
 
         // 2. Compute ETag (CRC64 of user data only).
         let etag_crc = checksum::crc64::checksum(user_data);
-
-        // 3. Pad user data to multiple of k for equal shard sizes.
-        let k = self.ec_config.data_shards as usize;
-        let m = self.ec_config.parity_shards as usize;
-        let mut padded_data = user_data.to_vec();
-        let remainder = padded_data.len() % k;
-        if remainder != 0 {
-            let pad = k - remainder;
-            padded_data.resize(padded_data.len() + pad, 0);
-        }
-
-        // 4. Split into k data shards
-        let shard_size = padded_data.len() / k;
-        let data_shards: Vec<&[u8]> = (0..k)
-            .map(|i| &padded_data[i * shard_size..(i + 1) * shard_size])
-            .collect();
-
-        // 5. Allocate parity buffers and encode
-        let mut parity_bufs: Vec<Vec<u8>> = (0..m).map(|_| vec![0u8; shard_size]).collect();
-        let mut parity_refs: Vec<&mut [u8]> = parity_bufs
-            .iter_mut()
-            .map(std::vec::Vec::as_mut_slice)
-            .collect();
-        self.ec_codec.encode(&data_shards, &mut parity_refs)?;
-
-        // 6. Compute object_key_hash
-        let okh = object_key_hash(bucket, key);
         let stale_payload = if version_id.is_null() {
             Self::snapshot_overwritten_null_version_payload(meta_pg, bucket, key)?
         } else {
             None
         };
 
-        // 7. Write all k+m shards, with cleanup on failure
-        let mut written_shards: Vec<ShardKey> = Vec::with_capacity(k + m);
+        let k = self.ec_config.data_shards as usize;
+        let m = self.ec_config.parity_shards as usize;
+        let segment_vid = GenerationId::MIN;
+        let segment_shard_pg_id = shard_pg.pg_id();
+
+        // 3. Write all segment shard sets, with cleanup on failure.
+        let mut written_shards: Vec<ShardKey> = Vec::new();
+        let mut committed_segments = Vec::new();
         let write_result: Result<(), ServerError> = (|| {
-            for i in 0..(k + m) {
-                let shard_key = ShardKey::new(&okh, generation_id.get(), i as u8);
-                let shard_data = if i < k {
-                    data_shards[i]
-                } else {
-                    &parity_bufs[i - k]
-                };
-                shard_pg.write_shard(&shard_key, shard_data)?;
-                written_shards.push(shard_key);
+            for (segment_index, segment_data) in user_data.chunks(INTERNAL_SEGMENT_SIZE).enumerate()
+            {
+                let segment_index =
+                    u32::try_from(segment_index).map_err(|_| ServerError::InternalError {
+                        reason: "too many object segments".to_string(),
+                    })?;
+                let segment_okh = segment_key_hash(bucket, key, generation_id, segment_index);
+
+                let mut padded = segment_data.to_vec();
+                let remainder = padded.len() % k;
+                if remainder != 0 {
+                    padded.resize(padded.len() + (k - remainder), 0);
+                }
+
+                let shard_size = padded.len() / k;
+                let data_shards: Vec<&[u8]> = (0..k)
+                    .map(|i| &padded[i * shard_size..(i + 1) * shard_size])
+                    .collect();
+                let mut parity_bufs: Vec<Vec<u8>> = (0..m).map(|_| vec![0u8; shard_size]).collect();
+                let mut parity_refs: Vec<&mut [u8]> = parity_bufs
+                    .iter_mut()
+                    .map(std::vec::Vec::as_mut_slice)
+                    .collect();
+                self.ec_codec.encode(&data_shards, &mut parity_refs)?;
+
+                for i in 0..(k + m) {
+                    let shard_key = ShardKey::new(&segment_okh, segment_vid.get(), i as u8);
+                    let shard_data = if i < k {
+                        data_shards[i]
+                    } else {
+                        &parity_bufs[i - k]
+                    };
+                    shard_pg.write_shard(&shard_key, shard_data)?;
+                    written_shards.push(shard_key);
+                }
+
+                committed_segments.push(ObjectSegmentRecord {
+                    bucket: BucketName::from(bucket),
+                    key: ObjectKey::from(key),
+                    version_id,
+                    segment_index,
+                    size: segment_data.len() as u64,
+                    segment_okh,
+                    segment_vid,
+                    shard_pg_id: segment_shard_pg_id,
+                    ec_k: self.ec_config.data_shards,
+                    ec_m: self.ec_config.parity_shards,
+                });
             }
             Ok(())
         })();
@@ -3069,10 +3088,9 @@ impl Coordinator {
             return Err(e);
         }
 
-        // 8. Record metadata (to metadata PG).
-        //    Metadata blob stored in DB row; size == user data length.
+        // 4. Record metadata and committed segment manifest atomically.
         let user_size = user_data.len() as u64;
-        let meta_result = meta_pg.put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
+        let put_req = PutLiveObjectReq {
             bucket: BucketName::from(bucket),
             key: ObjectKey::from(key),
             version_id,
@@ -3086,7 +3104,8 @@ impl Coordinator {
             layout: ObjectLayout::SegmentManifest,
             tags: tags.map(std::string::ToString::to_string),
             metadata_blob: Some(blob_bytes),
-        }));
+        };
+        let meta_result = meta_pg.put_segment_object(&put_req, &committed_segments);
 
         if let Err(e) = meta_result {
             // Best-effort cleanup of all written shards
@@ -3097,7 +3116,27 @@ impl Coordinator {
         }
 
         if let Some(ref payload) = stale_payload {
-            Self::delete_stale_object_payload_metadata(meta_pg, bucket, key, version_id, payload)?;
+            match payload {
+                StaleObjectPayload::SegmentManifest {
+                    generation_id,
+                    chunks,
+                } => {
+                    // `put_segment_object` already replaced the live segment rows for
+                    // VersionId::Null, so only enqueue reclaim for the old payload.
+                    Self::enqueue_segment_manifest_reclaim(
+                        meta_pg,
+                        bucket,
+                        key,
+                        *generation_id,
+                        chunks,
+                    )?;
+                }
+                _ => {
+                    Self::delete_stale_object_payload_metadata(
+                        meta_pg, bucket, key, version_id, payload,
+                    )?;
+                }
+            }
         }
 
         Ok((
@@ -8151,18 +8190,37 @@ mod tests {
 
     /// Compute shard file path on disk for a given object and shard index.
     fn shard_file_path(
+        coord: &Coordinator,
         data_dir: &Path,
         bucket: &str,
         key: &str,
         shard_index: u8,
-        pg_count: u32,
     ) -> PathBuf {
-        let generation_id = GenerationId::MIN.get();
-        let pg_id = derive_pg_shards(bucket, key, generation_id, pg_count);
-        let okh = object_key_hash(bucket, key);
-        let shard_key = ShardKey::new(&okh, generation_id, shard_index);
+        let (shard_pg_id, okh, generation_id) = {
+            let meta_pg_id = coord.object_pg_id(bucket, key);
+            let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
+            let record = pg.get_object_meta(bucket, key).unwrap();
+            let segments = pg
+                .get_object_segments(bucket, key, record.version_id())
+                .unwrap();
+            if let Some(segment) = segments.first() {
+                (
+                    segment.shard_pg_id,
+                    segment.segment_okh,
+                    segment.segment_vid,
+                )
+            } else {
+                let live = record.as_live().expect("expected live object");
+                (
+                    coord.shard_pg_id(bucket, key, live.generation_id),
+                    object_key_hash(bucket, key),
+                    live.generation_id,
+                )
+            }
+        };
+        let shard_key = ShardKey::new(&okh, generation_id.get(), shard_index);
         data_dir
-            .join(format!("pg-{pg_id:04}"))
+            .join(format!("pg-{shard_pg_id:04}"))
             .join("shards")
             .join(shard_key.hex_prefix())
             .join(shard_key.hex())
@@ -8170,13 +8228,13 @@ mod tests {
 
     /// Delete a specific shard file from disk.
     fn delete_shard_on_disk(
+        coord: &Coordinator,
         data_dir: &Path,
         bucket: &str,
         key: &str,
         shard_index: u8,
-        pg_count: u32,
     ) {
-        let path = shard_file_path(data_dir, bucket, key, shard_index, pg_count);
+        let path = shard_file_path(coord, data_dir, bucket, key, shard_index);
         std::fs::remove_file(&path).unwrap_or_else(|e| {
             panic!(
                 "failed to delete shard {shard_index} at {}: {e}",
@@ -8188,13 +8246,13 @@ mod tests {
     /// Corrupt a specific shard file on disk (flip first byte).
     /// PgStore's read_shard will detect CRC mismatch.
     fn corrupt_shard_on_disk(
+        coord: &Coordinator,
         data_dir: &Path,
         bucket: &str,
         key: &str,
         shard_index: u8,
-        pg_count: u32,
     ) {
-        let path = shard_file_path(data_dir, bucket, key, shard_index, pg_count);
+        let path = shard_file_path(coord, data_dir, bucket, key, shard_index);
         let mut data = std::fs::read(&path).unwrap_or_else(|e| {
             panic!(
                 "failed to read shard {shard_index} at {}: {e}",
@@ -8262,7 +8320,7 @@ mod tests {
             .unwrap();
 
         // Delete one data shard using the helper
-        delete_shard_on_disk(tmp.path(), "bucket", "resilient", 0, 4);
+        delete_shard_on_disk(&coord, tmp.path(), "bucket", "resilient", 0);
 
         // Get should still succeed via EC reconstruction
         let obj = coord
@@ -8297,7 +8355,7 @@ mod tests {
             })
             .unwrap();
 
-        delete_shard_on_disk(tmp.path(), "bucket", "obj1", 0, 4);
+        delete_shard_on_disk(&coord, tmp.path(), "bucket", "obj1", 0);
 
         let obj = coord
             .get_object(&GetObjectRequest {
@@ -8333,8 +8391,8 @@ mod tests {
             .unwrap();
 
         // Delete 2 data shards (indices 0 and 1)
-        delete_shard_on_disk(tmp.path(), "bucket", "obj2", 0, 4);
-        delete_shard_on_disk(tmp.path(), "bucket", "obj2", 1, 4);
+        delete_shard_on_disk(&coord, tmp.path(), "bucket", "obj2", 0);
+        delete_shard_on_disk(&coord, tmp.path(), "bucket", "obj2", 1);
 
         let obj = coord
             .get_object(&GetObjectRequest {
@@ -8370,9 +8428,9 @@ mod tests {
             .unwrap();
 
         // Delete 3 shards (indices 0, 1, 2)
-        delete_shard_on_disk(tmp.path(), "bucket", "obj3", 0, 4);
-        delete_shard_on_disk(tmp.path(), "bucket", "obj3", 1, 4);
-        delete_shard_on_disk(tmp.path(), "bucket", "obj3", 2, 4);
+        delete_shard_on_disk(&coord, tmp.path(), "bucket", "obj3", 0);
+        delete_shard_on_disk(&coord, tmp.path(), "bucket", "obj3", 1);
+        delete_shard_on_disk(&coord, tmp.path(), "bucket", "obj3", 2);
 
         let obj = coord
             .get_object(&GetObjectRequest {
@@ -8408,7 +8466,7 @@ mod tests {
             })
             .unwrap();
 
-        corrupt_shard_on_disk(tmp.path(), "bucket", "obj4", 0, 4);
+        corrupt_shard_on_disk(&coord, tmp.path(), "bucket", "obj4", 0);
 
         let obj = coord
             .get_object(&GetObjectRequest {
@@ -8443,7 +8501,7 @@ mod tests {
             .unwrap();
 
         // Delete shard 0 (covers the beginning of the data)
-        delete_shard_on_disk(tmp.path(), "bucket", "obj5", 0, 4);
+        delete_shard_on_disk(&coord, tmp.path(), "bucket", "obj5", 0);
 
         // Range get should still succeed via EC reconstruction
         let result = coord
@@ -8481,7 +8539,7 @@ mod tests {
             .unwrap();
 
         // Delete first parity shard (index 4, since k=4)
-        delete_shard_on_disk(tmp.path(), "bucket", "obj6", 4, 4);
+        delete_shard_on_disk(&coord, tmp.path(), "bucket", "obj6", 4);
 
         let obj = coord
             .get_object(&GetObjectRequest {
@@ -12890,7 +12948,7 @@ mod tests {
         {
             let pg = admin.storage_node.get_pg(meta_pg_id).unwrap();
             assert!(pg
-                .get_simple_payload_reclaim("bucket", "key", generation_id)
+                .get_segment_manifest_reclaim("bucket", "key", generation_id)
                 .unwrap()
                 .is_some());
         }
@@ -12908,7 +12966,7 @@ mod tests {
         {
             let pg = admin.storage_node.get_pg(meta_pg_id).unwrap();
             assert!(pg
-                .get_simple_payload_reclaim("bucket", "key", generation_id)
+                .get_segment_manifest_reclaim("bucket", "key", generation_id)
                 .unwrap()
                 .is_some());
         }
@@ -16349,7 +16407,18 @@ mod tests {
             })
             .unwrap();
 
-        // Destination should be a normal (non-segment-manifest) object.
+        // Buffered copy destinations now commit through the same segment-manifest
+        // path as normal PutObject writes.
+        {
+            let meta_pg_id = coord.object_pg_id("bucket", "dst");
+            let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
+            let segments = pg
+                .get_object_segments("bucket", "dst", VersionId::Null)
+                .unwrap();
+            assert_eq!(segments.len(), 1);
+            assert_eq!(segments[0].size, 7);
+        }
+
         let result = coord
             .get_object(&GetObjectRequest {
                 bucket: "bucket",
@@ -16360,6 +16429,108 @@ mod tests {
             })
             .unwrap();
         assert_eq!(result.body.into_bytes().unwrap(), b"copy-me");
+    }
+
+    #[test]
+    fn buffered_put_writes_segment_manifest() {
+        let dir = test_util::tempdir();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let data = vec![0x5A; (INTERNAL_SEGMENT_SIZE * 2) + 123];
+        let result = coord
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: &data,
+                metadata: &MetadataBlob::new(),
+                tags: None,
+                cond: &WriteCondition::default(),
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
+            })
+            .unwrap();
+
+        {
+            let meta_pg_id = coord.object_pg_id("bucket", "key");
+            let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
+            let segments = pg
+                .get_object_segments("bucket", "key", result.version_id)
+                .unwrap();
+            assert_eq!(segments.len(), 3);
+            assert_eq!(segments[0].segment_index, 0);
+            assert_eq!(segments[0].size, INTERNAL_SEGMENT_SIZE as u64);
+            assert_eq!(segments[1].segment_index, 1);
+            assert_eq!(segments[1].size, INTERNAL_SEGMENT_SIZE as u64);
+            assert_eq!(segments[2].segment_index, 2);
+            assert_eq!(segments[2].size, 123);
+        }
+
+        let get = coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: NO_READ,
+                requester: TEST_REQUESTER,
+            })
+            .unwrap();
+        assert_eq!(get.body.into_bytes().unwrap(), data);
+    }
+
+    #[test]
+    fn buffered_put_overwrite_eventually_reclaims_old_segments() {
+        let dir = test_util::tempdir();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let old_data = vec![0x41; INTERNAL_SEGMENT_SIZE + 17];
+        let first = coord
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: &old_data,
+                metadata: &MetadataBlob::new(),
+                tags: None,
+                cond: &WriteCondition::default(),
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
+            })
+            .unwrap();
+
+        let old_segments = {
+            let meta_pg_id = coord.object_pg_id("bucket", "key");
+            let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
+            pg.get_object_segments("bucket", "key", first.version_id)
+                .unwrap()
+        };
+        assert_eq!(old_segments.len(), 2);
+
+        coord
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"new-data",
+                metadata: &MetadataBlob::new(),
+                tags: None,
+                cond: &WriteCondition::default(),
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
+            })
+            .unwrap();
+
+        for segment in old_segments {
+            wait_for_shard_set_deletion(
+                &coord,
+                segment.shard_pg_id,
+                &segment.segment_okh,
+                segment.segment_vid,
+                EcShape {
+                    k: segment.ec_k,
+                    m: segment.ec_m,
+                },
+            );
+        }
     }
 
     #[test]
