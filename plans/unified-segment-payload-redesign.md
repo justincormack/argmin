@@ -185,7 +185,20 @@ Candidate starting points:
 - `1 MiB`
 - `4 MiB`
 
-This should be chosen deliberately, not inherited from current HTTP chunking.
+Working assumption:
+
+- start at `4 MiB`
+
+Reason:
+
+- with the current default `k=4`, a `4 MiB` logical segment becomes `1 MiB` data
+  shards before parity, which is a more plausible physical unit than `256 KiB`
+  data shards from a `1 MiB` logical segment
+- `1 MiB` segments are likely too small and will drive unnecessary metadata and
+  file churn
+
+This should still be implemented as a code constant and revisited with benchmark
+data, not treated as a permanent unmeasured choice.
 
 ### 2. Manifest shape for multipart
 
@@ -218,6 +231,8 @@ This means:
 - reclaim records and leases are keyed by that root generation
 - segment identities are subordinate payload-location identities, not separate
   reclaim roots
+- segments do not need their own separate `GenerationId`; object generation plus
+  manifest position and placement metadata is sufficient
 
 ### 4. Metadata schema strategy
 
@@ -229,6 +244,13 @@ Possible directions:
 
 There are no backward compatibility guarantees at this stage, so we should choose
 the cleaner resulting schema rather than optimize for incremental migration.
+
+Working decision:
+
+- replace the current experimental tables directly if that yields the cleaner
+  schema
+- exact final table shape can be settled during implementation, as long as it
+  preserves the agreed semantic model
 
 ## Recommended Direction
 
@@ -268,7 +290,11 @@ Decide:
 3. identity model
 4. schema evolution strategy
 
-This document is the starting point for that design.
+Status:
+
+- complete at the semantic level
+- implementation may still refine the exact table layout, but the core design
+  decisions above are now fixed
 
 ### Phase B: Add generic segment metadata
 
