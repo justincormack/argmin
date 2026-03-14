@@ -16,3 +16,4 @@ tmp/
 /data/
 # profiles
 *.profraw
+*.data
