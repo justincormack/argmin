@@ -2,7 +2,7 @@
 
 ## Context
 
-`plans/s3-integration-tests.md` identifies multipart upload as the next large
+`plans/completed/s3-integration-tests.md` identifies multipart upload as the next large
 foundational feature.
 
 The current object write path assumes a single contiguous object payload

@@ -1,5 +1,18 @@
 # Rust S3 Integration Test Framework
 
+> Status: Historical bootstrap plan.
+>
+> The test harness and most of the high-value Ceph `s3-tests` porting work were
+> completed from this plan, but the detailed file counts and phased backlog in
+> this document are now stale.
+>
+> The main remaining unported areas are no longer one integration-framework task:
+> - auth/header/public-access remainder is tracked in `plans/aws-auth-compat-plan.md`
+> - encryption coverage is tracked in `plans/encryption-compat-plan.md`
+>
+> Treat this document as the historical plan for creating `crates/s3-tests`, not
+> as the current roadmap for remaining compatibility work.
+
 ## Context
 
 The Ceph s3-tests (Python/boto3) have been useful for S3 compatibility validation but have

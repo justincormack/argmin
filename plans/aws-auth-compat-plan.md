@@ -93,6 +93,8 @@ Still missing:
 - a short documented auth/public-access compatibility subset against AWS
 - a short written record of the confirmed AWS ownership behavior for anonymous
   public-write uploads
+- folding in the remaining auth/header-related Ceph `s3-tests` porting work so
+  it is tracked here rather than in the old integration-framework bootstrap plan
 
 Already covered:
 - wrong-region header auth coverage
@@ -167,6 +169,8 @@ Status: open.
 
 Deliver:
 - rerun targeted auth/public-access `s3-tests`
+- account for the remaining auth/header-related Ceph test coverage that is not
+  yet ported into `crates/s3-tests`
 - document remaining intentional incompatibilities:
   - object ACLs, if still deferred
   - account-level Block Public Access, if still deferred
