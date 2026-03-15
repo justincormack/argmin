@@ -46,6 +46,7 @@ Completed:
 Still open:
 - Full object ownership compatibility
 - Object ACL APIs / semantics
+- Account-level Block Public Access controls
 - Final compatibility/conformance documentation
 
 ## Remaining Work
@@ -79,6 +80,8 @@ Longer-term identity note:
 Still missing:
 - object ACL APIs / semantics
 - any ACL-driven authorization beyond the current bucket-level ACL model
+- account-level Block Public Access controls and their interaction with
+  bucket-level ACL/public-access behavior
 
 Explicitly still out of scope for this plan:
 - full bucket policy evaluation
@@ -122,6 +125,8 @@ Minimal intended behavior after this follow-up:
 - owner: full bucket/object access
 - anonymous: read-only on explicitly public-read buckets
 - anonymous/public write only when explicitly enabled by the supported ACL model
+- account-level Block Public Access controls override bucket-level public ACL
+  behavior where AWS does
 - non-owner authenticated callers remain denied unless allowed by supported ACL or later policy work
 
 This is still intentionally weaker than full AWS ownership behavior until the
@@ -164,6 +169,7 @@ Deliver:
 - rerun targeted auth/public-access `s3-tests`
 - document remaining intentional incompatibilities:
   - object ACLs, if still deferred
+  - account-level Block Public Access, if still deferred
   - policy evaluation, if still deferred
 
 ## Test Plan
