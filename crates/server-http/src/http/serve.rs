@@ -149,8 +149,8 @@ enum StreamingWriteOp {
     },
 }
 
-/// Default internal chunk payload size for streaming writes (4 MiB).
-const STREAM_CHUNK_SIZE: usize = 4 * 1024 * 1024;
+/// Default internal segment payload size for streaming writes (4 MiB).
+const STREAM_SEGMENT_SIZE: usize = 4 * 1024 * 1024;
 
 /// Tunable timeouts for the HTTP serve layer.
 pub struct ServeConfig {
@@ -267,7 +267,7 @@ pub async fn serve(
 /// for control-plane dispatch.
 ///
 /// For `PutObject`/`UploadPart` (except copy-source variants), body frames are
-/// consumed incrementally and fed to coordinator chunk appends. All other
+/// consumed incrementally and fed to coordinator segment appends. All other
 /// requests collect the full body first.
 ///
 /// Errors are always converted to S3 XML error responses.
@@ -727,8 +727,8 @@ async fn handle_streaming_post_object(
     let mut crc64 = checksum::crc64::Hasher::new();
     let mut sha256 = ring::digest::Context::new(&ring::digest::SHA256);
     let mut total_size: u64 = 0;
-    let mut chunk_index: u32 = 0;
-    let mut upload_buf = Vec::with_capacity(STREAM_CHUNK_SIZE);
+    let mut segment_index: u32 = 0;
+    let mut upload_buf = Vec::with_capacity(STREAM_SEGMENT_SIZE);
 
     let mut body = body;
     loop {
@@ -807,16 +807,16 @@ async fn handle_streaming_post_object(
                                 }
 
                                 upload_buf.extend_from_slice(&data);
-                                while upload_buf.len() >= STREAM_CHUNK_SIZE {
+                                while upload_buf.len() >= STREAM_SEGMENT_SIZE {
                                     let flush_data: Vec<u8> =
-                                        upload_buf.drain(..STREAM_CHUNK_SIZE).collect();
-                                    let idx = chunk_index;
-                                    chunk_index += 1;
+                                        upload_buf.drain(..STREAM_SEGMENT_SIZE).collect();
+                                    let idx = segment_index;
+                                    segment_index += 1;
                                     let ctx_ref = Arc::clone(c);
                                     let st = Arc::clone(&state);
                                     match tokio::task::spawn_blocking(move || {
                                         let frontend = acquire_frontend(&st);
-                                        frontend.streaming_append_post_chunk(
+                                        frontend.streaming_append_post_segment(
                                             &ctx_ref,
                                             idx,
                                             &flush_data,
@@ -888,12 +888,12 @@ async fn handle_streaming_post_object(
     };
 
     if !upload_buf.is_empty() {
-        let idx = chunk_index;
+        let idx = segment_index;
         let st = Arc::clone(&state);
         let ctx_ref = Arc::clone(&ctx);
         match tokio::task::spawn_blocking(move || {
             let frontend = acquire_frontend(&st);
-            frontend.streaming_append_post_chunk(&ctx_ref, idx, &upload_buf)
+            frontend.streaming_append_post_segment(&ctx_ref, idx, &upload_buf)
         })
         .await
         {
@@ -998,11 +998,11 @@ async fn handle_streaming_put(
         }
     }
 
-    // 2. Stream body frames, accumulating into STREAM_CHUNK_SIZE buffers.
+    // 2. Stream body frames, accumulating into STREAM_SEGMENT_SIZE buffers.
     let ctx = Arc::new(ctx);
     let mut hasher = checksum::crc64::Hasher::new();
-    let mut chunk_index: u32 = 0;
-    let mut buf = Vec::with_capacity(STREAM_CHUNK_SIZE);
+    let mut segment_index: u32 = 0;
+    let mut buf = Vec::with_capacity(STREAM_SEGMENT_SIZE);
     let mut total_size: u64 = 0;
     let mut body = body;
 
@@ -1045,15 +1045,15 @@ async fn handle_streaming_put(
                     buf.extend_from_slice(&payload);
 
                     // Flush when buffer reaches chunk size.
-                    while buf.len() >= STREAM_CHUNK_SIZE {
-                        let flush_data: Vec<u8> = buf.drain(..STREAM_CHUNK_SIZE).collect();
-                        let idx = chunk_index;
-                        chunk_index += 1;
+                    while buf.len() >= STREAM_SEGMENT_SIZE {
+                        let flush_data: Vec<u8> = buf.drain(..STREAM_SEGMENT_SIZE).collect();
+                        let idx = segment_index;
+                        segment_index += 1;
                         let ctx_ref = Arc::clone(&ctx);
                         let st = Arc::clone(&state);
                         match tokio::task::spawn_blocking(move || {
                             let frontend = acquire_frontend(&st);
-                            frontend.streaming_append_chunk(&ctx_ref, idx, &flush_data)
+                            frontend.streaming_append_segment(&ctx_ref, idx, &flush_data)
                         })
                         .await
                         {
@@ -1151,12 +1151,12 @@ async fn handle_streaming_put(
 
     // 3. Flush remaining buffer.
     if !buf.is_empty() {
-        let idx = chunk_index;
+        let idx = segment_index;
         let ctx_ref = Arc::clone(&ctx);
         let st = Arc::clone(&state);
         match tokio::task::spawn_blocking(move || {
             let frontend = acquire_frontend(&st);
-            frontend.streaming_append_chunk(&ctx_ref, idx, &buf)
+            frontend.streaming_append_segment(&ctx_ref, idx, &buf)
         })
         .await
         {
@@ -1278,11 +1278,11 @@ async fn handle_streaming_part(
             inline_checksum_claim = Some(claimed);
         }
     }
-    // 2. Stream body frames, accumulating into STREAM_CHUNK_SIZE buffers.
+    // 2. Stream body frames, accumulating into STREAM_SEGMENT_SIZE buffers.
     let ctx = Arc::new(ctx);
     let mut hasher = checksum::crc64::Hasher::new();
-    let mut chunk_index: u32 = 0;
-    let mut buf = Vec::with_capacity(STREAM_CHUNK_SIZE);
+    let mut segment_index: u32 = 0;
+    let mut buf = Vec::with_capacity(STREAM_SEGMENT_SIZE);
     let mut total_size: u64 = 0;
     let mut body = body;
 
@@ -1323,15 +1323,15 @@ async fn handle_streaming_part(
                     }
                     buf.extend_from_slice(&payload);
 
-                    while buf.len() >= STREAM_CHUNK_SIZE {
-                        let flush_data: Vec<u8> = buf.drain(..STREAM_CHUNK_SIZE).collect();
-                        let idx = chunk_index;
-                        chunk_index += 1;
+                    while buf.len() >= STREAM_SEGMENT_SIZE {
+                        let flush_data: Vec<u8> = buf.drain(..STREAM_SEGMENT_SIZE).collect();
+                        let idx = segment_index;
+                        segment_index += 1;
                         let ctx_ref = Arc::clone(&ctx);
                         let st = Arc::clone(&state);
                         match tokio::task::spawn_blocking(move || {
                             let frontend = acquire_frontend(&st);
-                            frontend.streaming_append_part_chunk(&ctx_ref, idx, &flush_data)
+                            frontend.streaming_append_part_segment(&ctx_ref, idx, &flush_data)
                         })
                         .await
                         {
@@ -1434,12 +1434,12 @@ async fn handle_streaming_part(
 
     // 3. Flush remaining buffer.
     if !buf.is_empty() {
-        let idx = chunk_index;
+        let idx = segment_index;
         let ctx_ref = Arc::clone(&ctx);
         let st = Arc::clone(&state);
         match tokio::task::spawn_blocking(move || {
             let frontend = acquire_frontend(&st);
-            frontend.streaming_append_part_chunk(&ctx_ref, idx, &buf)
+            frontend.streaming_append_part_segment(&ctx_ref, idx, &buf)
         })
         .await
         {

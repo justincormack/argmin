@@ -405,7 +405,7 @@ pub trait PgMetadataStore {
         &self,
         session_id: &str,
         obj: &CommitStreamPutReq,
-        chunks: &[ObjectSegmentRecord],
+        segments: &[ObjectSegmentRecord],
     ) -> Result<(), MetadataError>;
 
     /// Atomically write or replace a live standard segmented object.
@@ -431,7 +431,7 @@ pub trait PgMetadataStore {
         &self,
         session_id: &str,
         part: &MultipartPartRecord,
-        chunks: &[MultipartPartSegmentRecord],
+        segments: &[MultipartPartSegmentRecord],
     ) -> Result<(), MetadataError>;
 
     /// Read committed segments for a StandardInternal object.
@@ -467,14 +467,14 @@ pub trait PgMetadataStore {
         version_id: VersionId,
     ) -> Result<(), MetadataError>;
 
-    /// Get all chunk records for a given upload_id (any version_id / part_number).
+    /// Get all segment records for a given upload_id (any version_id / part_number).
     /// Used during abort to collect shard refs before deletion.
     fn get_all_multipart_part_segments_for_upload(
         &self,
         upload_id: &str,
     ) -> Result<Vec<MultipartPartSegmentRecord>, MetadataError>;
 
-    /// Delete all chunk records for a given upload_id.
+    /// Delete all segment records for a given upload_id.
     fn delete_multipart_part_segments_by_upload_id(
         &self,
         upload_id: &str,

@@ -747,7 +747,7 @@ impl MultipartReclaimPartKind {
     }
 }
 
-/// Chunk entry for a segmented multipart part reclaim record.
+/// Segment entry for a multipart part reclaim record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MultipartReclaimPartSegmentRecord {
     pub part_number: u32,
@@ -1202,7 +1202,7 @@ pub struct StreamUploadSegmentRecord {
     pub ec_m: u8,
 }
 
-/// Committed chunk record for a normal PutObject.
+/// Committed segment record for a normal PutObject.
 #[derive(Debug, Clone)]
 pub struct ObjectSegmentRecord {
     pub bucket: BucketName,
@@ -1219,7 +1219,7 @@ pub struct ObjectSegmentRecord {
     pub ec_m: u8,
 }
 
-/// Committed chunk record for a multipart part.
+/// Committed segment record for a multipart part.
 #[derive(Debug, Clone)]
 pub struct MultipartPartSegmentRecord {
     pub bucket: BucketName,

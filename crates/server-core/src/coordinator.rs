@@ -32,8 +32,8 @@ use crate::error::ServerError;
 use crate::etag::{compute_multipart_etag, crc64_to_etag_bytes, etag_bytes_to_crc64, format_etag};
 use crate::metadata_blob::MetadataBlob;
 use crate::pg::{
-    chunk_key_hash, multipart_part_segment_key_hash, object_key_hash, part_key_hash,
-    segment_key_hash, PgTopology,
+    multipart_part_segment_key_hash, object_key_hash, part_key_hash, segment_key_hash,
+    stream_segment_key_hash, PgTopology,
 };
 use crate::range::ByteRange;
 
@@ -196,14 +196,14 @@ struct SegmentListReader {
     runtime: ReadRuntime,
     bucket: String,
     key: String,
-    chunks: Vec<SegmentSliceRecord>,
+    segments: Vec<SegmentSliceRecord>,
     next_segment_index: usize,
-    loaded_chunk: Option<(Vec<u8>, usize, usize)>,
+    loaded_segment: Option<(Vec<u8>, usize, usize)>,
 }
 
 #[derive(Debug, Clone)]
 struct SnapshottedMultipartPartRange {
-    streaming_chunks: Vec<SegmentSliceRecord>,
+    streaming_segments: Vec<SegmentSliceRecord>,
 }
 
 struct MultipartReader {
@@ -277,27 +277,27 @@ impl std::fmt::Debug for ReadHandle {
 }
 
 impl ReadHandle {
-    fn chunk_slices_for_range(
-        chunks: Vec<SegmentPayloadRecord>,
+    fn segment_slices_for_range(
+        segments: Vec<SegmentPayloadRecord>,
         start: usize,
         end: usize,
     ) -> Vec<SegmentSliceRecord> {
         let mut slices = Vec::new();
         let mut offset = 0usize;
 
-        for payload in chunks {
-            let chunk_end = offset + payload.size as usize;
+        for payload in segments {
+            let segment_end = offset + payload.size as usize;
             if offset > end {
                 break;
             }
-            if payload.size != 0 && chunk_end > start {
+            if payload.size != 0 && segment_end > start {
                 slices.push(SegmentSliceRecord {
                     start_offset: start.saturating_sub(offset),
                     end_offset: (end + 1).saturating_sub(offset).min(payload.size as usize),
                     payload,
                 });
             }
-            offset = chunk_end;
+            offset = segment_end;
         }
 
         slices
@@ -322,17 +322,17 @@ impl ReadHandle {
                     .saturating_sub(offset)
                     .min(part.record.size as usize);
                 ranges.push(SnapshottedMultipartPartRange {
-                    streaming_chunks: Self::chunk_slices_for_range(
-                        part.streaming_chunks
+                    streaming_segments: Self::segment_slices_for_range(
+                        part.streaming_segments
                             .into_iter()
-                            .map(|chunk| SegmentPayloadRecord {
-                                size: chunk.size,
-                                segment_crc64: chunk.segment_crc64,
-                                segment_okh: chunk.segment_okh,
-                                segment_vid: chunk.segment_vid,
-                                shard_pg_id: chunk.shard_pg_id,
-                                ec_k: chunk.ec_k,
-                                ec_m: chunk.ec_m,
+                            .map(|segment| SegmentPayloadRecord {
+                                size: segment.size,
+                                segment_crc64: segment.segment_crc64,
+                                segment_okh: segment.segment_okh,
+                                segment_vid: segment.segment_vid,
+                                shard_pg_id: segment.shard_pg_id,
+                                ec_k: segment.ec_k,
+                                ec_m: segment.ec_m,
                             })
                             .collect(),
                         start_offset,
@@ -351,7 +351,7 @@ impl ReadHandle {
         bucket: &str,
         key: &str,
         generation_id: GenerationId,
-        chunks: Vec<SegmentPayloadRecord>,
+        segments: Vec<SegmentPayloadRecord>,
         expected_size: usize,
         expected_crc64: Option<u64>,
     ) -> Self {
@@ -367,9 +367,13 @@ impl ReadHandle {
                 runtime,
                 bucket: bucket.to_string(),
                 key: key.to_string(),
-                chunks: Self::chunk_slices_for_range(chunks, 0, expected_size.saturating_sub(1)),
+                segments: Self::segment_slices_for_range(
+                    segments,
+                    0,
+                    expected_size.saturating_sub(1),
+                ),
                 next_segment_index: 0,
-                loaded_chunk: None,
+                loaded_segment: None,
             }),
         }
     }
@@ -379,7 +383,7 @@ impl ReadHandle {
         bucket: &str,
         key: &str,
         generation_id: GenerationId,
-        chunks: Vec<SegmentPayloadRecord>,
+        segments: Vec<SegmentPayloadRecord>,
         start: usize,
         end: usize,
     ) -> Self {
@@ -396,9 +400,9 @@ impl ReadHandle {
                 runtime,
                 bucket: bucket.to_string(),
                 key: key.to_string(),
-                chunks: Self::chunk_slices_for_range(chunks, start, end),
+                segments: Self::segment_slices_for_range(segments, start, end),
                 next_segment_index: 0,
-                loaded_chunk: None,
+                loaded_segment: None,
             }),
         }
     }
@@ -527,19 +531,19 @@ impl ReadHandle {
     }
 }
 
-fn chunk_payloads_from_object_segments(
-    chunks: Vec<ObjectSegmentRecord>,
+fn segment_payloads_from_object_segments(
+    segments: Vec<ObjectSegmentRecord>,
 ) -> Vec<SegmentPayloadRecord> {
-    chunks
+    segments
         .into_iter()
-        .map(|chunk| SegmentPayloadRecord {
-            size: chunk.size,
-            segment_crc64: chunk.segment_crc64,
-            segment_okh: chunk.segment_okh,
-            segment_vid: chunk.segment_vid,
-            shard_pg_id: chunk.shard_pg_id,
-            ec_k: chunk.ec_k,
-            ec_m: chunk.ec_m,
+        .map(|segment| SegmentPayloadRecord {
+            size: segment.size,
+            segment_crc64: segment.segment_crc64,
+            segment_okh: segment.segment_okh,
+            segment_vid: segment.segment_vid,
+            shard_pg_id: segment.shard_pg_id,
+            ec_k: segment.ec_k,
+            ec_m: segment.ec_m,
         })
         .collect()
 }
@@ -1257,19 +1261,19 @@ struct LockedWriteObject<'a> {
 #[derive(Debug, Clone)]
 struct SnapshottedMultipartPart {
     record: ObjectPartRecord,
-    streaming_chunks: Vec<MultipartPartSegmentRecord>,
+    streaming_segments: Vec<MultipartPartSegmentRecord>,
 }
 
 #[derive(Debug, Clone)]
 enum StaleObjectPayload {
     Segments {
         generation_id: GenerationId,
-        chunks: Vec<ObjectSegmentRecord>,
+        segments: Vec<ObjectSegmentRecord>,
     },
     Multipart {
         generation_id: GenerationId,
         parts: Vec<ObjectPartRecord>,
-        streaming_chunks: Vec<MultipartPartSegmentRecord>,
+        streaming_segments: Vec<MultipartPartSegmentRecord>,
     },
 }
 
@@ -1279,7 +1283,7 @@ struct ReclamationTestHooks {
     target: Option<(String, String)>,
     after_multipart_snapshot: Option<Arc<dyn Fn() + Send + Sync>>,
     after_multipart_delete_metadata: Option<Arc<dyn Fn() + Send + Sync>>,
-    after_object_segments_first_chunk: Option<Arc<dyn Fn() + Send + Sync>>,
+    after_object_segments_first_segment: Option<Arc<dyn Fn() + Send + Sync>>,
     after_object_segments_delete_metadata: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
@@ -1370,7 +1374,7 @@ fn maybe_run_multipart_delete_metadata_hook(bucket: &str, key: &str) {
 }
 
 #[cfg(test)]
-fn maybe_run_object_segments_first_chunk_hook(bucket: &str, key: &str) {
+fn maybe_run_object_segments_first_segment_hook(bucket: &str, key: &str) {
     let hooks = RECLAMATION_TEST_HOOKS
         .get_or_init(|| Mutex::new(ReclamationTestHooks::default()))
         .lock()
@@ -1381,7 +1385,7 @@ fn maybe_run_object_segments_first_chunk_hook(bucket: &str, key: &str) {
         .as_ref()
         .is_some_and(|(b, k)| b == bucket && k == key)
     {
-        if let Some(hook) = hooks.after_object_segments_first_chunk {
+        if let Some(hook) = hooks.after_object_segments_first_segment {
             hook();
         }
     }
@@ -1664,11 +1668,11 @@ impl ReadRuntime {
         }
     }
 
-    fn read_segment_payload(&self, chunk: &SegmentPayloadRecord) -> Result<Vec<u8>, ServerError> {
-        let pg = self.storage_node.get_pg(chunk.shard_pg_id)?;
-        let k = chunk.ec_k as usize;
-        let m = chunk.ec_m as usize;
-        let padded = (chunk.size as usize).div_ceil(k) * k;
+    fn read_segment_payload(&self, segment: &SegmentPayloadRecord) -> Result<Vec<u8>, ServerError> {
+        let pg = self.storage_node.get_pg(segment.shard_pg_id)?;
+        let k = segment.ec_k as usize;
+        let m = segment.ec_m as usize;
+        let padded = (segment.size as usize).div_ceil(k) * k;
         let shard_size = padded / k;
 
         if shard_size == 0 {
@@ -1680,7 +1684,7 @@ impl ReadRuntime {
         let mut present_count = 0;
 
         for i in 0..(k + m) {
-            let shard_key = ShardKey::new(&chunk.segment_okh, chunk.segment_vid.get(), i as u8);
+            let shard_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i as u8);
             match pg.read_shard(&shard_key) {
                 Ok(sd) => {
                     all_shards.push(Some(sd.data));
@@ -1709,12 +1713,12 @@ impl ReadRuntime {
                 .collect();
 
             let tmp_codec;
-            let codec = if chunk.ec_k == self.ec_config.data_shards
-                && chunk.ec_m == self.ec_config.parity_shards
+            let codec = if segment.ec_k == self.ec_config.data_shards
+                && segment.ec_m == self.ec_config.parity_shards
             {
                 self.ec_codec.as_ref()
             } else {
-                let ec_config = EcConfig::new(chunk.ec_k, chunk.ec_m)?;
+                let ec_config = EcConfig::new(segment.ec_k, segment.ec_m)?;
                 tmp_codec = ErasureCodec::new(ec_config)?;
                 &tmp_codec
             };
@@ -1744,8 +1748,8 @@ impl ReadRuntime {
         for shard in all_shards.iter().take(k) {
             buf.extend_from_slice(shard.as_ref().unwrap());
         }
-        buf.truncate(chunk.size as usize);
-        if let Some(expected_crc64) = chunk.segment_crc64 {
+        buf.truncate(segment.size as usize);
+        if let Some(expected_crc64) = segment.segment_crc64 {
             let actual_crc64 = checksum::crc64::checksum(&buf);
             if actual_crc64 != expected_crc64 {
                 return Err(ServerError::Store(storage::StoreError::IntegrityError {
@@ -1761,23 +1765,23 @@ impl ReadRuntime {
 impl SegmentListReader {
     fn next_chunk(&mut self, target_size: usize) -> Result<Option<Vec<u8>>, ServerError> {
         loop {
-            if let Some((loaded, offset, end_offset)) = &mut self.loaded_chunk {
+            if let Some((loaded, offset, end_offset)) = &mut self.loaded_segment {
                 if *offset < *end_offset {
                     let end = (*offset + target_size).min(*end_offset);
                     let out = loaded[*offset..end].to_vec();
                     *offset = end;
                     return Ok(Some(out));
                 }
-                self.loaded_chunk = None;
+                self.loaded_segment = None;
             }
 
-            if self.next_segment_index >= self.chunks.len() {
+            if self.next_segment_index >= self.segments.len() {
                 return Ok(None);
             }
 
             let data = self
                 .runtime
-                .read_segment_payload(&self.chunks[self.next_segment_index].payload)
+                .read_segment_payload(&self.segments[self.next_segment_index].payload)
                 .map_err(|e| match e {
                     ServerError::Store(storage::StoreError::NotFound) => {
                         ServerError::ObjectNotFound {
@@ -1787,12 +1791,12 @@ impl SegmentListReader {
                     }
                     other => other,
                 })?;
-            let slice = &self.chunks[self.next_segment_index];
+            let slice = &self.segments[self.next_segment_index];
             self.next_segment_index += 1;
-            self.loaded_chunk = Some((data, slice.start_offset, slice.end_offset));
+            self.loaded_segment = Some((data, slice.start_offset, slice.end_offset));
             #[cfg(test)]
             if self.next_segment_index == 1 {
-                maybe_run_object_segments_first_chunk_hook(&self.bucket, &self.key);
+                maybe_run_object_segments_first_segment_hook(&self.bucket, &self.key);
             }
         }
     }
@@ -1819,9 +1823,9 @@ impl MultipartReader {
                 runtime: self.runtime.clone(),
                 bucket: self.bucket.clone(),
                 key: self.key.clone(),
-                chunks: part.streaming_chunks,
+                segments: part.streaming_segments,
                 next_segment_index: 0,
-                loaded_chunk: None,
+                loaded_segment: None,
             });
         }
     }
@@ -2761,7 +2765,7 @@ impl Coordinator {
             match payload {
                 StaleObjectPayload::Segments {
                     generation_id,
-                    chunks,
+                    segments,
                 } => {
                     // `put_object_with_segments` already replaced the live segment rows for
                     // VersionId::Null, so only enqueue reclaim for the old payload.
@@ -2770,7 +2774,7 @@ impl Coordinator {
                         bucket,
                         key,
                         *generation_id,
-                        chunks,
+                        segments,
                     )?;
                 }
                 StaleObjectPayload::Multipart { .. } => {
@@ -2871,7 +2875,7 @@ impl Coordinator {
     /// Begin a streaming PutObject upload session.
     ///
     /// Creates a session on the metadata PG for `(bucket, key)`. The caller
-    /// feeds chunks via `append_stream_chunk` and commits via
+    /// feeds segments via `append_stream_segment` and commits via
     /// `finalize_stream_put`.
     pub fn begin_stream_put(&self, req: &BeginStreamPutRequest<'_>) -> Result<String, ServerError> {
         let bucket = req.bucket;
@@ -2983,14 +2987,14 @@ impl Coordinator {
         })
     }
 
-    /// Append a chunk of data to an in-progress streaming session.
+    /// Append a segment of data to an in-progress streaming session.
     ///
-    /// Locks the metadata/session PG and the chunk's shard PG in global
+    /// Locks the metadata/session PG and the segment's shard PG in global
     /// ascending order. Validates the session is InProgress, EC-encodes the
-    /// chunk, writes shards, and records a staging chunk row.
+    /// segment, writes shards, and records a staging segment row.
     ///
     /// The caller must not hold any PG locks when calling this method.
-    pub fn append_stream_chunk(
+    pub fn append_stream_segment(
         &self,
         bucket: &str,
         key: &str,
@@ -3000,11 +3004,11 @@ impl Coordinator {
     ) -> Result<(), ServerError> {
         let meta_pg_id = self.object_pg_id(bucket, key);
 
-        // Derive chunk shard placement.
-        let segment_okh = chunk_key_hash(session_id, segment_index);
+        // Derive stream segment shard placement.
+        let segment_okh = stream_segment_key_hash(session_id, segment_index);
         let segment_vid = GenerationId::MIN;
         let shard_pg_id = self.shard_pg_id_raw(
-            &format!("chunk/{session_id}"),
+            &format!("segment/{session_id}"),
             &segment_index.to_string(),
             segment_vid.get(),
         );
@@ -3035,7 +3039,7 @@ impl Coordinator {
             });
         }
         // Reject duplicate segment_index — writing shards then failing on PK
-        // constraint would delete the already-staged chunk's shard data.
+        // constraint would delete the already-staged segment's shard data.
         let existing_segments = meta_guard
             .list_stream_segments(session_id)
             .map_err(ServerError::Metadata)?;
@@ -3048,7 +3052,7 @@ impl Coordinator {
             });
         }
 
-        // EC-encode chunk data.
+        // EC-encode segment data.
         let k = self.ec_config.data_shards as usize;
         let m = self.ec_config.parity_shards as usize;
         let mut padded = data.to_vec();
@@ -3092,7 +3096,7 @@ impl Coordinator {
         }
 
         // Record staging segment row.
-        let chunk_result = meta_guard.append_stream_segment(&StreamUploadSegmentRecord {
+        let segment_result = meta_guard.append_stream_segment(&StreamUploadSegmentRecord {
             session_id: SessionId::from(session_id),
             segment_index,
             size: data.len() as u64,
@@ -3104,7 +3108,7 @@ impl Coordinator {
             ec_m: self.ec_config.parity_shards,
         });
 
-        if let Err(e) = chunk_result {
+        if let Err(e) = segment_result {
             // Best-effort cleanup of written shards.
             for shard_key in &written_shards {
                 let _ = shard_pg.delete_shard(shard_key);
@@ -3117,12 +3121,12 @@ impl Coordinator {
 
     /// Finalize a streaming PutObject session.
     ///
-    /// Locks the metadata PG, allocates a version_id, builds committed chunk
-    /// manifest from staging rows, and atomically commits the object via
+    /// Locks the metadata PG, allocates a version_id, builds committed segment
+    /// metadata from staging rows, and atomically commits the object via
     /// `commit_stream_put`.
     ///
     /// The caller passes the running CRC64 checksum, total size, and metadata
-    /// blob computed during the append phase. No chunk data is re-read.
+    /// blob computed during the append phase. No segment data is re-read.
     pub fn finalize_stream_put(
         &self,
         req: &FinalizeStreamPutRequest,
@@ -3194,15 +3198,15 @@ impl Coordinator {
         let staging_segments = meta_guard
             .list_stream_segments(session_id)
             .map_err(ServerError::Metadata)?;
-        let chunks_total: u64 = staging_segments.iter().map(|segment| segment.size).sum();
-        if chunks_total != total_size {
+        let segments_total: u64 = staging_segments.iter().map(|segment| segment.size).sum();
+        if segments_total != total_size {
             return Err(ServerError::InvalidRequest {
                 reason: format!(
-                    "total_size mismatch: caller passed {total_size} but staged chunks sum to {chunks_total}"
+                    "total_size mismatch: caller passed {total_size} but staged segments sum to {segments_total}"
                 ),
             });
         }
-        let committed_chunks: Vec<ObjectSegmentRecord> = staging_segments
+        let committed_segments: Vec<ObjectSegmentRecord> = staging_segments
             .iter()
             .map(|segment| ObjectSegmentRecord {
                 bucket: BucketName::from(bucket),
@@ -3237,7 +3241,7 @@ impl Coordinator {
                     tags: tags.map(SerializedTagSet::from),
                     metadata_blob: Some(SerializedMetadataBlob::from(blob_bytes)),
                 },
-                &committed_chunks,
+                &committed_segments,
             )
             .map_err(ServerError::Metadata)?;
 
@@ -3245,7 +3249,7 @@ impl Coordinator {
             match payload {
                 StaleObjectPayload::Segments {
                     generation_id,
-                    chunks,
+                    segments,
                 } => {
                     // `commit_stream_put` already replaced the live object segments rows
                     // for VersionId::Null, so only enqueue reclaim for the old payload.
@@ -3254,7 +3258,7 @@ impl Coordinator {
                         bucket,
                         key,
                         *generation_id,
-                        chunks,
+                        segments,
                     )?;
                 }
                 StaleObjectPayload::Multipart { .. } => {
@@ -3421,16 +3425,16 @@ impl Coordinator {
         let staging_segments = meta_guard
             .list_stream_segments(session_id)
             .map_err(ServerError::Metadata)?;
-        let chunks_total: u64 = staging_segments.iter().map(|segment| segment.size).sum();
-        if chunks_total != total_size {
+        let segments_total: u64 = staging_segments.iter().map(|segment| segment.size).sum();
+        if segments_total != total_size {
             return Err(ServerError::InvalidRequest {
                 reason: format!(
-                    "total_size mismatch: caller passed {total_size} but staged chunks sum to {chunks_total}"
+                    "total_size mismatch: caller passed {total_size} but staged segments sum to {segments_total}"
                 ),
             });
         }
 
-        let committed_chunks: Vec<MultipartPartSegmentRecord> = staging_segments
+        let committed_segments: Vec<MultipartPartSegmentRecord> = staging_segments
             .iter()
             .map(|segment| MultipartPartSegmentRecord {
                 bucket: BucketName::from(bucket),
@@ -3470,14 +3474,14 @@ impl Coordinator {
             checksum: checksum_bytes.clone(),
         };
 
-        // Atomic commit: upsert part, insert chunks, delete staging.
+        // Atomic commit: upsert part, insert segments, delete staging.
         meta_guard
-            .commit_stream_part(session_id, &part_record, &committed_chunks)
+            .commit_stream_part(session_id, &part_record, &committed_segments)
             .map_err(ServerError::Metadata)?;
 
         // Best-effort cleanup of prior generation's shards.
         // The prior generation used the non-streaming path, so clean its
-        // single shard set. If it was also a streamed part, clean its chunks.
+        // single shard set. If it was also a streamed part, clean its segments.
         drop(meta_guard);
         if generation > 0 {
             let old_gen = generation - 1;
@@ -3499,17 +3503,18 @@ impl Coordinator {
                 }
             }
             // Clean old streamed-part segments (if prior generation was streamed).
-            // commit_stream_part already handles deleting prior multipart_part_segments
-            // in its transaction, but the shard data on disk needs cleanup.
+            // `commit_stream_part` already handles deleting prior
+            // `multipart_part_segments` rows in its transaction, but the shard
+            // data on disk still needs cleanup.
             if let Ok(pg) = self.storage_node.get_pg(meta_pg_id) {
-                if let Ok(old_chunks) = pg.get_multipart_part_segments(
+                if let Ok(old_segments) = pg.get_multipart_part_segments(
                     bucket,
                     key,
                     VersionId::from_u64(old_vid.get()),
                     part_number,
                 ) {
                     drop(pg);
-                    let _ = self.delete_chunk_shards_generic(&old_chunks);
+                    let _ = self.delete_segment_shards_generic(&old_segments);
                 }
             }
         }
@@ -3742,7 +3747,7 @@ impl Coordinator {
 
                 // Non-multipart payloads now read through committed object segments.
                 let meta_pg = pgs.meta();
-                let chunks = meta_pg
+                let segments = meta_pg
                     .get_object_segments(src_bucket, src_key, src_record.version_id)
                     .map_err(ServerError::Metadata)?;
 
@@ -3755,7 +3760,7 @@ impl Coordinator {
                         src_bucket,
                         src_key,
                         src_record.generation_id,
-                        chunk_payloads_from_object_segments(chunks),
+                        segment_payloads_from_object_segments(segments),
                         user_size,
                         Some(src_etag_crc),
                     );
@@ -4020,12 +4025,12 @@ impl Coordinator {
             .map_err(ServerError::Metadata)?;
         let mut snapshotted = Vec::with_capacity(parts.len());
         for part in parts {
-            let streaming_chunks = meta_pg
+            let streaming_segments = meta_pg
                 .get_multipart_part_segments(bucket, key, version_id, part.part_number)
                 .map_err(ServerError::Metadata)?;
             snapshotted.push(SnapshottedMultipartPart {
                 record: part,
-                streaming_chunks,
+                streaming_segments,
             });
         }
         Ok(snapshotted)
@@ -4051,10 +4056,10 @@ impl Coordinator {
                 let parts = meta_pg
                     .get_object_parts(bucket, key, VersionId::Null)
                     .map_err(ServerError::Metadata)?;
-                let mut streaming_chunks = Vec::new();
+                let mut streaming_segments = Vec::new();
                 for part in &parts {
                     if part.part_okh == [0u8; 16] {
-                        let chunks = meta_pg
+                        let segments = meta_pg
                             .get_multipart_part_segments(
                                 bucket,
                                 key,
@@ -4062,22 +4067,22 @@ impl Coordinator {
                                 part.part_number,
                             )
                             .map_err(ServerError::Metadata)?;
-                        streaming_chunks.extend(chunks);
+                        streaming_segments.extend(segments);
                     }
                 }
                 Ok(Some(StaleObjectPayload::Multipart {
                     generation_id: record.generation_id,
                     parts,
-                    streaming_chunks,
+                    streaming_segments,
                 }))
             }
             ObjectLayout::Standard => {
-                let chunks = meta_pg
+                let segments = meta_pg
                     .get_object_segments(bucket, key, VersionId::Null)
                     .map_err(ServerError::Metadata)?;
                 Ok(Some(StaleObjectPayload::Segments {
                     generation_id: record.generation_id,
-                    chunks,
+                    segments,
                 }))
             }
         }
@@ -4093,14 +4098,14 @@ impl Coordinator {
         match payload {
             StaleObjectPayload::Segments {
                 generation_id,
-                chunks,
+                segments,
             } => {
                 Self::enqueue_object_segments_reclaim(
                     meta_pg,
                     bucket,
                     key,
                     *generation_id,
-                    chunks,
+                    segments,
                 )?;
                 meta_pg
                     .delete_object_segments(bucket, key, version_id)
@@ -4109,7 +4114,7 @@ impl Coordinator {
             StaleObjectPayload::Multipart {
                 generation_id,
                 parts,
-                streaming_chunks,
+                streaming_segments,
             } => {
                 Self::enqueue_multipart_reclaim(
                     meta_pg,
@@ -4117,9 +4122,9 @@ impl Coordinator {
                     key,
                     *generation_id,
                     parts,
-                    streaming_chunks,
+                    streaming_segments,
                 )?;
-                if !streaming_chunks.is_empty() {
+                if !streaming_segments.is_empty() {
                     meta_pg
                         .delete_multipart_part_segments(bucket, key, version_id)
                         .map_err(ServerError::Metadata)?;
@@ -4178,13 +4183,13 @@ impl Coordinator {
         key: &str,
         generation_id: GenerationId,
         parts: &[ObjectPartRecord],
-        streaming_chunks: &[MultipartPartSegmentRecord],
+        streaming_segments: &[MultipartPartSegmentRecord],
     ) -> Result<(), ServerError> {
         use std::collections::BTreeMap;
 
         let mut segments_by_part: BTreeMap<u32, Vec<MultipartReclaimPartSegmentRecord>> =
             BTreeMap::new();
-        for segment in streaming_chunks {
+        for segment in streaming_segments {
             segments_by_part
                 .entry(segment.part_number)
                 .or_default()
@@ -4237,12 +4242,12 @@ impl Coordinator {
             .map_err(ServerError::Metadata)
     }
 
-    fn delete_chunk_shards_generic(
+    fn delete_segment_shards_generic(
         &self,
         segments: &[MultipartPartSegmentRecord],
     ) -> Result<(), ServerError> {
         for segment in segments {
-            self.delete_chunk_shard_set(
+            self.delete_segment_shard_set(
                 segment.shard_pg_id,
                 &segment.segment_okh,
                 segment.segment_vid,
@@ -4253,7 +4258,7 @@ impl Coordinator {
         Ok(())
     }
 
-    fn delete_chunk_shard_set(
+    fn delete_segment_shard_set(
         &self,
         shard_pg_id: u32,
         segment_okh: &[u8; 16],
@@ -4338,7 +4343,7 @@ impl Coordinator {
 
             // Non-multipart payloads now read through committed object segments.
             let meta_pg = pgs.meta();
-            let chunks = meta_pg
+            let segments = meta_pg
                 .get_object_segments(bucket, key, record.version_id)
                 .map_err(ServerError::Metadata)?;
 
@@ -4358,7 +4363,7 @@ impl Coordinator {
                     bucket,
                     key,
                     record.generation_id,
-                    chunk_payloads_from_object_segments(chunks),
+                    segment_payloads_from_object_segments(segments),
                     user_size,
                     Some(etag_crc),
                 );
@@ -4498,7 +4503,7 @@ impl Coordinator {
 
             // Non-multipart payloads now read through committed object segments.
             let meta_pg = pgs.meta();
-            let chunks = meta_pg
+            let segments = meta_pg
                 .get_object_segments(bucket, key, record.version_id)
                 .map_err(ServerError::Metadata)?;
 
@@ -4511,7 +4516,7 @@ impl Coordinator {
                     bucket,
                     key,
                     record.generation_id,
-                    chunk_payloads_from_object_segments(chunks),
+                    segment_payloads_from_object_segments(segments),
                     user_size,
                     Some(etag_crc),
                 );
@@ -4894,7 +4899,7 @@ impl Coordinator {
 
             // Non-multipart payloads now read through committed object segments.
             let meta_pg = pgs.meta();
-            let chunks = meta_pg
+            let segments = meta_pg
                 .get_object_segments(bucket, key, record.version_id)
                 .map_err(ServerError::Metadata)?;
 
@@ -4903,7 +4908,7 @@ impl Coordinator {
                 bucket,
                 key,
                 record.generation_id,
-                chunk_payloads_from_object_segments(chunks),
+                segment_payloads_from_object_segments(segments),
                 user_start as usize,
                 user_end as usize,
             );
@@ -4983,10 +4988,10 @@ impl Coordinator {
                         .get_object_parts(bucket, key, record.version_id)
                         .map_err(ServerError::Metadata)?;
                     // Collect object segments for streaming parts before deleting metadata.
-                    let mut streaming_chunks: Vec<MultipartPartSegmentRecord> = Vec::new();
+                    let mut streaming_segments: Vec<MultipartPartSegmentRecord> = Vec::new();
                     for part in &obj_parts {
                         if part.part_okh == [0u8; 16] {
-                            let chunks = meta_pg
+                            let segments = meta_pg
                                 .get_multipart_part_segments(
                                     bucket,
                                     key,
@@ -4994,7 +4999,7 @@ impl Coordinator {
                                     part.part_number,
                                 )
                                 .map_err(ServerError::Metadata)?;
-                            streaming_chunks.extend(chunks);
+                            streaming_segments.extend(segments);
                         }
                     }
                     Self::enqueue_multipart_reclaim(
@@ -5003,9 +5008,9 @@ impl Coordinator {
                         key,
                         record.generation_id,
                         &obj_parts,
-                        &streaming_chunks,
+                        &streaming_segments,
                     )?;
-                    if !streaming_chunks.is_empty() {
+                    if !streaming_segments.is_empty() {
                         meta_pg
                             .delete_multipart_part_segments(bucket, key, record.version_id)
                             .map_err(ServerError::Metadata)?;
@@ -5024,7 +5029,7 @@ impl Coordinator {
                     let vid = record.version_id;
 
                     // Segment-manifest payloads are now the only non-multipart layout.
-                    let chunks = meta_pg
+                    let segments = meta_pg
                         .get_object_segments(bucket, key, vid)
                         .map_err(ServerError::Metadata)?;
 
@@ -5033,7 +5038,7 @@ impl Coordinator {
                         bucket,
                         key,
                         record.generation_id,
-                        &chunks,
+                        &segments,
                     )?;
                     meta_pg
                         .delete_object_segments(bucket, key, vid)
@@ -5081,13 +5086,13 @@ impl Coordinator {
                             .get_object_parts(bucket, key, vid)
                             .map_err(ServerError::Metadata)?;
                         // Collect object segments for streaming parts.
-                        let mut streaming_chunks: Vec<MultipartPartSegmentRecord> = Vec::new();
+                        let mut streaming_segments: Vec<MultipartPartSegmentRecord> = Vec::new();
                         for part in &obj_parts {
                             if part.part_okh == [0u8; 16] {
-                                let chunks = meta_pg
+                                let segments = meta_pg
                                     .get_multipart_part_segments(bucket, key, vid, part.part_number)
                                     .map_err(ServerError::Metadata)?;
-                                streaming_chunks.extend(chunks);
+                                streaming_segments.extend(segments);
                             }
                         }
                         Self::enqueue_multipart_reclaim(
@@ -5096,9 +5101,9 @@ impl Coordinator {
                             key,
                             record.generation_id,
                             &obj_parts,
-                            &streaming_chunks,
+                            &streaming_segments,
                         )?;
-                        if !streaming_chunks.is_empty() {
+                        if !streaming_segments.is_empty() {
                             meta_pg
                                 .delete_multipart_part_segments(bucket, key, vid)
                                 .map_err(ServerError::Metadata)?;
@@ -5121,7 +5126,7 @@ impl Coordinator {
                     }
 
                     // Segment-manifest payloads are now the only non-multipart layout.
-                    let chunks = meta_pg
+                    let segments = meta_pg
                         .get_object_segments(bucket, key, vid)
                         .map_err(ServerError::Metadata)?;
 
@@ -5130,7 +5135,7 @@ impl Coordinator {
                         bucket,
                         key,
                         record.generation_id,
-                        &chunks,
+                        &segments,
                     )?;
                     meta_pg
                         .delete_object_segments(bucket, key, vid)
@@ -5642,7 +5647,7 @@ impl Coordinator {
             } else {
                 // Non-multipart source: check for object segments first.
                 let meta_pg = pgs.meta();
-                let chunks = meta_pg
+                let segments = meta_pg
                     .get_object_segments(src_bucket, src_key, src_record.version_id)
                     .map_err(ServerError::Metadata)?;
 
@@ -5651,7 +5656,7 @@ impl Coordinator {
                     src_bucket,
                     src_key,
                     src_record.generation_id,
-                    chunk_payloads_from_object_segments(chunks),
+                    segment_payloads_from_object_segments(segments),
                     read_start as usize,
                     read_end as usize,
                 );
@@ -5946,7 +5951,7 @@ impl Coordinator {
         drop(shard_guard);
         drop(meta_pg);
         if !prev_segments.is_empty() {
-            self.delete_chunk_shards_generic(&prev_segments)?;
+            self.delete_segment_shards_generic(&prev_segments)?;
         } else if let Some(old_gen) = prev_gen {
             let old_okh = part_key_hash(upload_id, part_number, old_gen);
             let old_vid =
@@ -6335,7 +6340,7 @@ impl Coordinator {
                 StaleObjectPayload::Multipart {
                     generation_id,
                     parts,
-                    streaming_chunks,
+                    streaming_segments,
                 } => {
                     // `complete_multipart_commit` already replaced the live
                     // object_parts rows for VersionId::Null, so only enqueue
@@ -6346,7 +6351,7 @@ impl Coordinator {
                         key,
                         *generation_id,
                         parts,
-                        streaming_chunks,
+                        streaming_segments,
                     )?;
                 }
                 StaleObjectPayload::Segments { .. } => {
@@ -6421,7 +6426,7 @@ impl Coordinator {
             .map_err(ServerError::Metadata)?;
 
         // 3b. Collect streaming object segments for shard cleanup.
-        let streaming_chunks = meta_pg
+        let streaming_segments = meta_pg
             .get_all_multipart_part_segments_for_upload(upload_id)
             .map_err(ServerError::Metadata)?;
 
@@ -6450,15 +6455,15 @@ impl Coordinator {
 
         // 5b. Delete shard data for streaming part segments first, then
         //     delete the manifest rows. This order ensures that if shard
-        //     deletion fails, the chunk refs survive for retry.
-        if !streaming_chunks.is_empty() {
-            self.delete_chunk_shards_generic(&streaming_chunks)?;
+        //     deletion fails, the segment refs survive for retry.
+        if !streaming_segments.is_empty() {
+            self.delete_segment_shards_generic(&streaming_segments)?;
         }
 
         // 6. Re-acquire meta PG and delete upload + parts (CASCADE)
         //    and object segments rows.
         let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
-        if !streaming_chunks.is_empty() {
+        if !streaming_segments.is_empty() {
             meta_pg
                 .delete_multipart_part_segments_by_upload_id(upload_id)
                 .map_err(ServerError::Metadata)?;
@@ -6779,8 +6784,8 @@ mod tests {
     }
 
     struct ObjectSegmentsDeleteRaceSync {
-        first_chunk_reached: Arc<Barrier>,
-        first_chunk_resume: Arc<Barrier>,
+        first_segment_reached: Arc<Barrier>,
+        first_segment_resume: Arc<Barrier>,
         delete_reached: Arc<Barrier>,
         delete_resume: Arc<Barrier>,
         _serial_guard: MutexGuard<'static, ()>,
@@ -6795,19 +6800,19 @@ mod tests {
             .get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap();
-        let first_chunk_reached = Arc::new(Barrier::new(2));
-        let first_chunk_resume = Arc::new(Barrier::new(2));
+        let first_segment_reached = Arc::new(Barrier::new(2));
+        let first_segment_resume = Arc::new(Barrier::new(2));
         let delete_reached = Arc::new(Barrier::new(2));
         let delete_resume = Arc::new(Barrier::new(2));
-        let first_chunk_reached_hook = Arc::clone(&first_chunk_reached);
-        let first_chunk_resume_hook = Arc::clone(&first_chunk_resume);
+        let first_segment_reached_hook = Arc::clone(&first_segment_reached);
+        let first_segment_resume_hook = Arc::clone(&first_segment_resume);
         let delete_reached_hook = Arc::clone(&delete_reached);
         let delete_resume_hook = Arc::clone(&delete_resume);
         let guard = install_reclamation_test_hooks(ReclamationTestHooks {
             target: Some((bucket.to_string(), key.to_string())),
-            after_object_segments_first_chunk: Some(Arc::new(move || {
-                first_chunk_reached_hook.wait();
-                first_chunk_resume_hook.wait();
+            after_object_segments_first_segment: Some(Arc::new(move || {
+                first_segment_reached_hook.wait();
+                first_segment_resume_hook.wait();
             })),
             after_object_segments_delete_metadata: Some(Arc::new(move || {
                 delete_reached_hook.wait();
@@ -6816,8 +6821,8 @@ mod tests {
             ..ReclamationTestHooks::default()
         });
         ObjectSegmentsDeleteRaceSync {
-            first_chunk_reached,
-            first_chunk_resume,
+            first_segment_reached,
+            first_segment_resume,
             delete_reached,
             delete_resume,
             _serial_guard: serial,
@@ -11689,30 +11694,30 @@ mod tests {
         let admin = make_coord();
         admin.create_bucket("race-bucket").unwrap();
 
-        let session_id = begin_stream_put_test(&admin, "race-bucket", "race-key-chunks").unwrap();
+        let session_id = begin_stream_put_test(&admin, "race-bucket", "race-key-segments").unwrap();
         admin
-            .append_stream_chunk(
+            .append_stream_segment(
                 "race-bucket",
-                "race-key-chunks",
+                "race-key-segments",
                 &session_id,
                 0,
-                b"chunk-zero-",
+                b"segment-zero-",
             )
             .unwrap();
         admin
-            .append_stream_chunk(
+            .append_stream_segment(
                 "race-bucket",
-                "race-key-chunks",
+                "race-key-segments",
                 &session_id,
                 1,
-                b"chunk-one",
+                b"segment-one",
             )
             .unwrap();
-        let expected = b"chunk-zero-chunk-one".to_vec();
+        let expected = b"segment-zero-segment-one".to_vec();
         admin
             .finalize_stream_put(&FinalizeStreamPutRequest {
                 bucket: "race-bucket",
-                key: "race-key-chunks",
+                key: "race-key-segments",
                 session_id: &session_id,
                 crc64: checksum::crc64::checksum(&expected),
                 total_size: expected.len() as u64,
@@ -11722,7 +11727,7 @@ mod tests {
             })
             .unwrap();
 
-        let sync = install_object_segments_delete_race_hooks("race-bucket", "race-key-chunks");
+        let sync = install_object_segments_delete_race_hooks("race-bucket", "race-key-segments");
         let reader = make_coord();
         let deleter = make_coord();
 
@@ -11730,19 +11735,19 @@ mod tests {
             reader
                 .get_object(&GetObjectRequest {
                     bucket: "race-bucket",
-                    key: "race-key-chunks",
+                    key: "race-key-segments",
                     version_id: None,
                     cond: NO_READ,
                     requester: TEST_REQUESTER,
                 })
                 .and_then(|result| result.body.into_bytes())
         });
-        sync.first_chunk_reached.wait();
+        sync.first_segment_reached.wait();
 
         let t_delete = thread::spawn(move || {
             deleter.delete_object(&DeleteObjectRequest {
                 bucket: "race-bucket",
-                key: "race-key-chunks",
+                key: "race-key-segments",
                 version_id: None,
                 cond: NO_DELETE,
                 requester: TEST_REQUESTER,
@@ -11750,7 +11755,7 @@ mod tests {
         });
         sync.delete_reached.wait();
 
-        sync.first_chunk_resume.wait();
+        sync.first_segment_resume.wait();
         let read_res = t_read.join().unwrap();
         sync.delete_resume.wait();
         let delete_res = t_delete.join().unwrap();
@@ -14289,7 +14294,7 @@ mod tests {
         let session = begin_stream_part_test(coord, bucket, key, &create.upload_id, 2).unwrap();
         let part2 = b"streamed-tail-data".to_vec();
         coord
-            .append_stream_chunk(bucket, key, &session.session_id, 0, &part2)
+            .append_stream_segment(bucket, key, &session.session_id, 0, &part2)
             .unwrap();
         let part2_crc = checksum::crc64::checksum(&part2);
         let part2_result = coord
@@ -15237,20 +15242,20 @@ mod tests {
         let session_id = begin_stream_put_test(&coord, "bucket", "mykey").unwrap();
         assert_eq!(session_id.len(), 32);
 
-        // Append two chunks.
-        let chunk0 = b"hello ";
-        let chunk1 = b"world";
+        // Append two segments.
+        let segment0 = b"hello ";
+        let segment1 = b"world";
         coord
-            .append_stream_chunk("bucket", "mykey", &session_id, 0, chunk0)
+            .append_stream_segment("bucket", "mykey", &session_id, 0, segment0)
             .unwrap();
         coord
-            .append_stream_chunk("bucket", "mykey", &session_id, 1, chunk1)
+            .append_stream_segment("bucket", "mykey", &session_id, 1, segment1)
             .unwrap();
 
         // Finalize with caller-computed CRC64 and total_size.
         let mut full_data = Vec::new();
-        full_data.extend_from_slice(chunk0);
-        full_data.extend_from_slice(chunk1);
+        full_data.extend_from_slice(segment0);
+        full_data.extend_from_slice(segment1);
         let crc = checksum::crc64::checksum(&full_data);
         let metadata = MetadataBlob::from_headers(&[("x-amz-meta-foo", "bar")]).unwrap();
         let result = coord
@@ -15292,7 +15297,7 @@ mod tests {
 
         let session_id = begin_stream_put_test(&coord, "bucket", "mykey").unwrap();
 
-        // Finalize with no chunks appended — zero-byte object.
+        // Finalize with no segments appended — zero-byte object.
         let crc = checksum::crc64::checksum(&[]);
         let metadata = MetadataBlob::new();
         let result = coord
@@ -15330,7 +15335,7 @@ mod tests {
 
         let session_id = begin_stream_put_test(&coord, "bucket", "mykey").unwrap();
         coord
-            .append_stream_chunk("bucket", "mykey", &session_id, 0, b"hello")
+            .append_stream_segment("bucket", "mykey", &session_id, 0, b"hello")
             .unwrap();
 
         let tags_xml =
@@ -15369,7 +15374,7 @@ mod tests {
 
         let session_id = begin_stream_put_test(&coord, "bucket", "mykey").unwrap();
         coord
-            .append_stream_chunk("bucket", "mykey", &session_id, 0, b"data")
+            .append_stream_segment("bucket", "mykey", &session_id, 0, b"data")
             .unwrap();
 
         // Abort the session.
@@ -15414,7 +15419,7 @@ mod tests {
 
         // Session is deleted after finalize — append should fail.
         let err = coord
-            .append_stream_chunk("bucket", "mykey", &session_id, 0, b"data")
+            .append_stream_segment("bucket", "mykey", &session_id, 0, b"data")
             .unwrap_err();
         assert!(
             matches!(
@@ -15469,7 +15474,7 @@ mod tests {
 
         // Attempt append with wrong key.
         let err = coord
-            .append_stream_chunk("bucket", "key2", &session_id, 0, b"data")
+            .append_stream_segment("bucket", "key2", &session_id, 0, b"data")
             .unwrap_err();
         // The session lives on key1's metadata PG. If key2 maps to a different PG,
         // the session won't be found. If same PG, the bucket/key check catches it.
@@ -15548,7 +15553,7 @@ mod tests {
         let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         let new_data = b"new-streamed-data";
         coord
-            .append_stream_chunk("bucket", "key", &session_id, 0, new_data)
+            .append_stream_segment("bucket", "key", &session_id, 0, new_data)
             .unwrap();
 
         let crc = checksum::crc64::checksum(new_data.as_slice());
@@ -15603,7 +15608,7 @@ mod tests {
         // Stream put with if-match on the correct etag succeeds.
         let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         coord
-            .append_stream_chunk("bucket", "key", &session_id, 0, b"updated")
+            .append_stream_segment("bucket", "key", &session_id, 0, b"updated")
             .unwrap();
         let crc = checksum::crc64::checksum(b"updated");
         let metadata = MetadataBlob::new();
@@ -15624,7 +15629,7 @@ mod tests {
         // Stream put with if-match on a wrong etag fails.
         let session_id2 = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         coord
-            .append_stream_chunk("bucket", "key", &session_id2, 0, b"third")
+            .append_stream_segment("bucket", "key", &session_id2, 0, b"third")
             .unwrap();
         let bad_cond =
             WriteCondition::IfMatch(SpecificEtag::new("\"0000000000000000\"".to_string()).unwrap());
@@ -15647,24 +15652,24 @@ mod tests {
     }
 
     #[test]
-    fn stream_put_multiple_chunks_correct_manifest() {
+    fn stream_put_multiple_segments_correct_manifest() {
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
         let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
 
-        // Append 3 chunks.
-        let chunks: Vec<&[u8]> = vec![b"aaa", b"bbb", b"ccc"];
-        for (i, chunk) in chunks.iter().enumerate() {
+        // Append 3 segments.
+        let segments: Vec<&[u8]> = vec![b"aaa", b"bbb", b"ccc"];
+        for (i, segment) in segments.iter().enumerate() {
             coord
-                .append_stream_chunk("bucket", "key", &session_id, i as u32, chunk)
+                .append_stream_segment("bucket", "key", &session_id, i as u32, segment)
                 .unwrap();
         }
 
         let mut full_data = Vec::new();
-        for chunk in &chunks {
-            full_data.extend_from_slice(chunk);
+        for segment in &segments {
+            full_data.extend_from_slice(segment);
         }
         let crc = checksum::crc64::checksum(&full_data);
         let metadata = MetadataBlob::new();
@@ -15689,9 +15694,9 @@ mod tests {
             .get_object_segments("bucket", "key", result.version_id)
             .unwrap();
         assert_eq!(committed.len(), 3);
-        for (i, chunk) in committed.iter().enumerate() {
-            assert_eq!(chunk.segment_index, i as u32);
-            assert_eq!(chunk.size, 3); // "aaa", "bbb", "ccc" are all 3 bytes
+        for (i, segment) in committed.iter().enumerate() {
+            assert_eq!(segment.segment_index, i as u32);
+            assert_eq!(segment.size, 3); // "aaa", "bbb", "ccc" are all 3 bytes
         }
     }
 
@@ -15703,12 +15708,13 @@ mod tests {
 
         let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         coord
-            .append_stream_chunk("bucket", "key", &session_id, 0, b"data-to-clean")
+            .append_stream_segment("bucket", "key", &session_id, 0, b"data-to-clean")
             .unwrap();
 
         // Record shard keys before abort for verification.
-        let segment_okh = crate::pg::chunk_key_hash(&session_id, 0);
-        let shard_pg_id = coord.shard_pg_id(&format!("chunk/{session_id}"), "0", GenerationId::MIN);
+        let segment_okh = crate::pg::stream_segment_key_hash(&session_id, 0);
+        let shard_pg_id =
+            coord.shard_pg_id(&format!("segment/{session_id}"), "0", GenerationId::MIN);
 
         coord
             .abort_stream_put("bucket", "key", &session_id)
@@ -15734,7 +15740,7 @@ mod tests {
 
         let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         coord
-            .append_stream_chunk("bucket", "key", &session_id, 0, b"hello")
+            .append_stream_segment("bucket", "key", &session_id, 0, b"hello")
             .unwrap();
         let crc = checksum::crc64::checksum(b"hello");
         let metadata = MetadataBlob::new();
@@ -15778,21 +15784,21 @@ mod tests {
     }
 
     #[test]
-    fn stream_put_get_multi_chunk() {
-        // Stream-put with multiple chunks: GET reconstructs all chunks.
+    fn stream_put_get_multi_segment() {
+        // Stream-put with multiple segments: GET reconstructs all segments.
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
         let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         coord
-            .append_stream_chunk("bucket", "key", &session_id, 0, b"aaaa")
+            .append_stream_segment("bucket", "key", &session_id, 0, b"aaaa")
             .unwrap();
         coord
-            .append_stream_chunk("bucket", "key", &session_id, 1, b"bbbb")
+            .append_stream_segment("bucket", "key", &session_id, 1, b"bbbb")
             .unwrap();
         coord
-            .append_stream_chunk("bucket", "key", &session_id, 2, b"cc")
+            .append_stream_segment("bucket", "key", &session_id, 2, b"cc")
             .unwrap();
 
         let full_data = b"aaaabbbbcc";
@@ -15832,10 +15838,10 @@ mod tests {
 
         let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         coord
-            .append_stream_chunk("bucket", "key", &session_id, 0, b"AAAA")
+            .append_stream_segment("bucket", "key", &session_id, 0, b"AAAA")
             .unwrap();
         coord
-            .append_stream_chunk("bucket", "key", &session_id, 1, b"BBBB")
+            .append_stream_segment("bucket", "key", &session_id, 1, b"BBBB")
             .unwrap();
 
         let full_data = b"AAAABBBB";
@@ -15853,7 +15859,7 @@ mod tests {
             })
             .unwrap();
 
-        // Range within first chunk.
+        // Range within first segment.
         let r1 = coord
             .get_object_range(&GetObjectRangeRequest {
                 bucket: "bucket",
@@ -15866,7 +15872,7 @@ mod tests {
             .unwrap();
         assert_eq!(r1.body.into_bytes().unwrap(), b"AAAA");
 
-        // Range spanning chunks.
+        // Range spanning segments.
         let r2 = coord
             .get_object_range(&GetObjectRangeRequest {
                 bucket: "bucket",
@@ -15879,7 +15885,7 @@ mod tests {
             .unwrap();
         assert_eq!(r2.body.into_bytes().unwrap(), b"AABB");
 
-        // Range within second chunk.
+        // Range within second segment.
         let r3 = coord
             .get_object_range(&GetObjectRangeRequest {
                 bucket: "bucket",
@@ -15915,7 +15921,7 @@ mod tests {
 
         let session_id = begin_stream_put_test(&coord, "bucket", "src").unwrap();
         coord
-            .append_stream_chunk("bucket", "src", &session_id, 0, b"copy-me")
+            .append_stream_segment("bucket", "src", &session_id, 0, b"copy-me")
             .unwrap();
         let crc = checksum::crc64::checksum(b"copy-me");
         coord
@@ -16120,7 +16126,7 @@ mod tests {
 
         let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         coord
-            .append_stream_chunk("bucket", "key", &session_id, 0, b"partdata")
+            .append_stream_segment("bucket", "key", &session_id, 0, b"partdata")
             .unwrap();
         let crc = checksum::crc64::checksum(b"partdata");
         coord
@@ -16151,8 +16157,8 @@ mod tests {
     }
 
     #[test]
-    fn stream_put_overwrite_with_normal_put_cleans_chunks() {
-        // P0 fix: normal PUT after stream-write must clear stale chunk rows.
+    fn stream_put_overwrite_with_normal_put_cleans_segments() {
+        // P0 fix: normal PUT after stream-write must clear stale segment rows.
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
@@ -16160,7 +16166,7 @@ mod tests {
         // Stream-write an object.
         let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         coord
-            .append_stream_chunk("bucket", "key", &session_id, 0, b"stream-data")
+            .append_stream_segment("bucket", "key", &session_id, 0, b"stream-data")
             .unwrap();
         let crc = checksum::crc64::checksum(b"stream-data");
         coord
@@ -16202,7 +16208,7 @@ mod tests {
             })
             .unwrap();
 
-        // GET should return the new data, not stale chunk data.
+        // GET should return the new data, not stale segment data.
         let r2 = coord
             .get_object(&GetObjectRequest {
                 bucket: "bucket",
@@ -16216,7 +16222,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_put_delete_cleans_chunks() {
+    fn stream_put_delete_cleans_segments() {
         // P1 fix: delete must clean up object_segments and their shards.
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
@@ -16224,7 +16230,7 @@ mod tests {
 
         let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         coord
-            .append_stream_chunk("bucket", "key", &session_id, 0, b"delete-me")
+            .append_stream_segment("bucket", "key", &session_id, 0, b"delete-me")
             .unwrap();
         let crc = checksum::crc64::checksum(b"delete-me");
         coord
@@ -16265,14 +16271,14 @@ mod tests {
     }
 
     #[test]
-    fn stream_put_delete_eventually_reclaims_chunk_shards() {
+    fn stream_put_delete_eventually_reclaims_segment_shards() {
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
         let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         coord
-            .append_stream_chunk("bucket", "key", &session_id, 0, b"delete-me")
+            .append_stream_segment("bucket", "key", &session_id, 0, b"delete-me")
             .unwrap();
         let crc = checksum::crc64::checksum(b"delete-me");
         let result = coord
@@ -16288,7 +16294,7 @@ mod tests {
             })
             .unwrap();
 
-        let chunks = {
+        let segments = {
             let meta_pg_id = coord.object_pg_id("bucket", "key");
             let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
             pg.get_object_segments("bucket", "key", result.version_id)
@@ -16305,7 +16311,7 @@ mod tests {
             })
             .unwrap();
 
-        for segment in chunks {
+        for segment in segments {
             wait_for_shard_set_deletion(
                 &coord,
                 segment.shard_pg_id,
@@ -16329,7 +16335,7 @@ mod tests {
         // Stream-write a source object.
         let session_id = begin_stream_put_test(&coord, "bucket", "src").unwrap();
         coord
-            .append_stream_chunk("bucket", "src", &session_id, 0, b"source-data")
+            .append_stream_segment("bucket", "src", &session_id, 0, b"source-data")
             .unwrap();
         let crc = checksum::crc64::checksum(b"source-data");
         coord
@@ -16434,19 +16440,19 @@ mod tests {
 
         let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         coord
-            .append_stream_chunk("bucket", "key", &session_id, 0, b"first")
+            .append_stream_segment("bucket", "key", &session_id, 0, b"first")
             .unwrap();
 
         // Appending the same segment_index again should be rejected.
         let err = coord
-            .append_stream_chunk("bucket", "key", &session_id, 0, b"second")
+            .append_stream_segment("bucket", "key", &session_id, 0, b"second")
             .unwrap_err();
         assert!(
             matches!(err, ServerError::InvalidRequest { .. }),
             "expected InvalidRequest for duplicate segment_index, got {err:?}"
         );
 
-        // Original chunk should still be intact — verify by finalizing.
+        // Original segment should still be intact — verify by finalizing.
         let crc = checksum::crc64::checksum(b"first");
         let metadata = MetadataBlob::new();
         coord
@@ -16471,7 +16477,7 @@ mod tests {
 
         let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         coord
-            .append_stream_chunk("bucket", "key", &session_id, 0, b"hello")
+            .append_stream_segment("bucket", "key", &session_id, 0, b"hello")
             .unwrap();
 
         // Finalize with wrong total_size.
@@ -16497,7 +16503,7 @@ mod tests {
 
     #[test]
     fn stream_append_accepts_upload_part_session() {
-        // append_stream_chunk accepts both PutObject and UploadPart sessions.
+        // append_stream_segment accepts both PutObject and UploadPart sessions.
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
@@ -16517,7 +16523,7 @@ mod tests {
         drop(pg);
 
         coord
-            .append_stream_chunk("bucket", "key", "upload-part-session", 0, b"data")
+            .append_stream_segment("bucket", "key", "upload-part-session", 0, b"data")
             .unwrap();
     }
 
@@ -16545,10 +16551,10 @@ mod tests {
         let session = begin_stream_part_test(&coord, "bucket", "key", &mpu.upload_id, 1).unwrap();
         let session_id = session.session_id;
 
-        // Append chunks.
+        // Append segments.
         let data = b"hello streaming part";
         coord
-            .append_stream_chunk("bucket", "key", &session_id, 0, data)
+            .append_stream_segment("bucket", "key", &session_id, 0, data)
             .unwrap();
 
         // Finalize.
@@ -16639,7 +16645,7 @@ mod tests {
 
         let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         coord
-            .append_stream_chunk("bucket", "key", &session_id, 0, b"data")
+            .append_stream_segment("bucket", "key", &session_id, 0, b"data")
             .unwrap();
 
         let mpu = coord
@@ -16672,7 +16678,7 @@ mod tests {
     #[test]
     fn concurrent_streamed_mpu_isolation_on_unversioned_key() {
         // Regression: two streamed MPUs on the same unversioned key must not
-        // corrupt each other's chunk data. Upload A completes first; upload B
+        // corrupt each other's segment data. Upload A completes first; upload B
         // completes second (overwriting A). Each must read back its own data.
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
@@ -16708,7 +16714,7 @@ mod tests {
                 .unwrap()
                 .session_id;
             coord
-                .append_stream_chunk("bucket", "key", &sess, 0, data)
+                .append_stream_segment("bucket", "key", &sess, 0, data)
                 .unwrap();
             let crc = checksum::crc64::checksum(data);
             let result = coord
@@ -16829,7 +16835,7 @@ mod tests {
             .session_id;
         let data = b"streamed-part-data-for-abort-test";
         coord
-            .append_stream_chunk("bucket", "key", &sess, 0, data)
+            .append_stream_segment("bucket", "key", &sess, 0, data)
             .unwrap();
         let crc = checksum::crc64::checksum(data);
         coord
@@ -16846,23 +16852,24 @@ mod tests {
             })
             .unwrap();
 
-        // Capture chunk records before abort for shard verification.
+        // Capture segment records before abort for shard verification.
         let meta_pg_id = coord.object_pg_id("bucket", "key");
-        let chunks_before = {
+        let segments_before = {
             let meta_pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
-            let chunks = meta_pg
+            let segments = meta_pg
                 .get_all_multipart_part_segments_for_upload(&mpu.upload_id)
                 .unwrap();
-            assert!(!chunks.is_empty(), "chunks should exist before abort");
-            chunks
+            assert!(!segments.is_empty(), "segments should exist before abort");
+            segments
         };
 
         // Verify shard data exists before abort.
-        for chunk in &chunks_before {
-            let shard_pg = coord.storage_node.get_pg(chunk.shard_pg_id).unwrap();
-            let total = chunk.ec_k as usize + chunk.ec_m as usize;
+        for segment in &segments_before {
+            let shard_pg = coord.storage_node.get_pg(segment.shard_pg_id).unwrap();
+            let total = segment.ec_k as usize + segment.ec_m as usize;
             for i in 0..total {
-                let shard_key = ShardKey::new(&chunk.segment_okh, chunk.segment_vid.get(), i as u8);
+                let shard_key =
+                    ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i as u8);
                 assert!(
                     shard_pg.read_shard(&shard_key).is_ok(),
                     "shard {i} should exist before abort"
@@ -16884,21 +16891,22 @@ mod tests {
         // Verify object segments rows are gone.
         {
             let meta_pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
-            let chunks = meta_pg
+            let segments = meta_pg
                 .get_all_multipart_part_segments_for_upload(&mpu.upload_id)
                 .unwrap();
             assert!(
-                chunks.is_empty(),
+                segments.is_empty(),
                 "object segments rows should be deleted after abort"
             );
         }
 
         // Verify shard data is gone.
-        for chunk in &chunks_before {
-            let shard_pg = coord.storage_node.get_pg(chunk.shard_pg_id).unwrap();
-            let total = chunk.ec_k as usize + chunk.ec_m as usize;
+        for segment in &segments_before {
+            let shard_pg = coord.storage_node.get_pg(segment.shard_pg_id).unwrap();
+            let total = segment.ec_k as usize + segment.ec_m as usize;
             for i in 0..total {
-                let shard_key = ShardKey::new(&chunk.segment_okh, chunk.segment_vid.get(), i as u8);
+                let shard_key =
+                    ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i as u8);
                 assert!(
                     shard_pg.read_shard(&shard_key).is_err(),
                     "shard {i} should be deleted after abort"
@@ -16918,7 +16926,7 @@ mod tests {
         // Begin a session (creates with current timestamp).
         let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         coord
-            .append_stream_chunk("bucket", "key", &session_id, 0, b"data")
+            .append_stream_segment("bucket", "key", &session_id, 0, b"data")
             .unwrap();
 
         // Scavenge with a very large max_age so all sessions created "now" are stale.
@@ -16931,7 +16939,7 @@ mod tests {
 
         // Session should be gone — appending should fail.
         let err = coord
-            .append_stream_chunk("bucket", "key", &session_id, 1, b"more")
+            .append_stream_segment("bucket", "key", &session_id, 1, b"more")
             .unwrap_err();
         assert!(
             matches!(
@@ -16952,7 +16960,7 @@ mod tests {
 
         let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         coord
-            .append_stream_chunk("bucket", "key", &session_id, 0, b"safe-data")
+            .append_stream_segment("bucket", "key", &session_id, 0, b"safe-data")
             .unwrap();
         let crc = checksum::crc64::checksum(b"safe-data");
         coord
@@ -16994,7 +17002,7 @@ mod tests {
 
         let session_id = begin_stream_put_test(&coord, "bucket", "new-key").unwrap();
         coord
-            .append_stream_chunk("bucket", "new-key", &session_id, 0, b"pending")
+            .append_stream_segment("bucket", "new-key", &session_id, 0, b"pending")
             .unwrap();
 
         // Key should not exist yet.
@@ -17032,10 +17040,10 @@ mod tests {
 
         let session_id = begin_stream_put_test(&coord, "bucket", "verify").unwrap();
         coord
-            .append_stream_chunk("bucket", "verify", &session_id, 0, b"chunk-0-")
+            .append_stream_segment("bucket", "verify", &session_id, 0, b"chunk-0-")
             .unwrap();
         coord
-            .append_stream_chunk("bucket", "verify", &session_id, 1, b"chunk-1-")
+            .append_stream_segment("bucket", "verify", &session_id, 1, b"chunk-1-")
             .unwrap();
         let full = b"chunk-0-chunk-1-";
         let crc = checksum::crc64::checksum(full);
@@ -17057,21 +17065,21 @@ mod tests {
         {
             let meta_pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
             let record = meta_pg.get_object_meta("bucket", "verify").unwrap();
-            let chunks = meta_pg
+            let segments = meta_pg
                 .get_object_segments("bucket", "verify", record.version_id())
                 .unwrap();
 
-            assert_eq!(chunks.len(), 2);
-            assert_eq!(chunks[0].segment_index, 0);
-            assert_eq!(chunks[0].size, 8);
+            assert_eq!(segments.len(), 2);
+            assert_eq!(segments[0].segment_index, 0);
+            assert_eq!(segments[0].size, 8);
             assert_eq!(
-                chunks[0].segment_crc64,
+                segments[0].segment_crc64,
                 Some(checksum::crc64::checksum(b"chunk-0-"))
             );
-            assert_eq!(chunks[1].segment_index, 1);
-            assert_eq!(chunks[1].size, 8);
+            assert_eq!(segments[1].segment_index, 1);
+            assert_eq!(segments[1].size, 8);
             assert_eq!(
-                chunks[1].segment_crc64,
+                segments[1].segment_crc64,
                 Some(checksum::crc64::checksum(b"chunk-1-"))
             );
         } // Drop PG lock before coordinator calls.
@@ -17170,7 +17178,7 @@ mod tests {
         // 1. Stream-write.
         let session_id = begin_stream_put_test(&coord, "bucket", "cycle").unwrap();
         coord
-            .append_stream_chunk("bucket", "cycle", &session_id, 0, b"v1")
+            .append_stream_segment("bucket", "cycle", &session_id, 0, b"v1")
             .unwrap();
         let crc = checksum::crc64::checksum(b"v1");
         coord
@@ -17226,7 +17234,7 @@ mod tests {
 
     #[test]
     fn stream_put_overwrite_with_stream_put() {
-        // Stream-write → stream-write overwrite: second write's chunks replace first.
+        // Stream-write → stream-write overwrite: second write's segments replace first.
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
@@ -17234,7 +17242,7 @@ mod tests {
         // First stream-write.
         let s1 = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         coord
-            .append_stream_chunk("bucket", "key", &s1, 0, b"old-data")
+            .append_stream_segment("bucket", "key", &s1, 0, b"old-data")
             .unwrap();
         coord
             .finalize_stream_put(&FinalizeStreamPutRequest {
@@ -17252,7 +17260,7 @@ mod tests {
         // Second stream-write (overwrite).
         let s2 = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         coord
-            .append_stream_chunk("bucket", "key", &s2, 0, b"new-data")
+            .append_stream_segment("bucket", "key", &s2, 0, b"new-data")
             .unwrap();
         coord
             .finalize_stream_put(&FinalizeStreamPutRequest {

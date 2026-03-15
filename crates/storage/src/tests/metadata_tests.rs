@@ -2527,7 +2527,7 @@ fn stream_segment_append_and_list() {
 
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "sess-chunks".into(),
+            session_id: "sess-segments".into(),
             bucket: "b".into(),
             key: "k".into(),
             target: StreamUploadTarget::PutObject,
@@ -2537,7 +2537,7 @@ fn stream_segment_append_and_list() {
     for i in 0..3u32 {
         store
             .append_stream_segment(&StreamUploadSegmentRecord {
-                session_id: "sess-chunks".into(),
+                session_id: "sess-segments".into(),
                 segment_index: i,
                 size: (i as u64 + 1) * 1000,
                 segment_crc64: Some((i as u64) + 10),
@@ -2550,7 +2550,7 @@ fn stream_segment_append_and_list() {
             .unwrap();
     }
 
-    let segments = store.list_stream_segments("sess-chunks").unwrap();
+    let segments = store.list_stream_segments("sess-segments").unwrap();
     assert_eq!(segments.len(), 3);
     assert_eq!(segments[0].segment_index, 0);
     assert_eq!(segments[0].size, 1000);
@@ -2591,7 +2591,7 @@ fn stream_segment_cascade_delete() {
         })
         .unwrap();
 
-    // Deleting session cascades to chunks
+    // Delete session cascades to segments
     store.delete_stream_upload("sess-cascade").unwrap();
 
     let segments = store.list_stream_segments("sess-cascade").unwrap();
@@ -2602,7 +2602,7 @@ fn stream_segment_cascade_delete() {
 fn commit_stream_put_atomic() {
     let (_dir, store) = make_pg_store();
 
-    // Create session and append chunks
+    // Create session and append segments
     store
         .create_stream_upload(&CreateStreamUploadReq {
             session_id: "sess-commit".into(),
@@ -2653,7 +2653,7 @@ fn commit_stream_put_atomic() {
         metadata_blob: None,
     };
 
-    let committed_chunks = vec![
+    let committed_segments = vec![
         ObjectSegmentRecord {
             bucket: "b".into(),
             key: "k".into(),
@@ -2683,7 +2683,7 @@ fn commit_stream_put_atomic() {
     ];
 
     store
-        .commit_stream_put("sess-commit", &obj, &committed_chunks)
+        .commit_stream_put("sess-commit", &obj, &committed_segments)
         .unwrap();
 
     // Object metadata is committed
@@ -2692,20 +2692,20 @@ fn commit_stream_put_atomic() {
     assert_eq!(live.size, 6_000_000);
     assert_eq!(live.layout, ObjectLayout::Standard);
 
-    // Committed chunks are readable
-    let chunks = store
+    // Committed segments are readable
+    let segments = store
         .get_object_segments("b", "k", VersionId::Null)
         .unwrap();
-    assert_eq!(chunks.len(), 2);
-    assert_eq!(chunks[0].segment_index, 0);
-    assert_eq!(chunks[0].size, 4_000_000);
-    assert_eq!(chunks[0].segment_crc64, Some(11));
-    assert_eq!(chunks[0].segment_okh, [0x11; 16]);
-    assert_eq!(chunks[0].shard_pg_id, 0);
-    assert_eq!(chunks[1].segment_index, 1);
-    assert_eq!(chunks[1].size, 2_000_000);
-    assert_eq!(chunks[1].segment_crc64, Some(22));
-    assert_eq!(chunks[1].shard_pg_id, 1);
+    assert_eq!(segments.len(), 2);
+    assert_eq!(segments[0].segment_index, 0);
+    assert_eq!(segments[0].size, 4_000_000);
+    assert_eq!(segments[0].segment_crc64, Some(11));
+    assert_eq!(segments[0].segment_okh, [0x11; 16]);
+    assert_eq!(segments[0].shard_pg_id, 0);
+    assert_eq!(segments[1].segment_index, 1);
+    assert_eq!(segments[1].size, 2_000_000);
+    assert_eq!(segments[1].segment_crc64, Some(22));
+    assert_eq!(segments[1].shard_pg_id, 1);
 
     // Staging rows are cleaned up
     let err = store.get_stream_upload("sess-commit").unwrap_err();
@@ -2803,13 +2803,13 @@ fn commit_stream_put_overwrite_unversioned() {
     let record = store.get_object_meta("b", "k").unwrap();
     assert_eq!(record.as_live().unwrap().size, 200);
 
-    // Chunks replaced
-    let chunks = store
+    // Segments replaced
+    let segments = store
         .get_object_segments("b", "k", VersionId::Null)
         .unwrap();
-    assert_eq!(chunks.len(), 1);
-    assert_eq!(chunks[0].size, 200);
-    assert_eq!(chunks[0].segment_okh, [2; 16]);
+    assert_eq!(segments.len(), 1);
+    assert_eq!(segments[0].size, 200);
+    assert_eq!(segments[0].segment_okh, [2; 16]);
 }
 
 #[test]
@@ -2991,14 +2991,14 @@ fn delete_object_segments_cleanup() {
         )
         .unwrap();
 
-    // Delete committed chunks
+    // Delete committed segments
     store
         .delete_object_segments("b", "k", VersionId::Null)
         .unwrap();
-    let chunks = store
+    let segments = store
         .get_object_segments("b", "k", VersionId::Null)
         .unwrap();
-    assert!(chunks.is_empty());
+    assert!(segments.is_empty());
 
     // Idempotent
     store
@@ -3075,23 +3075,23 @@ fn multipart_part_segments_crud() {
     .unwrap();
 
     // Read back
-    let chunks = store
+    let segments = store
         .get_multipart_part_segments("b", "k", VersionId::from_u64(1), 1)
         .unwrap();
-    assert_eq!(chunks.len(), 2);
-    assert_eq!(chunks[0].segment_index, 0);
-    assert_eq!(chunks[0].size, 4_000_000);
-    assert_eq!(chunks[1].segment_index, 1);
-    assert_eq!(chunks[1].size, 2_000_000);
+    assert_eq!(segments.len(), 2);
+    assert_eq!(segments[0].segment_index, 0);
+    assert_eq!(segments[0].size, 4_000_000);
+    assert_eq!(segments[1].segment_index, 1);
+    assert_eq!(segments[1].size, 2_000_000);
 
     // Delete
     store
         .delete_multipart_part_segments("b", "k", VersionId::from_u64(1))
         .unwrap();
-    let chunks = store
+    let segments = store
         .get_multipart_part_segments("b", "k", VersionId::from_u64(1), 1)
         .unwrap();
-    assert!(chunks.is_empty());
+    assert!(segments.is_empty());
 }
 
 #[test]
@@ -3171,7 +3171,7 @@ fn upsert_multipart_part_segments_replaces_prior_segments() {
 }
 
 #[test]
-fn commit_stream_part_replaces_prior_chunks_on_reupload() {
+fn commit_stream_part_replaces_prior_segments_on_reupload() {
     let (_dir, store) = make_pg_store();
 
     // Create the multipart upload first
@@ -3201,7 +3201,7 @@ fn commit_stream_part_replaces_prior_chunks_on_reupload() {
         checksum: None,
     };
 
-    // First upload: 3 chunks
+    // First upload: 3 segments
     store
         .create_stream_upload(&CreateStreamUploadReq {
             session_id: "sp-1".into(),
@@ -3214,7 +3214,7 @@ fn commit_stream_part_replaces_prior_chunks_on_reupload() {
         })
         .unwrap();
 
-    let chunks_v1: Vec<MultipartPartSegmentRecord> = (0..3)
+    let segments_v1: Vec<MultipartPartSegmentRecord> = (0..3)
         .map(|i| MultipartPartSegmentRecord {
             bucket: "b".into(),
             key: "k".into(),
@@ -3233,15 +3233,15 @@ fn commit_stream_part_replaces_prior_chunks_on_reupload() {
         .collect();
 
     store
-        .commit_stream_part("sp-1", &make_part(3000), &chunks_v1)
+        .commit_stream_part("sp-1", &make_part(3000), &segments_v1)
         .unwrap();
 
-    let chunks = store
+    let segments = store
         .get_multipart_part_segments("b", "k", VersionId::from_u64(u64::MAX), 1)
         .unwrap();
-    assert_eq!(chunks.len(), 3);
+    assert_eq!(segments.len(), 3);
 
-    // Re-upload same part: only 1 chunk (fewer than before)
+    // Re-upload same part: only 1 segment (fewer than before)
     store
         .create_stream_upload(&CreateStreamUploadReq {
             session_id: "sp-2".into(),
@@ -3254,7 +3254,7 @@ fn commit_stream_part_replaces_prior_chunks_on_reupload() {
         })
         .unwrap();
 
-    let chunks_v2 = vec![MultipartPartSegmentRecord {
+    let segments_v2 = vec![MultipartPartSegmentRecord {
         bucket: "b".into(),
         key: "k".into(),
         upload_id: "mpu-1".into(),
@@ -3271,16 +3271,16 @@ fn commit_stream_part_replaces_prior_chunks_on_reupload() {
     }];
 
     store
-        .commit_stream_part("sp-2", &make_part(5000), &chunks_v2)
+        .commit_stream_part("sp-2", &make_part(5000), &segments_v2)
         .unwrap();
 
-    // Verify: only 1 chunk (stale rows deleted)
-    let chunks = store
+    // Verify: only 1 segment (stale rows deleted)
+    let segments = store
         .get_multipart_part_segments("b", "k", VersionId::from_u64(u64::MAX), 1)
         .unwrap();
-    assert_eq!(chunks.len(), 1);
-    assert_eq!(chunks[0].size, 5000);
-    assert_eq!(chunks[0].segment_okh, [0x22; 16]);
+    assert_eq!(segments.len(), 1);
+    assert_eq!(segments[0].size, 5000);
+    assert_eq!(segments[0].segment_okh, [0x22; 16]);
 }
 
 #[test]
@@ -3425,7 +3425,7 @@ fn commit_stream_part_rejects_wrong_upload_id() {
 }
 
 #[test]
-fn commit_stream_part_zero_chunks_clears_prior() {
+fn commit_stream_part_zero_segments_clears_prior() {
     let (_dir, store) = make_pg_store();
 
     store
@@ -3439,7 +3439,7 @@ fn commit_stream_part_zero_chunks_clears_prior() {
         })
         .unwrap();
 
-    // First upload: 2 chunks
+    // First upload: 2 segments
     store
         .create_stream_upload(&CreateStreamUploadReq {
             session_id: "sp-zc1".into(),
@@ -3511,7 +3511,7 @@ fn commit_stream_part_zero_chunks_clears_prior() {
         2
     );
 
-    // Re-upload with zero chunks — must clear prior rows
+    // Re-upload with zero segments — must clear prior rows
     store
         .create_stream_upload(&CreateStreamUploadReq {
             session_id: "sp-zc2".into(),
@@ -3540,21 +3540,21 @@ fn commit_stream_part_zero_chunks_clears_prior() {
                 last_modified: 2000,
                 checksum: None,
             },
-            &[], // zero chunks
+            &[], // zero segments
         )
         .unwrap();
 
-    let chunks = store
+    let segments = store
         .get_multipart_part_segments("b", "k", VersionId::from_u64(u64::MAX), 1)
         .unwrap();
     assert!(
-        chunks.is_empty(),
-        "stale chunks should be deleted on zero-chunk re-upload"
+        segments.is_empty(),
+        "stale segments should be deleted on zero-segment re-upload"
     );
 }
 
 #[test]
-fn commit_stream_put_rejects_mismatched_chunk_target() {
+fn commit_stream_put_rejects_mismatched_segment_target() {
     let (_dir, store) = make_pg_store();
 
     store
@@ -3566,7 +3566,7 @@ fn commit_stream_put_rejects_mismatched_chunk_target() {
         })
         .unwrap();
 
-    // Chunk with wrong bucket
+    // Segment with wrong bucket
     let err = store
         .commit_stream_put(
             "sp-ct",
@@ -3601,7 +3601,7 @@ fn commit_stream_put_rejects_mismatched_chunk_target() {
             err,
             crate::error::MetadataError::StreamSessionNotFound { .. }
         ),
-        "expected rejection for mismatched chunk bucket, got: {err:?}"
+        "expected rejection for mismatched segment bucket, got: {err:?}"
     );
 }
 
@@ -3800,7 +3800,7 @@ fn get_bucket_payload_reclaim_root_returns_first_root() {
 }
 
 #[test]
-fn commit_stream_part_rejects_mismatched_chunk_part_number() {
+fn commit_stream_part_rejects_mismatched_segment_part_number() {
     let (_dir, store) = make_pg_store();
 
     store
@@ -3866,12 +3866,12 @@ fn commit_stream_part_rejects_mismatched_chunk_part_number() {
             err,
             crate::error::MetadataError::StreamSessionNotFound { .. }
         ),
-        "expected rejection for mismatched chunk part_number, got: {err:?}"
+        "expected rejection for mismatched segment part_number, got: {err:?}"
     );
 }
 
 #[test]
-fn commit_stream_part_rejects_non_staging_chunk_version_id() {
+fn commit_stream_part_rejects_non_staging_segment_version_id() {
     let (_dir, store) = make_pg_store();
 
     store
@@ -3897,7 +3897,7 @@ fn commit_stream_part_rejects_non_staging_chunk_version_id() {
         })
         .unwrap();
 
-    // Chunk has version_id=42 — must be PART_CHUNK_STAGING_VERSION_ID (u64::MAX) pre-CompleteMultipartUpload
+    // Segment has version_id=42 — must be PART_SEGMENT_STAGING_VERSION_ID (u64::MAX) pre-CompleteMultipartUpload
     let err = store
         .commit_stream_part(
             "sp-vid",
@@ -3937,7 +3937,7 @@ fn commit_stream_part_rejects_non_staging_chunk_version_id() {
             err,
             crate::error::MetadataError::StreamSessionNotFound { .. }
         ),
-        "expected rejection for non-staging chunk version_id, got: {err:?}"
+        "expected rejection for non-staging segment version_id, got: {err:?}"
     );
 }
 
@@ -3945,7 +3945,7 @@ fn commit_stream_part_rejects_non_staging_chunk_version_id() {
 fn malformed_segment_okh_returns_db_error() {
     let (_dir, store) = make_pg_store();
 
-    // Insert a chunk with wrong-length okh directly via SQL
+    // Insert a segment with wrong-length okh directly via SQL
     let conn = store.connection();
     conn.execute(
         "INSERT INTO object_segments \

@@ -22,10 +22,10 @@ use crate::schema::init_pg_schema;
 use crate::traits::{PgMetadataStore, ShardStore};
 use crate::types::*;
 
-/// Part chunk rows use a sentinel version_id during staging (pre-CompleteMultipartUpload).
+/// Part segment rows use a sentinel version_id during staging (pre-CompleteMultipartUpload).
 /// Must differ from any real version_id (0 for unversioned, 1+ for versioned) so that
 /// in-progress staging rows are invisible to reads of completed objects.
-const PART_CHUNK_STAGING_VERSION_ID: VersionId = MULTIPART_PART_SEGMENT_STAGING_VERSION_ID;
+const PART_SEGMENT_STAGING_VERSION_ID: VersionId = MULTIPART_PART_SEGMENT_STAGING_VERSION_ID;
 type StreamSessionRow = (u8, u8, BucketName, ObjectKey, Option<UploadId>, Option<i64>);
 
 /// Per-PG store combining shard file I/O with SQLite metadata.
@@ -2043,7 +2043,7 @@ impl PgMetadataStore for PgStore {
                     });
                 }
                 MultipartReclaimPartKind::Segments => {
-                    let mut chunk_stmt = self
+                    let mut segment_stmt = self
                         .conn
                         .prepare(
                             "SELECT part_number, segment_index, segment_okh, segment_vid, shard_pg_id, ec_k, ec_m \
@@ -2056,7 +2056,7 @@ impl PgMetadataStore for PgStore {
                             source: e,
                         })?;
 
-                    let segments = chunk_stmt
+                    let segments = segment_stmt
                         .query_map(
                             params![bucket, key, generation_id.get() as i64, part_number],
                             |row| {
@@ -2731,7 +2731,7 @@ impl PgMetadataStore for PgStore {
                 let prev_rows = prev_stmt.query_map(
                     params![
                         part.upload_id,
-                        PART_CHUNK_STAGING_VERSION_ID.to_u64() as i64,
+                        PART_SEGMENT_STAGING_VERSION_ID.to_u64() as i64,
                         part.part_number
                     ],
                     |row| {
@@ -2786,7 +2786,7 @@ impl PgMetadataStore for PgStore {
                  WHERE upload_id = ?1 AND version_id = ?2 AND part_number = ?3",
                     params![
                         part.upload_id,
-                        PART_CHUNK_STAGING_VERSION_ID.to_u64() as i64,
+                        PART_SEGMENT_STAGING_VERSION_ID.to_u64() as i64,
                         part.part_number
                     ],
                 )?;
@@ -2800,7 +2800,7 @@ impl PgMetadataStore for PgStore {
                 for segment in segments {
                     if segment.upload_id != part.upload_id
                         || segment.part_number != part.part_number
-                        || segment.version_id != PART_CHUNK_STAGING_VERSION_ID.to_u64()
+                        || segment.version_id != PART_SEGMENT_STAGING_VERSION_ID.to_u64()
                     {
                         return Err(rusqlite::Error::FromSqlConversionFailure(
                             0,
@@ -3247,7 +3247,7 @@ impl PgMetadataStore for PgStore {
                 ],
             )?;
 
-            // 6. Reparent this upload's chunks from staging version_id to
+            // 6. Reparent this upload's segments from staging version_id to
             //    the real object version_id so reads can find them.
             self.conn.execute(
                 "UPDATE multipart_part_segments \
@@ -3259,7 +3259,7 @@ impl PgMetadataStore for PgStore {
                     obj.bucket,
                     obj.key,
                     upload_id,
-                    PART_CHUNK_STAGING_VERSION_ID.to_u64() as i64,
+                    PART_SEGMENT_STAGING_VERSION_ID.to_u64() as i64,
                 ],
             )?;
 
@@ -3539,7 +3539,7 @@ impl PgMetadataStore for PgStore {
         &self,
         session_id: &str,
         obj: &CommitStreamPutReq,
-        chunks: &[ObjectSegmentRecord],
+        segments: &[ObjectSegmentRecord],
     ) -> Result<(), MetadataError> {
         self.conn
             .execute_batch("BEGIN IMMEDIATE")
@@ -3660,7 +3660,7 @@ impl PgMetadataStore for PgStore {
                     params![obj.bucket, obj.key, obj.version_id.to_u64() as i64],
                 )
                 .map_err(|e| MetadataError::Db {
-                    context: "commit stream put (delete prior chunks)",
+                    context: "commit stream put (delete prior segments)",
                     source: e,
                 })?;
 
@@ -3675,33 +3675,33 @@ impl PgMetadataStore for PgStore {
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                     )
                     .map_err(|e| MetadataError::Db {
-                        context: "commit stream put (prepare insert chunks)",
+                        context: "commit stream put (prepare insert segments)",
                         source: e,
                     })?;
-                for chunk in chunks {
-                    if chunk.bucket != obj.bucket
-                        || chunk.key != obj.key
-                        || chunk.version_id != obj.version_id
+                for segment in segments {
+                    if segment.bucket != obj.bucket
+                        || segment.key != obj.key
+                        || segment.version_id != obj.version_id
                     {
                         return Err(MetadataError::StreamSessionNotFound {
                             session_id: SessionId::from(session_id),
                         });
                     }
                     stmt.execute(params![
-                        chunk.bucket,
-                        chunk.key,
-                        chunk.version_id.to_u64() as i64,
-                        chunk.segment_index,
-                        chunk.size as i64,
-                        chunk.segment_crc64.map(|v| v as i64),
-                        chunk.segment_okh.as_slice(),
-                        chunk.segment_vid.get() as i64,
-                        chunk.shard_pg_id,
-                        chunk.ec_k,
-                        chunk.ec_m,
+                        segment.bucket,
+                        segment.key,
+                        segment.version_id.to_u64() as i64,
+                        segment.segment_index,
+                        segment.size as i64,
+                        segment.segment_crc64.map(|v| v as i64),
+                        segment.segment_okh.as_slice(),
+                        segment.segment_vid.get() as i64,
+                        segment.shard_pg_id,
+                        segment.ec_k,
+                        segment.ec_m,
                     ])
                     .map_err(|e| MetadataError::Db {
-                        context: "commit stream put (insert chunk)",
+                        context: "commit stream put (insert segment)",
                         source: e,
                     })?;
                 }
@@ -3900,7 +3900,7 @@ impl PgMetadataStore for PgStore {
         &self,
         session_id: &str,
         part: &MultipartPartRecord,
-        chunks: &[MultipartPartSegmentRecord],
+        segments: &[MultipartPartSegmentRecord],
     ) -> Result<(), MetadataError> {
         self.conn
             .execute_batch("BEGIN IMMEDIATE")
@@ -4036,7 +4036,7 @@ impl PgMetadataStore for PgStore {
                     params![sess_bucket, sess_key, part.upload_id, part.part_number],
                 )
                 .map_err(|e| MetadataError::Db {
-                    context: "commit stream part (delete prior chunks)",
+                    context: "commit stream part (delete prior segments)",
                     source: e,
                 })?;
 
@@ -4051,37 +4051,37 @@ impl PgMetadataStore for PgStore {
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                     )
                     .map_err(|e| MetadataError::Db {
-                        context: "commit stream part (prepare insert chunks)",
+                        context: "commit stream part (prepare insert segments)",
                         source: e,
                     })?;
-                for chunk in chunks {
-                    if chunk.bucket != sess_bucket
-                        || chunk.key != sess_key
-                        || chunk.upload_id != part.upload_id
-                        || chunk.version_id != PART_CHUNK_STAGING_VERSION_ID.to_u64()
-                        || chunk.part_number != part.part_number
+                for segment in segments {
+                    if segment.bucket != sess_bucket
+                        || segment.key != sess_key
+                        || segment.upload_id != part.upload_id
+                        || segment.version_id != PART_SEGMENT_STAGING_VERSION_ID.to_u64()
+                        || segment.part_number != part.part_number
                     {
                         return Err(MetadataError::StreamSessionNotFound {
                             session_id: SessionId::from(session_id),
                         });
                     }
                     stmt.execute(params![
-                        chunk.bucket,
-                        chunk.key,
-                        chunk.upload_id,
-                        chunk.version_id as i64,
-                        chunk.part_number,
-                        chunk.segment_index,
-                        chunk.size as i64,
-                        chunk.segment_crc64.map(|v| v as i64),
-                        chunk.segment_okh.as_slice(),
-                        chunk.segment_vid.get() as i64,
-                        chunk.shard_pg_id,
-                        chunk.ec_k,
-                        chunk.ec_m,
+                        segment.bucket,
+                        segment.key,
+                        segment.upload_id,
+                        segment.version_id as i64,
+                        segment.part_number,
+                        segment.segment_index,
+                        segment.size as i64,
+                        segment.segment_crc64.map(|v| v as i64),
+                        segment.segment_okh.as_slice(),
+                        segment.segment_vid.get() as i64,
+                        segment.shard_pg_id,
+                        segment.ec_k,
+                        segment.ec_m,
                     ])
                     .map_err(|e| MetadataError::Db {
-                        context: "commit stream part (insert chunk)",
+                        context: "commit stream part (insert segment)",
                         source: e,
                     })?;
                 }
@@ -4134,7 +4134,7 @@ impl PgMetadataStore for PgStore {
                  ORDER BY segment_index ASC",
             )
             .map_err(|e| MetadataError::Db {
-                context: "prepare get stream object chunks",
+                context: "prepare get stream object segments",
                 source: e,
             })?;
 
@@ -4161,18 +4161,18 @@ impl PgMetadataStore for PgStore {
                 })
             })
             .map_err(|e| MetadataError::Db {
-                context: "get stream object chunks",
+                context: "get stream object segments",
                 source: e,
             })?;
 
-        let mut chunks = Vec::new();
+        let mut segments = Vec::new();
         for row in rows {
-            chunks.push(row.map_err(|e| MetadataError::Db {
-                context: "get stream object chunks row",
+            segments.push(row.map_err(|e| MetadataError::Db {
+                context: "get stream object segments row",
                 source: e,
             })?);
         }
-        Ok(chunks)
+        Ok(segments)
     }
 
     fn delete_object_segments(
@@ -4188,7 +4188,7 @@ impl PgMetadataStore for PgStore {
                 params![bucket, key, version_id.to_u64() as i64],
             )
             .map_err(|e| MetadataError::Db {
-                context: "delete stream object chunks",
+                context: "delete stream object segments",
                 source: e,
             })?;
         Ok(())
@@ -4246,14 +4246,14 @@ impl PgMetadataStore for PgStore {
                 source: e,
             })?;
 
-        let mut chunks = Vec::new();
+        let mut segments = Vec::new();
         for row in rows {
-            chunks.push(row.map_err(|e| MetadataError::Db {
+            segments.push(row.map_err(|e| MetadataError::Db {
                 context: "get multipart part segments row",
                 source: e,
             })?);
         }
-        Ok(chunks)
+        Ok(segments)
     }
 
     fn delete_multipart_part_segments(

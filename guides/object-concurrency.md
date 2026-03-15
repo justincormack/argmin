@@ -8,7 +8,7 @@ This guide defines the lock and read/write rules for object operations in
 Applies to object data/metadata operations:
 
 - `put_object`
-- `begin_stream_put` / `append_stream_chunk` / `finalize_stream_put` / `abort_stream_put`
+- `begin_stream_put` / `append_stream_segment` / `finalize_stream_put` / `abort_stream_put`
 - `copy_object` (source read and destination write)
 - `upload_part` / streamed `UploadPart` finalize
 - `get_object`
@@ -22,8 +22,8 @@ metadata paths (for example, `DeleteBucket` emptiness checks).
 ## Required Invariants
 
 1. Single-object multi-PG operations must lock PGs in global ascending PG ID order.
-2. Streaming chunk appends must never hold a lock while waiting for network input.
-3. Streaming chunk append lock scope is metadata/session PG + chunk shard PGs.
+2. Streaming segment appends must never hold a lock while waiting for network input.
+3. Streaming segment append lock scope is metadata/session PG + segment shard PGs.
 4. Streaming finalize lock scope includes metadata/session PG (and any required secondary PGs), in global order.
 5. Session state transitions are serialized via metadata-PG transactions over session rows (no ad-hoc in-memory correctness lock).
 6. Latest-version reads must bind metadata lookup and shard placement under one consistent lock window.

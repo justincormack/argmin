@@ -1877,18 +1877,18 @@ impl HttpFrontend {
         ))
     }
 
-    /// Append a chunk to a streaming POST session.
-    pub fn streaming_append_post_chunk(
+    /// Append a segment to a streaming POST session.
+    pub fn streaming_append_post_segment(
         &self,
         ctx: &StreamingPostContext,
-        chunk_index: u32,
+        segment_index: u32,
         data: &[u8],
     ) -> Result<(), ServerError> {
-        self.coordinator.append_stream_chunk(
+        self.coordinator.append_stream_segment(
             &ctx.binding.bucket,
             &ctx.binding.key,
             &ctx.binding.session_id,
-            chunk_index,
+            segment_index,
             data,
         )
     }
@@ -1905,7 +1905,7 @@ impl HttpFrontend {
     /// Prepare a streaming `PutObject`: authenticate, validate, begin session.
     ///
     /// Returns a context struct that the async streaming loop uses to drive
-    /// chunk appends and finalization.
+    /// segment appends and finalization.
     pub fn prepare_streaming_put(
         &self,
         req: &S3Request,
@@ -1993,18 +1993,18 @@ impl HttpFrontend {
         })
     }
 
-    /// Append a chunk to a streaming session.
-    pub fn streaming_append_chunk(
+    /// Append a segment to a streaming session.
+    pub fn streaming_append_segment(
         &self,
         ctx: &StreamingPutContext,
-        chunk_index: u32,
+        segment_index: u32,
         data: &[u8],
     ) -> Result<(), ServerError> {
-        self.coordinator.append_stream_chunk(
+        self.coordinator.append_stream_segment(
             &ctx.binding.bucket,
             &ctx.binding.key,
             &ctx.binding.session_id,
-            chunk_index,
+            segment_index,
             data,
         )
     }
@@ -2127,18 +2127,18 @@ impl HttpFrontend {
         })
     }
 
-    /// Append a chunk to a streaming `UploadPart` session.
-    pub fn streaming_append_part_chunk(
+    /// Append a segment to a streaming `UploadPart` session.
+    pub fn streaming_append_part_segment(
         &self,
         ctx: &StreamingPartContext,
-        chunk_index: u32,
+        segment_index: u32,
         data: &[u8],
     ) -> Result<(), ServerError> {
-        self.coordinator.append_stream_chunk(
+        self.coordinator.append_stream_segment(
             &ctx.binding.object.bucket,
             &ctx.binding.object.key,
             &ctx.binding.object.session_id,
-            chunk_index,
+            segment_index,
             data,
         )
     }
