@@ -1,5 +1,50 @@
 # Metadata Service — Design Document
 
+## Status
+
+Superseded historical design note.
+
+This document is no longer the source of truth for the current metadata
+architecture. It was written before several later decisions landed, including:
+
+1. bucket metadata sharding into per-PG SQLite
+2. metadata/data decoupling for user metadata blobs
+3. version-aware shard PG routing
+4. unified internal segment-based payload layout
+5. retained-payload reclamation and background cleanup
+
+What remains conceptually relevant here is the original argument for per-PG
+metadata rather than a centralized object-metadata cluster. That direction did
+survive.
+
+What is no longer current:
+
+1. references to a separate global service handling bucket metadata
+2. assumptions that user metadata lives only in payload prefixes rather than DB rows
+3. older object-record and data-layout descriptions
+4. speculative future design sections on global Raft, PG migration state,
+   cluster-map history, peering, and dynamic PG-count behavior
+
+## Current Source-Of-Truth Plans
+
+Use these instead for the current implemented direction:
+
+1. [bucket-metadata-sharding.md](/home/justin/src/github.com/justincormack/argmin/plans/completed/bucket-metadata-sharding.md)
+2. [unified-segment-payload-redesign.md](/home/justin/src/github.com/justincormack/argmin/plans/completed/unified-segment-payload-redesign.md)
+3. [server-http-storage-boundary-plan.md](/home/justin/src/github.com/justincormack/argmin/plans/completed/server-http-storage-boundary-plan.md)
+4. [in-flight-read-reclamation-plan.md](/home/justin/src/github.com/justincormack/argmin/plans/completed/in-flight-read-reclamation-plan.md)
+
+## Historical Value
+
+This note is still useful as background for:
+
+1. why per-PG metadata was preferred over a centralized object metadata cluster
+2. why list operations were accepted as fan-out + merge
+3. why object metadata records were originally intended to stay small
+
+The remainder of the original document is preserved below as historical context.
+# Metadata Service — Design Document
+
 ## Scope
 
 This document covers the design of the metadata service (subsystem 4 in the build
