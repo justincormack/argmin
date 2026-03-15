@@ -620,9 +620,9 @@ impl HttpFrontend {
                         )
                     })();
                     if result.is_err() {
-                        let _ = self.coordinator.abort_stream_put(
-                            &bucket, &key, &session_id,
-                        );
+                        let _ = self
+                            .coordinator
+                            .abort_stream_put(&bucket, &key, &session_id);
                     }
                     let result = result?;
                     let mut resp = S3Response::put_object(&result);
@@ -1242,14 +1242,11 @@ impl HttpFrontend {
                             match algo {
                                 Some(a) => {
                                     let bytes = compute_checksum_bytes(a, &req.body);
-                                    Some(
-                                        checksum::RawChecksum::new(a, bytes).map_err(|_| {
-                                            ServerError::InternalError {
-                                                reason: "checksum byte length mismatch"
-                                                    .to_string(),
-                                            }
-                                        })?,
-                                    )
+                                    Some(checksum::RawChecksum::new(a, bytes).map_err(|_| {
+                                        ServerError::InternalError {
+                                            reason: "checksum byte length mismatch".to_string(),
+                                        }
+                                    })?)
                                 }
                                 None => None,
                             }
@@ -1269,9 +1266,9 @@ impl HttpFrontend {
                         )
                     })();
                     if result.is_err() {
-                        let _ = self.coordinator.abort_stream_put(
-                            &bucket, &key, &session_id,
-                        );
+                        let _ = self
+                            .coordinator
+                            .abort_stream_put(&bucket, &key, &session_id);
                     }
                     let result = result?;
                     Ok(S3Response::upload_part(
@@ -4340,10 +4337,7 @@ mod tests {
             method: String::new(),
             path: String::new(),
             query_string: String::new(),
-            headers: vec![(
-                "if-none-match".to_string(),
-                "*".to_string(),
-            )],
+            headers: vec![("if-none-match".to_string(), "*".to_string())],
             body: b"world".to_vec(),
         };
         let op2 = S3Operation::PutObject {

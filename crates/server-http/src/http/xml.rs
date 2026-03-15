@@ -2450,9 +2450,8 @@ mod tests {
     use crate::conditional::{DeleteCondition, WriteCondition};
     use crate::coordinator::ListEntry;
     use crate::coordinator::{
-        Coordinator, DeleteEntry, DeleteObjectsRequest, ListObjectVersionsRequest,
+        test_helpers, Coordinator, DeleteEntry, DeleteObjectsRequest, ListObjectVersionsRequest,
         ListObjectsV2Request, PutObjectAcl, PutObjectRequest, Requester,
-        test_helpers,
     };
     use crate::metadata_blob::MetadataBlob;
     use ec::EcConfig;
@@ -4286,7 +4285,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("test-bucket").unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "test-bucket",
                 key: "dir/file1.txt",
                 data: b"hello",
@@ -4295,9 +4296,12 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+            },
+        )
+        .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "test-bucket",
                 key: "dir/file2.txt",
                 data: b"world",
@@ -4306,9 +4310,12 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+            },
+        )
+        .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "test-bucket",
                 key: "root.txt",
                 data: b"root",
@@ -4317,8 +4324,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let versions_result = coord
             .list_object_versions(&ListObjectVersionsRequest {
@@ -4408,7 +4416,9 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
         for i in 0..5 {
             let key = format!("key-{i:02}");
-            test_helpers::put_object(&coord, &PutObjectRequest {
+            test_helpers::put_object(
+                &coord,
+                &PutObjectRequest {
                     bucket: "bucket",
                     key: &key,
                     data: b"data",
@@ -4417,8 +4427,9 @@ mod tests {
                     cond: NO_WRITE,
                     requester: TEST_REQUESTER,
                     acl: NO_PUT_OBJECT_ACL,
-                })
-                .unwrap();
+                },
+            )
+            .unwrap();
         }
 
         let page1 = coord

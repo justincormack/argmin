@@ -3995,18 +3995,20 @@ fn malformed_multipart_segment_okh_returns_db_error() {
 #[test]
 fn get_object_version_null() {
     let (_dir, store) = make_pg_store();
-    store.put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
-        bucket: "b".into(),
-        key: "k".into(),
-        version_id: VersionId::Null,
-        generation_id: GenerationId::MIN,
-        ec: EcShape { k: 4, m: 2 },
-        size: 100,
-        etag: ObjectEtag::SinglePart([1, 0, 0, 0, 0, 0, 0, 0]),
-        layout: ObjectLayout::Standard,
-        tags: None,
-        metadata_blob: None,
-    })).unwrap();
+    store
+        .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
+            bucket: "b".into(),
+            key: "k".into(),
+            version_id: VersionId::Null,
+            generation_id: GenerationId::MIN,
+            ec: EcShape { k: 4, m: 2 },
+            size: 100,
+            etag: ObjectEtag::SinglePart([1, 0, 0, 0, 0, 0, 0, 0]),
+            layout: ObjectLayout::Standard,
+            tags: None,
+            metadata_blob: None,
+        }))
+        .unwrap();
 
     let obj = store.get_object_version("b", "k", VersionId::Null).unwrap();
     let live = obj.as_live().unwrap();
@@ -4017,18 +4019,20 @@ fn get_object_version_null() {
 fn get_object_version_versioned() {
     let (_dir, store) = make_pg_store();
     let vid = VersionId::Versioned(NonZeroU64::new(1).unwrap());
-    store.put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
-        bucket: "b".into(),
-        key: "k".into(),
-        version_id: vid,
-        generation_id: GenerationId::MIN,
-        ec: EcShape { k: 4, m: 2 },
-        size: 200,
-        etag: ObjectEtag::SinglePart([2, 0, 0, 0, 0, 0, 0, 0]),
-        layout: ObjectLayout::Standard,
-        tags: None,
-        metadata_blob: None,
-    })).unwrap();
+    store
+        .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
+            bucket: "b".into(),
+            key: "k".into(),
+            version_id: vid,
+            generation_id: GenerationId::MIN,
+            ec: EcShape { k: 4, m: 2 },
+            size: 200,
+            etag: ObjectEtag::SinglePart([2, 0, 0, 0, 0, 0, 0, 0]),
+            layout: ObjectLayout::Standard,
+            tags: None,
+            metadata_blob: None,
+        }))
+        .unwrap();
 
     let obj = store.get_object_version("b", "k", vid).unwrap();
     let live = obj.as_live().unwrap();
@@ -4039,28 +4043,36 @@ fn get_object_version_versioned() {
 #[test]
 fn get_object_version_not_found() {
     let (_dir, store) = make_pg_store();
-    let err = store.get_object_version("b", "k", VersionId::Null).unwrap_err();
+    let err = store
+        .get_object_version("b", "k", VersionId::Null)
+        .unwrap_err();
     assert!(matches!(err, crate::error::MetadataError::ObjectNotFound));
 }
 
 #[test]
 fn delete_object_version_null() {
     let (_dir, store) = make_pg_store();
-    store.put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
-        bucket: "b".into(),
-        key: "k".into(),
-        version_id: VersionId::Null,
-        generation_id: GenerationId::MIN,
-        ec: EcShape { k: 4, m: 2 },
-        size: 100,
-        etag: ObjectEtag::SinglePart([1, 0, 0, 0, 0, 0, 0, 0]),
-        layout: ObjectLayout::Standard,
-        tags: None,
-        metadata_blob: None,
-    })).unwrap();
+    store
+        .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
+            bucket: "b".into(),
+            key: "k".into(),
+            version_id: VersionId::Null,
+            generation_id: GenerationId::MIN,
+            ec: EcShape { k: 4, m: 2 },
+            size: 100,
+            etag: ObjectEtag::SinglePart([1, 0, 0, 0, 0, 0, 0, 0]),
+            layout: ObjectLayout::Standard,
+            tags: None,
+            metadata_blob: None,
+        }))
+        .unwrap();
 
-    store.delete_object_version("b", "k", VersionId::Null).unwrap();
-    let err = store.get_object_version("b", "k", VersionId::Null).unwrap_err();
+    store
+        .delete_object_version("b", "k", VersionId::Null)
+        .unwrap();
+    let err = store
+        .get_object_version("b", "k", VersionId::Null)
+        .unwrap_err();
     assert!(matches!(err, crate::error::MetadataError::ObjectNotFound));
 }
 
@@ -4071,18 +4083,20 @@ fn delete_object_version_specific_leaves_others() {
     let vid2 = VersionId::Versioned(NonZeroU64::new(2).unwrap());
 
     for (vid, size) in [(vid1, 100u64), (vid2, 200u64)] {
-        store.put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
-            bucket: "b".into(),
-            key: "k".into(),
-            version_id: vid,
-            generation_id: GenerationId::MIN,
-            ec: EcShape { k: 4, m: 2 },
-            size,
-            etag: ObjectEtag::SinglePart([1, 0, 0, 0, 0, 0, 0, 0]),
-            layout: ObjectLayout::Standard,
-            tags: None,
-            metadata_blob: None,
-        })).unwrap();
+        store
+            .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
+                bucket: "b".into(),
+                key: "k".into(),
+                version_id: vid,
+                generation_id: GenerationId::MIN,
+                ec: EcShape { k: 4, m: 2 },
+                size,
+                etag: ObjectEtag::SinglePart([1, 0, 0, 0, 0, 0, 0, 0]),
+                layout: ObjectLayout::Standard,
+                tags: None,
+                metadata_blob: None,
+            }))
+            .unwrap();
     }
 
     store.delete_object_version("b", "k", vid1).unwrap();
@@ -4104,27 +4118,31 @@ fn list_object_versions_basic() {
     let vid2 = VersionId::Versioned(NonZeroU64::new(2).unwrap());
 
     for (vid, size) in [(vid1, 100u64), (vid2, 200)] {
-        store.put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
-            bucket: "b".into(),
-            key: "k".into(),
-            version_id: vid,
-            generation_id: GenerationId::MIN,
-            ec: EcShape { k: 4, m: 2 },
-            size,
-            etag: ObjectEtag::SinglePart([1, 0, 0, 0, 0, 0, 0, 0]),
-            layout: ObjectLayout::Standard,
-            tags: None,
-            metadata_blob: None,
-        })).unwrap();
+        store
+            .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
+                bucket: "b".into(),
+                key: "k".into(),
+                version_id: vid,
+                generation_id: GenerationId::MIN,
+                ec: EcShape { k: 4, m: 2 },
+                size,
+                etag: ObjectEtag::SinglePart([1, 0, 0, 0, 0, 0, 0, 0]),
+                layout: ObjectLayout::Standard,
+                tags: None,
+                metadata_blob: None,
+            }))
+            .unwrap();
     }
 
-    let resp = store.list_object_versions(&ListObjectVersionsReq {
-        bucket: "b".into(),
-        prefix: None,
-        key_marker: None,
-        version_id_marker: None,
-        max_keys: 10,
-    }).unwrap();
+    let resp = store
+        .list_object_versions(&ListObjectVersionsReq {
+            bucket: "b".into(),
+            prefix: None,
+            key_marker: None,
+            version_id_marker: None,
+            max_keys: 10,
+        })
+        .unwrap();
 
     assert_eq!(resp.versions.len(), 2);
     assert!(!resp.is_truncated);
@@ -4136,41 +4154,47 @@ fn list_object_versions_pagination() {
 
     // Create 3 versions of the same key
     for i in 1..=3u64 {
-        store.put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
-            bucket: "b".into(),
-            key: "k".into(),
-            version_id: VersionId::Versioned(NonZeroU64::new(i).unwrap()),
-            generation_id: GenerationId::MIN,
-            ec: EcShape { k: 4, m: 2 },
-            size: i * 100,
-            etag: ObjectEtag::SinglePart([i as u8, 0, 0, 0, 0, 0, 0, 0]),
-            layout: ObjectLayout::Standard,
-            tags: None,
-            metadata_blob: None,
-        })).unwrap();
+        store
+            .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
+                bucket: "b".into(),
+                key: "k".into(),
+                version_id: VersionId::Versioned(NonZeroU64::new(i).unwrap()),
+                generation_id: GenerationId::MIN,
+                ec: EcShape { k: 4, m: 2 },
+                size: i * 100,
+                etag: ObjectEtag::SinglePart([i as u8, 0, 0, 0, 0, 0, 0, 0]),
+                layout: ObjectLayout::Standard,
+                tags: None,
+                metadata_blob: None,
+            }))
+            .unwrap();
     }
 
     // Page 1: max_keys=2
-    let resp = store.list_object_versions(&ListObjectVersionsReq {
-        bucket: "b".into(),
-        prefix: None,
-        key_marker: None,
-        version_id_marker: None,
-        max_keys: 2,
-    }).unwrap();
+    let resp = store
+        .list_object_versions(&ListObjectVersionsReq {
+            bucket: "b".into(),
+            prefix: None,
+            key_marker: None,
+            version_id_marker: None,
+            max_keys: 2,
+        })
+        .unwrap();
     assert_eq!(resp.versions.len(), 2);
     assert!(resp.is_truncated);
     assert!(resp.next_key_marker.is_some());
     assert!(resp.next_version_id_marker.is_some());
 
     // Page 2: use markers from page 1
-    let resp2 = store.list_object_versions(&ListObjectVersionsReq {
-        bucket: "b".into(),
-        prefix: None,
-        key_marker: resp.next_key_marker,
-        version_id_marker: resp.next_version_id_marker,
-        max_keys: 2,
-    }).unwrap();
+    let resp2 = store
+        .list_object_versions(&ListObjectVersionsReq {
+            bucket: "b".into(),
+            prefix: None,
+            key_marker: resp.next_key_marker,
+            version_id_marker: resp.next_version_id_marker,
+            max_keys: 2,
+        })
+        .unwrap();
     assert_eq!(resp2.versions.len(), 1);
     assert!(!resp2.is_truncated);
 }
@@ -4180,27 +4204,31 @@ fn list_object_versions_with_prefix() {
     let (_dir, store) = make_pg_store();
 
     for key in ["photos/a.jpg", "photos/b.jpg", "docs/c.txt"] {
-        store.put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
-            bucket: "b".into(),
-            key: key.into(),
-            version_id: VersionId::Null,
-            generation_id: GenerationId::MIN,
-            ec: EcShape { k: 4, m: 2 },
-            size: 10,
-            etag: ObjectEtag::SinglePart([1, 0, 0, 0, 0, 0, 0, 0]),
-            layout: ObjectLayout::Standard,
-            tags: None,
-            metadata_blob: None,
-        })).unwrap();
+        store
+            .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
+                bucket: "b".into(),
+                key: key.into(),
+                version_id: VersionId::Null,
+                generation_id: GenerationId::MIN,
+                ec: EcShape { k: 4, m: 2 },
+                size: 10,
+                etag: ObjectEtag::SinglePart([1, 0, 0, 0, 0, 0, 0, 0]),
+                layout: ObjectLayout::Standard,
+                tags: None,
+                metadata_blob: None,
+            }))
+            .unwrap();
     }
 
-    let resp = store.list_object_versions(&ListObjectVersionsReq {
-        bucket: "b".into(),
-        prefix: Some("photos/".into()),
-        key_marker: None,
-        version_id_marker: None,
-        max_keys: 100,
-    }).unwrap();
+    let resp = store
+        .list_object_versions(&ListObjectVersionsReq {
+            bucket: "b".into(),
+            prefix: Some("photos/".into()),
+            key_marker: None,
+            version_id_marker: None,
+            max_keys: 100,
+        })
+        .unwrap();
     assert_eq!(resp.versions.len(), 2);
 }
 
@@ -4210,32 +4238,38 @@ fn list_object_versions_includes_delete_markers() {
     let vid1 = VersionId::Versioned(NonZeroU64::new(1).unwrap());
     let vid2 = VersionId::Versioned(NonZeroU64::new(2).unwrap());
 
-    store.put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
-        bucket: "b".into(),
-        key: "k".into(),
-        version_id: vid1,
-        generation_id: GenerationId::MIN,
-        ec: EcShape { k: 4, m: 2 },
-        size: 100,
-        etag: ObjectEtag::SinglePart([1, 0, 0, 0, 0, 0, 0, 0]),
-        layout: ObjectLayout::Standard,
-        tags: None,
-        metadata_blob: None,
-    })).unwrap();
+    store
+        .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
+            bucket: "b".into(),
+            key: "k".into(),
+            version_id: vid1,
+            generation_id: GenerationId::MIN,
+            ec: EcShape { k: 4, m: 2 },
+            size: 100,
+            etag: ObjectEtag::SinglePart([1, 0, 0, 0, 0, 0, 0, 0]),
+            layout: ObjectLayout::Standard,
+            tags: None,
+            metadata_blob: None,
+        }))
+        .unwrap();
 
-    store.put_object_meta(&PutObjectReq::DeleteMarker(PutDeleteMarkerReq {
-        bucket: "b".into(),
-        key: "k".into(),
-        version_id: vid2,
-    })).unwrap();
+    store
+        .put_object_meta(&PutObjectReq::DeleteMarker(PutDeleteMarkerReq {
+            bucket: "b".into(),
+            key: "k".into(),
+            version_id: vid2,
+        }))
+        .unwrap();
 
-    let resp = store.list_object_versions(&ListObjectVersionsReq {
-        bucket: "b".into(),
-        prefix: None,
-        key_marker: None,
-        version_id_marker: None,
-        max_keys: 10,
-    }).unwrap();
+    let resp = store
+        .list_object_versions(&ListObjectVersionsReq {
+            bucket: "b".into(),
+            prefix: None,
+            key_marker: None,
+            version_id_marker: None,
+            max_keys: 10,
+        })
+        .unwrap();
     assert_eq!(resp.versions.len(), 2);
 
     let has_live = resp.versions.iter().any(|v| !v.is_delete_marker());
@@ -4255,18 +4289,20 @@ fn next_version_id_increments() {
     assert!(matches!(v1, VersionId::Versioned(_)));
 
     // Write an object at v1 so the counter advances.
-    store.put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
-        bucket: "b".into(),
-        key: "k".into(),
-        version_id: v1,
-        generation_id: GenerationId::MIN,
-        ec: EcShape { k: 4, m: 2 },
-        size: 10,
-        etag: ObjectEtag::SinglePart([1, 0, 0, 0, 0, 0, 0, 0]),
-        layout: ObjectLayout::Standard,
-        tags: None,
-        metadata_blob: None,
-    })).unwrap();
+    store
+        .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
+            bucket: "b".into(),
+            key: "k".into(),
+            version_id: v1,
+            generation_id: GenerationId::MIN,
+            ec: EcShape { k: 4, m: 2 },
+            size: 10,
+            etag: ObjectEtag::SinglePart([1, 0, 0, 0, 0, 0, 0, 0]),
+            layout: ObjectLayout::Standard,
+            tags: None,
+            metadata_blob: None,
+        }))
+        .unwrap();
 
     let v2 = store.next_version_id("b", "k").unwrap();
     assert!(matches!(v2, VersionId::Versioned(_)));
@@ -4288,30 +4324,36 @@ fn next_version_id_independent_per_key() {
 #[test]
 fn object_tags_round_trip() {
     let (_dir, store) = make_pg_store();
-    store.put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
-        bucket: "b".into(),
-        key: "k".into(),
-        version_id: VersionId::Null,
-        generation_id: GenerationId::MIN,
-        ec: EcShape { k: 4, m: 2 },
-        size: 100,
-        etag: ObjectEtag::SinglePart([1, 0, 0, 0, 0, 0, 0, 0]),
-        layout: ObjectLayout::Standard,
-        tags: None,
-        metadata_blob: None,
-    })).unwrap();
+    store
+        .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
+            bucket: "b".into(),
+            key: "k".into(),
+            version_id: VersionId::Null,
+            generation_id: GenerationId::MIN,
+            ec: EcShape { k: 4, m: 2 },
+            size: 100,
+            etag: ObjectEtag::SinglePart([1, 0, 0, 0, 0, 0, 0, 0]),
+            layout: ObjectLayout::Standard,
+            tags: None,
+            metadata_blob: None,
+        }))
+        .unwrap();
 
     // Initially no tags
     let tags = store.get_object_tags("b", "k", VersionId::Null).unwrap();
     assert!(tags.is_none());
 
     // Put tags
-    store.put_object_tags("b", "k", VersionId::Null, "<tags>env=prod</tags>").unwrap();
+    store
+        .put_object_tags("b", "k", VersionId::Null, "<tags>env=prod</tags>")
+        .unwrap();
     let tags = store.get_object_tags("b", "k", VersionId::Null).unwrap();
     assert_eq!(tags.as_deref(), Some("<tags>env=prod</tags>"));
 
     // Overwrite tags
-    store.put_object_tags("b", "k", VersionId::Null, "<tags>env=staging</tags>").unwrap();
+    store
+        .put_object_tags("b", "k", VersionId::Null, "<tags>env=staging</tags>")
+        .unwrap();
     let tags = store.get_object_tags("b", "k", VersionId::Null).unwrap();
     assert_eq!(tags.as_deref(), Some("<tags>env=staging</tags>"));
 
@@ -4324,7 +4366,9 @@ fn object_tags_round_trip() {
 #[test]
 fn object_tags_on_nonexistent_object() {
     let (_dir, store) = make_pg_store();
-    let err = store.get_object_tags("b", "k", VersionId::Null).unwrap_err();
+    let err = store
+        .get_object_tags("b", "k", VersionId::Null)
+        .unwrap_err();
     assert!(matches!(err, crate::error::MetadataError::ObjectNotFound));
 }
 
@@ -4332,27 +4376,38 @@ fn object_tags_on_nonexistent_object() {
 fn object_tags_on_delete_marker() {
     let (_dir, store) = make_pg_store();
     let vid = VersionId::Versioned(NonZeroU64::new(1).unwrap());
-    store.put_object_meta(&PutObjectReq::DeleteMarker(PutDeleteMarkerReq {
-        bucket: "b".into(),
-        key: "k".into(),
-        version_id: vid,
-    })).unwrap();
+    store
+        .put_object_meta(&PutObjectReq::DeleteMarker(PutDeleteMarkerReq {
+            bucket: "b".into(),
+            key: "k".into(),
+            version_id: vid,
+        }))
+        .unwrap();
 
     let err = store.put_object_tags("b", "k", vid, "<tags/>").unwrap_err();
     assert!(
-        matches!(err, crate::error::MetadataError::MethodNotAllowedOnDeleteMarker),
+        matches!(
+            err,
+            crate::error::MetadataError::MethodNotAllowedOnDeleteMarker
+        ),
         "expected MethodNotAllowedOnDeleteMarker, got {err:?}"
     );
 
     let err = store.get_object_tags("b", "k", vid).unwrap_err();
     assert!(
-        matches!(err, crate::error::MetadataError::MethodNotAllowedOnDeleteMarker),
+        matches!(
+            err,
+            crate::error::MetadataError::MethodNotAllowedOnDeleteMarker
+        ),
         "expected MethodNotAllowedOnDeleteMarker, got {err:?}"
     );
 
     let err = store.delete_object_tags("b", "k", vid).unwrap_err();
     assert!(
-        matches!(err, crate::error::MetadataError::MethodNotAllowedOnDeleteMarker),
+        matches!(
+            err,
+            crate::error::MetadataError::MethodNotAllowedOnDeleteMarker
+        ),
         "expected MethodNotAllowedOnDeleteMarker, got {err:?}"
     );
 }
@@ -4364,13 +4419,15 @@ fn simple_payload_reclaim_round_trip() {
     let (_dir, store) = make_pg_store();
     let gen = GenerationId::new(5).unwrap();
 
-    store.put_simple_payload_reclaim(&SimplePayloadReclaimRecord {
-        bucket: "b".into(),
-        key: "k".into(),
-        generation_id: gen,
-        ec: EcShape { k: 4, m: 2 },
-        created_at: 12345,
-    }).unwrap();
+    store
+        .put_simple_payload_reclaim(&SimplePayloadReclaimRecord {
+            bucket: "b".into(),
+            key: "k".into(),
+            generation_id: gen,
+            ec: EcShape { k: 4, m: 2 },
+            created_at: 12345,
+        })
+        .unwrap();
 
     let rec = store.get_simple_payload_reclaim("b", "k", gen).unwrap();
     assert!(rec.is_some());
@@ -4390,7 +4447,9 @@ fn simple_payload_reclaim_round_trip() {
 fn simple_payload_reclaim_delete_idempotent() {
     let (_dir, store) = make_pg_store();
     // Deleting a nonexistent reclaim should not error
-    store.delete_simple_payload_reclaim("b", "k", GenerationId::MIN).unwrap();
+    store
+        .delete_simple_payload_reclaim("b", "k", GenerationId::MIN)
+        .unwrap();
 }
 
 // ── list_all_stream_uploads ────────────────────────────────────────────
@@ -4406,18 +4465,22 @@ fn list_all_stream_uploads_empty() {
 fn list_all_stream_uploads_returns_sessions() {
     let (_dir, store) = make_pg_store();
 
-    store.create_stream_upload(&CreateStreamUploadReq {
-        session_id: "s1".into(),
-        bucket: "b".into(),
-        key: "k1".into(),
-        target: StreamUploadTarget::PutObject,
-    }).unwrap();
-    store.create_stream_upload(&CreateStreamUploadReq {
-        session_id: "s2".into(),
-        bucket: "b".into(),
-        key: "k2".into(),
-        target: StreamUploadTarget::PutObject,
-    }).unwrap();
+    store
+        .create_stream_upload(&CreateStreamUploadReq {
+            session_id: "s1".into(),
+            bucket: "b".into(),
+            key: "k1".into(),
+            target: StreamUploadTarget::PutObject,
+        })
+        .unwrap();
+    store
+        .create_stream_upload(&CreateStreamUploadReq {
+            session_id: "s2".into(),
+            bucket: "b".into(),
+            key: "k2".into(),
+            target: StreamUploadTarget::PutObject,
+        })
+        .unwrap();
 
     let uploads = store.list_all_stream_uploads().unwrap();
     assert_eq!(uploads.len(), 2);
@@ -4433,31 +4496,37 @@ fn list_all_stream_uploads_returns_sessions() {
 fn delete_multipart_part_segments_by_upload_id_cleans_up() {
     let (_dir, store) = make_pg_store();
 
-    store.create_multipart_upload(&CreateMultipartUploadReq {
-        upload_id: "mpu-seg".into(),
-        bucket: "b".into(),
-        key: "k".into(),
-        metadata_blob: vec![].into(),
-        owner_principal: None,
-        checksum: None,
-    }).unwrap();
+    store
+        .create_multipart_upload(&CreateMultipartUploadReq {
+            upload_id: "mpu-seg".into(),
+            bucket: "b".into(),
+            key: "k".into(),
+            metadata_blob: vec![].into(),
+            owner_principal: None,
+            checksum: None,
+        })
+        .unwrap();
 
     // Upsert a part (needed before segments can be inserted).
-    store.upsert_multipart_part(&MultipartPartRecord {
-        upload_id: "mpu-seg".into(),
-        part_number: 1,
-        generation: 0,
-        size: 100,
-        etag: vec![0xAA],
-        etag_kind: EtagKind::Crc64,
-        part_okh: [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-                   0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
-        part_vid: GenerationId::MIN,
-        ec_k: 4,
-        ec_m: 2,
-        last_modified: 0,
-        checksum: None,
-    }).unwrap();
+    store
+        .upsert_multipart_part(&MultipartPartRecord {
+            upload_id: "mpu-seg".into(),
+            part_number: 1,
+            generation: 0,
+            size: 100,
+            etag: vec![0xAA],
+            etag_kind: EtagKind::Crc64,
+            part_okh: [
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
+                0xEE, 0xFF,
+            ],
+            part_vid: GenerationId::MIN,
+            ec_k: 4,
+            ec_m: 2,
+            last_modified: 0,
+            checksum: None,
+        })
+        .unwrap();
 
     // Insert segments via SQL since upsert_multipart_part_segments may have
     // requirements we can work around here.
@@ -4471,13 +4540,19 @@ fn delete_multipart_part_segments_by_upload_id_cleans_up() {
     ).unwrap();
 
     // Verify segments exist
-    let segs = store.get_all_multipart_part_segments_for_upload("mpu-seg").unwrap();
+    let segs = store
+        .get_all_multipart_part_segments_for_upload("mpu-seg")
+        .unwrap();
     assert_eq!(segs.len(), 1);
 
     // Delete segments by upload_id
-    store.delete_multipart_part_segments_by_upload_id("mpu-seg").unwrap();
+    store
+        .delete_multipart_part_segments_by_upload_id("mpu-seg")
+        .unwrap();
 
-    let segs = store.get_all_multipart_part_segments_for_upload("mpu-seg").unwrap();
+    let segs = store
+        .get_all_multipart_part_segments_for_upload("mpu-seg")
+        .unwrap();
     assert!(segs.is_empty());
 }
 
@@ -4485,7 +4560,9 @@ fn delete_multipart_part_segments_by_upload_id_cleans_up() {
 fn delete_multipart_part_segments_by_upload_id_noop_on_missing() {
     let (_dir, store) = make_pg_store();
     // Should not error on nonexistent upload_id
-    store.delete_multipart_part_segments_by_upload_id("nonexistent").unwrap();
+    store
+        .delete_multipart_part_segments_by_upload_id("nonexistent")
+        .unwrap();
 }
 
 // ── mark_bucket_deleting / head_bucket_raw ─────────────────────────────
@@ -4592,7 +4669,9 @@ fn complete_multipart_commit_no_such_upload() {
         checksum: None,
     }];
     // Should fail — upload "nonexistent" does not exist.
-    let err = store.complete_multipart_commit("nonexistent", &obj, &parts).unwrap_err();
+    let err = store
+        .complete_multipart_commit("nonexistent", &obj, &parts)
+        .unwrap_err();
     assert!(
         matches!(
             err,

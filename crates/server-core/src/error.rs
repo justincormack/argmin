@@ -15,6 +15,13 @@ pub enum ServerError {
     #[error("object not found: {bucket}/{key}")]
     ObjectNotFound { bucket: String, key: String },
 
+    #[error("version not found: {bucket}/{key} version {version_id}")]
+    VersionNotFound {
+        bucket: String,
+        key: String,
+        version_id: String,
+    },
+
     #[error("delete marker hit: {bucket}/{key}")]
     DeleteMarkerHit { bucket: String, key: String },
 
@@ -165,6 +172,7 @@ impl ServerError {
             Self::BucketAlreadyExists => "BucketAlreadyExists",
             Self::BucketNotEmpty => "BucketNotEmpty",
             Self::ObjectNotFound { .. } => "NoSuchKey",
+            Self::VersionNotFound { .. } => "NoSuchVersion",
             Self::DeleteMarkerHit { .. } => "NoSuchKey",
             Self::Auth(auth::AuthError::MissingAuth) => "AccessDenied",
             Self::Auth(auth::AuthError::MalformedAuth) => "AuthorizationHeaderMalformed",
@@ -236,6 +244,7 @@ impl ServerError {
             Self::BucketAlreadyExists => 409,
             Self::BucketNotEmpty => 409,
             Self::ObjectNotFound { .. } => 404,
+            Self::VersionNotFound { .. } => 404,
             Self::DeleteMarkerHit { .. } => 404,
             Self::Auth(
                 auth::AuthError::MalformedAuth

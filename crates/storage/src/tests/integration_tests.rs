@@ -470,7 +470,9 @@ fn streaming_put_object_lifecycle() {
     assert_eq!(obj.as_live().unwrap().size, total_size);
 
     // Object segments readable.
-    let segs = store.get_object_segments("b", "k", VersionId::Null).unwrap();
+    let segs = store
+        .get_object_segments("b", "k", VersionId::Null)
+        .unwrap();
     assert_eq!(segs.len(), 2);
     assert_eq!(segs[0].segment_okh, hash0);
     assert_eq!(segs[1].segment_okh, hash1);
@@ -668,9 +670,7 @@ fn versioned_object_lifecycle() {
     assert_eq!(resp.versions.len(), 3);
 
     // Get specific version.
-    let obj = store
-        .get_object_version("b", "k", version_ids[1])
-        .unwrap();
+    let obj = store.get_object_version("b", "k", version_ids[1]).unwrap();
     assert_eq!(obj.as_live().unwrap().size, "version-2-data".len() as u64);
 
     // Delete version 2.
@@ -686,12 +686,8 @@ fn versioned_object_lifecycle() {
     assert!(matches!(err, crate::MetadataError::ObjectNotFound));
 
     // Versions 1 and 3 intact.
-    store
-        .get_object_version("b", "k", version_ids[0])
-        .unwrap();
-    store
-        .get_object_version("b", "k", version_ids[2])
-        .unwrap();
+    store.get_object_version("b", "k", version_ids[0]).unwrap();
+    store.get_object_version("b", "k", version_ids[2]).unwrap();
 
     // List now shows 2.
     let resp = store
@@ -802,9 +798,7 @@ fn object_overwrite_with_reclaim() {
     assert_eq!(root.generation_id, gen1);
 
     // Clean up reclaim, then old shard.
-    store
-        .delete_simple_payload_reclaim("b", "k", gen1)
-        .unwrap();
+    store.delete_simple_payload_reclaim("b", "k", gen1).unwrap();
     store.delete_shard(&sk1).unwrap();
 
     // Reclaim gone.

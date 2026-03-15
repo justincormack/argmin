@@ -2565,6 +2565,13 @@ impl Coordinator {
             None => pg.get_object_meta(bucket, key),
         }
         .map_err(|e| match e {
+            storage::MetadataError::ObjectNotFound if version_id.is_some() => {
+                ServerError::VersionNotFound {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                    version_id: version_id.unwrap().to_string(),
+                }
+            }
             storage::MetadataError::ObjectNotFound => ServerError::ObjectNotFound {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
@@ -2593,6 +2600,13 @@ impl Coordinator {
             None => pg.get_object_meta(bucket, key),
         }
         .map_err(|e| match e {
+            storage::MetadataError::ObjectNotFound if version_id.is_some() => {
+                ServerError::VersionNotFound {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                    version_id: version_id.unwrap().to_string(),
+                }
+            }
             storage::MetadataError::ObjectNotFound => ServerError::ObjectNotFound {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
@@ -2621,6 +2635,13 @@ impl Coordinator {
             None => pg.get_object_meta(bucket, key),
         }
         .map_err(|e| match e {
+            storage::MetadataError::ObjectNotFound if version_id.is_some() => {
+                ServerError::VersionNotFound {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                    version_id: version_id.unwrap().to_string(),
+                }
+            }
             storage::MetadataError::ObjectNotFound => ServerError::ObjectNotFound {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
@@ -3799,6 +3820,13 @@ impl Coordinator {
             None => meta_pg.get_object_meta(bucket, key),
         }
         .map_err(|e| match e {
+            storage::MetadataError::ObjectNotFound if version_id.is_some() => {
+                ServerError::VersionNotFound {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                    version_id: version_id.unwrap().to_string(),
+                }
+            }
             storage::MetadataError::ObjectNotFound => ServerError::ObjectNotFound {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
@@ -4992,7 +5020,9 @@ impl Coordinator {
                     pgs,
                 } = match self.lock_object_pgs_for_read(bucket, key, Some(vid)) {
                     Ok(locked) => locked,
-                    Err(ServerError::ObjectNotFound { .. }) => {
+                    Err(
+                        ServerError::ObjectNotFound { .. } | ServerError::VersionNotFound { .. },
+                    ) => {
                         return Ok(DeleteObjectResult {
                             version_id: vid,
                             delete_marker: false,
@@ -6560,13 +6590,7 @@ pub mod test_helpers {
         })?;
         let result = (|| {
             for (idx, chunk) in req.data.chunks(INTERNAL_SEGMENT_SIZE).enumerate() {
-                coord.append_stream_segment(
-                    req.bucket,
-                    req.key,
-                    &session_id,
-                    idx as u32,
-                    chunk,
-                )?;
+                coord.append_stream_segment(req.bucket, req.key, &session_id, idx as u32, chunk)?;
             }
             let crc = checksum::crc64::checksum(req.data);
             coord.finalize_stream_put(&FinalizeStreamPutRequest {
@@ -6604,13 +6628,7 @@ pub mod test_helpers {
         let session_id = &session.session_id;
         let result = (|| {
             for (idx, chunk) in req.data.chunks(INTERNAL_SEGMENT_SIZE).enumerate() {
-                coord.append_stream_segment(
-                    req.bucket,
-                    req.key,
-                    session_id,
-                    idx as u32,
-                    chunk,
-                )?;
+                coord.append_stream_segment(req.bucket, req.key, session_id, idx as u32, chunk)?;
             }
             let crc = checksum::crc64::checksum(req.data);
             let computed_checksum = {
@@ -6619,13 +6637,11 @@ pub mod test_helpers {
                     .map(ChecksumClaim::algorithm)
                     .or(session.checksum_algorithm);
                 match algo {
-                    Some(a) => Some(
-                        RawChecksum::new(a, compute_checksum(a, req.data)).map_err(|_| {
-                            ServerError::InternalError {
-                                reason: "checksum byte length mismatch".to_string(),
-                            }
-                        })?,
-                    ),
+                    Some(a) => Some(RawChecksum::new(a, compute_checksum(a, req.data)).map_err(
+                        |_| ServerError::InternalError {
+                            reason: "checksum byte length mismatch".to_string(),
+                        },
+                    )?),
                     None => None,
                 }
             };
@@ -6650,8 +6666,8 @@ pub mod test_helpers {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::test_helpers;
+    use super::*;
     use crate::conditional::{DeleteCondition, ReadCondition, SpecificEtag, WriteCondition};
     use std::path::{Path, PathBuf};
     use std::sync::mpsc;
@@ -7080,7 +7096,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -7089,8 +7107,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let err = delete_bucket_test(&coord, "bucket").unwrap_err();
         assert!(matches!(err, ServerError::BucketNotEmpty));
@@ -7104,7 +7123,9 @@ mod tests {
 
         let tags_xml =
             "<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag></TagSet></Tagging>";
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -7113,8 +7134,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let obj = coord
             .get_object(&GetObjectRequest {
@@ -7152,16 +7174,19 @@ mod tests {
         let guard = storage_node.lock_bucket("bucket");
         let (tx, rx) = mpsc::channel();
         let handle = thread::spawn(move || {
-            let res = test_helpers::put_object(&writer, &PutObjectRequest {
-                bucket: "bucket",
-                key: "key",
-                data: b"data",
-                metadata: &MetadataBlob::new(),
-                tags: None,
-                cond: NO_WRITE,
-                requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
-            });
+            let res = test_helpers::put_object(
+                &writer,
+                &PutObjectRequest {
+                    bucket: "bucket",
+                    key: "key",
+                    data: b"data",
+                    metadata: &MetadataBlob::new(),
+                    tags: None,
+                    cond: NO_WRITE,
+                    requester: TEST_REQUESTER,
+                    acl: NO_PUT_OBJECT_ACL,
+                },
+            );
             tx.send(res).unwrap();
         });
 
@@ -7225,7 +7250,9 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let headers = [("Content-Type", "text/plain")];
-        let result = test_helpers::put_object(&coord, &PutObjectRequest {
+        let result = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "hello.txt",
                 data: b"Hello, world!",
@@ -7234,8 +7261,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         assert!(!result.etag.is_empty());
 
         let obj = coord
@@ -7264,7 +7292,9 @@ mod tests {
             ("X-Amz-Meta-Author", "alice"),
             ("X-Amz-Meta-Version", "42"),
         ];
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "obj",
                 data: b"{}",
@@ -7273,8 +7303,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let obj = coord
             .get_object(&GetObjectRequest {
@@ -7297,7 +7328,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -7306,8 +7339,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let head = coord
             .head_object(&GetObjectRequest {
@@ -7328,7 +7362,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: b"v1",
@@ -7337,9 +7373,12 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+            },
+        )
+        .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: b"v2",
@@ -7348,8 +7387,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let obj = coord
             .get_object(&GetObjectRequest {
@@ -7369,7 +7409,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "empty",
                 data: b"",
@@ -7378,8 +7420,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let obj = coord
             .get_object(&GetObjectRequest {
@@ -7400,7 +7443,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -7409,8 +7454,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         coord
             .delete_object(&DeleteObjectRequest {
                 bucket: "bucket",
@@ -7439,7 +7485,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: b"simple-data",
@@ -7448,8 +7496,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let (generation_id, ec) = {
             let meta_pg_id = coord.object_pg_id("bucket", "key");
@@ -7501,7 +7550,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "a/1",
                 data: b"1",
@@ -7510,9 +7561,12 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+            },
+        )
+        .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "a/2",
                 data: b"2",
@@ -7521,9 +7575,12 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+            },
+        )
+        .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "b/1",
                 data: b"3",
@@ -7532,8 +7589,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let result = coord
             .list_objects_v2(&ListObjectsV2Request {
@@ -7558,7 +7616,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "photos/cat.jpg",
                 data: b"cat",
@@ -7567,9 +7627,12 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+            },
+        )
+        .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "photos/dog.jpg",
                 data: b"dog",
@@ -7578,9 +7641,12 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+            },
+        )
+        .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "docs/readme.md",
                 data: b"md",
@@ -7589,8 +7655,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let result = coord
             .list_objects_v2(&ListObjectsV2Request {
@@ -7611,7 +7678,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "photos/cat.jpg",
                 data: b"cat",
@@ -7620,9 +7689,12 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+            },
+        )
+        .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "photos/dog.jpg",
                 data: b"dog",
@@ -7631,9 +7703,12 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+            },
+        )
+        .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "docs/readme.md",
                 data: b"md",
@@ -7642,9 +7717,12 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+            },
+        )
+        .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "root.txt",
                 data: b"root",
@@ -7653,8 +7731,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let result = coord
             .list_objects_v2(&ListObjectsV2Request {
@@ -7678,7 +7757,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "folder/",
                 data: b"data",
@@ -7687,8 +7768,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let obj = coord
             .get_object(&GetObjectRequest {
@@ -7823,7 +7905,9 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         let data = b"This data should survive shard loss!";
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "resilient",
                 data,
@@ -7832,8 +7916,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         // Delete one data shard using the helper
         delete_shard_on_disk(&coord, tmp.path(), "bucket", "resilient", 0);
@@ -7858,7 +7943,9 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         let data = b"EC single shard loss test data";
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "obj1",
                 data,
@@ -7867,8 +7954,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         delete_shard_on_disk(&coord, tmp.path(), "bucket", "obj1", 0);
 
@@ -7892,7 +7980,9 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         let data = b"EC m-shard loss limit test data";
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "obj2",
                 data,
@@ -7901,8 +7991,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         // Delete 2 data shards (indices 0 and 1)
         delete_shard_on_disk(&coord, tmp.path(), "bucket", "obj2", 0);
@@ -7928,7 +8019,9 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         let data = b"EC m+1 shard loss test data";
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "obj3",
                 data,
@@ -7937,8 +8030,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         // Delete 3 shards (indices 0, 1, 2)
         delete_shard_on_disk(&coord, tmp.path(), "bucket", "obj3", 0);
@@ -7966,7 +8060,9 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         let data = b"EC corruption recovery test data";
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "obj4",
                 data,
@@ -7975,8 +8071,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         corrupt_shard_on_disk(&coord, tmp.path(), "bucket", "obj4", 0);
 
@@ -7999,7 +8096,9 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         let data = b"Hello, World! Range test with EC recovery";
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "obj5",
                 data,
@@ -8008,8 +8107,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         // Delete shard 0 (covers the beginning of the data)
         delete_shard_on_disk(&coord, tmp.path(), "bucket", "obj5", 0);
@@ -8036,7 +8136,9 @@ mod tests {
 
         coord.create_bucket("bucket").unwrap();
         let data = b"EC parity shard drop test";
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "obj6",
                 data,
@@ -8045,8 +8147,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         // Delete first parity shard (index 4, since k=4)
         delete_shard_on_disk(&coord, tmp.path(), "bucket", "obj6", 4);
@@ -8068,7 +8171,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        let err = test_helpers::put_object(&coord, &PutObjectRequest {
+        let err = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "no-such-bucket",
                 key: "key",
                 data: b"data",
@@ -8077,8 +8182,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap_err();
+            },
+        )
+        .unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
     }
 
@@ -8106,7 +8212,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        let result = test_helpers::put_object(&coord, &PutObjectRequest {
+        let result = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -8115,8 +8223,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let obj = coord
             .get_object(&GetObjectRequest {
@@ -8147,7 +8256,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "a/1",
                 data: b"1",
@@ -8156,9 +8267,12 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+            },
+        )
+        .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "a/2",
                 data: b"2",
@@ -8167,9 +8281,12 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+            },
+        )
+        .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "b/1",
                 data: b"3",
@@ -8178,9 +8295,12 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+            },
+        )
+        .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "c/1",
                 data: b"4",
@@ -8189,9 +8309,12 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+            },
+        )
+        .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "root.txt",
                 data: b"5",
@@ -8200,8 +8323,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         // First page: max_keys=2 with delimiter
         let result = coord
@@ -8249,7 +8373,9 @@ mod tests {
         // Create many prefixed objects to ensure common_prefixes count toward max_keys
         for i in 0..10 {
             let key = format!("dir{i}/file.txt");
-            test_helpers::put_object(&coord, &PutObjectRequest {
+            test_helpers::put_object(
+                &coord,
+                &PutObjectRequest {
                     bucket: "bucket",
                     key: &key,
                     data: b"data",
@@ -8258,8 +8384,9 @@ mod tests {
                     cond: NO_WRITE,
                     requester: TEST_REQUESTER,
                     acl: NO_PUT_OBJECT_ACL,
-                })
-                .unwrap();
+                },
+            )
+            .unwrap();
         }
 
         let result = coord
@@ -8283,7 +8410,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         // Don't create bucket — put should fail at bucket check before writing shards
-        let err = test_helpers::put_object(&coord, &PutObjectRequest {
+        let err = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "no-bucket",
                 key: "key",
                 data: b"data",
@@ -8292,8 +8421,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap_err();
+            },
+        )
+        .unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
     }
 
@@ -8314,7 +8444,9 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
         for i in 0..5 {
             let key = format!("key-{i:02}");
-            test_helpers::put_object(&coord, &PutObjectRequest {
+            test_helpers::put_object(
+                &coord,
+                &PutObjectRequest {
                     bucket: "bucket",
                     key: &key,
                     data: b"data",
@@ -8323,8 +8455,9 @@ mod tests {
                     cond: NO_WRITE,
                     requester: TEST_REQUESTER,
                     acl: NO_PUT_OBJECT_ACL,
-                })
-                .unwrap();
+                },
+            )
+            .unwrap();
         }
 
         // Request fewer than available
@@ -8351,7 +8484,9 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
         for i in 0..5 {
             let key = format!("key-{i:02}");
-            test_helpers::put_object(&coord, &PutObjectRequest {
+            test_helpers::put_object(
+                &coord,
+                &PutObjectRequest {
                     bucket: "bucket",
                     key: &key,
                     data: b"data",
@@ -8360,8 +8495,9 @@ mod tests {
                     cond: NO_WRITE,
                     requester: TEST_REQUESTER,
                     acl: NO_PUT_OBJECT_ACL,
-                })
-                .unwrap();
+                },
+            )
+            .unwrap();
         }
 
         // First page
@@ -8416,7 +8552,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "photos/2024/jan.jpg",
                 data: b"j",
@@ -8425,9 +8563,12 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+            },
+        )
+        .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "photos/2024/feb.jpg",
                 data: b"f",
@@ -8436,9 +8577,12 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+            },
+        )
+        .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "photos/2025/mar.jpg",
                 data: b"m",
@@ -8447,9 +8591,12 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+            },
+        )
+        .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "photos/top.jpg",
                 data: b"t",
@@ -8458,8 +8605,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         // List with prefix "photos/" and delimiter "/"
         let result = coord
@@ -8487,7 +8635,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "only-one",
                 data: b"data",
@@ -8496,8 +8646,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let result = coord
             .list_objects_v2(&ListObjectsV2Request {
@@ -8520,7 +8671,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key1",
                 data: b"data",
@@ -8529,8 +8682,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let result = coord
             .list_objects_v2(&ListObjectsV2Request {
@@ -8554,7 +8708,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "a/1",
                 data: b"data",
@@ -8563,8 +8719,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let result = coord
             .list_objects_v2(&ListObjectsV2Request {
@@ -8605,7 +8762,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key1",
                 data: b"data1",
@@ -8614,9 +8773,12 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+            },
+        )
+        .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key2",
                 data: b"data2",
@@ -8625,8 +8787,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let entries = vec![
             DeleteEntry {
@@ -8818,7 +8981,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: b"Hello, World!",
@@ -8827,8 +8992,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         // bytes=0-4 → "Hello"
         let result = coord
@@ -8853,7 +9019,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: b"Hello, World!",
@@ -8862,8 +9030,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         // bytes=-6 → "World!"  (last 6 bytes)
         let result = coord
@@ -8887,7 +9056,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: b"Hello, World!",
@@ -8896,8 +9067,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         // bytes=7- → "World!"
         let result = coord
@@ -8919,7 +9091,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: b"Hello",
@@ -8928,8 +9102,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         // bytes=100- → unsatisfiable
         let err = coord
@@ -8951,7 +9126,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: b"Hello",
@@ -8960,8 +9137,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         // bytes=0-99999 on 5-byte object → clamp to 0-4
         let result = coord
@@ -8991,7 +9169,9 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let cond = WriteCondition::IfNoneMatchStar;
-        let result = test_helpers::put_object(&coord, &PutObjectRequest {
+        let result = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "new-key",
                 data: b"data",
@@ -9000,8 +9180,9 @@ mod tests {
                 cond: &cond,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         assert!(!result.etag.is_empty());
     }
 
@@ -9010,7 +9191,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: b"v1",
@@ -9019,11 +9202,14 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let cond = WriteCondition::IfNoneMatchStar;
-        let err = test_helpers::put_object(&coord, &PutObjectRequest {
+        let err = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: b"v2",
@@ -9032,8 +9218,9 @@ mod tests {
                 cond: &cond,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap_err();
+            },
+        )
+        .unwrap_err();
         assert!(matches!(err, ServerError::PreconditionFailed));
     }
 
@@ -9043,7 +9230,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
-        let r1 = test_helpers::put_object(&coord, &PutObjectRequest {
+        let r1 = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: b"v1",
@@ -9052,10 +9241,13 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         let cond = WriteCondition::IfMatch(SpecificEtag::new(r1.etag.clone()).unwrap());
-        let r2 = test_helpers::put_object(&coord, &PutObjectRequest {
+        let r2 = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: b"v2",
@@ -9064,8 +9256,9 @@ mod tests {
                 cond: &cond,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         assert_ne!(r1.etag, r2.etag);
 
         let obj = coord
@@ -9086,7 +9279,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
-        let r1 = test_helpers::put_object(&coord, &PutObjectRequest {
+        let r1 = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: b"v1",
@@ -9095,10 +9290,13 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         // Overwrite so etag changes
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: b"v2",
@@ -9107,11 +9305,14 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let cond = WriteCondition::IfMatch(SpecificEtag::new(r1.etag).unwrap());
-        let err = test_helpers::put_object(&coord, &PutObjectRequest {
+        let err = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: b"v3",
@@ -9120,8 +9321,9 @@ mod tests {
                 cond: &cond,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap_err();
+            },
+        )
+        .unwrap_err();
         assert!(matches!(err, ServerError::PreconditionFailed));
     }
 
@@ -9131,7 +9333,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
-        let err = test_helpers::put_object(&coord, &PutObjectRequest {
+        let err = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -9140,8 +9344,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: Requester::principal("other-user"),
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap_err();
+            },
+        )
+        .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
     }
 
@@ -9158,7 +9363,9 @@ mod tests {
             )
             .unwrap();
 
-        let err = test_helpers::put_object(&coord, &PutObjectRequest {
+        let err = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -9167,8 +9374,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: PutObjectAcl::Other("public-read"),
-            })
-            .unwrap_err();
+            },
+        )
+        .unwrap_err();
         assert!(matches!(err, ServerError::AccessControlListNotSupported));
     }
 
@@ -9225,7 +9433,9 @@ mod tests {
         coord
             .create_bucket_for_owner("owner-a", "bucket", false)
             .unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -9234,8 +9444,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let err = coord
             .get_object_tags("bucket", "key", None, Requester::principal("other-user"))
@@ -9250,7 +9461,9 @@ mod tests {
         coord
             .create_bucket_for_owner("owner-a", "bucket", false)
             .unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -9259,8 +9472,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let err = coord
             .delete_object(&DeleteObjectRequest {
@@ -9304,7 +9518,9 @@ mod tests {
         coord
             .create_bucket_for_owner("owner-a", "bucket", false)
             .unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: b"secret",
@@ -9313,8 +9529,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let err = coord
             .get_object(&GetObjectRequest {
@@ -9335,7 +9552,9 @@ mod tests {
         coord
             .create_bucket_for_owner("owner-a", "bucket", true)
             .unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: b"public",
@@ -9344,8 +9563,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let obj = coord
             .get_object(&GetObjectRequest {
@@ -9400,7 +9620,9 @@ mod tests {
         coord
             .create_bucket_for_owner("owner-a", "bucket", false)
             .unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -9409,8 +9631,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let err = coord
             .list_objects_v2(&ListObjectsV2Request {
@@ -9480,7 +9703,9 @@ mod tests {
             })
             .unwrap();
 
-        let err = test_helpers::upload_part(&coord, &UploadPartRequest {
+        let err = test_helpers::upload_part(
+            &coord,
+            &UploadPartRequest {
                 bucket: "bucket",
                 key: "key",
                 upload_id: &upload.upload_id,
@@ -9488,8 +9713,9 @@ mod tests {
                 data: b"data",
                 claimed_checksum: None,
                 requester: Requester::principal("other-user"),
-            })
-            .unwrap_err();
+            },
+        )
+        .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
     }
 
@@ -9634,7 +9860,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
-        let put = test_helpers::put_object(&coord, &PutObjectRequest {
+        let put = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -9643,8 +9871,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         let cond = ReadCondition {
             if_match: Some(put.etag.into()),
             ..Default::default()
@@ -9666,7 +9895,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -9675,8 +9906,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let cond = ReadCondition {
             if_match: Some("\"0000000000000000\"".into()),
@@ -9700,7 +9932,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
-        let put = test_helpers::put_object(&coord, &PutObjectRequest {
+        let put = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -9709,8 +9943,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         let cond = ReadCondition {
             if_none_match: Some(put.etag.into()),
             ..Default::default()
@@ -9733,7 +9968,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
-        let put = test_helpers::put_object(&coord, &PutObjectRequest {
+        let put = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -9742,8 +9979,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         let cond = ReadCondition {
             if_none_match: Some(put.etag.into()),
             ..Default::default()
@@ -9766,7 +10004,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
-        let put = test_helpers::put_object(&coord, &PutObjectRequest {
+        let put = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -9775,8 +10015,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         let cond = DeleteCondition::IfMatch(put.etag.into());
         coord
             .delete_object(&DeleteObjectRequest {
@@ -9803,7 +10044,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -9812,8 +10055,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let cond = DeleteCondition::IfMatch("\"0000000000000000\"".into());
         let err = coord
@@ -9834,7 +10078,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
-        let p1 = test_helpers::put_object(&coord, &PutObjectRequest {
+        let p1 = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key1",
                 data: b"data1",
@@ -9843,9 +10089,12 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+            },
+        )
+        .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key2",
                 data: b"data2",
@@ -9854,8 +10103,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         // Use key1's etag for both entries; key2 will fail the condition
         let cond = DeleteCondition::IfMatch(p1.etag.into());
@@ -9889,7 +10139,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
-        let put = test_helpers::put_object(&coord, &PutObjectRequest {
+        let put = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: b"Hello, World!",
@@ -9898,8 +10150,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         let cond = ReadCondition {
             if_match: Some(put.etag.into()),
             ..Default::default()
@@ -9926,7 +10179,9 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let headers = [("Content-Type", "text/plain")];
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "src",
                 data: b"hello copy",
@@ -9935,8 +10190,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let result = coord
             .copy_object(&CopyObjectRequest {
@@ -9980,7 +10236,9 @@ mod tests {
             .create_bucket_for_owner("owner-b", "dst-bucket", false)
             .unwrap();
 
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "src-bucket",
                 key: "src",
                 data: b"private",
@@ -9989,8 +10247,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let err = coord
             .copy_object(&CopyObjectRequest {
@@ -10024,7 +10283,9 @@ mod tests {
                 TEST_REQUESTER,
             )
             .unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "src",
                 data: b"data",
@@ -10033,8 +10294,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let err = coord
             .copy_object(&CopyObjectRequest {
@@ -10066,7 +10328,9 @@ mod tests {
             ("Content-Type", "image/png"),
             ("X-Amz-Meta-Author", "alice"),
         ];
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "src",
                 data: b"data",
@@ -10075,8 +10339,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         coord
             .copy_object(&CopyObjectRequest {
@@ -10119,7 +10384,9 @@ mod tests {
             ("Content-Type", "image/png"),
             ("X-Amz-Meta-Author", "alice"),
         ];
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "src",
                 data: b"data",
@@ -10128,8 +10395,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let new_headers = [("Content-Type", "text/html"), ("X-Amz-Meta-Version", "2")];
         let new_metadata = MetadataBlob::from_headers(&new_headers).unwrap();
@@ -10177,7 +10445,9 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let headers = [("Content-Type", "text/plain")];
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -10186,8 +10456,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let new_metadata =
             MetadataBlob::from_headers(&[("Content-Type", "application/json")]).unwrap();
@@ -10233,7 +10504,9 @@ mod tests {
 
         let tags_xml =
             "<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag></TagSet></Tagging>";
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "src",
                 data: b"data",
@@ -10242,8 +10515,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         coord
             .copy_object(&CopyObjectRequest {
@@ -10285,7 +10559,9 @@ mod tests {
             "<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag></TagSet></Tagging>";
         let dst_tags =
             "<Tagging><TagSet><Tag><Key>tier</Key><Value>gold</Value></Tag></TagSet></Tagging>";
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "src",
                 data: b"data",
@@ -10294,8 +10570,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         coord
             .copy_object(&CopyObjectRequest {
@@ -10335,7 +10612,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "src",
                 data: b"hello",
@@ -10344,8 +10623,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         // Metadata blob with only content-type (checksum value headers should
         // be stripped at the HTTP boundary before reaching the coordinator).
@@ -10395,7 +10675,9 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let data = b"hello";
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "src",
                 data,
@@ -10404,8 +10686,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let new_metadata = MetadataBlob::from_headers(&[("Content-Type", "text/plain")]).unwrap();
         coord
@@ -10493,7 +10776,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "src",
                 data: b"data",
@@ -10502,8 +10787,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let err = coord
             .copy_object(&CopyObjectRequest {
@@ -10530,7 +10816,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "src",
                 data: b"data",
@@ -10539,8 +10827,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let src_cond = ReadCondition {
             if_match: Some("\"0000000000000000\"".into()),
@@ -10572,7 +10861,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "src",
                 data: b"data",
@@ -10581,9 +10872,12 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
-        test_helpers::put_object(&coord, &PutObjectRequest {
+            },
+        )
+        .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "dst",
                 data: b"existing",
@@ -10592,8 +10886,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let dst_cond = WriteCondition::IfNoneMatchStar;
         let err = coord
@@ -10622,7 +10917,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "src",
                 data: b"new data",
@@ -10631,9 +10928,12 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
-        let existing = test_helpers::put_object(&coord, &PutObjectRequest {
+            },
+        )
+        .unwrap();
+        let existing = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "dst",
                 data: b"old data",
@@ -10642,8 +10942,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let dst_cond = WriteCondition::IfMatch(SpecificEtag::new(existing.etag).unwrap());
         let result = coord
@@ -10685,7 +10986,9 @@ mod tests {
         coord.create_bucket("dst-bucket").unwrap();
 
         let headers = [("Content-Type", "text/plain")];
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "src-bucket",
                 key: "key",
                 data: b"cross bucket data",
@@ -10694,8 +10997,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         coord
             .copy_object(&CopyObjectRequest {
@@ -10864,7 +11168,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
-        let result = test_helpers::put_object(&coord, &PutObjectRequest {
+        let result = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -10873,8 +11179,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         assert_eq!(result.version_id, VersionId::Null);
     }
 
@@ -10884,7 +11191,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -10893,8 +11202,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         let obj = coord
             .get_object(&GetObjectRequest {
                 bucket: "bucket",
@@ -10913,7 +11223,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -10922,8 +11234,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         let head = coord
             .head_object(&GetObjectRequest {
                 bucket: "bucket",
@@ -10972,29 +11285,35 @@ mod tests {
 
             let t1 = thread::spawn(move || {
                 b1.wait();
-                test_helpers::put_object(&coord_a, &PutObjectRequest {
-                    bucket: "bucket",
-                    key: &key_a,
-                    data: b"v1",
-                    metadata: &MetadataBlob::new(),
-                    tags: None,
-                    cond: NO_WRITE,
-                    requester: TEST_REQUESTER,
-                    acl: NO_PUT_OBJECT_ACL,
-                })
+                test_helpers::put_object(
+                    &coord_a,
+                    &PutObjectRequest {
+                        bucket: "bucket",
+                        key: &key_a,
+                        data: b"v1",
+                        metadata: &MetadataBlob::new(),
+                        tags: None,
+                        cond: NO_WRITE,
+                        requester: TEST_REQUESTER,
+                        acl: NO_PUT_OBJECT_ACL,
+                    },
+                )
             });
             let t2 = thread::spawn(move || {
                 b2.wait();
-                test_helpers::put_object(&coord_b, &PutObjectRequest {
-                    bucket: "bucket",
-                    key: &key_b,
-                    data: b"v2",
-                    metadata: &MetadataBlob::new(),
-                    tags: None,
-                    cond: NO_WRITE,
-                    requester: TEST_REQUESTER,
-                    acl: NO_PUT_OBJECT_ACL,
-                })
+                test_helpers::put_object(
+                    &coord_b,
+                    &PutObjectRequest {
+                        bucket: "bucket",
+                        key: &key_b,
+                        data: b"v2",
+                        metadata: &MetadataBlob::new(),
+                        tags: None,
+                        cond: NO_WRITE,
+                        requester: TEST_REQUESTER,
+                        acl: NO_PUT_OBJECT_ACL,
+                    },
+                )
             });
 
             barrier.wait();
@@ -11031,7 +11350,9 @@ mod tests {
         admin.create_bucket("bucket").unwrap();
 
         let object_size = (2 * 1024 * 1024) + 137;
-        test_helpers::put_object(&admin, &PutObjectRequest {
+        test_helpers::put_object(
+            &admin,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: &vec![b'A'; object_size],
@@ -11040,8 +11361,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let mut current = b'A';
         for _ in 0..20 {
@@ -11056,16 +11378,19 @@ mod tests {
 
             let t_write = thread::spawn(move || {
                 b1.wait();
-                test_helpers::put_object(&writer, &PutObjectRequest {
-                    bucket: "bucket",
-                    key: "key",
-                    data: &new_payload,
-                    metadata: &MetadataBlob::new(),
-                    tags: None,
-                    cond: NO_WRITE,
-                    requester: TEST_REQUESTER,
-                    acl: NO_PUT_OBJECT_ACL,
-                })
+                test_helpers::put_object(
+                    &writer,
+                    &PutObjectRequest {
+                        bucket: "bucket",
+                        key: "key",
+                        data: &new_payload,
+                        metadata: &MetadataBlob::new(),
+                        tags: None,
+                        cond: NO_WRITE,
+                        requester: TEST_REQUESTER,
+                        acl: NO_PUT_OBJECT_ACL,
+                    },
+                )
             });
             let t_read = thread::spawn(move || {
                 b2.wait();
@@ -11121,7 +11446,9 @@ mod tests {
         admin.create_bucket("dst-bucket").unwrap();
 
         let object_size = (2 * 1024 * 1024) + 137;
-        test_helpers::put_object(&admin, &PutObjectRequest {
+        test_helpers::put_object(
+            &admin,
+            &PutObjectRequest {
                 bucket: "src-bucket",
                 key: "src",
                 data: &vec![b'A'; object_size],
@@ -11130,8 +11457,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let mut current = b'A';
         for i in 0..12 {
@@ -11148,16 +11476,19 @@ mod tests {
 
             let t_write = thread::spawn(move || {
                 b1.wait();
-                test_helpers::put_object(&writer, &PutObjectRequest {
-                    bucket: "src-bucket",
-                    key: "src",
-                    data: &new_payload,
-                    metadata: &MetadataBlob::new(),
-                    tags: None,
-                    cond: NO_WRITE,
-                    requester: TEST_REQUESTER,
-                    acl: NO_PUT_OBJECT_ACL,
-                })
+                test_helpers::put_object(
+                    &writer,
+                    &PutObjectRequest {
+                        bucket: "src-bucket",
+                        key: "src",
+                        data: &new_payload,
+                        metadata: &MetadataBlob::new(),
+                        tags: None,
+                        cond: NO_WRITE,
+                        requester: TEST_REQUESTER,
+                        acl: NO_PUT_OBJECT_ACL,
+                    },
+                )
             });
             let t_copy = thread::spawn(move || {
                 b2.wait();
@@ -11233,7 +11564,9 @@ mod tests {
         admin.create_bucket("bucket").unwrap();
 
         let object_size = (2 * 1024 * 1024) + 137;
-        test_helpers::put_object(&admin, &PutObjectRequest {
+        test_helpers::put_object(
+            &admin,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "src",
                 data: &vec![b'A'; object_size],
@@ -11242,8 +11575,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let mut current = b'A';
         for i in 0..8 {
@@ -11270,16 +11604,19 @@ mod tests {
 
             let t_write = thread::spawn(move || {
                 b1.wait();
-                test_helpers::put_object(&writer, &PutObjectRequest {
-                    bucket: "bucket",
-                    key: "src",
-                    data: &new_payload,
-                    metadata: &MetadataBlob::new(),
-                    tags: None,
-                    cond: NO_WRITE,
-                    requester: TEST_REQUESTER,
-                    acl: NO_PUT_OBJECT_ACL,
-                })
+                test_helpers::put_object(
+                    &writer,
+                    &PutObjectRequest {
+                        bucket: "bucket",
+                        key: "src",
+                        data: &new_payload,
+                        metadata: &MetadataBlob::new(),
+                        tags: None,
+                        cond: NO_WRITE,
+                        requester: TEST_REQUESTER,
+                        acl: NO_PUT_OBJECT_ACL,
+                    },
+                )
             });
             let t_copy = thread::spawn(move || {
                 b2.wait();
@@ -11366,7 +11703,9 @@ mod tests {
         admin.create_bucket("bucket").unwrap();
 
         let object_size = 256 * 1024;
-        test_helpers::put_object(&admin, &PutObjectRequest {
+        test_helpers::put_object(
+            &admin,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: &vec![b'A'; object_size],
@@ -11375,8 +11714,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         for i in 0..50 {
             let expected_byte = if i % 2 == 0 { b'B' } else { b'C' };
@@ -11390,16 +11730,19 @@ mod tests {
 
             let t_write = thread::spawn(move || {
                 b1.wait();
-                test_helpers::put_object(&writer, &PutObjectRequest {
-                    bucket: "bucket",
-                    key: "key",
-                    data: &payload,
-                    metadata: &MetadataBlob::new(),
-                    tags: None,
-                    cond: NO_WRITE,
-                    requester: TEST_REQUESTER,
-                    acl: NO_PUT_OBJECT_ACL,
-                })
+                test_helpers::put_object(
+                    &writer,
+                    &PutObjectRequest {
+                        bucket: "bucket",
+                        key: "key",
+                        data: &payload,
+                        metadata: &MetadataBlob::new(),
+                        tags: None,
+                        cond: NO_WRITE,
+                        requester: TEST_REQUESTER,
+                        acl: NO_PUT_OBJECT_ACL,
+                    },
+                )
             });
             let t_delete = thread::spawn(move || {
                 b2.wait();
@@ -11825,7 +12168,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -11834,8 +12179,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         let result = coord
             .delete_object(&DeleteObjectRequest {
                 bucket: "bucket",
@@ -12335,7 +12681,9 @@ mod tests {
         admin.create_bucket("bucket").unwrap();
 
         let metadata = MetadataBlob::new();
-        test_helpers::put_object(&admin, &PutObjectRequest {
+        test_helpers::put_object(
+            &admin,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: b"hello world",
@@ -12344,8 +12692,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let held_read = admin
             .get_object(&GetObjectRequest {
@@ -12513,7 +12862,9 @@ mod tests {
             })
             .unwrap();
 
-        let result = test_helpers::upload_part(&coord, &UploadPartRequest {
+        let result = test_helpers::upload_part(
+            &coord,
+            &UploadPartRequest {
                 bucket: "bucket",
                 key: "key",
                 upload_id: &create.upload_id,
@@ -12522,8 +12873,9 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         // ETag should be a quoted hex CRC64.
         assert!(result.etag.starts_with('"'));
@@ -12567,7 +12919,9 @@ mod tests {
             .unwrap();
 
         // First upload → generation 0.
-        test_helpers::upload_part(&coord, &UploadPartRequest {
+        test_helpers::upload_part(
+            &coord,
+            &UploadPartRequest {
                 bucket: "bucket",
                 key: "key",
                 upload_id: &create.upload_id,
@@ -12576,11 +12930,14 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         // Re-upload same part number → generation 1.
-        let result = test_helpers::upload_part(&coord, &UploadPartRequest {
+        let result = test_helpers::upload_part(
+            &coord,
+            &UploadPartRequest {
                 bucket: "bucket",
                 key: "key",
                 upload_id: &create.upload_id,
@@ -12589,8 +12946,9 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let meta_pg_id = coord.object_pg_id("bucket", "key");
         let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
@@ -12621,7 +12979,9 @@ mod tests {
             })
             .unwrap();
 
-        let err = test_helpers::upload_part(&coord, &UploadPartRequest {
+        let err = test_helpers::upload_part(
+            &coord,
+            &UploadPartRequest {
                 bucket: "bucket",
                 key: "key",
                 upload_id: &create.upload_id,
@@ -12630,8 +12990,9 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
-            })
-            .unwrap_err();
+            },
+        )
+        .unwrap_err();
         assert!(matches!(err, ServerError::InvalidArgument { .. }));
     }
 
@@ -12653,7 +13014,9 @@ mod tests {
             })
             .unwrap();
 
-        let err = test_helpers::upload_part(&coord, &UploadPartRequest {
+        let err = test_helpers::upload_part(
+            &coord,
+            &UploadPartRequest {
                 bucket: "bucket",
                 key: "key",
                 upload_id: &create.upload_id,
@@ -12662,8 +13025,9 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
-            })
-            .unwrap_err();
+            },
+        )
+        .unwrap_err();
         assert!(matches!(err, ServerError::InvalidArgument { .. }));
     }
 
@@ -12673,7 +13037,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
-        let err = test_helpers::upload_part(&coord, &UploadPartRequest {
+        let err = test_helpers::upload_part(
+            &coord,
+            &UploadPartRequest {
                 bucket: "bucket",
                 key: "key",
                 upload_id: "bogus-upload-id",
@@ -12682,8 +13048,9 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
-            })
-            .unwrap_err();
+            },
+        )
+        .unwrap_err();
         assert!(matches!(err, ServerError::NoSuchUpload { .. }));
     }
 
@@ -12705,7 +13072,9 @@ mod tests {
             })
             .unwrap();
 
-        test_helpers::upload_part(&coord, &UploadPartRequest {
+        test_helpers::upload_part(
+            &coord,
+            &UploadPartRequest {
                 bucket: "bucket",
                 key: "key",
                 upload_id: &create.upload_id,
@@ -12714,9 +13083,12 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
-            })
-            .unwrap();
-        test_helpers::upload_part(&coord, &UploadPartRequest {
+            },
+        )
+        .unwrap();
+        test_helpers::upload_part(
+            &coord,
+            &UploadPartRequest {
                 bucket: "bucket",
                 key: "key",
                 upload_id: &create.upload_id,
@@ -12725,9 +13097,12 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
-            })
-            .unwrap();
-        test_helpers::upload_part(&coord, &UploadPartRequest {
+            },
+        )
+        .unwrap();
+        test_helpers::upload_part(
+            &coord,
+            &UploadPartRequest {
                 bucket: "bucket",
                 key: "key",
                 upload_id: &create.upload_id,
@@ -12736,8 +13111,9 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         // Verify all three parts exist.
         let meta_pg_id = coord.object_pg_id("bucket", "key");
@@ -12777,7 +13153,9 @@ mod tests {
         // Upload same part 4 times — generation should increment each time.
         for i in 0..4u32 {
             let data = format!("version-{i}");
-            test_helpers::upload_part(&coord, &UploadPartRequest {
+            test_helpers::upload_part(
+                &coord,
+                &UploadPartRequest {
                     bucket: "bucket",
                     key: "key",
                     upload_id: &create.upload_id,
@@ -12785,8 +13163,9 @@ mod tests {
                     data: data.as_bytes(),
                     claimed_checksum: None,
                     requester: TEST_REQUESTER,
-                })
-                .unwrap();
+                },
+            )
+            .unwrap();
         }
 
         let meta_pg_id = coord.object_pg_id("bucket", "key");
@@ -12815,7 +13194,9 @@ mod tests {
             .unwrap();
 
         // Part 1 (min valid).
-        test_helpers::upload_part(&coord, &UploadPartRequest {
+        test_helpers::upload_part(
+            &coord,
+            &UploadPartRequest {
                 bucket: "bucket",
                 key: "key",
                 upload_id: &create.upload_id,
@@ -12824,10 +13205,13 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         // Part 10000 (max valid).
-        test_helpers::upload_part(&coord, &UploadPartRequest {
+        test_helpers::upload_part(
+            &coord,
+            &UploadPartRequest {
                 bucket: "bucket",
                 key: "key",
                 upload_id: &create.upload_id,
@@ -12836,8 +13220,9 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let meta_pg_id = coord.object_pg_id("bucket", "key");
         let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
@@ -12864,7 +13249,9 @@ mod tests {
             .unwrap();
 
         // Try uploading with wrong key — should be rejected even if upload_id is valid.
-        let err = test_helpers::upload_part(&coord, &UploadPartRequest {
+        let err = test_helpers::upload_part(
+            &coord,
+            &UploadPartRequest {
                 bucket: "bucket",
                 key: "wrong-key",
                 upload_id: &create.upload_id,
@@ -12873,13 +13260,16 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
-            })
-            .unwrap_err();
+            },
+        )
+        .unwrap_err();
         assert!(matches!(err, ServerError::NoSuchUpload { .. }));
 
         // Try uploading with wrong bucket.
         coord.create_bucket("other-bucket").unwrap();
-        let err = test_helpers::upload_part(&coord, &UploadPartRequest {
+        let err = test_helpers::upload_part(
+            &coord,
+            &UploadPartRequest {
                 bucket: "other-bucket",
                 key: "key",
                 upload_id: &create.upload_id,
@@ -12888,8 +13278,9 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
-            })
-            .unwrap_err();
+            },
+        )
+        .unwrap_err();
         assert!(matches!(err, ServerError::NoSuchUpload { .. }));
     }
 
@@ -12913,7 +13304,9 @@ mod tests {
 
         // Simulate concurrent same-part uploads sequentially.
         // Each successive upload should overwrite, with generation incrementing.
-        let etag1 = test_helpers::upload_part(&coord, &UploadPartRequest {
+        let etag1 = test_helpers::upload_part(
+            &coord,
+            &UploadPartRequest {
                 bucket: "bucket",
                 key: "key",
                 upload_id: &create.upload_id,
@@ -12922,10 +13315,13 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
-            })
-            .unwrap()
-            .etag;
-        let etag2 = test_helpers::upload_part(&coord, &UploadPartRequest {
+            },
+        )
+        .unwrap()
+        .etag;
+        let etag2 = test_helpers::upload_part(
+            &coord,
+            &UploadPartRequest {
                 bucket: "bucket",
                 key: "key",
                 upload_id: &create.upload_id,
@@ -12934,10 +13330,13 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
-            })
-            .unwrap()
-            .etag;
-        let etag3 = test_helpers::upload_part(&coord, &UploadPartRequest {
+            },
+        )
+        .unwrap()
+        .etag;
+        let etag3 = test_helpers::upload_part(
+            &coord,
+            &UploadPartRequest {
                 bucket: "bucket",
                 key: "key",
                 upload_id: &create.upload_id,
@@ -12946,9 +13345,10 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
-            })
-            .unwrap()
-            .etag;
+            },
+        )
+        .unwrap()
+        .etag;
 
         // Each write has different data → different ETags.
         assert_ne!(etag1, etag2);
@@ -12985,7 +13385,9 @@ mod tests {
             .unwrap();
         let mut complete_parts = Vec::new();
         for &(part_number, data) in part_data {
-            let result = test_helpers::upload_part(&coord, &UploadPartRequest {
+            let result = test_helpers::upload_part(
+                &coord,
+                &UploadPartRequest {
                     bucket,
                     key,
                     upload_id: &create.upload_id,
@@ -12993,8 +13395,9 @@ mod tests {
                     data,
                     claimed_checksum: None,
                     requester: TEST_REQUESTER,
-                })
-                .unwrap();
+                },
+            )
+            .unwrap();
             complete_parts.push(CompletePart {
                 part_number,
                 etag: result.etag,
@@ -13306,7 +13709,9 @@ mod tests {
 
         // Upload remains usable — re-upload part 1 with large data and retry.
         let big_data = vec![0u8; 5 * 1024 * 1024];
-        let new_part1 = test_helpers::upload_part(&coord, &UploadPartRequest {
+        let new_part1 = test_helpers::upload_part(
+            &coord,
+            &UploadPartRequest {
                 bucket: "bucket",
                 key: "key",
                 upload_id: &upload_id,
@@ -13315,8 +13720,9 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let retry_parts = vec![
             CompletePart {
@@ -13527,7 +13933,9 @@ mod tests {
             .unwrap();
 
         // Upload should no longer exist.
-        let err = test_helpers::upload_part(&coord, &UploadPartRequest {
+        let err = test_helpers::upload_part(
+            &coord,
+            &UploadPartRequest {
                 bucket: "bucket",
                 key: "key",
                 upload_id: &upload_id,
@@ -13536,8 +13944,9 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
-            })
-            .unwrap_err();
+            },
+        )
+        .unwrap_err();
         assert!(
             matches!(err, ServerError::NoSuchUpload { .. }),
             "expected NoSuchUpload, got {err:?}"
@@ -13725,7 +14134,9 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        test_helpers::upload_part(&coord, &UploadPartRequest {
+        test_helpers::upload_part(
+            &coord,
+            &UploadPartRequest {
                 bucket: "bucket",
                 key: "key",
                 upload_id: &create.upload_id,
@@ -13734,8 +14145,9 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         coord
             .abort_multipart_upload(&AbortMultipartUploadRequest {
@@ -13747,7 +14159,9 @@ mod tests {
             })
             .unwrap();
 
-        let err = test_helpers::upload_part(&coord, &UploadPartRequest {
+        let err = test_helpers::upload_part(
+            &coord,
+            &UploadPartRequest {
                 bucket: "bucket",
                 key: "key",
                 upload_id: &create.upload_id,
@@ -13756,8 +14170,9 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
-            })
-            .unwrap_err();
+            },
+        )
+        .unwrap_err();
         assert!(
             matches!(err, ServerError::NoSuchUpload { .. }),
             "expected NoSuchUpload, got {err:?}"
@@ -13945,7 +14360,9 @@ mod tests {
             .unwrap();
 
         // Upload part 1, then overwrite it.
-        test_helpers::upload_part(&coord, &UploadPartRequest {
+        test_helpers::upload_part(
+            &coord,
+            &UploadPartRequest {
                 bucket: "bucket",
                 key: "key",
                 upload_id: &create.upload_id,
@@ -13954,9 +14371,12 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
-            })
-            .unwrap();
-        let reupload = test_helpers::upload_part(&coord, &UploadPartRequest {
+            },
+        )
+        .unwrap();
+        let reupload = test_helpers::upload_part(
+            &coord,
+            &UploadPartRequest {
                 bucket: "bucket",
                 key: "key",
                 upload_id: &create.upload_id,
@@ -13965,8 +14385,9 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let result = coord
             .list_parts(&ListPartsRequest {
@@ -14000,7 +14421,9 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        test_helpers::upload_part(&coord, &UploadPartRequest {
+        test_helpers::upload_part(
+            &coord,
+            &UploadPartRequest {
                 bucket: "bucket",
                 key: "key",
                 upload_id: &create.upload_id,
@@ -14009,8 +14432,9 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         // Manually transition to Aborting (simulates the window during abort).
         let meta_pg_id = coord.object_pg_id("bucket", "key");
@@ -14105,7 +14529,9 @@ mod tests {
             .unwrap();
         let mut complete_parts = Vec::new();
         for (part_number, data) in part_data {
-            let result = test_helpers::upload_part(&coord, &UploadPartRequest {
+            let result = test_helpers::upload_part(
+                &coord,
+                &UploadPartRequest {
                     bucket,
                     key,
                     upload_id: &create.upload_id,
@@ -14114,8 +14540,9 @@ mod tests {
                     claimed_checksum: None,
 
                     requester: TEST_REQUESTER,
-                })
-                .unwrap();
+                },
+            )
+            .unwrap();
             complete_parts.push(CompletePart {
                 part_number: *part_number,
                 etag: result.etag,
@@ -14153,7 +14580,9 @@ mod tests {
             .unwrap();
 
         let part1 = make_part(0xAA, MIN_PART);
-        let part1_result = test_helpers::upload_part(&coord, &UploadPartRequest {
+        let part1_result = test_helpers::upload_part(
+            &coord,
+            &UploadPartRequest {
                 bucket,
                 key,
                 upload_id: &create.upload_id,
@@ -14162,8 +14591,9 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let session = begin_stream_part_test(coord, bucket, key, &create.upload_id, 2).unwrap();
         let part2 = b"streamed-tail-data".to_vec();
@@ -14541,7 +14971,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: b"hello world",
@@ -14550,8 +14982,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         // partNumber=1 on non-multipart object returns the full object.
         let result = coord
@@ -14589,7 +15022,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: b"",
@@ -14598,8 +15033,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let result = coord
             .head_object_part(&GetObjectPartRequest {
@@ -14750,7 +15186,9 @@ mod tests {
             let part_number = (i + 1) as u32;
             let checksum_b64 = b64.encode(compute_checksum(algo, data));
             let claim = ChecksumClaim::from_base64(algo, &checksum_b64).unwrap();
-            let result = test_helpers::upload_part(&coord, &UploadPartRequest {
+            let result = test_helpers::upload_part(
+                &coord,
+                &UploadPartRequest {
                     bucket,
                     key,
                     upload_id: &create.upload_id,
@@ -14758,8 +15196,9 @@ mod tests {
                     data,
                     claimed_checksum: Some(&claim),
                     requester: TEST_REQUESTER,
-                })
-                .unwrap();
+                },
+            )
+            .unwrap();
             complete_parts.push(CompletePart {
                 part_number,
                 etag: result.etag,
@@ -15407,7 +15846,9 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         // Write an existing object via normal put.
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: b"old-data",
@@ -15416,8 +15857,9 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         // Stream-put a new version.
         let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
@@ -15462,7 +15904,9 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         // Write initial object.
-        let initial = test_helpers::put_object(&coord, &PutObjectRequest {
+        let initial = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: b"initial",
@@ -15471,8 +15915,9 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         // Stream put with if-match on the correct etag succeeds.
         let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
@@ -15856,7 +16301,9 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let data = vec![0x5A; (INTERNAL_SEGMENT_SIZE * 2) + 123];
-        let result = test_helpers::put_object(&coord, &PutObjectRequest {
+        let result = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: &data,
@@ -15865,8 +16312,9 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         {
             let meta_pg_id = coord.object_pg_id("bucket", "key");
@@ -15902,7 +16350,9 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let old_data = vec![0x41; INTERNAL_SEGMENT_SIZE + 17];
-        let first = test_helpers::put_object(&coord, &PutObjectRequest {
+        let first = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: &old_data,
@@ -15911,8 +16361,9 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let old_segments = {
             let meta_pg_id = coord.object_pg_id("bucket", "key");
@@ -15922,7 +16373,9 @@ mod tests {
         };
         assert_eq!(old_segments.len(), 2);
 
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: b"new-data",
@@ -15931,8 +16384,9 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         for segment in old_segments {
             wait_for_shard_set_deletion(
@@ -16061,7 +16515,9 @@ mod tests {
         assert_eq!(r1.body.into_bytes().unwrap(), b"stream-data");
 
         // Overwrite with a normal PUT.
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "key",
                 data: b"normal-data",
@@ -16070,8 +16526,9 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         // GET should return the new data, not stale segment data.
         let r2 = coord
@@ -16254,7 +16711,9 @@ mod tests {
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "src",
                 data: b"source-data",
@@ -16263,8 +16722,9 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let upload = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
@@ -16971,7 +17431,9 @@ mod tests {
         let coord = setup_coordinator(dir.path());
         coord.create_bucket("bucket").unwrap();
 
-        let put = test_helpers::put_object(&coord, &PutObjectRequest {
+        let put = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "bad-segment-crc",
                 data: b"segment-data",
@@ -16980,8 +17442,9 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let meta_pg_id = coord.object_pg_id("bucket", "bad-segment-crc");
         {
@@ -17069,7 +17532,9 @@ mod tests {
             .unwrap();
 
         // 3. Normal put.
-        test_helpers::put_object(&coord, &PutObjectRequest {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
                 bucket: "bucket",
                 key: "cycle",
                 data: b"v2-normal",
@@ -17078,8 +17543,9 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         // 4. GET should return normal-put data, no object segments interference.
         let result = coord

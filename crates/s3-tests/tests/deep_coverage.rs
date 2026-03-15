@@ -43,12 +43,7 @@ async fn cleanup(bucket: &str, keys: &[&str]) {
     for key in keys {
         let _ = client.delete_object().bucket(bucket).key(*key).send().await;
     }
-    client
-        .delete_bucket()
-        .bucket(bucket)
-        .send()
-        .await
-        .unwrap();
+    client.delete_bucket().bucket(bucket).send().await.unwrap();
 }
 
 fn tag(key: &str, value: &str) -> Tag {
@@ -276,7 +271,7 @@ fn test_versioned_object_tags() {
             .unwrap();
         let vid2 = v2.version_id().unwrap().to_string();
 
-        // Tag version 1 only.
+        // Tag version 1 only (non-current version).
         client
             .put_object_tagging()
             .bucket(&bucket)
@@ -324,7 +319,7 @@ fn test_versioned_object_tags() {
             .await
             .unwrap();
 
-        // Getting tags for deleted version should fail.
+        // Getting tags for deleted version should fail (NoSuchVersion).
         let result = client
             .get_object_tagging()
             .bucket(&bucket)
@@ -332,7 +327,7 @@ fn test_versioned_object_tags() {
             .version_id(&vid1)
             .send()
             .await;
-        assert!(result.is_err(), "expected error for deleted version tags");
+        assert_s3_err_code(&result, "NoSuchVersion");
 
         // Version 2 still accessible.
         let get = client
@@ -427,10 +422,7 @@ fn test_list_object_versions_full_pagination() {
         let mut pages = 0;
 
         loop {
-            let mut req = client
-                .list_object_versions()
-                .bucket(&bucket)
-                .max_keys(2);
+            let mut req = client.list_object_versions().bucket(&bucket).max_keys(2);
 
             if let Some(ref km) = key_marker {
                 req = req.key_marker(km);
@@ -465,7 +457,10 @@ fn test_list_object_versions_full_pagination() {
             "expected 9 versions, got {}",
             all_entries.len()
         );
-        assert!(pages >= 5, "expected at least 5 pages with max_keys=2 for 9 entries, got {pages}");
+        assert!(
+            pages >= 5,
+            "expected at least 5 pages with max_keys=2 for 9 entries, got {pages}"
+        );
 
         // Verify all keys are present.
         let a_count = all_entries.iter().filter(|(k, _)| k == "a").count();
@@ -480,7 +475,11 @@ fn test_list_object_versions_full_pagination() {
         pairs.sort();
         let before = pairs.len();
         pairs.dedup();
-        assert_eq!(pairs.len(), before, "duplicate (key, version_id) pairs found");
+        assert_eq!(
+            pairs.len(),
+            before,
+            "duplicate (key, version_id) pairs found"
+        );
 
         cleanup_versioned_bucket(CTX.client(), &bucket).await;
     });
@@ -739,5 +738,341 @@ fn test_multipart_part_reupload() {
         );
 
         cleanup(&bucket, &[key]).await;
+    });
+}
+
+// ── 10. ListObjectVersions with key-marker only (no version-id-marker) ──
+
+/// Paginate ListObjectVersions using only key-marker (no version-id-marker).
+/// Exercises the SQL branch `key > ?` instead of `(key > ? OR (key = ? AND version_id < ?))`.
+#[test]
+fn test_list_object_versions_key_marker_only() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_versioned_bucket().await;
+
+        // Create 3 keys with 2 versions each = 6 total entries.
+        for key in ["alpha", "beta", "gamma"] {
+            for body in [b"v1" as &[u8], b"v2"] {
+                client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(key)
+                    .body(ByteStream::from_static(body))
+                    .send()
+                    .await
+                    .unwrap();
+            }
+        }
+
+        // Page 1: get first 2 entries.
+        let resp1 = client
+            .list_object_versions()
+            .bucket(&bucket)
+            .max_keys(2)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp1.versions().len(), 2);
+        assert_eq!(resp1.is_truncated(), Some(true));
+
+        // Page 2: use only key-marker (no version-id-marker).
+        // This should skip past the key-marker and return subsequent entries.
+        let key_marker = resp1.next_key_marker().unwrap().to_string();
+        let resp2 = client
+            .list_object_versions()
+            .bucket(&bucket)
+            .max_keys(2)
+            .key_marker(&key_marker)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp2.versions().len(), 2);
+
+        // Entries from page 2 should all have keys > key_marker.
+        for v in resp2.versions() {
+            assert!(
+                v.key().unwrap() > key_marker.as_str(),
+                "expected key > {key_marker}, got {}",
+                v.key().unwrap()
+            );
+        }
+
+        cleanup_versioned_bucket(CTX.client(), &bucket).await;
+    });
+}
+
+// ── 11. ListMultipartUploads with key-marker only (no upload-id-marker) ─
+
+/// Paginate ListMultipartUploads using only key-marker (no upload-id-marker).
+/// Exercises the SQL branch `key > ?` instead of the compound cursor branch.
+#[test]
+fn test_list_multipart_uploads_key_marker_only() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+
+        // Create 4 multipart uploads on different keys.
+        let mut upload_ids = Vec::new();
+        for key in ["mpu-a", "mpu-b", "mpu-c", "mpu-d"] {
+            let create = client
+                .create_multipart_upload()
+                .bucket(&bucket)
+                .key(key)
+                .send()
+                .await
+                .unwrap();
+            upload_ids.push((key.to_string(), create.upload_id().unwrap().to_string()));
+        }
+
+        // Page 1: get first 2 uploads.
+        let resp1 = client
+            .list_multipart_uploads()
+            .bucket(&bucket)
+            .max_uploads(2)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp1.uploads().len(), 2);
+        assert_eq!(resp1.is_truncated(), Some(true));
+
+        // Page 2: use only key-marker (no upload-id-marker).
+        let key_marker = resp1.next_key_marker().unwrap().to_string();
+        let resp2 = client
+            .list_multipart_uploads()
+            .bucket(&bucket)
+            .max_uploads(2)
+            .key_marker(&key_marker)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp2.uploads().len(), 2);
+
+        // Entries from page 2 should all have keys > key_marker.
+        for u in resp2.uploads() {
+            assert!(
+                u.key().unwrap() > key_marker.as_str(),
+                "expected key > {key_marker}, got {}",
+                u.key().unwrap()
+            );
+        }
+
+        // Cleanup: abort all uploads.
+        for (key, uid) in &upload_ids {
+            client
+                .abort_multipart_upload()
+                .bucket(&bucket)
+                .key(key)
+                .upload_id(uid)
+                .send()
+                .await
+                .unwrap();
+        }
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+// ── 12. PutObjectTagging on nonexistent key ─────────────────────────────
+
+/// PutObjectTagging on a key that doesn't exist at all should return NoSuchKey.
+/// (Distinct from delete marker, which returns MethodNotAllowed.)
+#[test]
+fn test_put_tagging_nonexistent_key() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+
+        let result = client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key("does-not-exist")
+            .tagging(tagging(vec![tag("env", "test")]))
+            .send()
+            .await;
+        assert_s3_err_code(&result, "NoSuchKey");
+
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+// ── 13. DeleteObjectTagging on nonexistent key ──────────────────────────
+
+/// DeleteObjectTagging on a key that doesn't exist should return NoSuchKey.
+#[test]
+fn test_delete_tagging_nonexistent_key() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+
+        let result = client
+            .delete_object_tagging()
+            .bucket(&bucket)
+            .key("does-not-exist")
+            .send()
+            .await;
+        assert_s3_err_code(&result, "NoSuchKey");
+
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+// ── 14. Versioned streaming PutObject (large object on versioned bucket) ─
+
+/// PUT an 8 MiB object on a versioned bucket. Exercises the `INSERT INTO`
+/// (versioned) SQL branch in commit_stream_put instead of `INSERT OR REPLACE`
+/// (unversioned).
+#[test]
+fn test_large_put_versioned_bucket() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_versioned_bucket().await;
+        let key = "large-versioned";
+
+        let size = 8 * 1024 * 1024;
+        let data_v1: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        let data_v2: Vec<u8> = (0..size).map(|i| ((i + 128) % 251) as u8).collect();
+
+        // Write v1.
+        let r1 = client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from(data_v1.clone()))
+            .send()
+            .await
+            .unwrap();
+        let vid1 = r1.version_id().unwrap().to_string();
+
+        // Write v2.
+        let r2 = client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from(data_v2.clone()))
+            .send()
+            .await
+            .unwrap();
+        let vid2 = r2.version_id().unwrap().to_string();
+        assert_ne!(vid1, vid2, "versions should differ");
+
+        // GET latest should return v2.
+        let get = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let got = get.body.collect().await.unwrap().into_bytes();
+        assert_eq!(got.len(), data_v2.len());
+        assert_eq!(&got[..], &data_v2[..]);
+
+        // GET v1 by version-id should return v1.
+        let get_v1 = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&vid1)
+            .send()
+            .await
+            .unwrap();
+        let got_v1 = get_v1.body.collect().await.unwrap().into_bytes();
+        assert_eq!(got_v1.len(), data_v1.len());
+        assert_eq!(&got_v1[..], &data_v1[..]);
+
+        cleanup_versioned_bucket(CTX.client(), &bucket).await;
+    });
+}
+
+// ── 15. Versioned multipart CompleteMultipartUpload ──────────────────────
+
+/// Complete a multipart upload on a versioned bucket. Exercises the versioned
+/// SQL branch in complete_multipart_commit (`INSERT INTO` vs `INSERT OR REPLACE`).
+#[test]
+fn test_multipart_complete_versioned_bucket() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_versioned_bucket().await;
+        let key = "mpu-versioned";
+
+        // First: put a simple object to create version 1.
+        let r1 = client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"simple-v1"))
+            .send()
+            .await
+            .unwrap();
+        let vid1 = r1.version_id().unwrap().to_string();
+
+        // Second: multipart upload to create version 2.
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+
+        let part_data: Vec<u8> = vec![0xCC; PART_SIZE];
+        let resp = client
+            .upload_part()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .part_number(1)
+            .body(ByteStream::from(part_data.clone()))
+            .send()
+            .await
+            .unwrap();
+
+        let complete_resp = client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(resp.e_tag().unwrap())
+                            .part_number(1)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+        let vid2 = complete_resp.version_id().unwrap().to_string();
+        assert_ne!(vid1, vid2, "MPU should create a new version");
+
+        // GET latest should return multipart data.
+        let get = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let got = get.body.collect().await.unwrap().into_bytes();
+        assert_eq!(got.len(), PART_SIZE);
+        assert!(got.iter().all(|&b| b == 0xCC));
+
+        // GET v1 should return simple data.
+        let get_v1 = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&vid1)
+            .send()
+            .await
+            .unwrap();
+        let got_v1 = get_v1.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&got_v1[..], b"simple-v1");
+
+        cleanup_versioned_bucket(CTX.client(), &bucket).await;
     });
 }

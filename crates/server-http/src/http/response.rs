@@ -906,6 +906,7 @@ impl S3Response {
             ServerError::InvalidArgument { reason } => reason.as_str(),
             ServerError::InvalidBucketName { reason } => reason.as_str(),
             ServerError::MetadataBlobError { reason } => reason.as_str(),
+            ServerError::VersionNotFound { .. } => "The specified version does not exist.",
             _ => {
                 fallback = err.to_string();
                 fallback.as_str()
