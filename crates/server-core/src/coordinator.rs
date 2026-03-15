@@ -19,8 +19,9 @@ use storage::{
     MultipartReclaimPartSegmentRecord, MultipartReclaimRecord, MultipartUploadRecord, ObjectKey,
     ObjectLayout, ObjectPartRecord, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
     ObjectSegmentsReclaimSegmentRecord, PutDeleteMarkerReq, PutLiveObjectReq, PutObjectReq,
-    ReclaimWorkItem, SessionId, ShardKey, SharedStorageNode, StoredObject,
-    StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, UploadId, UploadState,
+    ReclaimWorkItem, SerializedMetadataBlob, SerializedTagSet, SessionId, ShardKey,
+    SharedStorageNode, StoredObject, StreamUploadSegmentRecord, StreamUploadState,
+    StreamUploadTarget, UploadId, UploadState,
 };
 
 use crate::conditional::{
@@ -46,7 +47,7 @@ const INTERNAL_SEGMENT_SIZE: usize = 4 * 1024 * 1024;
 ///
 /// Base64 decoding and length validation happen at construction time,
 /// so the coordinator receives already-decoded, validated bytes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChecksumClaim {
     algorithm: ChecksumAlgorithm,
     expected_bytes: Vec<u8>,
@@ -86,6 +87,42 @@ impl ChecksumClaim {
     /// The decoded checksum bytes.
     pub fn expected_bytes(&self) -> &[u8] {
         &self.expected_bytes
+    }
+
+    /// The expected checksum value as canonical base64.
+    pub fn to_base64(&self) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(&self.expected_bytes)
+    }
+}
+
+/// A typed encoded checksum claim whose serialized form is preserved as-is.
+///
+/// Used for multipart-complete object-level checksum claims, where some valid
+/// values are composite forms such as `base64-N`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncodedChecksumClaim {
+    algorithm: ChecksumAlgorithm,
+    encoded_value: String,
+}
+
+impl EncodedChecksumClaim {
+    #[must_use]
+    pub fn new(algorithm: ChecksumAlgorithm, encoded_value: String) -> Self {
+        Self {
+            algorithm,
+            encoded_value,
+        }
+    }
+
+    #[must_use]
+    pub fn algorithm(&self) -> ChecksumAlgorithm {
+        self.algorithm
+    }
+
+    #[must_use]
+    pub fn encoded_value(&self) -> &str {
+        &self.encoded_value
     }
 }
 
@@ -953,7 +990,7 @@ pub struct CompleteMultipartUploadRequest<'a> {
     pub key: &'a str,
     pub upload_id: &'a str,
     pub parts: &'a [CompletePart],
-    pub claimed_checksum: Option<(ChecksumAlgorithm, &'a str)>,
+    pub claimed_checksum: Option<&'a EncodedChecksumClaim>,
     pub requester: Requester<'a>,
 }
 
@@ -1117,8 +1154,8 @@ pub struct CreateMultipartUploadResult {
 pub struct CompletePart {
     pub part_number: u32,
     pub etag: String,
-    /// Per-part checksum from the request XML: (algorithm implied by element name, base64 value).
-    pub checksum: Option<(ChecksumAlgorithm, String)>,
+    /// Per-part checksum from the request XML.
+    pub checksum: Option<ChecksumClaim>,
 }
 
 /// Result of a CompleteMultipartUpload operation.
@@ -2707,8 +2744,8 @@ impl Coordinator {
                 m: self.ec_config.parity_shards,
             },
             layout: ObjectLayout::Standard,
-            tags: tags.map(std::string::ToString::to_string),
-            metadata_blob: Some(blob_bytes),
+            tags: tags.map(SerializedTagSet::from),
+            metadata_blob: Some(SerializedMetadataBlob::from(blob_bytes)),
         };
         let meta_result = meta_pg.put_object_with_segments(&put_req, &committed_segments);
 
@@ -3197,8 +3234,8 @@ impl Coordinator {
                         k: self.ec_config.data_shards,
                         m: self.ec_config.parity_shards,
                     },
-                    tags: tags.map(std::string::ToString::to_string),
-                    metadata_blob: Some(blob_bytes),
+                    tags: tags.map(SerializedTagSet::from),
+                    metadata_blob: Some(SerializedMetadataBlob::from(blob_bytes)),
                 },
                 &committed_chunks,
             )
@@ -3693,7 +3730,7 @@ impl Coordinator {
                 let metadata = src_record
                     .metadata_blob
                     .as_ref()
-                    .map(|b| MetadataBlob::deserialize(b).map(|(m, _)| m))
+                    .map(|b| MetadataBlob::deserialize(b.as_slice()).map(|(m, _)| m))
                     .transpose()?
                     .unwrap_or_default();
 
@@ -3740,7 +3777,7 @@ impl Coordinator {
                 let src_metadata = src_record
                     .metadata_blob
                     .as_ref()
-                    .map(|b| MetadataBlob::deserialize(b).map(|(m, _)| m))
+                    .map(|b| MetadataBlob::deserialize(b.as_slice()).map(|(m, _)| m))
                     .transpose()?
                     .unwrap_or_default();
 
@@ -3771,7 +3808,7 @@ impl Coordinator {
         };
         let tags = match &req.tagging {
             TaggingDirective::Copy => src_tags,
-            TaggingDirective::Replace(tags) => tags.map(std::string::ToString::to_string),
+            TaggingDirective::Replace(tags) => tags.map(SerializedTagSet::from),
         };
 
         let LockedWriteObject {
@@ -4269,7 +4306,7 @@ impl Coordinator {
             let metadata = record
                 .metadata_blob
                 .as_ref()
-                .map(|b| MetadataBlob::deserialize(b).map(|(m, _)| m))
+                .map(|b| MetadataBlob::deserialize(b.as_slice()).map(|(m, _)| m))
                 .transpose()?
                 .unwrap_or_default();
 
@@ -4292,7 +4329,7 @@ impl Coordinator {
                 size: record.size,
                 last_modified: record.last_modified,
                 version_id: record.version_id,
-                tags: record.tags,
+                tags: record.tags.map(Into::into),
             })
         } else {
             // Non-multipart: metadata from DB row, user data from shards.
@@ -4308,7 +4345,7 @@ impl Coordinator {
             let metadata = record
                 .metadata_blob
                 .as_ref()
-                .map(|b| MetadataBlob::deserialize(b).map(|(m, _)| m))
+                .map(|b| MetadataBlob::deserialize(b.as_slice()).map(|(m, _)| m))
                 .transpose()?
                 .unwrap_or_default();
 
@@ -4336,7 +4373,7 @@ impl Coordinator {
                 size: record.size,
                 last_modified: record.last_modified,
                 version_id: record.version_id,
-                tags: record.tags,
+                tags: record.tags.map(Into::into),
             })
         }
     }
@@ -4398,7 +4435,7 @@ impl Coordinator {
             let metadata = record
                 .metadata_blob
                 .as_ref()
-                .map(|b| MetadataBlob::deserialize(b).map(|(m, _)| m))
+                .map(|b| MetadataBlob::deserialize(b.as_slice()).map(|(m, _)| m))
                 .transpose()?
                 .unwrap_or_default();
 
@@ -4447,7 +4484,7 @@ impl Coordinator {
                 part_end,
                 parts_count: obj_parts.len() as u32,
                 version_id: record.version_id,
-                tags: record.tags,
+                tags: record.tags.map(Into::into),
                 checksum,
             })
         } else {
@@ -4485,7 +4522,7 @@ impl Coordinator {
             let metadata = record
                 .metadata_blob
                 .as_ref()
-                .map(|b| MetadataBlob::deserialize(b).map(|(m, _)| m))
+                .map(|b| MetadataBlob::deserialize(b.as_slice()).map(|(m, _)| m))
                 .transpose()?
                 .unwrap_or_default();
 
@@ -4500,7 +4537,7 @@ impl Coordinator {
                 part_end: record.size.saturating_sub(1),
                 parts_count: 1,
                 version_id: record.version_id,
-                tags: record.tags,
+                tags: record.tags.map(Into::into),
                 checksum: None,
             })
         }
@@ -4551,7 +4588,7 @@ impl Coordinator {
             let metadata = record
                 .metadata_blob
                 .as_ref()
-                .map(|b| MetadataBlob::deserialize(b).map(|(m, _)| m))
+                .map(|b| MetadataBlob::deserialize(b.as_slice()).map(|(m, _)| m))
                 .transpose()?
                 .unwrap_or_default();
 
@@ -4584,7 +4621,7 @@ impl Coordinator {
                 last_modified: record.last_modified,
                 parts_count: obj_parts.len() as u32,
                 version_id: record.version_id,
-                tags: record.tags,
+                tags: record.tags.map(Into::into),
                 checksum,
             })
         } else {
@@ -4595,7 +4632,7 @@ impl Coordinator {
             let metadata = record
                 .metadata_blob
                 .as_ref()
-                .map(|b| MetadataBlob::deserialize(b).map(|(m, _)| m))
+                .map(|b| MetadataBlob::deserialize(b.as_slice()).map(|(m, _)| m))
                 .transpose()?
                 .unwrap_or_default();
 
@@ -4607,7 +4644,7 @@ impl Coordinator {
                 last_modified: record.last_modified,
                 parts_count: 1,
                 version_id: record.version_id,
-                tags: record.tags,
+                tags: record.tags.map(Into::into),
                 checksum: None,
             })
         }
@@ -4644,7 +4681,7 @@ impl Coordinator {
         let metadata = record
             .metadata_blob
             .as_ref()
-            .map(|b| MetadataBlob::deserialize(b).map(|(m, _)| m))
+            .map(|b| MetadataBlob::deserialize(b.as_slice()).map(|(m, _)| m))
             .transpose()?
             .unwrap_or_default();
 
@@ -4654,7 +4691,7 @@ impl Coordinator {
             size: record.size,
             last_modified: record.last_modified,
             version_id: record.version_id,
-            tags: record.tags,
+            tags: record.tags.map(Into::into),
         })
     }
 
@@ -4695,7 +4732,7 @@ impl Coordinator {
         let metadata = record
             .metadata_blob
             .as_ref()
-            .map(|b| MetadataBlob::deserialize(b).map(|(m, _)| m))
+            .map(|b| MetadataBlob::deserialize(b.as_slice()).map(|(m, _)| m))
             .transpose()?
             .unwrap_or_default();
 
@@ -4829,7 +4866,7 @@ impl Coordinator {
             let metadata = record
                 .metadata_blob
                 .as_ref()
-                .map(|b| MetadataBlob::deserialize(b).map(|(m, _)| m))
+                .map(|b| MetadataBlob::deserialize(b.as_slice()).map(|(m, _)| m))
                 .transpose()?
                 .unwrap_or_default();
 
@@ -4851,7 +4888,7 @@ impl Coordinator {
             let metadata = record
                 .metadata_blob
                 .as_ref()
-                .map(|b| MetadataBlob::deserialize(b).map(|(m, _)| m))
+                .map(|b| MetadataBlob::deserialize(b.as_slice()).map(|(m, _)| m))
                 .transpose()?
                 .unwrap_or_default();
 
@@ -4884,7 +4921,7 @@ impl Coordinator {
             range_start: user_start,
             range_end: user_end,
             version_id: record.version_id,
-            tags: record.tags,
+            tags: record.tags.map(Into::into),
         })
     }
 
@@ -5479,7 +5516,7 @@ impl Coordinator {
             upload_id: UploadId::from(upload_id.as_str()),
             bucket: BucketName::from(bucket),
             key: ObjectKey::from(key),
-            metadata_blob,
+            metadata_blob: SerializedMetadataBlob::from(metadata_blob),
             owner_principal: Some(bucket_info.owner_principal),
             checksum: req.checksum,
         })?;
@@ -6035,25 +6072,22 @@ impl Coordinator {
             }
 
             // Validate per-part checksum from request against stored value.
-            if let Some((ref claimed_algo, ref claimed_b64)) = cp.checksum {
+            if let Some(ref claim) = cp.checksum {
                 // The checksum element type must match the upload's algorithm.
                 if let Some(upload_algo) = checksum_algo {
-                    if *claimed_algo != upload_algo {
+                    if claim.algorithm() != upload_algo {
                         return Err(ServerError::InvalidRequest {
                             reason: format!(
                                 "checksum element type {} does not match upload algorithm {}",
-                                claimed_algo.as_str(),
+                                claim.algorithm().as_str(),
                                 upload_algo.as_str()
                             ),
                         });
                     }
                 }
-                use base64::Engine;
                 match &part.checksum {
                     Some(stored_bytes) => {
-                        let stored_b64 =
-                            base64::engine::general_purpose::STANDARD.encode(stored_bytes);
-                        if *claimed_b64 != stored_b64 {
+                        if claim.expected_bytes() != stored_bytes {
                             return Err(ServerError::InvalidRequest {
                                 reason: "part checksum mismatch".to_string(),
                             });
@@ -6204,16 +6238,14 @@ impl Coordinator {
         };
 
         // 8b'. Validate claimed object-level checksum if provided.
-        // This uses a raw (algorithm, string) pair rather than ChecksumClaim because
-        // composite checksums are formatted as "base64-N", not plain base64.
-        if let Some((claimed_algo, claimed_value)) = claimed_checksum {
+        if let Some(claimed) = claimed_checksum {
             // Algorithm of the header must match the upload's algorithm.
             match checksum_algo {
-                Some(upload_algo) if claimed_algo != upload_algo => {
+                Some(upload_algo) if claimed.algorithm() != upload_algo => {
                     return Err(ServerError::InvalidRequest {
                         reason: format!(
                             "checksum header algorithm {} does not match upload algorithm {}",
-                            claimed_algo.as_str(),
+                            claimed.algorithm().as_str(),
                             upload_algo.as_str()
                         ),
                     });
@@ -6229,7 +6261,7 @@ impl Coordinator {
             }
             // Value must match computed checksum.
             if let Some(ref computed) = checksum_value {
-                if computed != claimed_value {
+                if computed != claimed.encoded_value() {
                     return Err(ServerError::InvalidRequest {
                         reason: "checksum mismatch".to_string(),
                     });
@@ -6241,15 +6273,17 @@ impl Coordinator {
         let mut metadata_blob_bytes = upload.metadata_blob.clone();
         if let (Some(algo), Some(ref val)) = (checksum_algo, &checksum_value) {
             let (mut blob, _) =
-                crate::metadata_blob::MetadataBlob::deserialize(&metadata_blob_bytes)?;
+                crate::metadata_blob::MetadataBlob::deserialize(metadata_blob_bytes.as_slice())?;
             blob.set(algo.header_name(), val);
             blob.set("x-amz-checksum-algorithm", algo.as_str());
             if let Some(ctype) = checksum_type {
                 blob.set("x-amz-checksum-type", ctype.as_str());
             }
-            metadata_blob_bytes = blob.serialize().map_err(|e| ServerError::InvalidRequest {
-                reason: format!("failed to serialize metadata blob: {e}"),
-            })?;
+            metadata_blob_bytes = SerializedMetadataBlob::from(blob.serialize().map_err(|e| {
+                ServerError::InvalidRequest {
+                    reason: format!("failed to serialize metadata blob: {e}"),
+                }
+            })?);
         }
 
         // 9. Build the object metadata and manifest parts.
@@ -9672,7 +9706,7 @@ mod tests {
             })
             .unwrap();
         let cond = ReadCondition {
-            if_match: Some(put.etag),
+            if_match: Some(put.etag.into()),
             ..Default::default()
         };
         let obj = coord
@@ -9706,7 +9740,7 @@ mod tests {
             .unwrap();
 
         let cond = ReadCondition {
-            if_match: Some("\"0000000000000000\"".to_string()),
+            if_match: Some("\"0000000000000000\"".into()),
             ..Default::default()
         };
         let err = coord
@@ -9740,7 +9774,7 @@ mod tests {
             })
             .unwrap();
         let cond = ReadCondition {
-            if_none_match: Some(put.etag),
+            if_none_match: Some(put.etag.into()),
             ..Default::default()
         };
         let err = coord
@@ -9774,7 +9808,7 @@ mod tests {
             })
             .unwrap();
         let cond = ReadCondition {
-            if_none_match: Some(put.etag),
+            if_none_match: Some(put.etag.into()),
             ..Default::default()
         };
         let err = coord
@@ -9807,7 +9841,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
-        let cond = DeleteCondition::IfMatch(put.etag);
+        let cond = DeleteCondition::IfMatch(put.etag.into());
         coord
             .delete_object(&DeleteObjectRequest {
                 bucket: "bucket",
@@ -9846,7 +9880,7 @@ mod tests {
             })
             .unwrap();
 
-        let cond = DeleteCondition::IfMatch("\"0000000000000000\"".to_string());
+        let cond = DeleteCondition::IfMatch("\"0000000000000000\"".into());
         let err = coord
             .delete_object(&DeleteObjectRequest {
                 bucket: "bucket",
@@ -9891,7 +9925,7 @@ mod tests {
             .unwrap();
 
         // Use key1's etag for both entries; key2 will fail the condition
-        let cond = DeleteCondition::IfMatch(p1.etag);
+        let cond = DeleteCondition::IfMatch(p1.etag.into());
         let entries = vec![
             DeleteEntry {
                 key: "key1",
@@ -9935,7 +9969,7 @@ mod tests {
             })
             .unwrap();
         let cond = ReadCondition {
-            if_match: Some(put.etag),
+            if_match: Some(put.etag.into()),
             ..Default::default()
         };
         let result = coord
@@ -10589,7 +10623,7 @@ mod tests {
             .unwrap();
 
         let src_cond = ReadCondition {
-            if_match: Some("\"0000000000000000\"".to_string()),
+            if_match: Some("\"0000000000000000\"".into()),
             ..Default::default()
         };
         let err = coord
@@ -12309,7 +12343,7 @@ mod tests {
         assert_eq!(record.key, "photo.png");
 
         // Deserialize and verify the metadata blob.
-        let (blob, _) = MetadataBlob::deserialize(&record.metadata_blob).unwrap();
+        let (blob, _) = MetadataBlob::deserialize(record.metadata_blob.as_slice()).unwrap();
         assert_eq!(blob.get("content-type"), Some("image/png"));
         assert_eq!(blob.get("x-amz-meta-author"), Some("test"));
     }
@@ -14853,7 +14887,7 @@ mod tests {
             complete_parts.push(CompletePart {
                 part_number,
                 etag: result.etag,
-                checksum: Some((algo, checksum_b64)),
+                checksum: Some(ChecksumClaim::from_base64(algo, &checksum_b64).unwrap()),
             });
         }
         (create.upload_id, complete_parts)
@@ -15100,7 +15134,8 @@ mod tests {
         );
 
         // Tamper with part 1's checksum value in the request.
-        parts[0].checksum = Some((ChecksumAlgorithm::Crc32, "AAAAAAAA".to_string()));
+        parts[0].checksum =
+            Some(ChecksumClaim::from_base64(ChecksumAlgorithm::Crc32, "AAAAAA==").unwrap());
 
         let err = coord
             .complete_multipart_upload(&CompleteMultipartUploadRequest {
@@ -15149,6 +15184,8 @@ mod tests {
 
     #[test]
     fn complete_multipart_wrong_checksum_element_type_rejected() {
+        use base64::Engine;
+
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
@@ -15165,9 +15202,11 @@ mod tests {
         );
 
         // Replace the CRC32 checksum with a SHA256-tagged element (wrong algorithm).
-        // Use the correct CRC32 value so only the element type is wrong.
-        let correct_value = parts[0].checksum.as_ref().unwrap().1.clone();
-        parts[0].checksum = Some((ChecksumAlgorithm::Sha256, correct_value));
+        // Use a structurally valid SHA256 value so the request reaches the algorithm check.
+        let wrong_sha256_value = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
+        parts[0].checksum = Some(
+            ChecksumClaim::from_base64(ChecksumAlgorithm::Sha256, &wrong_sha256_value).unwrap(),
+        );
 
         let err = coord
             .complete_multipart_upload(&CompleteMultipartUploadRequest {

@@ -2,54 +2,47 @@
 
 ## Status
 
-Completed or largely completed:
+Complete.
 
-1. Phase 1 is largely complete
-   - public storage/core interfaces now use typed enums and newtypes for most
-     important primitive domains:
-     - `VersionId`
-     - `BucketVersioningState`
-     - `ObjectState`
-     - `EtagKind`
-     - `StorageClass`
-     - `BucketName`
-     - `ObjectKey`
-     - `UploadId`
-     - `SessionId`
-2. Phase 2 is largely complete
-   - storage-facing object records and write requests are now variant-based:
-     - `StoredObject`
-     - `LiveObjectRecord`
-     - `DeleteMarkerRecord`
-     - `PutObjectReq`
-     - `PutLiveObjectReq`
-     - `PutDeleteMarkerReq`
-     - `ObjectLayout`
-3. Typed object ETags are in place via `ObjectEtag`
-4. Write-condition typing is materially improved
-   - `WriteCondition` uses `IfMatch(SpecificEtag)` and `IfNoneMatchStar`
-5. `http -> coordinator` request structs are much more explicit than before,
-   even where later cleanup is still open
+What landed:
 
-Still open:
+1. public storage/core interfaces now use typed enums and newtypes for the
+   important primitive domains:
+   - `VersionId`
+   - `BucketVersioningState`
+   - `ObjectState`
+   - `EtagKind`
+   - `StorageClass`
+   - `BucketName`
+   - `ObjectKey`
+   - `UploadId`
+   - `SessionId`
+2. storage-facing object records and write requests are variant-based:
+   - `StoredObject`
+   - `LiveObjectRecord`
+   - `DeleteMarkerRecord`
+   - `PutObjectReq`
+   - `PutLiveObjectReq`
+   - `PutDeleteMarkerReq`
+   - `ObjectLayout`
+3. checksum interfaces are typed end-to-end at the boundary:
+   - `ChecksumClaim`
+   - `EncodedChecksumClaim`
+   - typed multipart-complete part checksums
+4. metadata/tag boundaries are explicit with:
+   - `SerializedMetadataBlob`
+   - `SerializedTagSet`
+5. read/write/delete/copy condition types are all parsed into typed condition
+   values before they reach coordinator logic
+6. streaming contexts now use typed bindings and checksum contracts instead of
+   loose related string fields
 
-1. checksum typing is only partially complete
-   - `ChecksumClaim` exists and is used in several paths, but raw
-     `(ChecksumAlgorithm, String)` pairs still remain in some request/XML paths
-2. metadata/tag opaque wrappers are not done
-   - interfaces still expose `Option<Vec<u8>>` and `Option<String>` in several
-     storage/core boundaries
-3. read/delete condition typing is still partial
-   - `ReadCondition` and `DeleteCondition` still carry raw strings in places
-4. streaming-specific context cleanup is not done
-   - streaming contexts still carry several related raw string fields rather
-     than a typed binding object
+Explicitly deferred:
 
-Current assessment:
-
-1. the highest-value illegal-state cleanup has already landed
-2. the remaining work is narrower and should be treated as focused follow-up,
-   not a large foundational refactor
+1. introducing a separate shared leaf crate for these boundary types
+   - the current wrapper/newtype approach is sufficient
+   - this can be revisited later only if cross-crate duplication becomes
+     meaningfully painful
 
 ## Constraint
 
@@ -119,13 +112,7 @@ explicit wrapper like `SerializedMetadataBlob(Vec<u8>)` over a naked `Vec<u8>`.
 
 ## Recommended sequence
 
-The original early phases are largely done. The remaining sequence is now:
-
-1. finish checksum typing cleanup
-2. add opaque metadata/tag wrappers if the current raw `Vec<u8>` / `String`
-   boundaries still feel too loose
-3. clean up streaming-specific context types
-4. only then decide whether a shared leaf crate is actually justified
+Completed.
 
 ## Phase 1: Replace raw primitive state with enums and newtypes
 
@@ -238,7 +225,7 @@ optional fields, make the write intent explicit:
 
 ## Phase 3: Make checksum and ETag interfaces typed
 
-Status: partially complete.
+Status: complete.
 
 What is done:
 
@@ -247,12 +234,7 @@ What is done:
 3. edge parsing already converts checksum headers into typed claims in several
    operations
 
-What remains:
-
-1. remove the remaining raw `(ChecksumAlgorithm, String)` request/XML pairs
-2. decide whether a separate `VerifiedChecksum` type is worth adding
-3. unify the multipart-complete checksum path with the rest of the typed claim
-   model
+No remaining required work in this phase.
 
 Several interfaces still use correlated option tuples:
 
@@ -338,12 +320,11 @@ most of the system.
 
 ## Phase 4: Tighten the `http -> coordinator` request boundary
 
-Status: partially complete.
+Status: complete.
 
-Coordinator entry points are already much more explicit request structs than
-before. The main remaining gap is not "raw HTTP everywhere", but a few request
-fields and streaming contexts that still use raw strings or partially typed
-bundles.
+Coordinator entry points are now explicit request structs, and the remaining raw
+checksum/condition/streaming-context gaps called out in this phase have been
+closed.
 
 ### Current issue
 
@@ -412,7 +393,7 @@ This yields most of the type-safety benefit without a large HTTP rewrite.
 
 ## Phase 5: Metadata and tag typing while preserving storage independence
 
-Status: not started in the recommended wrapper form.
+Status: complete.
 
 This needs an explicit decision because `storage` must stay independent.
 
@@ -449,7 +430,7 @@ Phases 1-4.
 
 ## Phase 6: Clean up streaming-specific interfaces
 
-Status: not started.
+Status: complete.
 
 Recent work already improved `StreamUploadTarget`. The next step is to carry the
 same approach through the remaining streaming interfaces.
@@ -486,12 +467,7 @@ need to be revalidated together.
 
 ## Rollout plan
 
-The remaining practical rollout is:
-
-1. remove the remaining raw checksum tuple interfaces
-2. add opaque metadata/tag wrapper types if still warranted
-3. clean up streaming context types
-4. then reassess whether anything remains that justifies a shared leaf crate
+Completed.
 
 ## Verification
 

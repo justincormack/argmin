@@ -1,7 +1,8 @@
 /// Hand-formatted XML for S3 responses with lightweight request XML parsing.
 use crate::coordinator::{
-    BucketAcl, BucketSummary, CompletePart, DeleteError, DeletedObject, ListMultipartUploadsResult,
-    ListObjectVersionsResult, ListObjectsResult, ListPartsResult, ObjectPartsInfo,
+    BucketAcl, BucketSummary, ChecksumClaim, CompletePart, DeleteError, DeletedObject,
+    ListMultipartUploadsResult, ListObjectVersionsResult, ListObjectsResult, ListPartsResult,
+    ObjectPartsInfo,
 };
 use crate::error::ServerError;
 use auth::canonical::uri_encode_path;
@@ -2316,7 +2317,7 @@ pub fn parse_complete_multipart_upload_xml(body: &[u8]) -> Result<Vec<CompletePa
     let mut current_text = String::new();
     let mut current_part_number: Option<u32> = None;
     let mut current_etag: Option<String> = None;
-    let mut current_checksum: Option<(ChecksumAlgorithm, String)> = None;
+    let mut current_checksum: Option<ChecksumClaim> = None;
     let mut parts = Vec::new();
 
     loop {
@@ -2401,7 +2402,8 @@ pub fn parse_complete_multipart_upload_xml(body: &[u8]) -> Result<Vec<CompletePa
                     if checksum_algorithm_for_element(name) == Some(algo) =>
                 {
                     if current_checksum.is_none() {
-                        current_checksum = Some((algo, current_text.trim().to_string()));
+                        current_checksum =
+                            Some(ChecksumClaim::from_base64(algo, current_text.trim())?);
                     }
                     current_text.clear();
                     state = State::InPart;
@@ -3778,30 +3780,36 @@ mod tests {
 
     #[test]
     fn parse_complete_multipart_with_part_checksums() {
+        let crc32_b64 = "AAAAAA==";
         let body = b"\
             <CompleteMultipartUpload>\
             <Part><PartNumber>1</PartNumber><ETag>\"e1\"</ETag>\
-            <ChecksumCRC32>AABBCC==</ChecksumCRC32></Part>\
+            <ChecksumCRC32>AAAAAA==</ChecksumCRC32></Part>\
             <Part><PartNumber>2</PartNumber><ETag>\"e2\"</ETag></Part>\
             </CompleteMultipartUpload>";
         let parts = parse_complete_multipart_upload_xml(body).unwrap();
         assert_eq!(parts.len(), 2);
         assert_eq!(
             parts[0].checksum,
-            Some((ChecksumAlgorithm::Crc32, "AABBCC==".to_string()))
+            Some(ChecksumClaim::from_base64(ChecksumAlgorithm::Crc32, crc32_b64).unwrap())
         );
         assert_eq!(parts[1].checksum, None);
     }
 
     #[test]
     fn parse_complete_multipart_multiple_checksum_elements_rejected() {
-        let body = b"\
-            <CompleteMultipartUpload>\
-            <Part><PartNumber>1</PartNumber><ETag>\"e1\"</ETag>\
-            <ChecksumCRC32>AA==</ChecksumCRC32>\
-            <ChecksumSHA256>BB==</ChecksumSHA256></Part>\
-            </CompleteMultipartUpload>";
-        let err = parse_complete_multipart_upload_xml(body).unwrap_err();
+        use base64::Engine;
+
+        let crc32_b64 = base64::engine::general_purpose::STANDARD.encode([0u8; 4]);
+        let sha256_b64 = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
+        let body = format!(
+            "<CompleteMultipartUpload>\
+             <Part><PartNumber>1</PartNumber><ETag>\"e1\"</ETag>\
+             <ChecksumCRC32>{crc32_b64}</ChecksumCRC32>\
+             <ChecksumSHA256>{sha256_b64}</ChecksumSHA256></Part>\
+             </CompleteMultipartUpload>"
+        );
+        let err = parse_complete_multipart_upload_xml(body.as_bytes()).unwrap_err();
         assert!(
             matches!(err, ServerError::MalformedXML { .. }),
             "expected MalformedXML, got {err:?}"
@@ -3813,8 +3821,8 @@ mod tests {
         let body = b"\
             <CompleteMultipartUpload>\
             <Part><PartNumber>1</PartNumber><ETag>\"e1\"</ETag>\
-            <ChecksumCRC32>AA==</ChecksumCRC32>\
-            <ChecksumCRC32>BB==</ChecksumCRC32></Part>\
+            <ChecksumCRC32>AAAAAA==</ChecksumCRC32>\
+            <ChecksumCRC32>AAAAAA==</ChecksumCRC32></Part>\
             </CompleteMultipartUpload>";
         let err = parse_complete_multipart_upload_xml(body).unwrap_err();
         assert!(

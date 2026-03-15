@@ -21,8 +21,8 @@ fn now_millis() -> u64 {
 /// Conditions for read operations (GET, HEAD, Range GET).
 #[derive(Debug, Default)]
 pub struct ReadCondition {
-    pub if_match: Option<String>,
-    pub if_none_match: Option<String>,
+    pub if_match: Option<EtagMatchList>,
+    pub if_none_match: Option<EtagMatchList>,
     pub if_modified_since: Option<u64>,
     pub if_unmodified_since: Option<u64>,
 }
@@ -46,6 +46,67 @@ impl SpecificEtag {
     /// The underlying ETag string.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+/// A single ETag match token from a conditional header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EtagMatchToken {
+    /// `*`
+    Any,
+    /// A specific ETag token.
+    Specific(SpecificEtag),
+}
+
+/// A parsed `If-Match`/`If-None-Match` header value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EtagMatchList(Vec<EtagMatchToken>);
+
+impl EtagMatchList {
+    /// Parse a raw header value into wildcard/specific match tokens.
+    #[must_use]
+    pub fn from_header_value(value: &str) -> Self {
+        let trimmed = value.trim();
+        if trimmed == "*" {
+            return Self(vec![EtagMatchToken::Any]);
+        }
+
+        Self(
+            trimmed
+                .split(',')
+                .map(str::trim)
+                .map(|entry| {
+                    if entry == "*" {
+                        EtagMatchToken::Any
+                    } else {
+                        EtagMatchToken::Specific(
+                            SpecificEtag::new(entry.to_string())
+                                .expect("non-wildcard token must parse as SpecificEtag"),
+                        )
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    #[must_use]
+    pub fn matches(&self, object_etag: &str) -> bool {
+        self.0.iter().any(|token| match token {
+            EtagMatchToken::Any => true,
+            EtagMatchToken::Specific(etag) => etag_matches_one(etag.as_str(), object_etag),
+        })
+    }
+}
+
+impl From<String> for EtagMatchList {
+    fn from(value: String) -> Self {
+        Self::from_header_value(&value)
+    }
+}
+
+impl From<&str> for EtagMatchList {
+    fn from(value: &str) -> Self {
+        Self::from_header_value(value)
     }
 }
 
@@ -74,7 +135,7 @@ pub enum DeleteCondition {
     #[default]
     None,
     /// `If-Match: <etag-or-wildcard>` — only delete if the ETag matches.
-    IfMatch(String),
+    IfMatch(EtagMatchList),
 }
 
 /// Compare a single `ETag` value against an object's etag for equality.
@@ -123,7 +184,7 @@ pub fn check_read_conditions(
 ) -> Result<(), ServerError> {
     // Step 1: If-Match — `*` always passes, otherwise 412 if no etag in list matches
     if let Some(ref required) = cond.if_match {
-        if !etags_match(required, etag) {
+        if !required.matches(etag) {
             return Err(ServerError::PreconditionFailed);
         }
     }
@@ -140,7 +201,7 @@ pub fn check_read_conditions(
 
     // Step 3: If-None-Match — `*` always triggers 304, otherwise 304 if any etag matches
     if let Some(ref unwanted) = cond.if_none_match {
-        if etags_match(unwanted, etag) {
+        if unwanted.matches(etag) {
             return Err(ServerError::NotModified {
                 etag: etag.to_string(),
                 last_modified,
@@ -211,13 +272,11 @@ pub fn check_delete_conditions(cond: &DeleteCondition, etag: &str) -> Result<(),
     match cond {
         DeleteCondition::None => Ok(()),
         DeleteCondition::IfMatch(required_etag) => {
-            if required_etag.trim() == "*" {
+            if required_etag.matches(etag) {
                 // Wildcard matches any existing object
                 Ok(())
-            } else if !etags_match(required_etag, etag) {
-                Err(ServerError::PreconditionFailed)
             } else {
-                Ok(())
+                Err(ServerError::PreconditionFailed)
             }
         }
     }
@@ -234,7 +293,7 @@ pub fn check_copy_source_conditions(
 ) -> Result<(), ServerError> {
     // Step 1: If-Match
     if let Some(ref required) = cond.if_match {
-        if !etags_match(required, etag) {
+        if !required.matches(etag) {
             return Err(ServerError::PreconditionFailed);
         }
     }
@@ -251,7 +310,7 @@ pub fn check_copy_source_conditions(
 
     // Step 3: If-None-Match — returns 412 (not 304)
     if let Some(ref unwanted) = cond.if_none_match {
-        if etags_match(unwanted, etag) {
+        if unwanted.matches(etag) {
             return Err(ServerError::PreconditionFailed);
         }
     }
@@ -312,7 +371,7 @@ mod tests {
     #[test]
     fn read_if_match_passes() {
         let cond = ReadCondition {
-            if_match: Some(test_etag()),
+            if_match: Some(test_etag().into()),
             ..Default::default()
         };
         assert!(check_read_conditions(&cond, &test_etag(), 1000).is_ok());
@@ -321,7 +380,7 @@ mod tests {
     #[test]
     fn read_if_match_fails() {
         let cond = ReadCondition {
-            if_match: Some(other_etag()),
+            if_match: Some(other_etag().into()),
             ..Default::default()
         };
         let err = check_read_conditions(&cond, &test_etag(), 1000).unwrap_err();
@@ -331,7 +390,7 @@ mod tests {
     #[test]
     fn read_if_none_match_returns_not_modified() {
         let cond = ReadCondition {
-            if_none_match: Some(test_etag()),
+            if_none_match: Some(test_etag().into()),
             ..Default::default()
         };
         let err = check_read_conditions(&cond, &test_etag(), 1000).unwrap_err();
@@ -341,7 +400,7 @@ mod tests {
     #[test]
     fn read_if_none_match_passes() {
         let cond = ReadCondition {
-            if_none_match: Some(other_etag()),
+            if_none_match: Some(other_etag().into()),
             ..Default::default()
         };
         assert!(check_read_conditions(&cond, &test_etag(), 1000).is_ok());
@@ -414,8 +473,8 @@ mod tests {
     fn read_evaluation_order_if_match_before_if_none_match() {
         // If-Match fails → 412, even if If-None-Match would say 304
         let cond = ReadCondition {
-            if_match: Some(other_etag()),
-            if_none_match: Some(test_etag()),
+            if_match: Some(other_etag().into()),
+            if_none_match: Some(test_etag().into()),
             ..Default::default()
         };
         let err = check_read_conditions(&cond, &test_etag(), 1000).unwrap_err();
@@ -461,20 +520,20 @@ mod tests {
 
     #[test]
     fn delete_if_match_passes() {
-        let cond = DeleteCondition::IfMatch(test_etag());
+        let cond = DeleteCondition::IfMatch(test_etag().into());
         assert!(check_delete_conditions(&cond, &test_etag()).is_ok());
     }
 
     #[test]
     fn delete_if_match_fails() {
-        let cond = DeleteCondition::IfMatch(other_etag());
+        let cond = DeleteCondition::IfMatch(other_etag().into());
         let err = check_delete_conditions(&cond, &test_etag()).unwrap_err();
         assert!(matches!(err, ServerError::PreconditionFailed));
     }
 
     #[test]
     fn delete_if_match_wildcard_passes() {
-        let cond = DeleteCondition::IfMatch("*".to_string());
+        let cond = DeleteCondition::IfMatch("*".into());
         assert!(check_delete_conditions(&cond, &test_etag()).is_ok());
     }
 
@@ -551,7 +610,7 @@ mod tests {
     #[test]
     fn read_if_match_wildcard_passes() {
         let cond = ReadCondition {
-            if_match: Some("*".to_string()),
+            if_match: Some("*".into()),
             ..Default::default()
         };
         assert!(check_read_conditions(&cond, &test_etag(), 1000).is_ok());
@@ -560,7 +619,7 @@ mod tests {
     #[test]
     fn read_if_none_match_wildcard_returns_304() {
         let cond = ReadCondition {
-            if_none_match: Some("*".to_string()),
+            if_none_match: Some("*".into()),
             ..Default::default()
         };
         let err = check_read_conditions(&cond, &test_etag(), 1000).unwrap_err();
@@ -571,7 +630,7 @@ mod tests {
     fn read_if_match_comma_list_one_matches() {
         let list = format!("\"1111111111111111\", {}", test_etag());
         let cond = ReadCondition {
-            if_match: Some(list),
+            if_match: Some(list.into()),
             ..Default::default()
         };
         assert!(check_read_conditions(&cond, &test_etag(), 1000).is_ok());
@@ -580,7 +639,7 @@ mod tests {
     #[test]
     fn read_if_match_comma_list_none_match() {
         let cond = ReadCondition {
-            if_match: Some("\"1111111111111111\", \"2222222222222222\"".to_string()),
+            if_match: Some("\"1111111111111111\", \"2222222222222222\"".into()),
             ..Default::default()
         };
         let err = check_read_conditions(&cond, &test_etag(), 1000).unwrap_err();
@@ -591,7 +650,7 @@ mod tests {
     fn read_if_none_match_comma_list_one_matches() {
         let list = format!("\"1111111111111111\", {}", test_etag());
         let cond = ReadCondition {
-            if_none_match: Some(list),
+            if_none_match: Some(list.into()),
             ..Default::default()
         };
         let err = check_read_conditions(&cond, &test_etag(), 1000).unwrap_err();
@@ -603,7 +662,7 @@ mod tests {
     #[test]
     fn copy_source_if_match_passes() {
         let cond = ReadCondition {
-            if_match: Some(test_etag()),
+            if_match: Some(test_etag().into()),
             ..Default::default()
         };
         assert!(check_copy_source_conditions(&cond, &test_etag(), 1000).is_ok());
@@ -612,7 +671,7 @@ mod tests {
     #[test]
     fn copy_source_if_match_fails() {
         let cond = ReadCondition {
-            if_match: Some(other_etag()),
+            if_match: Some(other_etag().into()),
             ..Default::default()
         };
         let err = check_copy_source_conditions(&cond, &test_etag(), 1000).unwrap_err();
@@ -623,7 +682,7 @@ mod tests {
     fn copy_source_if_none_match_matching_returns_412() {
         // Key difference from read: returns 412, NOT 304
         let cond = ReadCondition {
-            if_none_match: Some(test_etag()),
+            if_none_match: Some(test_etag().into()),
             ..Default::default()
         };
         let err = check_copy_source_conditions(&cond, &test_etag(), 1000).unwrap_err();
@@ -633,7 +692,7 @@ mod tests {
     #[test]
     fn copy_source_if_none_match_passes() {
         let cond = ReadCondition {
-            if_none_match: Some(other_etag()),
+            if_none_match: Some(other_etag().into()),
             ..Default::default()
         };
         assert!(check_copy_source_conditions(&cond, &test_etag(), 1000).is_ok());

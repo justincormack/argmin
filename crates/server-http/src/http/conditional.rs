@@ -3,7 +3,9 @@
 /// Extracts `ReadCondition`, `WriteCondition`, and `DeleteCondition` from
 /// raw S3 request headers. The core condition types and evaluation logic
 /// live in `crate::conditional`; this module handles only the HTTP boundary.
-use crate::conditional::{DeleteCondition, ReadCondition, SpecificEtag, WriteCondition};
+use crate::conditional::{
+    DeleteCondition, EtagMatchList, ReadCondition, SpecificEtag, WriteCondition,
+};
 use crate::error::ServerError;
 use crate::http::request::S3Request;
 use crate::http::response::parse_http_date;
@@ -11,8 +13,10 @@ use crate::http::response::parse_http_date;
 /// Extract read conditions from an S3 request's headers.
 pub fn read_condition_from_headers(req: &S3Request) -> ReadCondition {
     ReadCondition {
-        if_match: req.header("if-match").map(str::to_string),
-        if_none_match: req.header("if-none-match").map(str::to_string),
+        if_match: req.header("if-match").map(EtagMatchList::from_header_value),
+        if_none_match: req
+            .header("if-none-match")
+            .map(EtagMatchList::from_header_value),
         if_modified_since: req.header("if-modified-since").and_then(parse_http_date),
         if_unmodified_since: req.header("if-unmodified-since").and_then(parse_http_date),
     }
@@ -82,7 +86,7 @@ pub fn delete_condition_from_headers(req: &S3Request) -> Result<DeleteCondition,
         });
     }
     Ok(match req.header("if-match") {
-        Some(val) => DeleteCondition::IfMatch(val.to_string()),
+        Some(val) => DeleteCondition::IfMatch(EtagMatchList::from_header_value(val)),
         None => DeleteCondition::None,
     })
 }
@@ -90,10 +94,12 @@ pub fn delete_condition_from_headers(req: &S3Request) -> Result<DeleteCondition,
 /// Extract copy-source conditions from an S3 request's `x-amz-copy-source-if-*` headers.
 pub fn copy_source_condition_from_headers(req: &S3Request) -> ReadCondition {
     ReadCondition {
-        if_match: req.header("x-amz-copy-source-if-match").map(str::to_string),
+        if_match: req
+            .header("x-amz-copy-source-if-match")
+            .map(EtagMatchList::from_header_value),
         if_none_match: req
             .header("x-amz-copy-source-if-none-match")
-            .map(str::to_string),
+            .map(EtagMatchList::from_header_value),
         if_modified_since: req
             .header("x-amz-copy-source-if-modified-since")
             .and_then(parse_http_date),

@@ -281,7 +281,9 @@ impl PgStore {
             public_read: row.get::<_, i64>(7)? != 0,
             public_write: row.get::<_, i64>(8)? != 0,
             cors_config: row.get(9)?,
-            tags: row.get(10)?,
+            tags: row
+                .get::<_, Option<String>>(10)?
+                .map(SerializedTagSet::from),
             public_access_block: row.get(11)?,
             ownership_controls: row.get(12)?,
         })
@@ -334,8 +336,12 @@ impl PgStore {
                 let storage_class = row.get::<_, u8>(8)?;
                 let ec_k = row.get::<_, u8>(9)?;
                 let ec_m = row.get::<_, u8>(10)?;
-                let tags: Option<String> = row.get(12)?;
-                let metadata_blob: Option<Vec<u8>> = row.get(15)?;
+                let tags: Option<SerializedTagSet> = row
+                    .get::<_, Option<String>>(12)?
+                    .map(SerializedTagSet::from);
+                let metadata_blob: Option<SerializedMetadataBlob> = row
+                    .get::<_, Option<Vec<u8>>>(15)?
+                    .map(SerializedMetadataBlob::from);
                 if size != 0
                     || generation_id.is_some()
                     || !etag.is_empty()
@@ -410,8 +416,12 @@ impl PgStore {
                         m: row.get::<_, u8>(10)?,
                     },
                     layout,
-                    tags: row.get(12)?,
-                    metadata_blob: row.get(15)?,
+                    tags: row
+                        .get::<_, Option<String>>(12)?
+                        .map(SerializedTagSet::from),
+                    metadata_blob: row
+                        .get::<_, Option<Vec<u8>>>(15)?
+                        .map(SerializedMetadataBlob::from),
                 }))
             }
         }
@@ -1085,8 +1095,11 @@ impl PgMetadataStore for PgStore {
                 let etag_kind_u8 = req.etag.etag_kind() as u8;
                 let status_u8 = ObjectState::Live as u8;
                 let parts_count = req.layout.parts_count().map(|n| n as i64);
-                let tags = req.tags.as_deref();
-                let metadata_blob: Option<&[u8]> = req.metadata_blob.as_deref();
+                let tags = req.tags.as_ref().map(SerializedTagSet::as_str);
+                let metadata_blob = req
+                    .metadata_blob
+                    .as_ref()
+                    .map(SerializedMetadataBlob::as_slice);
                 let sql = if req.version_id.is_null() {
                     "INSERT OR REPLACE INTO objects \
                      (bucket, key, version_id, generation_id, size, etag, etag_kind, last_modified, \
@@ -2277,7 +2290,7 @@ impl PgMetadataStore for PgStore {
                     req.bucket,
                     req.key,
                     now as i64,
-                    req.metadata_blob,
+                    req.metadata_blob.as_slice(),
                     req.owner_principal,
                     algo,
                     ctype,
@@ -2345,7 +2358,7 @@ impl PgMetadataStore for PgStore {
                                 Box::from(format!("invalid upload state: {state_raw}")),
                             )
                         })?,
-                        metadata_blob: row.get(5)?,
+                        metadata_blob: SerializedMetadataBlob::from(row.get::<_, Vec<u8>>(5)?),
                         owner_principal: row.get(6)?,
                         checksum,
                     })
@@ -2558,7 +2571,7 @@ impl PgMetadataStore for PgStore {
                             Box::from(format!("invalid upload state: {state_raw}")),
                         )
                     })?,
-                    metadata_blob: row.get(5)?,
+                    metadata_blob: SerializedMetadataBlob::from(row.get::<_, Vec<u8>>(5)?),
                     owner_principal: row.get(6)?,
                     checksum,
                 })
@@ -3104,7 +3117,10 @@ impl PgMetadataStore for PgStore {
         let now = PgStore::now_millis();
         let data_layout = DataLayout::MultipartManifest as u8;
         let parts_count = Some(parts.len() as i64);
-        let metadata_blob: Option<&[u8]> = obj.metadata_blob.as_deref();
+        let metadata_blob = obj
+            .metadata_blob
+            .as_ref()
+            .map(SerializedMetadataBlob::as_slice);
 
         self.conn
             .execute_batch("BEGIN IMMEDIATE")
@@ -3595,7 +3611,7 @@ impl PgMetadataStore for PgStore {
             let now = PgStore::now_millis();
             let data_layout = DataLayout::StandardInternal as u8;
             let parts_count: Option<i64> = None;
-            let tags = obj.tags.as_deref();
+            let tags = obj.tags.as_ref().map(SerializedTagSet::as_str);
 
             let obj_sql = if obj.version_id.is_null() {
                 "INSERT OR REPLACE INTO objects \
@@ -3626,7 +3642,9 @@ impl PgMetadataStore for PgStore {
                         data_layout,
                         parts_count,
                         tags,
-                        obj.metadata_blob,
+                        obj.metadata_blob
+                            .as_ref()
+                            .map(SerializedMetadataBlob::as_slice),
                     ],
                 )
                 .map_err(|e| MetadataError::Db {
@@ -3758,8 +3776,11 @@ impl PgMetadataStore for PgStore {
             let etag_kind = obj.etag.etag_kind() as u8;
             let status = ObjectState::Live as u8;
             let parts_count = obj.layout.parts_count().map(|n| n as i64);
-            let tags = obj.tags.as_deref();
-            let metadata_blob = obj.metadata_blob.as_deref();
+            let tags = obj.tags.as_ref().map(SerializedTagSet::as_str);
+            let metadata_blob = obj
+                .metadata_blob
+                .as_ref()
+                .map(SerializedMetadataBlob::as_slice);
 
             let obj_sql = if obj.version_id.is_null() {
                 "INSERT OR REPLACE INTO objects \

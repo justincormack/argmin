@@ -24,6 +24,7 @@ use crate::coordinator::ChecksumClaim;
 use crate::coordinator::Coordinator;
 use crate::coordinator::CopyObjectRequest;
 use crate::coordinator::CopySource;
+use crate::coordinator::EncodedChecksumClaim;
 use crate::coordinator::FinalizeStreamPartRequest;
 use crate::coordinator::FinalizeStreamPutRequest;
 use crate::coordinator::MetadataDirective;
@@ -1210,10 +1211,7 @@ impl HttpFrontend {
                 // Extract object-level checksum claim from request headers as a raw
                 // string. CompleteMultipartUpload checksums may be composite ("base64-N"),
                 // so we cannot decode them as plain base64.
-                let claimed_checksum = extract_checksum_header_raw(req)?;
-                let claimed_ref = claimed_checksum
-                    .as_ref()
-                    .map(|(algo, val)| (*algo, val.as_str()));
+                let claimed_checksum = extract_encoded_checksum_header(req)?;
                 let requester =
                     crate::coordinator::Requester::from_principal(auth.principal.as_deref());
                 let result = self.coordinator.complete_multipart_upload(
@@ -1222,7 +1220,7 @@ impl HttpFrontend {
                         key: &key,
                         upload_id: &upload_id,
                         parts: &parts,
-                        claimed_checksum: claimed_ref,
+                        claimed_checksum: claimed_checksum.as_ref(),
                         requester,
                     },
                 )?;
@@ -1781,9 +1779,11 @@ impl HttpFrontend {
             .unwrap_or(204);
 
         Ok(StreamingPostContext {
-            session_id,
-            bucket: bucket.to_string(),
-            key,
+            binding: StreamObjectBinding {
+                session_id,
+                bucket: bucket.to_string(),
+                key,
+            },
             metadata_blob,
             success_status,
             form_fields: form_fields.to_vec(),
@@ -1820,25 +1820,31 @@ impl HttpFrontend {
                 .filter(|(k, _)| !k.eq_ignore_ascii_case("key"))
                 .map(|(k, v)| (k.as_str(), v.as_str()))
                 .collect();
-            field_pairs.push(("key", &ctx.key));
+            field_pairs.push(("key", &ctx.binding.key));
 
-            auth::validate_post_policy(policy_b64, &field_pairs, file_size, &ctx.bucket, now)
-                .map_err(|e| match &e {
-                    // Structural/format errors → 400
-                    auth::PostPolicyError::Malformed(_) => ServerError::InvalidRequest {
+            auth::validate_post_policy(
+                policy_b64,
+                &field_pairs,
+                file_size,
+                &ctx.binding.bucket,
+                now,
+            )
+            .map_err(|e| match &e {
+                // Structural/format errors → 400
+                auth::PostPolicyError::Malformed(_) => ServerError::InvalidRequest {
+                    reason: e.to_string(),
+                },
+                // content-length-range violations → 400
+                auth::PostPolicyError::ConditionFailed("content-length-range") => {
+                    ServerError::InvalidRequest {
                         reason: e.to_string(),
-                    },
-                    // content-length-range violations → 400
-                    auth::PostPolicyError::ConditionFailed("content-length-range") => {
-                        ServerError::InvalidRequest {
-                            reason: e.to_string(),
-                        }
                     }
-                    // Other condition failures and expiration → 403
-                    auth::PostPolicyError::Expired | auth::PostPolicyError::ConditionFailed(_) => {
-                        ServerError::Auth(auth::AuthError::AccessDenied)
-                    }
-                })?;
+                }
+                // Other condition failures and expiration → 403
+                auth::PostPolicyError::Expired | auth::PostPolicyError::ConditionFailed(_) => {
+                    ServerError::Auth(auth::AuthError::AccessDenied)
+                }
+            })?;
         }
 
         // Validate optional x-amz-checksum-sha256 form field.
@@ -1853,9 +1859,9 @@ impl HttpFrontend {
         let result = self
             .coordinator
             .finalize_stream_put(&FinalizeStreamPutRequest {
-                bucket: &ctx.bucket,
-                key: &ctx.key,
-                session_id: &ctx.session_id,
+                bucket: &ctx.binding.bucket,
+                key: &ctx.binding.key,
+                session_id: &ctx.binding.session_id,
                 crc64,
                 total_size,
                 metadata_blob: &ctx.metadata_blob,
@@ -1865,8 +1871,8 @@ impl HttpFrontend {
 
         Ok(S3Response::post_object(
             &result,
-            &ctx.bucket,
-            &ctx.key,
+            &ctx.binding.bucket,
+            &ctx.binding.key,
             ctx.success_status,
         ))
     }
@@ -1879,9 +1885,9 @@ impl HttpFrontend {
         data: &[u8],
     ) -> Result<(), ServerError> {
         self.coordinator.append_stream_chunk(
-            &ctx.bucket,
-            &ctx.key,
-            &ctx.session_id,
+            &ctx.binding.bucket,
+            &ctx.binding.key,
+            &ctx.binding.session_id,
             chunk_index,
             data,
         )
@@ -1889,9 +1895,11 @@ impl HttpFrontend {
 
     /// Abort a streaming POST session (best-effort cleanup).
     pub fn abort_streaming_post_object(&self, ctx: &StreamingPostContext) {
-        let _ = self
-            .coordinator
-            .abort_stream_put(&ctx.bucket, &ctx.key, &ctx.session_id);
+        let _ = self.coordinator.abort_stream_put(
+            &ctx.binding.bucket,
+            &ctx.binding.key,
+            &ctx.binding.session_id,
+        );
     }
 
     /// Prepare a streaming `PutObject`: authenticate, validate, begin session.
@@ -1970,13 +1978,17 @@ impl HttpFrontend {
         })?;
 
         Ok(StreamingPutContext {
-            session_id,
-            bucket: bucket.to_string(),
-            key: key.to_string(),
+            binding: StreamObjectBinding {
+                session_id,
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+            },
             metadata_blob,
             cond,
             inline_tags_xml,
-            checksum_response,
+            checksum: StreamingPutChecksumContract {
+                response_headers: ChecksumResponseHeaders(checksum_response),
+            },
             streaming_signing: auth.streaming,
         })
     }
@@ -1989,9 +2001,9 @@ impl HttpFrontend {
         data: &[u8],
     ) -> Result<(), ServerError> {
         self.coordinator.append_stream_chunk(
-            &ctx.bucket,
-            &ctx.key,
-            &ctx.session_id,
+            &ctx.binding.bucket,
+            &ctx.binding.key,
+            &ctx.binding.session_id,
             chunk_index,
             data,
         )
@@ -2024,9 +2036,9 @@ impl HttpFrontend {
         let result = self
             .coordinator
             .finalize_stream_put(&FinalizeStreamPutRequest {
-                bucket: &ctx.bucket,
-                key: &ctx.key,
-                session_id: &ctx.session_id,
+                bucket: &ctx.binding.bucket,
+                key: &ctx.binding.key,
+                session_id: &ctx.binding.session_id,
                 crc64,
                 total_size,
                 metadata_blob: &metadata_blob,
@@ -2036,7 +2048,7 @@ impl HttpFrontend {
 
         let mut resp = S3Response::put_object(&result);
         // Echo checksum headers. Trailer values override initial header values.
-        for (name, value) in &ctx.checksum_response {
+        for (name, value) in &ctx.checksum.response_headers.0 {
             if let Some((_, tv)) = trailer_checksums.iter().find(|(k, _)| k == name) {
                 resp.headers.push((name.clone(), tv.clone()));
             } else {
@@ -2044,7 +2056,13 @@ impl HttpFrontend {
             }
         }
         for (name, value) in trailer_checksums {
-            if !ctx.checksum_response.iter().any(|(k, _)| k == name) {
+            if !ctx
+                .checksum
+                .response_headers
+                .0
+                .iter()
+                .any(|(k, _)| k == name)
+            {
                 resp.headers.push((name.clone(), value.clone()));
             }
         }
@@ -2053,9 +2071,11 @@ impl HttpFrontend {
 
     /// Abort a streaming session (best-effort cleanup).
     pub fn abort_streaming_put(&self, ctx: &StreamingPutContext) {
-        let _ = self
-            .coordinator
-            .abort_stream_put(&ctx.bucket, &ctx.key, &ctx.session_id);
+        let _ = self.coordinator.abort_stream_put(
+            &ctx.binding.bucket,
+            &ctx.binding.key,
+            &ctx.binding.session_id,
+        );
     }
 
     /// Prepare a streaming `UploadPart` session.
@@ -2089,14 +2109,20 @@ impl HttpFrontend {
             })?;
 
         Ok(StreamingPartContext {
-            session_id: begin.session_id,
-            bucket: bucket.to_string(),
-            key: key.to_string(),
-            upload_id: upload_id.to_string(),
-            part_number,
-            upload_checksum_algorithm: begin.checksum_algorithm,
-            claimed_checksum,
-            checksum_response,
+            binding: StreamPartBinding {
+                object: StreamObjectBinding {
+                    session_id: begin.session_id,
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                },
+                upload_id: upload_id.to_string(),
+                part_number,
+            },
+            checksum: StreamingPartChecksumContract {
+                upload_checksum_algorithm: begin.checksum_algorithm,
+                claim: claimed_checksum,
+                response_headers: ChecksumResponseHeaders(checksum_response),
+            },
             streaming_signing: auth.streaming,
         })
     }
@@ -2109,9 +2135,9 @@ impl HttpFrontend {
         data: &[u8],
     ) -> Result<(), ServerError> {
         self.coordinator.append_stream_chunk(
-            &ctx.bucket,
-            &ctx.key,
-            &ctx.session_id,
+            &ctx.binding.object.bucket,
+            &ctx.binding.object.key,
+            &ctx.binding.object.session_id,
             chunk_index,
             data,
         )
@@ -2141,16 +2167,16 @@ impl HttpFrontend {
         } else {
             None
         };
-        let effective_claim = trailer_claim.as_ref().or(ctx.claimed_checksum.as_ref());
+        let effective_claim = trailer_claim.as_ref().or(ctx.checksum.claim.as_ref());
 
         let result = self
             .coordinator
             .finalize_stream_part(FinalizeStreamPartRequest {
-                bucket: &ctx.bucket,
-                key: &ctx.key,
-                session_id: &ctx.session_id,
-                upload_id: &ctx.upload_id,
-                part_number: ctx.part_number,
+                bucket: &ctx.binding.object.bucket,
+                key: &ctx.binding.object.key,
+                session_id: &ctx.binding.object.session_id,
+                upload_id: &ctx.binding.upload_id,
+                part_number: ctx.binding.part_number,
                 crc64,
                 total_size,
                 claimed_checksum: effective_claim,
@@ -2165,7 +2191,7 @@ impl HttpFrontend {
             .checksum
             .as_ref()
             .map(|c| c.algorithm().header_name());
-        for (name, value) in &ctx.checksum_response {
+        for (name, value) in &ctx.checksum.response_headers.0 {
             if already_set == Some(name.as_str()) {
                 continue; // Already set by S3Response::upload_part
             }
@@ -2179,7 +2205,13 @@ impl HttpFrontend {
             if already_set == Some(name.as_str()) {
                 continue; // Already set by S3Response::upload_part
             }
-            if !ctx.checksum_response.iter().any(|(k, _)| k == name) {
+            if !ctx
+                .checksum
+                .response_headers
+                .0
+                .iter()
+                .any(|(k, _)| k == name)
+            {
                 resp.headers.push((name.clone(), value.clone()));
             }
         }
@@ -2188,32 +2220,59 @@ impl HttpFrontend {
 
     /// Abort a streaming `UploadPart` session (best-effort cleanup).
     pub fn abort_streaming_part(&self, ctx: &StreamingPartContext) {
-        let _ = self
-            .coordinator
-            .abort_stream_put(&ctx.bucket, &ctx.key, &ctx.session_id);
+        let _ = self.coordinator.abort_stream_put(
+            &ctx.binding.object.bucket,
+            &ctx.binding.object.key,
+            &ctx.binding.object.session_id,
+        );
     }
+}
+
+/// Session binding for a streaming object-scoped upload.
+pub struct StreamObjectBinding {
+    pub session_id: String,
+    pub bucket: String,
+    pub key: String,
+}
+
+/// Session binding for a streaming multipart-part upload.
+pub struct StreamPartBinding {
+    pub object: StreamObjectBinding,
+    pub upload_id: String,
+    pub part_number: u32,
+}
+
+/// Checksum response headers to echo back on a streaming response.
+pub struct ChecksumResponseHeaders(pub Vec<(String, String)>);
+
+/// Checksum contract for streaming `PutObject`.
+pub struct StreamingPutChecksumContract {
+    pub response_headers: ChecksumResponseHeaders,
+}
+
+/// Checksum contract for streaming `UploadPart`.
+pub struct StreamingPartChecksumContract {
+    pub upload_checksum_algorithm: Option<ChecksumAlgorithm>,
+    pub claim: Option<ChecksumClaim>,
+    pub response_headers: ChecksumResponseHeaders,
 }
 
 /// Context for an in-progress streaming `PutObject`.
 ///
 /// Created by `prepare_streaming_put`, used across async/blocking boundaries.
 pub struct StreamingPutContext {
-    pub session_id: String,
-    pub bucket: String,
-    pub key: String,
+    pub binding: StreamObjectBinding,
     pub metadata_blob: crate::metadata_blob::MetadataBlob,
     pub cond: crate::conditional::WriteCondition,
     pub inline_tags_xml: Option<String>,
-    pub checksum_response: Vec<(String, String)>,
+    pub checksum: StreamingPutChecksumContract,
     /// Signing context for aws-chunked modes, None for unsigned/plain.
     pub streaming_signing: Option<auth::StreamingSigningContext>,
 }
 
 /// Context for an in-progress streaming `PostObject`.
 pub struct StreamingPostContext {
-    pub session_id: String,
-    pub bucket: String,
-    pub key: String,
+    pub binding: StreamObjectBinding,
     pub metadata_blob: crate::metadata_blob::MetadataBlob,
     pub success_status: u16,
     pub form_fields: Vec<(String, String)>,
@@ -2226,14 +2285,8 @@ pub struct StreamingPostContext {
 ///
 /// Created by `prepare_streaming_part`, used across async/blocking boundaries.
 pub struct StreamingPartContext {
-    pub session_id: String,
-    pub bucket: String,
-    pub key: String,
-    pub upload_id: String,
-    pub part_number: u32,
-    pub upload_checksum_algorithm: Option<ChecksumAlgorithm>,
-    pub claimed_checksum: Option<ChecksumClaim>,
-    pub checksum_response: Vec<(String, String)>,
+    pub binding: StreamPartBinding,
+    pub checksum: StreamingPartChecksumContract,
     /// Signing context for aws-chunked modes, None for unsigned/plain.
     pub streaming_signing: Option<auth::StreamingSigningContext>,
 }
@@ -2392,22 +2445,22 @@ fn header_count(req: &S3Request, name: &str) -> usize {
     req.headers.iter().filter(|(k, _)| k == name).count()
 }
 
-/// Extract a checksum header as a raw `(algorithm, value_string)` pair.
+/// Extract a checksum header as an encoded typed claim.
 ///
 /// Shared validation for all checksum-header consumers. Rejects if:
 /// - multiple distinct checksum value headers are present (e.g. crc32 + sha256)
 /// - the same checksum header appears more than once
 /// - `x-amz-checksum-algorithm` contradicts the value header's algorithm
-fn extract_checksum_header_raw(
+fn extract_encoded_checksum_header(
     req: &S3Request,
-) -> Result<Option<(ChecksumAlgorithm, String)>, ServerError> {
+) -> Result<Option<EncodedChecksumClaim>, ServerError> {
     if header_count(req, "x-amz-checksum-algorithm") > 1 {
         return Err(ServerError::InvalidRequest {
             reason: "duplicate header: x-amz-checksum-algorithm".into(),
         });
     }
     let algo_header = req.header("x-amz-checksum-algorithm");
-    let mut found: Option<(ChecksumAlgorithm, String)> = None;
+    let mut found: Option<EncodedChecksumClaim> = None;
     for &(algo_name, header) in CHECKSUM_HEADERS {
         if let Some(claimed) = req.header(header) {
             if found.is_some() {
@@ -2434,7 +2487,7 @@ fn extract_checksum_header_raw(
             }
             // CHECKSUM_HEADERS uses known-good algo names.
             let algo = ChecksumAlgorithm::parse(algo_name).unwrap();
-            found = Some((algo, claimed.to_string()));
+            found = Some(EncodedChecksumClaim::new(algo, claimed.to_string()));
         }
     }
     Ok(found)
@@ -2444,8 +2497,11 @@ fn extract_checksum_header_raw(
 ///
 /// Used by `UploadPart` and streaming paths where the value is always plain base64.
 fn extract_checksum_header(req: &S3Request) -> Result<Option<ChecksumClaim>, ServerError> {
-    match extract_checksum_header_raw(req)? {
-        Some((algo, value)) => Ok(Some(ChecksumClaim::from_base64(algo, &value)?)),
+    match extract_encoded_checksum_header(req)? {
+        Some(claim) => Ok(Some(ChecksumClaim::from_base64(
+            claim.algorithm(),
+            claim.encoded_value(),
+        )?)),
         None => Ok(None),
     }
 }

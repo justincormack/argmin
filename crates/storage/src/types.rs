@@ -152,6 +152,92 @@ string_newtype!(
     SessionId
 );
 
+/// Serialized user metadata blob.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SerializedMetadataBlob(Vec<u8>);
+
+impl SerializedMetadataBlob {
+    #[must_use]
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn into_inner(self) -> Vec<u8> {
+        self.0
+    }
+}
+
+impl AsRef<[u8]> for SerializedMetadataBlob {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl From<Vec<u8>> for SerializedMetadataBlob {
+    fn from(value: Vec<u8>) -> Self {
+        Self(value)
+    }
+}
+
+impl From<SerializedMetadataBlob> for Vec<u8> {
+    fn from(value: SerializedMetadataBlob) -> Self {
+        value.0
+    }
+}
+
+/// Serialized tag-set XML.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SerializedTagSet(String);
+
+impl SerializedTagSet {
+    #[must_use]
+    pub fn new(xml: String) -> Self {
+        Self(xml)
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl std::ops::Deref for SerializedTagSet {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
+impl From<String> for SerializedTagSet {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for SerializedTagSet {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
+    }
+}
+
+impl From<SerializedTagSet> for String {
+    fn from(value: SerializedTagSet) -> Self {
+        value.0
+    }
+}
+
 /// Length of a composite shard key in bytes.
 ///
 /// Layout: object_key_hash (16 bytes) || version_id (8 bytes) || shard_index (1 byte)
@@ -585,9 +671,9 @@ pub struct LiveObjectRecord {
     pub ec: EcShape,
     pub layout: ObjectLayout,
     /// Serialized tagging XML (None = no tags).
-    pub tags: Option<String>,
+    pub tags: Option<SerializedTagSet>,
     /// Serialized user metadata headers.
-    pub metadata_blob: Option<Vec<u8>>,
+    pub metadata_blob: Option<SerializedMetadataBlob>,
 }
 
 /// A delete marker record.
@@ -736,7 +822,7 @@ pub struct BucketInfo {
     /// Serialized CORS configuration XML (None = no CORS config).
     pub cors_config: Option<String>,
     /// Serialized tagging XML (None = no tags).
-    pub tags: Option<String>,
+    pub tags: Option<SerializedTagSet>,
     /// Serialized public access block configuration XML (None = no config).
     pub public_access_block: Option<String>,
     /// Ownership controls value (None = not set).
@@ -764,9 +850,9 @@ pub struct PutLiveObjectReq {
     pub ec: EcShape,
     pub layout: ObjectLayout,
     /// Serialized tagging XML (None = no tags).
-    pub tags: Option<String>,
+    pub tags: Option<SerializedTagSet>,
     /// Serialized user metadata headers.
-    pub metadata_blob: Option<Vec<u8>>,
+    pub metadata_blob: Option<SerializedMetadataBlob>,
 }
 
 impl PutLiveObjectReq {
@@ -820,7 +906,7 @@ pub struct CommitMultipartReq {
     pub etag_crc64: [u8; 8],
     pub ec: EcShape,
     /// Serialized user metadata headers.
-    pub metadata_blob: Option<Vec<u8>>,
+    pub metadata_blob: Option<SerializedMetadataBlob>,
 }
 
 /// Request to finalize a streaming PutObject into a live object.
@@ -838,9 +924,9 @@ pub struct CommitStreamPutReq {
     pub etag_crc64: u64,
     pub ec: EcShape,
     /// Serialized tagging XML (None = no tags).
-    pub tags: Option<String>,
+    pub tags: Option<SerializedTagSet>,
     /// Serialized user metadata headers.
-    pub metadata_blob: Option<Vec<u8>>,
+    pub metadata_blob: Option<SerializedMetadataBlob>,
 }
 
 /// Request to list objects in a PG.
@@ -907,7 +993,7 @@ pub struct MultipartUploadRecord {
     pub initiated_at: u64,
     pub state: UploadState,
     /// Serialized user metadata headers.
-    pub metadata_blob: Vec<u8>,
+    pub metadata_blob: SerializedMetadataBlob,
     pub owner_principal: Option<String>,
     /// Validated checksum configuration for this upload.
     pub checksum: Option<MultipartChecksumConfig>,
@@ -959,7 +1045,7 @@ pub struct CreateMultipartUploadReq {
     pub upload_id: UploadId,
     pub bucket: BucketName,
     pub key: ObjectKey,
-    pub metadata_blob: Vec<u8>,
+    pub metadata_blob: SerializedMetadataBlob,
     pub owner_principal: Option<String>,
     pub checksum: Option<MultipartChecksumConfig>,
 }
