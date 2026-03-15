@@ -2452,6 +2452,7 @@ mod tests {
     use crate::coordinator::{
         Coordinator, DeleteEntry, DeleteObjectsRequest, ListObjectVersionsRequest,
         ListObjectsV2Request, PutObjectAcl, PutObjectRequest, Requester,
+        test_helpers,
     };
     use crate::metadata_blob::MetadataBlob;
     use ec::EcConfig;
@@ -4285,8 +4286,7 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("test-bucket").unwrap();
-        coord
-            .put_object(&PutObjectRequest {
+        test_helpers::put_object(&coord, &PutObjectRequest {
                 bucket: "test-bucket",
                 key: "dir/file1.txt",
                 data: b"hello",
@@ -4297,8 +4297,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
-        coord
-            .put_object(&PutObjectRequest {
+        test_helpers::put_object(&coord, &PutObjectRequest {
                 bucket: "test-bucket",
                 key: "dir/file2.txt",
                 data: b"world",
@@ -4309,8 +4308,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
-        coord
-            .put_object(&PutObjectRequest {
+        test_helpers::put_object(&coord, &PutObjectRequest {
                 bucket: "test-bucket",
                 key: "root.txt",
                 data: b"root",
@@ -4410,8 +4408,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
         for i in 0..5 {
             let key = format!("key-{i:02}");
-            coord
-                .put_object(&PutObjectRequest {
+            test_helpers::put_object(&coord, &PutObjectRequest {
                     bucket: "bucket",
                     key: &key,
                     data: b"data",

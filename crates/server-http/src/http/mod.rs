@@ -563,9 +563,8 @@ impl HttpFrontend {
                     })?;
                     Ok(S3Response::copy_object(&result))
                 } else {
-                    // Normal PutObject path
+                    // Normal PutObject — use streaming upload path directly.
                     validate_checksum_headers(req, true)?;
-                    // Parse inline tags before writing so invalid tags don't leave orphan objects
                     let inline_tags_xml = if let Some(tagging_header) = req.header("x-amz-tagging")
                     {
                         let tags = xml::parse_url_encoded_tags(tagging_header)?;
@@ -587,20 +586,51 @@ impl HttpFrontend {
                     let requester =
                         crate::coordinator::Requester::from_principal(auth.principal.as_deref());
                     let acl = parse_put_object_acl(req.header("x-amz-acl"));
-                    let result =
-                        self.coordinator
-                            .put_object(&crate::coordinator::PutObjectRequest {
+                    let session_id = self.coordinator.begin_stream_put(
+                        &crate::coordinator::BeginStreamPutRequest {
+                            bucket: &bucket,
+                            key: &key,
+                            requester,
+                            acl,
+                        },
+                    )?;
+                    let result = (|| {
+                        const SEGMENT_SIZE: usize = 4 * 1024 * 1024;
+                        for (idx, chunk) in req.body.chunks(SEGMENT_SIZE).enumerate() {
+                            self.coordinator.append_stream_segment(
+                                &bucket,
+                                &key,
+                                &session_id,
+                                idx as u32,
+                                chunk,
+                            )?;
+                        }
+                        let crc = checksum::crc64::checksum(&req.body);
+                        self.coordinator.finalize_stream_put(
+                            &crate::coordinator::FinalizeStreamPutRequest {
                                 bucket: &bucket,
                                 key: &key,
-                                data: &req.body,
-                                metadata: &metadata_blob,
+                                session_id: &session_id,
+                                crc64: crc,
+                                total_size: req.body.len() as u64,
+                                metadata_blob: &metadata_blob,
                                 tags: inline_tags_xml.as_deref(),
                                 cond: &cond,
-                                requester,
-                                acl,
-                            })?;
+                            },
+                        )
+                    })();
+                    if result.is_err() {
+                        let _ = self.coordinator.abort_stream_put(
+                            &bucket, &key, &session_id,
+                        );
+                    }
+                    let result = result?;
                     let mut resp = S3Response::put_object(&result);
-                    append_checksum_response_headers(&mut resp, req);
+                    for &(_, header) in CHECKSUM_HEADERS {
+                        if let Some(value) = req.header(header) {
+                            resp.headers.push((header.to_string(), value.to_string()));
+                        }
+                    }
                     Ok(resp)
                 }
             }
@@ -1178,23 +1208,72 @@ impl HttpFrontend {
                         result.last_modified,
                     ))
                 } else {
-                    // Normal UploadPart path
-                    // Extract claimed checksum from request headers (at most one).
+                    // Normal UploadPart — use streaming upload path directly.
                     let claimed_checksum = extract_checksum_header(req)?;
                     let requester =
                         crate::coordinator::Requester::from_principal(auth.principal.as_deref());
-
-                    let result =
-                        self.coordinator
-                            .upload_part(&crate::coordinator::UploadPartRequest {
+                    let session = self.coordinator.begin_stream_part(
+                        &crate::coordinator::BeginStreamPartRequest {
+                            bucket: &bucket,
+                            key: &key,
+                            upload_id: &upload_id,
+                            part_number,
+                            requester,
+                        },
+                    )?;
+                    let session_id = session.session_id;
+                    let result = (|| {
+                        const SEGMENT_SIZE: usize = 4 * 1024 * 1024;
+                        for (idx, chunk) in req.body.chunks(SEGMENT_SIZE).enumerate() {
+                            self.coordinator.append_stream_segment(
+                                &bucket,
+                                &key,
+                                &session_id,
+                                idx as u32,
+                                chunk,
+                            )?;
+                        }
+                        let crc = checksum::crc64::checksum(&req.body);
+                        let computed_checksum = {
+                            let algo = claimed_checksum
+                                .as_ref()
+                                .map(|c| c.algorithm())
+                                .or(session.checksum_algorithm);
+                            match algo {
+                                Some(a) => {
+                                    let bytes = compute_checksum_bytes(a, &req.body);
+                                    Some(
+                                        checksum::RawChecksum::new(a, bytes).map_err(|_| {
+                                            ServerError::InternalError {
+                                                reason: "checksum byte length mismatch"
+                                                    .to_string(),
+                                            }
+                                        })?,
+                                    )
+                                }
+                                None => None,
+                            }
+                        };
+                        self.coordinator.finalize_stream_part(
+                            crate::coordinator::FinalizeStreamPartRequest {
                                 bucket: &bucket,
                                 key: &key,
+                                session_id: &session_id,
                                 upload_id: &upload_id,
                                 part_number,
-                                data: &req.body,
+                                crc64: crc,
+                                total_size: req.body.len() as u64,
                                 claimed_checksum: claimed_checksum.as_ref(),
-                                requester,
-                            })?;
+                                computed_checksum,
+                            },
+                        )
+                    })();
+                    if result.is_err() {
+                        let _ = self.coordinator.abort_stream_put(
+                            &bucket, &key, &session_id,
+                        );
+                    }
+                    let result = result?;
                     Ok(S3Response::upload_part(
                         &result.etag,
                         result.checksum.as_ref(),
@@ -2506,11 +2585,25 @@ fn extract_checksum_header(req: &S3Request) -> Result<Option<ChecksumClaim>, Ser
     }
 }
 
-/// Append any checksum headers that were sent on `PutObject` to the response.
-fn append_checksum_response_headers(resp: &mut S3Response, req: &S3Request) {
-    for &(_, header) in CHECKSUM_HEADERS {
-        if let Some(value) = req.header(header) {
-            resp.headers.push((header.to_string(), value.to_string()));
+/// Compute raw checksum bytes for the given algorithm and data.
+fn compute_checksum_bytes(algo: checksum::ChecksumAlgorithm, data: &[u8]) -> Vec<u8> {
+    match algo {
+        checksum::ChecksumAlgorithm::Crc32 => {
+            checksum::crc32::checksum(data).to_be_bytes().to_vec()
+        }
+        checksum::ChecksumAlgorithm::Crc32c => {
+            checksum::crc32c::checksum(data).to_be_bytes().to_vec()
+        }
+        checksum::ChecksumAlgorithm::Crc64nvme => {
+            checksum::crc64::checksum(data).to_be_bytes().to_vec()
+        }
+        checksum::ChecksumAlgorithm::Sha256 => ring::digest::digest(&ring::digest::SHA256, data)
+            .as_ref()
+            .to_vec(),
+        checksum::ChecksumAlgorithm::Sha1 => {
+            ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, data)
+                .as_ref()
+                .to_vec()
         }
     }
 }
@@ -4213,5 +4306,123 @@ mod tests {
             Ok(_) => {}
             Err(e) => panic!("expected Ok, got {e:?}"),
         }
+    }
+
+    // ── Abort-on-error path tests ──────────────────────────────────────
+
+    #[test]
+    fn put_object_abort_cleans_up_session_on_precondition_failure() {
+        // Write an object, then PutObject with If-None-Match:* so finalize
+        // fails with PreconditionFailed.  The handler's abort path must
+        // clean up the streaming session so no session is left behind.
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+
+        // First put succeeds.
+        let req = S3Request {
+            method: String::new(),
+            path: String::new(),
+            query_string: String::new(),
+            headers: vec![],
+            body: b"hello".to_vec(),
+        };
+        let op = S3Operation::PutObject {
+            bucket: "mybucket".to_string(),
+            key: "k".to_string(),
+        };
+        fe.dispatch_routed(&req, &test_auth(), op).unwrap();
+
+        // Second put with If-None-Match:* must fail.
+        let req2 = S3Request {
+            method: String::new(),
+            path: String::new(),
+            query_string: String::new(),
+            headers: vec![(
+                "if-none-match".to_string(),
+                "*".to_string(),
+            )],
+            body: b"world".to_vec(),
+        };
+        let op2 = S3Operation::PutObject {
+            bucket: "mybucket".to_string(),
+            key: "k".to_string(),
+        };
+        match fe.dispatch_routed(&req2, &test_auth(), op2) {
+            Err(ServerError::PreconditionFailed) => {}
+            Err(e) => panic!("expected PreconditionFailed, got {e:?}"),
+            Ok(_) => panic!("expected PreconditionFailed, got Ok"),
+        }
+
+        // No leaked streaming sessions.
+        assert_eq!(
+            fe.coordinator.scavenge_stale_sessions(0),
+            0,
+            "streaming session leaked after PutObject precondition failure"
+        );
+    }
+
+    #[test]
+    fn upload_part_abort_cleans_up_session_on_bad_checksum() {
+        // UploadPart with a wrong checksum header so finalize_stream_part
+        // fails with BadDigest.  The handler's abort path must clean up.
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+
+        // Create a multipart upload.
+        let create_req = S3Request {
+            method: "POST".to_string(),
+            path: "/mybucket/mykey".to_string(),
+            query_string: "uploads".to_string(),
+            headers: vec![],
+            body: vec![],
+        };
+        let create_op = S3Operation::CreateMultipartUpload {
+            bucket: "mybucket".to_string(),
+            key: "mykey".to_string(),
+        };
+        let resp = fe
+            .dispatch_routed(&create_req, &test_auth(), create_op)
+            .unwrap();
+        let upload_id = {
+            let body = String::from_utf8(resp.body).unwrap();
+            // Extract <UploadId>...</UploadId> from XML.
+            let start = body.find("<UploadId>").unwrap() + "<UploadId>".len();
+            let end = body[start..].find("</UploadId>").unwrap() + start;
+            body[start..end].to_string()
+        };
+
+        // UploadPart with deliberately wrong CRC32 checksum.
+        let req = S3Request {
+            method: String::new(),
+            path: String::new(),
+            query_string: format!("partNumber=1&uploadId={upload_id}"),
+            headers: vec![(
+                "x-amz-checksum-crc32".to_string(),
+                "AAAAAA==".to_string(), // wrong CRC32 (valid 4-byte base64)
+            )],
+            body: b"part-data".to_vec(),
+        };
+        let op = S3Operation::UploadPart {
+            bucket: "mybucket".to_string(),
+            key: "mykey".to_string(),
+        };
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::BadDigest) => {}
+            Err(e) => panic!("expected BadDigest, got {e:?}"),
+            Ok(_) => panic!("expected BadDigest, got Ok"),
+        }
+
+        // No leaked streaming sessions.
+        assert_eq!(
+            fe.coordinator.scavenge_stale_sessions(0),
+            0,
+            "streaming session leaked after UploadPart bad checksum"
+        );
     }
 }

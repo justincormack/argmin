@@ -27,3 +27,4 @@ quick-xml = "0.37"
 [dev-dependencies]
 test-util = { path = "../test-util" }
 storage = { path = "../storage" }
+server-core = { path = "../server-core", features = ["test-utils"] }

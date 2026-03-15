@@ -3998,7 +3998,7 @@ impl PgMetadataStore for PgStore {
                     source: e,
                 })?;
 
-            let new_gen = prev_gen.map_or(1, |g| g + 1);
+            let new_gen = prev_gen.map_or(0, |g| g + 1);
 
             self.conn
                 .execute(
