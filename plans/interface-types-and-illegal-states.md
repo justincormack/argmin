@@ -1,5 +1,56 @@
 # Interface Types and Illegal States Plan
 
+## Status
+
+Completed or largely completed:
+
+1. Phase 1 is largely complete
+   - public storage/core interfaces now use typed enums and newtypes for most
+     important primitive domains:
+     - `VersionId`
+     - `BucketVersioningState`
+     - `ObjectState`
+     - `EtagKind`
+     - `StorageClass`
+     - `BucketName`
+     - `ObjectKey`
+     - `UploadId`
+     - `SessionId`
+2. Phase 2 is largely complete
+   - storage-facing object records and write requests are now variant-based:
+     - `StoredObject`
+     - `LiveObjectRecord`
+     - `DeleteMarkerRecord`
+     - `PutObjectReq`
+     - `PutLiveObjectReq`
+     - `PutDeleteMarkerReq`
+     - `ObjectLayout`
+3. Typed object ETags are in place via `ObjectEtag`
+4. Write-condition typing is materially improved
+   - `WriteCondition` uses `IfMatch(SpecificEtag)` and `IfNoneMatchStar`
+5. `http -> coordinator` request structs are much more explicit than before,
+   even where later cleanup is still open
+
+Still open:
+
+1. checksum typing is only partially complete
+   - `ChecksumClaim` exists and is used in several paths, but raw
+     `(ChecksumAlgorithm, String)` pairs still remain in some request/XML paths
+2. metadata/tag opaque wrappers are not done
+   - interfaces still expose `Option<Vec<u8>>` and `Option<String>` in several
+     storage/core boundaries
+3. read/delete condition typing is still partial
+   - `ReadCondition` and `DeleteCondition` still carry raw strings in places
+4. streaming-specific context cleanup is not done
+   - streaming contexts still carry several related raw string fields rather
+     than a typed binding object
+
+Current assessment:
+
+1. the highest-value illegal-state cleanup has already landed
+2. the remaining work is narrower and should be treated as focused follow-up,
+   not a large foundational refactor
+
 ## Constraint
 
 `storage` must remain independent of `server`.
@@ -68,16 +119,17 @@ explicit wrapper like `SerializedMetadataBlob(Vec<u8>)` over a naked `Vec<u8>`.
 
 ## Recommended sequence
 
-Start with the highest-payoff, lowest-disruption refactors first:
+The original early phases are largely done. The remaining sequence is now:
 
-1. Remove raw enums/discriminants from public storage interfaces.
-2. Replace correlated object-record fields with variant-based object models.
-3. Tighten checksum and ETag interfaces.
-4. Tighten parsed request interfaces between `http` and `coordinator`.
-5. Only then decide whether metadata/tags should use opaque wrappers or move to
-   a shared leaf crate.
+1. finish checksum typing cleanup
+2. add opaque metadata/tag wrappers if the current raw `Vec<u8>` / `String`
+   boundaries still feel too loose
+3. clean up streaming-specific context types
+4. only then decide whether a shared leaf crate is actually justified
 
 ## Phase 1: Replace raw primitive state with enums and newtypes
+
+Status: largely complete.
 
 This phase is low-risk and should happen before bigger model changes.
 
@@ -112,6 +164,8 @@ These are lower priority, but worth introducing when touching the call sites:
 These can begin as simple tuple newtypes without validation logic.
 
 ## Phase 2: Replace object bag-of-fields types with variant-based models
+
+Status: largely complete.
 
 This is the biggest improvement for illegal states.
 
@@ -183,6 +237,22 @@ optional fields, make the write intent explicit:
 `PutDeleteMarkerReq` should likewise have no tag field.
 
 ## Phase 3: Make checksum and ETag interfaces typed
+
+Status: partially complete.
+
+What is done:
+
+1. `ObjectEtag` is in place
+2. `ChecksumClaim` exists and is used in several HTTP/core paths
+3. edge parsing already converts checksum headers into typed claims in several
+   operations
+
+What remains:
+
+1. remove the remaining raw `(ChecksumAlgorithm, String)` request/XML pairs
+2. decide whether a separate `VerifiedChecksum` type is worth adding
+3. unify the multipart-complete checksum path with the rest of the typed claim
+   model
 
 Several interfaces still use correlated option tuples:
 
@@ -268,6 +338,13 @@ most of the system.
 
 ## Phase 4: Tighten the `http -> coordinator` request boundary
 
+Status: partially complete.
+
+Coordinator entry points are already much more explicit request structs than
+before. The main remaining gap is not "raw HTTP everywhere", but a few request
+fields and streaming contexts that still use raw strings or partially typed
+bundles.
+
 ### Current issue
 
 `S3Request` is intentionally generic, but coordinator-facing calls still take
@@ -335,6 +412,8 @@ This yields most of the type-safety benefit without a large HTTP rewrite.
 
 ## Phase 5: Metadata and tag typing while preserving storage independence
 
+Status: not started in the recommended wrapper form.
+
 This needs an explicit decision because `storage` must stay independent.
 
 ### Option A: Opaque serialized wrappers first
@@ -369,6 +448,8 @@ introduce a leaf crate if the remaining duplication is still substantial after
 Phases 1-4.
 
 ## Phase 6: Clean up streaming-specific interfaces
+
+Status: not started.
 
 Recent work already improved `StreamUploadTarget`. The next step is to carry the
 same approach through the remaining streaming interfaces.
@@ -405,28 +486,12 @@ need to be revalidated together.
 
 ## Rollout plan
 
-### Step 1
+The remaining practical rollout is:
 
-Land the small enum/newtype conversions first, with no schema changes.
-
-### Step 2
-
-Refactor `ObjectRecord` and `PutObjectMetaReq` into variant-based models.
-
-This is the highest-value change and should happen before broader metadata work.
-
-### Step 3
-
-Refactor checksum and ETag types.
-
-### Step 4
-
-Introduce parsed coordinator request structs in `http`.
-
-### Step 5
-
-Only then decide whether metadata/tags need opaque wrappers only, or a new leaf
-crate.
+1. remove the remaining raw checksum tuple interfaces
+2. add opaque metadata/tag wrapper types if still warranted
+3. clean up streaming context types
+4. then reassess whether anything remains that justifies a shared leaf crate
 
 ## Verification
 
@@ -447,7 +512,9 @@ This work is successful when:
    combinations
 2. coordinator APIs accept parsed request objects instead of ad hoc parameter
    groups
-3. checksum and ETag values cross layers in typed forms
-4. storage remains independent from server-specific modules
-5. the number of runtime "this combination should never happen" checks is
+3. the remaining checksum-bearing interfaces stop using raw tuple/string forms
+4. metadata/tag boundaries are made explicit, whether by wrappers or a later
+   shared crate
+5. storage remains independent from server-specific modules
+6. the number of runtime "this combination should never happen" checks is
    materially reduced
