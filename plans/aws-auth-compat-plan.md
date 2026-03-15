@@ -22,7 +22,7 @@ This still does not cover:
 
 ## Current Status
 
-Implemented:
+Completed:
 - Header SigV4 auth
 - Presigned SigV4 query auth
 - POST SigV4 form auth
@@ -33,61 +33,24 @@ Implemented:
 - Principal-based bucket ownership (`owner_principal`)
 - Durable bucket `owner_canonical_id`
 - Owner/private/public-read authorization behavior
-- Bucket-level `PutBucketAcl` support for current public-read behavior
+- Bucket-level `PutBucketAcl` support
 - Bucket-level `GetBucketAcl` support
 - Bucket-level public write semantics for anonymous/public `PUT Object`
 - Bucket-level public write semantics for anonymous/public `POST Object`
 - S3 XML owner `<ID>` fields using canonical owner IDs for current bucket/list
-  surfaces
+  and version-list surfaces
 - Schema-level length checks for bucket auth/identity fields
 - Public access block and ownership-controls integration
-- Auth, presigned, and public-access integration coverage
+- Auth, presigned, public-access, and owner-XML integration coverage
 
-## Remaining Gaps
-
-### 1. Header SigV4 Hardening
-
-Completed:
-- Header SigV4 credential scope region validation
-- Header SigV4 credential scope service validation
-- Strict enforcement that every header named in `SignedHeaders` is present
-- Explicit auth parsing size/count limits
-  - `Authorization` header length
-  - presigned query length
-  - token length
-  - signed-header count
-- Duplicate `Authorization` handling
-  - AWS-compatible `501 NotImplemented` for duplicate `Authorization`
-
-### 2. Auth Error Mapping
-
-Completed:
-- `ExpiredToken` maps explicitly
-- `InvalidToken` maps explicitly
-- malformed header scope failures route through `AuthorizationHeaderMalformed`
-
-### 3. ACL and Authorization Surface
-
-Still missing:
+Still open:
+- Full object ownership compatibility
 - Object ACL APIs / semantics
-- Any ACL-driven authorization beyond the current bucket-level ACL model
-- Bucket policy / IAM policy evaluation
+- Final compatibility/conformance documentation
 
-Notes:
-- `PutBucketAcl` is implemented; the old plan text saying otherwise is stale.
-- `GetBucketAcl` is now implemented.
-- Public-read is no longer create-time only; bucket ACL updates already affect it.
-- Bucket-level public write for anonymous/public `PUT` and `POST` is now implemented.
+## Remaining Work
 
-### 4. Owner Identity Compatibility
-
-Completed:
-- durable `owner_canonical_id`
-- S3 XML owner `<ID>` using canonical owner id instead of raw principal string
-  on the current bucket/list surfaces
-- schema-level length checks for bucket auth/identity fields
-
-### 5. Full Ownership Model Compatibility
+### 1. Full Ownership Model Compatibility
 
 Still missing:
 - durable object-level owner identity distinct from bucket owner
@@ -95,28 +58,42 @@ Still missing:
 - bucket-owner access rules that match AWS for objects written by other principals
 - object ACL semantics sufficient to express owner/grantee behavior
 
-Notes:
-- AWS behavior was confirmed directly for bucket-level `public-read-write`:
-  - anonymous `PUT`/`POST` succeeds
-  - the bucket owner cannot subsequently `HEAD`/`GET` that object
-  - the bucket owner can still delete it
-- Argmin does not yet model per-object owner identity for these writes, so local
-  behavior still differs here.
-- Longer term, canonical owner IDs should come from durable account metadata,
-  not be derived from principal strings. That implies a real account/account-
-  metadata service during the later ownership/account design work, rather than
-  treating principal strings as the permanent identity substrate.
+Confirmed AWS behavior that still differs locally:
+- bucket-level `public-read-write` allows anonymous `PUT` and `POST`
+- the bucket owner cannot subsequently `HEAD`/`GET` that uploaded object
+- the bucket owner can still delete it
 
-### 6. Conformance and Integration Coverage
+Current argmin behavior:
+- anonymous/public write itself is implemented
+- argmin does not yet model per-object owner identity for these writes
+- local bucket-owner readback therefore still differs from AWS
+
+Longer-term identity note:
+- canonical owner IDs should ultimately come from durable account metadata, not
+  be derived from principal strings
+- that implies a real account/account-metadata service in the later ownership
+  design, rather than treating principal strings as the permanent identity substrate
+
+### 2. ACL Surface Beyond Bucket ACLs
 
 Still missing:
-- a documented auth/public-access compatibility subset against AWS
+- object ACL APIs / semantics
+- any ACL-driven authorization beyond the current bucket-level ACL model
+
+Explicitly still out of scope for this plan:
+- full bucket policy evaluation
+- full IAM policy language
+
+### 3. Conformance Cleanup
+
+Still missing:
+- a short documented auth/public-access compatibility subset against AWS
 - a short written record of the confirmed AWS ownership behavior for anonymous
   public-write uploads
 
-Completed:
-- header-auth wrong-region coverage
-- header-auth wrong-service coverage
+Already covered:
+- wrong-region header auth coverage
+- wrong-service header auth coverage
 - duplicate `Authorization` rejection coverage
 - AWS validation for bucket-level public write and admin-operation denial
 
@@ -154,40 +131,19 @@ object-ownership work lands.
 
 ### Phase 1: Header Auth Hardening
 
-Deliver:
-- Completed
-
-Success criteria:
-- the formerly ignored header-auth tests are enabled and passing
-- targeted AWS checks match the local behavior for:
-  - wrong region
-  - wrong service
-  - duplicate `Authorization`
+Status: complete.
 
 ### Phase 2: ACL Surface Completion
 
-Deliver:
-- Completed
-
-Success criteria:
-- `GetBucketAcl` is implemented
-- bucket-level public write for anonymous/public `PUT` and `POST` is implemented
-- integration coverage exists for:
-  - anonymous/public `PUT`
-  - anonymous/public `POST`
-  - public-write buckets still denying admin operations
+Status: complete for bucket-level ACL behavior.
 
 ### Phase 3: Owner Identity Compatibility
 
-Deliver:
-- `owner_canonical_id` storage
-- canonical owner XML rendering
-- schema `CHECK(length(...))` constraints for auth/identity fields
-
-Success criteria:
-- owner XML no longer exposes raw principal strings as canonical IDs
+Status: complete for current bucket/list/version-list XML surfaces.
 
 ### Phase 4: Full Ownership Model
+
+Status: open.
 
 Deliver:
 - explicit object-level owner identity
@@ -201,6 +157,8 @@ Success criteria:
   - bucket-owner cleanup still succeeds
 
 ### Phase 5: Conformance Cleanup
+
+Status: open.
 
 Deliver:
 - rerun targeted auth/public-access `s3-tests`
@@ -217,29 +175,27 @@ Targeted integration tests:
 - `cargo test -p s3-tests --test headers`
 - `cargo test -p s3-tests --test presigned`
 - `cargo test -p s3-tests --test public_access_block`
-- add/update dedicated tests for anonymous/public `PUT` and `POST`
+- `cargo test -p s3-tests --test bucket_anon`
+- `cargo test -p s3-tests --test post_object`
+- `cargo test -p s3-tests --test versioning`
 
 AWS checks:
-- rerun the auth/public-access subset against AWS once the remaining header-scope
-  and public-write behavior is implemented
+- rerun the narrowed auth/public-access subset against AWS while working on
+  Phase 4 ownership behavior
 
 ## Open Decisions
 
-1. Public write representation
-- whether to model public write as a bucket-level ACL flag first, or jump directly
-  to fuller ACL/object-ACL representation
+1. Object owner identity source
+- whether to persist authenticated writer principal first, or introduce a
+  canonical object-owner identifier at the same time
 
-2. Owner canonical id derivation
-- whether to store a configured/generated canonical id directly or derive it
-  deterministically from an existing stable principal identity
-
-3. Object owner identity source
-- whether to persist the authenticated writer principal directly as object owner
-  first, or introduce a separate canonical object-owner identifier at the same
-  time
+2. Object ACL rollout shape
+- whether to start with the minimum object-owner semantics needed for the AWS
+  public-write behavior, or implement a broader object-ACL surface together
 
 ## Recommended Default Decisions
 
 - Keep region strictness enabled
-- Finish bucket-level public write before object ACLs
-- Store `owner_canonical_id` explicitly rather than deriving it ad hoc in XML rendering
+- Keep bucket-level public write as the current supported bucket-ACL surface
+- Finish object ownership semantics before widening object ACL scope
+- Keep `owner_canonical_id` explicitly stored rather than deriving it ad hoc in XML rendering
