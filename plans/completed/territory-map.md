@@ -1,5 +1,14 @@
 # Territory Map: S3-Compatible Object Store (argmin)
 
+> Status: Archived historical overview.
+>
+> This was the original top-level decomposition of the system. It was useful as an
+> early map of the problem space, but many subsystem boundaries and sequencing
+> assumptions were later refined or replaced by implementation-specific plans.
+>
+> Treat it as historical context, not a current architecture source of truth. Use
+> the later completed plans and the current code for implemented design details.
+
 ## Context
 
 The goal is to build a full, high-quality, reliable, easy-to-operate S3-compatible object storage system. Before writing any code, we need to map the full scope so we can identify clear, independently buildable subsystems. This document is a territory map — not an implementation plan — intended to subdivide the problem into pieces that can be tackled in order.
