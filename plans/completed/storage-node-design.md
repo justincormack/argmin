@@ -1,5 +1,25 @@
 # Storage Node — Design Document
 
+> Status: Superseded historical design note.
+>
+> The implemented storage backend kept many of the shard-store decisions from this
+> document: per-PG directories, per-PG SQLite `metadata.db`, file-per-shard data,
+> temp-file writes with `fsync` + rename, CRC64-NVME shard verification, and
+> `PgStore` / `SharedStorageNode` as the main local storage abstractions.
+>
+> The active architecture no longer follows the metadata-embedding and separate
+> storage-daemon design options discussed here. User/object metadata now lives in
+> the current per-PG SQLite schema, payload layout has been unified around fixed
+> segments, and read retention/reclaim semantics were designed later.
+>
+> Treat this document as background only. The current source of truth is:
+> - `crates/storage/src/lib.rs`
+> - `crates/storage/src/pg_store.rs`
+> - `crates/storage/src/node.rs`
+> - `plans/completed/pg-serialization-and-crc-verification.md`
+> - `plans/completed/unified-segment-payload-redesign.md`
+> - `plans/completed/segment-integrity-checks-for-bounded-reads.md`
+
 ## Scope
 
 This document covers the design of the per-node storage daemon (subsystem 3 in the

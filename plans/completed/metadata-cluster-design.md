@@ -60,7 +60,7 @@ and PG state. There is no separate centralized metadata cluster for object recor
 The metadata service does NOT store:
 - Shard data (that's the storage node's shard store)
 - User-defined metadata / content-type / S3 headers (those are stored in the shard
-  data as a prepended metadata blob — see storage-node-design.md, Architecture C2)
+  data as a prepended metadata blob — see completed/storage-node-design.md, Architecture C2)
 - Raw checksums of shard data (those are per-storage-node)
 
 It stores the minimum needed for namespace operations (ListObjects, routing) and
@@ -70,7 +70,7 @@ object-level bookkeeping (versioning, lifecycle).
 
 ## Relationship to Storage Node Design
 
-The storage node design doc (storage-node-design.md) establishes several decisions
+The storage node design doc (completed/storage-node-design.md) establishes several decisions
 that constrain the metadata service:
 
 - **Architecture C2 (preferred)**: User metadata (content-type, x-amz-meta-*) is
@@ -1105,7 +1105,7 @@ shard deletion happens asynchronously. This keeps the delete response fast.
    garbage collected
 ```
 
-CopyObject-to-self always rewrites shards (resolved in storage-node-design.md). This
+CopyObject-to-self always rewrites shards (resolved in completed/storage-node-design.md). This
 maintains the invariant that shard metadata is always accurate.
 
 ---
@@ -1551,7 +1551,7 @@ pub struct PgMetadataConfig {
 
 ## Cross-references
 
-- **Storage Node Design**: `plans/storage-node-design.md` — Architecture C (embedded
+- **Storage Node Design**: `plans/completed/storage-node-design.md` — Architecture C (embedded
   metadata), shard immutability, C2 prepend design.
 - **Territory Map**: `plans/territory-map.md` — subsystem 4 definition, build sequence.
 - **Placement API**: `plans/completed/placement-api.md` — rendezvous hashing, ClusterMap,

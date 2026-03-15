@@ -104,7 +104,7 @@ The system decomposes into these major internal layers:
 **In**: shard writes/reads/deletes scoped by PG
 **Out**: stored bytes, per-shard checksums
 **Dependencies**: Erasure Coding Engine
-**Notes**: Per-PG directories on disk (`pg-NNNN/shards/`, `pg-NNNN/metadata.db`, `pg-NNNN/tmp/`). Atomic writes (temp → fsync → rename). CRC64-NVME per shard. SQLite in WAL mode for per-PG shard index. ShardStore trait per PG, StorageNode multiplexes across PGs. See `plans/storage-node-design.md`.
+**Notes**: Per-PG directories on disk (`pg-NNNN/shards/`, `pg-NNNN/metadata.db`, `pg-NNNN/tmp/`). Atomic writes (temp → fsync → rename). CRC64-NVME per shard. SQLite in WAL mode for per-PG shard index. ShardStore trait per PG, StorageNode multiplexes across PGs. See `plans/completed/storage-node-design.md`.
 
 ### 4. Global Service (Raft)
 **What**: Small Raft-replicated cluster (3-5 nodes) that owns global state: bucket table, cluster map with epoch, PG state.
