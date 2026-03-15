@@ -81,7 +81,8 @@ Current state:
 5. the main HTTP/core boundary work is complete
 6. the in-flight read vs object reclamation race discovered during this work is
    tracked separately in
-   [`plans/in-flight-read-reclamation-plan.md`](./in-flight-read-reclamation-plan.md)
+   [`in-flight-read-reclamation-plan.md`](./in-flight-read-reclamation-plan.md)
+7. `GetBucketAcl` is also core-owned now
 
 ## Context
 
@@ -187,16 +188,6 @@ The rule is:
    state
 3. `storage` remains auth-agnostic
 
-## Remaining Implementation Order
-
-### Step 1: reassess the deeper core/storage boundary
-
-Only after the HTTP/core split is judged complete enough on its own:
-
-1. decide whether `server-core` should continue to depend directly on
-   `SharedStorageNode` / `PgStore`
-2. decide whether a narrower storage service abstraction is worth the churn
-
 ## Deeper `server-core -> storage` Split
 
 Only after the boundary work above is complete should we decide whether the
@@ -211,36 +202,14 @@ Current concrete coupling includes:
 That is a separate question from the HTTP/core boundary. Do not start there
 until the remaining boundary work above is done.
 
-## Validation
+## Completion Note
 
-After each implementation step:
+This plan is complete for its intended scope:
 
-1. `cargo fmt --all`
-2. `cargo test -p storage -p server-core -p server-http`
-3. `cargo clippy -p server-core -p server-http --all-targets --no-deps -- -D warnings -W clippy::pedantic`
+1. `server-http` is the transport/authentication boundary
+2. `server-core` owns S3 authorization and stored-state policy
+3. `storage` remains policy-agnostic
 
-Add focused regression tests for:
-
-1. direct coordinator calls that should now reject unauthorized access
-2. bucket read authorization with `public_read` plus `IgnorePublicAcls`
-3. BucketOwnerEnforced and BlockPublicAcls enforcement after the checks move
-4. multipart and streaming write authz at the core boundary
-
-## Open Questions
-
-1. whether object-tagging operations should reuse the existing requester-aware
-   object helpers or grow dedicated authz helpers in `server-core`
-2. whether `HeadBucket` and bucket subresource reads should share a bucket-level
-   request DTO rather than each growing requester fields independently
-3. whether the remaining `server-core -> storage` concreteness is actually a
-   problem once the authz move is complete
-
-## Recommendation Summary
-
-Recommended next move:
-
-1. finish the remaining authz move into `server-core`
-2. start with bucket read and list operations
-3. then move bucket subresource writes and their stored-state policy
-4. then cover multipart, POST, and streaming paths
-5. only after that reassess the deeper core/storage coupling
+The only remaining question is whether a narrower storage abstraction is worth
+introducing under `server-core`. That is a separate future design choice, not
+unfinished work from this boundary cleanup.
