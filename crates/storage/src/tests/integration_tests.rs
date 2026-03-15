@@ -1,5 +1,6 @@
 use crate::traits::{PgMetadataStore, ShardStore, StorageNode};
 use crate::types::*;
+use std::num::NonZeroU64;
 
 /// Integration test: write shard data + object metadata, read both back.
 #[test]
@@ -190,5 +191,1024 @@ fn pg_store_persistence() {
 
         let obj = store.get_object_meta("b", "k").unwrap();
         assert_eq!(obj.as_live().unwrap().size, data.len() as u64);
+    }
+}
+
+// ── 1. Multipart upload lifecycle ──────────────────────────────────────
+
+/// Full multipart flow: create upload → upsert parts with shards →
+/// commit_object_parts → complete_multipart_commit → read back everything.
+#[test]
+fn multipart_upload_lifecycle() {
+    let dir = test_util::tempdir();
+    let pg_dir = dir.path().join("pg-0000");
+    let store = crate::PgStore::open(&pg_dir, 0).unwrap();
+
+    store
+        .create_bucket(
+            "b",
+            "owner",
+            &CanonicalUserId::from_principal("owner"),
+            false,
+            false,
+        )
+        .unwrap();
+
+    // Create multipart upload.
+    store
+        .create_multipart_upload(&CreateMultipartUploadReq {
+            upload_id: "mpu-1".into(),
+            bucket: "b".into(),
+            key: "k".into(),
+            metadata_blob: vec![].into(),
+            owner_principal: Some("owner".into()),
+            checksum: None,
+        })
+        .unwrap();
+
+    // Write shard data for two parts.
+    let part1_data = b"part-one-data-here";
+    let part2_data = b"part-two-data-here";
+
+    let hash1 = [0x11u8; 16];
+    let shard_key1 = ShardKey::new(&hash1, 1, 0);
+    let ack1 = store.write_shard(&shard_key1, part1_data).unwrap();
+
+    let hash2 = [0x22u8; 16];
+    let shard_key2 = ShardKey::new(&hash2, 1, 0);
+    let ack2 = store.write_shard(&shard_key2, part2_data).unwrap();
+
+    // Upsert parts.
+    store
+        .upsert_multipart_part(&MultipartPartRecord {
+            upload_id: "mpu-1".into(),
+            part_number: 1,
+            generation: 0,
+            size: part1_data.len() as u64,
+            etag: ack1.crc64.to_be_bytes().to_vec(),
+            etag_kind: EtagKind::Crc64,
+            part_okh: hash1,
+            part_vid: GenerationId::MIN,
+            ec_k: 4,
+            ec_m: 2,
+            last_modified: 0,
+            checksum: None,
+        })
+        .unwrap();
+    store
+        .upsert_multipart_part(&MultipartPartRecord {
+            upload_id: "mpu-1".into(),
+            part_number: 2,
+            generation: 0,
+            size: part2_data.len() as u64,
+            etag: ack2.crc64.to_be_bytes().to_vec(),
+            etag_kind: EtagKind::Crc64,
+            part_okh: hash2,
+            part_vid: GenerationId::MIN,
+            ec_k: 4,
+            ec_m: 2,
+            last_modified: 0,
+            checksum: None,
+        })
+        .unwrap();
+
+    // Verify parts are listed.
+    let parts = store
+        .list_multipart_parts(&ListPartsReq {
+            upload_id: "mpu-1".into(),
+            part_number_marker: None,
+            max_parts: 10,
+        })
+        .unwrap();
+    assert_eq!(parts.parts.len(), 2);
+
+    // Complete multipart: commit object + parts.
+    let total_size = (part1_data.len() + part2_data.len()) as u64;
+    let obj = CommitMultipartReq {
+        bucket: "b".into(),
+        key: "k".into(),
+        version_id: VersionId::Null,
+        generation_id: GenerationId::MIN,
+        size: total_size,
+        etag_crc64: [0xCC, 0, 0, 0, 0, 0, 0, 0],
+        ec: EcShape { k: 4, m: 2 },
+        metadata_blob: Some(vec![].into()),
+    };
+    let committed_parts = vec![
+        ObjectPartRecord {
+            bucket: "b".into(),
+            key: "k".into(),
+            version_id: VersionId::Null,
+            part_number: 1,
+            size: part1_data.len() as u64,
+            etag: ack1.crc64.to_be_bytes().to_vec(),
+            etag_kind: EtagKind::Crc64,
+            part_okh: hash1,
+            part_vid: GenerationId::MIN,
+            ec_k: 4,
+            ec_m: 2,
+            shard_pg_id: 0,
+            checksum: None,
+        },
+        ObjectPartRecord {
+            bucket: "b".into(),
+            key: "k".into(),
+            version_id: VersionId::Null,
+            part_number: 2,
+            size: part2_data.len() as u64,
+            etag: ack2.crc64.to_be_bytes().to_vec(),
+            etag_kind: EtagKind::Crc64,
+            part_okh: hash2,
+            part_vid: GenerationId::MIN,
+            ec_k: 4,
+            ec_m: 2,
+            shard_pg_id: 0,
+            checksum: None,
+        },
+    ];
+
+    store
+        .set_upload_state("mpu-1", UploadState::Completing)
+        .unwrap();
+    store
+        .complete_multipart_commit("mpu-1", &obj, &committed_parts)
+        .unwrap();
+
+    // Read back the committed object.
+    let read_obj = store.get_object_meta("b", "k").unwrap();
+    let live = read_obj.as_live().unwrap();
+    assert_eq!(live.size, total_size);
+
+    // Read back committed parts.
+    let read_parts = store.get_object_parts("b", "k", VersionId::Null).unwrap();
+    assert_eq!(read_parts.len(), 2);
+    assert_eq!(read_parts[0].part_number, 1);
+    assert_eq!(read_parts[1].part_number, 2);
+
+    // Verify shards are still readable.
+    let r1 = store.read_shard(&shard_key1).unwrap();
+    assert_eq!(r1.data, part1_data);
+    let r2 = store.read_shard(&shard_key2).unwrap();
+    assert_eq!(r2.data, part2_data);
+}
+
+// ── 2. Streaming PutObject lifecycle ───────────────────────────────────
+
+/// Streaming put: create session → append segments with shards →
+/// commit_stream_put → verify object + segments readable, session gone.
+#[test]
+fn streaming_put_object_lifecycle() {
+    let dir = test_util::tempdir();
+    let pg_dir = dir.path().join("pg-0000");
+    let store = crate::PgStore::open(&pg_dir, 0).unwrap();
+
+    // Write shard data for two segments.
+    let seg0_data = b"segment-zero-data";
+    let seg1_data = b"segment-one-data!";
+
+    let hash0 = [0xA0u8; 16];
+    let shard_key0 = ShardKey::new(&hash0, 1, 0);
+    store.write_shard(&shard_key0, seg0_data).unwrap();
+
+    let hash1 = [0xA1u8; 16];
+    let shard_key1 = ShardKey::new(&hash1, 1, 0);
+    store.write_shard(&shard_key1, seg1_data).unwrap();
+
+    // Create streaming session.
+    store
+        .create_stream_upload(&CreateStreamUploadReq {
+            session_id: "ss-put".into(),
+            bucket: "b".into(),
+            key: "k".into(),
+            target: StreamUploadTarget::PutObject,
+        })
+        .unwrap();
+
+    // Append staging segments.
+    store
+        .append_stream_segment(&StreamUploadSegmentRecord {
+            session_id: "ss-put".into(),
+            segment_index: 0,
+            size: seg0_data.len() as u64,
+            segment_crc64: Some(123),
+            segment_okh: hash0,
+            segment_vid: GenerationId::MIN,
+            shard_pg_id: 0,
+            ec_k: 4,
+            ec_m: 2,
+        })
+        .unwrap();
+    store
+        .append_stream_segment(&StreamUploadSegmentRecord {
+            session_id: "ss-put".into(),
+            segment_index: 1,
+            size: seg1_data.len() as u64,
+            segment_crc64: Some(456),
+            segment_okh: hash1,
+            segment_vid: GenerationId::MIN,
+            shard_pg_id: 0,
+            ec_k: 4,
+            ec_m: 2,
+        })
+        .unwrap();
+
+    // Verify staging segments.
+    let staging = store.list_stream_segments("ss-put").unwrap();
+    assert_eq!(staging.len(), 2);
+
+    // Commit: atomically writes object + object_segments, deletes session.
+    let total_size = (seg0_data.len() + seg1_data.len()) as u64;
+    let committed_segments = vec![
+        ObjectSegmentRecord {
+            bucket: "b".into(),
+            key: "k".into(),
+            version_id: VersionId::Null,
+            segment_index: 0,
+            size: seg0_data.len() as u64,
+            segment_crc64: Some(123),
+            segment_okh: hash0,
+            segment_vid: GenerationId::MIN,
+            shard_pg_id: 0,
+            ec_k: 4,
+            ec_m: 2,
+        },
+        ObjectSegmentRecord {
+            bucket: "b".into(),
+            key: "k".into(),
+            version_id: VersionId::Null,
+            segment_index: 1,
+            size: seg1_data.len() as u64,
+            segment_crc64: Some(456),
+            segment_okh: hash1,
+            segment_vid: GenerationId::MIN,
+            shard_pg_id: 0,
+            ec_k: 4,
+            ec_m: 2,
+        },
+    ];
+
+    store
+        .commit_stream_put(
+            "ss-put",
+            &CommitStreamPutReq {
+                bucket: "b".into(),
+                key: "k".into(),
+                version_id: VersionId::Null,
+                generation_id: GenerationId::MIN,
+                size: total_size,
+                etag_crc64: 0xDEAD,
+                ec: EcShape { k: 4, m: 2 },
+                tags: None,
+                metadata_blob: None,
+            },
+            &committed_segments,
+        )
+        .unwrap();
+
+    // Object metadata readable.
+    let obj = store.get_object_meta("b", "k").unwrap();
+    assert_eq!(obj.as_live().unwrap().size, total_size);
+
+    // Object segments readable.
+    let segs = store.get_object_segments("b", "k", VersionId::Null).unwrap();
+    assert_eq!(segs.len(), 2);
+    assert_eq!(segs[0].segment_okh, hash0);
+    assert_eq!(segs[1].segment_okh, hash1);
+
+    // Session is gone.
+    let err = store.get_stream_upload("ss-put").unwrap_err();
+    assert!(matches!(
+        err,
+        crate::error::MetadataError::StreamSessionNotFound { .. }
+    ));
+
+    // Shards still readable.
+    assert_eq!(store.read_shard(&shard_key0).unwrap().data, seg0_data);
+    assert_eq!(store.read_shard(&shard_key1).unwrap().data, seg1_data);
+}
+
+// ── 3. Streaming UploadPart lifecycle ──────────────────────────────────
+
+/// Streaming part: create multipart → create stream session(UploadPart) →
+/// append segments → commit_stream_part → verify part + part segments.
+#[test]
+fn streaming_upload_part_lifecycle() {
+    let dir = test_util::tempdir();
+    let pg_dir = dir.path().join("pg-0000");
+    let store = crate::PgStore::open(&pg_dir, 0).unwrap();
+
+    // Create multipart upload first.
+    store
+        .create_multipart_upload(&CreateMultipartUploadReq {
+            upload_id: "mpu-sp".into(),
+            bucket: "b".into(),
+            key: "k".into(),
+            metadata_blob: vec![].into(),
+            owner_principal: None,
+            checksum: None,
+        })
+        .unwrap();
+
+    // Write shard data.
+    let seg_data = b"streaming-part-segment";
+    let hash = [0xBBu8; 16];
+    let shard_key = ShardKey::new(&hash, 1, 0);
+    let ack = store.write_shard(&shard_key, seg_data).unwrap();
+
+    // Create streaming session for part 1.
+    store
+        .create_stream_upload(&CreateStreamUploadReq {
+            session_id: "ss-part".into(),
+            bucket: "b".into(),
+            key: "k".into(),
+            target: StreamUploadTarget::UploadPart {
+                upload_id: "mpu-sp".into(),
+                part_number: 1,
+            },
+        })
+        .unwrap();
+
+    // Append staging segment.
+    store
+        .append_stream_segment(&StreamUploadSegmentRecord {
+            session_id: "ss-part".into(),
+            segment_index: 0,
+            size: seg_data.len() as u64,
+            segment_crc64: Some(ack.crc64),
+            segment_okh: hash,
+            segment_vid: GenerationId::MIN,
+            shard_pg_id: 0,
+            ec_k: 4,
+            ec_m: 2,
+        })
+        .unwrap();
+
+    // Commit stream part.
+    let part_segments = vec![MultipartPartSegmentRecord {
+        bucket: "b".into(),
+        key: "k".into(),
+        upload_id: "mpu-sp".into(),
+        version_id: MULTIPART_PART_SEGMENT_STAGING_VERSION_ID.to_u64(),
+        part_number: 1,
+        segment_index: 0,
+        size: seg_data.len() as u64,
+        segment_crc64: Some(ack.crc64),
+        segment_okh: hash,
+        segment_vid: GenerationId::MIN,
+        shard_pg_id: 0,
+        ec_k: 4,
+        ec_m: 2,
+    }];
+
+    store
+        .commit_stream_part(
+            "ss-part",
+            &MultipartPartRecord {
+                upload_id: "mpu-sp".into(),
+                part_number: 1,
+                generation: 0,
+                size: seg_data.len() as u64,
+                etag: ack.crc64.to_be_bytes().to_vec(),
+                etag_kind: EtagKind::Crc64,
+                part_okh: [0u8; 16], // zero sentinel for segmented parts
+                part_vid: GenerationId::MIN,
+                ec_k: 4,
+                ec_m: 2,
+                last_modified: 0,
+                checksum: None,
+            },
+            &part_segments,
+        )
+        .unwrap();
+
+    // Session gone.
+    let err = store.get_stream_upload("ss-part").unwrap_err();
+    assert!(matches!(
+        err,
+        crate::error::MetadataError::StreamSessionNotFound { .. }
+    ));
+
+    // Part readable.
+    let part = store.get_multipart_part("mpu-sp", 1).unwrap();
+    assert_eq!(part.size, seg_data.len() as u64);
+
+    // Part segments readable.
+    let segs = store
+        .get_all_multipart_part_segments_for_upload("mpu-sp")
+        .unwrap();
+    assert_eq!(segs.len(), 1);
+    assert_eq!(segs[0].segment_okh, hash);
+
+    // Shard still readable.
+    assert_eq!(store.read_shard(&shard_key).unwrap().data, seg_data);
+}
+
+// ── 4. Versioned object lifecycle ──────────────────────────────────────
+
+/// Enable versioning → put multiple versions → list → get specific →
+/// delete one → verify others intact.
+#[test]
+fn versioned_object_lifecycle() {
+    let dir = test_util::tempdir();
+    let pg_dir = dir.path().join("pg-0000");
+    let store = crate::PgStore::open(&pg_dir, 0).unwrap();
+
+    store
+        .create_bucket(
+            "b",
+            "owner",
+            &CanonicalUserId::from_principal("owner"),
+            false,
+            false,
+        )
+        .unwrap();
+    store
+        .put_bucket_versioning("b", BucketVersioningState::Enabled)
+        .unwrap();
+
+    // Write 3 versions with shards.
+    let mut shard_keys = Vec::new();
+    let mut version_ids = Vec::new();
+    for i in 1..=3u64 {
+        let vid = VersionId::Versioned(NonZeroU64::new(i).unwrap());
+        version_ids.push(vid);
+
+        let hash = [i as u8; 16];
+        let sk = ShardKey::new(&hash, 1, 0);
+        let data = format!("version-{i}-data");
+        store.write_shard(&sk, data.as_bytes()).unwrap();
+        shard_keys.push(sk);
+
+        store
+            .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
+                bucket: "b".into(),
+                key: "k".into(),
+                version_id: vid,
+                generation_id: GenerationId::MIN,
+                ec: EcShape { k: 4, m: 2 },
+                size: data.len() as u64,
+                etag: ObjectEtag::SinglePart([i as u8, 0, 0, 0, 0, 0, 0, 0]),
+                layout: ObjectLayout::Standard,
+                tags: None,
+                metadata_blob: None,
+            }))
+            .unwrap();
+    }
+
+    // List versions — should see all 3.
+    let resp = store
+        .list_object_versions(&ListObjectVersionsReq {
+            bucket: "b".into(),
+            prefix: None,
+            key_marker: None,
+            version_id_marker: None,
+            max_keys: 10,
+        })
+        .unwrap();
+    assert_eq!(resp.versions.len(), 3);
+
+    // Get specific version.
+    let obj = store
+        .get_object_version("b", "k", version_ids[1])
+        .unwrap();
+    assert_eq!(obj.as_live().unwrap().size, "version-2-data".len() as u64);
+
+    // Delete version 2.
+    store
+        .delete_object_version("b", "k", version_ids[1])
+        .unwrap();
+    store.delete_shard(&shard_keys[1]).unwrap();
+
+    // Version 2 gone.
+    let err = store
+        .get_object_version("b", "k", version_ids[1])
+        .unwrap_err();
+    assert!(matches!(err, crate::MetadataError::ObjectNotFound));
+
+    // Versions 1 and 3 intact.
+    store
+        .get_object_version("b", "k", version_ids[0])
+        .unwrap();
+    store
+        .get_object_version("b", "k", version_ids[2])
+        .unwrap();
+
+    // List now shows 2.
+    let resp = store
+        .list_object_versions(&ListObjectVersionsReq {
+            bucket: "b".into(),
+            prefix: None,
+            key_marker: None,
+            version_id_marker: None,
+            max_keys: 10,
+        })
+        .unwrap();
+    assert_eq!(resp.versions.len(), 2);
+
+    // Remaining shards still readable.
+    assert_eq!(
+        store.read_shard(&shard_keys[0]).unwrap().data,
+        b"version-1-data"
+    );
+    assert_eq!(
+        store.read_shard(&shard_keys[2]).unwrap().data,
+        b"version-3-data"
+    );
+}
+
+// ── 5. Object overwrite with reclaim ───────────────────────────────────
+
+/// Put object (gen 1) → record reclaim → overwrite (gen 2) → verify
+/// reclaim points to old gen → delete reclaim.
+#[test]
+fn object_overwrite_with_reclaim() {
+    let dir = test_util::tempdir();
+    let pg_dir = dir.path().join("pg-0000");
+    let store = crate::PgStore::open(&pg_dir, 0).unwrap();
+
+    let gen1 = GenerationId::MIN;
+    let gen2 = GenerationId::new(2).unwrap();
+
+    // Write gen 1 object + shard.
+    let hash1 = [0x10u8; 16];
+    let sk1 = ShardKey::new(&hash1, gen1.get(), 0);
+    store.write_shard(&sk1, b"gen-1-data").unwrap();
+
+    store
+        .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
+            bucket: "b".into(),
+            key: "k".into(),
+            version_id: VersionId::Null,
+            generation_id: gen1,
+            ec: EcShape { k: 4, m: 2 },
+            size: 10,
+            etag: ObjectEtag::SinglePart([1, 0, 0, 0, 0, 0, 0, 0]),
+            layout: ObjectLayout::Standard,
+            tags: None,
+            metadata_blob: None,
+        }))
+        .unwrap();
+
+    // Record reclaim for gen 1 before overwriting.
+    store
+        .put_simple_payload_reclaim(&SimplePayloadReclaimRecord {
+            bucket: "b".into(),
+            key: "k".into(),
+            generation_id: gen1,
+            ec: EcShape { k: 4, m: 2 },
+            created_at: 100,
+        })
+        .unwrap();
+
+    // Overwrite with gen 2.
+    let hash2 = [0x20u8; 16];
+    let sk2 = ShardKey::new(&hash2, gen2.get(), 0);
+    store.write_shard(&sk2, b"gen-2-data").unwrap();
+
+    store
+        .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
+            bucket: "b".into(),
+            key: "k".into(),
+            version_id: VersionId::Null,
+            generation_id: gen2,
+            ec: EcShape { k: 4, m: 2 },
+            size: 10,
+            etag: ObjectEtag::SinglePart([2, 0, 0, 0, 0, 0, 0, 0]),
+            layout: ObjectLayout::Standard,
+            tags: None,
+            metadata_blob: None,
+        }))
+        .unwrap();
+
+    // Current object is gen 2.
+    let obj = store.get_object_meta("b", "k").unwrap();
+    assert_eq!(
+        obj.as_live().unwrap().etag,
+        ObjectEtag::SinglePart([2, 0, 0, 0, 0, 0, 0, 0])
+    );
+
+    // Reclaim record for gen 1 still exists.
+    let reclaim = store
+        .get_simple_payload_reclaim("b", "k", gen1)
+        .unwrap()
+        .expect("reclaim should exist");
+    assert_eq!(reclaim.generation_id, gen1);
+
+    // Reclaim root points to gen 1 (earliest reclaim in bucket).
+    let root = store
+        .get_bucket_payload_reclaim_root("b")
+        .unwrap()
+        .expect("root should exist");
+    assert_eq!(root.generation_id, gen1);
+
+    // Clean up reclaim, then old shard.
+    store
+        .delete_simple_payload_reclaim("b", "k", gen1)
+        .unwrap();
+    store.delete_shard(&sk1).unwrap();
+
+    // Reclaim gone.
+    assert!(store
+        .get_simple_payload_reclaim("b", "k", gen1)
+        .unwrap()
+        .is_none());
+
+    // Gen 2 shard still readable.
+    assert_eq!(store.read_shard(&sk2).unwrap().data, b"gen-2-data");
+}
+
+// ── 6. Bucket deletion lifecycle ───────────────────────────────────────
+
+/// Create bucket → put objects → delete objects → mark deleting →
+/// head_bucket_raw sees it → delete_bucket → gone.
+#[test]
+fn bucket_deletion_lifecycle() {
+    let dir = test_util::tempdir();
+    let pg_dir = dir.path().join("pg-0000");
+    let store = crate::PgStore::open(&pg_dir, 0).unwrap();
+
+    store
+        .create_bucket(
+            "doomed",
+            "owner",
+            &CanonicalUserId::from_principal("owner"),
+            false,
+            false,
+        )
+        .unwrap();
+
+    // Put an object.
+    store
+        .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
+            bucket: "doomed".into(),
+            key: "file.txt".into(),
+            version_id: VersionId::Null,
+            generation_id: GenerationId::MIN,
+            ec: EcShape { k: 4, m: 2 },
+            size: 5,
+            etag: ObjectEtag::SinglePart([1, 0, 0, 0, 0, 0, 0, 0]),
+            layout: ObjectLayout::Standard,
+            tags: None,
+            metadata_blob: None,
+        }))
+        .unwrap();
+
+    // Add tags to the object.
+    store
+        .put_object_tags("doomed", "file.txt", VersionId::Null, "<t>v</t>")
+        .unwrap();
+
+    // Delete the object.
+    store.delete_object_meta("doomed", "file.txt").unwrap();
+
+    // Mark bucket as deleting.
+    store.mark_bucket_deleting("doomed").unwrap();
+
+    // head_bucket no longer sees it.
+    let err = store.head_bucket("doomed").unwrap_err();
+    assert!(matches!(
+        err,
+        crate::error::MetadataError::BucketNotFound { .. }
+    ));
+
+    // head_bucket_raw still sees it in Deleting state.
+    let info = store.head_bucket_raw("doomed").unwrap();
+    assert_eq!(info.state, BucketState::Deleting);
+
+    // list_buckets does not include it.
+    let buckets = store.list_buckets("owner").unwrap();
+    assert!(buckets.is_empty());
+
+    // Final delete.
+    store.delete_bucket("doomed").unwrap();
+
+    // Completely gone.
+    let err = store.head_bucket_raw("doomed").unwrap_err();
+    assert!(matches!(
+        err,
+        crate::error::MetadataError::BucketNotFound { .. }
+    ));
+}
+
+// ── 7. Multipart abort cleanup ─────────────────────────────────────────
+
+/// Create upload → upsert parts with segments → abort: delete segments
+/// by upload_id → delete parts → delete upload → verify all cleaned up.
+#[test]
+fn multipart_abort_cleanup() {
+    let dir = test_util::tempdir();
+    let pg_dir = dir.path().join("pg-0000");
+    let store = crate::PgStore::open(&pg_dir, 0).unwrap();
+
+    store
+        .create_multipart_upload(&CreateMultipartUploadReq {
+            upload_id: "mpu-abort".into(),
+            bucket: "b".into(),
+            key: "k".into(),
+            metadata_blob: vec![].into(),
+            owner_principal: None,
+            checksum: None,
+        })
+        .unwrap();
+
+    // Write a shard.
+    let hash = [0xDD; 16];
+    let sk = ShardKey::new(&hash, 1, 0);
+    store.write_shard(&sk, b"abort-me").unwrap();
+
+    // Upsert part with segments.
+    let part = MultipartPartRecord {
+        upload_id: "mpu-abort".into(),
+        part_number: 1,
+        generation: 0,
+        size: 8,
+        etag: vec![0xAA],
+        etag_kind: EtagKind::Crc64,
+        part_okh: [0u8; 16], // zero sentinel for segmented parts
+        part_vid: GenerationId::MIN,
+        ec_k: 4,
+        ec_m: 2,
+        last_modified: 0,
+        checksum: None,
+    };
+    let segments = vec![MultipartPartSegmentRecord {
+        bucket: "b".into(),
+        key: "k".into(),
+        upload_id: "mpu-abort".into(),
+        version_id: MULTIPART_PART_SEGMENT_STAGING_VERSION_ID.to_u64(),
+        part_number: 1,
+        segment_index: 0,
+        size: 8,
+        segment_crc64: Some(999),
+        segment_okh: hash,
+        segment_vid: GenerationId::MIN,
+        shard_pg_id: 0,
+        ec_k: 4,
+        ec_m: 2,
+    }];
+    store
+        .upsert_multipart_part_segments(&part, &segments)
+        .unwrap();
+
+    // Verify part and segments exist.
+    let p = store.get_multipart_part("mpu-abort", 1).unwrap();
+    assert_eq!(p.size, 8);
+    let segs = store
+        .get_all_multipart_part_segments_for_upload("mpu-abort")
+        .unwrap();
+    assert_eq!(segs.len(), 1);
+
+    // Abort: clean up segments, then set state, then delete upload.
+    store
+        .delete_multipart_part_segments_by_upload_id("mpu-abort")
+        .unwrap();
+    store
+        .set_upload_state("mpu-abort", UploadState::Aborting)
+        .unwrap();
+    store.delete_multipart_upload("mpu-abort").unwrap();
+
+    // Verify upload gone.
+    let err = store.get_multipart_upload("mpu-abort").unwrap_err();
+    assert!(matches!(
+        err,
+        crate::error::MetadataError::NoSuchUpload { .. }
+    ));
+
+    // Segments gone.
+    let segs = store
+        .get_all_multipart_part_segments_for_upload("mpu-abort")
+        .unwrap();
+    assert!(segs.is_empty());
+
+    // Shard still exists (shard cleanup is caller's responsibility).
+    assert_eq!(store.read_shard(&sk).unwrap().data, b"abort-me");
+
+    // Clean up shard.
+    store.delete_shard(&sk).unwrap();
+    assert!(matches!(
+        store.read_shard(&sk).unwrap_err(),
+        crate::StoreError::NotFound
+    ));
+}
+
+// ── 8. Object tags through overwrite and versioned delete ──────────────
+
+/// Tags are stored per-version. Overwriting an unversioned object clears
+/// tags (since the old row is replaced). Versioned objects have
+/// independent tags per version.
+#[test]
+fn object_tags_through_overwrite_and_versioned_delete() {
+    let dir = test_util::tempdir();
+    let pg_dir = dir.path().join("pg-0000");
+    let store = crate::PgStore::open(&pg_dir, 0).unwrap();
+
+    store
+        .create_bucket(
+            "b",
+            "owner",
+            &CanonicalUserId::from_principal("owner"),
+            false,
+            false,
+        )
+        .unwrap();
+
+    // Unversioned: put object, add tags, overwrite → tags gone.
+    store
+        .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
+            bucket: "b".into(),
+            key: "k".into(),
+            version_id: VersionId::Null,
+            generation_id: GenerationId::MIN,
+            ec: EcShape { k: 4, m: 2 },
+            size: 10,
+            etag: ObjectEtag::SinglePart([1, 0, 0, 0, 0, 0, 0, 0]),
+            layout: ObjectLayout::Standard,
+            tags: Some("<t>old</t>".into()),
+            metadata_blob: None,
+        }))
+        .unwrap();
+
+    let tags = store.get_object_tags("b", "k", VersionId::Null).unwrap();
+    assert_eq!(tags.as_deref(), Some("<t>old</t>"));
+
+    // Overwrite with no tags.
+    store
+        .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
+            bucket: "b".into(),
+            key: "k".into(),
+            version_id: VersionId::Null,
+            generation_id: GenerationId::new(2).unwrap(),
+            ec: EcShape { k: 4, m: 2 },
+            size: 20,
+            etag: ObjectEtag::SinglePart([2, 0, 0, 0, 0, 0, 0, 0]),
+            layout: ObjectLayout::Standard,
+            tags: None,
+            metadata_blob: None,
+        }))
+        .unwrap();
+
+    let tags = store.get_object_tags("b", "k", VersionId::Null).unwrap();
+    assert!(tags.is_none(), "tags should be cleared after overwrite");
+
+    // Versioned: put two versions with independent tags.
+    store
+        .put_bucket_versioning("b", BucketVersioningState::Enabled)
+        .unwrap();
+
+    let vid1 = VersionId::Versioned(NonZeroU64::new(10).unwrap());
+    let vid2 = VersionId::Versioned(NonZeroU64::new(20).unwrap());
+
+    for (vid, tag) in [(vid1, "<t>v1</t>"), (vid2, "<t>v2</t>")] {
+        store
+            .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
+                bucket: "b".into(),
+                key: "tagged".into(),
+                version_id: vid,
+                generation_id: GenerationId::MIN,
+                ec: EcShape { k: 4, m: 2 },
+                size: 5,
+                etag: ObjectEtag::SinglePart([1, 0, 0, 0, 0, 0, 0, 0]),
+                layout: ObjectLayout::Standard,
+                tags: Some(tag.into()),
+                metadata_blob: None,
+            }))
+            .unwrap();
+    }
+
+    assert_eq!(
+        store
+            .get_object_tags("b", "tagged", vid1)
+            .unwrap()
+            .as_deref(),
+        Some("<t>v1</t>")
+    );
+    assert_eq!(
+        store
+            .get_object_tags("b", "tagged", vid2)
+            .unwrap()
+            .as_deref(),
+        Some("<t>v2</t>")
+    );
+
+    // Delete version 1 — version 2 tags unaffected.
+    store.delete_object_version("b", "tagged", vid1).unwrap();
+
+    let err = store.get_object_tags("b", "tagged", vid1).unwrap_err();
+    assert!(matches!(err, crate::MetadataError::ObjectNotFound));
+
+    assert_eq!(
+        store
+            .get_object_tags("b", "tagged", vid2)
+            .unwrap()
+            .as_deref(),
+        Some("<t>v2</t>")
+    );
+}
+
+// ── 10. Persistence through reopen for complex state ───────────────────
+
+/// Stream session and multipart upload survive PgStore reopen.
+#[test]
+fn persistence_complex_state_through_reopen() {
+    let dir = test_util::tempdir();
+    let pg_dir = dir.path().join("pg-0000");
+
+    let stream_session_id = "ss-persist";
+    let upload_id = "mpu-persist";
+
+    // Phase 1: create state, then drop the store.
+    {
+        let store = crate::PgStore::open(&pg_dir, 0).unwrap();
+
+        // Create a streaming session.
+        store
+            .create_stream_upload(&CreateStreamUploadReq {
+                session_id: stream_session_id.into(),
+                bucket: "b".into(),
+                key: "k1".into(),
+                target: StreamUploadTarget::PutObject,
+            })
+            .unwrap();
+
+        // Append a staging segment.
+        store
+            .append_stream_segment(&StreamUploadSegmentRecord {
+                session_id: stream_session_id.into(),
+                segment_index: 0,
+                size: 100,
+                segment_crc64: Some(42),
+                segment_okh: [0xEE; 16],
+                segment_vid: GenerationId::MIN,
+                shard_pg_id: 0,
+                ec_k: 4,
+                ec_m: 2,
+            })
+            .unwrap();
+
+        // Create a multipart upload with a part.
+        store
+            .create_multipart_upload(&CreateMultipartUploadReq {
+                upload_id: upload_id.into(),
+                bucket: "b".into(),
+                key: "k2".into(),
+                metadata_blob: vec![].into(),
+                owner_principal: Some("owner".into()),
+                checksum: None,
+            })
+            .unwrap();
+
+        store
+            .upsert_multipart_part(&MultipartPartRecord {
+                upload_id: upload_id.into(),
+                part_number: 1,
+                generation: 0,
+                size: 200,
+                etag: vec![0xBB],
+                etag_kind: EtagKind::Crc64,
+                part_okh: [0xFF; 16],
+                part_vid: GenerationId::MIN,
+                ec_k: 4,
+                ec_m: 2,
+                last_modified: 0,
+                checksum: None,
+            })
+            .unwrap();
+
+        // Write a shard.
+        let sk = ShardKey::new(&[0xCC; 16], 1, 0);
+        store.write_shard(&sk, b"persistent-shard").unwrap();
+    }
+
+    // Phase 2: reopen and verify everything survived.
+    {
+        let store = crate::PgStore::open(&pg_dir, 0).unwrap();
+
+        // Stream session survives.
+        let session = store.get_stream_upload(stream_session_id).unwrap();
+        assert_eq!(session.bucket.as_str(), "b");
+        assert_eq!(session.key.as_str(), "k1");
+
+        // list_all_stream_uploads finds it.
+        let all = store.list_all_stream_uploads().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].session_id.as_str(), stream_session_id);
+
+        // Staging segment survives.
+        let segs = store.list_stream_segments(stream_session_id).unwrap();
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].segment_okh, [0xEE; 16]);
+
+        // Multipart upload survives.
+        let upload = store.get_multipart_upload(upload_id).unwrap();
+        assert_eq!(upload.state, UploadState::InProgress);
+
+        // Part survives.
+        let part = store.get_multipart_part(upload_id, 1).unwrap();
+        assert_eq!(part.size, 200);
+
+        // Shard survives.
+        let sk = ShardKey::new(&[0xCC; 16], 1, 0);
+        let read = store.read_shard(&sk).unwrap();
+        assert_eq!(read.data, b"persistent-shard");
     }
 }
