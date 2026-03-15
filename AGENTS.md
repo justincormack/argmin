@@ -5,9 +5,6 @@ fix non conforming behaviour.
 
 ## Repository structure
 
-The notes/ path has rough design notes and is not part of this repo. It also contains some useful papers. Do
-not edit anything here.
-
 The guides/ folder has guides about specific technical or other issues and coding guidelines. These include
 important areas like concurrency.
 
