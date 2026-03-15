@@ -14,6 +14,7 @@ The main design question is:
 
 - should all segments for one object generation land on the same data PG
 - should segments be independently distributed over all data PGs
+- should segment placement be banded for better locality
 - or should segments be spread over a bounded deterministic subset of PGs
 
 ## Goals
@@ -75,7 +76,45 @@ Each segment chooses its data PG independently.
 This is attractive only if the implementation is explicitly designed to pipeline
 work across many PGs. Otherwise it mostly adds noise and tail risk.
 
-## Option 3: Bounded Object-Local PG Set
+## Option 3: Banded Segment Placement
+
+Placement is still derived from segment position, but consecutive runs of segments
+share one placement decision.
+
+Example:
+
+- choose a band size `B`
+- derive `band_index = segment_index / B`
+- place all segments in that band on the same data PG
+
+With the current `4 MiB` segment size:
+
+- `B = 16` gives `64 MiB` locality bands
+- `B = 32` gives `128 MiB` locality bands
+
+### Pros
+
+- very small change from per-segment placement
+- materially improves sequential locality
+- reduces PG transitions during large `PUT` and `GET`
+- reduces lock, file, cache, and network context churn
+- easy to tune with one constant
+
+### Cons
+
+- does not bound total fan-out for very large objects
+- can still spread one large object over many PGs as object size grows
+- weaker global balancing than fully independent placement
+
+### Assessment
+
+This is a good simple intermediate option.
+
+It improves locality without forcing all data for one object generation onto one
+PG, but it does not by itself provide the stronger long-term property of a bounded
+object-local PG set.
+
+## Option 4: Bounded Object-Local PG Set
 
 Each object generation is assigned a small deterministic set of data PGs, and
 its segments are spread across that set.
@@ -124,6 +163,12 @@ This is the real tradeoff.
 - load is spread well
 - request behavior becomes noisier and more tail-sensitive
 
+### Banded placement
+
+- one object still spreads, but with longer local runs
+- traffic is less noisy than per-segment placement
+- distinct PG count can still grow with object size
+
 ### Bounded PG set
 
 - one object spreads load, but only within a limited envelope
@@ -138,14 +183,17 @@ Working recommendation:
 
 1. keep a configurable object-local PG-set width
 2. start with a small width such as `4`
-3. derive the PG subset deterministically from object identity
-4. place segments over that subset by `segment_index`
+3. also keep a configurable band size
+4. derive the PG subset deterministically from object identity
+5. place segments over that subset by `band_index`, not raw `segment_index`
 
 Important rule:
 
 - fan-out for one object should not scale with total PG count
 
 That is the key reason to avoid full independent placement as the default.
+Banding is still worthwhile even before subset bounding, but it should be understood
+as a locality improvement, not the full solution.
 
 ## Placement Function Constraints
 
@@ -153,22 +201,25 @@ Any concrete placement function should preserve these invariants:
 
 1. all segments of one object generation map to a deterministic PG subset
 2. the subset is stable for that object generation
-3. reclaim identity is still rooted at object generation, not per-segment placement
-4. metadata placement remains unchanged
-5. request fan-out is bounded by the configured subset width
+3. segments within one band share one PG choice
+4. reclaim identity is still rooted at object generation, not per-segment placement
+5. metadata placement remains unchanged
+6. request fan-out is bounded by the configured subset width
 
 ## Practical Guidance
 
 If we want the simplest first implementation:
 
-- width `1` is acceptable as a temporary choice
+- band placement alone is a reasonable first step
+- `band_index = segment_index / 16` is a good initial default
 
-But it should be treated as an explicit simplification, not the intended steady
-state.
+That gives `64 MiB` locality runs with today's `4 MiB` segments and is a useful
+improvement even if subset-bounded placement is deferred.
 
 If we want a more future-proof default:
 
 - width `4` is a reasonable first target
+- pair it with a band size such as `16`
 
 It is small enough to keep fan-out bounded and large enough to avoid the worst
 single-PG hot-spot behavior.
@@ -179,8 +230,9 @@ These do not need to be decided now:
 
 1. whether segment-to-PG mapping inside the subset should be round-robin or hashed
 2. whether width should vary by object size
-3. whether multipart parts should preserve stronger locality within the same subset
-4. whether future parallel read/write scheduling should align explicitly with the
+3. whether band size should vary by object size or EC shape
+4. whether multipart parts should preserve stronger locality within the same subset
+5. whether future parallel read/write scheduling should align explicitly with the
    chosen subset width
 
 ## Current Conclusion
@@ -189,4 +241,5 @@ This is not an immediate implementation priority, but the design direction shoul
 
 - do not scatter one object generation across all PGs by default
 - do not assume one PG per object is the long-term answer
+- treat banded placement as the simple locality improvement
 - prefer a bounded deterministic PG subset per object generation
