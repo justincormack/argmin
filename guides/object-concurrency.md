@@ -1,5 +1,8 @@
 # Object Concurrency Invariants
 
+Status: active guidance. This guide describes the lock-order and concurrency
+rules that current object paths are expected to follow.
+
 This guide defines the lock and read/write rules for object operations in
 `crates/server-core/src/coordinator.rs`.
 

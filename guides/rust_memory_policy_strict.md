@@ -2,6 +2,10 @@
 
 *For Bounded, Backpressure-Driven Systems*
 
+Status: strict policy target. This guide describes the intended memory model
+and review bar for the codebase; it is not a claim that every current path
+already satisfies every rule here.
+
 ------------------------------------------------------------------------
 
 ## GLOBAL INVARIANTS
@@ -200,4 +204,3 @@ Every byte must be:
 -   Releasable
 
 If memory pressure increases, the system must slow down --- not grow.
-

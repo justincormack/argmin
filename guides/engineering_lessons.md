@@ -2,6 +2,9 @@
 
 *Lessons learned building the EC engine. Generalise before adding new entries.*
 
+Status: active guidance. This guide is intended as current engineering
+guidance, not a historical note.
+
 ---
 
 ## API Design
