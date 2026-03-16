@@ -3238,15 +3238,20 @@ impl Coordinator {
         // EC-encode segment data.
         let k = self.ec_config.data_shards as usize;
         let m = self.ec_config.parity_shards as usize;
-        let mut padded = data.to_vec();
-        let remainder = padded.len() % k;
-        if remainder != 0 {
-            padded.resize(padded.len() + (k - remainder), 0);
-        }
+        let remainder = data.len() % k;
+        let mut padded = Vec::new();
+        let shard_source: &[u8] = if remainder == 0 {
+            data
+        } else {
+            padded.reserve_exact(data.len() + (k - remainder));
+            padded.extend_from_slice(data);
+            padded.resize(data.len() + (k - remainder), 0);
+            &padded
+        };
 
-        let shard_size = padded.len() / k;
+        let shard_size = shard_source.len() / k;
         let data_shards: Vec<&[u8]> = (0..k)
-            .map(|i| &padded[i * shard_size..(i + 1) * shard_size])
+            .map(|i| &shard_source[i * shard_size..(i + 1) * shard_size])
             .collect();
         let mut parity_bufs: Vec<Vec<u8>> = (0..m).map(|_| vec![0u8; shard_size]).collect();
         let mut parity_refs: Vec<&mut [u8]> = parity_bufs

@@ -860,12 +860,24 @@ async fn handle_streaming_post_object(
                                     });
                                 }
 
-                                upload_buf.extend_from_slice(&data);
-                                while upload_buf.len() >= crate::coordinator::INTERNAL_SEGMENT_SIZE
-                                {
-                                    let flush_data: Vec<u8> = upload_buf
-                                        .drain(..crate::coordinator::INTERNAL_SEGMENT_SIZE)
-                                        .collect();
+                                let mut remaining: &[u8] = data.as_ref();
+                                while !remaining.is_empty() {
+                                    let needed = crate::coordinator::INTERNAL_SEGMENT_SIZE
+                                        - upload_buf.len();
+                                    let take = needed.min(remaining.len());
+                                    upload_buf.extend_from_slice(&remaining[..take]);
+                                    remaining = &remaining[take..];
+                                    if upload_buf.len() < crate::coordinator::INTERNAL_SEGMENT_SIZE
+                                    {
+                                        continue;
+                                    }
+
+                                    let flush_data = std::mem::replace(
+                                        &mut upload_buf,
+                                        Vec::with_capacity(
+                                            crate::coordinator::INTERNAL_SEGMENT_SIZE,
+                                        ),
+                                    );
                                     let idx = segment_index;
                                     segment_index += 1;
                                     let ctx_ref = Arc::clone(c);
@@ -1099,13 +1111,20 @@ async fn handle_streaming_put(
                             max: MAX_OBJECT_SIZE,
                         });
                     }
-                    buf.extend_from_slice(&payload);
+                    let mut remaining: &[u8] = payload.as_ref();
+                    while !remaining.is_empty() {
+                        let needed = crate::coordinator::INTERNAL_SEGMENT_SIZE - buf.len();
+                        let take = needed.min(remaining.len());
+                        buf.extend_from_slice(&remaining[..take]);
+                        remaining = &remaining[take..];
+                        if buf.len() < crate::coordinator::INTERNAL_SEGMENT_SIZE {
+                            continue;
+                        }
 
-                    // Flush when buffer reaches chunk size.
-                    while buf.len() >= crate::coordinator::INTERNAL_SEGMENT_SIZE {
-                        let flush_data: Vec<u8> = buf
-                            .drain(..crate::coordinator::INTERNAL_SEGMENT_SIZE)
-                            .collect();
+                        let flush_data = std::mem::replace(
+                            &mut buf,
+                            Vec::with_capacity(crate::coordinator::INTERNAL_SEGMENT_SIZE),
+                        );
                         let idx = segment_index;
                         segment_index += 1;
                         let ctx_ref = Arc::clone(&ctx);
@@ -1381,12 +1400,20 @@ async fn handle_streaming_part(
                             max: MAX_OBJECT_SIZE,
                         });
                     }
-                    buf.extend_from_slice(&payload);
+                    let mut remaining: &[u8] = payload.as_ref();
+                    while !remaining.is_empty() {
+                        let needed = crate::coordinator::INTERNAL_SEGMENT_SIZE - buf.len();
+                        let take = needed.min(remaining.len());
+                        buf.extend_from_slice(&remaining[..take]);
+                        remaining = &remaining[take..];
+                        if buf.len() < crate::coordinator::INTERNAL_SEGMENT_SIZE {
+                            continue;
+                        }
 
-                    while buf.len() >= crate::coordinator::INTERNAL_SEGMENT_SIZE {
-                        let flush_data: Vec<u8> = buf
-                            .drain(..crate::coordinator::INTERNAL_SEGMENT_SIZE)
-                            .collect();
+                        let flush_data = std::mem::replace(
+                            &mut buf,
+                            Vec::with_capacity(crate::coordinator::INTERNAL_SEGMENT_SIZE),
+                        );
                         let idx = segment_index;
                         segment_index += 1;
                         let ctx_ref = Arc::clone(&ctx);
