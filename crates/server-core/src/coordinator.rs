@@ -1846,6 +1846,21 @@ impl ReadRuntime {
 impl SegmentListReader {
     fn next_chunk(&mut self, target_size: usize) -> Result<Option<Vec<u8>>, ServerError> {
         loop {
+            let take_loaded_whole =
+                self.loaded_segment
+                    .as_ref()
+                    .is_some_and(|(loaded, offset, end_offset)| {
+                        if *offset >= *end_offset {
+                            return false;
+                        }
+                        let end = (*offset + target_size).min(*end_offset);
+                        *offset == 0 && *end_offset == loaded.len() && end == loaded.len()
+                    });
+            if take_loaded_whole {
+                let (loaded, _, _) = self.loaded_segment.take().unwrap();
+                return Ok(Some(loaded));
+            }
+
             if let Some((loaded, offset, end_offset)) = &mut self.loaded_segment {
                 if *offset < *end_offset {
                     let end = (*offset + target_size).min(*end_offset);
@@ -16632,6 +16647,36 @@ mod tests {
             .unwrap();
         assert_eq!(result.body.read_all().unwrap(), full_data);
         assert_eq!(result.size, 10);
+    }
+
+    #[test]
+    fn segment_list_reader_next_chunk_moves_whole_loaded_segment() {
+        let dir = test_util::tempdir();
+        let ec_config = EcConfig::new(4, 2).unwrap();
+        let runtime = ReadRuntime {
+            storage_node: Arc::new(SharedStorageNode::open(dir.path(), &[0]).unwrap()),
+            ec_codec: Arc::new(ErasureCodec::new(ec_config).unwrap()),
+            ec_config,
+            pg_topology: PgTopology::new(&[0]).unwrap(),
+        };
+
+        let data = vec![1u8, 2, 3, 4];
+        let ptr = data.as_ptr();
+        let len = data.len();
+        let mut reader = SegmentListReader {
+            runtime,
+            bucket: "bucket".to_string(),
+            key: "key".to_string(),
+            segments: vec![],
+            next_segment_index: 0,
+            loaded_segment: Some((data, 0, len)),
+        };
+
+        let chunk = reader.next_chunk(len).unwrap().unwrap();
+        assert_eq!(chunk, vec![1u8, 2, 3, 4]);
+        assert_eq!(chunk.as_ptr(), ptr);
+        assert!(reader.loaded_segment.is_none());
+        assert_eq!(reader.next_chunk(len).unwrap(), None);
     }
 
     #[test]
