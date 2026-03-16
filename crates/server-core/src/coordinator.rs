@@ -1,8 +1,8 @@
 /// Coordinator: orchestrates S3 operations across EC, storage, and metadata layers.
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, MutexGuard};
 #[cfg(test)]
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 
 use checksum::{ChecksumAlgorithm, ChecksumType, MultipartChecksumConfig, RawChecksum};
@@ -208,6 +208,85 @@ impl std::ops::Deref for ReadChunk {
     fn deref(&self) -> &Self::Target {
         self.as_ref()
     }
+}
+
+struct EncodeScratchPool {
+    scratch_len: usize,
+    max_cached: usize,
+    cached: Mutex<Vec<Vec<u8>>>,
+    #[cfg(test)]
+    allocations: std::sync::atomic::AtomicUsize,
+}
+
+struct EncodeScratch<'a> {
+    pool: &'a EncodeScratchPool,
+    buf: Option<Vec<u8>>,
+}
+
+impl EncodeScratchPool {
+    fn new(ec_config: EcConfig) -> Self {
+        let scratch_len = encode_parity_scratch_len(ec_config);
+        let max_cached = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .max(1);
+        Self {
+            scratch_len,
+            max_cached,
+            cached: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            allocations: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn checkout(&self) -> EncodeScratch<'_> {
+        let buf = self.cached.lock().unwrap().pop().unwrap_or_else(|| {
+            #[cfg(test)]
+            self.allocations.fetch_add(1, Ordering::Relaxed);
+            vec![0u8; self.scratch_len]
+        });
+        EncodeScratch {
+            pool: self,
+            buf: Some(buf),
+        }
+    }
+
+    #[cfg(test)]
+    fn allocation_count(&self) -> usize {
+        self.allocations.load(Ordering::Relaxed)
+    }
+}
+
+impl EncodeScratch<'_> {
+    fn as_mut_slice(&mut self, len: usize) -> &mut [u8] {
+        debug_assert!(len <= self.pool.scratch_len);
+        &mut self.buf.as_mut().unwrap()[..len]
+    }
+
+    fn as_slice(&self, len: usize) -> &[u8] {
+        debug_assert!(len <= self.pool.scratch_len);
+        &self.buf.as_ref().unwrap()[..len]
+    }
+}
+
+impl Drop for EncodeScratch<'_> {
+    fn drop(&mut self) {
+        let Some(buf) = self.buf.take() else {
+            return;
+        };
+        let mut cached = self.pool.cached.lock().unwrap();
+        if cached.len() < self.pool.max_cached {
+            cached.push(buf);
+        }
+    }
+}
+
+fn encode_parity_scratch_len(ec_config: EcConfig) -> usize {
+    let k = ec_config.data_shards as usize;
+    let m = ec_config.parity_shards as usize;
+    let padded = INTERNAL_SEGMENT_SIZE.div_ceil(k) * k;
+    let shard_size = padded / k;
+    shard_size.saturating_mul(m)
 }
 
 #[derive(Clone)]
@@ -1386,6 +1465,7 @@ pub struct Coordinator {
     pg_topology: PgTopology,
     ec_codec: Arc<ErasureCodec>,
     ec_config: EcConfig,
+    encode_scratch_pool: EncodeScratchPool,
     region: String,
     _reclaim_sweeper: ReclaimSweeper,
 }
@@ -2239,6 +2319,7 @@ impl Coordinator {
             pg_topology,
             ec_codec,
             ec_config,
+            encode_scratch_pool: EncodeScratchPool::new(ec_config),
             region,
             _reclaim_sweeper: ReclaimSweeper {
                 storage_node: sweeper_storage_node,
@@ -3303,28 +3384,56 @@ impl Coordinator {
         let data_shards: Vec<&[u8]> = (0..k)
             .map(|i| &shard_source[i * shard_size..(i + 1) * shard_size])
             .collect();
-        let mut parity_bufs: Vec<Vec<u8>> = (0..m).map(|_| vec![0u8; shard_size]).collect();
-        let mut parity_refs: Vec<&mut [u8]> = parity_bufs
-            .iter_mut()
-            .map(std::vec::Vec::as_mut_slice)
-            .collect();
-        self.ec_codec.encode(&data_shards, &mut parity_refs)?;
-
-        // Write shards with cleanup on failure.
         let mut written_shards: Vec<ShardKey> = Vec::with_capacity(k + m);
-        let write_result: Result<(), ServerError> = (|| {
-            for i in 0..(k + m) {
-                let shard_key = ShardKey::new(&segment_okh, segment_vid.get(), i as u8);
-                let shard_data = if i < k {
-                    data_shards[i]
-                } else {
-                    &parity_bufs[i - k]
-                };
-                shard_pg.write_shard(&shard_key, shard_data)?;
-                written_shards.push(shard_key);
+        let write_result: Result<(), ServerError> = if shard_size == 0 {
+            let mut parity_bufs: Vec<Vec<u8>> = (0..m).map(|_| Vec::new()).collect();
+            let mut parity_refs: Vec<&mut [u8]> = parity_bufs
+                .iter_mut()
+                .map(std::vec::Vec::as_mut_slice)
+                .collect();
+            self.ec_codec.encode(&data_shards, &mut parity_refs)?;
+            (|| {
+                for (i, shard_data) in data_shards.iter().enumerate() {
+                    let shard_key = ShardKey::new(&segment_okh, segment_vid.get(), i as u8);
+                    shard_pg.write_shard(&shard_key, shard_data)?;
+                    written_shards.push(shard_key);
+                }
+                for (parity_index, shard_data) in parity_bufs.iter().enumerate() {
+                    let shard_key =
+                        ShardKey::new(&segment_okh, segment_vid.get(), (k + parity_index) as u8);
+                    shard_pg.write_shard(&shard_key, shard_data)?;
+                    written_shards.push(shard_key);
+                }
+                Ok(())
+            })()
+        } else {
+            let parity_len =
+                m.checked_mul(shard_size)
+                    .ok_or_else(|| ServerError::InternalError {
+                        reason: "parity scratch length overflow".to_string(),
+                    })?;
+            let mut scratch = self.encode_scratch_pool.checkout();
+            {
+                let parity = scratch.as_mut_slice(parity_len);
+                let mut parity_refs: Vec<&mut [u8]> = parity.chunks_exact_mut(shard_size).collect();
+                self.ec_codec.encode(&data_shards, &mut parity_refs)?;
             }
-            Ok(())
-        })();
+            let parity = scratch.as_slice(parity_len);
+            (|| {
+                for (i, shard_data) in data_shards.iter().enumerate() {
+                    let shard_key = ShardKey::new(&segment_okh, segment_vid.get(), i as u8);
+                    shard_pg.write_shard(&shard_key, shard_data)?;
+                    written_shards.push(shard_key);
+                }
+                for (parity_index, shard_data) in parity.chunks_exact(shard_size).enumerate() {
+                    let shard_key =
+                        ShardKey::new(&segment_okh, segment_vid.get(), (k + parity_index) as u8);
+                    shard_pg.write_shard(&shard_key, shard_data)?;
+                    written_shards.push(shard_key);
+                }
+                Ok(())
+            })()
+        };
 
         if let Err(e) = write_result {
             for shard_key in &written_shards {
@@ -17534,6 +17643,26 @@ mod tests {
         coord
             .append_stream_segment("bucket", "key", "upload-part-session", 0, b"data")
             .unwrap();
+    }
+
+    #[test]
+    fn stream_append_reuses_encode_scratch_for_aligned_segments() {
+        let dir = test_util::tempdir();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
+        assert_eq!(coord.encode_scratch_pool.allocation_count(), 0);
+
+        coord
+            .append_stream_segment("bucket", "key", &session_id, 0, b"data")
+            .unwrap();
+        assert_eq!(coord.encode_scratch_pool.allocation_count(), 1);
+
+        coord
+            .append_stream_segment("bucket", "key", &session_id, 1, b"more")
+            .unwrap();
+        assert_eq!(coord.encode_scratch_pool.allocation_count(), 1);
     }
 
     // ── Phase 3a: Streaming UploadPart tests ─────────────────────────
