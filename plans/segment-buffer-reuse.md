@@ -45,12 +45,14 @@ This is only about internal segment payload movement. It does not change:
 7. healthy `server-core` reads now reuse pooled payload buffers for loaded
    segments, so repeated range/object reads and read-driven copy flows do not
    allocate a fresh segment `Vec` on each read
+8. degraded `server-core` reads now reuse pooled reconstruction scratch instead
+   of allocating one `Vec` per recovered shard and cloning those shards back
+   into the assembly path
 
 ## Remaining
 
-1. decide how far to take scratch reuse on recovery paths:
-   - reconstruction buffers on fallback reads
-   - any checksum or small control-path scratch that is still per-segment
+1. decide whether any remaining checksum or small control-path scratch is worth
+   pooling, or whether the current hot-path reduction is enough
 2. measure whether the remaining small owner-object churn
    (`Arc`/`Bytes::from_owner`) is worth another abstraction layer, or whether
    the current pooled payload buffers are sufficient for the healthy path

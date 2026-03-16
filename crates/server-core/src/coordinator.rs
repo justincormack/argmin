@@ -2028,7 +2028,6 @@ impl ReadRuntime {
     ) -> Result<PooledPayloadBuffer, ServerError> {
         let pg = self.storage_node.get_pg(segment.shard_pg_id)?;
 
-        let needed: Vec<usize> = (0..k).collect();
         let mut all_shards = vec![None; k + m];
         let mut present_count = 0;
 
@@ -2059,12 +2058,11 @@ impl ReadRuntime {
             return Err(ServerError::Store(storage::StoreError::NotFound));
         }
 
+        let mut recovered = None;
+        let mut recovered_ranges = vec![None; k];
+
         if !(0..k).all(|i| all_shards[i].is_some()) {
-            let missing_needed: Vec<usize> = needed
-                .iter()
-                .copied()
-                .filter(|&i| all_shards[i].is_none())
-                .collect();
+            let missing_needed: Vec<usize> = (0..k).filter(|&i| all_shards[i].is_none()).collect();
 
             let present_indices: Vec<usize> =
                 (0..(k + m)).filter(|&i| all_shards[i].is_some()).collect();
@@ -2084,13 +2082,12 @@ impl ReadRuntime {
                 &tmp_codec
             };
 
-            let mut outputs: Vec<Vec<u8>> = missing_needed
-                .iter()
-                .map(|_| vec![0u8; shard_size])
-                .collect();
-            let mut output_refs: Vec<&mut [u8]> = outputs
-                .iter_mut()
-                .map(std::vec::Vec::as_mut_slice)
+            let recovered_len = missing_needed.len() * shard_size;
+            let mut recovered_buf = self.payload_buffer_pool.checkout(recovered_len);
+            recovered_buf.resize_zeroed(recovered_len);
+            let mut output_refs: Vec<&mut [u8]> = recovered_buf
+                .chunks_mut(shard_size)
+                .take(missing_needed.len())
                 .collect();
 
             codec.reconstruct(
@@ -2100,15 +2097,23 @@ impl ReadRuntime {
                 &mut output_refs,
             )?;
 
-            for (idx, &missing_idx) in missing_needed.iter().enumerate() {
-                all_shards[missing_idx] = Some(outputs[idx].clone());
+            for (slot, &missing_idx) in missing_needed.iter().enumerate() {
+                let start = slot * shard_size;
+                recovered_ranges[missing_idx] = Some((start, start + shard_size));
             }
+            recovered = Some(recovered_buf);
         }
 
         let mut buf = self.payload_buffer_pool.checkout(padded);
         buf.resize_zeroed(0);
-        for shard in all_shards.iter().take(k) {
-            buf.extend_from_slice(shard.as_ref().unwrap());
+        for (idx, shard) in all_shards.iter().take(k).enumerate() {
+            if let Some(shard) = shard.as_ref() {
+                buf.extend_from_slice(shard);
+            } else if let Some((start, end)) = recovered_ranges[idx] {
+                buf.extend_from_slice(&recovered.as_ref().unwrap()[start..end]);
+            } else {
+                unreachable!("missing reconstructed shard for data index {idx}");
+            }
         }
         buf.truncate(segment.size as usize);
         if let Some(expected_crc64) = segment.segment_crc64 {
@@ -8666,6 +8671,57 @@ mod tests {
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), data);
+    }
+
+    #[test]
+    fn ec_degraded_read_reuses_reconstruction_scratch() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+
+        coord.create_bucket("bucket").unwrap();
+        let data = vec![5u8; INTERNAL_SEGMENT_SIZE];
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                bucket: "bucket",
+                key: "obj-reconstruct",
+                data: &data,
+                metadata: &MetadataBlob::new(),
+                tags: None,
+                cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
+            },
+        )
+        .unwrap();
+
+        delete_shard_on_disk(&coord, tmp.path(), "bucket", "obj-reconstruct", 0);
+
+        assert_eq!(coord.payload_buffer_pool.allocation_count(), 0);
+
+        let first = coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "obj-reconstruct",
+                version_id: None,
+                cond: NO_READ,
+                requester: TEST_REQUESTER,
+            })
+            .unwrap();
+        assert_eq!(first.body.read_all().unwrap(), data);
+        assert_eq!(coord.payload_buffer_pool.allocation_count(), 2);
+
+        let second = coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "obj-reconstruct",
+                version_id: None,
+                cond: NO_READ,
+                requester: TEST_REQUESTER,
+            })
+            .unwrap();
+        assert_eq!(second.body.read_all().unwrap(), data);
+        assert_eq!(coord.payload_buffer_pool.allocation_count(), 2);
     }
 
     #[test]
