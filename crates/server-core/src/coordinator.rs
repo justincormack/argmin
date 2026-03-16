@@ -166,7 +166,7 @@ pub struct BeginStreamPartResult {
 
 #[derive(Debug, Clone)]
 pub struct ReadChunk {
-    data: Arc<Vec<u8>>,
+    data: Arc<SharedPayloadBuffer>,
     start: usize,
     end: usize,
 }
@@ -175,13 +175,13 @@ impl ReadChunk {
     fn from_vec(data: Vec<u8>) -> Self {
         let len = data.len();
         Self {
-            data: Arc::new(data),
+            data: Arc::new(SharedPayloadBuffer::from_unpooled(data)),
             start: 0,
             end: len,
         }
     }
 
-    fn from_shared_range(data: Arc<Vec<u8>>, start: usize, end: usize) -> Self {
+    fn from_shared_range(data: Arc<SharedPayloadBuffer>, start: usize, end: usize) -> Self {
         debug_assert!(start <= end);
         debug_assert!(end <= data.len());
         Self { data, start, end }
@@ -198,7 +198,7 @@ impl ReadChunk {
 
 impl AsRef<[u8]> for ReadChunk {
     fn as_ref(&self) -> &[u8] {
-        &self.data[self.start..self.end]
+        &self.data.buf[self.start..self.end]
     }
 }
 
@@ -207,6 +207,148 @@ impl std::ops::Deref for ReadChunk {
 
     fn deref(&self) -> &Self::Target {
         self.as_ref()
+    }
+}
+
+#[derive(Debug)]
+struct PayloadBufferPool {
+    default_capacity: usize,
+    max_cached: usize,
+    cached: Mutex<Vec<Vec<u8>>>,
+    #[cfg(test)]
+    allocations: std::sync::atomic::AtomicUsize,
+}
+
+struct PooledPayloadBuffer {
+    pool: Arc<PayloadBufferPool>,
+    buf: Option<Vec<u8>>,
+}
+
+#[derive(Debug)]
+struct SharedPayloadBuffer {
+    pool: Option<Arc<PayloadBufferPool>>,
+    buf: Vec<u8>,
+}
+
+impl PayloadBufferPool {
+    fn new(ec_config: EcConfig) -> Arc<Self> {
+        let default_capacity = segment_payload_buffer_capacity(ec_config);
+        let max_cached = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .max(1);
+        Arc::new(Self {
+            default_capacity,
+            max_cached,
+            cached: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            allocations: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    fn checkout(self: &Arc<Self>, required_capacity: usize) -> PooledPayloadBuffer {
+        let min_capacity = required_capacity.max(self.default_capacity);
+        let mut cached = self.cached.lock().unwrap();
+        let maybe_idx = cached
+            .iter()
+            .rposition(|buf| buf.capacity() >= min_capacity);
+        let mut buf = maybe_idx.map_or_else(
+            || {
+                #[cfg(test)]
+                self.allocations.fetch_add(1, Ordering::Relaxed);
+                Vec::with_capacity(min_capacity)
+            },
+            |idx| cached.swap_remove(idx),
+        );
+        drop(cached);
+        buf.clear();
+        PooledPayloadBuffer {
+            pool: Arc::clone(self),
+            buf: Some(buf),
+        }
+    }
+
+    fn recycle(&self, mut buf: Vec<u8>) {
+        if buf.capacity() < self.default_capacity {
+            return;
+        }
+        buf.clear();
+        let mut cached = self.cached.lock().unwrap();
+        if cached.len() < self.max_cached {
+            cached.push(buf);
+        }
+    }
+
+    #[cfg(test)]
+    fn allocation_count(&self) -> usize {
+        self.allocations.load(Ordering::Relaxed)
+    }
+}
+
+impl PooledPayloadBuffer {
+    fn resize_zeroed(&mut self, len: usize) {
+        self.buf.as_mut().unwrap().resize(len, 0);
+    }
+
+    fn truncate(&mut self, len: usize) {
+        self.buf.as_mut().unwrap().truncate(len);
+    }
+
+    fn into_shared(mut self) -> Arc<SharedPayloadBuffer> {
+        Arc::new(SharedPayloadBuffer {
+            pool: Some(Arc::clone(&self.pool)),
+            buf: self.buf.take().unwrap(),
+        })
+    }
+}
+
+impl std::ops::Deref for PooledPayloadBuffer {
+    type Target = Vec<u8>;
+
+    fn deref(&self) -> &Self::Target {
+        self.buf.as_ref().unwrap()
+    }
+}
+
+impl std::ops::DerefMut for PooledPayloadBuffer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.buf.as_mut().unwrap()
+    }
+}
+
+impl Drop for PooledPayloadBuffer {
+    fn drop(&mut self) {
+        let Some(buf) = self.buf.take() else {
+            return;
+        };
+        self.pool.recycle(buf);
+    }
+}
+
+impl SharedPayloadBuffer {
+    fn from_unpooled(buf: Vec<u8>) -> Self {
+        Self { pool: None, buf }
+    }
+
+    fn len(&self) -> usize {
+        self.buf.len()
+    }
+}
+
+impl std::ops::Deref for SharedPayloadBuffer {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.buf
+    }
+}
+
+impl Drop for SharedPayloadBuffer {
+    fn drop(&mut self) {
+        let Some(pool) = self.pool.take() else {
+            return;
+        };
+        pool.recycle(std::mem::take(&mut self.buf));
     }
 }
 
@@ -289,12 +431,18 @@ fn encode_parity_scratch_len(ec_config: EcConfig) -> usize {
     shard_size.saturating_mul(m)
 }
 
+fn segment_payload_buffer_capacity(ec_config: EcConfig) -> usize {
+    let k = ec_config.data_shards as usize;
+    INTERNAL_SEGMENT_SIZE.div_ceil(k) * k
+}
+
 #[derive(Clone)]
 struct ReadRuntime {
     storage_node: Arc<SharedStorageNode>,
     ec_codec: Arc<ErasureCodec>,
     ec_config: EcConfig,
     pg_topology: PgTopology,
+    payload_buffer_pool: Arc<PayloadBufferPool>,
 }
 
 #[derive(Debug, Clone)]
@@ -336,7 +484,7 @@ struct SegmentListReader {
     key: String,
     segments: Vec<SegmentSliceRecord>,
     next_segment_index: usize,
-    loaded_segment: Option<(Arc<Vec<u8>>, usize, usize)>,
+    loaded_segment: Option<(Arc<SharedPayloadBuffer>, usize, usize)>,
 }
 
 #[derive(Debug, Clone)]
@@ -1466,6 +1614,7 @@ pub struct Coordinator {
     ec_codec: Arc<ErasureCodec>,
     ec_config: EcConfig,
     encode_scratch_pool: EncodeScratchPool,
+    payload_buffer_pool: Arc<PayloadBufferPool>,
     region: String,
     _reclaim_sweeper: ReclaimSweeper,
 }
@@ -1808,21 +1957,25 @@ impl ReadRuntime {
         }
     }
 
-    fn read_segment_payload(&self, segment: &SegmentPayloadRecord) -> Result<Vec<u8>, ServerError> {
+    fn read_segment_payload(
+        &self,
+        segment: &SegmentPayloadRecord,
+    ) -> Result<Arc<SharedPayloadBuffer>, ServerError> {
         let k = segment.ec_k as usize;
         let m = segment.ec_m as usize;
         let padded = (segment.size as usize).div_ceil(k) * k;
         let shard_size = padded / k;
 
         if shard_size == 0 {
-            return Ok(vec![]);
+            return Ok(Arc::new(SharedPayloadBuffer::from_unpooled(Vec::new())));
         }
 
         if let Some(buf) = self.try_read_segment_payload_direct(segment, k, shard_size, padded)? {
-            return Ok(buf);
+            return Ok(buf.into_shared());
         }
 
         self.read_segment_payload_locked(segment, k, m, padded, shard_size)
+            .map(PooledPayloadBuffer::into_shared)
     }
 
     fn try_read_segment_payload_direct(
@@ -1831,12 +1984,13 @@ impl ReadRuntime {
         k: usize,
         shard_size: usize,
         padded: usize,
-    ) -> Result<Option<Vec<u8>>, ServerError> {
+    ) -> Result<Option<PooledPayloadBuffer>, ServerError> {
         let Some(expected_crc64) = segment.segment_crc64 else {
             return Ok(None);
         };
 
-        let mut buf = vec![0u8; padded];
+        let mut buf = self.payload_buffer_pool.checkout(padded);
+        buf.resize_zeroed(padded);
         for i in 0..k {
             let shard_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i as u8);
             let start = i * shard_size;
@@ -1871,7 +2025,7 @@ impl ReadRuntime {
         m: usize,
         padded: usize,
         shard_size: usize,
-    ) -> Result<Vec<u8>, ServerError> {
+    ) -> Result<PooledPayloadBuffer, ServerError> {
         let pg = self.storage_node.get_pg(segment.shard_pg_id)?;
 
         let needed: Vec<usize> = (0..k).collect();
@@ -1951,7 +2105,8 @@ impl ReadRuntime {
             }
         }
 
-        let mut buf = Vec::with_capacity(padded);
+        let mut buf = self.payload_buffer_pool.checkout(padded);
+        buf.resize_zeroed(0);
         for shard in all_shards.iter().take(k) {
             buf.extend_from_slice(shard.as_ref().unwrap());
         }
@@ -2076,7 +2231,7 @@ impl SegmentListReader {
                     other => other,
                 })?;
             self.next_segment_index += 1;
-            self.loaded_segment = Some((Arc::new(data), slice.start_offset, slice.end_offset));
+            self.loaded_segment = Some((data, slice.start_offset, slice.end_offset));
             #[cfg(test)]
             if self.next_segment_index == 1 {
                 maybe_run_object_segments_first_segment_hook(&self.bucket, &self.key);
@@ -2283,11 +2438,13 @@ impl Coordinator {
                 reason: reason.to_string(),
             }
         })?;
+        let payload_buffer_pool = PayloadBufferPool::new(ec_config);
         let read_runtime = ReadRuntime {
             storage_node: Arc::clone(&storage_node),
             ec_codec: Arc::clone(&ec_codec),
             ec_config,
             pg_topology: pg_topology.clone(),
+            payload_buffer_pool: Arc::clone(&payload_buffer_pool),
         };
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
@@ -2320,6 +2477,7 @@ impl Coordinator {
             ec_codec,
             ec_config,
             encode_scratch_pool: EncodeScratchPool::new(ec_config),
+            payload_buffer_pool,
             region,
             _reclaim_sweeper: ReclaimSweeper {
                 storage_node: sweeper_storage_node,
@@ -2335,6 +2493,7 @@ impl Coordinator {
             ec_codec: Arc::clone(&self.ec_codec),
             ec_config: self.ec_config,
             pg_topology: self.pg_topology.clone(),
+            payload_buffer_pool: Arc::clone(&self.payload_buffer_pool),
         }
     }
 
@@ -16802,6 +16961,7 @@ mod tests {
             ec_codec: Arc::new(ErasureCodec::new(ec_config).unwrap()),
             ec_config,
             pg_topology: PgTopology::new(&[0]).unwrap(),
+            payload_buffer_pool: PayloadBufferPool::new(ec_config),
         };
 
         let data = vec![1u8, 2, 3, 4];
@@ -16813,7 +16973,7 @@ mod tests {
             key: "key".to_string(),
             segments: vec![],
             next_segment_index: 0,
-            loaded_segment: Some((Arc::new(data), 0, len)),
+            loaded_segment: Some((Arc::new(SharedPayloadBuffer::from_unpooled(data)), 0, len)),
         };
 
         let chunk = reader.next_chunk(len).unwrap().unwrap();
@@ -16821,6 +16981,57 @@ mod tests {
         assert_eq!(chunk.as_ref().as_ptr(), ptr);
         assert!(reader.loaded_segment.is_none());
         assert!(reader.next_chunk(len).unwrap().is_none());
+    }
+
+    #[test]
+    fn get_object_reuses_payload_buffer_for_repeated_segment_reads() {
+        let dir = test_util::tempdir();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
+        let data = vec![7u8; INTERNAL_SEGMENT_SIZE];
+        coord
+            .append_stream_segment("bucket", "key", &session_id, 0, &data)
+            .unwrap();
+        coord
+            .finalize_stream_put(&FinalizeStreamPutRequest {
+                bucket: "bucket",
+                key: "key",
+                session_id: &session_id,
+                crc64: checksum::crc64::checksum(&data),
+                total_size: data.len() as u64,
+                metadata_blob: &MetadataBlob::new(),
+                tags: None,
+                cond: NO_WRITE,
+            })
+            .unwrap();
+
+        assert_eq!(coord.payload_buffer_pool.allocation_count(), 0);
+
+        let first = coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: NO_READ,
+                requester: TEST_REQUESTER,
+            })
+            .unwrap();
+        assert_eq!(first.body.read_all().unwrap(), data);
+        assert_eq!(coord.payload_buffer_pool.allocation_count(), 1);
+
+        let second = coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: NO_READ,
+                requester: TEST_REQUESTER,
+            })
+            .unwrap();
+        assert_eq!(second.body.read_all().unwrap(), data);
+        assert_eq!(coord.payload_buffer_pool.allocation_count(), 1);
     }
 
     #[test]

@@ -42,18 +42,18 @@ This is only about internal segment payload movement. It does not change:
    new parity buffers for every encoded segment
 6. `server-http` streaming ingest now reuses pooled `8 MiB` payload buffers
    instead of allocating a fresh segment buffer for each flushed chunk
+7. healthy `server-core` reads now reuse pooled payload buffers for loaded
+   segments, so repeated range/object reads and read-driven copy flows do not
+   allocate a fresh segment `Vec` on each read
 
 ## Remaining
 
-1. thread payload buffer ownership across read, copy, and write boundaries so
-   `server-core` can hand off payload buffers instead of repeatedly creating
-   new `Vec`/`Arc<Vec>` owners
-2. introduce the next reusable payload buffer abstraction on the core side so
-   reads and copy paths can recycle segment buffers instead of only reusing
-   them at HTTP ingress
-3. decide how far to take scratch reuse on recovery paths:
+1. decide how far to take scratch reuse on recovery paths:
    - reconstruction buffers on fallback reads
    - any checksum or small control-path scratch that is still per-segment
+2. measure whether the remaining small owner-object churn
+   (`Arc`/`Bytes::from_owner`) is worth another abstraction layer, or whether
+   the current pooled payload buffers are sufficient for the healthy path
 
 ## Notes
 
@@ -61,5 +61,5 @@ This is only about internal segment payload movement. It does not change:
   `len <= INTERNAL_SEGMENT_SIZE`, not fixed-length `8 MiB`.
 - Rare reconstruct or recovery paths may still allocate scratch at first; the
   priority is the healthy data path.
-- `CopyObject` and `UploadPartCopy` should naturally benefit once reads return
-  reusable owned chunks and writes can consume them directly.
+- `CopyObject` and `UploadPartCopy` now benefit automatically from the pooled
+  read path because they stream through `ReadHandle`.
