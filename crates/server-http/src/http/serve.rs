@@ -151,9 +151,6 @@ enum StreamingWriteOp {
     },
 }
 
-/// Default internal segment payload size for streaming writes (4 MiB).
-const STREAM_SEGMENT_SIZE: usize = 4 * 1024 * 1024;
-
 /// Tunable timeouts for the HTTP serve layer.
 pub struct ServeConfig {
     /// Time allowed for a client to send request headers. Also serves as the
@@ -778,7 +775,7 @@ async fn handle_streaming_post_object(
     let mut sha256 = ring::digest::Context::new(&ring::digest::SHA256);
     let mut total_size: u64 = 0;
     let mut segment_index: u32 = 0;
-    let mut upload_buf = Vec::with_capacity(STREAM_SEGMENT_SIZE);
+    let mut upload_buf = Vec::with_capacity(crate::coordinator::INTERNAL_SEGMENT_SIZE);
 
     let mut body = body;
     loop {
@@ -857,9 +854,11 @@ async fn handle_streaming_post_object(
                                 }
 
                                 upload_buf.extend_from_slice(&data);
-                                while upload_buf.len() >= STREAM_SEGMENT_SIZE {
-                                    let flush_data: Vec<u8> =
-                                        upload_buf.drain(..STREAM_SEGMENT_SIZE).collect();
+                                while upload_buf.len() >= crate::coordinator::INTERNAL_SEGMENT_SIZE
+                                {
+                                    let flush_data: Vec<u8> = upload_buf
+                                        .drain(..crate::coordinator::INTERNAL_SEGMENT_SIZE)
+                                        .collect();
                                     let idx = segment_index;
                                     segment_index += 1;
                                     let ctx_ref = Arc::clone(c);
@@ -1049,11 +1048,11 @@ async fn handle_streaming_put(
         }
     }
 
-    // 2. Stream body frames, accumulating into STREAM_SEGMENT_SIZE buffers.
+    // 2. Stream body frames, accumulating into internal segment-sized buffers.
     let ctx = Arc::new(ctx);
     let mut hasher = checksum::crc64::Hasher::new();
     let mut segment_index: u32 = 0;
-    let mut buf = Vec::with_capacity(STREAM_SEGMENT_SIZE);
+    let mut buf = Vec::with_capacity(crate::coordinator::INTERNAL_SEGMENT_SIZE);
     let mut total_size: u64 = 0;
     let mut body = body;
 
@@ -1096,8 +1095,10 @@ async fn handle_streaming_put(
                     buf.extend_from_slice(&payload);
 
                     // Flush when buffer reaches chunk size.
-                    while buf.len() >= STREAM_SEGMENT_SIZE {
-                        let flush_data: Vec<u8> = buf.drain(..STREAM_SEGMENT_SIZE).collect();
+                    while buf.len() >= crate::coordinator::INTERNAL_SEGMENT_SIZE {
+                        let flush_data: Vec<u8> = buf
+                            .drain(..crate::coordinator::INTERNAL_SEGMENT_SIZE)
+                            .collect();
                         let idx = segment_index;
                         segment_index += 1;
                         let ctx_ref = Arc::clone(&ctx);
@@ -1330,11 +1331,11 @@ async fn handle_streaming_part(
             inline_checksum_claim = Some(claimed);
         }
     }
-    // 2. Stream body frames, accumulating into STREAM_SEGMENT_SIZE buffers.
+    // 2. Stream body frames, accumulating into internal segment-sized buffers.
     let ctx = Arc::new(ctx);
     let mut hasher = checksum::crc64::Hasher::new();
     let mut segment_index: u32 = 0;
-    let mut buf = Vec::with_capacity(STREAM_SEGMENT_SIZE);
+    let mut buf = Vec::with_capacity(crate::coordinator::INTERNAL_SEGMENT_SIZE);
     let mut total_size: u64 = 0;
     let mut body = body;
 
@@ -1375,8 +1376,10 @@ async fn handle_streaming_part(
                     }
                     buf.extend_from_slice(&payload);
 
-                    while buf.len() >= STREAM_SEGMENT_SIZE {
-                        let flush_data: Vec<u8> = buf.drain(..STREAM_SEGMENT_SIZE).collect();
+                    while buf.len() >= crate::coordinator::INTERNAL_SEGMENT_SIZE {
+                        let flush_data: Vec<u8> = buf
+                            .drain(..crate::coordinator::INTERNAL_SEGMENT_SIZE)
+                            .collect();
                         let idx = segment_index;
                         segment_index += 1;
                         let ctx_ref = Arc::clone(&ctx);

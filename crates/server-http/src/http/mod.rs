@@ -624,8 +624,11 @@ impl HttpFrontend {
                         },
                     )?;
                     let result = (|| {
-                        const SEGMENT_SIZE: usize = 4 * 1024 * 1024;
-                        for (idx, chunk) in req.body.chunks(SEGMENT_SIZE).enumerate() {
+                        for (idx, chunk) in req
+                            .body
+                            .chunks(crate::coordinator::INTERNAL_SEGMENT_SIZE)
+                            .enumerate()
+                        {
                             self.coordinator.append_stream_segment(
                                 &bucket,
                                 &key,
@@ -1310,8 +1313,11 @@ impl HttpFrontend {
                     )?;
                     let session_id = session.session_id;
                     let result = (|| {
-                        const SEGMENT_SIZE: usize = 4 * 1024 * 1024;
-                        for (idx, chunk) in req.body.chunks(SEGMENT_SIZE).enumerate() {
+                        for (idx, chunk) in req
+                            .body
+                            .chunks(crate::coordinator::INTERNAL_SEGMENT_SIZE)
+                            .enumerate()
+                        {
                             self.coordinator.append_stream_segment(
                                 &bucket,
                                 &key,

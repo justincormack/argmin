@@ -43,7 +43,7 @@ const TRACE_TARGET: &str = "server_core";
 pub const MAX_OBJECT_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 
 /// Fixed internal segment size for newly committed segmented payloads.
-const INTERNAL_SEGMENT_SIZE: usize = 4 * 1024 * 1024;
+pub const INTERNAL_SEGMENT_SIZE: usize = 8 * 1024 * 1024;
 
 /// A checksum claim parsed from HTTP headers or trailers.
 ///

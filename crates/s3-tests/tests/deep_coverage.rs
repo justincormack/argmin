@@ -56,17 +56,17 @@ fn tagging(tags: Vec<Tag>) -> Tagging {
 
 // ── 1. Large object round-trip (multi-segment) ────────────────────────
 
-/// PUT an 8 MiB object (> 4 MiB segment boundary), GET it back, verify
+/// PUT an object larger than one internal segment, GET it back, verify
 /// byte-for-byte. Exercises commit_stream_put with multiple segments and
 /// multi-segment shard reads on GET.
 #[test]
-fn test_large_object_round_trip_8mb() {
+fn test_large_object_round_trip_multisegment() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = setup_bucket().await;
         let key = "large-8mb";
 
-        let size = 8 * 1024 * 1024;
+        let size = (8 * 1024 * 1024) + 123;
         let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
 
         client
@@ -100,8 +100,9 @@ fn test_large_object_round_trip_8mb() {
 
 // ── 2. Large object overwrite ──────────────────────────────────────────
 
-/// PUT 8 MiB, overwrite with different 8 MiB, GET verifies new data.
-/// Exercises segment reclaim (old segments cleaned up on overwrite).
+/// PUT an object larger than one internal segment, overwrite it with different
+/// data of the same size, and verify GET returns the new bytes.
+/// Exercises segment reclaim for multi-segment overwrites.
 #[test]
 fn test_large_object_overwrite() {
     s3_tests::run(async {
@@ -109,7 +110,7 @@ fn test_large_object_overwrite() {
         let bucket = setup_bucket().await;
         let key = "large-overwrite";
 
-        let size = 8 * 1024 * 1024;
+        let size = (8 * 1024 * 1024) + 123;
         let data_v1: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
         let data_v2: Vec<u8> = (0..size).map(|i| ((i + 128) % 251) as u8).collect();
         assert_ne!(&data_v1[..32], &data_v2[..32], "test data should differ");
@@ -152,8 +153,9 @@ fn test_large_object_overwrite() {
 
 // ── 3. Large multipart parts (multi-segment per part) ──────────────────
 
-/// Multipart upload with 8 MiB parts. Each part exceeds the 4 MiB segment
-/// boundary, exercising commit_stream_part with multiple segments per part.
+/// Multipart upload with parts larger than one internal segment. Each part spans
+/// multiple internal segments, exercising commit_stream_part with multiple
+/// segments per part.
 #[test]
 fn test_multipart_large_parts() {
     s3_tests::run(async {
@@ -161,7 +163,7 @@ fn test_multipart_large_parts() {
         let bucket = setup_bucket().await;
         let key = "mpu-large-parts";
 
-        let part_size = 8 * 1024 * 1024;
+        let part_size = (8 * 1024 * 1024) + 123;
         let part1: Vec<u8> = (0..part_size).map(|i| (i % 251) as u8).collect();
         let part2: Vec<u8> = (0..part_size).map(|i| (i % 239) as u8).collect();
 

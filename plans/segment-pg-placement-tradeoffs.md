@@ -87,10 +87,10 @@ Example:
 - derive `band_index = segment_index / B`
 - place all segments in that band on the same data PG
 
-With the current `4 MiB` segment size:
+With the current `8 MiB` segment size:
 
-- `B = 16` gives `64 MiB` locality bands
-- `B = 32` gives `128 MiB` locality bands
+- `B = 16` gives `128 MiB` locality bands
+- `B = 32` gives `256 MiB` locality bands
 
 ### Pros
 
@@ -213,7 +213,7 @@ If we want the simplest first implementation:
 - band placement alone is a reasonable first step
 - `band_index = segment_index / 16` is a good initial default
 
-That gives `64 MiB` locality runs with today's `4 MiB` segments and is a useful
+That gives `128 MiB` locality runs with today's `8 MiB` segments and is a useful
 improvement even if subset-bounded placement is deferred.
 
 If we want a more future-proof default:
