@@ -48,11 +48,16 @@ This is only about internal segment payload movement. It does not change:
 8. degraded `server-core` reads now reuse pooled reconstruction scratch instead
    of allocating one `Vec` per recovered shard and cloning those shards back
    into the assembly path
+9. streaming PUT and UploadPart ingress now consume non-decoded Hyper frame
+   bytes directly instead of copying each frame into a fresh `Vec<u8>`
 
 ## Remaining
 
 1. decide whether any remaining checksum or small control-path scratch is worth
    pooling, or whether the current hot-path reduction is enough
+   This currently means tiny fixed-size checksum byte buffers and small EC
+   helper vectors such as index/reference lists, not segment-sized payload
+   buffers.
 2. measure whether the remaining small owner-object churn
    (`Arc`/`Bytes::from_owner`) is worth another abstraction layer, or whether
    the current pooled payload buffers are sufficient for the healthy path

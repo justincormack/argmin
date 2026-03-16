@@ -1155,72 +1155,43 @@ async fn handle_streaming_put(
         match tokio::time::timeout(idle_timeout, body.frame()).await {
             Ok(Some(Ok(frame))) => {
                 if let Some(wire_data) = frame.data_ref() {
-                    // Decode through aws-chunked layer if applicable.
-                    let payload = if let Some(ref mut dec) = decoder {
-                        match dec.feed(wire_data) {
+                    if let Some(ref mut dec) = decoder {
+                        let payload = match dec.feed(wire_data) {
                             Ok(p) => p,
                             Err(err) => {
                                 abort_streaming(&state, &ctx).await;
                                 return error_response(&err);
                             }
-                        }
-                    } else {
-                        wire_data.to_vec()
-                    };
-
-                    if payload.is_empty() {
-                        continue;
-                    }
-
-                    hasher.update(&payload);
-                    if let Some(ref mut h) = payload_sha256_hasher {
-                        h.update(&payload);
-                    }
-                    if let Some(ref mut th) = trailing_hasher {
-                        th.update(&payload);
-                    }
-                    total_size += payload.len() as u64;
-                    if total_size > MAX_OBJECT_SIZE {
-                        abort_streaming(&state, &ctx).await;
-                        return error_response(&ServerError::ObjectTooLarge {
-                            size: total_size,
-                            max: MAX_OBJECT_SIZE,
-                        });
-                    }
-                    let mut remaining: &[u8] = payload.as_ref();
-                    while !remaining.is_empty() {
-                        let needed = crate::coordinator::INTERNAL_SEGMENT_SIZE - buf.len();
-                        let take = needed.min(remaining.len());
-                        buf.extend_from_slice(&remaining[..take]);
-                        remaining = &remaining[take..];
-                        if buf.len() < crate::coordinator::INTERNAL_SEGMENT_SIZE {
-                            continue;
-                        }
-
-                        let mut flush_data = PooledSegmentBuffer::new(&state);
-                        std::mem::swap(&mut buf, &mut flush_data);
-                        let idx = segment_index;
-                        segment_index += 1;
-                        let ctx_ref = Arc::clone(&ctx);
-                        let st = Arc::clone(&state);
-                        match tokio::task::spawn_blocking(move || {
-                            let frontend = acquire_frontend(&st);
-                            let result =
-                                frontend.streaming_append_segment(&ctx_ref, idx, &flush_data);
-                            (result, flush_data)
-                        })
+                        };
+                        if let Err(resp) = ingest_streaming_put_payload(
+                            &state,
+                            &ctx,
+                            &payload,
+                            &mut hasher,
+                            &mut payload_sha256_hasher,
+                            &mut trailing_hasher,
+                            &mut total_size,
+                            &mut buf,
+                            &mut segment_index,
+                        )
                         .await
                         {
-                            Ok((Ok(()), _flush_data)) => {}
-                            Ok((Err(err), _flush_data)) => {
-                                abort_streaming(&state, &ctx).await;
-                                return error_response(&err);
-                            }
-                            Err(_) => {
-                                abort_streaming(&state, &ctx).await;
-                                return internal_error_response();
-                            }
+                            return resp;
                         }
+                    } else if let Err(resp) = ingest_streaming_put_payload(
+                        &state,
+                        &ctx,
+                        wire_data.as_ref(),
+                        &mut hasher,
+                        &mut payload_sha256_hasher,
+                        &mut trailing_hasher,
+                        &mut total_size,
+                        &mut buf,
+                        &mut segment_index,
+                    )
+                    .await
+                    {
+                        return resp;
                     }
                 }
             }
@@ -1360,6 +1331,75 @@ async fn abort_streaming(state: &Arc<ServerState>, ctx: &Arc<super::StreamingPut
     .await;
 }
 
+async fn ingest_streaming_put_payload(
+    state: &Arc<ServerState>,
+    ctx: &Arc<super::StreamingPutContext>,
+    payload: &[u8],
+    hasher: &mut checksum::crc64::Hasher,
+    payload_sha256_hasher: &mut Option<ring::digest::Context>,
+    trailing_hasher: &mut Option<TrailingChecksumHasher>,
+    total_size: &mut u64,
+    buf: &mut PooledSegmentBuffer,
+    segment_index: &mut u32,
+) -> Result<(), S3Response> {
+    if payload.is_empty() {
+        return Ok(());
+    }
+
+    hasher.update(payload);
+    if let Some(h) = payload_sha256_hasher.as_mut() {
+        h.update(payload);
+    }
+    if let Some(th) = trailing_hasher.as_mut() {
+        th.update(payload);
+    }
+    *total_size += payload.len() as u64;
+    if *total_size > MAX_OBJECT_SIZE {
+        abort_streaming(state, ctx).await;
+        return Err(error_response(&ServerError::ObjectTooLarge {
+            size: *total_size,
+            max: MAX_OBJECT_SIZE,
+        }));
+    }
+
+    let mut remaining = payload;
+    while !remaining.is_empty() {
+        let needed = crate::coordinator::INTERNAL_SEGMENT_SIZE - buf.len();
+        let take = needed.min(remaining.len());
+        buf.extend_from_slice(&remaining[..take]);
+        remaining = &remaining[take..];
+        if buf.len() < crate::coordinator::INTERNAL_SEGMENT_SIZE {
+            continue;
+        }
+
+        let mut flush_data = PooledSegmentBuffer::new(state);
+        std::mem::swap(buf, &mut flush_data);
+        let idx = *segment_index;
+        *segment_index += 1;
+        let ctx_ref = Arc::clone(ctx);
+        let st = Arc::clone(state);
+        match tokio::task::spawn_blocking(move || {
+            let frontend = acquire_frontend(&st);
+            let result = frontend.streaming_append_segment(&ctx_ref, idx, &flush_data);
+            (result, flush_data)
+        })
+        .await
+        {
+            Ok((Ok(()), _flush_data)) => {}
+            Ok((Err(err), _flush_data)) => {
+                abort_streaming(state, ctx).await;
+                return Err(error_response(&err));
+            }
+            Err(_) => {
+                abort_streaming(state, ctx).await;
+                return Err(internal_error_response());
+            }
+        }
+    }
+
+    Ok(())
+}
+
 async fn abort_streaming_post_object(
     state: &Arc<ServerState>,
     ctx: &Arc<super::StreamingPostContext>,
@@ -1446,71 +1486,43 @@ async fn handle_streaming_part(
         match tokio::time::timeout(idle_timeout, body.frame()).await {
             Ok(Some(Ok(frame))) => {
                 if let Some(wire_data) = frame.data_ref() {
-                    let payload = if let Some(ref mut dec) = decoder {
-                        match dec.feed(wire_data) {
+                    if let Some(ref mut dec) = decoder {
+                        let payload = match dec.feed(wire_data) {
                             Ok(p) => p,
                             Err(err) => {
                                 abort_streaming_part_ctx(&state, &ctx).await;
                                 return error_response(&err);
                             }
-                        }
-                    } else {
-                        wire_data.to_vec()
-                    };
-
-                    if payload.is_empty() {
-                        continue;
-                    }
-
-                    hasher.update(&payload);
-                    if let Some(ref mut h) = payload_sha256_hasher {
-                        h.update(&payload);
-                    }
-                    if let Some(ref mut th) = trailing_hasher {
-                        th.update(&payload);
-                    }
-                    total_size += payload.len() as u64;
-                    if total_size > MAX_OBJECT_SIZE {
-                        abort_streaming_part_ctx(&state, &ctx).await;
-                        return error_response(&ServerError::ObjectTooLarge {
-                            size: total_size,
-                            max: MAX_OBJECT_SIZE,
-                        });
-                    }
-                    let mut remaining: &[u8] = payload.as_ref();
-                    while !remaining.is_empty() {
-                        let needed = crate::coordinator::INTERNAL_SEGMENT_SIZE - buf.len();
-                        let take = needed.min(remaining.len());
-                        buf.extend_from_slice(&remaining[..take]);
-                        remaining = &remaining[take..];
-                        if buf.len() < crate::coordinator::INTERNAL_SEGMENT_SIZE {
-                            continue;
-                        }
-
-                        let mut flush_data = PooledSegmentBuffer::new(&state);
-                        std::mem::swap(&mut buf, &mut flush_data);
-                        let idx = segment_index;
-                        segment_index += 1;
-                        let ctx_ref = Arc::clone(&ctx);
-                        let st = Arc::clone(&state);
-                        match tokio::task::spawn_blocking(move || {
-                            let frontend = acquire_frontend(&st);
-                            let result =
-                                frontend.streaming_append_part_segment(&ctx_ref, idx, &flush_data);
-                            (result, flush_data)
-                        })
+                        };
+                        if let Err(resp) = ingest_streaming_part_payload(
+                            &state,
+                            &ctx,
+                            &payload,
+                            &mut hasher,
+                            &mut payload_sha256_hasher,
+                            &mut trailing_hasher,
+                            &mut total_size,
+                            &mut buf,
+                            &mut segment_index,
+                        )
                         .await
                         {
-                            Ok((Ok(()), _flush_data)) => {}
-                            Ok((Err(err), _flush_data)) => {
-                                abort_streaming_part_ctx(&state, &ctx).await;
-                                return error_response(&err);
-                            }
-                            Err(_) => {
-                                abort_streaming_part_ctx(&state, &ctx).await;
-                                return internal_error_response();
-                            }
+                            return resp;
                         }
+                    } else if let Err(resp) = ingest_streaming_part_payload(
+                        &state,
+                        &ctx,
+                        wire_data.as_ref(),
+                        &mut hasher,
+                        &mut payload_sha256_hasher,
+                        &mut trailing_hasher,
+                        &mut total_size,
+                        &mut buf,
+                        &mut segment_index,
+                    )
+                    .await
+                    {
+                        return resp;
                     }
                 }
             }
@@ -1662,6 +1674,75 @@ async fn abort_streaming_part_ctx(
         frontend.abort_streaming_part(&ctx);
     })
     .await;
+}
+
+async fn ingest_streaming_part_payload(
+    state: &Arc<ServerState>,
+    ctx: &Arc<super::StreamingPartContext>,
+    payload: &[u8],
+    hasher: &mut checksum::crc64::Hasher,
+    payload_sha256_hasher: &mut Option<ring::digest::Context>,
+    trailing_hasher: &mut Option<TrailingChecksumHasher>,
+    total_size: &mut u64,
+    buf: &mut PooledSegmentBuffer,
+    segment_index: &mut u32,
+) -> Result<(), S3Response> {
+    if payload.is_empty() {
+        return Ok(());
+    }
+
+    hasher.update(payload);
+    if let Some(h) = payload_sha256_hasher.as_mut() {
+        h.update(payload);
+    }
+    if let Some(th) = trailing_hasher.as_mut() {
+        th.update(payload);
+    }
+    *total_size += payload.len() as u64;
+    if *total_size > MAX_OBJECT_SIZE {
+        abort_streaming_part_ctx(state, ctx).await;
+        return Err(error_response(&ServerError::ObjectTooLarge {
+            size: *total_size,
+            max: MAX_OBJECT_SIZE,
+        }));
+    }
+
+    let mut remaining = payload;
+    while !remaining.is_empty() {
+        let needed = crate::coordinator::INTERNAL_SEGMENT_SIZE - buf.len();
+        let take = needed.min(remaining.len());
+        buf.extend_from_slice(&remaining[..take]);
+        remaining = &remaining[take..];
+        if buf.len() < crate::coordinator::INTERNAL_SEGMENT_SIZE {
+            continue;
+        }
+
+        let mut flush_data = PooledSegmentBuffer::new(state);
+        std::mem::swap(buf, &mut flush_data);
+        let idx = *segment_index;
+        *segment_index += 1;
+        let ctx_ref = Arc::clone(ctx);
+        let st = Arc::clone(state);
+        match tokio::task::spawn_blocking(move || {
+            let frontend = acquire_frontend(&st);
+            let result = frontend.streaming_append_part_segment(&ctx_ref, idx, &flush_data);
+            (result, flush_data)
+        })
+        .await
+        {
+            Ok((Ok(()), _flush_data)) => {}
+            Ok((Err(err), _flush_data)) => {
+                abort_streaming_part_ctx(state, ctx).await;
+                return Err(error_response(&err));
+            }
+            Err(_) => {
+                abort_streaming_part_ctx(state, ctx).await;
+                return Err(internal_error_response());
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Validate post-decode conditions for aws-chunked requests.
