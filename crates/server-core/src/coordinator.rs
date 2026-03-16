@@ -1710,25 +1710,24 @@ impl ReadRuntime {
             return Ok(None);
         };
 
-        let mut buf = Vec::with_capacity(padded);
+        let mut buf = vec![0u8; padded];
         for i in 0..k {
             let shard_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i as u8);
-            let data = match self
-                .storage_node
-                .read_shard_file(segment.shard_pg_id, &shard_key)
-            {
-                Ok(data) => data,
+            let start = i * shard_size;
+            let end = start + shard_size;
+            match self.storage_node.read_shard_file_into(
+                segment.shard_pg_id,
+                &shard_key,
+                &mut buf[start..end],
+            ) {
+                Ok(()) => {}
                 Err(storage::StoreError::PgNotFound { pg_id }) => {
                     return Err(ServerError::Store(storage::StoreError::PgNotFound {
                         pg_id,
                     }));
                 }
                 Err(_) => return Ok(None),
-            };
-            if data.len() != shard_size {
-                return Ok(None);
             }
-            buf.extend_from_slice(&data);
         }
 
         buf.truncate(segment.size as usize);

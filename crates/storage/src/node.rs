@@ -1,6 +1,7 @@
 /// LocalStorageNode and SharedStorageNode — manage multiple PgStores on a single node.
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard};
@@ -282,6 +283,61 @@ impl SharedStorageNode {
         })
     }
 
+    /// Read a shard file directly into a caller-provided buffer without taking
+    /// the per-PG mutex.
+    pub fn read_shard_file_into(
+        &self,
+        pg_id: u32,
+        key: &ShardKey,
+        dst: &mut [u8],
+    ) -> Result<(), StoreError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "SharedStorageNode::read_shard_file_into",
+            "pg_id={} shard={} bytes={}",
+            pg_id,
+            key.hex(),
+            dst.len()
+        );
+        if !self.stores.contains_key(&pg_id) {
+            return Err(StoreError::PgNotFound { pg_id });
+        }
+
+        let shard_path = self
+            .data_dir
+            .join(format!("pg-{pg_id:04}"))
+            .join("shards")
+            .join(key.hex_prefix())
+            .join(key.hex());
+        let mut file = fs::File::open(&shard_path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                return StoreError::NotFound;
+            }
+            StoreError::Io {
+                context: "open shard file",
+                source: e,
+            }
+        })?;
+
+        file.read_exact(dst).map_err(|e| StoreError::Io {
+            context: "read shard file",
+            source: e,
+        })?;
+
+        let mut extra = [0u8; 1];
+        match file.read(&mut extra) {
+            Ok(0) => Ok(()),
+            Ok(_) => Err(StoreError::Io {
+                context: "read shard file length mismatch",
+                source: std::io::Error::from(std::io::ErrorKind::InvalidData),
+            }),
+            Err(e) => Err(StoreError::Io {
+                context: "read shard file",
+                source: e,
+            }),
+        }
+    }
+
     /// Acquire an in-memory lease on an object payload generation.
     pub fn acquire_object_payload_lease(
         &self,
@@ -548,6 +604,42 @@ mod tests {
 
         let data = node.read_shard_file(0, &key).unwrap();
         assert_eq!(data, b"hello");
+    }
+
+    #[test]
+    fn shared_node_read_shard_file_into_roundtrip() {
+        let tmp = test_util::tempdir();
+        let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();
+        let key = crate::types::ShardKey::new(&[0xBC; 16], 7, 0);
+        {
+            let pg = node.get_pg(0).unwrap();
+            pg.write_shard(&key, b"hello").unwrap();
+        }
+
+        let mut buf = [0u8; 5];
+        node.read_shard_file_into(0, &key, &mut buf).unwrap();
+        assert_eq!(&buf, b"hello");
+    }
+
+    #[test]
+    fn shared_node_read_shard_file_into_length_mismatch() {
+        let tmp = test_util::tempdir();
+        let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();
+        let key = crate::types::ShardKey::new(&[0xCE; 16], 7, 0);
+        {
+            let pg = node.get_pg(0).unwrap();
+            pg.write_shard(&key, b"hello").unwrap();
+        }
+
+        let mut buf = [0u8; 4];
+        let err = node.read_shard_file_into(0, &key, &mut buf).unwrap_err();
+        match err {
+            StoreError::Io { context, source } => {
+                assert_eq!(context, "read shard file length mismatch");
+                assert_eq!(source.kind(), std::io::ErrorKind::InvalidData);
+            }
+            other => panic!("expected length mismatch io error, got {other:?}"),
+        }
     }
 
     #[test]
