@@ -3176,6 +3176,52 @@ impl Coordinator {
                 reason: "session bucket/key mismatch".to_string(),
             });
         }
+        if let Some(trace) = observability::current_context() {
+            let segment_offset_start = u64::from(segment_index) * INTERNAL_SEGMENT_SIZE as u64;
+            let segment_offset_len = data.len() as u64;
+            let segment_offset_end_exclusive = segment_offset_start + segment_offset_len;
+            match &session.target {
+                StreamUploadTarget::PutObject => {
+                    let _ = observability::event_in_context(
+                        &trace,
+                        TRACE_TARGET,
+                        "stream_put_segment_layout",
+                        Some(format_args!(
+                            "bucket={} key={} session_id={} segment_index={} object_offset_start={} object_offset_len={} object_offset_end_exclusive={}",
+                            bucket,
+                            key,
+                            session_id,
+                            segment_index,
+                            segment_offset_start,
+                            segment_offset_len,
+                            segment_offset_end_exclusive
+                        )),
+                    );
+                }
+                StreamUploadTarget::UploadPart {
+                    upload_id,
+                    part_number,
+                } => {
+                    let _ = observability::event_in_context(
+                        &trace,
+                        TRACE_TARGET,
+                        "stream_part_segment_layout",
+                        Some(format_args!(
+                            "bucket={} key={} upload_id={} part_number={} session_id={} segment_index={} part_offset_start={} part_offset_len={} part_offset_end_exclusive={}",
+                            bucket,
+                            key,
+                            upload_id,
+                            part_number,
+                            session_id,
+                            segment_index,
+                            segment_offset_start,
+                            segment_offset_len,
+                            segment_offset_end_exclusive
+                        )),
+                    );
+                }
+            }
+        }
         // Reject duplicate segment_index — writing shards then failing on PK
         // constraint would delete the already-staged segment's shard data.
         let existing_segments = meta_guard
@@ -6426,6 +6472,47 @@ impl Coordinator {
 
         // 8. Compute total object size.
         let total_size: u64 = part_records.iter().map(|p| p.size).sum();
+        if let Some(trace) = observability::current_context() {
+            let _ = observability::event_in_context(
+                &trace,
+                TRACE_TARGET,
+                "complete_multipart_layout",
+                Some(format_args!(
+                    "bucket={} key={} upload_id={} parts={} total_size={}",
+                    bucket,
+                    key,
+                    upload_id,
+                    part_records.len(),
+                    total_size
+                )),
+            );
+            let mut object_offset_start = 0u64;
+            for (part_order, (requested_part, stored_part)) in
+                parts.iter().zip(part_records.iter()).enumerate()
+            {
+                let object_offset_len = stored_part.size;
+                let object_offset_end_exclusive = object_offset_start + object_offset_len;
+                let _ = observability::event_in_context(
+                    &trace,
+                    TRACE_TARGET,
+                    "complete_multipart_part_layout",
+                    Some(format_args!(
+                        "bucket={} key={} upload_id={} part_order={} part_number={} part_size={} object_offset_start={} object_offset_len={} object_offset_end_exclusive={} etag={}",
+                        bucket,
+                        key,
+                        upload_id,
+                        part_order,
+                        requested_part.part_number,
+                        stored_part.size,
+                        object_offset_start,
+                        object_offset_len,
+                        object_offset_end_exclusive,
+                        requested_part.etag
+                    )),
+                );
+                object_offset_start = object_offset_end_exclusive;
+            }
+        }
 
         // 8b. Compute object-level checksum if the upload was configured with one.
         let checksum_value = if let (Some(algo), Some(ctype)) = (checksum_algo, checksum_type) {
