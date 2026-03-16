@@ -111,6 +111,34 @@ impl PgStore {
             .as_millis() as u64
     }
 
+    fn row_to_object_part(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObjectPartRecord> {
+        let part_okh = Self::blob_to_okh(row.get(7)?, 7)?;
+        Ok(ObjectPartRecord {
+            bucket: row.get(0)?,
+            key: row.get(1)?,
+            version_id: PgStore::parse_version_id(row.get::<_, i64>(2)?, 2)?,
+            part_number: row.get::<_, i64>(3)? as u32,
+            size: row.get::<_, i64>(4)? as u64,
+            etag: row.get(5)?,
+            etag_kind: Self::parse_enum(row.get::<_, u8>(6)?, 6, "etag_kind", EtagKind::from_u8)?,
+            part_okh,
+            part_vid: Self::parse_generation_id(row.get::<_, i64>(8)?, 8, "part_vid")?,
+            ec_k: row.get::<_, u8>(9)?,
+            ec_m: row.get::<_, u8>(10)?,
+            shard_pg_id: row.get::<_, i64>(11)? as u32,
+            checksum: row.get(12)?,
+        })
+    }
+
+    fn row_to_object_part_range(
+        row: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<ObjectPartRangeRecord> {
+        Ok(ObjectPartRangeRecord {
+            part: Self::row_to_object_part(row)?,
+            object_offset_start: row.get::<_, i64>(13)? as u64,
+        })
+    }
+
     /// Convert a BLOB to a 16-byte object key hash, failing on wrong length.
     fn blob_to_okh(blob: Vec<u8>, col: usize) -> Result<[u8; 16], rusqlite::Error> {
         let len = blob.len();
@@ -3093,17 +3121,21 @@ impl PgMetadataStore for PgStore {
         let result = (|| {
             let mut stmt = self.conn.prepare(
                 "INSERT INTO object_parts \
-                 (bucket, key, version_id, part_number, size, etag, etag_kind, \
+                 (bucket, key, version_id, part_number, object_offset_start, size, etag, etag_kind, \
                   part_okh, part_vid, ec_k, ec_m, shard_pg_id, checksum) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             )?;
 
-            for part in parts {
+            let mut ordered_parts: Vec<&ObjectPartRecord> = parts.iter().collect();
+            ordered_parts.sort_by_key(|part| part.part_number);
+            let mut object_offset_start = 0u64;
+            for part in ordered_parts {
                 stmt.execute(params![
                     part.bucket,
                     part.key,
                     part.version_id.to_u64() as i64,
                     part.part_number,
+                    object_offset_start as i64,
                     part.size as i64,
                     part.etag,
                     part.etag_kind as u8,
@@ -3114,6 +3146,7 @@ impl PgMetadataStore for PgStore {
                     part.shard_pg_id,
                     part.checksum,
                 ])?;
+                object_offset_start += part.size;
             }
             Ok(())
         })();
@@ -3160,29 +3193,10 @@ impl PgMetadataStore for PgStore {
             })?;
 
         let rows = stmt
-            .query_map(params![bucket, key, version_id.to_u64() as i64], |row| {
-                let part_okh = Self::blob_to_okh(row.get(7)?, 7)?;
-                Ok(ObjectPartRecord {
-                    bucket: row.get(0)?,
-                    key: row.get(1)?,
-                    version_id: PgStore::parse_version_id(row.get::<_, i64>(2)?, 2)?,
-                    part_number: row.get::<_, i64>(3)? as u32,
-                    size: row.get::<_, i64>(4)? as u64,
-                    etag: row.get(5)?,
-                    etag_kind: Self::parse_enum(
-                        row.get::<_, u8>(6)?,
-                        6,
-                        "etag_kind",
-                        EtagKind::from_u8,
-                    )?,
-                    part_okh,
-                    part_vid: Self::parse_generation_id(row.get::<_, i64>(8)?, 8, "part_vid")?,
-                    ec_k: row.get::<_, u8>(9)?,
-                    ec_m: row.get::<_, u8>(10)?,
-                    shard_pg_id: row.get::<_, i64>(11)? as u32,
-                    checksum: row.get(12)?,
-                })
-            })
+            .query_map(
+                params![bucket, key, version_id.to_u64() as i64],
+                Self::row_to_object_part,
+            )
             .map_err(|e| MetadataError::Db {
                 context: "get object parts query",
                 source: e,
@@ -3195,6 +3209,99 @@ impl PgMetadataStore for PgStore {
                 source: e,
             })?);
         }
+        Ok(parts)
+    }
+
+    fn get_object_parts_overlapping_range(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: VersionId,
+        start: u64,
+        end_exclusive: u64,
+    ) -> Result<Vec<ObjectPartRangeRecord>, MetadataError> {
+        if start >= end_exclusive {
+            return Ok(Vec::new());
+        }
+
+        let mut first_stmt = self
+            .conn
+            .prepare(
+                "SELECT bucket, key, version_id, part_number, size, etag, etag_kind, \
+                 part_okh, part_vid, ec_k, ec_m, shard_pg_id, checksum, object_offset_start \
+                 FROM object_parts \
+                 WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 \
+                   AND object_offset_start <= ?4 \
+                   AND object_offset_start + size > ?4 \
+                 ORDER BY object_offset_start DESC, part_number ASC \
+                 LIMIT 1",
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "prepare get object parts overlapping range first part",
+                source: e,
+            })?;
+
+        let first = first_stmt
+            .query_row(
+                params![bucket, key, version_id.to_u64() as i64, start as i64],
+                Self::row_to_object_part_range,
+            )
+            .optional()
+            .map_err(|e| MetadataError::Db {
+                context: "get object parts overlapping range first part",
+                source: e,
+            })?;
+
+        let Some(first) = first else {
+            return Ok(Vec::new());
+        };
+
+        let first_part_number = first.part.part_number;
+        let first_part_end = first.object_offset_start + first.part.size;
+        if first_part_end >= end_exclusive {
+            return Ok(vec![first]);
+        }
+
+        let mut parts = vec![first];
+        let mut tail_stmt = self
+            .conn
+            .prepare(
+                "SELECT bucket, key, version_id, part_number, size, etag, etag_kind, \
+                 part_okh, part_vid, ec_k, ec_m, shard_pg_id, checksum, object_offset_start \
+                 FROM object_parts \
+                 WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 \
+                   AND part_number > ?4 \
+                   AND object_offset_start < ?5 \
+                 ORDER BY part_number ASC",
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "prepare get object parts overlapping range tail parts",
+                source: e,
+            })?;
+
+        let rows = tail_stmt
+            .query_map(
+                params![
+                    bucket,
+                    key,
+                    version_id.to_u64() as i64,
+                    first_part_number,
+                    end_exclusive as i64
+                ],
+                Self::row_to_object_part_range,
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "get object parts overlapping range tail parts",
+                source: e,
+            })?;
+
+        for row in rows {
+            parts.push(row.map_err(|e| MetadataError::Db {
+                context: "get object parts overlapping range tail row",
+                source: e,
+            })?);
+        }
+
         Ok(parts)
     }
 
@@ -3330,16 +3437,20 @@ impl PgMetadataStore for PgStore {
             {
                 let mut stmt = self.conn.prepare(
                     "INSERT INTO object_parts \
-                     (bucket, key, version_id, part_number, size, etag, etag_kind, \
+                     (bucket, key, version_id, part_number, object_offset_start, size, etag, etag_kind, \
                       part_okh, part_vid, ec_k, ec_m, shard_pg_id, checksum) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 )?;
-                for part in parts {
+                let mut ordered_parts: Vec<&ObjectPartRecord> = parts.iter().collect();
+                ordered_parts.sort_by_key(|part| part.part_number);
+                let mut object_offset_start = 0u64;
+                for part in ordered_parts {
                     stmt.execute(params![
                         part.bucket,
                         part.key,
                         part.version_id.to_u64() as i64,
                         part.part_number,
+                        object_offset_start as i64,
                         part.size as i64,
                         part.etag,
                         part.etag_kind as u8,
@@ -3350,6 +3461,7 @@ impl PgMetadataStore for PgStore {
                         part.shard_pg_id,
                         part.checksum,
                     ])?;
+                    object_offset_start += part.size;
                 }
             }
 

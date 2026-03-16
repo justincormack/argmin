@@ -221,7 +221,7 @@ struct SegmentListReader {
 #[derive(Debug, Clone)]
 struct SnapshottedMultipartPartRange {
     layout: MultipartPartReadLayout,
-    streaming_segments: Vec<SegmentSliceRecord>,
+    segments: Vec<SegmentSliceRecord>,
 }
 
 struct MultipartReader {
@@ -340,47 +340,35 @@ impl ReadHandle {
         end: usize,
     ) -> Vec<SnapshottedMultipartPartRange> {
         let mut ranges = Vec::new();
-        let mut offset = 0usize;
 
         for (part_order, part) in parts.into_iter().enumerate() {
-            let part_end = offset + part.record.size as usize;
-            if offset > end {
+            let part_start = part.object_offset_start;
+            let part_end = part_start + part.record.size as usize;
+            if part_start > end {
                 break;
             }
             if part.record.size != 0 && part_end > start {
-                let start_offset = start.saturating_sub(offset);
+                let start_offset = start.saturating_sub(part_start);
                 let end_offset = (end + 1)
-                    .saturating_sub(offset)
+                    .saturating_sub(part_start)
                     .min(part.record.size as usize);
                 let layout = MultipartPartReadLayout {
                     part_number: part.record.part_number,
                     part_order,
-                    object_offset_start: offset,
+                    object_offset_start: part_start,
                     object_offset_end_exclusive: part_end,
                 };
                 ranges.push(SnapshottedMultipartPartRange {
                     layout: layout.clone(),
-                    streaming_segments: Self::segment_slices_for_range(
-                        part.streaming_segments
-                            .into_iter()
-                            .map(|segment| SegmentPayloadRecord {
-                                size: segment.size,
-                                segment_crc64: segment.segment_crc64,
-                                segment_okh: segment.segment_okh,
-                                segment_vid: segment.segment_vid,
-                                shard_pg_id: segment.shard_pg_id,
-                                ec_k: segment.ec_k,
-                                ec_m: segment.ec_m,
-                            })
-                            .collect(),
+                    segments: Self::segment_slices_for_range(
+                        part.segments,
                         start_offset,
                         end_offset - 1,
-                        offset,
+                        part_start,
                         Some(&layout),
                     ),
                 });
             }
-            offset = part_end;
         }
 
         ranges
@@ -1324,7 +1312,8 @@ struct LockedWriteObject<'a> {
 #[derive(Debug, Clone)]
 struct SnapshottedMultipartPart {
     record: ObjectPartRecord,
-    streaming_segments: Vec<MultipartPartSegmentRecord>,
+    object_offset_start: usize,
+    segments: Vec<SegmentPayloadRecord>,
 }
 
 #[derive(Debug, Clone)]
@@ -1746,7 +1735,9 @@ impl ReadRuntime {
         let mut all_shards = vec![None; k + m];
         let mut present_count = 0;
 
-        let read_shard = |i: usize, all_shards: &mut [Option<Vec<u8>>], present_count: &mut usize| {
+        let read_shard = |i: usize,
+                          all_shards: &mut [Option<Vec<u8>>],
+                          present_count: &mut usize| {
             let shard_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i as u8);
             if let Ok(sd) = pg.read_shard(&shard_key) {
                 all_shards[i] = Some(sd.data);
@@ -1978,7 +1969,7 @@ impl MultipartReader {
                         part.layout.object_offset_start,
                         part.layout.object_offset_end_exclusive - part.layout.object_offset_start,
                         part.layout.object_offset_end_exclusive,
-                        part.streaming_segments.len(),
+                        part.segments.len(),
                     )),
                 );
             }
@@ -1986,7 +1977,7 @@ impl MultipartReader {
                 runtime: self.runtime.clone(),
                 bucket: self.bucket.clone(),
                 key: self.key.clone(),
-                segments: part.streaming_segments,
+                segments: part.segments,
                 next_segment_index: 0,
                 loaded_segment: None,
             });
@@ -4251,12 +4242,13 @@ impl Coordinator {
         })
     }
 
-    /// Lock metadata and shard PGs for a consistent object read view.
+    /// Lock metadata PG for a consistent object read/delete view.
     ///
-    /// For latest-version reads (`version_id = None`), shard placement depends on
-    /// the current metadata row's payload generation. If `meta_pg_id > shard_pg_id`, we
-    /// drop and relock in global ascending order, then re-read metadata to ensure
-    /// the record still maps to the locked shard PG.
+    /// Latest-version readers snapshot object metadata while holding the metadata
+    /// PG lock, then construct `ReadHandle`s that acquire a generation-scoped
+    /// payload lease before this guard is released. Committed payload
+    /// generations are immutable, and reclaim is lease-gated, so read-side
+    /// paths no longer need to relock a synthetic shard PG.
     fn lock_object_pgs_for_read<'a>(
         &'a self,
         bucket: &str,
@@ -4264,51 +4256,12 @@ impl Coordinator {
         version_id: Option<VersionId>,
     ) -> Result<LockedReadObject<'a>, ServerError> {
         let meta_pg_id = self.object_pg_id(bucket, key);
-
-        loop {
-            let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
-            let record = Self::lookup_object_record(&meta_guard, bucket, key, version_id)?;
-            let shard_pg_id = match &record {
-                StoredObject::Live(r) => self.shard_pg_id(bucket, key, r.generation_id),
-                StoredObject::DeleteMarker(_) => meta_pg_id,
-            };
-
-            if shard_pg_id == meta_pg_id {
-                return Ok(LockedReadObject {
-                    record,
-                    pgs: TwoPgGuards::new(meta_guard, None),
-                });
-            }
-
-            if meta_pg_id < shard_pg_id {
-                let shard_guard = self.storage_node.get_pg(shard_pg_id)?;
-                return Ok(LockedReadObject {
-                    record,
-                    pgs: TwoPgGuards::new(meta_guard, Some(shard_guard)),
-                });
-            }
-
-            // Need lower-id shard PG first to avoid deadlocks with writers.
-            drop(meta_guard);
-
-            let (meta_guard, shard_guard) =
-                self.storage_node.lock_two_pgs(meta_pg_id, shard_pg_id)?;
-            let record = Self::lookup_object_record(&meta_guard, bucket, key, version_id)?;
-            let verify_shard_pg_id = match &record {
-                StoredObject::Live(r) => self.shard_pg_id(bucket, key, r.generation_id),
-                StoredObject::DeleteMarker(_) => meta_pg_id,
-            };
-
-            // Latest-version target changed while relocking; try again with new mapping.
-            if verify_shard_pg_id != shard_pg_id {
-                continue;
-            }
-
-            return Ok(LockedReadObject {
-                record,
-                pgs: TwoPgGuards::new(meta_guard, shard_guard),
-            });
-        }
+        let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
+        let record = Self::lookup_object_record(&meta_guard, bucket, key, version_id)?;
+        Ok(LockedReadObject {
+            record,
+            pgs: TwoPgGuards::new(meta_guard, None),
+        })
     }
 
     /// Lock metadata and shard PGs for an object write.
@@ -4383,6 +4336,44 @@ impl Coordinator {
         }
     }
 
+    fn multipart_part_payloads(
+        meta_pg: &storage::PgStore,
+        bucket: &str,
+        key: &str,
+        version_id: VersionId,
+        part: &ObjectPartRecord,
+    ) -> Result<Vec<SegmentPayloadRecord>, ServerError> {
+        if part.part_okh != [0u8; 16] {
+            return Ok(vec![SegmentPayloadRecord {
+                size: part.size,
+                segment_crc64: None,
+                segment_okh: part.part_okh,
+                segment_vid: part.part_vid,
+                shard_pg_id: part.shard_pg_id,
+                ec_k: part.ec_k,
+                ec_m: part.ec_m,
+            }]);
+        }
+
+        meta_pg
+            .get_multipart_part_segments(bucket, key, version_id, part.part_number)
+            .map(|segments| {
+                segments
+                    .into_iter()
+                    .map(|segment| SegmentPayloadRecord {
+                        size: segment.size,
+                        segment_crc64: segment.segment_crc64,
+                        segment_okh: segment.segment_okh,
+                        segment_vid: segment.segment_vid,
+                        shard_pg_id: segment.shard_pg_id,
+                        ec_k: segment.ec_k,
+                        ec_m: segment.ec_m,
+                    })
+                    .collect()
+            })
+            .map_err(ServerError::Metadata)
+    }
+
     fn snapshot_multipart_parts(
         meta_pg: &storage::PgStore,
         bucket: &str,
@@ -4393,13 +4384,39 @@ impl Coordinator {
             .get_object_parts(bucket, key, version_id)
             .map_err(ServerError::Metadata)?;
         let mut snapshotted = Vec::with_capacity(parts.len());
+        let mut object_offset_start = 0usize;
         for part in parts {
-            let streaming_segments = meta_pg
-                .get_multipart_part_segments(bucket, key, version_id, part.part_number)
-                .map_err(ServerError::Metadata)?;
+            let part_size = part.size as usize;
+            let segments = Self::multipart_part_payloads(meta_pg, bucket, key, version_id, &part)?;
             snapshotted.push(SnapshottedMultipartPart {
                 record: part,
-                streaming_segments,
+                object_offset_start,
+                segments,
+            });
+            object_offset_start += part_size;
+        }
+        Ok(snapshotted)
+    }
+
+    fn snapshot_multipart_parts_overlapping_range(
+        meta_pg: &storage::PgStore,
+        bucket: &str,
+        key: &str,
+        version_id: VersionId,
+        start: u64,
+        end_exclusive: u64,
+    ) -> Result<Vec<SnapshottedMultipartPart>, ServerError> {
+        let parts = meta_pg
+            .get_object_parts_overlapping_range(bucket, key, version_id, start, end_exclusive)
+            .map_err(ServerError::Metadata)?;
+        let mut snapshotted = Vec::with_capacity(parts.len());
+        for part in parts {
+            let segments =
+                Self::multipart_part_payloads(meta_pg, bucket, key, version_id, &part.part)?;
+            snapshotted.push(SnapshottedMultipartPart {
+                record: part.part,
+                object_offset_start: part.object_offset_start as usize,
+                segments,
             });
         }
         Ok(snapshotted)
@@ -4814,12 +4831,7 @@ impl Coordinator {
                 .find(|p| p.record.part_number == part_number)
                 .ok_or(ServerError::InvalidPart { part_number })?;
 
-            // Compute byte offset of this part within the full object
-            let part_start: u64 = obj_parts
-                .iter()
-                .take_while(|p| p.record.part_number < part_number)
-                .map(|p| p.record.size)
-                .sum();
+            let part_start = part.object_offset_start as u64;
             let part_end = part_start + part.record.size.saturating_sub(1);
 
             // Decode per-part checksum
@@ -4852,12 +4864,14 @@ impl Coordinator {
                 None
             };
 
+            let mut part_body = part.clone();
+            part_body.object_offset_start = 0;
             let body = ReadHandle::from_multipart(
                 self.read_runtime(),
                 bucket,
                 key,
                 record.generation_id,
-                vec![part.clone()],
+                vec![part_body],
                 part.record.size as usize,
             );
             drop(pgs);
@@ -5317,8 +5331,21 @@ impl Coordinator {
         let (metadata, body) = if matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
             // Multipart: metadata from object row, data spans parts.
             let meta_pg = pgs.meta();
-            let obj_parts =
-                Self::snapshot_multipart_parts(meta_pg, bucket, key, record.version_id)?;
+            let obj_parts = Self::snapshot_multipart_parts_overlapping_range(
+                meta_pg,
+                bucket,
+                key,
+                record.version_id,
+                user_start,
+                user_end + 1,
+            )?;
+            if obj_parts.is_empty() {
+                return Err(ServerError::InternalError {
+                    reason: format!(
+                        "multipart range resolved to no parts for {bucket}/{key} version {version_id:?} at {user_start}-{user_end}"
+                    ),
+                });
+            }
 
             let metadata = record
                 .metadata_blob
@@ -7378,6 +7405,38 @@ mod tests {
             part_number,
             requester: TEST_REQUESTER,
         })
+    }
+
+    fn find_fresh_key_with_meta_pg_gt_shard_pg(
+        coord: &Coordinator,
+        bucket: &str,
+        prefix: &str,
+    ) -> String {
+        for suffix in 0..1024 {
+            let key = format!("{prefix}-{suffix}");
+            let meta_pg_id = coord.object_pg_id(bucket, &key);
+            let shard_pg_id = coord.shard_pg_id(bucket, &key, GenerationId::MIN);
+            if meta_pg_id > shard_pg_id {
+                return key;
+            }
+        }
+        panic!("failed to find a key with meta_pg_id > shard_pg_id");
+    }
+
+    fn assert_object_maps_meta_pg_gt_shard_pg(coord: &Coordinator, bucket: &str, key: &str) {
+        let meta_pg_id = coord.object_pg_id(bucket, key);
+        let meta_pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
+        let generation_id = match meta_pg.get_object_meta(bucket, key).unwrap() {
+            StoredObject::Live(record) => record.generation_id,
+            StoredObject::DeleteMarker(other) => {
+                panic!("expected live object for {bucket}/{key}, got {other:?}")
+            }
+        };
+        let shard_pg_id = coord.shard_pg_id(bucket, key, generation_id);
+        assert!(
+            meta_pg_id > shard_pg_id,
+            "expected test object {bucket}/{key} to map to old read slow path: meta_pg_id={meta_pg_id} shard_pg_id={shard_pg_id}"
+        );
     }
 
     struct MultipartMetadataRaceSync {
@@ -12567,18 +12626,22 @@ mod tests {
 
         let admin = make_coord();
         admin.create_bucket("race-bucket").unwrap();
+        let key = find_fresh_key_with_meta_pg_gt_shard_pg(&admin, "race-bucket", "race-key-get");
         let (_, expected) =
-            create_completed_multipart_with_streamed_tail(&admin, "race-bucket", "race-key-get");
+            create_completed_multipart_with_streamed_tail(&admin, "race-bucket", &key);
+        assert_object_maps_meta_pg_gt_shard_pg(&admin, "race-bucket", &key);
 
-        let sync = install_multipart_metadata_race_hooks("race-bucket", "race-key-get");
+        let sync = install_multipart_metadata_race_hooks("race-bucket", &key);
         let reader = make_coord();
         let deleter = make_coord();
+        let read_key = key.clone();
+        let delete_key = key.clone();
 
         let t_read = thread::spawn(move || {
             reader
                 .get_object(&GetObjectRequest {
                     bucket: "race-bucket",
-                    key: "race-key-get",
+                    key: &read_key,
                     version_id: None,
                     cond: NO_READ,
                     requester: TEST_REQUESTER,
@@ -12590,7 +12653,7 @@ mod tests {
         let t_delete = thread::spawn(move || {
             deleter.delete_object(&DeleteObjectRequest {
                 bucket: "race-bucket",
-                key: "race-key-get",
+                key: &delete_key,
                 version_id: None,
                 cond: NO_DELETE,
                 requester: TEST_REQUESTER,
@@ -12626,23 +12689,27 @@ mod tests {
 
         let admin = make_coord();
         admin.create_bucket("race-bucket").unwrap();
+        let key = find_fresh_key_with_meta_pg_gt_shard_pg(&admin, "race-bucket", "race-key-part");
         let (_, expected) =
-            create_completed_multipart_with_streamed_tail(&admin, "race-bucket", "race-key-part");
+            create_completed_multipart_with_streamed_tail(&admin, "race-bucket", &key);
+        assert_object_maps_meta_pg_gt_shard_pg(&admin, "race-bucket", &key);
         let expected_tail = b"streamed-tail-data".to_vec();
         assert_eq!(
             &expected[expected.len() - expected_tail.len()..],
             expected_tail.as_slice()
         );
 
-        let sync = install_multipart_metadata_race_hooks("race-bucket", "race-key-part");
+        let sync = install_multipart_metadata_race_hooks("race-bucket", &key);
         let reader = make_coord();
         let deleter = make_coord();
+        let read_key = key.clone();
+        let delete_key = key.clone();
 
         let t_read = thread::spawn(move || {
             reader
                 .get_object_part(&GetObjectPartRequest {
                     bucket: "race-bucket",
-                    key: "race-key-part",
+                    key: &read_key,
                     version_id: None,
                     part_number: 2,
                     cond: NO_READ,
@@ -12659,7 +12726,7 @@ mod tests {
         let t_delete = thread::spawn(move || {
             deleter.delete_object(&DeleteObjectRequest {
                 bucket: "race-bucket",
-                key: "race-key-part",
+                key: &delete_key,
                 version_id: None,
                 cond: NO_DELETE,
                 requester: TEST_REQUESTER,
@@ -12697,31 +12764,21 @@ mod tests {
 
         let admin = make_coord();
         admin.create_bucket("race-bucket").unwrap();
+        let key =
+            find_fresh_key_with_meta_pg_gt_shard_pg(&admin, "race-bucket", "race-key-segments");
 
-        let session_id = begin_stream_put_test(&admin, "race-bucket", "race-key-segments").unwrap();
+        let session_id = begin_stream_put_test(&admin, "race-bucket", &key).unwrap();
         admin
-            .append_stream_segment(
-                "race-bucket",
-                "race-key-segments",
-                &session_id,
-                0,
-                b"segment-zero-",
-            )
+            .append_stream_segment("race-bucket", &key, &session_id, 0, b"segment-zero-")
             .unwrap();
         admin
-            .append_stream_segment(
-                "race-bucket",
-                "race-key-segments",
-                &session_id,
-                1,
-                b"segment-one",
-            )
+            .append_stream_segment("race-bucket", &key, &session_id, 1, b"segment-one")
             .unwrap();
         let expected = b"segment-zero-segment-one".to_vec();
         admin
             .finalize_stream_put(&FinalizeStreamPutRequest {
                 bucket: "race-bucket",
-                key: "race-key-segments",
+                key: &key,
                 session_id: &session_id,
                 crc64: checksum::crc64::checksum(&expected),
                 total_size: expected.len() as u64,
@@ -12730,16 +12787,19 @@ mod tests {
                 cond: &WriteCondition::default(),
             })
             .unwrap();
+        assert_object_maps_meta_pg_gt_shard_pg(&admin, "race-bucket", &key);
 
-        let sync = install_object_segments_delete_race_hooks("race-bucket", "race-key-segments");
+        let sync = install_object_segments_delete_race_hooks("race-bucket", &key);
         let reader = make_coord();
         let deleter = make_coord();
+        let read_key = key.clone();
+        let delete_key = key.clone();
 
         let t_read = thread::spawn(move || {
             reader
                 .get_object(&GetObjectRequest {
                     bucket: "race-bucket",
-                    key: "race-key-segments",
+                    key: &read_key,
                     version_id: None,
                     cond: NO_READ,
                     requester: TEST_REQUESTER,
@@ -12751,7 +12811,7 @@ mod tests {
         let t_delete = thread::spawn(move || {
             deleter.delete_object(&DeleteObjectRequest {
                 bucket: "race-bucket",
-                key: "race-key-segments",
+                key: &delete_key,
                 version_id: None,
                 cond: NO_DELETE,
                 requester: TEST_REQUESTER,
@@ -12786,7 +12846,10 @@ mod tests {
 
         let admin = make_coord();
         admin.create_bucket("race-bucket").unwrap();
-        create_completed_multipart_with_streamed_tail(&admin, "race-bucket", "race-key-copy");
+        let source_key =
+            find_fresh_key_with_meta_pg_gt_shard_pg(&admin, "race-bucket", "race-key-copy");
+        create_completed_multipart_with_streamed_tail(&admin, "race-bucket", &source_key);
+        assert_object_maps_meta_pg_gt_shard_pg(&admin, "race-bucket", &source_key);
         let upload = admin
             .create_multipart_upload(&CreateMultipartUploadRequest {
                 bucket: "race-bucket",
@@ -12798,15 +12861,17 @@ mod tests {
             })
             .unwrap();
 
-        let sync = install_multipart_metadata_race_hooks("race-bucket", "race-key-copy");
+        let sync = install_multipart_metadata_race_hooks("race-bucket", &source_key);
         let copier = make_coord();
         let deleter = make_coord();
+        let copy_key = source_key.clone();
+        let delete_key = source_key.clone();
 
         let t_copy = thread::spawn(move || {
             copier.upload_part_copy(&UploadPartCopyRequest {
                 source: CopySource {
                     bucket: "race-bucket",
-                    key: "race-key-copy",
+                    key: &copy_key,
                     version_id: None,
                     condition: NO_READ,
                 },
@@ -12823,7 +12888,7 @@ mod tests {
         let t_delete = thread::spawn(move || {
             deleter.delete_object(&DeleteObjectRequest {
                 bucket: "race-bucket",
-                key: "race-key-copy",
+                key: &delete_key,
                 version_id: None,
                 cond: NO_DELETE,
                 requester: TEST_REQUESTER,

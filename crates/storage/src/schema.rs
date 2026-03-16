@@ -88,6 +88,7 @@ CREATE TABLE IF NOT EXISTS object_parts (
     key              TEXT NOT NULL,
     version_id       INTEGER NOT NULL CHECK (version_id >= 0),
     part_number      INTEGER NOT NULL,
+    object_offset_start INTEGER NOT NULL,
     size             INTEGER NOT NULL,
     etag             BLOB NOT NULL,
     etag_kind        INTEGER NOT NULL CHECK (etag_kind IN (0, 1)),
@@ -98,6 +99,10 @@ CREATE TABLE IF NOT EXISTS object_parts (
     shard_pg_id      INTEGER NOT NULL,
     PRIMARY KEY (bucket, key, version_id, part_number)
 )";
+
+const CREATE_OBJECT_PARTS_OFFSET_INDEX: &str = "\
+CREATE INDEX IF NOT EXISTS idx_object_parts_offset \
+ON object_parts (bucket, key, version_id, object_offset_start, part_number)";
 
 /// In-progress streaming upload session table.
 const CREATE_STREAM_UPLOADS_TABLE: &str = "\
@@ -330,6 +335,7 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(CREATE_MULTIPART_PART_CHUNKS_VERSION_INDEX, [])?;
     conn.execute(CREATE_BUCKETS_TABLE, [])?;
     conn.execute(CREATE_BUCKETS_OWNER_LIST_INDEX, [])?;
+    conn.execute(CREATE_OBJECT_PARTS_OFFSET_INDEX, [])?;
     migrate_checksum_columns(conn)?;
     migrate_segment_crc_columns(conn)?;
     migrate_owner_identity_columns(conn)?;

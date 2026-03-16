@@ -29,7 +29,7 @@ metadata paths (for example, `DeleteBucket` emptiness checks).
 3. Streaming segment append lock scope is metadata/session PG + segment shard PGs.
 4. Streaming finalize lock scope includes metadata/session PG (and any required secondary PGs), in global order.
 5. Session state transitions are serialized via metadata-PG transactions over session rows (no ad-hoc in-memory correctness lock).
-6. Latest-version reads must bind metadata lookup and shard placement under one consistent lock window.
+6. Latest-version reads must snapshot metadata and acquire any payload-generation lease before releasing the metadata PG lock.
 7. Version ID allocation for versioned writes must be derived while holding the metadata PG lock and revalidated when relocking is required.
 8. Full-object reads (`GET` and copy-source full reads) must verify reconstructed data CRC against stored ETag.
 9. Streaming must not change external ETag/checksum semantics (headers/XML/validation).
@@ -44,7 +44,9 @@ orchestration:
 - `lock_object_pgs_for_read(...)`
 - `lock_object_pgs_for_write(...)`
 
-Use `TwoPgGuards::meta()` and `TwoPgGuards::shard()` for access.
+Use `TwoPgGuards::meta()` and `TwoPgGuards::shard()` for write-side access.
+Read-side helpers snapshot metadata under the metadata PG lock and must not
+open-code read-side shard relocking.
 
 For streaming write paths, use dedicated coordinator streaming APIs and shared
 lock helpers for:
@@ -64,8 +66,8 @@ Do not open-code this pattern in object paths:
 
 - Without lock ordering, multi-PG operations can deadlock.
 - Without short append lock windows, slow clients can block unrelated work.
-- Without consistent read locking, metadata and shard reads can race, causing
-  mixed snapshots and integrity failures.
+- Without metadata-locked snapshotting plus payload leases, reads can race with
+  overwrite/delete reclaim and observe mixed snapshots or missing payload.
 - Without locked version allocation, concurrent versioned writes can choose the
   same `version_id`.
 - Without transactional finalize cleanup, stale staging rows can leak or race

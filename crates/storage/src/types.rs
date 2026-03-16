@@ -1040,6 +1040,13 @@ pub struct ObjectPartRecord {
     pub checksum: Option<Vec<u8>>,
 }
 
+/// Committed part record annotated with its byte offset in the completed object.
+#[derive(Debug, Clone)]
+pub struct ObjectPartRangeRecord {
+    pub part: ObjectPartRecord,
+    pub object_offset_start: u64,
+}
+
 /// Request to create a multipart upload.
 pub struct CreateMultipartUploadReq {
     pub upload_id: UploadId,

@@ -1634,6 +1634,84 @@ fn mpu_commit_and_get_object_parts() {
 }
 
 #[test]
+fn get_object_parts_overlapping_range_returns_only_overlapping_parts() {
+    let (_dir, store) = make_pg_store();
+
+    let mib = 1024 * 1024;
+    let parts = vec![
+        ObjectPartRecord {
+            bucket: "b".into(),
+            key: "k".into(),
+            version_id: VersionId::from_u64(1),
+            part_number: 1,
+            size: 5 * mib,
+            etag: vec![0xAA],
+            etag_kind: EtagKind::Crc64,
+            part_okh: [1u8; 16],
+            part_vid: GenerationId::MIN,
+            ec_k: 4,
+            ec_m: 2,
+            shard_pg_id: 0,
+            checksum: None,
+        },
+        ObjectPartRecord {
+            bucket: "b".into(),
+            key: "k".into(),
+            version_id: VersionId::from_u64(1),
+            part_number: 2,
+            size: 3 * mib,
+            etag: vec![0xBB],
+            etag_kind: EtagKind::Crc64,
+            part_okh: [2u8; 16],
+            part_vid: GenerationId::new(2).unwrap(),
+            ec_k: 4,
+            ec_m: 2,
+            shard_pg_id: 0,
+            checksum: None,
+        },
+        ObjectPartRecord {
+            bucket: "b".into(),
+            key: "k".into(),
+            version_id: VersionId::from_u64(1),
+            part_number: 3,
+            size: 2 * mib,
+            etag: vec![0xCC],
+            etag_kind: EtagKind::Crc64,
+            part_okh: [3u8; 16],
+            part_vid: GenerationId::new(3).unwrap(),
+            ec_k: 4,
+            ec_m: 2,
+            shard_pg_id: 0,
+            checksum: None,
+        },
+    ];
+
+    store.commit_object_parts(&parts).unwrap();
+
+    let middle = store
+        .get_object_parts_overlapping_range("b", "k", VersionId::from_u64(1), 5 * mib, 5 * mib + 1)
+        .unwrap();
+    assert_eq!(middle.len(), 1);
+    assert_eq!(middle[0].part.part_number, 2);
+    assert_eq!(middle[0].object_offset_start, 5 * mib);
+
+    let boundary = store
+        .get_object_parts_overlapping_range(
+            "b",
+            "k",
+            VersionId::from_u64(1),
+            5 * mib - 1,
+            5 * mib + 1,
+        )
+        .unwrap();
+    assert_eq!(boundary.len(), 2);
+    assert_eq!(boundary[0].part.part_number, 1);
+    assert_eq!(boundary[0].object_offset_start, 0);
+    assert_eq!(boundary[1].part.part_number, 2);
+    assert_eq!(boundary[1].object_offset_start, 5 * mib);
+}
+
+#[test]
 fn mpu_delete_object_parts() {
     let (_dir, store) = make_pg_store();
 

@@ -334,6 +334,18 @@ pub trait PgMetadataStore {
         version_id: VersionId,
     ) -> Result<Vec<ObjectPartRecord>, MetadataError>;
 
+    /// Read committed manifest parts overlapping a byte range within a multipart object.
+    ///
+    /// `start` is inclusive and `end_exclusive` is exclusive.
+    fn get_object_parts_overlapping_range(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: VersionId,
+        start: u64,
+        end_exclusive: u64,
+    ) -> Result<Vec<ObjectPartRangeRecord>, MetadataError>;
+
     /// Delete committed manifest parts for an object version.
     fn delete_object_parts(
         &self,
