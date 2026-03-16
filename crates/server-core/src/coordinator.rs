@@ -9,8 +9,6 @@ use checksum::{ChecksumAlgorithm, ChecksumType, MultipartChecksumConfig, RawChec
 use ec::{EcConfig, ErasureCodec};
 use s3_types::{BucketVersioningState, CanonicalUserId, VersionId};
 use storage::traits::{PgMetadataStore, ShardStore};
-#[cfg(test)]
-use storage::SimplePayloadReclaimRecord;
 use storage::{
     BucketInfo, BucketName, BucketState, CommitMultipartReq, CommitStreamPutReq,
     CreateMultipartUploadReq, CreateStreamUploadReq, EcShape, GenerationId,
@@ -18,11 +16,12 @@ use storage::{
     MultipartPartRecord, MultipartPartSegmentRecord, MultipartReclaimPartRecord,
     MultipartReclaimPartSegmentRecord, MultipartReclaimRecord, MultipartUploadRecord, ObjectKey,
     ObjectLayout, ObjectPartRecord, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
-    ObjectSegmentsReclaimSegmentRecord, PutDeleteMarkerReq, PutLiveObjectReq, PutObjectReq,
-    ReclaimWorkItem, SerializedMetadataBlob, SerializedTagSet, SessionId, ShardKey,
-    SharedStorageNode, StoredObject, StreamUploadSegmentRecord, StreamUploadState,
-    StreamUploadTarget, UploadId, UploadState,
+    ObjectSegmentsReclaimSegmentRecord, PutDeleteMarkerReq, PutObjectReq, ReclaimWorkItem,
+    SerializedMetadataBlob, SerializedTagSet, SessionId, ShardKey, SharedStorageNode, StoredObject,
+    StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, UploadId, UploadState,
 };
+#[cfg(test)]
+use storage::{PutLiveObjectReq, SimplePayloadReclaimRecord};
 
 use crate::conditional::{
     check_copy_source_conditions, check_delete_conditions, check_read_conditions,
@@ -32,8 +31,8 @@ use crate::error::ServerError;
 use crate::etag::{compute_multipart_etag, crc64_to_etag_bytes, etag_bytes_to_crc64, format_etag};
 use crate::metadata_blob::MetadataBlob;
 use crate::pg::{
-    multipart_part_segment_key_hash, object_key_hash, part_key_hash, segment_key_hash,
-    stream_segment_key_hash, PgTopology,
+    multipart_part_segment_key_hash, object_key_hash, part_key_hash, stream_segment_key_hash,
+    PgTopology,
 };
 use crate::range::ByteRange;
 
@@ -561,10 +560,10 @@ impl ReadHandle {
     }
 
     pub fn into_bytes(mut self) -> Result<Vec<u8>, ServerError> {
-        const TEST_READ_CHUNK_SIZE: usize = 1024 * 1024;
+        const READ_TO_BYTES_CHUNK_SIZE: usize = INTERNAL_SEGMENT_SIZE;
 
         let mut out = Vec::with_capacity(self.expected_size);
-        while let Some(chunk) = self.next_chunk(TEST_READ_CHUNK_SIZE)? {
+        while let Some(chunk) = self.next_chunk(READ_TO_BYTES_CHUNK_SIZE)? {
             out.extend_from_slice(&chunk);
         }
         Ok(out)
@@ -1272,41 +1271,27 @@ pub struct ListMultipartUploadsResult {
     pub next_upload_id_marker: Option<String>,
 }
 
-/// Ordered PG guard pair for object operations.
+/// PG guards held while an object metadata snapshot is live.
 ///
-/// Constructed only by `lock_object_pgs_for_read` / `lock_object_pgs_for_write`.
-/// Object paths should not hand-roll multi-PG locking.
-struct TwoPgGuards<'a> {
+/// Read-side payload access relies on generation-scoped leases, so current
+/// object read paths only need the metadata PG guard.
+struct ObjectPgGuards<'a> {
     meta: MutexGuard<'a, storage::PgStore>,
-    shard: Option<MutexGuard<'a, storage::PgStore>>,
 }
 
-impl<'a> TwoPgGuards<'a> {
-    fn new(
-        meta: MutexGuard<'a, storage::PgStore>,
-        shard: Option<MutexGuard<'a, storage::PgStore>>,
-    ) -> Self {
-        Self { meta, shard }
+impl<'a> ObjectPgGuards<'a> {
+    fn new(meta: MutexGuard<'a, storage::PgStore>) -> Self {
+        Self { meta }
     }
 
     fn meta(&self) -> &storage::PgStore {
         &self.meta
     }
-
-    fn shard(&self) -> &storage::PgStore {
-        self.shard.as_deref().unwrap_or(&self.meta)
-    }
 }
 
 struct LockedReadObject<'a> {
     record: StoredObject,
-    pgs: TwoPgGuards<'a>,
-}
-
-struct LockedWriteObject<'a> {
-    version_id: VersionId,
-    generation_id: GenerationId,
-    pgs: TwoPgGuards<'a>,
+    pgs: ObjectPgGuards<'a>,
 }
 
 #[derive(Debug, Clone)]
@@ -2262,6 +2247,7 @@ impl Coordinator {
         self.pg_topology.shard_pg(bucket, key, generation)
     }
 
+    #[cfg(test)]
     fn shard_pg_id(&self, bucket: &str, key: &str, generation_id: GenerationId) -> u32 {
         self.shard_pg_id_raw(bucket, key, generation_id.get())
     }
@@ -3018,165 +3004,6 @@ impl Coordinator {
     }
 
     // ── Object operations ─────────────────────────────────────────────
-
-    /// Core write path: serialize metadata, EC-encode, write shards, record metadata.
-    /// Shared by `put_object` and `copy_object`.
-    ///
-    /// Callers are responsible for locking the PGs and passing references.
-    /// `meta_pg` and `shard_pg` may point to the same `PgStore`.
-    #[allow(clippy::too_many_arguments)]
-    fn write_object_inner(
-        &self,
-        bucket: &str,
-        key: &str,
-        metadata_blob: &MetadataBlob,
-        tags: Option<&str>,
-        user_data: &[u8],
-        version_id: VersionId,
-        generation_id: GenerationId,
-        meta_pg: &storage::PgStore,
-        shard_pg: &storage::PgStore,
-    ) -> Result<(PutObjectResult, Option<StaleObjectPayload>), ServerError> {
-        // 1. Serialize metadata blob for DB storage (not embedded in shard data).
-        let blob_bytes = metadata_blob.serialize()?;
-
-        // 2. Compute ETag (CRC64 of user data only).
-        let etag_crc = checksum::crc64::checksum(user_data);
-        let stale_payload = if version_id.is_null() {
-            Self::snapshot_overwritten_null_version_payload(meta_pg, bucket, key)?
-        } else {
-            None
-        };
-
-        let k = self.ec_config.data_shards as usize;
-        let m = self.ec_config.parity_shards as usize;
-        let segment_vid = GenerationId::MIN;
-        let segment_shard_pg_id = shard_pg.pg_id();
-
-        // 3. Write all segment shard sets, with cleanup on failure.
-        let mut written_shards: Vec<ShardKey> = Vec::new();
-        let mut committed_segments = Vec::new();
-        let write_result: Result<(), ServerError> = (|| {
-            for (segment_index, segment_data) in user_data.chunks(INTERNAL_SEGMENT_SIZE).enumerate()
-            {
-                let segment_index =
-                    u32::try_from(segment_index).map_err(|_| ServerError::InternalError {
-                        reason: "too many object segments".to_string(),
-                    })?;
-                let segment_okh = segment_key_hash(bucket, key, generation_id, segment_index);
-
-                let mut padded = segment_data.to_vec();
-                let remainder = padded.len() % k;
-                if remainder != 0 {
-                    padded.resize(padded.len() + (k - remainder), 0);
-                }
-
-                let shard_size = padded.len() / k;
-                let data_shards: Vec<&[u8]> = (0..k)
-                    .map(|i| &padded[i * shard_size..(i + 1) * shard_size])
-                    .collect();
-                let mut parity_bufs: Vec<Vec<u8>> = (0..m).map(|_| vec![0u8; shard_size]).collect();
-                let mut parity_refs: Vec<&mut [u8]> = parity_bufs
-                    .iter_mut()
-                    .map(std::vec::Vec::as_mut_slice)
-                    .collect();
-                self.ec_codec.encode(&data_shards, &mut parity_refs)?;
-
-                for i in 0..(k + m) {
-                    let shard_key = ShardKey::new(&segment_okh, segment_vid.get(), i as u8);
-                    let shard_data = if i < k {
-                        data_shards[i]
-                    } else {
-                        &parity_bufs[i - k]
-                    };
-                    shard_pg.write_shard(&shard_key, shard_data)?;
-                    written_shards.push(shard_key);
-                }
-
-                committed_segments.push(ObjectSegmentRecord {
-                    bucket: BucketName::from(bucket),
-                    key: ObjectKey::from(key),
-                    version_id,
-                    segment_index,
-                    size: segment_data.len() as u64,
-                    segment_crc64: Some(checksum::crc64::checksum(segment_data)),
-                    segment_okh,
-                    segment_vid,
-                    shard_pg_id: segment_shard_pg_id,
-                    ec_k: self.ec_config.data_shards,
-                    ec_m: self.ec_config.parity_shards,
-                });
-            }
-            Ok(())
-        })();
-
-        if let Err(e) = write_result {
-            // Best-effort cleanup of already-written shards
-            for shard_key in &written_shards {
-                let _ = shard_pg.delete_shard(shard_key);
-            }
-            return Err(e);
-        }
-
-        // 4. Record metadata and committed object segments atomically.
-        let user_size = user_data.len() as u64;
-        let put_req = PutLiveObjectReq {
-            bucket: BucketName::from(bucket),
-            key: ObjectKey::from(key),
-            version_id,
-            generation_id,
-            size: user_size,
-            etag: storage::ObjectEtag::single_part(etag_crc),
-            ec: EcShape {
-                k: self.ec_config.data_shards,
-                m: self.ec_config.parity_shards,
-            },
-            layout: ObjectLayout::Standard,
-            tags: tags.map(SerializedTagSet::from),
-            metadata_blob: Some(SerializedMetadataBlob::from(blob_bytes)),
-        };
-        let meta_result = meta_pg.put_object_with_segments(&put_req, &committed_segments);
-
-        if let Err(e) = meta_result {
-            // Best-effort cleanup of all written shards
-            for shard_key in &written_shards {
-                let _ = shard_pg.delete_shard(shard_key);
-            }
-            return Err(ServerError::Metadata(e));
-        }
-
-        if let Some(ref payload) = stale_payload {
-            match payload {
-                StaleObjectPayload::Segments {
-                    generation_id,
-                    segments,
-                } => {
-                    // `put_object_with_segments` already replaced the live segment rows for
-                    // VersionId::Null, so only enqueue reclaim for the old payload.
-                    Self::enqueue_object_segments_reclaim(
-                        meta_pg,
-                        bucket,
-                        key,
-                        *generation_id,
-                        segments,
-                    )?;
-                }
-                StaleObjectPayload::Multipart { .. } => {
-                    Self::delete_stale_object_payload_metadata(
-                        meta_pg, bucket, key, version_id, payload,
-                    )?;
-                }
-            }
-        }
-
-        Ok((
-            PutObjectResult {
-                etag: format_etag(etag_crc),
-                version_id,
-            },
-            stale_payload,
-        ))
-    }
 
     // ── Streaming upload session API ──────────────────────────────────
 
@@ -4060,7 +3887,6 @@ impl Coordinator {
         let directive = &req.directive;
         let requester = req.requester;
         let acl = req.acl;
-        let _bucket_guard = self.storage_node.lock_bucket(dst_bucket);
 
         let dst_bucket_info = self.authorize_object_write_requester(requester, dst_bucket)?;
 
@@ -4075,8 +3901,8 @@ impl Coordinator {
 
         let _src_bucket_info = self.authorize_bucket_read_requester(requester, src_bucket)?;
 
-        // Phase 1: Read source object
-        let (src_metadata, src_tags, user_data) = {
+        // Phase 1: Snapshot source metadata and prepare a read handle.
+        let (src_metadata, src_tags, mut source_body) = {
             let LockedReadObject {
                 record: src_stored,
                 pgs,
@@ -4104,13 +3930,12 @@ impl Coordinator {
             let src_etag = src_record.etag.format();
             check_copy_source_conditions(src_cond, &src_etag, src_record.last_modified)?;
 
-            let not_found = |e: ServerError| match e {
-                ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
-                    bucket: src_bucket.to_string(),
-                    key: src_key.to_string(),
-                },
-                other => other,
-            };
+            if src_record.size > MAX_OBJECT_SIZE {
+                return Err(ServerError::ObjectTooLarge {
+                    size: src_record.size,
+                    max: MAX_OBJECT_SIZE,
+                });
+            }
 
             if matches!(src_record.layout, ObjectLayout::MultipartManifest { .. }) {
                 // Multipart source: metadata from row, data from parts.
@@ -4121,11 +3946,11 @@ impl Coordinator {
                     src_key,
                     src_record.version_id,
                 )?;
-                let data = if src_record.size == 0 {
+                let body = if src_record.size == 0 {
                     drop(pgs);
                     #[cfg(test)]
                     maybe_run_multipart_snapshot_hook(src_bucket, src_key);
-                    vec![]
+                    ReadHandle::from_buffered_bytes(Vec::new())
                 } else {
                     let body = ReadHandle::from_multipart(
                         self.read_runtime(),
@@ -4138,7 +3963,7 @@ impl Coordinator {
                     drop(pgs);
                     #[cfg(test)]
                     maybe_run_multipart_snapshot_hook(src_bucket, src_key);
-                    body.into_bytes().map_err(not_found)?
+                    body
                 };
 
                 let metadata = src_record
@@ -4148,11 +3973,10 @@ impl Coordinator {
                     .transpose()?
                     .unwrap_or_default();
 
-                (metadata, src_record.tags.clone(), data)
+                (metadata, src_record.tags.clone(), body)
             } else {
                 // Non-multipart source: metadata from DB row, user data from shards.
                 let src_etag_crc = src_record.etag.crc64();
-                let user_size = src_record.size as usize;
 
                 // Non-multipart payloads now read through committed object segments.
                 let meta_pg = pgs.meta();
@@ -4160,9 +3984,9 @@ impl Coordinator {
                     .get_object_segments(src_bucket, src_key, src_record.version_id)
                     .map_err(ServerError::Metadata)?;
 
-                let user_data = if user_size == 0 {
+                let body = if src_record.size == 0 {
                     drop(pgs);
-                    vec![]
+                    ReadHandle::from_buffered_bytes(Vec::new())
                 } else {
                     let body = ReadHandle::from_segments(
                         self.read_runtime(),
@@ -4170,23 +3994,12 @@ impl Coordinator {
                         src_key,
                         src_record.generation_id,
                         segment_payloads_from_object_segments(segments),
-                        user_size,
+                        src_record.size as usize,
                         Some(src_etag_crc),
                     );
                     drop(pgs);
-                    body.into_bytes().map_err(not_found)?
+                    body
                 };
-
-                // Verify CRC against stored etag (user data only).
-                let actual_crc = checksum::crc64::checksum(&user_data);
-                if actual_crc != src_etag_crc {
-                    return Err(ServerError::IntegrityError {
-                        bucket: src_bucket.to_string(),
-                        key: src_key.to_string(),
-                        expected: src_etag_crc,
-                        actual: actual_crc,
-                    });
-                }
 
                 let src_metadata = src_record
                     .metadata_blob
@@ -4195,81 +4008,111 @@ impl Coordinator {
                     .transpose()?
                     .unwrap_or_default();
 
-                (src_metadata, src_record.tags.clone(), user_data)
+                (src_metadata, src_record.tags.clone(), body)
             }
         }; // source locks dropped here
 
-        // Phase 2: Write destination object
-        let metadata_blob = match directive {
+        // Phase 2: Stream into destination staging session.
+        let mut metadata_blob = match directive {
             MetadataDirective::Copy => src_metadata,
             MetadataDirective::Replace {
                 metadata: new_metadata,
-                checksum_algorithm,
-            } => {
-                let mut blob = (*new_metadata).clone();
-
-                // If a checksum algorithm is specified, compute a fresh checksum
-                // from the copied data and store it in the metadata.
-                if let Some(algo) = checksum_algorithm {
-                    use base64::Engine;
-                    let cksum = compute_checksum(*algo, &user_data);
-                    let b64 = base64::engine::general_purpose::STANDARD.encode(&cksum);
-                    blob.set(algo.header_name(), &b64);
-                }
-
-                blob
-            }
+                ..
+            } => (*new_metadata).clone(),
         };
         let tags = match &req.tagging {
             TaggingDirective::Copy => src_tags,
             TaggingDirective::Replace(tags) => tags.map(SerializedTagSet::from),
         };
+        let mut replacement_checksum = match directive {
+            MetadataDirective::Replace {
+                checksum_algorithm: Some(algo),
+                ..
+            } => Some(CopyChecksumAccumulator::new(*algo)),
+            _ => None,
+        };
+        let session_id = self.begin_stream_put(&BeginStreamPutRequest {
+            bucket: dst_bucket,
+            key: dst_key,
+            requester,
+            acl,
+        })?;
+        let not_found = |e: ServerError| match e {
+            ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
+                bucket: src_bucket.to_string(),
+                key: src_key.to_string(),
+            },
+            other => other,
+        };
+        let copy_result = (|| {
+            let mut crc64 = checksum::crc64::Hasher::new();
+            let mut total_size = 0u64;
+            let mut segment_index = 0u32;
 
-        let LockedWriteObject {
-            version_id: dst_version_id,
-            generation_id: dst_generation_id,
-            pgs,
-        } = self.lock_object_pgs_for_write(dst_bucket, dst_key, dst_bucket_info.versioning)?;
-        let dst_meta_pg = pgs.meta();
-        let dst_shard_pg = pgs.shard();
+            while let Some(chunk) = source_body
+                .next_chunk(INTERNAL_SEGMENT_SIZE)
+                .map_err(not_found)?
+            {
+                total_size = total_size.checked_add(chunk.len() as u64).ok_or_else(|| {
+                    ServerError::InternalError {
+                        reason: "copy size overflow".to_string(),
+                    }
+                })?;
+                crc64.update(&chunk);
+                if let Some(checksum) = replacement_checksum.as_mut() {
+                    checksum.update(&chunk);
+                }
+                self.append_stream_segment(
+                    dst_bucket,
+                    dst_key,
+                    &session_id,
+                    segment_index,
+                    &chunk,
+                )?;
+                segment_index =
+                    segment_index
+                        .checked_add(1)
+                        .ok_or_else(|| ServerError::InternalError {
+                            reason: "too many copy segments".to_string(),
+                        })?;
+            }
 
-        // Check dest write conditions
-        if !dst_cond.is_empty() {
-            let existing_etag = match dst_meta_pg.get_object_meta(dst_bucket, dst_key) {
-                Ok(stored) => stored.as_live().map(|record| record.etag.format()),
-                Err(storage::MetadataError::ObjectNotFound) => None,
-                Err(e) => return Err(ServerError::Metadata(e)),
-            };
-            check_write_conditions(dst_cond, existing_etag.as_deref())?;
+            if let Some(checksum) = replacement_checksum.take() {
+                use base64::Engine;
+
+                let algo = checksum.algorithm();
+                let b64 = base64::engine::general_purpose::STANDARD.encode(checksum.finalize());
+                metadata_blob.set(algo.header_name(), &b64);
+            }
+
+            let put_result = self.finalize_stream_put(&FinalizeStreamPutRequest {
+                bucket: dst_bucket,
+                key: dst_key,
+                session_id: &session_id,
+                crc64: crc64.finalize(),
+                total_size,
+                metadata_blob: &metadata_blob,
+                tags: tags.as_deref(),
+                cond: dst_cond,
+            })?;
+
+            let dst_meta_pg = self
+                .storage_node
+                .get_pg(self.object_pg_id(dst_bucket, dst_key))?;
+            let dst_stored = dst_meta_pg
+                .get_object_meta(dst_bucket, dst_key)
+                .map_err(ServerError::Metadata)?;
+
+            Ok(CopyObjectResult {
+                etag: put_result.etag,
+                last_modified: dst_stored.last_modified(),
+                version_id: put_result.version_id,
+            })
+        })();
+        if copy_result.is_err() {
+            let _ = self.abort_stream_put(dst_bucket, dst_key, &session_id);
         }
-
-        let (put_result, stale_payload) = self.write_object_inner(
-            dst_bucket,
-            dst_key,
-            &metadata_blob,
-            tags.as_deref(),
-            &user_data,
-            dst_version_id,
-            dst_generation_id,
-            dst_meta_pg,
-            dst_shard_pg,
-        )?;
-
-        // Read back dest metadata to get the authoritative last_modified
-        let dst_stored = dst_meta_pg
-            .get_object_meta(dst_bucket, dst_key)
-            .map_err(ServerError::Metadata)?;
-        drop(pgs);
-
-        if let Some(stale_payload) = &stale_payload {
-            self.delete_stale_object_payload(dst_bucket, dst_key, stale_payload);
-        }
-
-        Ok(CopyObjectResult {
-            etag: put_result.etag,
-            last_modified: dst_stored.last_modified(),
-            version_id: put_result.version_id,
-        })
+        copy_result
     }
 
     fn lookup_object_record(
@@ -4316,80 +4159,8 @@ impl Coordinator {
         let record = Self::lookup_object_record(&meta_guard, bucket, key, version_id)?;
         Ok(LockedReadObject {
             record,
-            pgs: TwoPgGuards::new(meta_guard, None),
+            pgs: ObjectPgGuards::new(meta_guard),
         })
-    }
-
-    /// Lock metadata and shard PGs for an object write.
-    ///
-    /// Computes a candidate version ID from metadata while holding the metadata PG
-    /// lock, then locks shard PG in global order and revalidates when needed.
-    fn lock_object_pgs_for_write<'a>(
-        &'a self,
-        bucket: &str,
-        key: &str,
-        versioning_state: BucketVersioningState,
-    ) -> Result<LockedWriteObject<'a>, ServerError> {
-        let meta_pg_id = self.object_pg_id(bucket, key);
-
-        loop {
-            let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
-            let version_id = if versioning_state == BucketVersioningState::Enabled {
-                meta_guard.next_version_id(bucket, key)?
-            } else {
-                VersionId::Null
-            };
-            let generation_id = meta_guard.next_generation_id(bucket, key)?;
-            let shard_pg_id = self.shard_pg_id(bucket, key, generation_id);
-
-            if shard_pg_id == meta_pg_id {
-                return Ok(LockedWriteObject {
-                    version_id,
-                    generation_id,
-                    pgs: TwoPgGuards::new(meta_guard, None),
-                });
-            }
-
-            if meta_pg_id < shard_pg_id {
-                let shard_guard = self.storage_node.get_pg(shard_pg_id)?;
-                let current_version = if versioning_state == BucketVersioningState::Enabled {
-                    meta_guard.next_version_id(bucket, key)?
-                } else {
-                    VersionId::Null
-                };
-                let current_generation = meta_guard.next_generation_id(bucket, key)?;
-                if current_version != version_id || current_generation != generation_id {
-                    continue;
-                }
-                return Ok(LockedWriteObject {
-                    version_id,
-                    generation_id,
-                    pgs: TwoPgGuards::new(meta_guard, Some(shard_guard)),
-                });
-            }
-
-            // Need lower-id shard PG first to avoid deadlocks with readers/writers.
-            drop(meta_guard);
-
-            let (meta_guard, shard_guard) =
-                self.storage_node.lock_two_pgs(meta_pg_id, shard_pg_id)?;
-            let version_id = if versioning_state == BucketVersioningState::Enabled {
-                meta_guard.next_version_id(bucket, key)?
-            } else {
-                VersionId::Null
-            };
-            let generation_id = meta_guard.next_generation_id(bucket, key)?;
-            let verify_shard_pg_id = self.shard_pg_id(bucket, key, generation_id);
-            if verify_shard_pg_id != shard_pg_id {
-                continue;
-            }
-
-            return Ok(LockedWriteObject {
-                version_id,
-                generation_id,
-                pgs: TwoPgGuards::new(meta_guard, shard_guard),
-            });
-        }
     }
 
     fn multipart_part_payloads(
@@ -6262,8 +6033,7 @@ impl Coordinator {
         // 2. Lock meta PG and shard PG in global ascending order.
         //
         //    The shard PG depends on the generation, which is read from metadata.
-        //    We use the same loop-and-revalidate pattern as lock_object_pgs_for_write:
-        //    if meta_pg_id > shard_pg_id, drop, relock in order, and re-read.
+        //    If meta_pg_id > shard_pg_id, drop, relock in order, and re-read.
         let meta_pg_id = self.object_pg_id(bucket, key);
 
         let (meta_pg, shard_guard, generation, shard_pg_id, upload_checksum_algo) = loop {
@@ -7265,6 +7035,60 @@ fn compute_checksum(algo: ChecksumAlgorithm, data: &[u8]) -> Vec<u8> {
             ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, data)
                 .as_ref()
                 .to_vec()
+        }
+    }
+}
+
+enum CopyChecksumAccumulator {
+    Crc32(checksum::crc32::Hasher),
+    Crc32c(checksum::crc32c::Hasher),
+    Crc64(checksum::crc64::Hasher),
+    Sha1(ring::digest::Context),
+    Sha256(ring::digest::Context),
+}
+
+impl CopyChecksumAccumulator {
+    fn new(algo: ChecksumAlgorithm) -> Self {
+        match algo {
+            ChecksumAlgorithm::Crc32 => Self::Crc32(checksum::crc32::Hasher::new()),
+            ChecksumAlgorithm::Crc32c => Self::Crc32c(checksum::crc32c::Hasher::new()),
+            ChecksumAlgorithm::Crc64nvme => Self::Crc64(checksum::crc64::Hasher::new()),
+            ChecksumAlgorithm::Sha1 => Self::Sha1(ring::digest::Context::new(
+                &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
+            )),
+            ChecksumAlgorithm::Sha256 => {
+                Self::Sha256(ring::digest::Context::new(&ring::digest::SHA256))
+            }
+        }
+    }
+
+    fn algorithm(&self) -> ChecksumAlgorithm {
+        match self {
+            Self::Crc32(_) => ChecksumAlgorithm::Crc32,
+            Self::Crc32c(_) => ChecksumAlgorithm::Crc32c,
+            Self::Crc64(_) => ChecksumAlgorithm::Crc64nvme,
+            Self::Sha1(_) => ChecksumAlgorithm::Sha1,
+            Self::Sha256(_) => ChecksumAlgorithm::Sha256,
+        }
+    }
+
+    fn update(&mut self, data: &[u8]) {
+        match self {
+            Self::Crc32(hasher) => hasher.update(data),
+            Self::Crc32c(hasher) => hasher.update(data),
+            Self::Crc64(hasher) => hasher.update(data),
+            Self::Sha1(hasher) => hasher.update(data),
+            Self::Sha256(hasher) => hasher.update(data),
+        }
+    }
+
+    fn finalize(self) -> Vec<u8> {
+        match self {
+            Self::Crc32(hasher) => hasher.finalize().to_be_bytes().to_vec(),
+            Self::Crc32c(hasher) => hasher.finalize().to_be_bytes().to_vec(),
+            Self::Crc64(hasher) => hasher.finalize().to_be_bytes().to_vec(),
+            Self::Sha1(hasher) => hasher.finish().as_ref().to_vec(),
+            Self::Sha256(hasher) => hasher.finish().as_ref().to_vec(),
         }
     }
 }

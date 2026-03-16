@@ -30,6 +30,47 @@ pub fn checksum(data: &[u8]) -> u32 {
     unsafe { ec_sys::crc32_gzip_refl(0, data.as_ptr(), data.len() as u64) }
 }
 
+/// Streaming CRC-32 (gzip/IEEE) hasher.
+///
+/// Feed data in chunks via [`update`](Hasher::update), then call
+/// [`finalize`](Hasher::finalize) to get the checksum.
+#[derive(Clone, Debug)]
+pub struct Hasher {
+    crc: u32,
+}
+
+impl Hasher {
+    /// Create a new hasher with initial state.
+    #[inline]
+    pub fn new() -> Self {
+        Self { crc: 0 }
+    }
+
+    /// Feed more data into the hasher.
+    #[inline]
+    pub fn update(&mut self, data: &[u8]) {
+        self.crc = unsafe { ec_sys::crc32_gzip_refl(self.crc, data.as_ptr(), data.len() as u64) };
+    }
+
+    /// Return the CRC-32 checksum of all data fed so far.
+    #[inline]
+    pub fn finalize(&self) -> u32 {
+        self.crc
+    }
+
+    /// Reset the hasher to its initial state.
+    #[inline]
+    pub fn reset(&mut self) {
+        self.crc = 0;
+    }
+}
+
+impl Default for Hasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Combine two independently computed CRC-32 checksums.
 ///
 /// Given `crc_a = checksum(A)` and `crc_b = checksum(B)`, returns
@@ -130,6 +171,30 @@ mod tests {
         let zeros = [0u8; 32];
         let crc = checksum(&zeros);
         assert_ne!(crc, 0);
+    }
+
+    #[test]
+    fn streaming_matches_oneshot() {
+        let data = b"hello world";
+        let mut hasher = Hasher::new();
+        hasher.update(b"hello ");
+        hasher.update(b"world");
+        assert_eq!(hasher.finalize(), checksum(data));
+    }
+
+    #[test]
+    fn streaming_empty() {
+        let hasher = Hasher::new();
+        assert_eq!(hasher.finalize(), checksum(b""));
+    }
+
+    #[test]
+    fn streaming_reset() {
+        let mut hasher = Hasher::new();
+        hasher.update(b"abc");
+        hasher.reset();
+        hasher.update(b"123456789");
+        assert_eq!(hasher.finalize(), 0xCBF43926);
     }
 
     // ── Combine ──────────────────────────────────────────────────────
