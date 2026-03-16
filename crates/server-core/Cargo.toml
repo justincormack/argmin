@@ -7,6 +7,7 @@ edition = "2021"
 auth = { path = "../auth" }
 checksum = { path = "../checksum" }
 ec = { path = "../ec" }
+observability = { path = "../observability" }
 storage = { path = "../storage" }
 s3-types = { path = "../s3-types" }
 base64 = "0.22"

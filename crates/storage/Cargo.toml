@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 checksum = { path = "../checksum" }
+observability = { path = "../observability" }
 s3-types = { path = "../s3-types" }
 rapidhash = "1"
 rusqlite = { version = "0.33", features = ["bundled"] }

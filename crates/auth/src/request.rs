@@ -14,6 +14,8 @@ use crate::{
     MAX_SIGNED_HEADER_COUNT,
 };
 
+const TRACE_TARGET: &str = "auth";
+
 /// Authentication mode used by the incoming request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthMode {
@@ -61,6 +63,14 @@ pub fn authenticate_request(
     expected_service: &str,
     now_epoch_secs: u64,
 ) -> Result<AuthContext, AuthError> {
+    observability::trace_scope!(
+        TRACE_TARGET,
+        "authenticate_request",
+        "method={} path={} query={}",
+        method,
+        path,
+        query_string
+    );
     let authorization_headers: Vec<&str> = headers
         .iter()
         .filter_map(|(name, value)| (*name == "authorization").then_some(*value))

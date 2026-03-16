@@ -7,6 +7,8 @@ use crate::error::AuthError;
 use crate::request::{AuthContext, AuthMode};
 use crate::sigv4;
 
+const TRACE_TARGET: &str = "auth";
+
 /// Authenticate a POST Object request using SigV4 form fields.
 ///
 /// SigV4 POST signs the base64-encoded policy directly (no canonical request).
@@ -19,6 +21,13 @@ pub fn authenticate_post_sigv4(
     signature_hex: &str,
     store: &CredentialStore,
 ) -> Result<AuthContext, AuthError> {
+    observability::trace_scope!(
+        TRACE_TARGET,
+        "authenticate_post_sigv4",
+        "algorithm={} credential={}",
+        algorithm,
+        credential
+    );
     // Validate algorithm
     if algorithm != "AWS4-HMAC-SHA256" {
         return Err(AuthError::MalformedAuth);

@@ -1,5 +1,7 @@
 use crate::reconstruct::reconstruct_shards;
 
+const TRACE_TARGET: &str = "ec";
+
 /// Maximum supported total shards (k + m).
 pub const MAX_TOTAL_SHARDS: usize = 32;
 
@@ -31,6 +33,13 @@ pub struct EcConfig {
 impl EcConfig {
     /// Create and validate a config.
     pub fn new(data_shards: u8, parity_shards: u8) -> Result<Self, EcError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "EcConfig::new",
+            "data_shards={} parity_shards={}",
+            data_shards,
+            parity_shards
+        );
         if data_shards == 0 {
             return Err(EcError::InvalidConfig {
                 reason: "data_shards must be >= 1",
@@ -142,6 +151,13 @@ impl ErasureCodec {
     ///
     /// ZONE_INIT: allocates.
     pub fn new(config: EcConfig) -> Result<Self, EcError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "ErasureCodec::new",
+            "k={} m={}",
+            config.data_shards,
+            config.parity_shards
+        );
         let k = config.data_shards as usize;
         let m = config.parity_shards as usize;
         let total = k + m;
@@ -207,6 +223,13 @@ impl ErasureCodec {
     ///
     /// ZONE_HOT: no heap allocation.
     pub fn encode(&self, data: &[&[u8]], parity: &mut [&mut [u8]]) -> Result<(), EcError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "ErasureCodec::encode",
+            "data_shards={} parity_shards={}",
+            data.len(),
+            parity.len()
+        );
         let k = self.config.data_shards as usize;
         let m = self.config.parity_shards as usize;
 
@@ -297,6 +320,14 @@ impl ErasureCodec {
         parity: &[&[u8]],
         scratch: &mut [u8],
     ) -> Result<VerifyResult, EcError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "ErasureCodec::verify",
+            "data_shards={} parity_shards={} scratch={}",
+            data.len(),
+            parity.len(),
+            scratch.len()
+        );
         let k = self.config.data_shards as usize;
         let m = self.config.parity_shards as usize;
 
@@ -415,6 +446,13 @@ impl ErasureCodec {
         recover_indices: &[usize],
         outputs: &mut [&mut [u8]],
     ) -> Result<(), EcError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "ErasureCodec::reconstruct",
+            "present={} recover={}",
+            present_data.len(),
+            outputs.len()
+        );
         let k = self.config.data_shards as usize;
         let m = self.config.parity_shards as usize;
         let total = k + m;

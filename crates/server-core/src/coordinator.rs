@@ -37,6 +37,8 @@ use crate::pg::{
 };
 use crate::range::ByteRange;
 
+const TRACE_TARGET: &str = "server_core";
+
 /// Maximum object size for single PUT or upload part (5 GiB, matches AWS S3).
 pub const MAX_OBJECT_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 
@@ -257,6 +259,7 @@ pub struct ReadHandle {
     key: String,
     inner: ReadHandleInner,
     lease: Option<PayloadLease>,
+    trace: Option<observability::TraceContext>,
     expected_size: usize,
     bytes_emitted: usize,
     expected_crc64: Option<u64>,
@@ -359,6 +362,7 @@ impl ReadHandle {
             bucket: bucket.to_string(),
             key: key.to_string(),
             lease: Some(runtime.acquire_object_payload_lease(bucket, key, generation_id)),
+            trace: observability::current_context(),
             expected_size,
             bytes_emitted: 0,
             expected_crc64,
@@ -392,6 +396,7 @@ impl ReadHandle {
             bucket: bucket.to_string(),
             key: key.to_string(),
             lease: Some(runtime.acquire_object_payload_lease(bucket, key, generation_id)),
+            trace: observability::current_context(),
             expected_size,
             bytes_emitted: 0,
             expected_crc64: None,
@@ -419,6 +424,7 @@ impl ReadHandle {
             bucket: bucket.to_string(),
             key: key.to_string(),
             lease: Some(runtime.acquire_object_payload_lease(bucket, key, generation_id)),
+            trace: observability::current_context(),
             expected_size,
             bytes_emitted: 0,
             expected_crc64: None,
@@ -448,6 +454,7 @@ impl ReadHandle {
             bucket: bucket.to_string(),
             key: key.to_string(),
             lease: Some(runtime.acquire_object_payload_lease(bucket, key, generation_id)),
+            trace: observability::current_context(),
             expected_size,
             bytes_emitted: 0,
             expected_crc64: None,
@@ -470,6 +477,7 @@ impl ReadHandle {
             key: "<buffered>".to_string(),
             inner: ReadHandleInner::TestBuffered(Some(data)),
             lease: None,
+            trace: observability::current_context(),
             expected_size: len,
             bytes_emitted: 0,
             expected_crc64: None,
@@ -478,6 +486,15 @@ impl ReadHandle {
     }
 
     pub fn next_chunk(&mut self, target_size: usize) -> Result<Option<Vec<u8>>, ServerError> {
+        let _trace = self.trace.clone().map(observability::AttachedTrace::new);
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "ReadHandle::next_chunk",
+            "bucket={} key={} target_size={}",
+            self.bucket,
+            self.key,
+            target_size
+        );
         if target_size == 0 {
             return Ok(Some(Vec::new()));
         }
@@ -2072,6 +2089,12 @@ impl Coordinator {
         &self,
         req: &CreateBucketRequest<'_>,
     ) -> Result<(), ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::create_bucket_for_requester",
+            "bucket={}",
+            req.name
+        );
         let owner_principal = Self::requester_principal_required(req.requester)?;
         let (public_read, public_write) = match req.acl {
             BucketAcl::Private => (false, false),
@@ -2152,6 +2175,12 @@ impl Coordinator {
     }
 
     pub fn delete_bucket(&self, req: &DeleteBucketRequest<'_>) -> Result<(), ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::delete_bucket",
+            "bucket={}",
+            req.name
+        );
         let name = req.name;
         let _bucket_guard = self.storage_node.lock_bucket(name);
         let _bucket_info = self.authorize_bucket_admin_requester(req.requester, name)?;
@@ -2211,6 +2240,12 @@ impl Coordinator {
         &self,
         req: &HeadBucketRequest<'_>,
     ) -> Result<BucketSummary, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::head_bucket_for_requester",
+            "bucket={}",
+            req.bucket
+        );
         self.authorize_bucket_read_requester(req.requester, req.bucket)
     }
 
@@ -2222,6 +2257,7 @@ impl Coordinator {
         &self,
         req: &ListBucketsRequest<'_>,
     ) -> Result<Vec<BucketSummary>, ServerError> {
+        observability::trace_scope!(TRACE_TARGET, "Coordinator::list_buckets_for_requester");
         self.list_buckets_for_owner(Self::requester_principal_required(req.requester)?)
     }
 
@@ -2246,6 +2282,13 @@ impl Coordinator {
         state: BucketVersioningState,
         requester: Requester<'_>,
     ) -> Result<(), ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::put_bucket_versioning",
+            "bucket={} state={:?}",
+            name,
+            state
+        );
         let _bucket_info = self.authorize_bucket_admin_requester(requester, name)?;
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg
@@ -2268,6 +2311,12 @@ impl Coordinator {
         name: &str,
         requester: Requester<'_>,
     ) -> Result<BucketVersioningState, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::get_bucket_versioning",
+            "bucket={}",
+            name
+        );
         let info = self.authorize_bucket_read_requester(requester, name)?;
         Ok(info.versioning)
     }
@@ -2278,6 +2327,13 @@ impl Coordinator {
         config: &str,
         requester: Requester<'_>,
     ) -> Result<(), ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::put_bucket_cors",
+            "bucket={} bytes={}",
+            name,
+            config.len()
+        );
         let _bucket_info = self.authorize_bucket_admin_requester(requester, name)?;
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg
@@ -2291,6 +2347,12 @@ impl Coordinator {
     }
 
     pub fn get_bucket_cors_unchecked(&self, name: &str) -> Result<Option<String>, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::get_bucket_cors_unchecked",
+            "bucket={}",
+            name
+        );
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg.get_bucket_cors(name).map_err(|e| match e {
             storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
@@ -2305,6 +2367,12 @@ impl Coordinator {
         name: &str,
         requester: Requester<'_>,
     ) -> Result<Option<String>, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::get_bucket_cors",
+            "bucket={}",
+            name
+        );
         let _bucket_info = self.authorize_bucket_read_requester(requester, name)?;
         self.get_bucket_cors_unchecked(name)
     }
@@ -2314,6 +2382,12 @@ impl Coordinator {
         name: &str,
         requester: Requester<'_>,
     ) -> Result<(), ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::delete_bucket_cors",
+            "bucket={}",
+            name
+        );
         let _bucket_info = self.authorize_bucket_admin_requester(requester, name)?;
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg.delete_bucket_cors(name).map_err(|e| match e {
@@ -2332,6 +2406,13 @@ impl Coordinator {
         tags: &str,
         requester: Requester<'_>,
     ) -> Result<(), ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::put_bucket_tags",
+            "bucket={} bytes={}",
+            name,
+            tags.len()
+        );
         let _bucket_info = self.authorize_bucket_admin_requester(requester, name)?;
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg.put_bucket_tags(name, tags).map_err(|e| match e {
@@ -2347,6 +2428,12 @@ impl Coordinator {
         name: &str,
         requester: Requester<'_>,
     ) -> Result<Option<String>, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::get_bucket_tags",
+            "bucket={}",
+            name
+        );
         let _bucket_info = self.authorize_bucket_read_requester(requester, name)?;
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg.get_bucket_tags(name).map_err(|e| match e {
@@ -2362,6 +2449,12 @@ impl Coordinator {
         name: &str,
         requester: Requester<'_>,
     ) -> Result<(), ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::delete_bucket_tags",
+            "bucket={}",
+            name
+        );
         let _bucket_info = self.authorize_bucket_admin_requester(requester, name)?;
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg.delete_bucket_tags(name).map_err(|e| match e {
@@ -2380,6 +2473,13 @@ impl Coordinator {
         config: &str,
         requester: Requester<'_>,
     ) -> Result<(), ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::put_bucket_public_access_block",
+            "bucket={} bytes={}",
+            name,
+            config.len()
+        );
         let _bucket_info = self.authorize_bucket_admin_requester(requester, name)?;
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg
@@ -2397,6 +2497,12 @@ impl Coordinator {
         name: &str,
         requester: Requester<'_>,
     ) -> Result<Option<String>, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::get_bucket_public_access_block",
+            "bucket={}",
+            name
+        );
         let _bucket_info = self.authorize_bucket_admin_requester(requester, name)?;
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg
@@ -2414,6 +2520,12 @@ impl Coordinator {
         name: &str,
         requester: Requester<'_>,
     ) -> Result<(), ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::delete_bucket_public_access_block",
+            "bucket={}",
+            name
+        );
         let _bucket_info = self.authorize_bucket_admin_requester(requester, name)?;
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg
@@ -2434,6 +2546,13 @@ impl Coordinator {
         acl: BucketAcl,
         requester: Requester<'_>,
     ) -> Result<(), ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::put_bucket_acl",
+            "bucket={} acl={:?}",
+            name,
+            acl
+        );
         let _bucket_info = self.authorize_bucket_admin_requester(requester, name)?;
         let ownership_controls = self.get_bucket_ownership_controls(name, requester)?;
         if Self::is_bucket_owner_enforced(ownership_controls.as_deref()) {
@@ -2473,6 +2592,12 @@ impl Coordinator {
         name: &str,
         requester: Requester<'_>,
     ) -> Result<GetBucketAclResult, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::get_bucket_acl",
+            "bucket={}",
+            name
+        );
         let bucket = self.authorize_bucket_admin_requester(requester, name)?;
         let acl = if bucket.public_write {
             BucketAcl::PublicReadWrite
@@ -2496,6 +2621,13 @@ impl Coordinator {
         config: &str,
         requester: Requester<'_>,
     ) -> Result<(), ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::put_bucket_ownership_controls",
+            "bucket={} bytes={}",
+            name,
+            config.len()
+        );
         let bucket_info = self.authorize_bucket_admin_requester(requester, name)?;
         if Self::is_bucket_owner_enforced(Some(config))
             && (bucket_info.public_read || bucket_info.public_write)
@@ -2518,6 +2650,12 @@ impl Coordinator {
         name: &str,
         requester: Requester<'_>,
     ) -> Result<Option<String>, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::get_bucket_ownership_controls",
+            "bucket={}",
+            name
+        );
         let _bucket_info = self.authorize_bucket_admin_requester(requester, name)?;
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg
@@ -2535,6 +2673,12 @@ impl Coordinator {
         name: &str,
         requester: Requester<'_>,
     ) -> Result<(), ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::delete_bucket_ownership_controls",
+            "bucket={}",
+            name
+        );
         let _bucket_info = self.authorize_bucket_admin_requester(requester, name)?;
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg
@@ -2557,6 +2701,14 @@ impl Coordinator {
         tags: &str,
         requester: Requester<'_>,
     ) -> Result<(), ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::put_object_tags",
+            "bucket={} key={} bytes={}",
+            bucket,
+            key,
+            tags.len()
+        );
         let _bucket_info = self.authorize_object_write_requester(requester, bucket)?;
         let pg_id = self.object_pg_id(bucket, key);
         let pg = self.storage_node.get_pg(pg_id)?;
@@ -2592,6 +2744,13 @@ impl Coordinator {
         version_id: Option<VersionId>,
         requester: Requester<'_>,
     ) -> Result<Option<String>, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::get_object_tags",
+            "bucket={} key={}",
+            bucket,
+            key
+        );
         let _bucket_info = self.authorize_bucket_read_requester(requester, bucket)?;
         let pg_id = self.object_pg_id(bucket, key);
         let pg = self.storage_node.get_pg(pg_id)?;
@@ -2627,6 +2786,13 @@ impl Coordinator {
         version_id: Option<VersionId>,
         requester: Requester<'_>,
     ) -> Result<(), ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::delete_object_tags",
+            "bucket={} key={}",
+            bucket,
+            key
+        );
         let _bucket_info = self.authorize_object_write_requester(requester, bucket)?;
         let pg_id = self.object_pg_id(bucket, key);
         let pg = self.storage_node.get_pg(pg_id)?;
@@ -2824,6 +2990,13 @@ impl Coordinator {
     /// feeds segments via `append_stream_segment` and commits via
     /// `finalize_stream_put`.
     pub fn begin_stream_put(&self, req: &BeginStreamPutRequest<'_>) -> Result<String, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::begin_stream_put",
+            "bucket={} key={}",
+            req.bucket,
+            req.key
+        );
         let bucket = req.bucket;
         let key = req.key;
         let _bucket_guard = self.storage_node.lock_bucket(bucket);
@@ -2873,6 +3046,15 @@ impl Coordinator {
         &self,
         req: &BeginStreamPartRequest<'_>,
     ) -> Result<BeginStreamPartResult, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::begin_stream_part",
+            "bucket={} key={} upload_id={} part_number={}",
+            req.bucket,
+            req.key,
+            req.upload_id,
+            req.part_number
+        );
         let bucket = req.bucket;
         let key = req.key;
         let upload_id = req.upload_id;
@@ -2948,6 +3130,16 @@ impl Coordinator {
         segment_index: u32,
         data: &[u8],
     ) -> Result<(), ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::append_stream_segment",
+            "bucket={} key={} session_id={} segment_index={} bytes={}",
+            bucket,
+            key,
+            session_id,
+            segment_index,
+            data.len()
+        );
         let meta_pg_id = self.object_pg_id(bucket, key);
 
         // Derive stream segment shard placement.
@@ -3077,6 +3269,15 @@ impl Coordinator {
         &self,
         req: &FinalizeStreamPutRequest,
     ) -> Result<PutObjectResult, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::finalize_stream_put",
+            "bucket={} key={} session_id={} bytes={}",
+            req.bucket,
+            req.key,
+            req.session_id,
+            req.total_size
+        );
         let bucket = req.bucket;
         let key = req.key;
         let session_id = req.session_id;
@@ -3240,6 +3441,17 @@ impl Coordinator {
         &self,
         req: FinalizeStreamPartRequest,
     ) -> Result<UploadPartResult, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::finalize_stream_part",
+            "bucket={} key={} upload_id={} part_number={} session_id={} bytes={}",
+            req.bucket,
+            req.key,
+            req.upload_id,
+            req.part_number,
+            req.session_id,
+            req.total_size
+        );
         let bucket = req.bucket;
         let key = req.key;
         let session_id = req.session_id;
@@ -3587,6 +3799,15 @@ impl Coordinator {
     /// and metadata directive (COPY preserves source metadata, REPLACE
     /// uses new headers).
     pub fn copy_object(&self, req: &CopyObjectRequest) -> Result<CopyObjectResult, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::copy_object",
+            "src_bucket={} src_key={} dst_bucket={} dst_key={}",
+            req.source.bucket,
+            req.source.key,
+            req.dst_bucket,
+            req.dst_key
+        );
         let src_bucket = req.source.bucket;
         let src_key = req.source.key;
         let src_version_id = req.source.version_id;
@@ -4230,6 +4451,14 @@ impl Coordinator {
 
     /// Get an object from storage.
     pub fn get_object(&self, req: &GetObjectRequest) -> Result<GetObjectResult, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::get_object",
+            "bucket={} key={} version_id={:?}",
+            req.bucket,
+            req.key,
+            req.version_id
+        );
         let bucket = req.bucket;
         let key = req.key;
         let version_id = req.version_id;
@@ -4345,6 +4574,15 @@ impl Coordinator {
         &self,
         req: &GetObjectPartRequest,
     ) -> Result<GetObjectPartResult, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::get_object_part",
+            "bucket={} key={} part_number={} version_id={:?}",
+            req.bucket,
+            req.key,
+            req.part_number,
+            req.version_id
+        );
         let bucket = req.bucket;
         let key = req.key;
         let version_id = req.version_id;
@@ -4506,6 +4744,15 @@ impl Coordinator {
         &self,
         req: &GetObjectPartRequest,
     ) -> Result<HeadObjectPartResult, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::head_object_part",
+            "bucket={} key={} part_number={} version_id={:?}",
+            req.bucket,
+            req.key,
+            req.part_number,
+            req.version_id
+        );
         let bucket = req.bucket;
         let key = req.key;
         let version_id = req.version_id;
@@ -4612,6 +4859,14 @@ impl Coordinator {
     ///
     /// Metadata is always read from the DB row (no shard read needed).
     pub fn head_object(&self, req: &GetObjectRequest) -> Result<HeadObjectResult, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::head_object",
+            "bucket={} key={} version_id={:?}",
+            req.bucket,
+            req.key,
+            req.version_id
+        );
         let bucket = req.bucket;
         let key = req.key;
         let version_id = req.version_id;
@@ -4659,6 +4914,15 @@ impl Coordinator {
         &self,
         req: &GetObjectAttributesRequest,
     ) -> Result<GetObjectAttributesResult, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::get_object_attributes",
+            "bucket={} key={} want_parts={} version_id={:?}",
+            req.bucket,
+            req.key,
+            req.want_parts,
+            req.version_id
+        );
         let bucket = req.bucket;
         let key = req.key;
         let version_id = req.version_id;
@@ -4781,6 +5045,15 @@ impl Coordinator {
         &self,
         req: &GetObjectRangeRequest,
     ) -> Result<GetObjectRangeResult, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::get_object_range",
+            "bucket={} key={} version_id={:?} requested_range={}",
+            req.bucket,
+            req.key,
+            req.version_id,
+            req.range
+        );
         let bucket = req.bucket;
         let key = req.key;
         let version_id = req.version_id;
@@ -4808,12 +5081,43 @@ impl Coordinator {
         check_read_conditions(cond, &etag_str, record.last_modified)?;
 
         // Resolve byte range against user data size
-        let (user_start, user_end) =
-            range
-                .resolve(record.size)
-                .ok_or(ServerError::InvalidRange {
+        let (user_start, user_end) = match range.resolve(record.size) {
+            Some(resolved) => resolved,
+            None => {
+                if let Some(trace) = observability::current_context() {
+                    let _ = observability::event_in_context(
+                        &trace,
+                        TRACE_TARGET,
+                        "get_object_range_invalid",
+                        Some(format_args!(
+                            "bucket={} key={} version_id={:?} requested_range={} object_size={}",
+                            bucket, key, version_id, range, record.size
+                        )),
+                    );
+                }
+                return Err(ServerError::InvalidRange {
                     total_size: record.size,
-                })?;
+                });
+            }
+        };
+        if let Some(trace) = observability::current_context() {
+            let _ = observability::event_in_context(
+                &trace,
+                TRACE_TARGET,
+                "get_object_range_resolved",
+                Some(format_args!(
+                    "bucket={} key={} version_id={:?} requested_range={} object_size={} resolved_start={} resolved_end={} resolved_len={}",
+                    bucket,
+                    key,
+                    version_id,
+                    range,
+                    record.size,
+                    user_start,
+                    user_end,
+                    user_end - user_start + 1
+                )),
+            );
+        }
 
         let (metadata, body) = if matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
             // Multipart: metadata from object row, data spans parts.
@@ -4888,6 +5192,14 @@ impl Coordinator {
         &self,
         req: &DeleteObjectRequest,
     ) -> Result<DeleteObjectResult, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::delete_object",
+            "bucket={} key={} version_id={:?}",
+            req.bucket,
+            req.key,
+            req.version_id
+        );
         let bucket = req.bucket;
         let key = req.key;
         let request_version_id = req.version_id;
@@ -5142,6 +5454,13 @@ impl Coordinator {
         &self,
         req: &ListObjectsV2Request,
     ) -> Result<ListObjectsResult, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::list_objects_v2",
+            "bucket={} max_keys={}",
+            req.bucket,
+            req.max_keys
+        );
         let bucket = req.bucket;
         let prefix = req.prefix;
         let delimiter = req.delimiter;
@@ -5303,6 +5622,13 @@ impl Coordinator {
         &self,
         req: &ListObjectVersionsRequest,
     ) -> Result<ListObjectVersionsResult, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::list_object_versions",
+            "bucket={} max_keys={}",
+            req.bucket,
+            req.max_keys
+        );
         let bucket = req.bucket;
         let prefix = req.prefix;
         let key_marker = req.key_marker;
@@ -5400,6 +5726,13 @@ impl Coordinator {
         &self,
         req: &DeleteObjectsRequest,
     ) -> Result<DeleteObjectsResult, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::delete_objects",
+            "bucket={} objects={}",
+            req.bucket,
+            req.entries.len()
+        );
         let bucket = req.bucket;
         let entries = req.entries;
         let cond = req.cond;
@@ -5447,6 +5780,13 @@ impl Coordinator {
         &self,
         req: &CreateMultipartUploadRequest,
     ) -> Result<CreateMultipartUploadResult, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::create_multipart_upload",
+            "bucket={} key={}",
+            req.bucket,
+            req.key
+        );
         let bucket = req.bucket;
         let key = req.key;
         let metadata = req.metadata;
@@ -5489,6 +5829,17 @@ impl Coordinator {
         &self,
         req: &UploadPartCopyRequest,
     ) -> Result<UploadPartCopyResult, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::upload_part_copy",
+            "src_bucket={} src_key={} dst_bucket={} dst_key={} upload_id={} part_number={}",
+            req.source.bucket,
+            req.source.key,
+            req.dst_bucket,
+            req.dst_key,
+            req.upload_id,
+            req.part_number
+        );
         let src_bucket = req.source.bucket;
         let src_key = req.source.key;
         let src_version_id = req.source.version_id;
@@ -5918,6 +6269,15 @@ impl Coordinator {
         &self,
         req: &CompleteMultipartUploadRequest,
     ) -> Result<CompleteMultipartUploadResult, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::complete_multipart_upload",
+            "bucket={} key={} upload_id={} parts={}",
+            req.bucket,
+            req.key,
+            req.upload_id,
+            req.parts.len()
+        );
         let bucket = req.bucket;
         let key = req.key;
         let upload_id = req.upload_id;
@@ -6306,6 +6666,14 @@ impl Coordinator {
         &self,
         req: &AbortMultipartUploadRequest,
     ) -> Result<(), ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::abort_multipart_upload",
+            "bucket={} key={} upload_id={}",
+            req.bucket,
+            req.key,
+            req.upload_id
+        );
         let bucket = req.bucket;
         let key = req.key;
         let upload_id = req.upload_id;
@@ -6399,6 +6767,15 @@ impl Coordinator {
 
     /// List parts of an in-progress multipart upload.
     pub fn list_parts(&self, req: &ListPartsRequest) -> Result<ListPartsResult, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::list_parts",
+            "bucket={} key={} upload_id={} max_parts={}",
+            req.bucket,
+            req.key,
+            req.upload_id,
+            req.max_parts
+        );
         let bucket = req.bucket;
         let key = req.key;
         let upload_id = req.upload_id;
@@ -6468,6 +6845,13 @@ impl Coordinator {
         &self,
         req: &ListMultipartUploadsRequest,
     ) -> Result<ListMultipartUploadsResult, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::list_multipart_uploads",
+            "bucket={} max_uploads={}",
+            req.bucket,
+            req.max_uploads
+        );
         let bucket = req.bucket;
         let prefix = req.prefix;
         let key_marker = req.key_marker;
@@ -13386,7 +13770,7 @@ mod tests {
         let mut complete_parts = Vec::new();
         for &(part_number, data) in part_data {
             let result = test_helpers::upload_part(
-                &coord,
+                coord,
                 &UploadPartRequest {
                     bucket,
                     key,
@@ -14530,7 +14914,7 @@ mod tests {
         let mut complete_parts = Vec::new();
         for (part_number, data) in part_data {
             let result = test_helpers::upload_part(
-                &coord,
+                coord,
                 &UploadPartRequest {
                     bucket,
                     key,
@@ -14581,7 +14965,7 @@ mod tests {
 
         let part1 = make_part(0xAA, MIN_PART);
         let part1_result = test_helpers::upload_part(
-            &coord,
+            coord,
             &UploadPartRequest {
                 bucket,
                 key,
@@ -15187,7 +15571,7 @@ mod tests {
             let checksum_b64 = b64.encode(compute_checksum(algo, data));
             let claim = ChecksumClaim::from_base64(algo, &checksum_b64).unwrap();
             let result = test_helpers::upload_part(
-                &coord,
+                coord,
                 &UploadPartRequest {
                     bucket,
                     key,

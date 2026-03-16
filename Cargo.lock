@@ -43,6 +43,7 @@ name = "auth"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "observability",
  "proptest",
  "ring",
  "serde_json",
@@ -763,6 +764,7 @@ name = "ec"
 version = "0.1.0"
 dependencies = [
  "ec-sys",
+ "observability",
  "proptest",
  "thiserror",
 ]
@@ -1527,6 +1529,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "observability"
+version = "0.1.0"
+
+[[package]]
 name = "once_cell"
 version = "1.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2065,6 +2071,7 @@ dependencies = [
  "base64",
  "checksum",
  "ec",
+ "observability",
  "rapidhash 1.4.0",
  "ring",
  "s3-types",
@@ -2087,6 +2094,7 @@ dependencies = [
  "http-body-util",
  "hyper 1.8.1",
  "hyper-util",
+ "observability",
  "quick-xml",
  "ring",
  "s3-types",
@@ -2209,6 +2217,7 @@ name = "storage"
 version = "0.1.0"
 dependencies = [
  "checksum",
+ "observability",
  "proptest",
  "rapidhash 1.4.0",
  "rusqlite",

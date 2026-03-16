@@ -22,6 +22,8 @@ use crate::schema::init_pg_schema;
 use crate::traits::{PgMetadataStore, ShardStore};
 use crate::types::*;
 
+const TRACE_TARGET: &str = "storage";
+
 /// Part segment rows use a sentinel version_id during staging (pre-CompleteMultipartUpload).
 /// Must differ from any real version_id (0 for unversioned, 1+ for versioned) so that
 /// in-progress staging rows are invisible to reads of completed objects.
@@ -430,6 +432,14 @@ impl PgStore {
 
 impl ShardStore for PgStore {
     fn write_shard(&self, key: &ShardKey, data: &[u8]) -> Result<WriteAck, StoreError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "PgStore::write_shard",
+            "pg_id={} shard={} bytes={}",
+            self.pg_id,
+            key.hex(),
+            data.len()
+        );
         let crc = checksum::crc64::checksum(data);
         let stored_size = data.len() as u64;
 
@@ -518,6 +528,13 @@ impl ShardStore for PgStore {
     }
 
     fn read_shard(&self, key: &ShardKey) -> Result<ShardData, StoreError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "PgStore::read_shard",
+            "pg_id={} shard={}",
+            self.pg_id,
+            key.hex()
+        );
         // Look up shard in SQLite.
         let row: Option<(i64, i64, i64)> = self
             .conn
@@ -661,6 +678,14 @@ impl PgMetadataStore for PgStore {
         public_read: bool,
         public_write: bool,
     ) -> Result<(), MetadataError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "PgStore::create_bucket",
+            "pg_id={} bucket={} owner={}",
+            self.pg_id,
+            name,
+            owner_principal
+        );
         let now = PgStore::now_millis() as i64;
         let result = self.conn.execute(
             "INSERT INTO buckets (name, owner_principal, owner_canonical_id, created_at, state, public_read, public_write) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -689,6 +714,13 @@ impl PgMetadataStore for PgStore {
     }
 
     fn delete_bucket(&self, name: &str) -> Result<(), MetadataError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "PgStore::delete_bucket",
+            "pg_id={} bucket={}",
+            self.pg_id,
+            name
+        );
         let deleted = self
             .conn
             .execute("DELETE FROM buckets WHERE name = ?1", params![name])
@@ -705,6 +737,13 @@ impl PgMetadataStore for PgStore {
     }
 
     fn head_bucket(&self, name: &str) -> Result<BucketInfo, MetadataError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "PgStore::head_bucket",
+            "pg_id={} bucket={}",
+            self.pg_id,
+            name
+        );
         let info = self.head_bucket_raw(name)?;
         if info.state != BucketState::Active {
             return Err(MetadataError::BucketNotFound {
@@ -733,6 +772,13 @@ impl PgMetadataStore for PgStore {
     }
 
     fn list_buckets(&self, owner_principal: &str) -> Result<Vec<BucketInfo>, MetadataError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "PgStore::list_buckets",
+            "pg_id={} owner={}",
+            self.pg_id,
+            owner_principal
+        );
         let mut stmt = self
             .conn
             .prepare(
@@ -1080,6 +1126,12 @@ impl PgMetadataStore for PgStore {
     }
 
     fn put_object_meta(&self, req: &PutObjectReq) -> Result<(), MetadataError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "PgStore::put_object_meta",
+            "pg_id={}",
+            self.pg_id
+        );
         let now = PgStore::now_millis();
         match req {
             PutObjectReq::Live(req) => {
@@ -1169,6 +1221,14 @@ impl PgMetadataStore for PgStore {
     }
 
     fn get_object_meta(&self, bucket: &str, key: &str) -> Result<StoredObject, MetadataError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "PgStore::get_object_meta",
+            "pg_id={} bucket={} key={}",
+            self.pg_id,
+            bucket,
+            key
+        );
         self.conn
             .query_row(
                 "SELECT bucket, key, version_id, generation_id, size, etag, etag_kind, \
@@ -1193,6 +1253,15 @@ impl PgMetadataStore for PgStore {
         key: &str,
         version_id: VersionId,
     ) -> Result<StoredObject, MetadataError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "PgStore::get_object_version",
+            "pg_id={} bucket={} key={} version_id={}",
+            self.pg_id,
+            bucket,
+            key,
+            version_id
+        );
         self.conn
             .query_row(
                 "SELECT bucket, key, version_id, generation_id, size, etag, etag_kind, \
@@ -1211,6 +1280,14 @@ impl PgMetadataStore for PgStore {
     }
 
     fn delete_object_meta(&self, bucket: &str, key: &str) -> Result<(), MetadataError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "PgStore::delete_object_meta",
+            "pg_id={} bucket={} key={}",
+            self.pg_id,
+            bucket,
+            key
+        );
         self.conn
             .execute(
                 "DELETE FROM objects WHERE bucket = ?1 AND key = ?2",
@@ -1229,6 +1306,15 @@ impl PgMetadataStore for PgStore {
         key: &str,
         version_id: VersionId,
     ) -> Result<(), MetadataError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "PgStore::delete_object_version",
+            "pg_id={} bucket={} key={} version_id={}",
+            self.pg_id,
+            bucket,
+            key,
+            version_id
+        );
         self.conn
             .execute(
                 "DELETE FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
@@ -1242,6 +1328,14 @@ impl PgMetadataStore for PgStore {
     }
 
     fn list_objects(&self, req: &ListObjectsReq) -> Result<ListObjectsResp, MetadataError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "PgStore::list_objects",
+            "pg_id={} bucket={} max_keys={}",
+            self.pg_id,
+            req.bucket.as_str(),
+            req.max_keys
+        );
         // Use a CTE to find the latest version per key, then filter to live objects.
         // This correctly handles versioned buckets where delete markers hide keys.
         let limit = req.max_keys as i64 + 1;
@@ -1333,6 +1427,14 @@ impl PgMetadataStore for PgStore {
         &self,
         req: &ListObjectVersionsReq,
     ) -> Result<ListObjectVersionsResp, MetadataError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "PgStore::list_object_versions",
+            "pg_id={} bucket={} max_keys={}",
+            self.pg_id,
+            req.bucket.as_str(),
+            req.max_keys
+        );
         let limit = req.max_keys as i64 + 1;
 
         let mut where_clauses = vec!["bucket = ?1".to_string()];
@@ -2276,6 +2378,15 @@ impl PgMetadataStore for PgStore {
     // ── Multipart upload methods ──────────────────────────────────
 
     fn create_multipart_upload(&self, req: &CreateMultipartUploadReq) -> Result<(), MetadataError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "PgStore::create_multipart_upload",
+            "pg_id={} upload_id={} bucket={} key={}",
+            self.pg_id,
+            req.upload_id.as_str(),
+            req.bucket.as_str(),
+            req.key.as_str()
+        );
         let now = PgStore::now_millis();
         let algo = req.checksum.map(|c| c.algorithm() as u8);
         let ctype = req.checksum.map(|c| c.checksum_type() as u8);
@@ -2459,6 +2570,14 @@ impl PgMetadataStore for PgStore {
         &self,
         req: &ListMultipartUploadsReq,
     ) -> Result<ListMultipartUploadsResp, MetadataError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "PgStore::list_multipart_uploads",
+            "pg_id={} bucket={} max_uploads={}",
+            self.pg_id,
+            req.bucket.as_str(),
+            req.max_uploads
+        );
         let limit = req.max_uploads as i64 + 1;
         let mut where_clauses = vec!["bucket = ?1".to_string()];
         let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> =
@@ -3295,6 +3414,15 @@ impl PgMetadataStore for PgStore {
     // ── Streaming upload session methods ──────────────────────────────
 
     fn create_stream_upload(&self, req: &CreateStreamUploadReq) -> Result<(), MetadataError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "PgStore::create_stream_upload",
+            "pg_id={} session_id={} bucket={} key={}",
+            self.pg_id,
+            req.session_id.as_str(),
+            req.bucket.as_str(),
+            req.key.as_str()
+        );
         let now = PgStore::now_millis();
         let op_kind = req.target.op_kind() as u8;
         let upload_id = req.target.upload_id();
@@ -3541,6 +3669,16 @@ impl PgMetadataStore for PgStore {
         obj: &CommitStreamPutReq,
         segments: &[ObjectSegmentRecord],
     ) -> Result<(), MetadataError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "PgStore::commit_stream_put",
+            "pg_id={} session_id={} bucket={} key={} segments={}",
+            self.pg_id,
+            session_id,
+            obj.bucket.as_str(),
+            obj.key.as_str(),
+            segments.len()
+        );
         self.conn
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| MetadataError::Db {

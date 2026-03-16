@@ -14,6 +14,16 @@ pub enum ByteRange {
     Suffix { length: u64 },
 }
 
+impl std::fmt::Display for ByteRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Range { start, end } => write!(f, "bytes={start}-{end}"),
+            Self::FromStart { start } => write!(f, "bytes={start}-"),
+            Self::Suffix { length } => write!(f, "bytes=-{length}"),
+        }
+    }
+}
+
 impl ByteRange {
     /// Parse a Range header value (e.g. "bytes=0-99", "bytes=100-", "bytes=-50").
     ///
@@ -203,6 +213,19 @@ mod tests {
     #[test]
     fn parse_rejects_non_numeric() {
         assert!(ByteRange::parse("bytes=abc-def").is_err());
+    }
+
+    #[test]
+    fn display_range() {
+        assert_eq!(
+            ByteRange::Range { start: 0, end: 99 }.to_string(),
+            "bytes=0-99"
+        );
+        assert_eq!(
+            ByteRange::FromStart { start: 100 }.to_string(),
+            "bytes=100-"
+        );
+        assert_eq!(ByteRange::Suffix { length: 50 }.to_string(), "bytes=-50");
     }
 
     #[test]

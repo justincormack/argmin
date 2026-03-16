@@ -43,6 +43,12 @@ use router::{route, S3Operation};
 use s3_types::VersionId;
 use tokio::sync::{mpsc, OwnedSemaphorePermit};
 
+const TRACE_TARGET: &str = "server_http";
+
+fn current_trace_context() -> observability::TraceContext {
+    observability::current_context().unwrap_or_else(observability::TraceContext::new_request)
+}
+
 /// Parse versionId query parameter from an S3 request.
 /// Returns `Ok(None)` if the parameter is absent, `Ok(Some(id))` if valid,
 /// or `Err` if the value is present but not a valid version ID.
@@ -97,6 +103,12 @@ impl S3HyperBody {
     ) -> Self {
         let (tx, rx) = mpsc::channel(2);
         tokio::task::spawn_blocking(move || {
+            observability::trace_scope!(
+                TRACE_TARGET,
+                "S3HyperBody::streaming",
+                "read_chunk_size={}",
+                read_chunk_size
+            );
             let mut body = body;
             loop {
                 match body.next_chunk(read_chunk_size) {
@@ -167,6 +179,14 @@ impl HttpFrontend {
     /// an `S3Request` and converting the `S3Response` back to an HTTP response.
     #[must_use]
     pub fn handle_s3_request(&self, s3req: &S3Request) -> S3Response {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "HttpFrontend::handle_s3_request",
+            "method={} path={} query={}",
+            s3req.method,
+            s3req.path,
+            s3req.query_string
+        );
         // Route first to detect OPTIONS requests (which bypass auth).
         let operation = match route(&s3req.method, &s3req.path, &s3req.query_string) {
             Ok(op) => op,
@@ -317,6 +337,15 @@ impl HttpFrontend {
         auth: &AuthContext,
         operation: S3Operation,
     ) -> Result<S3Response, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "HttpFrontend::dispatch_routed",
+            "method={} path={} op={:?} principal={:?}",
+            req.method,
+            req.path,
+            operation,
+            auth.principal
+        );
         // Dispatch to coordinator
         match operation {
             S3Operation::ListBuckets => {
@@ -639,6 +668,7 @@ impl HttpFrontend {
                 let vid = parse_version_id(req)?;
                 let requester =
                     crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                let trace = current_trace_context();
                 // partNumber takes precedence over Range header (AWS behavior)
                 if let Some(pn_str) = req.query_param("partNumber") {
                     let part_number: u32 =
@@ -650,6 +680,15 @@ impl HttpFrontend {
                             reason: "partNumber must be >= 1".into(),
                         });
                     }
+                    let _ = observability::event_in_context(
+                        &trace,
+                        TRACE_TARGET,
+                        "get_object_part_request",
+                        Some(format_args!(
+                            "bucket={} key={} version_id={:?} part_number={}",
+                            bucket, key, vid, part_number
+                        )),
+                    );
                     let result = self
                         .coordinator
                         .get_object_part(&crate::coordinator::GetObjectPartRequest {
@@ -673,35 +712,73 @@ impl HttpFrontend {
                         add_tagging_count_header(&mut resp, &tags_xml)?;
                     }
                     Ok(resp)
-                } else if let Some(byte_range) = req
-                    .header("range")
-                    // AWS ignores malformed Range headers and returns 200 with
-                    // the full object. We mirror this by silently falling
-                    // through to the non-range GET path on parse failure.
-                    .and_then(|h| crate::range::ByteRange::parse(h).ok())
-                {
-                    match self.coordinator.get_object_range(
-                        &crate::coordinator::GetObjectRangeRequest {
-                            bucket: &bucket,
-                            key: &key,
-                            version_id: vid,
-                            range: byte_range,
-                            cond: &cond,
-                            requester,
-                        },
-                    ) {
-                        Ok(result) => {
+                } else if let Some(range_header) = req.header("range") {
+                    match crate::range::ByteRange::parse(range_header) {
+                        Ok(byte_range) => {
+                            let _ = observability::event_in_context(
+                                &trace,
+                                TRACE_TARGET,
+                                "get_object_range_request",
+                                Some(format_args!(
+                                    "bucket={} key={} version_id={:?} raw_range={} parsed_range={}",
+                                    bucket, key, vid, range_header, byte_range
+                                )),
+                            );
+                            match self.coordinator.get_object_range(
+                                &crate::coordinator::GetObjectRangeRequest {
+                                    bucket: &bucket,
+                                    key: &key,
+                                    version_id: vid,
+                                    range: byte_range,
+                                    cond: &cond,
+                                    requester,
+                                },
+                            ) {
+                                Ok(result) => {
+                                    let tags = result.tags.clone();
+                                    let mut resp = S3Response::get_object_range(result);
+                                    if let Some(tags_xml) = tags {
+                                        add_tagging_count_header(&mut resp, &tags_xml)?;
+                                    }
+                                    Ok(resp)
+                                }
+                                Err(ServerError::InvalidRange { total_size }) => {
+                                    Ok(S3Response::range_not_satisfiable(total_size))
+                                }
+                                Err(e) => Err(e),
+                            }
+                        }
+                        Err(_) => {
+                            let _ = observability::event_in_context(
+                                &trace,
+                                TRACE_TARGET,
+                                "get_object_range_ignored",
+                                Some(format_args!(
+                                    "bucket={} key={} version_id={:?} raw_range={} reason=invalid_header",
+                                    bucket,
+                                    key,
+                                    vid,
+                                    range_header
+                                )),
+                            );
+                            let result = self.coordinator.get_object(
+                                &crate::coordinator::GetObjectRequest {
+                                    bucket: &bucket,
+                                    key: &key,
+                                    version_id: vid,
+                                    cond: &cond,
+                                    requester,
+                                },
+                            )?;
+                            let checksum_mode = req.header("x-amz-checksum-mode");
                             let tags = result.tags.clone();
-                            let mut resp = S3Response::get_object_range(result);
+                            let mut resp = S3Response::get_object(result, checksum_mode);
+                            apply_response_overrides(&mut resp, req);
                             if let Some(tags_xml) = tags {
                                 add_tagging_count_header(&mut resp, &tags_xml)?;
                             }
                             Ok(resp)
                         }
-                        Err(ServerError::InvalidRange { total_size }) => {
-                            Ok(S3Response::range_not_satisfiable(total_size))
-                        }
-                        Err(e) => Err(e),
                     }
                 } else {
                     let result =
@@ -745,6 +822,7 @@ impl HttpFrontend {
                 let vid = parse_version_id(req)?;
                 let requester =
                     crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                let trace = current_trace_context();
                 if let Some(pn_str) = req.query_param("partNumber") {
                     let part_number: u32 =
                         pn_str.parse().map_err(|_| ServerError::InvalidArgument {
@@ -755,6 +833,15 @@ impl HttpFrontend {
                             reason: "partNumber must be >= 1".into(),
                         });
                     }
+                    let _ = observability::event_in_context(
+                        &trace,
+                        TRACE_TARGET,
+                        "head_object_part_request",
+                        Some(format_args!(
+                            "bucket={} key={} version_id={:?} part_number={}",
+                            bucket, key, vid, part_number
+                        )),
+                    );
                     let result = self
                         .coordinator
                         .head_object_part(&crate::coordinator::GetObjectPartRequest {
@@ -1736,6 +1823,13 @@ impl HttpFrontend {
         form_fields: &[(String, String)],
         file_name: Option<&str>,
     ) -> Result<StreamingPostContext, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "HttpFrontend::prepare_streaming_post_object",
+            "bucket={} file_name_present={}",
+            bucket,
+            file_name.is_some()
+        );
         let header_auth = self.authenticate_with_payload_check(req, false)?;
 
         let field = |name: &str| -> Option<&str> {
@@ -1855,6 +1949,7 @@ impl HttpFrontend {
             .unwrap_or(204);
 
         Ok(StreamingPostContext {
+            trace: current_trace_context(),
             binding: StreamObjectBinding {
                 session_id,
                 bucket: bucket.to_string(),
@@ -1878,6 +1973,15 @@ impl HttpFrontend {
         total_size: u64,
         actual_sha256_b64: &str,
     ) -> Result<S3Response, ServerError> {
+        let _trace = observability::AttachedTrace::new(ctx.trace.clone());
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "HttpFrontend::finalize_streaming_post_object",
+            "bucket={} key={} bytes={}",
+            ctx.binding.bucket,
+            ctx.binding.key,
+            total_size
+        );
         // Validate policy (if present) with the actual uploaded file size.
         if let Some(policy_b64) = ctx.policy_b64.as_deref() {
             let now = SystemTime::now()
@@ -1960,6 +2064,16 @@ impl HttpFrontend {
         segment_index: u32,
         data: &[u8],
     ) -> Result<(), ServerError> {
+        let _trace = observability::AttachedTrace::new(ctx.trace.clone());
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "HttpFrontend::streaming_append_post_segment",
+            "bucket={} key={} segment_index={} bytes={}",
+            ctx.binding.bucket,
+            ctx.binding.key,
+            segment_index,
+            data.len()
+        );
         self.coordinator.append_stream_segment(
             &ctx.binding.bucket,
             &ctx.binding.key,
@@ -1971,6 +2085,14 @@ impl HttpFrontend {
 
     /// Abort a streaming POST session (best-effort cleanup).
     pub fn abort_streaming_post_object(&self, ctx: &StreamingPostContext) {
+        let _trace = observability::AttachedTrace::new(ctx.trace.clone());
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "HttpFrontend::abort_streaming_post_object",
+            "bucket={} key={}",
+            ctx.binding.bucket,
+            ctx.binding.key
+        );
         let _ = self.coordinator.abort_stream_put(
             &ctx.binding.bucket,
             &ctx.binding.key,
@@ -1988,6 +2110,13 @@ impl HttpFrontend {
         bucket: &str,
         key: &str,
     ) -> Result<StreamingPutContext, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "HttpFrontend::prepare_streaming_put",
+            "bucket={} key={}",
+            bucket,
+            key
+        );
         let auth = self.authenticate_with_payload_check(req, false)?;
 
         validate_checksum_headers(req, false)?;
@@ -2054,6 +2183,7 @@ impl HttpFrontend {
         })?;
 
         Ok(StreamingPutContext {
+            trace: current_trace_context(),
             binding: StreamObjectBinding {
                 session_id,
                 bucket: bucket.to_string(),
@@ -2076,6 +2206,16 @@ impl HttpFrontend {
         segment_index: u32,
         data: &[u8],
     ) -> Result<(), ServerError> {
+        let _trace = observability::AttachedTrace::new(ctx.trace.clone());
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "HttpFrontend::streaming_append_segment",
+            "bucket={} key={} segment_index={} bytes={}",
+            ctx.binding.bucket,
+            ctx.binding.key,
+            segment_index,
+            data.len()
+        );
         self.coordinator.append_stream_segment(
             &ctx.binding.bucket,
             &ctx.binding.key,
@@ -2097,6 +2237,16 @@ impl HttpFrontend {
         total_size: u64,
         trailer_checksums: &[(String, String)],
     ) -> Result<S3Response, ServerError> {
+        let _trace = observability::AttachedTrace::new(ctx.trace.clone());
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "HttpFrontend::finalize_streaming_put",
+            "bucket={} key={} bytes={} trailer_checksums={}",
+            ctx.binding.bucket,
+            ctx.binding.key,
+            total_size,
+            trailer_checksums.len()
+        );
         // Merge trailer checksums into metadata blob so they're persisted.
         // Trailer values override any matching initial header entries.
         let metadata_blob = if trailer_checksums.is_empty() {
@@ -2147,6 +2297,14 @@ impl HttpFrontend {
 
     /// Abort a streaming session (best-effort cleanup).
     pub fn abort_streaming_put(&self, ctx: &StreamingPutContext) {
+        let _trace = observability::AttachedTrace::new(ctx.trace.clone());
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "HttpFrontend::abort_streaming_put",
+            "bucket={} key={}",
+            ctx.binding.bucket,
+            ctx.binding.key
+        );
         let _ = self.coordinator.abort_stream_put(
             &ctx.binding.bucket,
             &ctx.binding.key,
@@ -2163,6 +2321,15 @@ impl HttpFrontend {
         upload_id: &str,
         part_number: u32,
     ) -> Result<StreamingPartContext, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "HttpFrontend::prepare_streaming_part",
+            "bucket={} key={} upload_id={} part_number={}",
+            bucket,
+            key,
+            upload_id,
+            part_number
+        );
         let auth = self.authenticate_with_payload_check(req, false)?;
 
         let claimed_checksum = extract_checksum_header(req)?;
@@ -2185,6 +2352,7 @@ impl HttpFrontend {
             })?;
 
         Ok(StreamingPartContext {
+            trace: current_trace_context(),
             binding: StreamPartBinding {
                 object: StreamObjectBinding {
                     session_id: begin.session_id,
@@ -2210,6 +2378,18 @@ impl HttpFrontend {
         segment_index: u32,
         data: &[u8],
     ) -> Result<(), ServerError> {
+        let _trace = observability::AttachedTrace::new(ctx.trace.clone());
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "HttpFrontend::streaming_append_part_segment",
+            "bucket={} key={} upload_id={} part_number={} segment_index={} bytes={}",
+            ctx.binding.object.bucket,
+            ctx.binding.object.key,
+            ctx.binding.upload_id,
+            ctx.binding.part_number,
+            segment_index,
+            data.len()
+        );
         self.coordinator.append_stream_segment(
             &ctx.binding.object.bucket,
             &ctx.binding.object.key,
@@ -2232,6 +2412,18 @@ impl HttpFrontend {
         trailer_checksums: &[(String, String)],
         computed_checksum: Option<RawChecksum>,
     ) -> Result<S3Response, ServerError> {
+        let _trace = observability::AttachedTrace::new(ctx.trace.clone());
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "HttpFrontend::finalize_streaming_part",
+            "bucket={} key={} upload_id={} part_number={} bytes={} trailer_checksums={}",
+            ctx.binding.object.bucket,
+            ctx.binding.object.key,
+            ctx.binding.upload_id,
+            ctx.binding.part_number,
+            total_size,
+            trailer_checksums.len()
+        );
         // If trailer checksums are present, use the first one as the claimed
         // checksum (overriding any from request headers). Trailing checksums
         // take precedence since they are computed after the body is sent.
@@ -2296,6 +2488,16 @@ impl HttpFrontend {
 
     /// Abort a streaming `UploadPart` session (best-effort cleanup).
     pub fn abort_streaming_part(&self, ctx: &StreamingPartContext) {
+        let _trace = observability::AttachedTrace::new(ctx.trace.clone());
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "HttpFrontend::abort_streaming_part",
+            "bucket={} key={} upload_id={} part_number={}",
+            ctx.binding.object.bucket,
+            ctx.binding.object.key,
+            ctx.binding.upload_id,
+            ctx.binding.part_number
+        );
         let _ = self.coordinator.abort_stream_put(
             &ctx.binding.object.bucket,
             &ctx.binding.object.key,
@@ -2337,6 +2539,7 @@ pub struct StreamingPartChecksumContract {
 ///
 /// Created by `prepare_streaming_put`, used across async/blocking boundaries.
 pub struct StreamingPutContext {
+    pub trace: observability::TraceContext,
     pub binding: StreamObjectBinding,
     pub metadata_blob: crate::metadata_blob::MetadataBlob,
     pub cond: crate::conditional::WriteCondition,
@@ -2348,6 +2551,7 @@ pub struct StreamingPutContext {
 
 /// Context for an in-progress streaming `PostObject`.
 pub struct StreamingPostContext {
+    pub trace: observability::TraceContext,
     pub binding: StreamObjectBinding,
     pub metadata_blob: crate::metadata_blob::MetadataBlob,
     pub success_status: u16,
@@ -2361,6 +2565,7 @@ pub struct StreamingPostContext {
 ///
 /// Created by `prepare_streaming_part`, used across async/blocking boundaries.
 pub struct StreamingPartContext {
+    pub trace: observability::TraceContext,
     pub binding: StreamPartBinding,
     pub checksum: StreamingPartChecksumContract,
     /// Signing context for aws-chunked modes, None for unsigned/plain.

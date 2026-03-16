@@ -9,6 +9,8 @@ use crate::pg_store::PgStore;
 use crate::traits::{ShardStore, StorageNode};
 use crate::types::GenerationId;
 
+const TRACE_TARGET: &str = "storage";
+
 /// A local storage node managing multiple PG stores.
 ///
 /// On construction, takes a data directory and a list of PG IDs.
@@ -57,6 +59,7 @@ impl LocalStorageNode {
     /// This returns the full PgStore which implements both ShardStore
     /// and PgMetadataStore.
     pub fn get_pg(&self, pg_id: u32) -> Result<&PgStore, StoreError> {
+        observability::trace_scope!(TRACE_TARGET, "LocalStorageNode::get_pg", "pg_id={}", pg_id);
         self.stores
             .get(&pg_id)
             .ok_or(StoreError::PgNotFound { pg_id })
@@ -170,6 +173,12 @@ impl SharedStorageNode {
     /// followed by delete) cannot interleave with concurrent writes that would
     /// make the bucket non-empty.
     pub fn lock_bucket(&self, bucket: &str) -> MutexGuard<'_, ()> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "SharedStorageNode::lock_bucket",
+            "bucket={}",
+            bucket
+        );
         let idx = self.bucket_lock_index(bucket);
         self.bucket_locks[idx]
             .lock()
@@ -178,6 +187,7 @@ impl SharedStorageNode {
 
     /// Lock and return a guard for the given PG.
     pub fn get_pg(&self, pg_id: u32) -> Result<MutexGuard<'_, PgStore>, StoreError> {
+        observability::trace_scope!(TRACE_TARGET, "SharedStorageNode::get_pg", "pg_id={}", pg_id);
         let mutex = self
             .stores
             .get(&pg_id)
@@ -321,6 +331,13 @@ impl SharedStorageNode {
         pg_a: u32,
         pg_b: u32,
     ) -> Result<(MutexGuard<'_, PgStore>, Option<MutexGuard<'_, PgStore>>), StoreError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "SharedStorageNode::lock_two_pgs",
+            "pg_a={} pg_b={}",
+            pg_a,
+            pg_b
+        );
         if pg_a == pg_b {
             let guard = self.get_pg(pg_a)?;
             return Ok((guard, None));

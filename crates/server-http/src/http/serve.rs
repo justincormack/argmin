@@ -23,6 +23,8 @@ use super::{HttpFrontend, S3HyperBody};
 use crate::coordinator::MAX_OBJECT_SIZE;
 use crate::error::ServerError;
 
+const TRACE_TARGET: &str = "server_http";
+
 /// Incremental hasher for validating trailing checksums in streaming uploads.
 ///
 /// Created when `x-amz-trailer` declares a checksum header. Fed with decoded
@@ -189,6 +191,20 @@ struct ServerState {
     config: ServeConfig,
 }
 
+fn spawn_blocking_with_trace<F, R>(
+    trace: observability::TraceContext,
+    f: F,
+) -> tokio::task::JoinHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let _trace = observability::AttachedTrace::new(trace);
+        f()
+    })
+}
+
 /// Run the HTTP server, accepting connections and dispatching to the frontend pool.
 ///
 /// Two layers of admission control:
@@ -275,6 +291,27 @@ async fn handle(
     state: Arc<ServerState>,
     req: Request<Incoming>,
 ) -> Result<http::Response<S3HyperBody>, Infallible> {
+    let trace = observability::TraceContext::new_request();
+    let query = req.uri().query().unwrap_or("");
+    let range_suffix = req
+        .headers()
+        .get(http::header::RANGE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| format!(" range={value}"))
+        .unwrap_or_default();
+    let _ = observability::event_in_context(
+        &trace,
+        TRACE_TARGET,
+        "request_start",
+        Some(format_args!(
+            "method={} path={} query={}{}",
+            req.method(),
+            req.uri().path(),
+            query,
+            range_suffix
+        )),
+    );
+
     // Acquire request permit before body collection to bound memory.
     let req_permit = if let Ok(Ok(permit)) = tokio::time::timeout(
         state.config.request_wait_timeout,
@@ -308,7 +345,16 @@ async fn handle(
         };
         let resp = match op {
             StreamingWriteOp::PutObject { bucket, key } => {
-                handle_streaming_put(Arc::clone(&state), parts, body, bucket, key, chunked).await
+                handle_streaming_put(
+                    Arc::clone(&state),
+                    parts,
+                    body,
+                    bucket,
+                    key,
+                    chunked,
+                    trace.clone(),
+                )
+                .await
             }
             StreamingWriteOp::UploadPart {
                 bucket,
@@ -325,6 +371,7 @@ async fn handle(
                     upload_id,
                     part_number,
                     chunked,
+                    trace.clone(),
                 )
                 .await
             }
@@ -337,7 +384,9 @@ async fn handle(
     }
 
     if let Some(bucket) = post_object_bucket(&parts) {
-        let resp = handle_streaming_post_object(Arc::clone(&state), parts, body, bucket).await;
+        let resp =
+            handle_streaming_post_object(Arc::clone(&state), parts, body, bucket, trace.clone())
+                .await;
         return Ok(s3_response_to_hyper(
             resp,
             Some(req_permit),
@@ -370,7 +419,7 @@ async fn handle(
     };
 
     let state_ref = Arc::clone(&state);
-    let resp = tokio::task::spawn_blocking(move || {
+    let resp = spawn_blocking_with_trace(trace, move || {
         let frontend = acquire_frontend(&state_ref);
         frontend.handle_s3_request(&s3req)
     })
@@ -681,6 +730,7 @@ async fn handle_streaming_post_object(
     parts: http::request::Parts,
     body: Incoming,
     bucket: String,
+    trace: observability::TraceContext,
 ) -> S3Response {
     use base64::Engine;
 
@@ -773,7 +823,7 @@ async fn handle_streaming_post_object(
                                 let req = Arc::clone(&req_arc);
                                 let bucket_clone = bucket.clone();
                                 let fields_clone = fields.clone();
-                                let ctx_res = tokio::task::spawn_blocking(move || {
+                                let ctx_res = spawn_blocking_with_trace(trace.clone(), move || {
                                     let frontend = acquire_frontend(&st);
                                     frontend.prepare_streaming_post_object(
                                         &req,
@@ -956,6 +1006,7 @@ async fn handle_streaming_put(
     bucket: String,
     key: String,
     chunked: ChunkedMode,
+    trace: observability::TraceContext,
 ) -> S3Response {
     let idle_timeout = state.config.body_idle_timeout;
 
@@ -968,7 +1019,7 @@ async fn handle_streaming_put(
     let state2 = Arc::clone(&state);
     let bucket_clone = bucket.clone();
     let key_clone = key.clone();
-    let ctx = match tokio::task::spawn_blocking(move || {
+    let ctx = match spawn_blocking_with_trace(trace, move || {
         let frontend = acquire_frontend(&state2);
         frontend.prepare_streaming_put(&s3req, &bucket_clone, &key_clone)
     })
@@ -1230,6 +1281,7 @@ async fn handle_streaming_part(
     upload_id: String,
     part_number: u32,
     chunked: ChunkedMode,
+    trace: observability::TraceContext,
 ) -> S3Response {
     let idle_timeout = state.config.body_idle_timeout;
 
@@ -1243,7 +1295,7 @@ async fn handle_streaming_part(
     let bucket_clone = bucket.clone();
     let key_clone = key.clone();
     let upload_id_clone = upload_id.clone();
-    let ctx = match tokio::task::spawn_blocking(move || {
+    let ctx = match spawn_blocking_with_trace(trace, move || {
         let frontend = acquire_frontend(&state2);
         frontend.prepare_streaming_part(
             &s3req,

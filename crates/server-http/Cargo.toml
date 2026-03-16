@@ -11,6 +11,7 @@ path = "src/lib.rs"
 auth = { path = "../auth" }
 checksum = { path = "../checksum" }
 ec = { path = "../ec" }
+observability = { path = "../observability" }
 server-core = { path = "../server-core" }
 s3-types = { path = "../s3-types" }
 base64 = "0.22"
