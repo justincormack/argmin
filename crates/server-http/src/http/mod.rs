@@ -249,7 +249,7 @@ impl S3HyperBody {
             loop {
                 match body.next_chunk(read_chunk_size) {
                     Ok(Some(chunk)) => {
-                        if tx.blocking_send(Ok(Bytes::from(chunk))).is_err() {
+                        if tx.blocking_send(Ok(Bytes::from_owner(chunk))).is_err() {
                             break;
                         }
                     }

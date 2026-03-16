@@ -164,6 +164,52 @@ pub struct BeginStreamPartResult {
     pub checksum_algorithm: Option<ChecksumAlgorithm>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ReadChunk {
+    data: Arc<Vec<u8>>,
+    start: usize,
+    end: usize,
+}
+
+impl ReadChunk {
+    fn from_vec(data: Vec<u8>) -> Self {
+        let len = data.len();
+        Self {
+            data: Arc::new(data),
+            start: 0,
+            end: len,
+        }
+    }
+
+    fn from_shared_range(data: Arc<Vec<u8>>, start: usize, end: usize) -> Self {
+        debug_assert!(start <= end);
+        debug_assert!(end <= data.len());
+        Self { data, start, end }
+    }
+
+    pub fn len(&self) -> usize {
+        self.end - self.start
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl AsRef<[u8]> for ReadChunk {
+    fn as_ref(&self) -> &[u8] {
+        &self.data[self.start..self.end]
+    }
+}
+
+impl std::ops::Deref for ReadChunk {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_ref()
+    }
+}
+
 #[derive(Clone)]
 struct ReadRuntime {
     storage_node: Arc<SharedStorageNode>,
@@ -211,7 +257,7 @@ struct SegmentListReader {
     key: String,
     segments: Vec<SegmentSliceRecord>,
     next_segment_index: usize,
-    loaded_segment: Option<(Vec<u8>, usize, usize)>,
+    loaded_segment: Option<(Arc<Vec<u8>>, usize, usize)>,
 }
 
 #[derive(Debug, Clone)]
@@ -508,7 +554,7 @@ impl ReadHandle {
         }
     }
 
-    pub fn next_chunk(&mut self, target_size: usize) -> Result<Option<Vec<u8>>, ServerError> {
+    pub fn next_chunk(&mut self, target_size: usize) -> Result<Option<ReadChunk>, ServerError> {
         let _trace = self.trace.clone().map(observability::AttachedTrace::new);
         observability::trace_scope!(
             TRACE_TARGET,
@@ -519,18 +565,18 @@ impl ReadHandle {
             target_size
         );
         if target_size == 0 {
-            return Ok(Some(Vec::new()));
+            return Ok(Some(ReadChunk::from_vec(Vec::new())));
         }
 
         let next = match &mut self.inner {
             ReadHandleInner::Segments(reader) => reader.next_chunk(target_size),
             ReadHandleInner::Multipart(reader) => reader.next_chunk(target_size),
-            ReadHandleInner::TestBuffered(data) => Ok(data.take()),
+            ReadHandleInner::TestBuffered(data) => Ok(data.take().map(ReadChunk::from_vec)),
         }?;
 
         if let Some(chunk) = next {
             self.bytes_emitted += chunk.len();
-            self.crc64.update(&chunk);
+            self.crc64.update(chunk.as_ref());
             Ok(Some(chunk))
         } else {
             if self.bytes_emitted != self.expected_size {
@@ -1844,28 +1890,17 @@ impl ReadRuntime {
 }
 
 impl SegmentListReader {
-    fn next_chunk(&mut self, target_size: usize) -> Result<Option<Vec<u8>>, ServerError> {
+    fn next_chunk(&mut self, target_size: usize) -> Result<Option<ReadChunk>, ServerError> {
         loop {
-            let take_loaded_whole =
-                self.loaded_segment
-                    .as_ref()
-                    .is_some_and(|(loaded, offset, end_offset)| {
-                        if *offset >= *end_offset {
-                            return false;
-                        }
-                        let end = (*offset + target_size).min(*end_offset);
-                        *offset == 0 && *end_offset == loaded.len() && end == loaded.len()
-                    });
-            if take_loaded_whole {
-                let (loaded, _, _) = self.loaded_segment.take().unwrap();
-                return Ok(Some(loaded));
-            }
-
             if let Some((loaded, offset, end_offset)) = &mut self.loaded_segment {
                 if *offset < *end_offset {
                     let end = (*offset + target_size).min(*end_offset);
-                    let out = loaded[*offset..end].to_vec();
-                    *offset = end;
+                    let out = ReadChunk::from_shared_range(Arc::clone(loaded), *offset, end);
+                    if end == *end_offset {
+                        self.loaded_segment = None;
+                    } else {
+                        *offset = end;
+                    }
                     return Ok(Some(out));
                 }
                 self.loaded_segment = None;
@@ -1961,7 +1996,7 @@ impl SegmentListReader {
                     other => other,
                 })?;
             self.next_segment_index += 1;
-            self.loaded_segment = Some((data, slice.start_offset, slice.end_offset));
+            self.loaded_segment = Some((Arc::new(data), slice.start_offset, slice.end_offset));
             #[cfg(test)]
             if self.next_segment_index == 1 {
                 maybe_run_object_segments_first_segment_hook(&self.bucket, &self.key);
@@ -1971,7 +2006,7 @@ impl SegmentListReader {
 }
 
 impl MultipartReader {
-    fn next_chunk(&mut self, target_size: usize) -> Result<Option<Vec<u8>>, ServerError> {
+    fn next_chunk(&mut self, target_size: usize) -> Result<Option<ReadChunk>, ServerError> {
         loop {
             if let Some(current) = &mut self.current_part {
                 let chunk = current.next_chunk(target_size)?;
@@ -16669,14 +16704,14 @@ mod tests {
             key: "key".to_string(),
             segments: vec![],
             next_segment_index: 0,
-            loaded_segment: Some((data, 0, len)),
+            loaded_segment: Some((Arc::new(data), 0, len)),
         };
 
         let chunk = reader.next_chunk(len).unwrap().unwrap();
-        assert_eq!(chunk, vec![1u8, 2, 3, 4]);
-        assert_eq!(chunk.as_ptr(), ptr);
+        assert_eq!(chunk.as_ref(), [1u8, 2, 3, 4]);
+        assert_eq!(chunk.as_ref().as_ptr(), ptr);
         assert!(reader.loaded_segment.is_none());
-        assert_eq!(reader.next_chunk(len).unwrap(), None);
+        assert!(reader.next_chunk(len).unwrap().is_none());
     }
 
     #[test]
