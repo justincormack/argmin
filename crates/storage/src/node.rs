@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard};
+use std::time::Instant;
 
 use crate::error::StoreError;
 use crate::pg_store::PgStore;
@@ -10,6 +11,33 @@ use crate::traits::{ShardStore, StorageNode};
 use crate::types::GenerationId;
 
 const TRACE_TARGET: &str = "storage";
+
+pub struct BucketLockGuard<'a> {
+    guard: MutexGuard<'a, ()>,
+    bucket: String,
+    stripe: usize,
+    acquired_at: Instant,
+    trace: Option<observability::TraceContext>,
+}
+
+impl Drop for BucketLockGuard<'_> {
+    fn drop(&mut self) {
+        let _ = &self.guard;
+        if let Some(trace) = &self.trace {
+            let _ = observability::event_in_context(
+                trace,
+                TRACE_TARGET,
+                "bucket_lock_released",
+                Some(format_args!(
+                    "bucket={} stripe={} hold_us={}",
+                    self.bucket,
+                    self.stripe,
+                    self.acquired_at.elapsed().as_micros()
+                )),
+            );
+        }
+    }
+}
 
 /// A local storage node managing multiple PG stores.
 ///
@@ -172,7 +200,7 @@ impl SharedStorageNode {
     /// gate so multi-step flows (for example, delete-bucket emptiness check
     /// followed by delete) cannot interleave with concurrent writes that would
     /// make the bucket non-empty.
-    pub fn lock_bucket(&self, bucket: &str) -> MutexGuard<'_, ()> {
+    pub fn lock_bucket(&self, bucket: &str) -> BucketLockGuard<'_> {
         observability::trace_scope!(
             TRACE_TARGET,
             "SharedStorageNode::lock_bucket",
@@ -180,9 +208,31 @@ impl SharedStorageNode {
             bucket
         );
         let idx = self.bucket_lock_index(bucket);
-        self.bucket_locks[idx]
+        let trace = observability::current_context();
+        let wait_started_at = Instant::now();
+        let guard = self.bucket_locks[idx]
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(|e| e.into_inner());
+        let wait_us = wait_started_at.elapsed().as_micros();
+        let acquired_at = Instant::now();
+        if let Some(trace) = &trace {
+            let _ = observability::event_in_context(
+                trace,
+                TRACE_TARGET,
+                "bucket_lock_acquired",
+                Some(format_args!(
+                    "bucket={} stripe={} wait_us={}",
+                    bucket, idx, wait_us
+                )),
+            );
+        }
+        BucketLockGuard {
+            guard,
+            bucket: bucket.to_string(),
+            stripe: idx,
+            acquired_at,
+            trace,
+        }
     }
 
     /// Lock and return a guard for the given PG.
