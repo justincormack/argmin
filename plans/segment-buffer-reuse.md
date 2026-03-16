@@ -28,18 +28,28 @@ This is only about internal segment payload movement. It does not change:
 - EC parameters
 - tracing behavior except where extra detail helps validate the work
 
-## Planned steps
+## Completed
 
-1. healthy read path: read shard files directly into caller-provided segment
-   buffers instead of allocating one `Vec` per shard
-2. write path: avoid cloning aligned segment payloads into `padded`; only
-   allocate a padded copy when the final segment length is not divisible by `k`
-3. response path: replace `ReadHandle::next_chunk() -> Vec<u8>` with an owned
-   chunk type that can carry a reusable segment buffer without copying
-4. ingress path: remove `drain(..).collect()` segment flush copies in
-   `server-http` write buffering
-5. pooling: introduce a small reusable segment-buffer abstraction once the read
-   and write APIs can hand ownership across layers cleanly
+1. healthy read path now reads shard files directly into the assembled segment
+   buffer instead of allocating one `Vec` per shard
+2. aligned write segments no longer clone into `padded`; only short final
+   segments allocate a padded copy
+3. response reads now use an owned chunk view instead of copying partial
+   segment slices into fresh `Vec<u8>` buffers
+4. `server-http` streaming ingest no longer uses `drain(..).collect()` to copy
+   full `8 MiB` segments before handing them to `server-core`
+
+## Remaining
+
+1. introduce a reusable segment-buffer abstraction for the healthy path so
+   segment-sized buffers can be recycled instead of freshly allocated
+2. thread that buffer ownership across read, copy, and write boundaries so
+   `server-core` can hand off payload buffers instead of repeatedly creating
+   new `Vec`/`Arc<Vec>` owners
+3. decide how far to take scratch reuse on recovery paths:
+   - parity buffers during normal encode
+   - reconstruction buffers on fallback reads
+   - any checksum or small control-path scratch that is still per-segment
 
 ## Notes
 
