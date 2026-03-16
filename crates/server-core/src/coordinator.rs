@@ -30,10 +30,7 @@ use crate::conditional::{
 use crate::error::ServerError;
 use crate::etag::{compute_multipart_etag, crc64_to_etag_bytes, etag_bytes_to_crc64, format_etag};
 use crate::metadata_blob::MetadataBlob;
-use crate::pg::{
-    multipart_part_segment_key_hash, object_key_hash, part_key_hash, stream_segment_key_hash,
-    PgTopology,
-};
+use crate::pg::{object_key_hash, part_key_hash, stream_segment_key_hash, PgTopology};
 use crate::range::ByteRange;
 
 const TRACE_TARGET: &str = "server_core";
@@ -1189,12 +1186,6 @@ pub struct UploadPartResult {
 pub struct UploadPartCopyResult {
     pub etag: String,
     pub last_modified: u64,
-}
-
-/// Internal result from the shared part-write path.
-struct WritePartInnerResult {
-    etag: String,
-    last_modified: u64,
 }
 
 /// Result of a CreateMultipartUpload operation.
@@ -4028,7 +4019,7 @@ impl Coordinator {
             MetadataDirective::Replace {
                 checksum_algorithm: Some(algo),
                 ..
-            } => Some(CopyChecksumAccumulator::new(*algo)),
+            } => Some(StreamingChecksumAccumulator::new(*algo)),
             _ => None,
         };
         let session_id = self.begin_stream_put(&BeginStreamPutRequest {
@@ -5903,8 +5894,16 @@ impl Coordinator {
         let _dst_bucket_info = self.authorize_object_write_requester(requester, dst_bucket)?;
         let _src_bucket_info = self.authorize_bucket_read_requester(requester, src_bucket)?;
 
-        // Phase 1: Read source object (only the needed range)
-        let source_data = {
+        let not_found = |e: ServerError| match e {
+            ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
+                bucket: src_bucket.to_string(),
+                key: src_key.to_string(),
+            },
+            other => other,
+        };
+
+        // Phase 1: Snapshot source metadata and prepare a ranged read handle.
+        let mut source_body = {
             let LockedReadObject {
                 record: src_stored,
                 pgs,
@@ -5946,17 +5945,21 @@ impl Coordinator {
 
             let (read_start, read_end) =
                 copy_source_range.unwrap_or((0, source_size.saturating_sub(1)));
-
-            let not_found = |e: ServerError| match e {
-                ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
-                    bucket: src_bucket.to_string(),
-                    key: src_key.to_string(),
-                },
-                other => other,
+            let copy_size = if source_size == 0 {
+                0
+            } else {
+                read_end - read_start + 1
             };
+            if copy_size > MAX_OBJECT_SIZE {
+                return Err(ServerError::ObjectTooLarge {
+                    size: copy_size,
+                    max: MAX_OBJECT_SIZE,
+                });
+            }
 
             if source_size == 0 {
-                vec![]
+                drop(pgs);
+                ReadHandle::from_buffered_bytes(Vec::new())
             } else if matches!(src_record.layout, ObjectLayout::MultipartManifest { .. }) {
                 let meta_pg = pgs.meta();
                 let obj_parts = Self::snapshot_multipart_parts(
@@ -5977,7 +5980,7 @@ impl Coordinator {
                 drop(pgs);
                 #[cfg(test)]
                 maybe_run_multipart_snapshot_hook(src_bucket, src_key);
-                body.into_bytes().map_err(not_found)?
+                body
             } else {
                 // Non-multipart source: check for object segments first.
                 let meta_pg = pgs.meta();
@@ -5995,316 +5998,93 @@ impl Coordinator {
                     read_end as usize,
                 );
                 drop(pgs);
-                body.into_bytes().map_err(not_found)?
+                body
             }
         }; // source locks dropped here
 
-        let part_data = &source_data;
+        // Phase 2: Stream into the destination multipart part session.
+        let session = self.begin_stream_part(&BeginStreamPartRequest {
+            bucket: dst_bucket,
+            key: dst_key,
+            upload_id,
+            part_number,
+            requester,
+        })?;
+        let session_id = &session.session_id;
+        let result = (|| {
+            let mut crc64 = checksum::crc64::Hasher::new();
+            let mut total_size = 0u64;
+            let mut segment_index = 0u32;
+            let mut computed_checksum = session
+                .checksum_algorithm
+                .map(StreamingChecksumAccumulator::new);
 
-        // Phase 3: Write part data (no claimed checksum for copy)
-        let inner =
-            self.write_part_inner(dst_bucket, dst_key, upload_id, part_number, part_data, None)?;
+            while let Some(chunk) = source_body
+                .next_chunk(INTERNAL_SEGMENT_SIZE)
+                .map_err(not_found)?
+            {
+                total_size = total_size.checked_add(chunk.len() as u64).ok_or_else(|| {
+                    ServerError::InternalError {
+                        reason: "upload part copy size overflow".to_string(),
+                    }
+                })?;
+                crc64.update(&chunk);
+                if let Some(checksum) = computed_checksum.as_mut() {
+                    checksum.update(&chunk);
+                }
+                self.append_stream_segment(dst_bucket, dst_key, session_id, segment_index, &chunk)?;
+                segment_index =
+                    segment_index
+                        .checked_add(1)
+                        .ok_or_else(|| ServerError::InternalError {
+                            reason: "too many upload part copy segments".to_string(),
+                        })?;
+            }
+
+            let computed_checksum = match computed_checksum {
+                Some(checksum) => Some(
+                    RawChecksum::new(checksum.algorithm(), checksum.finalize()).map_err(|_| {
+                        ServerError::InternalError {
+                            reason: "checksum byte length mismatch".to_string(),
+                        }
+                    })?,
+                ),
+                None => None,
+            };
+            // UploadPartCopy has no checksum header/body claim from the client.
+            // When the multipart upload is checksum-configured, treat the
+            // server-computed checksum as the authoritative part claim.
+            let claimed_checksum = computed_checksum.as_ref().map(|checksum| ChecksumClaim {
+                algorithm: checksum.algorithm(),
+                expected_bytes: checksum.bytes().to_vec(),
+            });
+
+            self.finalize_stream_part(FinalizeStreamPartRequest {
+                bucket: dst_bucket,
+                key: dst_key,
+                session_id,
+                upload_id,
+                part_number,
+                crc64: crc64.finalize(),
+                total_size,
+                claimed_checksum: claimed_checksum.as_ref(),
+                computed_checksum,
+            })
+        })();
+        if result.is_err() {
+            let _ = self.abort_stream_put(dst_bucket, dst_key, session_id);
+        }
+        let inner = result?;
+        let meta_pg = self
+            .storage_node
+            .get_pg(self.object_pg_id(dst_bucket, dst_key))?;
+        let last_modified = meta_pg
+            .get_multipart_part(upload_id, part_number)
+            .map_err(ServerError::Metadata)?
+            .last_modified;
         Ok(UploadPartCopyResult {
             etag: inner.etag,
-            last_modified: inner.last_modified,
-        })
-    }
-
-    /// Shared implementation for writing a multipart part.
-    ///
-    /// Validates part number, locks PGs, EC-encodes data, writes shards,
-    /// upserts part metadata, and cleans up prior generations.
-    fn write_part_inner(
-        &self,
-        bucket: &str,
-        key: &str,
-        upload_id: &str,
-        part_number: u32,
-        data: &[u8],
-        claimed_checksum: Option<&ChecksumClaim>,
-    ) -> Result<WritePartInnerResult, ServerError> {
-        // 1. Validate part number range [1, 10000].
-        if part_number == 0 || part_number > 10_000 {
-            return Err(ServerError::InvalidArgument {
-                reason: format!("part number must be between 1 and 10000, got {part_number}"),
-            });
-        }
-
-        // 2. Lock meta PG and shard PG in global ascending order.
-        //
-        //    The shard PG depends on the generation, which is read from metadata.
-        //    If meta_pg_id > shard_pg_id, drop, relock in order, and re-read.
-        let meta_pg_id = self.object_pg_id(bucket, key);
-
-        let (meta_pg, shard_guard, generation, shard_pg_id, upload_checksum_algo) = loop {
-            let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
-
-            // Validate upload exists, belongs to this bucket/key, and is InProgress.
-            let upload = meta_pg.get_multipart_upload(upload_id)?;
-            if upload.bucket != bucket || upload.key != key {
-                return Err(ServerError::NoSuchUpload {
-                    upload_id: upload_id.to_string(),
-                });
-            }
-            if upload.state != UploadState::InProgress {
-                return Err(ServerError::NoSuchUpload {
-                    upload_id: upload_id.to_string(),
-                });
-            }
-            let upload_algo = upload.checksum.map(MultipartChecksumConfig::algorithm);
-
-            // Determine next generation for this part number.
-            let generation = match meta_pg.get_multipart_part(upload_id, part_number) {
-                Ok(existing) => existing.generation + 1,
-                Err(storage::MetadataError::PartNotFound { .. }) => 0,
-                Err(e) => return Err(ServerError::Metadata(e)),
-            };
-
-            let shard_pg_id = self.shard_pg_id_raw(
-                &format!("mpu/{upload_id}"),
-                &format!("{part_number}/{generation}"),
-                u64::from(generation) + 1,
-            );
-
-            if shard_pg_id == meta_pg_id {
-                break (meta_pg, None, generation, shard_pg_id, upload_algo);
-            }
-
-            if meta_pg_id < shard_pg_id {
-                // Already in ascending order.
-                let shard_guard = self.storage_node.get_pg(shard_pg_id)?;
-                break (
-                    meta_pg,
-                    Some(shard_guard),
-                    generation,
-                    shard_pg_id,
-                    upload_algo,
-                );
-            }
-
-            // Out of order: drop meta_pg, relock both in ascending order, revalidate.
-            drop(meta_pg);
-            let (meta_pg, shard_guard) = self.storage_node.lock_two_pgs(meta_pg_id, shard_pg_id)?;
-
-            let upload = meta_pg.get_multipart_upload(upload_id)?;
-            if upload.bucket != bucket || upload.key != key {
-                return Err(ServerError::NoSuchUpload {
-                    upload_id: upload_id.to_string(),
-                });
-            }
-            if upload.state != UploadState::InProgress {
-                return Err(ServerError::NoSuchUpload {
-                    upload_id: upload_id.to_string(),
-                });
-            }
-            let upload_algo = upload.checksum.map(MultipartChecksumConfig::algorithm);
-
-            let generation = match meta_pg.get_multipart_part(upload_id, part_number) {
-                Ok(existing) => existing.generation + 1,
-                Err(storage::MetadataError::PartNotFound { .. }) => 0,
-                Err(e) => return Err(ServerError::Metadata(e)),
-            };
-
-            let verify_shard_pg_id = self.shard_pg_id_raw(
-                &format!("mpu/{upload_id}"),
-                &format!("{part_number}/{generation}"),
-                u64::from(generation) + 1,
-            );
-
-            // Generation changed while relocking — shard PG may differ. Retry.
-            if verify_shard_pg_id != shard_pg_id {
-                continue;
-            }
-
-            break (meta_pg, shard_guard, generation, shard_pg_id, upload_algo);
-        };
-
-        // 3. Validate and compute part checksum.
-        //    The upload's checksum_algorithm is the single source of truth.
-        //    Parts may only carry a checksum if the upload was configured with one,
-        //    and it must match. This prevents untagged raw bytes from being stored.
-        let claimed_algo = claimed_checksum.map(ChecksumClaim::algorithm);
-        let effective_algo = match (upload_checksum_algo, claimed_algo) {
-            (Some(upload_algo), Some(part_algo)) if upload_algo != part_algo => {
-                return Err(ServerError::InvalidRequest {
-                    reason: format!(
-                        "checksum algorithm mismatch: upload configured with {} but part sent {}",
-                        upload_algo.as_str(),
-                        part_algo.as_str()
-                    ),
-                });
-            }
-            (Some(algo), Some(_)) => Some(algo),
-            // AWS rejects parts without a checksum when the upload requires one.
-            (Some(upload_algo), None) => {
-                return Err(ServerError::InvalidRequest {
-                    reason: format!(
-                        "Checksum Type mismatch occurred, expected checksum Type: {}, actual checksum Type: null",
-                        upload_algo.as_str().to_lowercase()
-                    ),
-                });
-            }
-            // AWS SDK v2+ sends CRC32 by default on all requests. Accept the
-            // checksum for verification even when the upload has no algorithm;
-            // it won't contribute to the object-level checksum.
-            (None, Some(part_algo)) => Some(part_algo),
-            (None, None) => None,
-        };
-
-        let checksum_bytes = effective_algo.map(|algo| compute_checksum(algo, data));
-
-        // Verify claimed checksum value if present.
-        if let (Some(claim), Some(ref actual)) = (&claimed_checksum, &checksum_bytes) {
-            if claim.expected_bytes() != actual.as_slice() {
-                return Err(ServerError::InvalidRequest {
-                    reason: "checksum mismatch".to_string(),
-                });
-            }
-        }
-
-        // 4. Segmented multipart parts use the zero part_okh sentinel and store
-        //    their payload identity in multipart_part_segments rows instead.
-        let part_okh = [0u8; 16];
-        let part_vid = GenerationId::MIN;
-
-        // 5. EC-encode part data (no metadata blob for parts — raw data only).
-        let etag_crc = checksum::crc64::checksum(data);
-
-        let k = self.ec_config.data_shards as usize;
-        let m = self.ec_config.parity_shards as usize;
-        let shard_pg: &storage::PgStore = shard_guard.as_deref().unwrap_or(&meta_pg);
-        let mut written_shards: Vec<ShardKey> = Vec::new();
-        let mut committed_segments = Vec::new();
-        let write_result: Result<(), ServerError> = (|| {
-            for (segment_index, segment_data) in data.chunks(INTERNAL_SEGMENT_SIZE).enumerate() {
-                let segment_index =
-                    u32::try_from(segment_index).map_err(|_| ServerError::InternalError {
-                        reason: "too many multipart part segments".to_string(),
-                    })?;
-                let segment_okh = multipart_part_segment_key_hash(
-                    upload_id,
-                    part_number,
-                    generation,
-                    segment_index,
-                );
-                let segment_vid = GenerationId::MIN;
-
-                let mut padded = segment_data.to_vec();
-                let remainder = padded.len() % k;
-                if remainder != 0 {
-                    padded.resize(padded.len() + (k - remainder), 0);
-                }
-
-                let shard_size = padded.len() / k;
-                let data_shards: Vec<&[u8]> = (0..k)
-                    .map(|i| &padded[i * shard_size..(i + 1) * shard_size])
-                    .collect();
-                let mut parity_bufs: Vec<Vec<u8>> = (0..m).map(|_| vec![0u8; shard_size]).collect();
-                let mut parity_refs: Vec<&mut [u8]> = parity_bufs
-                    .iter_mut()
-                    .map(std::vec::Vec::as_mut_slice)
-                    .collect();
-                self.ec_codec.encode(&data_shards, &mut parity_refs)?;
-
-                for i in 0..(k + m) {
-                    let shard_key = ShardKey::new(&segment_okh, segment_vid.get(), i as u8);
-                    let shard_data = if i < k {
-                        data_shards[i]
-                    } else {
-                        &parity_bufs[i - k]
-                    };
-                    shard_pg.write_shard(&shard_key, shard_data)?;
-                    written_shards.push(shard_key);
-                }
-
-                committed_segments.push(MultipartPartSegmentRecord {
-                    bucket: BucketName::from(bucket),
-                    key: ObjectKey::from(key),
-                    upload_id: UploadId::from(upload_id),
-                    version_id: storage::MULTIPART_PART_SEGMENT_STAGING_VERSION_ID.to_u64(),
-                    part_number,
-                    segment_index,
-                    size: segment_data.len() as u64,
-                    segment_crc64: Some(checksum::crc64::checksum(segment_data)),
-                    segment_okh,
-                    segment_vid,
-                    shard_pg_id,
-                    ec_k: self.ec_config.data_shards,
-                    ec_m: self.ec_config.parity_shards,
-                });
-            }
-            Ok(())
-        })();
-
-        if let Err(e) = write_result {
-            for shard_key in &written_shards {
-                let _ = shard_pg.delete_shard(shard_key);
-            }
-            return Err(e);
-        }
-
-        // 7. Upsert part metadata.
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
-        let upsert_result = meta_pg.upsert_multipart_part_segments(
-            &MultipartPartRecord {
-                upload_id: UploadId::from(upload_id),
-                part_number,
-                generation,
-                size: data.len() as u64,
-                etag: crc64_to_etag_bytes(etag_crc),
-                etag_kind: storage::EtagKind::Crc64,
-                part_okh,
-                part_vid,
-                ec_k: self.ec_config.data_shards,
-                ec_m: self.ec_config.parity_shards,
-                last_modified: now,
-                checksum: checksum_bytes.clone(),
-            },
-            &committed_segments,
-        );
-
-        let (prev_gen, prev_segments) = match upsert_result {
-            Ok(prev) => prev,
-            Err(e) => {
-                // Best-effort cleanup of written shards.
-                for shard_key in &written_shards {
-                    let _ = shard_pg.delete_shard(shard_key);
-                }
-                return Err(e.into());
-            }
-        };
-
-        // 8. Best-effort delete prior generation's shards.
-        //    Drop all held PG guards first to avoid deadlock, since the
-        //    old generation may map to any PG including those we hold.
-        drop(shard_guard);
-        drop(meta_pg);
-        if !prev_segments.is_empty() {
-            self.delete_segment_shards_generic(&prev_segments)?;
-        } else if let Some(old_gen) = prev_gen {
-            let old_okh = part_key_hash(upload_id, part_number, old_gen);
-            let old_vid =
-                GenerationId::new(u64::from(old_gen) + 1).expect("old generation must be nonzero");
-            let old_shard_pg_id = self.shard_pg_id_raw(
-                &format!("mpu/{upload_id}"),
-                &format!("{part_number}/{old_gen}"),
-                old_vid.get(),
-            );
-            if let Ok(old_pg) = self.storage_node.get_pg(old_shard_pg_id) {
-                for i in 0..(k + m) {
-                    let old_key = ShardKey::new(&old_okh, old_vid.get(), i as u8);
-                    let _ = old_pg.delete_shard(&old_key);
-                }
-            }
-        }
-
-        Ok(WritePartInnerResult {
-            etag: format_etag(etag_crc),
-            last_modified: now,
+            last_modified,
         })
     }
 
@@ -7039,7 +6819,7 @@ fn compute_checksum(algo: ChecksumAlgorithm, data: &[u8]) -> Vec<u8> {
     }
 }
 
-enum CopyChecksumAccumulator {
+enum StreamingChecksumAccumulator {
     Crc32(checksum::crc32::Hasher),
     Crc32c(checksum::crc32c::Hasher),
     Crc64(checksum::crc64::Hasher),
@@ -7047,7 +6827,7 @@ enum CopyChecksumAccumulator {
     Sha256(ring::digest::Context),
 }
 
-impl CopyChecksumAccumulator {
+impl StreamingChecksumAccumulator {
     fn new(algo: ChecksumAlgorithm) -> Self {
         match algo {
             ChecksumAlgorithm::Crc32 => Self::Crc32(checksum::crc32::Hasher::new()),
@@ -17406,6 +17186,120 @@ mod tests {
             })
             .unwrap();
         assert!(!result.etag.is_empty());
+    }
+
+    #[test]
+    fn upload_part_copy_streams_multisegment_source_and_persists_checksum() {
+        use base64::Engine;
+
+        let dir = test_util::tempdir();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let data: Vec<u8> = (0..((2 * INTERNAL_SEGMENT_SIZE) + 12_345))
+            .map(|i| (i % 251) as u8)
+            .collect();
+
+        let session_id = begin_stream_put_test(&coord, "bucket", "src").unwrap();
+        let mut crc64 = checksum::crc64::Hasher::new();
+        for (idx, chunk) in data.chunks(INTERNAL_SEGMENT_SIZE).enumerate() {
+            coord
+                .append_stream_segment("bucket", "src", &session_id, idx as u32, chunk)
+                .unwrap();
+            crc64.update(chunk);
+        }
+        coord
+            .finalize_stream_put(&FinalizeStreamPutRequest {
+                bucket: "bucket",
+                key: "src",
+                session_id: &session_id,
+                crc64: crc64.finalize(),
+                total_size: data.len() as u64,
+                metadata_blob: &MetadataBlob::new(),
+                tags: None,
+                cond: &WriteCondition::default(),
+            })
+            .unwrap();
+
+        let upload = coord
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "dst",
+                metadata: &MetadataBlob::new(),
+                checksum: Some(
+                    MultipartChecksumConfig::new(ChecksumAlgorithm::Crc32c, None).unwrap(),
+                ),
+                requester: TEST_REQUESTER,
+            })
+            .unwrap();
+
+        let part = coord
+            .upload_part_copy(&UploadPartCopyRequest {
+                source: CopySource {
+                    bucket: "bucket",
+                    key: "src",
+                    version_id: None,
+                    condition: NO_READ,
+                },
+                dst_bucket: "bucket",
+                dst_key: "dst",
+                upload_id: &upload.upload_id,
+                part_number: 1,
+                copy_source_range: None,
+                requester: TEST_REQUESTER,
+            })
+            .unwrap();
+
+        let parts = coord
+            .list_parts(&ListPartsRequest {
+                bucket: "bucket",
+                key: "dst",
+                upload_id: &upload.upload_id,
+                part_number_marker: None,
+                max_parts: 1000,
+                requester: TEST_REQUESTER,
+            })
+            .unwrap();
+        assert_eq!(parts.checksum_algorithm, Some(ChecksumAlgorithm::Crc32c));
+        assert_eq!(parts.parts.len(), 1);
+        let expected_checksum = base64::engine::general_purpose::STANDARD
+            .encode(checksum::crc32c::checksum(&data).to_be_bytes());
+        assert_eq!(
+            parts.parts[0].checksum.as_deref(),
+            Some(expected_checksum.as_str())
+        );
+
+        coord
+            .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                bucket: "bucket",
+                key: "dst",
+                upload_id: &upload.upload_id,
+                parts: &[CompletePart {
+                    part_number: 1,
+                    etag: part.etag,
+                    checksum: Some(
+                        ChecksumClaim::from_base64(
+                            ChecksumAlgorithm::Crc32c,
+                            parts.parts[0].checksum.as_deref().unwrap(),
+                        )
+                        .unwrap(),
+                    ),
+                }],
+                claimed_checksum: None,
+                requester: TEST_REQUESTER,
+            })
+            .unwrap();
+
+        let copied = coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "dst",
+                version_id: None,
+                cond: NO_READ,
+                requester: TEST_REQUESTER,
+            })
+            .unwrap();
+        assert_eq!(copied.body.into_bytes().unwrap(), data);
     }
 
     #[test]
