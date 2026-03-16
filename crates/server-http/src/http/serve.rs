@@ -289,7 +289,10 @@ async fn handle(
     req: Request<Incoming>,
 ) -> Result<http::Response<S3HyperBody>, Infallible> {
     let trace = observability::TraceContext::new_request();
-    let query = req.uri().query().unwrap_or("");
+    let method = req.method().to_string();
+    let path = req.uri().path().to_string();
+    let query = req.uri().query().unwrap_or("").to_string();
+    let response_trace = crate::http::ResponseTraceMeta::new(trace.clone(), &method, &path, &query);
     let range_suffix = req
         .headers()
         .get(http::header::RANGE)
@@ -302,10 +305,7 @@ async fn handle(
         "request_start",
         Some(format_args!(
             "method={} path={} query={}{}",
-            req.method(),
-            req.uri().path(),
-            query,
-            range_suffix
+            method, path, query, range_suffix
         )),
     );
 
@@ -323,6 +323,7 @@ async fn handle(
             resp,
             None,
             state.config.stream_read_chunk_size,
+            response_trace,
         ));
     };
 
@@ -337,6 +338,7 @@ async fn handle(
                     S3Response::error(&err, ""),
                     Some(req_permit),
                     state.config.stream_read_chunk_size,
+                    response_trace.clone(),
                 ))
             }
         };
@@ -377,6 +379,7 @@ async fn handle(
             resp,
             Some(req_permit),
             state.config.stream_read_chunk_size,
+            response_trace,
         ));
     }
 
@@ -388,6 +391,7 @@ async fn handle(
             resp,
             Some(req_permit),
             state.config.stream_read_chunk_size,
+            response_trace,
         ));
     }
 
@@ -400,6 +404,7 @@ async fn handle(
                 S3Response::error(&err, ""),
                 Some(req_permit),
                 state.config.stream_read_chunk_size,
+                response_trace,
             ));
         }
     };
@@ -411,6 +416,7 @@ async fn handle(
                 S3Response::error(&err, ""),
                 Some(req_permit),
                 state.config.stream_read_chunk_size,
+                response_trace,
             ));
         }
     };
@@ -434,6 +440,7 @@ async fn handle(
         resp,
         Some(req_permit),
         state.config.stream_read_chunk_size,
+        response_trace,
     ))
 }
 

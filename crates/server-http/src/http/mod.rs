@@ -8,7 +8,7 @@ pub mod router;
 pub mod serve;
 pub mod xml;
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::{
     pin::Pin,
     task::{Context, Poll},
@@ -83,15 +83,148 @@ enum S3HyperBodyState {
     Streaming(mpsc::Receiver<Result<Bytes, ServerError>>),
 }
 
+#[derive(Clone)]
+pub struct ResponseTraceMeta {
+    context: observability::TraceContext,
+    method: String,
+    path: String,
+    query: String,
+    started_at: Instant,
+}
+
+impl ResponseTraceMeta {
+    #[must_use]
+    pub fn new(
+        context: observability::TraceContext,
+        method: impl Into<String>,
+        path: impl Into<String>,
+        query: impl Into<String>,
+    ) -> Self {
+        Self {
+            context,
+            method: method.into(),
+            path: path.into(),
+            query: query.into(),
+            started_at: Instant::now(),
+        }
+    }
+}
+
+struct ResponseBodyTrace {
+    meta: ResponseTraceMeta,
+    status_code: u16,
+    body_len: u64,
+    bytes_sent: u64,
+    streaming: bool,
+    terminal_event_emitted: bool,
+}
+
+impl ResponseBodyTrace {
+    fn new(meta: ResponseTraceMeta, status_code: u16, body_len: u64, streaming: bool) -> Self {
+        Self {
+            meta,
+            status_code,
+            body_len,
+            bytes_sent: 0,
+            streaming,
+            terminal_event_emitted: false,
+        }
+    }
+
+    fn worker_context(&self) -> observability::TraceContext {
+        self.meta.context.clone()
+    }
+
+    fn record_bytes(&mut self, len: usize) {
+        self.bytes_sent += len as u64;
+    }
+
+    fn emit_complete(&mut self) {
+        if self.terminal_event_emitted {
+            return;
+        }
+        self.terminal_event_emitted = true;
+        let _ = observability::event_in_context(
+            &self.meta.context,
+            TRACE_TARGET,
+            "response_body_complete",
+            Some(format_args!(
+                "status={} method={} path={} query={} streaming={} body_len={} bytes_sent={} lifetime_us={}",
+                self.status_code,
+                self.meta.method,
+                self.meta.path,
+                self.meta.query,
+                self.streaming,
+                self.body_len,
+                self.bytes_sent,
+                self.meta.started_at.elapsed().as_micros()
+            )),
+        );
+    }
+
+    fn emit_error(&mut self, err: &ServerError) {
+        if self.terminal_event_emitted {
+            return;
+        }
+        self.terminal_event_emitted = true;
+        let _ = observability::event_in_context(
+            &self.meta.context,
+            TRACE_TARGET,
+            "response_body_error",
+            Some(format_args!(
+                "status={} method={} path={} query={} streaming={} body_len={} bytes_sent={} lifetime_us={} error={}",
+                self.status_code,
+                self.meta.method,
+                self.meta.path,
+                self.meta.query,
+                self.streaming,
+                self.body_len,
+                self.bytes_sent,
+                self.meta.started_at.elapsed().as_micros(),
+                err
+            )),
+        );
+    }
+
+    fn emit_dropped(&mut self) {
+        if self.terminal_event_emitted {
+            return;
+        }
+        self.terminal_event_emitted = true;
+        let _ = observability::event_in_context(
+            &self.meta.context,
+            TRACE_TARGET,
+            "response_body_dropped",
+            Some(format_args!(
+                "status={} method={} path={} query={} streaming={} body_len={} bytes_sent={} lifetime_us={}",
+                self.status_code,
+                self.meta.method,
+                self.meta.path,
+                self.meta.query,
+                self.streaming,
+                self.body_len,
+                self.bytes_sent,
+                self.meta.started_at.elapsed().as_micros()
+            )),
+        );
+    }
+}
+
 pub struct S3HyperBody {
     state: S3HyperBodyState,
+    trace: Option<ResponseBodyTrace>,
     _permit: Option<OwnedSemaphorePermit>,
 }
 
 impl S3HyperBody {
-    fn buffered(body: Vec<u8>, permit: Option<OwnedSemaphorePermit>) -> Self {
+    fn buffered(
+        body: Vec<u8>,
+        permit: Option<OwnedSemaphorePermit>,
+        trace: ResponseBodyTrace,
+    ) -> Self {
         Self {
             state: S3HyperBodyState::Buffered(Some(Bytes::from(body))),
+            trace: Some(trace),
             _permit: permit,
         }
     }
@@ -100,9 +233,12 @@ impl S3HyperBody {
         body: crate::coordinator::ReadHandle,
         permit: OwnedSemaphorePermit,
         read_chunk_size: usize,
+        trace: ResponseBodyTrace,
     ) -> Self {
+        let worker_trace = trace.worker_context();
         let (tx, rx) = mpsc::channel(2);
         tokio::task::spawn_blocking(move || {
+            let _trace = observability::AttachedTrace::new(worker_trace);
             observability::trace_scope!(
                 TRACE_TARGET,
                 "S3HyperBody::streaming",
@@ -128,6 +264,7 @@ impl S3HyperBody {
 
         Self {
             state: S3HyperBodyState::Streaming(rx),
+            trace: Some(trace),
             _permit: Some(permit),
         }
     }
@@ -144,13 +281,38 @@ impl Body for S3HyperBody {
         let this = self.get_mut();
         match &mut this.state {
             S3HyperBodyState::Buffered(bytes) => match bytes.take() {
-                Some(bytes) if !bytes.is_empty() => Poll::Ready(Some(Ok(Frame::data(bytes)))),
-                _ => Poll::Ready(None),
+                Some(bytes) if !bytes.is_empty() => {
+                    if let Some(trace) = this.trace.as_mut() {
+                        trace.record_bytes(bytes.len());
+                    }
+                    Poll::Ready(Some(Ok(Frame::data(bytes))))
+                }
+                _ => {
+                    if let Some(trace) = this.trace.as_mut() {
+                        trace.emit_complete();
+                    }
+                    Poll::Ready(None)
+                }
             },
             S3HyperBodyState::Streaming(rx) => match Pin::new(rx).poll_recv(cx) {
-                Poll::Ready(Some(Ok(bytes))) => Poll::Ready(Some(Ok(Frame::data(bytes)))),
-                Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(err))),
-                Poll::Ready(None) => Poll::Ready(None),
+                Poll::Ready(Some(Ok(bytes))) => {
+                    if let Some(trace) = this.trace.as_mut() {
+                        trace.record_bytes(bytes.len());
+                    }
+                    Poll::Ready(Some(Ok(Frame::data(bytes))))
+                }
+                Poll::Ready(Some(Err(err))) => {
+                    if let Some(trace) = this.trace.as_mut() {
+                        trace.emit_error(&err);
+                    }
+                    Poll::Ready(Some(Err(err)))
+                }
+                Poll::Ready(None) => {
+                    if let Some(trace) = this.trace.as_mut() {
+                        trace.emit_complete();
+                    }
+                    Poll::Ready(None)
+                }
                 Poll::Pending => Poll::Pending,
             },
         }
@@ -168,6 +330,22 @@ impl Body for S3HyperBody {
             S3HyperBodyState::Buffered(Some(bytes)) => SizeHint::with_exact(bytes.len() as u64),
             S3HyperBodyState::Buffered(None) => SizeHint::with_exact(0),
             S3HyperBodyState::Streaming(_) => SizeHint::default(),
+        }
+    }
+}
+
+impl Drop for S3HyperBody {
+    fn drop(&mut self) {
+        let Some(trace) = self.trace.as_mut() else {
+            return;
+        };
+        if trace.terminal_event_emitted {
+            return;
+        }
+        if trace.bytes_sent == trace.body_len {
+            trace.emit_complete();
+        } else {
+            trace.emit_dropped();
         }
     }
 }
@@ -2584,7 +2762,23 @@ pub fn s3_response_to_hyper(
     resp: S3Response,
     permit: Option<OwnedSemaphorePermit>,
     stream_read_chunk_size: usize,
+    trace_meta: ResponseTraceMeta,
 ) -> http::Response<S3HyperBody> {
+    let body_len = if resp.stream.is_some() {
+        resp.headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("Content-Length"))
+            .and_then(|(_, value)| value.parse::<u64>().ok())
+            .unwrap_or(0)
+    } else {
+        resp.body.len() as u64
+    };
+    let trace = ResponseBodyTrace::new(
+        trace_meta,
+        resp.status_code,
+        body_len,
+        resp.stream.is_some(),
+    );
     let mut builder = http::Response::builder().status(resp.status_code);
     for (name, value) in &resp.headers {
         builder = builder.header(name.as_str(), value.as_str());
@@ -2594,8 +2788,9 @@ pub fn s3_response_to_hyper(
             stream,
             permit.expect("streaming response requires request permit"),
             stream_read_chunk_size,
+            trace,
         ),
-        None => S3HyperBody::buffered(resp.body, permit),
+        None => S3HyperBody::buffered(resp.body, permit, trace),
     };
     builder
         .body(body)

@@ -1,5 +1,6 @@
 /// LocalStorageNode and SharedStorageNode — manage multiple PgStores on a single node.
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard};
@@ -8,7 +9,7 @@ use std::time::Instant;
 use crate::error::StoreError;
 use crate::pg_store::PgStore;
 use crate::traits::{ShardStore, StorageNode};
-use crate::types::GenerationId;
+use crate::types::{GenerationId, ShardKey};
 
 const TRACE_TARGET: &str = "storage";
 
@@ -243,6 +244,42 @@ impl SharedStorageNode {
             .get(&pg_id)
             .ok_or(StoreError::PgNotFound { pg_id })?;
         Ok(mutex.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Read a shard file directly without taking the per-PG mutex.
+    ///
+    /// The coordinator uses this on the healthy read path and validates the
+    /// assembled segment against `segment_crc64` before serving it. If the
+    /// shard is missing or the segment checksum does not match, callers fall
+    /// back to the fully locked `PgStore::read_shard` path for recovery and
+    /// quarantine behavior.
+    pub fn read_shard_file(&self, pg_id: u32, key: &ShardKey) -> Result<Vec<u8>, StoreError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "SharedStorageNode::read_shard_file",
+            "pg_id={} shard={}",
+            pg_id,
+            key.hex()
+        );
+        if !self.stores.contains_key(&pg_id) {
+            return Err(StoreError::PgNotFound { pg_id });
+        }
+
+        let shard_path = self
+            .data_dir
+            .join(format!("pg-{pg_id:04}"))
+            .join("shards")
+            .join(key.hex_prefix())
+            .join(key.hex());
+        fs::read(&shard_path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                return StoreError::NotFound;
+            }
+            StoreError::Io {
+                context: "read shard file",
+                source: e,
+            }
+        })
     }
 
     /// Acquire an in-memory lease on an object payload generation.
@@ -497,6 +534,29 @@ mod tests {
         assert_eq!(guard_a.pg_id(), 1);
         let guard_b = opt_b.unwrap();
         assert_eq!(guard_b.pg_id(), 0);
+    }
+
+    #[test]
+    fn shared_node_read_shard_file_roundtrip() {
+        let tmp = test_util::tempdir();
+        let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();
+        let key = crate::types::ShardKey::new(&[0xAB; 16], 7, 0);
+        {
+            let pg = node.get_pg(0).unwrap();
+            pg.write_shard(&key, b"hello").unwrap();
+        }
+
+        let data = node.read_shard_file(0, &key).unwrap();
+        assert_eq!(data, b"hello");
+    }
+
+    #[test]
+    fn shared_node_read_shard_file_missing() {
+        let tmp = test_util::tempdir();
+        let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();
+        let key = crate::types::ShardKey::new(&[0xCD; 16], 7, 0);
+        let err = node.read_shard_file(0, &key).unwrap_err();
+        assert!(matches!(err, StoreError::NotFound));
     }
 
     #[test]

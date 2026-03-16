@@ -1721,7 +1721,6 @@ impl ReadRuntime {
     }
 
     fn read_segment_payload(&self, segment: &SegmentPayloadRecord) -> Result<Vec<u8>, ServerError> {
-        let pg = self.storage_node.get_pg(segment.shard_pg_id)?;
         let k = segment.ec_k as usize;
         let m = segment.ec_m as usize;
         let padded = (segment.size as usize).div_ceil(k) * k;
@@ -1730,6 +1729,63 @@ impl ReadRuntime {
         if shard_size == 0 {
             return Ok(vec![]);
         }
+
+        if let Some(buf) = self.try_read_segment_payload_direct(segment, k, shard_size, padded)? {
+            return Ok(buf);
+        }
+
+        self.read_segment_payload_locked(segment, k, m, padded, shard_size)
+    }
+
+    fn try_read_segment_payload_direct(
+        &self,
+        segment: &SegmentPayloadRecord,
+        k: usize,
+        shard_size: usize,
+        padded: usize,
+    ) -> Result<Option<Vec<u8>>, ServerError> {
+        let Some(expected_crc64) = segment.segment_crc64 else {
+            return Ok(None);
+        };
+
+        let mut buf = Vec::with_capacity(padded);
+        for i in 0..k {
+            let shard_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i as u8);
+            let data = match self
+                .storage_node
+                .read_shard_file(segment.shard_pg_id, &shard_key)
+            {
+                Ok(data) => data,
+                Err(storage::StoreError::PgNotFound { pg_id }) => {
+                    return Err(ServerError::Store(storage::StoreError::PgNotFound {
+                        pg_id,
+                    }));
+                }
+                Err(_) => return Ok(None),
+            };
+            if data.len() != shard_size {
+                return Ok(None);
+            }
+            buf.extend_from_slice(&data);
+        }
+
+        buf.truncate(segment.size as usize);
+        let actual_crc64 = checksum::crc64::checksum(&buf);
+        if actual_crc64 != expected_crc64 {
+            return Ok(None);
+        }
+        Ok(Some(buf))
+    }
+
+    fn read_segment_payload_locked(
+        &self,
+        segment: &SegmentPayloadRecord,
+        k: usize,
+        m: usize,
+        padded: usize,
+        shard_size: usize,
+    ) -> Result<Vec<u8>, ServerError> {
+        let pg = self.storage_node.get_pg(segment.shard_pg_id)?;
 
         let needed: Vec<usize> = (0..k).collect();
         let mut all_shards = vec![None; k + m];
