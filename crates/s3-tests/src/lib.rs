@@ -60,6 +60,13 @@ impl TestContext {
     /// - `S3_TEST_ACCESS_KEY`: access key (defaults to test key)
     /// - `S3_TEST_SECRET_KEY`: secret key (defaults to test key)
     /// - `S3_TEST_REGION`: region (defaults to "us-east-1")
+    ///
+    /// Local embedded-server tracing helpers:
+    ///
+    /// - `S3_TEST_TRACE`: enables tracing for the local embedded server
+    /// - `S3_TEST_TRACE_FILTER`: comma-separated trace target filter
+    /// - `S3_TEST_TRACE_FILE`: trace file path
+    /// - `S3_TEST_TRACE_DIR`: trace directory; writes `<binary>.trace`
     pub async fn setup() -> Self {
         let external_endpoint = std::env::var("S3_TEST_ENDPOINT").ok();
 

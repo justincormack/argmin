@@ -47,12 +47,27 @@ The server is configured via environment variables:
 | `ARGMIN_WORKERS` | `4` | Number of frontend workers |
 | `ARGMIN_MAX_CONNECTIONS` | `512` | Max concurrent TCP connections |
 | `ARGMIN_MAX_INFLIGHT_REQUESTS` | `32` | Max concurrent in-flight requests |
+| `ARGMIN_STREAM_READ_CHUNK_SIZE` | `8388608` | HTTP streaming read chunk size |
+| `ARGMIN_TRACE` | `0` | Enable local tracing when truthy |
+| `ARGMIN_TRACE_FILTER` | *(all targets)* | Comma-separated trace target filter |
+| `ARGMIN_TRACE_FILE` | *(stderr)* | Write trace lines to a file instead of stderr |
 
 Start the server:
 
 ```bash
 ARGMIN_ACCESS_KEY_ID=admin \
 ARGMIN_SECRET_ACCESS_KEY=useasecuresecretkey \
+  ./target/release/argmin-s3
+```
+
+Enable tracing:
+
+```bash
+ARGMIN_ACCESS_KEY_ID=admin \
+ARGMIN_SECRET_ACCESS_KEY=useasecuresecretkey \
+ARGMIN_TRACE=1 \
+ARGMIN_TRACE_FILTER=server_http,auth,server_core,storage,ec \
+ARGMIN_TRACE_FILE=/tmp/argmin.trace \
   ./target/release/argmin-s3
 ```
 
@@ -127,4 +142,22 @@ or trailing hyphens, no consecutive periods, and not formatted as an IP address.
 
 ```bash
 cargo test --workspace
+```
+
+For local `s3-tests`, the embedded test server also supports trace helpers:
+
+| Variable | Description |
+|---|---|
+| `S3_TEST_TRACE` | Enables tracing for the local embedded test server |
+| `S3_TEST_TRACE_FILTER` | Sets `ARGMIN_TRACE_FILTER` for the local embedded test server |
+| `S3_TEST_TRACE_FILE` | Sets `ARGMIN_TRACE_FILE` directly |
+| `S3_TEST_TRACE_DIR` | Writes one trace file per test binary as `<dir>/<binary>.trace` |
+
+Example:
+
+```bash
+S3_TEST_TRACE=1 \
+S3_TEST_TRACE_FILTER=server_http,auth,server_core,storage,ec \
+S3_TEST_TRACE_DIR=/tmp/s3-test-traces \
+cargo test -p s3-tests --no-fail-fast
 ```

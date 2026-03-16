@@ -1939,6 +1939,7 @@ dependencies = [
  "base64",
  "checksum",
  "ec",
+ "observability",
  "ring",
  "serde_json",
  "server-core",
