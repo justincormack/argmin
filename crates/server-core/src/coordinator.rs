@@ -190,8 +190,23 @@ struct SegmentPayloadRecord {
 #[derive(Debug, Clone)]
 struct SegmentSliceRecord {
     payload: SegmentPayloadRecord,
+    segment_index: usize,
+    segment_object_offset_start: usize,
+    segment_object_offset_end_exclusive: usize,
     start_offset: usize,
     end_offset: usize,
+    part_number: Option<u32>,
+    part_order: Option<usize>,
+    part_object_offset_start: Option<usize>,
+    part_object_offset_end_exclusive: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct MultipartPartReadLayout {
+    part_number: u32,
+    part_order: usize,
+    object_offset_start: usize,
+    object_offset_end_exclusive: usize,
 }
 
 struct SegmentListReader {
@@ -205,6 +220,7 @@ struct SegmentListReader {
 
 #[derive(Debug, Clone)]
 struct SnapshottedMultipartPartRange {
+    layout: MultipartPartReadLayout,
     streaming_segments: Vec<SegmentSliceRecord>,
 }
 
@@ -284,20 +300,32 @@ impl ReadHandle {
         segments: Vec<SegmentPayloadRecord>,
         start: usize,
         end: usize,
+        object_offset_base: usize,
+        part_layout: Option<&MultipartPartReadLayout>,
     ) -> Vec<SegmentSliceRecord> {
         let mut slices = Vec::new();
         let mut offset = 0usize;
 
-        for payload in segments {
+        for (segment_index, payload) in segments.into_iter().enumerate() {
             let segment_end = offset + payload.size as usize;
             if offset > end {
                 break;
             }
             if payload.size != 0 && segment_end > start {
+                let start_offset = start.saturating_sub(offset);
+                let end_offset = (end + 1).saturating_sub(offset).min(payload.size as usize);
                 slices.push(SegmentSliceRecord {
-                    start_offset: start.saturating_sub(offset),
-                    end_offset: (end + 1).saturating_sub(offset).min(payload.size as usize),
                     payload,
+                    segment_index,
+                    segment_object_offset_start: object_offset_base + offset,
+                    segment_object_offset_end_exclusive: object_offset_base + segment_end,
+                    start_offset,
+                    end_offset,
+                    part_number: part_layout.map(|layout| layout.part_number),
+                    part_order: part_layout.map(|layout| layout.part_order),
+                    part_object_offset_start: part_layout.map(|layout| layout.object_offset_start),
+                    part_object_offset_end_exclusive: part_layout
+                        .map(|layout| layout.object_offset_end_exclusive),
                 });
             }
             offset = segment_end;
@@ -314,7 +342,7 @@ impl ReadHandle {
         let mut ranges = Vec::new();
         let mut offset = 0usize;
 
-        for part in parts {
+        for (part_order, part) in parts.into_iter().enumerate() {
             let part_end = offset + part.record.size as usize;
             if offset > end {
                 break;
@@ -324,7 +352,14 @@ impl ReadHandle {
                 let end_offset = (end + 1)
                     .saturating_sub(offset)
                     .min(part.record.size as usize);
+                let layout = MultipartPartReadLayout {
+                    part_number: part.record.part_number,
+                    part_order,
+                    object_offset_start: offset,
+                    object_offset_end_exclusive: part_end,
+                };
                 ranges.push(SnapshottedMultipartPartRange {
+                    layout: layout.clone(),
                     streaming_segments: Self::segment_slices_for_range(
                         part.streaming_segments
                             .into_iter()
@@ -340,6 +375,8 @@ impl ReadHandle {
                             .collect(),
                         start_offset,
                         end_offset - 1,
+                        offset,
+                        Some(&layout),
                     ),
                 });
             }
@@ -375,6 +412,8 @@ impl ReadHandle {
                     segments,
                     0,
                     expected_size.saturating_sub(1),
+                    0,
+                    None,
                 ),
                 next_segment_index: 0,
                 loaded_segment: None,
@@ -405,7 +444,7 @@ impl ReadHandle {
                 runtime,
                 bucket: bucket.to_string(),
                 key: key.to_string(),
-                segments: Self::segment_slices_for_range(segments, start, end),
+                segments: Self::segment_slices_for_range(segments, start, end, 0, None),
                 next_segment_index: 0,
                 loaded_segment: None,
             }),
@@ -1797,9 +1836,82 @@ impl SegmentListReader {
                 return Ok(None);
             }
 
+            let slice = self.segments[self.next_segment_index].clone();
+            if let Some(trace) = observability::current_context() {
+                let read_object_offset_start =
+                    slice.segment_object_offset_start + slice.start_offset;
+                let read_object_offset_end_exclusive =
+                    slice.segment_object_offset_start + slice.end_offset;
+                let read_object_offset_len =
+                    read_object_offset_end_exclusive - read_object_offset_start;
+                let read_segment_offset_len = slice.end_offset - slice.start_offset;
+                if let Some(part_layout) = slice.part_number.zip(slice.part_order).zip(
+                    slice
+                        .part_object_offset_start
+                        .zip(slice.part_object_offset_end_exclusive),
+                ) {
+                    let (
+                        (part_number, part_order),
+                        (part_object_offset_start, part_object_offset_end_exclusive),
+                    ) = part_layout;
+                    let _ = observability::event_in_context(
+                        &trace,
+                        TRACE_TARGET,
+                        "read_segment_layout",
+                        Some(format_args!(
+                            "bucket={} key={} part_order={} part_number={} part_object_offset_start={} part_object_offset_len={} part_object_offset_end_exclusive={} segment_index={} segment_size={} segment_object_offset_start={} segment_object_offset_end_exclusive={} read_object_offset_start={} read_object_offset_len={} read_object_offset_end_exclusive={} read_segment_offset_start={} read_segment_offset_len={} read_segment_offset_end_exclusive={} shard_pg_id={} ec_k={} ec_m={}",
+                            self.bucket,
+                            self.key,
+                            part_order,
+                            part_number,
+                            part_object_offset_start,
+                            part_object_offset_end_exclusive - part_object_offset_start,
+                            part_object_offset_end_exclusive,
+                            slice.segment_index,
+                            slice.payload.size,
+                            slice.segment_object_offset_start,
+                            slice.segment_object_offset_end_exclusive,
+                            read_object_offset_start,
+                            read_object_offset_len,
+                            read_object_offset_end_exclusive,
+                            slice.start_offset,
+                            read_segment_offset_len,
+                            slice.end_offset,
+                            slice.payload.shard_pg_id,
+                            slice.payload.ec_k,
+                            slice.payload.ec_m,
+                        )),
+                    );
+                } else {
+                    let _ = observability::event_in_context(
+                        &trace,
+                        TRACE_TARGET,
+                        "read_segment_layout",
+                        Some(format_args!(
+                            "bucket={} key={} segment_index={} segment_size={} segment_object_offset_start={} segment_object_offset_end_exclusive={} read_object_offset_start={} read_object_offset_len={} read_object_offset_end_exclusive={} read_segment_offset_start={} read_segment_offset_len={} read_segment_offset_end_exclusive={} shard_pg_id={} ec_k={} ec_m={}",
+                            self.bucket,
+                            self.key,
+                            slice.segment_index,
+                            slice.payload.size,
+                            slice.segment_object_offset_start,
+                            slice.segment_object_offset_end_exclusive,
+                            read_object_offset_start,
+                            read_object_offset_len,
+                            read_object_offset_end_exclusive,
+                            slice.start_offset,
+                            read_segment_offset_len,
+                            slice.end_offset,
+                            slice.payload.shard_pg_id,
+                            slice.payload.ec_k,
+                            slice.payload.ec_m,
+                        )),
+                    );
+                }
+            }
+
             let data = self
                 .runtime
-                .read_segment_payload(&self.segments[self.next_segment_index].payload)
+                .read_segment_payload(&slice.payload)
                 .map_err(|e| match e {
                     ServerError::Store(storage::StoreError::NotFound) => {
                         ServerError::ObjectNotFound {
@@ -1809,7 +1921,6 @@ impl SegmentListReader {
                     }
                     other => other,
                 })?;
-            let slice = &self.segments[self.next_segment_index];
             self.next_segment_index += 1;
             self.loaded_segment = Some((data, slice.start_offset, slice.end_offset));
             #[cfg(test)]
@@ -1837,6 +1948,24 @@ impl MultipartReader {
 
             let part = self.parts[self.next_part_index].clone();
             self.next_part_index += 1;
+            if let Some(trace) = observability::current_context() {
+                let _ = observability::event_in_context(
+                    &trace,
+                    TRACE_TARGET,
+                    "read_multipart_part_layout",
+                    Some(format_args!(
+                        "bucket={} key={} part_order={} part_number={} part_object_offset_start={} part_object_offset_len={} part_object_offset_end_exclusive={} segment_count={}",
+                        self.bucket,
+                        self.key,
+                        part.layout.part_order,
+                        part.layout.part_number,
+                        part.layout.object_offset_start,
+                        part.layout.object_offset_end_exclusive - part.layout.object_offset_start,
+                        part.layout.object_offset_end_exclusive,
+                        part.streaming_segments.len(),
+                    )),
+                );
+            }
             self.current_part = Some(SegmentListReader {
                 runtime: self.runtime.clone(),
                 bucket: self.bucket.clone(),
