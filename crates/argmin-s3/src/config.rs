@@ -30,7 +30,7 @@ impl ServerConfig {
     ///   `ARGMIN_WORKERS` (4)
     ///   `ARGMIN_MAX_CONNECTIONS` (512)
     ///   `ARGMIN_MAX_INFLIGHT_REQUESTS` (32)
-    ///   `ARGMIN_STREAM_READ_CHUNK_SIZE` (1048576)
+    ///   `ARGMIN_STREAM_READ_CHUNK_SIZE` (8388608)
     pub(crate) fn from_env() -> Result<Self, String> {
         Self::from_lookup(|key| std::env::var(key).ok())
     }
@@ -71,7 +71,7 @@ impl ServerConfig {
             .parse()
             .map_err(|e| format!("invalid ARGMIN_MAX_INFLIGHT_REQUESTS: {e}"))?;
         let stream_read_chunk_size: usize = get("ARGMIN_STREAM_READ_CHUNK_SIZE")
-            .unwrap_or_else(|| (1024 * 1024).to_string())
+            .unwrap_or_else(|| server_core::coordinator::INTERNAL_SEGMENT_SIZE.to_string())
             .parse()
             .map_err(|e| format!("invalid ARGMIN_STREAM_READ_CHUNK_SIZE: {e}"))?;
 
@@ -160,7 +160,10 @@ mod tests {
         assert_eq!(cfg.workers, 4);
         assert_eq!(cfg.max_connections, 512);
         assert_eq!(cfg.max_inflight_requests, 32);
-        assert_eq!(cfg.stream_read_chunk_size, 1024 * 1024);
+        assert_eq!(
+            cfg.stream_read_chunk_size,
+            server_core::coordinator::INTERNAL_SEGMENT_SIZE
+        );
         assert_eq!(cfg.access_key_id, "AKID");
         assert_eq!(cfg.secret_access_key, "SECRET");
     }
@@ -186,7 +189,10 @@ mod tests {
         assert_eq!(cfg.region, "eu-west-1");
         assert_eq!(cfg.workers, 4); // not overridden, uses default
         assert_eq!(cfg.max_inflight_requests, 32); // not overridden, uses default
-        assert_eq!(cfg.stream_read_chunk_size, 1024 * 1024);
+        assert_eq!(
+            cfg.stream_read_chunk_size,
+            server_core::coordinator::INTERNAL_SEGMENT_SIZE
+        );
         assert_eq!(cfg.access_key_id, "mykey");
         assert_eq!(cfg.secret_access_key, "mysecret");
     }

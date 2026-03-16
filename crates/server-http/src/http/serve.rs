@@ -174,7 +174,7 @@ impl Default for ServeConfig {
             header_read_timeout: Duration::from_secs(30),
             request_wait_timeout: Duration::from_secs(5),
             body_idle_timeout: Duration::from_secs(30),
-            stream_read_chunk_size: 1024 * 1024,
+            stream_read_chunk_size: server_core::coordinator::INTERNAL_SEGMENT_SIZE,
         }
     }
 }
