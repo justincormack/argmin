@@ -1743,17 +1743,27 @@ impl ReadRuntime {
         }
 
         let needed: Vec<usize> = (0..k).collect();
-        let mut all_shards: Vec<Option<Vec<u8>>> = Vec::with_capacity(k + m);
+        let mut all_shards = vec![None; k + m];
         let mut present_count = 0;
 
-        for i in 0..(k + m) {
+        let read_shard = |i: usize, all_shards: &mut [Option<Vec<u8>>], present_count: &mut usize| {
             let shard_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i as u8);
-            match pg.read_shard(&shard_key) {
-                Ok(sd) => {
-                    all_shards.push(Some(sd.data));
-                    present_count += 1;
+            if let Ok(sd) = pg.read_shard(&shard_key) {
+                all_shards[i] = Some(sd.data);
+                *present_count += 1;
+            }
+        };
+
+        for i in 0..k {
+            read_shard(i, &mut all_shards, &mut present_count);
+        }
+
+        if present_count < k {
+            for i in k..(k + m) {
+                if present_count >= k {
+                    break;
                 }
-                Err(_) => all_shards.push(None),
+                read_shard(i, &mut all_shards, &mut present_count);
             }
         }
 
@@ -8805,6 +8815,113 @@ mod tests {
             })
             .unwrap();
         assert_eq!(obj.body.into_bytes().unwrap(), data);
+    }
+
+    #[test]
+    fn ec_healthy_read_skips_corrupt_parity_shards() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+
+        coord.create_bucket("bucket").unwrap();
+        let data = b"EC healthy read should skip parity shards";
+        let put = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                bucket: "bucket",
+                key: "obj7",
+                data,
+                metadata: &MetadataBlob::new(),
+                tags: None,
+                cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
+            },
+        )
+        .unwrap();
+
+        let segment = {
+            let meta_pg_id = coord.object_pg_id("bucket", "obj7");
+            let meta_pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
+            let segments = meta_pg
+                .get_object_segments("bucket", "obj7", put.version_id)
+                .unwrap();
+            assert_eq!(segments.len(), 1);
+            segments[0].clone()
+        };
+
+        corrupt_shard_on_disk(&coord, tmp.path(), "bucket", "obj7", 4);
+
+        let obj = coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "obj7",
+                version_id: None,
+                cond: NO_READ,
+                requester: TEST_REQUESTER,
+            })
+            .unwrap();
+        assert_eq!(obj.body.into_bytes().unwrap(), data);
+
+        let shard_pg = coord.storage_node.get_pg(segment.shard_pg_id).unwrap();
+        let parity_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), 4);
+        assert!(
+            shard_pg.stat_shard(&parity_key).is_ok(),
+            "healthy-path read should not touch parity shard 4"
+        );
+    }
+
+    #[test]
+    fn ec_reconstruction_stops_after_first_needed_parity_shard() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+
+        coord.create_bucket("bucket").unwrap();
+        let data = b"EC reconstruction should stop after first needed parity";
+        let put = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                bucket: "bucket",
+                key: "obj8",
+                data,
+                metadata: &MetadataBlob::new(),
+                tags: None,
+                cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
+            },
+        )
+        .unwrap();
+
+        let segment = {
+            let meta_pg_id = coord.object_pg_id("bucket", "obj8");
+            let meta_pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
+            let segments = meta_pg
+                .get_object_segments("bucket", "obj8", put.version_id)
+                .unwrap();
+            assert_eq!(segments.len(), 1);
+            segments[0].clone()
+        };
+
+        delete_shard_on_disk(&coord, tmp.path(), "bucket", "obj8", 0);
+        corrupt_shard_on_disk(&coord, tmp.path(), "bucket", "obj8", 5);
+
+        let obj = coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "obj8",
+                version_id: None,
+                cond: NO_READ,
+                requester: TEST_REQUESTER,
+            })
+            .unwrap();
+        assert_eq!(obj.body.into_bytes().unwrap(), data);
+
+        let shard_pg = coord.storage_node.get_pg(segment.shard_pg_id).unwrap();
+        let parity_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), 5);
+        assert!(
+            shard_pg.stat_shard(&parity_key).is_ok(),
+            "reconstruction should stop once enough shards are present"
+        );
     }
 
     #[test]
