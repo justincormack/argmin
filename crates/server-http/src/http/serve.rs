@@ -185,7 +185,84 @@ struct ServerState {
     pool: Vec<Mutex<HttpFrontend>>,
     counter: AtomicUsize,
     request_semaphore: Arc<Semaphore>,
+    segment_buffer_pool: SegmentBufferPool,
     config: ServeConfig,
+}
+
+struct SegmentBufferPool {
+    max_cached: usize,
+    cached: Mutex<Vec<Vec<u8>>>,
+}
+
+struct PooledSegmentBuffer {
+    state: Arc<ServerState>,
+    buf: Option<Vec<u8>>,
+}
+
+impl SegmentBufferPool {
+    fn new(max_inflight_requests: usize) -> Self {
+        let default_cached = std::thread::available_parallelism()
+            .map(|n| n.get().saturating_mul(2))
+            .unwrap_or(8)
+            .max(1);
+        Self {
+            max_cached: default_cached.min(max_inflight_requests).max(1),
+            cached: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn checkout(&self) -> Vec<u8> {
+        let mut buf = self
+            .cached
+            .lock()
+            .unwrap()
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(crate::coordinator::INTERNAL_SEGMENT_SIZE));
+        buf.clear();
+        buf
+    }
+
+    fn recycle(&self, mut buf: Vec<u8>) {
+        if buf.capacity() < crate::coordinator::INTERNAL_SEGMENT_SIZE {
+            return;
+        }
+        buf.clear();
+        let mut cached = self.cached.lock().unwrap();
+        if cached.len() < self.max_cached {
+            cached.push(buf);
+        }
+    }
+}
+
+impl PooledSegmentBuffer {
+    fn new(state: &Arc<ServerState>) -> Self {
+        Self {
+            state: Arc::clone(state),
+            buf: Some(state.segment_buffer_pool.checkout()),
+        }
+    }
+}
+
+impl std::ops::Deref for PooledSegmentBuffer {
+    type Target = Vec<u8>;
+
+    fn deref(&self) -> &Self::Target {
+        self.buf.as_ref().unwrap()
+    }
+}
+
+impl std::ops::DerefMut for PooledSegmentBuffer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.buf.as_mut().unwrap()
+    }
+}
+
+impl Drop for PooledSegmentBuffer {
+    fn drop(&mut self) {
+        if let Some(buf) = self.buf.take() {
+            self.state.segment_buffer_pool.recycle(buf);
+        }
+    }
 }
 
 fn spawn_blocking_with_trace<F, R>(
@@ -227,6 +304,7 @@ pub async fn serve(
         pool: frontends.into_iter().map(Mutex::new).collect(),
         counter: AtomicUsize::new(0),
         request_semaphore: Arc::new(Semaphore::new(max_inflight_requests as usize)),
+        segment_buffer_pool: SegmentBufferPool::new(max_inflight_requests as usize),
         config,
     });
 
@@ -782,7 +860,7 @@ async fn handle_streaming_post_object(
     let mut sha256 = ring::digest::Context::new(&ring::digest::SHA256);
     let mut total_size: u64 = 0;
     let mut segment_index: u32 = 0;
-    let mut upload_buf = Vec::with_capacity(crate::coordinator::INTERNAL_SEGMENT_SIZE);
+    let mut upload_buf = PooledSegmentBuffer::new(&state);
 
     let mut body = body;
     loop {
@@ -872,28 +950,25 @@ async fn handle_streaming_post_object(
                                         continue;
                                     }
 
-                                    let flush_data = std::mem::replace(
-                                        &mut upload_buf,
-                                        Vec::with_capacity(
-                                            crate::coordinator::INTERNAL_SEGMENT_SIZE,
-                                        ),
-                                    );
+                                    let mut flush_data = PooledSegmentBuffer::new(&state);
+                                    std::mem::swap(&mut upload_buf, &mut flush_data);
                                     let idx = segment_index;
                                     segment_index += 1;
                                     let ctx_ref = Arc::clone(c);
                                     let st = Arc::clone(&state);
                                     match tokio::task::spawn_blocking(move || {
                                         let frontend = acquire_frontend(&st);
-                                        frontend.streaming_append_post_segment(
+                                        let result = frontend.streaming_append_post_segment(
                                             &ctx_ref,
                                             idx,
                                             &flush_data,
-                                        )
+                                        );
+                                        (result, flush_data)
                                     })
                                     .await
                                     {
-                                        Ok(Ok(())) => {}
-                                        Ok(Err(err)) => {
+                                        Ok((Ok(()), _flush_data)) => {}
+                                        Ok((Err(err), _flush_data)) => {
                                             abort_streaming_post_object(&state, c).await;
                                             return error_response(&err);
                                         }
@@ -961,12 +1036,13 @@ async fn handle_streaming_post_object(
         let ctx_ref = Arc::clone(&ctx);
         match tokio::task::spawn_blocking(move || {
             let frontend = acquire_frontend(&st);
-            frontend.streaming_append_post_segment(&ctx_ref, idx, &upload_buf)
+            let result = frontend.streaming_append_post_segment(&ctx_ref, idx, &upload_buf);
+            (result, upload_buf)
         })
         .await
         {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
+            Ok((Ok(()), _upload_buf)) => {}
+            Ok((Err(err), _upload_buf)) => {
                 abort_streaming_post_object(&state, &ctx).await;
                 return error_response(&err);
             }
@@ -1071,7 +1147,7 @@ async fn handle_streaming_put(
     let ctx = Arc::new(ctx);
     let mut hasher = checksum::crc64::Hasher::new();
     let mut segment_index: u32 = 0;
-    let mut buf = Vec::with_capacity(crate::coordinator::INTERNAL_SEGMENT_SIZE);
+    let mut buf = PooledSegmentBuffer::new(&state);
     let mut total_size: u64 = 0;
     let mut body = body;
 
@@ -1121,22 +1197,22 @@ async fn handle_streaming_put(
                             continue;
                         }
 
-                        let flush_data = std::mem::replace(
-                            &mut buf,
-                            Vec::with_capacity(crate::coordinator::INTERNAL_SEGMENT_SIZE),
-                        );
+                        let mut flush_data = PooledSegmentBuffer::new(&state);
+                        std::mem::swap(&mut buf, &mut flush_data);
                         let idx = segment_index;
                         segment_index += 1;
                         let ctx_ref = Arc::clone(&ctx);
                         let st = Arc::clone(&state);
                         match tokio::task::spawn_blocking(move || {
                             let frontend = acquire_frontend(&st);
-                            frontend.streaming_append_segment(&ctx_ref, idx, &flush_data)
+                            let result =
+                                frontend.streaming_append_segment(&ctx_ref, idx, &flush_data);
+                            (result, flush_data)
                         })
                         .await
                         {
-                            Ok(Ok(())) => {}
-                            Ok(Err(err)) => {
+                            Ok((Ok(()), _flush_data)) => {}
+                            Ok((Err(err), _flush_data)) => {
                                 abort_streaming(&state, &ctx).await;
                                 return error_response(&err);
                             }
@@ -1234,12 +1310,13 @@ async fn handle_streaming_put(
         let st = Arc::clone(&state);
         match tokio::task::spawn_blocking(move || {
             let frontend = acquire_frontend(&st);
-            frontend.streaming_append_segment(&ctx_ref, idx, &buf)
+            let result = frontend.streaming_append_segment(&ctx_ref, idx, &buf);
+            (result, buf)
         })
         .await
         {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
+            Ok((Ok(()), _buf)) => {}
+            Ok((Err(err), _buf)) => {
                 abort_streaming(&state, &ctx).await;
                 return error_response(&err);
             }
@@ -1361,7 +1438,7 @@ async fn handle_streaming_part(
     let ctx = Arc::new(ctx);
     let mut hasher = checksum::crc64::Hasher::new();
     let mut segment_index: u32 = 0;
-    let mut buf = Vec::with_capacity(crate::coordinator::INTERNAL_SEGMENT_SIZE);
+    let mut buf = PooledSegmentBuffer::new(&state);
     let mut total_size: u64 = 0;
     let mut body = body;
 
@@ -1410,22 +1487,22 @@ async fn handle_streaming_part(
                             continue;
                         }
 
-                        let flush_data = std::mem::replace(
-                            &mut buf,
-                            Vec::with_capacity(crate::coordinator::INTERNAL_SEGMENT_SIZE),
-                        );
+                        let mut flush_data = PooledSegmentBuffer::new(&state);
+                        std::mem::swap(&mut buf, &mut flush_data);
                         let idx = segment_index;
                         segment_index += 1;
                         let ctx_ref = Arc::clone(&ctx);
                         let st = Arc::clone(&state);
                         match tokio::task::spawn_blocking(move || {
                             let frontend = acquire_frontend(&st);
-                            frontend.streaming_append_part_segment(&ctx_ref, idx, &flush_data)
+                            let result =
+                                frontend.streaming_append_part_segment(&ctx_ref, idx, &flush_data);
+                            (result, flush_data)
                         })
                         .await
                         {
-                            Ok(Ok(())) => {}
-                            Ok(Err(err)) => {
+                            Ok((Ok(()), _flush_data)) => {}
+                            Ok((Err(err), _flush_data)) => {
                                 abort_streaming_part_ctx(&state, &ctx).await;
                                 return error_response(&err);
                             }
@@ -1528,12 +1605,13 @@ async fn handle_streaming_part(
         let st = Arc::clone(&state);
         match tokio::task::spawn_blocking(move || {
             let frontend = acquire_frontend(&st);
-            frontend.streaming_append_part_segment(&ctx_ref, idx, &buf)
+            let result = frontend.streaming_append_part_segment(&ctx_ref, idx, &buf);
+            (result, buf)
         })
         .await
         {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
+            Ok((Ok(()), _buf)) => {}
+            Ok((Err(err), _buf)) => {
                 abort_streaming_part_ctx(&state, &ctx).await;
                 return error_response(&err);
             }

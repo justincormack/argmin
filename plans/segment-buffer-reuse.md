@@ -40,14 +40,17 @@ This is only about internal segment payload movement. It does not change:
    full `8 MiB` segments before handing them to `server-core`
 5. healthy write paths now reuse pooled parity scratch instead of allocating
    new parity buffers for every encoded segment
+6. `server-http` streaming ingest now reuses pooled `8 MiB` payload buffers
+   instead of allocating a fresh segment buffer for each flushed chunk
 
 ## Remaining
 
-1. introduce a reusable payload segment-buffer abstraction for the healthy path
-   so `8 MiB` data buffers can be recycled instead of freshly allocated
-2. thread that payload buffer ownership across read, copy, and write boundaries so
+1. thread payload buffer ownership across read, copy, and write boundaries so
    `server-core` can hand off payload buffers instead of repeatedly creating
    new `Vec`/`Arc<Vec>` owners
+2. introduce the next reusable payload buffer abstraction on the core side so
+   reads and copy paths can recycle segment buffers instead of only reusing
+   them at HTTP ingress
 3. decide how far to take scratch reuse on recovery paths:
    - reconstruction buffers on fallback reads
    - any checksum or small control-path scratch that is still per-segment
