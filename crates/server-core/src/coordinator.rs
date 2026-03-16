@@ -555,20 +555,6 @@ impl ReadHandle {
             Ok(None)
         }
     }
-
-    pub fn into_bytes(mut self) -> Result<Vec<u8>, ServerError> {
-        const READ_TO_BYTES_CHUNK_SIZE: usize = INTERNAL_SEGMENT_SIZE;
-
-        let mut out = Vec::with_capacity(self.expected_size);
-        while let Some(chunk) = self.next_chunk(READ_TO_BYTES_CHUNK_SIZE)? {
-            out.extend_from_slice(&chunk);
-        }
-        Ok(out)
-    }
-
-    pub fn from_test_bytes(data: Vec<u8>) -> Self {
-        Self::from_buffered_bytes(data)
-    }
 }
 
 fn segment_payloads_from_object_segments(
@@ -6993,6 +6979,24 @@ mod tests {
     const TEST_REQUESTER: Requester<'static> = Requester::system();
     const NO_PUT_OBJECT_ACL: PutObjectAcl<'static> = PutObjectAcl::None;
 
+    fn read_all_body(mut body: ReadHandle) -> Result<Vec<u8>, ServerError> {
+        let mut out = Vec::new();
+        while let Some(chunk) = body.next_chunk(INTERNAL_SEGMENT_SIZE)? {
+            out.extend_from_slice(&chunk);
+        }
+        Ok(out)
+    }
+
+    trait ReadHandleTestExt {
+        fn read_all(self) -> Result<Vec<u8>, ServerError>;
+    }
+
+    impl ReadHandleTestExt for ReadHandle {
+        fn read_all(self) -> Result<Vec<u8>, ServerError> {
+            read_all_body(self)
+        }
+    }
+
     fn compute_shard_size(size: u64, ec_k: u8) -> usize {
         let k = u64::from(ec_k);
         let padded = size.div_ceil(k) * k;
@@ -7645,7 +7649,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.body.into_bytes().unwrap(), b"Hello, world!");
+        assert_eq!(obj.body.read_all().unwrap(), b"Hello, world!");
         assert_eq!(obj.size, 13);
         assert_eq!(obj.metadata.get("content-type"), Some("text/plain"));
     }
@@ -7686,7 +7690,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.body.into_bytes().unwrap(), b"{}");
+        assert_eq!(obj.body.read_all().unwrap(), b"{}");
         assert_eq!(obj.metadata.get("content-type"), Some("application/json"));
         assert_eq!(obj.metadata.get("x-amz-meta-author"), Some("alice"));
         assert_eq!(obj.metadata.get("x-amz-meta-version"), Some("42"));
@@ -7770,7 +7774,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.body.into_bytes().unwrap(), b"v2");
+        assert_eq!(obj.body.read_all().unwrap(), b"v2");
     }
 
     #[test]
@@ -7803,7 +7807,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.body.into_bytes().unwrap(), b"");
+        assert_eq!(obj.body.read_all().unwrap(), b"");
         assert_eq!(obj.size, 0);
     }
 
@@ -8151,7 +8155,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.body.into_bytes().unwrap(), b"data");
+        assert_eq!(obj.body.read_all().unwrap(), b"data");
         assert_eq!(obj.size, 4);
     }
 
@@ -8303,7 +8307,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.body.into_bytes().unwrap(), data);
+        assert_eq!(obj.body.read_all().unwrap(), data);
     }
 
     #[test]
@@ -8339,7 +8343,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.body.into_bytes().unwrap(), data);
+        assert_eq!(obj.body.read_all().unwrap(), data);
     }
 
     #[test]
@@ -8378,7 +8382,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.body.into_bytes().unwrap(), data);
+        assert_eq!(obj.body.read_all().unwrap(), data);
     }
 
     #[test]
@@ -8418,7 +8422,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        let err = obj.body.into_bytes().unwrap_err();
+        let err = obj.body.read_all().unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
     }
 
@@ -8456,7 +8460,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.body.into_bytes().unwrap(), data);
+        assert_eq!(obj.body.read_all().unwrap(), data);
     }
 
     #[test]
@@ -8495,7 +8499,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(result.body.into_bytes().unwrap(), b"Hello");
+        assert_eq!(result.body.read_all().unwrap(), b"Hello");
     }
 
     #[test]
@@ -8533,7 +8537,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.body.into_bytes().unwrap(), data);
+        assert_eq!(obj.body.read_all().unwrap(), data);
     }
 
     #[test]
@@ -8579,7 +8583,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.body.into_bytes().unwrap(), data);
+        assert_eq!(obj.body.read_all().unwrap(), data);
 
         let shard_pg = coord.storage_node.get_pg(segment.shard_pg_id).unwrap();
         let parity_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), 4);
@@ -8633,7 +8637,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.body.into_bytes().unwrap(), data);
+        assert_eq!(obj.body.read_all().unwrap(), data);
 
         let shard_pg = coord.storage_node.get_pg(segment.shard_pg_id).unwrap();
         let parity_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), 5);
@@ -9484,7 +9488,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(result.body.into_bytes().unwrap(), b"Hello");
+        assert_eq!(result.body.read_all().unwrap(), b"Hello");
         assert_eq!(result.range_start, 0);
         assert_eq!(result.range_end, 4);
         assert_eq!(result.size, 13);
@@ -9522,7 +9526,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(result.body.into_bytes().unwrap(), b"World!");
+        assert_eq!(result.body.read_all().unwrap(), b"World!");
         assert_eq!(result.range_start, 7);
         assert_eq!(result.range_end, 12);
     }
@@ -9559,7 +9563,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(result.body.into_bytes().unwrap(), b"World!");
+        assert_eq!(result.body.read_all().unwrap(), b"World!");
     }
 
     #[test]
@@ -9632,7 +9636,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(result.body.into_bytes().unwrap(), b"Hello");
+        assert_eq!(result.body.read_all().unwrap(), b"Hello");
         assert_eq!(result.range_start, 0);
         assert_eq!(result.range_end, 4);
     }
@@ -9747,7 +9751,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.body.into_bytes().unwrap(), b"v2");
+        assert_eq!(obj.body.read_all().unwrap(), b"v2");
     }
 
     #[test]
@@ -10053,7 +10057,7 @@ mod tests {
                 requester: Requester::anonymous(),
             })
             .unwrap();
-        assert_eq!(obj.body.into_bytes().unwrap(), b"public");
+        assert_eq!(obj.body.read_all().unwrap(), b"public");
     }
 
     #[test]
@@ -10364,7 +10368,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.body.into_bytes().unwrap(), b"data");
+        assert_eq!(obj.body.read_all().unwrap(), b"data");
     }
 
     #[test]
@@ -10644,7 +10648,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(result.body.into_bytes().unwrap(), b"Hello");
+        assert_eq!(result.body.read_all().unwrap(), b"Hello");
     }
 
     // ── CopyObject tests ──────────────────────────────────────────────
@@ -10699,7 +10703,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.body.into_bytes().unwrap(), b"hello copy");
+        assert_eq!(obj.body.read_all().unwrap(), b"hello copy");
     }
 
     #[test]
@@ -10908,7 +10912,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.body.into_bytes().unwrap(), b"data");
+        assert_eq!(obj.body.read_all().unwrap(), b"data");
         assert_eq!(obj.metadata.get("content-type"), Some("text/html"));
         assert_eq!(obj.metadata.get("x-amz-meta-version"), Some("2"));
         // Old metadata should be gone
@@ -10969,7 +10973,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.body.into_bytes().unwrap(), b"data");
+        assert_eq!(obj.body.read_all().unwrap(), b"data");
         assert_eq!(obj.metadata.get("content-type"), Some("application/json"));
     }
 
@@ -11137,7 +11141,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.body.into_bytes().unwrap(), b"hello");
+        assert_eq!(obj.body.read_all().unwrap(), b"hello");
         // No checksum should be present since none was requested.
         assert_eq!(obj.metadata.get("x-amz-checksum-crc32c"), None);
     }
@@ -11198,7 +11202,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.body.into_bytes().unwrap(), data);
+        assert_eq!(obj.body.read_all().unwrap(), data);
         // Checksum should be the real CRC32C of "hello", not missing.
         let expected_crc = checksum::crc32c::checksum(data);
         let expected_b64 =
@@ -11452,7 +11456,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.body.into_bytes().unwrap(), b"new data");
+        assert_eq!(obj.body.read_all().unwrap(), b"new data");
     }
 
     #[test]
@@ -11505,7 +11509,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.body.into_bytes().unwrap(), b"cross bucket data");
+        assert_eq!(obj.body.read_all().unwrap(), b"cross bucket data");
         assert_eq!(obj.metadata.get("content-type"), Some("text/plain"));
 
         // Source should still exist
@@ -11518,7 +11522,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(src.body.into_bytes().unwrap(), b"cross bucket data");
+        assert_eq!(src.body.read_all().unwrap(), b"cross bucket data");
     }
 
     // ── Bucket versioning tests ──────────────────────────────────────
@@ -11890,7 +11894,7 @@ mod tests {
 
             let read_res = t_read.join().unwrap();
             let obj = read_res.expect("get_object must not fail during overwrite");
-            let data = obj.body.into_bytes().unwrap();
+            let data = obj.body.read_all().unwrap();
             assert_eq!(data.len(), object_size);
             let uniform = data.iter().all(|&b| b == current) || data.iter().all(|&b| b == next);
             assert!(
@@ -12009,7 +12013,7 @@ mod tests {
                     requester: TEST_REQUESTER,
                 })
                 .unwrap();
-            let data = copied_obj.body.into_bytes().unwrap();
+            let data = copied_obj.body.read_all().unwrap();
             assert_eq!(data.len(), object_size);
             let uniform = data.iter().all(|&b| b == current) || data.iter().all(|&b| b == next);
             assert!(
@@ -12148,7 +12152,7 @@ mod tests {
                     requester: TEST_REQUESTER,
                 })
                 .unwrap();
-            let data = copied_obj.body.into_bytes().unwrap();
+            let data = copied_obj.body.read_all().unwrap();
             assert_eq!(data.len(), object_size);
             let uniform = data.iter().all(|&b| b == current) || data.iter().all(|&b| b == next);
             assert!(
@@ -12255,7 +12259,7 @@ mod tests {
             });
             match check {
                 Ok(obj) => {
-                    let data = obj.body.into_bytes().unwrap();
+                    let data = obj.body.read_all().unwrap();
                     assert_eq!(data.len(), object_size);
                     assert!(
                         data.iter().all(|&b| b == expected_byte),
@@ -12306,7 +12310,7 @@ mod tests {
                     cond: NO_READ,
                     requester: TEST_REQUESTER,
                 })
-                .and_then(|result| result.body.into_bytes())
+                .and_then(|result| result.body.read_all())
         });
         sync.snapshot_reached.wait();
 
@@ -12377,7 +12381,7 @@ mod tests {
                 })
                 .and_then(|res| {
                     let part_start = res.part_start;
-                    let body = res.body.into_bytes()?;
+                    let body = res.body.read_all()?;
                     Ok((part_start, body))
                 })
         });
@@ -12464,7 +12468,7 @@ mod tests {
                     cond: NO_READ,
                     requester: TEST_REQUESTER,
                 })
-                .and_then(|result| result.body.into_bytes())
+                .and_then(|result| result.body.read_all())
         });
         sync.first_segment_reached.wait();
 
@@ -12642,7 +12646,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(dst.body.into_bytes().unwrap(), expected);
+        assert_eq!(dst.body.read_all().unwrap(), expected);
     }
 
     #[test]
@@ -15147,7 +15151,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.body.into_bytes().unwrap(), expected);
+        assert_eq!(obj.body.read_all().unwrap(), expected);
         assert_eq!(obj.etag, result.etag);
         assert_eq!(obj.size, expected.len() as u64);
         assert!(obj.etag.ends_with("-2\""), "etag = {}", obj.etag);
@@ -15170,7 +15174,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.body.into_bytes().unwrap(), b"only-part");
+        assert_eq!(obj.body.read_all().unwrap(), b"only-part");
     }
 
     #[test]
@@ -15222,7 +15226,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(range.body.into_bytes().unwrap(), vec![0xAA; 10]);
+        assert_eq!(range.body.read_all().unwrap(), vec![0xAA; 10]);
         assert_eq!(range.range_start, 10);
         assert_eq!(range.range_end, 19);
     }
@@ -15261,7 +15265,7 @@ mod tests {
             .unwrap();
         let mut expected = vec![0xAA; 4];
         expected.extend_from_slice(&[0xBB; 4]);
-        assert_eq!(range.body.into_bytes().unwrap(), expected);
+        assert_eq!(range.body.read_all().unwrap(), expected);
     }
 
     #[test]
@@ -15286,7 +15290,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(range.body.into_bytes().unwrap(), vec![0xBB; 50]);
+        assert_eq!(range.body.read_all().unwrap(), vec![0xBB; 50]);
     }
 
     #[test]
@@ -15331,7 +15335,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(dst.body.into_bytes().unwrap(), expected);
+        assert_eq!(dst.body.read_all().unwrap(), expected);
     }
 
     #[test]
@@ -15351,7 +15355,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert!(obj.body.into_bytes().unwrap().is_empty());
+        assert!(obj.body.read_all().unwrap().is_empty());
         assert_eq!(obj.size, 0);
     }
 
@@ -15375,7 +15379,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.body.into_bytes().unwrap(), expected);
+        assert_eq!(obj.body.read_all().unwrap(), expected);
         assert_eq!(obj.size, MIN_PART as u64);
     }
 
@@ -15397,7 +15401,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert!(result.body.into_bytes().unwrap().is_empty());
+        assert!(result.body.read_all().unwrap().is_empty());
         assert_eq!(result.part_size, 0);
         assert_eq!(result.size, 0);
         assert_eq!(result.parts_count, 1);
@@ -15425,7 +15429,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(result.body.into_bytes().unwrap(), part1);
+        assert_eq!(result.body.read_all().unwrap(), part1);
         assert_eq!(result.part_size, MIN_PART as u64);
         assert_eq!(result.part_start, 0);
         assert_eq!(result.part_end, MIN_PART as u64 - 1);
@@ -15441,7 +15445,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert!(result.body.into_bytes().unwrap().is_empty());
+        assert!(result.body.read_all().unwrap().is_empty());
         assert_eq!(result.part_size, 0);
         assert_eq!(result.parts_count, 2);
         assert_eq!(result.part_start, MIN_PART as u64);
@@ -15591,7 +15595,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert!(dst.body.into_bytes().unwrap().is_empty());
+        assert!(dst.body.read_all().unwrap().is_empty());
     }
 
     #[test]
@@ -15630,7 +15634,7 @@ mod tests {
             })
             .unwrap()
             .body
-            .into_bytes()
+            .read_all()
             .unwrap_err();
         assert!(
             matches!(err, ServerError::IntegrityError { .. }),
@@ -16576,7 +16580,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(result.body.into_bytes().unwrap(), b"hello");
+        assert_eq!(result.body.read_all().unwrap(), b"hello");
         assert_eq!(result.size, 5);
     }
 
@@ -16622,7 +16626,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(result.body.into_bytes().unwrap(), full_data);
+        assert_eq!(result.body.read_all().unwrap(), full_data);
         assert_eq!(result.size, 10);
     }
 
@@ -16667,7 +16671,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(r1.body.into_bytes().unwrap(), b"AAAA");
+        assert_eq!(r1.body.read_all().unwrap(), b"AAAA");
 
         // Range spanning segments.
         let r2 = coord
@@ -16680,7 +16684,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(r2.body.into_bytes().unwrap(), b"AABB");
+        assert_eq!(r2.body.read_all().unwrap(), b"AABB");
 
         // Range within second segment.
         let r3 = coord
@@ -16693,7 +16697,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(r3.body.into_bytes().unwrap(), b"BBBB");
+        assert_eq!(r3.body.read_all().unwrap(), b"BBBB");
 
         // Suffix range.
         let r4 = coord
@@ -16706,7 +16710,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(r4.body.into_bytes().unwrap(), b"BBB");
+        assert_eq!(r4.body.read_all().unwrap(), b"BBB");
     }
 
     #[test]
@@ -16774,7 +16778,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(result.body.into_bytes().unwrap(), b"copy-me");
+        assert_eq!(result.body.read_all().unwrap(), b"copy-me");
     }
 
     #[test]
@@ -16823,7 +16827,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(get.body.into_bytes().unwrap(), data);
+        assert_eq!(get.body.read_all().unwrap(), data);
     }
 
     #[test]
@@ -16916,7 +16920,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(result.body.into_bytes().unwrap(), b"");
+        assert_eq!(result.body.read_all().unwrap(), b"");
         assert_eq!(result.size, 0);
     }
 
@@ -16955,7 +16959,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(result.body.into_bytes().unwrap(), b"partdata");
+        assert_eq!(result.body.read_all().unwrap(), b"partdata");
         assert_eq!(result.part_size, 8);
     }
 
@@ -16995,7 +16999,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(r1.body.into_bytes().unwrap(), b"stream-data");
+        assert_eq!(r1.body.read_all().unwrap(), b"stream-data");
 
         // Overwrite with a normal PUT.
         test_helpers::put_object(
@@ -17023,7 +17027,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(r2.body.into_bytes().unwrap(), b"normal-data");
+        assert_eq!(r2.body.read_all().unwrap(), b"normal-data");
     }
 
     #[test]
@@ -17299,7 +17303,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(copied.body.into_bytes().unwrap(), data);
+        assert_eq!(copied.body.read_all().unwrap(), data);
     }
 
     #[test]
@@ -17690,7 +17694,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            obj_a.body.into_bytes().unwrap(),
+            obj_a.body.read_all().unwrap(),
             data_a,
             "after completing A, reading part 1 should return A's data"
         );
@@ -17720,7 +17724,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            obj_b.body.into_bytes().unwrap(),
+            obj_b.body.read_all().unwrap(),
             data_b,
             "after completing B, reading part 1 should return B's data"
         );
@@ -17911,7 +17915,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(result.body.into_bytes().unwrap(), b"safe-data");
+        assert_eq!(result.body.read_all().unwrap(), b"safe-data");
     }
 
     #[test]
@@ -18015,7 +18019,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        let data = result.body.into_bytes().unwrap();
+        let data = result.body.read_all().unwrap();
         assert_eq!(data, full);
 
         // Verify CRC matches.
@@ -18084,7 +18088,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        let err = result.body.into_bytes().unwrap_err();
+        let err = result.body.read_all().unwrap_err();
         assert!(matches!(
             err,
             ServerError::Store(storage::StoreError::IntegrityError { .. })
@@ -18154,7 +18158,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(result.body.into_bytes().unwrap(), b"v2-normal");
+        assert_eq!(result.body.read_all().unwrap(), b"v2-normal");
     }
 
     #[test]
@@ -18209,6 +18213,6 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(result.body.into_bytes().unwrap(), b"new-data");
+        assert_eq!(result.body.read_all().unwrap(), b"new-data");
     }
 }

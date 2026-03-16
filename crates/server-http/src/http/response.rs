@@ -210,7 +210,15 @@ impl S3Response {
     #[cfg(test)]
     pub(crate) fn into_test_body_bytes(self) -> Result<Vec<u8>, ServerError> {
         match self.stream {
-            Some(stream) => stream.into_bytes(),
+            Some(mut stream) => {
+                let mut out = Vec::new();
+                while let Some(chunk) =
+                    stream.next_chunk(crate::coordinator::INTERNAL_SEGMENT_SIZE)?
+                {
+                    out.extend_from_slice(&chunk);
+                }
+                Ok(out)
+            }
             None => Ok(self.body),
         }
     }
@@ -1105,7 +1113,7 @@ mod tests {
     #[test]
     fn get_object_with_content_type() {
         let result = GetObjectResult {
-            body: ReadHandle::from_test_bytes(b"hello".to_vec()),
+            body: ReadHandle::from_buffered_bytes(b"hello".to_vec()),
             metadata: MetadataBlob::from_pairs(&[("content-type", "text/plain")]),
             etag: "\"etag\"".into(),
             size: 5,
@@ -1122,7 +1130,7 @@ mod tests {
     #[test]
     fn get_object_default_content_type() {
         let result = GetObjectResult {
-            body: ReadHandle::from_test_bytes(b"data".to_vec()),
+            body: ReadHandle::from_buffered_bytes(b"data".to_vec()),
             metadata: MetadataBlob::new(),
             etag: "\"etag\"".into(),
             size: 4,
@@ -1140,7 +1148,7 @@ mod tests {
     #[test]
     fn get_object_with_amz_meta_headers() {
         let result = GetObjectResult {
-            body: ReadHandle::from_test_bytes(vec![]),
+            body: ReadHandle::from_buffered_bytes(vec![]),
             metadata: MetadataBlob::from_pairs(&[("x-amz-meta-author", "alice")]),
             etag: "\"e\"".into(),
             size: 0,
@@ -1155,7 +1163,7 @@ mod tests {
     #[test]
     fn get_object_with_all_standard_metadata() {
         let result = GetObjectResult {
-            body: ReadHandle::from_test_bytes(vec![]),
+            body: ReadHandle::from_buffered_bytes(vec![]),
             metadata: MetadataBlob::from_pairs(&[
                 ("content-type", "text/html"),
                 ("content-encoding", "gzip"),
@@ -1188,7 +1196,7 @@ mod tests {
     #[test]
     fn get_object_checksum_type_with_checksum_mode_enabled() {
         let result = GetObjectResult {
-            body: ReadHandle::from_test_bytes(vec![]),
+            body: ReadHandle::from_buffered_bytes(vec![]),
             metadata: MetadataBlob::from_pairs(&[
                 ("x-amz-checksum-crc32", "AAAAAA=="),
                 ("x-amz-checksum-type", "FULL_OBJECT"),
@@ -1210,7 +1218,7 @@ mod tests {
     #[test]
     fn get_object_checksum_type_omitted_without_checksum_mode() {
         let result = GetObjectResult {
-            body: ReadHandle::from_test_bytes(vec![]),
+            body: ReadHandle::from_buffered_bytes(vec![]),
             metadata: MetadataBlob::from_pairs(&[
                 ("x-amz-checksum-crc32", "AAAAAA=="),
                 ("x-amz-checksum-type", "FULL_OBJECT"),
