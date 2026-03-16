@@ -878,6 +878,12 @@ pub struct CreateBucketRequest<'a> {
     pub ownership: BucketObjectOwnership,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BucketCreateOutcome {
+    Created,
+    AlreadyOwned,
+}
+
 /// Request for a ListBuckets operation.
 #[derive(Debug)]
 pub struct ListBucketsRequest<'a> {
@@ -2242,17 +2248,20 @@ impl Coordinator {
             return Err(ServerError::InvalidBucketAclWithObjectOwnership);
         }
 
-        self.create_bucket_for_owner_with_acl(
+        let create_outcome = self.create_bucket_for_owner_with_acl(
             owner_principal,
             req.name,
             public_read,
             public_write,
         )?;
-        self.put_bucket_ownership_controls(
-            req.name,
-            &Self::ownership_controls_xml(req.ownership),
-            Requester::principal(owner_principal),
-        )
+        match create_outcome {
+            BucketCreateOutcome::Created => self.put_bucket_ownership_controls(
+                req.name,
+                &Self::ownership_controls_xml(req.ownership),
+                Requester::principal(owner_principal),
+            ),
+            BucketCreateOutcome::AlreadyOwned => Ok(()),
+        }
     }
 
     pub fn create_bucket_for_owner(
@@ -2261,7 +2270,8 @@ impl Coordinator {
         name: &str,
         public_read: bool,
     ) -> Result<(), ServerError> {
-        self.create_bucket_for_owner_with_acl(owner_principal, name, public_read, false)
+        self.create_bucket_for_owner_with_acl(owner_principal, name, public_read, false)?;
+        Ok(())
     }
 
     fn create_bucket_for_owner_with_acl(
@@ -2270,7 +2280,7 @@ impl Coordinator {
         name: &str,
         public_read: bool,
         public_write: bool,
-    ) -> Result<(), ServerError> {
+    ) -> Result<BucketCreateOutcome, ServerError> {
         let _bucket_guard = self.storage_node.lock_bucket(name);
         let bucket_pg = self.get_bucket_pg(name)?;
         let owner_canonical_id = CanonicalUserId::from_principal(owner_principal);
@@ -2281,7 +2291,7 @@ impl Coordinator {
             public_read,
             public_write,
         ) {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(BucketCreateOutcome::Created),
             Err(storage::MetadataError::BucketAlreadyExists) => {
                 let existing = bucket_pg.head_bucket_raw(name).map_err(|e| match e {
                     storage::MetadataError::BucketNotFound { name } => {
@@ -2294,7 +2304,7 @@ impl Coordinator {
                 if existing.state == BucketState::Active
                     && existing.owner_principal == owner_principal
                 {
-                    Ok(())
+                    Ok(BucketCreateOutcome::AlreadyOwned)
                 } else {
                     Err(ServerError::BucketAlreadyExists)
                 }
@@ -7573,6 +7583,37 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(controls.contains("<ObjectOwnership>ObjectWriter</ObjectOwnership>"));
+    }
+
+    #[test]
+    fn create_bucket_for_requester_idempotent_create_does_not_overwrite_ownership_controls() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+
+        coord
+            .create_bucket_for_requester(&CreateBucketRequest {
+                name: "bucket",
+                requester: Requester::principal("owner-a"),
+                acl: BucketAcl::Private,
+                ownership: BucketObjectOwnership::ObjectWriter,
+            })
+            .unwrap();
+
+        coord
+            .create_bucket_for_requester(&CreateBucketRequest {
+                name: "bucket",
+                requester: Requester::principal("owner-a"),
+                acl: BucketAcl::Private,
+                ownership: BucketObjectOwnership::BucketOwnerEnforced,
+            })
+            .unwrap();
+
+        let controls = coord
+            .get_bucket_ownership_controls("bucket", Requester::principal("owner-a"))
+            .unwrap()
+            .unwrap();
+        assert!(controls.contains("<ObjectOwnership>ObjectWriter</ObjectOwnership>"));
+        assert!(!controls.contains("<ObjectOwnership>BucketOwnerEnforced</ObjectOwnership>"));
     }
 
     #[test]

@@ -43,6 +43,41 @@ fn test_create_bucket_no_ownership_controls() {
     });
 }
 
+#[test]
+fn test_create_bucket_existing_bucket_does_not_overwrite_ownership_controls() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client
+            .create_bucket()
+            .bucket(&bucket)
+            .object_ownership(ObjectOwnership::ObjectWriter)
+            .send()
+            .await
+            .unwrap();
+
+        client
+            .create_bucket()
+            .bucket(&bucket)
+            .object_ownership(ObjectOwnership::BucketOwnerEnforced)
+            .send()
+            .await
+            .unwrap();
+
+        let resp = client
+            .get_bucket_ownership_controls()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        let rules = resp.ownership_controls().unwrap().rules();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].object_ownership, ObjectOwnership::ObjectWriter);
+
+        cleanup(&bucket).await;
+    });
+}
+
 // ── test_bucket_create_delete_bucket_ownership ──────────────────────
 
 /// Full PUT/GET/DELETE lifecycle for ownership controls.
