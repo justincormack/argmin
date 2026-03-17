@@ -24,13 +24,15 @@ behavior.
   broken out before changing the coordinator.
 - The ingress-side trace points are now in place for streaming `PutObject` and
   `UploadPart`.
-- `append_stream_segment` now validates under the metadata PG, drops it for
-  cross-PG shard writes, and revalidates before publishing the staging row.
-  The same-PG case is intentionally unchanged because there is no separate PG
-  lock to release.
+- `append_stream_segment` now validates under the metadata PG, writes shard
+  files durably without any PG lock, then briefly republishes shard metadata
+  and the staging segment row under ordered PG locks.
 - The remaining HTTP-side delay is not `spawn_blocking` queueing. The new trace
   shows most of the residual PUT cost waiting in `acquire_frontend`, so the
   frontend pool mutex is now the dominant gate on `UploadPart` append/finalize.
+- After removing the frontend mutex, the next bottleneck is shard-PG lock hold
+  time in `PgStore::write_shard`: durable file IO and SQLite publication still
+  happen together under the shard PG mutex.
 
 ## Steps
 
@@ -41,8 +43,10 @@ behavior.
    keep the metadata PG locked across cross-PG encode and shard writes.
 3. Done: rerun the local PUT trace and confirm the next bottleneck is the
    frontend pool mutex, not coordinator lock scope or `spawn_blocking`.
-4. In progress: remove frontend pool mutex contention for streaming
-   append/finalize and rerun the same local PUT trace.
+4. Done: remove frontend pool mutex contention for streaming append/finalize
+   and rerun the same local PUT trace.
+5. In progress: split shard durable file IO from shard metadata publication so
+   the shard PG mutex only covers SQLite visibility, not file write and fsync.
 
 ## Notes
 

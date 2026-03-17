@@ -90,9 +90,13 @@ impl PgStore {
 
     /// Resolve the file path for a shard key.
     fn shard_path(&self, key: &ShardKey) -> PathBuf {
+        Self::shard_path_for_dir(&self.pg_dir, key)
+    }
+
+    fn shard_path_for_dir(pg_dir: &Path, key: &ShardKey) -> PathBuf {
         let prefix = key.hex_prefix();
         let hex = key.hex();
-        self.pg_dir.join("shards").join(prefix).join(hex)
+        pg_dir.join("shards").join(prefix).join(hex)
     }
 
     /// Get the current unix timestamp in seconds.
@@ -109,6 +113,105 @@ impl PgStore {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64
+    }
+
+    pub(crate) fn write_shard_file_durable(
+        pg_dir: &Path,
+        key: &ShardKey,
+        data: &[u8],
+    ) -> Result<WriteAck, StoreError> {
+        let crc = checksum::crc64::checksum(data);
+        let stored_size = data.len() as u64;
+
+        // Write to temp file with O_EXCL (unique name via pid + timestamp).
+        let tmp_dir = pg_dir.join("tmp");
+        let tmp_name = format!(
+            "shard-{}-{}-{}",
+            std::process::id(),
+            Self::now_secs(),
+            key.hex()
+        );
+        let tmp_path = tmp_dir.join(&tmp_name);
+
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+            .map_err(|e| StoreError::Io {
+                context: "create temp shard file",
+                source: e,
+            })?;
+
+        file.write_all(data).map_err(|e| {
+            let _ = fs::remove_file(&tmp_path);
+            StoreError::Io {
+                context: "write shard data",
+                source: e,
+            }
+        })?;
+
+        // fdatasync the file data (sync_data = fdatasync on Linux).
+        file.sync_data().map_err(|e| {
+            let _ = fs::remove_file(&tmp_path);
+            StoreError::Io {
+                context: "fdatasync shard",
+                source: e,
+            }
+        })?;
+
+        // Ensure prefix subdirectory exists.
+        let shard_path = Self::shard_path_for_dir(pg_dir, key);
+        if let Some(parent) = shard_path.parent() {
+            fs::create_dir_all(parent).map_err(|e| {
+                let _ = fs::remove_file(&tmp_path);
+                StoreError::Io {
+                    context: "create shard prefix dir",
+                    source: e,
+                }
+            })?;
+        }
+
+        // Atomic rename.
+        fs::rename(&tmp_path, &shard_path).map_err(|e| {
+            let _ = fs::remove_file(&tmp_path);
+            StoreError::Io {
+                context: "rename shard into place",
+                source: e,
+            }
+        })?;
+
+        // fsync parent directory to ensure rename is durable.
+        if let Some(parent) = shard_path.parent() {
+            fsync_dir(parent).map_err(|e| StoreError::Io {
+                context: "fsync shard parent dir",
+                source: e,
+            })?;
+        }
+
+        Ok(WriteAck {
+            crc64: crc,
+            stored_size,
+        })
+    }
+
+    pub fn register_written_shard(&self, key: &ShardKey, ack: WriteAck) -> Result<(), StoreError> {
+        let now = Self::now_secs();
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO shards (shard_key, data_size, crc64_nvme, created_at, status) \
+                 VALUES (?1, ?2, ?3, ?4, 0)",
+                params![
+                    key.as_bytes().as_slice(),
+                    ack.stored_size as i64,
+                    ack.crc64 as i64,
+                    now as i64
+                ],
+            )
+            .map_err(|e| StoreError::Db {
+                context: "insert shard record",
+                source: e,
+            })?;
+        Ok(())
     }
 
     fn row_to_object_part(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObjectPartRecord> {
@@ -490,91 +593,9 @@ impl ShardStore for PgStore {
             key.hex(),
             data.len()
         );
-        let crc = checksum::crc64::checksum(data);
-        let stored_size = data.len() as u64;
-
-        // Write to temp file with O_EXCL (unique name via pid + timestamp).
-        let tmp_dir = self.pg_dir.join("tmp");
-        let tmp_name = format!(
-            "shard-{}-{}-{}",
-            std::process::id(),
-            Self::now_secs(),
-            key.hex()
-        );
-        let tmp_path = tmp_dir.join(&tmp_name);
-
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp_path)
-            .map_err(|e| StoreError::Io {
-                context: "create temp shard file",
-                source: e,
-            })?;
-
-        file.write_all(data).map_err(|e| {
-            let _ = fs::remove_file(&tmp_path);
-            StoreError::Io {
-                context: "write shard data",
-                source: e,
-            }
-        })?;
-
-        // fdatasync the file data (sync_data = fdatasync on Linux).
-        file.sync_data().map_err(|e| {
-            let _ = fs::remove_file(&tmp_path);
-            StoreError::Io {
-                context: "fdatasync shard",
-                source: e,
-            }
-        })?;
-
-        // Ensure prefix subdirectory exists.
-        let shard_path = self.shard_path(key);
-        if let Some(parent) = shard_path.parent() {
-            fs::create_dir_all(parent).map_err(|e| {
-                let _ = fs::remove_file(&tmp_path);
-                StoreError::Io {
-                    context: "create shard prefix dir",
-                    source: e,
-                }
-            })?;
-        }
-
-        // Atomic rename.
-        fs::rename(&tmp_path, &shard_path).map_err(|e| {
-            let _ = fs::remove_file(&tmp_path);
-            StoreError::Io {
-                context: "rename shard into place",
-                source: e,
-            }
-        })?;
-
-        // fsync parent directory to ensure rename is durable.
-        if let Some(parent) = shard_path.parent() {
-            fsync_dir(parent).map_err(|e| StoreError::Io {
-                context: "fsync shard parent dir",
-                source: e,
-            })?;
-        }
-
-        // Record in SQLite.
-        let now = Self::now_secs();
-        self.conn
-            .execute(
-                "INSERT OR REPLACE INTO shards (shard_key, data_size, crc64_nvme, created_at, status) \
-                 VALUES (?1, ?2, ?3, ?4, 0)",
-                params![key.as_bytes().as_slice(), stored_size as i64, crc as i64, now as i64],
-            )
-            .map_err(|e| StoreError::Db {
-                context: "insert shard record",
-                source: e,
-            })?;
-
-        Ok(WriteAck {
-            crc64: crc,
-            stored_size,
-        })
+        let ack = Self::write_shard_file_durable(&self.pg_dir, key, data)?;
+        self.register_written_shard(key, ack)?;
+        Ok(ack)
     }
 
     fn read_shard(&self, key: &ShardKey) -> Result<ShardData, StoreError> {

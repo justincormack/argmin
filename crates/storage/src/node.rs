@@ -10,7 +10,7 @@ use std::time::Instant;
 use crate::error::StoreError;
 use crate::pg_store::PgStore;
 use crate::traits::{ShardStore, StorageNode};
-use crate::types::{GenerationId, ShardKey};
+use crate::types::{GenerationId, ShardKey, WriteAck};
 
 const TRACE_TARGET: &str = "storage";
 
@@ -245,6 +245,33 @@ impl SharedStorageNode {
             .get(&pg_id)
             .ok_or(StoreError::PgNotFound { pg_id })?;
         Ok(mutex.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Write a shard file durably without taking the per-PG mutex.
+    ///
+    /// This is used on the write hot path so file IO and fsync do not hold the
+    /// PG metadata lock. Callers must publish the corresponding shard row under
+    /// the PG mutex afterward before the shard becomes visible to reads.
+    pub fn write_shard_file(
+        &self,
+        pg_id: u32,
+        key: &ShardKey,
+        data: &[u8],
+    ) -> Result<WriteAck, StoreError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "SharedStorageNode::write_shard_file",
+            "pg_id={} shard={} bytes={}",
+            pg_id,
+            key.hex(),
+            data.len()
+        );
+        if !self.stores.contains_key(&pg_id) {
+            return Err(StoreError::PgNotFound { pg_id });
+        }
+
+        let pg_dir = self.data_dir.join(format!("pg-{pg_id:04}"));
+        PgStore::write_shard_file_durable(&pg_dir, key, data)
     }
 
     /// Read a shard file directly without taking the per-PG mutex.
@@ -649,6 +676,22 @@ mod tests {
         let key = crate::types::ShardKey::new(&[0xCD; 16], 7, 0);
         let err = node.read_shard_file(0, &key).unwrap_err();
         assert!(matches!(err, StoreError::NotFound));
+    }
+
+    #[test]
+    fn shared_node_write_shard_file_requires_metadata_registration() {
+        let tmp = test_util::tempdir();
+        let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();
+        let key = crate::types::ShardKey::new(&[0xDD; 16], 7, 0);
+
+        let ack = node.write_shard_file(0, &key, b"hello").unwrap();
+        assert_eq!(node.read_shard_file(0, &key).unwrap(), b"hello");
+
+        let pg = node.get_pg(0).unwrap();
+        let err = pg.read_shard(&key).unwrap_err();
+        assert!(matches!(err, StoreError::NotFound));
+        pg.register_written_shard(&key, ack).unwrap();
+        assert_eq!(pg.read_shard(&key).unwrap().data, b"hello");
     }
 
     #[test]

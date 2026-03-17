@@ -474,6 +474,11 @@ struct SegmentSliceRecord {
     part_object_offset_end_exclusive: Option<usize>,
 }
 
+struct WrittenShard {
+    key: ShardKey,
+    ack: storage::WriteAck,
+}
+
 #[derive(Debug, Clone)]
 struct MultipartPartReadLayout {
     part_number: u32,
@@ -3509,11 +3514,11 @@ impl Coordinator {
 
     fn write_stream_segment_shards(
         &self,
-        shard_pg: &storage::PgStore,
+        shard_pg_id: u32,
         segment_okh: &[u8; 16],
         segment_vid: GenerationId,
         data: &[u8],
-    ) -> Result<Vec<ShardKey>, ServerError> {
+    ) -> Result<Vec<WrittenShard>, ServerError> {
         let k = self.ec_config.data_shards as usize;
         let m = self.ec_config.parity_shards as usize;
         let remainder = data.len() % k;
@@ -3531,7 +3536,7 @@ impl Coordinator {
         let data_shards: Vec<&[u8]> = (0..k)
             .map(|i| &shard_source[i * shard_size..(i + 1) * shard_size])
             .collect();
-        let mut written_shards: Vec<ShardKey> = Vec::with_capacity(k + m);
+        let mut written_shards: Vec<WrittenShard> = Vec::with_capacity(k + m);
         let write_result: Result<(), ServerError> = if shard_size == 0 {
             let mut parity_bufs: Vec<Vec<u8>> = (0..m).map(|_| Vec::new()).collect();
             let mut parity_refs: Vec<&mut [u8]> = parity_bufs
@@ -3542,14 +3547,24 @@ impl Coordinator {
             (|| {
                 for (i, shard_data) in data_shards.iter().enumerate() {
                     let shard_key = ShardKey::new(segment_okh, segment_vid.get(), i as u8);
-                    shard_pg.write_shard(&shard_key, shard_data)?;
-                    written_shards.push(shard_key);
+                    let ack =
+                        self.storage_node
+                            .write_shard_file(shard_pg_id, &shard_key, shard_data)?;
+                    written_shards.push(WrittenShard {
+                        key: shard_key,
+                        ack,
+                    });
                 }
                 for (parity_index, shard_data) in parity_bufs.iter().enumerate() {
                     let shard_key =
                         ShardKey::new(segment_okh, segment_vid.get(), (k + parity_index) as u8);
-                    shard_pg.write_shard(&shard_key, shard_data)?;
-                    written_shards.push(shard_key);
+                    let ack =
+                        self.storage_node
+                            .write_shard_file(shard_pg_id, &shard_key, shard_data)?;
+                    written_shards.push(WrittenShard {
+                        key: shard_key,
+                        ack,
+                    });
                 }
                 Ok(())
             })()
@@ -3569,44 +3584,69 @@ impl Coordinator {
             (|| {
                 for (i, shard_data) in data_shards.iter().enumerate() {
                     let shard_key = ShardKey::new(segment_okh, segment_vid.get(), i as u8);
-                    shard_pg.write_shard(&shard_key, shard_data)?;
-                    written_shards.push(shard_key);
+                    let ack =
+                        self.storage_node
+                            .write_shard_file(shard_pg_id, &shard_key, shard_data)?;
+                    written_shards.push(WrittenShard {
+                        key: shard_key,
+                        ack,
+                    });
                 }
                 for (parity_index, shard_data) in parity.chunks_exact(shard_size).enumerate() {
                     let shard_key =
                         ShardKey::new(segment_okh, segment_vid.get(), (k + parity_index) as u8);
-                    shard_pg.write_shard(&shard_key, shard_data)?;
-                    written_shards.push(shard_key);
+                    let ack =
+                        self.storage_node
+                            .write_shard_file(shard_pg_id, &shard_key, shard_data)?;
+                    written_shards.push(WrittenShard {
+                        key: shard_key,
+                        ack,
+                    });
                 }
                 Ok(())
             })()
         };
 
         if let Err(err) = write_result {
-            for shard_key in &written_shards {
-                let _ = shard_pg.delete_shard(shard_key);
-            }
+            self.best_effort_delete_stream_shards(shard_pg_id, &written_shards);
             return Err(err);
         }
 
         Ok(written_shards)
     }
 
-    fn best_effort_delete_stream_shards(&self, shard_pg_id: u32, written_shards: &[ShardKey]) {
+    fn cleanup_stream_shards_locked(shard_pg: &storage::PgStore, written_shards: &[WrittenShard]) {
+        for written in written_shards {
+            let _ = shard_pg.delete_shard(&written.key);
+        }
+    }
+
+    fn register_stream_shards_locked(
+        shard_pg: &storage::PgStore,
+        written_shards: &[WrittenShard],
+    ) -> Result<(), ServerError> {
+        for written in written_shards {
+            shard_pg
+                .register_written_shard(&written.key, written.ack)
+                .map_err(ServerError::Store)?;
+        }
+        Ok(())
+    }
+
+    fn best_effort_delete_stream_shards(&self, shard_pg_id: u32, written_shards: &[WrittenShard]) {
         let Ok(shard_pg) = self.storage_node.get_pg(shard_pg_id) else {
             return;
         };
-        for shard_key in written_shards {
-            let _ = shard_pg.delete_shard(shard_key);
-        }
+        Self::cleanup_stream_shards_locked(&shard_pg, written_shards);
     }
 
     /// Append a segment of data to an in-progress streaming session.
     ///
     /// Validates the session in the metadata PG, EC-encodes the segment,
-    /// writes shards, and records a staging segment row. When shard placement
-    /// differs from the metadata PG, shard writes happen without holding the
-    /// metadata PG lock.
+    /// writes shard files durably, publishes shard metadata, and records a
+    /// staging segment row. Shard file IO happens without holding any PG
+    /// mutex; only the metadata publication step briefly locks the relevant
+    /// PGs in a consistent order.
     ///
     /// The caller must not hold any PG locks when calling this method.
     pub fn append_stream_segment(
@@ -3637,6 +3677,17 @@ impl Coordinator {
             &segment_index.to_string(),
             segment_vid.get(),
         );
+        let segment_record = StreamUploadSegmentRecord {
+            session_id: SessionId::from(session_id),
+            segment_index,
+            size: data.len() as u64,
+            segment_crc64: Some(checksum::crc64::checksum(data)),
+            segment_okh,
+            segment_vid,
+            shard_pg_id,
+            ec_k: self.ec_config.data_shards,
+            ec_m: self.ec_config.parity_shards,
+        };
 
         {
             let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
@@ -3651,70 +3702,48 @@ impl Coordinator {
                 data.len(),
             );
             Self::reject_duplicate_stream_segment_index(&meta_guard, session_id, segment_index)?;
-
-            if shard_pg_id == meta_pg_id {
-                let written_shards =
-                    self.write_stream_segment_shards(&meta_guard, &segment_okh, segment_vid, data)?;
-                let segment_result = meta_guard.append_stream_segment(&StreamUploadSegmentRecord {
-                    session_id: SessionId::from(session_id),
-                    segment_index,
-                    size: data.len() as u64,
-                    segment_crc64: Some(checksum::crc64::checksum(data)),
-                    segment_okh,
-                    segment_vid,
-                    shard_pg_id,
-                    ec_k: self.ec_config.data_shards,
-                    ec_m: self.ec_config.parity_shards,
-                });
-
-                if let Err(e) = segment_result {
-                    self.best_effort_delete_stream_shards(meta_pg_id, &written_shards);
-                    return Err(ServerError::Metadata(e));
-                }
-
-                return Ok(());
-            }
         }
 
-        let shard_pg = self.storage_node.get_pg(shard_pg_id)?;
         let written_shards =
-            self.write_stream_segment_shards(&shard_pg, &segment_okh, segment_vid, data)?;
-        drop(shard_pg);
+            self.write_stream_segment_shards(shard_pg_id, &segment_okh, segment_vid, data)?;
 
-        let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
+        let (meta_guard, shard_guard_opt) =
+            match self.storage_node.lock_two_pgs(meta_pg_id, shard_pg_id) {
+                Ok(guards) => guards,
+                Err(err) => {
+                    self.best_effort_delete_stream_shards(shard_pg_id, &written_shards);
+                    return Err(ServerError::Store(err));
+                }
+            };
+        let shard_guard: &storage::PgStore = match shard_guard_opt.as_ref() {
+            Some(pg) => pg,
+            None => &meta_guard,
+        };
+
         let session = match meta_guard.get_stream_upload(session_id) {
             Ok(session) => session,
             Err(err) => {
-                self.best_effort_delete_stream_shards(shard_pg_id, &written_shards);
+                Self::cleanup_stream_shards_locked(shard_guard, &written_shards);
                 return Err(ServerError::Metadata(err));
             }
         };
         if let Err(err) = Self::validate_stream_session_binding(&session, bucket, key) {
-            self.best_effort_delete_stream_shards(shard_pg_id, &written_shards);
+            Self::cleanup_stream_shards_locked(shard_guard, &written_shards);
             return Err(err);
         }
         if let Err(err) =
             Self::reject_duplicate_stream_segment_index(&meta_guard, session_id, segment_index)
         {
-            self.best_effort_delete_stream_shards(shard_pg_id, &written_shards);
+            Self::cleanup_stream_shards_locked(shard_guard, &written_shards);
             return Err(err);
         }
-
-        let segment_result = meta_guard.append_stream_segment(&StreamUploadSegmentRecord {
-            session_id: SessionId::from(session_id),
-            segment_index,
-            size: data.len() as u64,
-            segment_crc64: Some(checksum::crc64::checksum(data)),
-            segment_okh,
-            segment_vid,
-            shard_pg_id,
-            ec_k: self.ec_config.data_shards,
-            ec_m: self.ec_config.parity_shards,
-        });
-
-        if let Err(e) = segment_result {
-            self.best_effort_delete_stream_shards(shard_pg_id, &written_shards);
-            return Err(ServerError::Metadata(e));
+        if let Err(err) = Self::register_stream_shards_locked(shard_guard, &written_shards) {
+            Self::cleanup_stream_shards_locked(shard_guard, &written_shards);
+            return Err(err);
+        }
+        if let Err(err) = meta_guard.append_stream_segment(&segment_record) {
+            Self::cleanup_stream_shards_locked(shard_guard, &written_shards);
+            return Err(ServerError::Metadata(err));
         }
 
         Ok(())
