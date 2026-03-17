@@ -202,17 +202,29 @@ impl MultipartChecksumConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawChecksum {
     algorithm: ChecksumAlgorithm,
-    bytes: Vec<u8>,
+    bytes: [u8; Self::MAX_LEN],
 }
 
 impl RawChecksum {
+    const MAX_LEN: usize = 32;
+
     /// Construct a `RawChecksum`, validating that the byte length matches the algorithm.
-    pub fn new(algorithm: ChecksumAlgorithm, bytes: Vec<u8>) -> Result<Self, &'static str> {
+    pub fn new(
+        algorithm: ChecksumAlgorithm,
+        bytes: impl AsRef<[u8]>,
+    ) -> Result<Self, &'static str> {
+        let bytes = bytes.as_ref();
         let expected = algorithm.expected_byte_length();
         if bytes.len() != expected {
             return Err("checksum byte length does not match algorithm");
         }
-        Ok(Self { algorithm, bytes })
+
+        let mut stored = [0u8; Self::MAX_LEN];
+        stored[..expected].copy_from_slice(bytes);
+        Ok(Self {
+            algorithm,
+            bytes: stored,
+        })
     }
 
     /// The checksum algorithm.
@@ -224,7 +236,7 @@ impl RawChecksum {
     /// The raw checksum bytes.
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
-        &self.bytes
+        &self.bytes[..self.algorithm.expected_byte_length()]
     }
 }
 

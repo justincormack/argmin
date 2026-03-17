@@ -1510,17 +1510,7 @@ impl HttpFrontend {
                                 .as_ref()
                                 .map(|c| c.algorithm())
                                 .or(session.checksum_algorithm);
-                            match algo {
-                                Some(a) => {
-                                    let bytes = compute_checksum_bytes(a, &req.body);
-                                    Some(checksum::RawChecksum::new(a, bytes).map_err(|_| {
-                                        ServerError::InternalError {
-                                            reason: "checksum byte length mismatch".to_string(),
-                                        }
-                                    })?)
-                                }
-                                None => None,
-                            }
+                            algo.map(|a| compute_checksum(a, &req.body))
                         };
                         self.coordinator.finalize_stream_part(
                             crate::coordinator::FinalizeStreamPartRequest {
@@ -2988,27 +2978,28 @@ fn extract_checksum_header(req: &S3Request) -> Result<Option<ChecksumClaim>, Ser
     }
 }
 
-/// Compute raw checksum bytes for the given algorithm and data.
-fn compute_checksum_bytes(algo: checksum::ChecksumAlgorithm, data: &[u8]) -> Vec<u8> {
+/// Compute an inline checksum value for the given algorithm and data.
+fn compute_checksum(algo: checksum::ChecksumAlgorithm, data: &[u8]) -> checksum::RawChecksum {
     match algo {
         checksum::ChecksumAlgorithm::Crc32 => {
-            checksum::crc32::checksum(data).to_be_bytes().to_vec()
+            checksum::RawChecksum::new(algo, checksum::crc32::checksum(data).to_be_bytes())
         }
         checksum::ChecksumAlgorithm::Crc32c => {
-            checksum::crc32c::checksum(data).to_be_bytes().to_vec()
+            checksum::RawChecksum::new(algo, checksum::crc32c::checksum(data).to_be_bytes())
         }
         checksum::ChecksumAlgorithm::Crc64nvme => {
-            checksum::crc64::checksum(data).to_be_bytes().to_vec()
+            checksum::RawChecksum::new(algo, checksum::crc64::checksum(data).to_be_bytes())
         }
-        checksum::ChecksumAlgorithm::Sha256 => ring::digest::digest(&ring::digest::SHA256, data)
-            .as_ref()
-            .to_vec(),
-        checksum::ChecksumAlgorithm::Sha1 => {
-            ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, data)
-                .as_ref()
-                .to_vec()
-        }
+        checksum::ChecksumAlgorithm::Sha256 => checksum::RawChecksum::new(
+            algo,
+            ring::digest::digest(&ring::digest::SHA256, data).as_ref(),
+        ),
+        checksum::ChecksumAlgorithm::Sha1 => checksum::RawChecksum::new(
+            algo,
+            ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, data).as_ref(),
+        ),
     }
+    .expect("checksum helper produces bytes matching the requested algorithm")
 }
 
 fn apply_response_overrides(resp: &mut S3Response, req: &S3Request) {

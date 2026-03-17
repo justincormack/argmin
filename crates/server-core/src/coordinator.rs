@@ -47,50 +47,51 @@ pub const INTERNAL_SEGMENT_SIZE: usize = 8 * 1024 * 1024;
 /// so the coordinator receives already-decoded, validated bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChecksumClaim {
-    algorithm: ChecksumAlgorithm,
-    expected_bytes: Vec<u8>,
+    expected: RawChecksum,
 }
 
 impl ChecksumClaim {
     /// Parse a base64-encoded checksum value, validating format and length.
     pub fn from_base64(algorithm: ChecksumAlgorithm, b64: &str) -> Result<Self, ServerError> {
         use base64::Engine;
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(b64)
+
+        let mut bytes = [0u8; 32];
+        let decoded_len = base64::engine::general_purpose::STANDARD
+            .decode_slice(b64, &mut bytes)
             .map_err(|_| ServerError::InvalidRequest {
                 reason: "invalid base64 in checksum value".to_string(),
             })?;
         let expected_len = algorithm.expected_byte_length();
-        if bytes.len() != expected_len {
+        if decoded_len != expected_len {
             return Err(ServerError::InvalidRequest {
                 reason: format!(
                     "checksum length {} does not match {} (expected {})",
-                    bytes.len(),
+                    decoded_len,
                     algorithm.as_str(),
                     expected_len,
                 ),
             });
         }
         Ok(Self {
-            algorithm,
-            expected_bytes: bytes,
+            expected: RawChecksum::new(algorithm, &bytes[..decoded_len])
+                .expect("decoded checksum bytes were length-validated against the algorithm"),
         })
     }
 
     /// The checksum algorithm.
     pub fn algorithm(&self) -> ChecksumAlgorithm {
-        self.algorithm
+        self.expected.algorithm()
     }
 
     /// The decoded checksum bytes.
     pub fn expected_bytes(&self) -> &[u8] {
-        &self.expected_bytes
+        self.expected.bytes()
     }
 
     /// The expected checksum value as canonical base64.
     pub fn to_base64(&self) -> String {
         use base64::Engine;
-        base64::engine::general_purpose::STANDARD.encode(&self.expected_bytes)
+        base64::engine::general_purpose::STANDARD.encode(self.expected.bytes())
     }
 }
 
@@ -3908,7 +3909,7 @@ impl Coordinator {
 
         // Use only a computed checksum from the streaming loop. This prevents
         // persisting unverified checksum claims from request headers.
-        let checksum_bytes = if let Some(cksum) = computed_checksum {
+        let checksum = if let Some(cksum) = computed_checksum {
             let algo = cksum.algorithm();
             let bytes = cksum.bytes();
             if let Some(ea) = effective_algo {
@@ -3936,7 +3937,7 @@ impl Coordinator {
                     return Err(ServerError::BadDigest);
                 }
             }
-            Some(bytes.to_vec())
+            Some(cksum)
         } else if effective_algo.is_some() || claimed_checksum.is_some() {
             return Err(ServerError::InvalidRequest {
                 reason: "missing computed checksum for streaming upload part".to_string(),
@@ -4002,7 +4003,7 @@ impl Coordinator {
             ec_k: self.ec_config.data_shards,
             ec_m: self.ec_config.parity_shards,
             last_modified: now,
-            checksum: checksum_bytes.clone(),
+            checksum: checksum.as_ref().map(|value| value.bytes().to_vec()),
         };
 
         // Atomic commit: upsert part, insert segments, delete staging.
@@ -4049,17 +4050,6 @@ impl Coordinator {
                 }
             }
         }
-
-        let checksum = match (effective_algo, checksum_bytes) {
-            (Some(algo), Some(bytes)) => {
-                Some(
-                    RawChecksum::new(algo, bytes).map_err(|_| ServerError::InternalError {
-                        reason: "computed checksum length does not match algorithm".into(),
-                    })?,
-                )
-            }
-            _ => None,
-        };
 
         Ok(UploadPartResult {
             etag: format_etag(crc64),
@@ -4385,7 +4375,8 @@ impl Coordinator {
                 use base64::Engine;
 
                 let algo = checksum.algorithm();
-                let b64 = base64::engine::general_purpose::STANDARD.encode(checksum.finalize());
+                let finalized = checksum.finalize();
+                let b64 = base64::engine::general_purpose::STANDARD.encode(finalized.bytes());
                 metadata_blob.set(algo.header_name(), &b64);
             }
 
@@ -4979,7 +4970,7 @@ impl Coordinator {
                     .get("x-amz-checksum-algorithm")
                     .and_then(ChecksumAlgorithm::parse)
                 {
-                    Some(algo) => Some(RawChecksum::new(algo, raw.clone()).map_err(|_| {
+                    Some(algo) => Some(RawChecksum::new(algo, raw.as_slice()).map_err(|_| {
                         ServerError::InternalError {
                             reason: format!(
                                 "stored checksum length {} does not match {} (expected {})",
@@ -5142,7 +5133,7 @@ impl Coordinator {
                     .get("x-amz-checksum-algorithm")
                     .and_then(ChecksumAlgorithm::parse)
                 {
-                    Some(algo) => Some(RawChecksum::new(algo, raw.clone()).map_err(|_| {
+                    Some(algo) => Some(RawChecksum::new(algo, raw.as_slice()).map_err(|_| {
                         ServerError::InternalError {
                             reason: format!(
                                 "stored checksum length {} does not match {} (expected {})",
@@ -6354,22 +6345,12 @@ impl Coordinator {
                         })?;
             }
 
-            let computed_checksum = match computed_checksum {
-                Some(checksum) => Some(
-                    RawChecksum::new(checksum.algorithm(), checksum.finalize()).map_err(|_| {
-                        ServerError::InternalError {
-                            reason: "checksum byte length mismatch".to_string(),
-                        }
-                    })?,
-                ),
-                None => None,
-            };
+            let computed_checksum = computed_checksum.map(StreamingChecksumAccumulator::finalize);
             // UploadPartCopy has no checksum header/body claim from the client.
             // When the multipart upload is checksum-configured, treat the
             // server-computed checksum as the authoritative part claim.
             let claimed_checksum = computed_checksum.as_ref().map(|checksum| ChecksumClaim {
-                algorithm: checksum.algorithm(),
-                expected_bytes: checksum.bytes().to_vec(),
+                expected: checksum.clone(),
             });
 
             self.finalize_stream_part(FinalizeStreamPartRequest {
@@ -6630,7 +6611,11 @@ impl Coordinator {
                         }
                     }
                     let hash = compute_checksum(algo, &concat);
-                    Some(format!("{}-{}", b64.encode(&hash), part_records.len()))
+                    Some(format!(
+                        "{}-{}",
+                        b64.encode(hash.bytes()),
+                        part_records.len()
+                    ))
                 }
                 ChecksumType::FullObject => {
                     // Combine part CRCs using mathematical combine.
@@ -7115,21 +7100,28 @@ impl Coordinator {
     }
 }
 
-/// Compute raw checksum bytes for the given algorithm and data.
-fn compute_checksum(algo: ChecksumAlgorithm, data: &[u8]) -> Vec<u8> {
+/// Compute an inline checksum value for the given algorithm and data.
+fn compute_checksum(algo: ChecksumAlgorithm, data: &[u8]) -> RawChecksum {
     match algo {
-        ChecksumAlgorithm::Crc32 => checksum::crc32::checksum(data).to_be_bytes().to_vec(),
-        ChecksumAlgorithm::Crc32c => checksum::crc32c::checksum(data).to_be_bytes().to_vec(),
-        ChecksumAlgorithm::Crc64nvme => checksum::crc64::checksum(data).to_be_bytes().to_vec(),
-        ChecksumAlgorithm::Sha256 => ring::digest::digest(&ring::digest::SHA256, data)
-            .as_ref()
-            .to_vec(),
-        ChecksumAlgorithm::Sha1 => {
-            ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, data)
-                .as_ref()
-                .to_vec()
+        ChecksumAlgorithm::Crc32 => {
+            RawChecksum::new(algo, checksum::crc32::checksum(data).to_be_bytes())
         }
+        ChecksumAlgorithm::Crc32c => {
+            RawChecksum::new(algo, checksum::crc32c::checksum(data).to_be_bytes())
+        }
+        ChecksumAlgorithm::Crc64nvme => {
+            RawChecksum::new(algo, checksum::crc64::checksum(data).to_be_bytes())
+        }
+        ChecksumAlgorithm::Sha256 => RawChecksum::new(
+            algo,
+            ring::digest::digest(&ring::digest::SHA256, data).as_ref(),
+        ),
+        ChecksumAlgorithm::Sha1 => RawChecksum::new(
+            algo,
+            ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, data).as_ref(),
+        ),
     }
+    .expect("checksum helper produces bytes matching the requested algorithm")
 }
 
 enum StreamingChecksumAccumulator {
@@ -7175,14 +7167,26 @@ impl StreamingChecksumAccumulator {
         }
     }
 
-    fn finalize(self) -> Vec<u8> {
+    fn finalize(self) -> RawChecksum {
         match self {
-            Self::Crc32(hasher) => hasher.finalize().to_be_bytes().to_vec(),
-            Self::Crc32c(hasher) => hasher.finalize().to_be_bytes().to_vec(),
-            Self::Crc64(hasher) => hasher.finalize().to_be_bytes().to_vec(),
-            Self::Sha1(hasher) => hasher.finish().as_ref().to_vec(),
-            Self::Sha256(hasher) => hasher.finish().as_ref().to_vec(),
+            Self::Crc32(hasher) => {
+                RawChecksum::new(ChecksumAlgorithm::Crc32, hasher.finalize().to_be_bytes())
+            }
+            Self::Crc32c(hasher) => {
+                RawChecksum::new(ChecksumAlgorithm::Crc32c, hasher.finalize().to_be_bytes())
+            }
+            Self::Crc64(hasher) => RawChecksum::new(
+                ChecksumAlgorithm::Crc64nvme,
+                hasher.finalize().to_be_bytes(),
+            ),
+            Self::Sha1(hasher) => {
+                RawChecksum::new(ChecksumAlgorithm::Sha1, hasher.finish().as_ref())
+            }
+            Self::Sha256(hasher) => {
+                RawChecksum::new(ChecksumAlgorithm::Sha256, hasher.finish().as_ref())
+            }
         }
+        .expect("streaming checksum accumulator produces bytes matching the algorithm")
     }
 }
 
@@ -7256,14 +7260,7 @@ pub mod test_helpers {
                     .claimed_checksum
                     .map(ChecksumClaim::algorithm)
                     .or(session.checksum_algorithm);
-                match algo {
-                    Some(a) => Some(RawChecksum::new(a, compute_checksum(a, req.data)).map_err(
-                        |_| ServerError::InternalError {
-                            reason: "checksum byte length mismatch".to_string(),
-                        },
-                    )?),
-                    None => None,
-                }
+                algo.map(|a| compute_checksum(a, req.data))
             };
             coord.finalize_stream_part(FinalizeStreamPartRequest {
                 bucket: req.bucket,
@@ -16049,7 +16046,7 @@ mod tests {
         let mut complete_parts = Vec::new();
         for (i, data) in part_data.iter().enumerate() {
             let part_number = (i + 1) as u32;
-            let checksum_b64 = b64.encode(compute_checksum(algo, data));
+            let checksum_b64 = b64.encode(compute_checksum(algo, data).bytes());
             let claim = ChecksumClaim::from_base64(algo, &checksum_b64).unwrap();
             let result = test_helpers::upload_part(
                 coord,
@@ -16114,10 +16111,10 @@ mod tests {
         let raw1 = compute_checksum(ChecksumAlgorithm::Sha256, &big);
         let raw2 = compute_checksum(ChecksumAlgorithm::Sha256, small);
         let mut concat = Vec::new();
-        concat.extend_from_slice(&raw1);
-        concat.extend_from_slice(&raw2);
+        concat.extend_from_slice(raw1.bytes());
+        concat.extend_from_slice(raw2.bytes());
         let expected_hash = compute_checksum(ChecksumAlgorithm::Sha256, &concat);
-        let expected = format!("{}-2", b64.encode(&expected_hash));
+        let expected = format!("{}-2", b64.encode(expected_hash.bytes()));
         assert_eq!(val, expected);
     }
 
@@ -16289,10 +16286,10 @@ mod tests {
         let raw1 = compute_checksum(ChecksumAlgorithm::Crc32, &big);
         let raw2 = compute_checksum(ChecksumAlgorithm::Crc32, small);
         let mut concat = Vec::new();
-        concat.extend_from_slice(&raw1);
-        concat.extend_from_slice(&raw2);
+        concat.extend_from_slice(raw1.bytes());
+        concat.extend_from_slice(raw2.bytes());
         let hash = compute_checksum(ChecksumAlgorithm::Crc32, &concat);
-        let expected = format!("{}-2", b64.encode(&hash));
+        let expected = format!("{}-2", b64.encode(hash.bytes()));
         assert_eq!(val, expected);
     }
 

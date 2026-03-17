@@ -50,14 +50,17 @@ This is only about internal segment payload movement. It does not change:
    into the assembly path
 9. streaming PUT and UploadPart ingress now consume non-decoded Hyper frame
    bytes directly instead of copying each frame into a fresh `Vec<u8>`
+10. checksum claims and computed checksum values now use inline fixed-size
+    storage instead of heap `Vec<u8>` allocations for 4/8/20/32-byte checksum
+    values
 
 ## Remaining
 
 1. decide whether any remaining checksum or small control-path scratch is worth
    pooling, or whether the current hot-path reduction is enough
-   This currently means tiny fixed-size checksum byte buffers and small EC
+   This now mostly means storage-boundary checksum blob copies and small EC
    helper vectors such as index/reference lists, not segment-sized payload
-   buffers.
+   buffers or computed checksum result values.
 2. measure whether the remaining small owner-object churn
    (`Arc`/`Bytes::from_owner`) is worth another abstraction layer, or whether
    the current pooled payload buffers are sufficient for the healthy path

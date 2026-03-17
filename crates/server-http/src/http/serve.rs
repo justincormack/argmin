@@ -74,26 +74,18 @@ impl TrailingChecksumHasher {
 
     /// Finalize and return a validated `RawChecksum`.
     fn finalize_raw(self) -> RawChecksum {
-        let (algo, bytes) = match self {
-            Self::Crc32(crc) => (ChecksumAlgorithm::Crc32, crc.to_be_bytes().to_vec()),
-            Self::Crc32c(h) => (
-                ChecksumAlgorithm::Crc32c,
-                h.finalize().to_be_bytes().to_vec(),
-            ),
-            Self::Crc64(h) => (
-                ChecksumAlgorithm::Crc64nvme,
-                h.finalize().to_be_bytes().to_vec(),
-            ),
-            Self::Sha256(ctx) => {
-                let digest = ctx.finish();
-                (ChecksumAlgorithm::Sha256, digest.as_ref().to_vec())
+        match self {
+            Self::Crc32(crc) => RawChecksum::new(ChecksumAlgorithm::Crc32, crc.to_be_bytes()),
+            Self::Crc32c(h) => {
+                RawChecksum::new(ChecksumAlgorithm::Crc32c, h.finalize().to_be_bytes())
             }
-            Self::Sha1(ctx) => {
-                let digest = ctx.finish();
-                (ChecksumAlgorithm::Sha1, digest.as_ref().to_vec())
+            Self::Crc64(h) => {
+                RawChecksum::new(ChecksumAlgorithm::Crc64nvme, h.finalize().to_be_bytes())
             }
-        };
-        RawChecksum::new(algo, bytes).expect("hasher produces correct length")
+            Self::Sha256(ctx) => RawChecksum::new(ChecksumAlgorithm::Sha256, ctx.finish().as_ref()),
+            Self::Sha1(ctx) => RawChecksum::new(ChecksumAlgorithm::Sha1, ctx.finish().as_ref()),
+        }
+        .expect("hasher produces correct length")
     }
 
     /// Finalize and return the base64-encoded checksum string.
@@ -1163,35 +1155,38 @@ async fn handle_streaming_put(
                                 return error_response(&err);
                             }
                         };
+                        let mut ingest = StreamingPutIngestState {
+                            hasher: &mut hasher,
+                            payload_sha256_hasher: &mut payload_sha256_hasher,
+                            trailing_hasher: &mut trailing_hasher,
+                            total_size: &mut total_size,
+                            buf: &mut buf,
+                            segment_index: &mut segment_index,
+                        };
+                        if let Err(resp) =
+                            ingest_streaming_put_payload(&state, &ctx, &payload, &mut ingest).await
+                        {
+                            return resp;
+                        }
+                    } else {
+                        let mut ingest = StreamingPutIngestState {
+                            hasher: &mut hasher,
+                            payload_sha256_hasher: &mut payload_sha256_hasher,
+                            trailing_hasher: &mut trailing_hasher,
+                            total_size: &mut total_size,
+                            buf: &mut buf,
+                            segment_index: &mut segment_index,
+                        };
                         if let Err(resp) = ingest_streaming_put_payload(
                             &state,
                             &ctx,
-                            &payload,
-                            &mut hasher,
-                            &mut payload_sha256_hasher,
-                            &mut trailing_hasher,
-                            &mut total_size,
-                            &mut buf,
-                            &mut segment_index,
+                            wire_data.as_ref(),
+                            &mut ingest,
                         )
                         .await
                         {
                             return resp;
                         }
-                    } else if let Err(resp) = ingest_streaming_put_payload(
-                        &state,
-                        &ctx,
-                        wire_data.as_ref(),
-                        &mut hasher,
-                        &mut payload_sha256_hasher,
-                        &mut trailing_hasher,
-                        &mut total_size,
-                        &mut buf,
-                        &mut segment_index,
-                    )
-                    .await
-                    {
-                        return resp;
                     }
                 }
             }
@@ -1331,51 +1326,55 @@ async fn abort_streaming(state: &Arc<ServerState>, ctx: &Arc<super::StreamingPut
     .await;
 }
 
+struct StreamingPutIngestState<'a> {
+    hasher: &'a mut checksum::crc64::Hasher,
+    payload_sha256_hasher: &'a mut Option<ring::digest::Context>,
+    trailing_hasher: &'a mut Option<TrailingChecksumHasher>,
+    total_size: &'a mut u64,
+    buf: &'a mut PooledSegmentBuffer,
+    segment_index: &'a mut u32,
+}
+
 async fn ingest_streaming_put_payload(
     state: &Arc<ServerState>,
     ctx: &Arc<super::StreamingPutContext>,
     payload: &[u8],
-    hasher: &mut checksum::crc64::Hasher,
-    payload_sha256_hasher: &mut Option<ring::digest::Context>,
-    trailing_hasher: &mut Option<TrailingChecksumHasher>,
-    total_size: &mut u64,
-    buf: &mut PooledSegmentBuffer,
-    segment_index: &mut u32,
+    ingest: &mut StreamingPutIngestState<'_>,
 ) -> Result<(), S3Response> {
     if payload.is_empty() {
         return Ok(());
     }
 
-    hasher.update(payload);
-    if let Some(h) = payload_sha256_hasher.as_mut() {
+    ingest.hasher.update(payload);
+    if let Some(h) = ingest.payload_sha256_hasher.as_mut() {
         h.update(payload);
     }
-    if let Some(th) = trailing_hasher.as_mut() {
+    if let Some(th) = ingest.trailing_hasher.as_mut() {
         th.update(payload);
     }
-    *total_size += payload.len() as u64;
-    if *total_size > MAX_OBJECT_SIZE {
+    *ingest.total_size += payload.len() as u64;
+    if *ingest.total_size > MAX_OBJECT_SIZE {
         abort_streaming(state, ctx).await;
         return Err(error_response(&ServerError::ObjectTooLarge {
-            size: *total_size,
+            size: *ingest.total_size,
             max: MAX_OBJECT_SIZE,
         }));
     }
 
     let mut remaining = payload;
     while !remaining.is_empty() {
-        let needed = crate::coordinator::INTERNAL_SEGMENT_SIZE - buf.len();
+        let needed = crate::coordinator::INTERNAL_SEGMENT_SIZE - ingest.buf.len();
         let take = needed.min(remaining.len());
-        buf.extend_from_slice(&remaining[..take]);
+        ingest.buf.extend_from_slice(&remaining[..take]);
         remaining = &remaining[take..];
-        if buf.len() < crate::coordinator::INTERNAL_SEGMENT_SIZE {
+        if ingest.buf.len() < crate::coordinator::INTERNAL_SEGMENT_SIZE {
             continue;
         }
 
         let mut flush_data = PooledSegmentBuffer::new(state);
-        std::mem::swap(buf, &mut flush_data);
-        let idx = *segment_index;
-        *segment_index += 1;
+        std::mem::swap(ingest.buf, &mut flush_data);
+        let idx = *ingest.segment_index;
+        *ingest.segment_index += 1;
         let ctx_ref = Arc::clone(ctx);
         let st = Arc::clone(state);
         match tokio::task::spawn_blocking(move || {
@@ -1494,35 +1493,38 @@ async fn handle_streaming_part(
                                 return error_response(&err);
                             }
                         };
+                        let mut ingest = StreamingPartIngestState {
+                            hasher: &mut hasher,
+                            payload_sha256_hasher: &mut payload_sha256_hasher,
+                            trailing_hasher: &mut trailing_hasher,
+                            total_size: &mut total_size,
+                            buf: &mut buf,
+                            segment_index: &mut segment_index,
+                        };
+                        if let Err(resp) =
+                            ingest_streaming_part_payload(&state, &ctx, &payload, &mut ingest).await
+                        {
+                            return resp;
+                        }
+                    } else {
+                        let mut ingest = StreamingPartIngestState {
+                            hasher: &mut hasher,
+                            payload_sha256_hasher: &mut payload_sha256_hasher,
+                            trailing_hasher: &mut trailing_hasher,
+                            total_size: &mut total_size,
+                            buf: &mut buf,
+                            segment_index: &mut segment_index,
+                        };
                         if let Err(resp) = ingest_streaming_part_payload(
                             &state,
                             &ctx,
-                            &payload,
-                            &mut hasher,
-                            &mut payload_sha256_hasher,
-                            &mut trailing_hasher,
-                            &mut total_size,
-                            &mut buf,
-                            &mut segment_index,
+                            wire_data.as_ref(),
+                            &mut ingest,
                         )
                         .await
                         {
                             return resp;
                         }
-                    } else if let Err(resp) = ingest_streaming_part_payload(
-                        &state,
-                        &ctx,
-                        wire_data.as_ref(),
-                        &mut hasher,
-                        &mut payload_sha256_hasher,
-                        &mut trailing_hasher,
-                        &mut total_size,
-                        &mut buf,
-                        &mut segment_index,
-                    )
-                    .await
-                    {
-                        return resp;
                     }
                 }
             }
@@ -1676,51 +1678,55 @@ async fn abort_streaming_part_ctx(
     .await;
 }
 
+struct StreamingPartIngestState<'a> {
+    hasher: &'a mut checksum::crc64::Hasher,
+    payload_sha256_hasher: &'a mut Option<ring::digest::Context>,
+    trailing_hasher: &'a mut Option<TrailingChecksumHasher>,
+    total_size: &'a mut u64,
+    buf: &'a mut PooledSegmentBuffer,
+    segment_index: &'a mut u32,
+}
+
 async fn ingest_streaming_part_payload(
     state: &Arc<ServerState>,
     ctx: &Arc<super::StreamingPartContext>,
     payload: &[u8],
-    hasher: &mut checksum::crc64::Hasher,
-    payload_sha256_hasher: &mut Option<ring::digest::Context>,
-    trailing_hasher: &mut Option<TrailingChecksumHasher>,
-    total_size: &mut u64,
-    buf: &mut PooledSegmentBuffer,
-    segment_index: &mut u32,
+    ingest: &mut StreamingPartIngestState<'_>,
 ) -> Result<(), S3Response> {
     if payload.is_empty() {
         return Ok(());
     }
 
-    hasher.update(payload);
-    if let Some(h) = payload_sha256_hasher.as_mut() {
+    ingest.hasher.update(payload);
+    if let Some(h) = ingest.payload_sha256_hasher.as_mut() {
         h.update(payload);
     }
-    if let Some(th) = trailing_hasher.as_mut() {
+    if let Some(th) = ingest.trailing_hasher.as_mut() {
         th.update(payload);
     }
-    *total_size += payload.len() as u64;
-    if *total_size > MAX_OBJECT_SIZE {
+    *ingest.total_size += payload.len() as u64;
+    if *ingest.total_size > MAX_OBJECT_SIZE {
         abort_streaming_part_ctx(state, ctx).await;
         return Err(error_response(&ServerError::ObjectTooLarge {
-            size: *total_size,
+            size: *ingest.total_size,
             max: MAX_OBJECT_SIZE,
         }));
     }
 
     let mut remaining = payload;
     while !remaining.is_empty() {
-        let needed = crate::coordinator::INTERNAL_SEGMENT_SIZE - buf.len();
+        let needed = crate::coordinator::INTERNAL_SEGMENT_SIZE - ingest.buf.len();
         let take = needed.min(remaining.len());
-        buf.extend_from_slice(&remaining[..take]);
+        ingest.buf.extend_from_slice(&remaining[..take]);
         remaining = &remaining[take..];
-        if buf.len() < crate::coordinator::INTERNAL_SEGMENT_SIZE {
+        if ingest.buf.len() < crate::coordinator::INTERNAL_SEGMENT_SIZE {
             continue;
         }
 
         let mut flush_data = PooledSegmentBuffer::new(state);
-        std::mem::swap(buf, &mut flush_data);
-        let idx = *segment_index;
-        *segment_index += 1;
+        std::mem::swap(ingest.buf, &mut flush_data);
+        let idx = *ingest.segment_index;
+        *ingest.segment_index += 1;
         let ctx_ref = Arc::clone(ctx);
         let st = Arc::clone(state);
         match tokio::task::spawn_blocking(move || {
