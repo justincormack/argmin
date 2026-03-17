@@ -57,10 +57,10 @@ impl S3Request {
     ///
     /// Body size limiting is done by the caller (serve layer) via `http_body_util::Limited`.
     pub fn from_hyper(
-        parts: &http::request::Parts,
+        parts: http::request::Parts,
         body: bytes::Bytes,
     ) -> Result<Self, ServerError> {
-        let method = parts.method.clone();
+        let method = parts.method;
         let path = parts.uri.path().to_string();
         let query_string = parts.uri.query().unwrap_or("").to_string();
 
@@ -72,7 +72,7 @@ impl S3Request {
                 reason: format!("invalid UTF-8 in header value for {name}"),
             })?;
         }
-        let headers = parts.headers.clone();
+        let headers = parts.headers;
 
         // Validate Content-Length header if present (reject negative/non-numeric)
         if let Some(cl_value) = headers.get("content-length").map(|value| {
@@ -97,7 +97,7 @@ impl S3Request {
     /// Used by the streaming write path where the body is consumed frame-by-frame
     /// rather than collected upfront. Auth works because the `x-amz-content-sha256`
     /// header provides the body hash (typically `UNSIGNED-PAYLOAD`).
-    pub fn from_hyper_headers(parts: &http::request::Parts) -> Result<Self, ServerError> {
+    pub fn from_hyper_headers(parts: http::request::Parts) -> Result<Self, ServerError> {
         Self::from_hyper(parts, bytes::Bytes::new())
     }
 
@@ -585,7 +585,7 @@ mod tests {
             .unwrap()
             .into_parts();
         parts.headers = headers;
-        let req = S3Request::from_hyper(&parts, bytes::Bytes::new()).unwrap();
+        let req = S3Request::from_hyper(parts, bytes::Bytes::new()).unwrap();
         assert_eq!(req.header("x-amz-meta-tag"), Some("caf\u{e9}"));
     }
 
@@ -608,7 +608,7 @@ mod tests {
             .unwrap()
             .into_parts();
         parts.headers = headers;
-        match S3Request::from_hyper(&parts, bytes::Bytes::new()) {
+        match S3Request::from_hyper(parts, bytes::Bytes::new()) {
             Err(ServerError::InvalidRequest { reason }) => {
                 assert!(
                     reason.contains("invalid UTF-8") && reason.contains("x-amz-meta-raw"),

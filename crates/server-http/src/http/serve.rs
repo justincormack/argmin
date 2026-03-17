@@ -414,7 +414,18 @@ async fn handle(
 
     // Check if this request should use the streaming write path.
     if let Some(op) = is_streaming_write(&parts) {
-        let chunked = match parse_chunked_mode(&parts) {
+        let s3req = match S3Request::from_hyper_headers(parts) {
+            Ok(req) => req,
+            Err(err) => {
+                return Ok(s3_response_to_hyper(
+                    S3Response::error(&err, ""),
+                    Some(req_permit),
+                    state.config.stream_read_chunk_size,
+                    response_trace.clone(),
+                ))
+            }
+        };
+        let chunked = match parse_chunked_mode(&s3req) {
             Ok(mode) => mode,
             Err(err) => {
                 return Ok(s3_response_to_hyper(
@@ -429,7 +440,7 @@ async fn handle(
             StreamingWriteOp::PutObject { bucket, key } => {
                 handle_streaming_put(
                     Arc::clone(&state),
-                    parts,
+                    s3req,
                     body,
                     bucket,
                     key,
@@ -446,7 +457,7 @@ async fn handle(
             } => {
                 handle_streaming_part(
                     Arc::clone(&state),
-                    parts,
+                    s3req,
                     body,
                     bucket,
                     key,
@@ -467,8 +478,19 @@ async fn handle(
     }
 
     if let Some(bucket) = post_object_bucket(&parts) {
+        let s3req = match S3Request::from_hyper_headers(parts) {
+            Ok(req) => req,
+            Err(err) => {
+                return Ok(s3_response_to_hyper(
+                    S3Response::error(&err, ""),
+                    Some(req_permit),
+                    state.config.stream_read_chunk_size,
+                    response_trace,
+                ));
+            }
+        };
         let resp =
-            handle_streaming_post_object(Arc::clone(&state), parts, body, bucket, trace.clone())
+            handle_streaming_post_object(Arc::clone(&state), s3req, body, bucket, trace.clone())
                 .await;
         return Ok(s3_response_to_hyper(
             resp,
@@ -492,7 +514,7 @@ async fn handle(
         }
     };
 
-    let s3req = match S3Request::from_hyper(&parts, body_bytes) {
+    let s3req = match S3Request::from_hyper(parts, body_bytes) {
         Ok(req) => req,
         Err(err) => {
             return Ok(s3_response_to_hyper(
@@ -569,13 +591,8 @@ fn is_streaming_write(parts: &http::request::Parts) -> Option<StreamingWriteOp> 
 ///
 /// Returns `ChunkedMode::None` for plain PUT bodies (including missing
 /// `x-amz-content-sha256`, `UNSIGNED-PAYLOAD`, and fixed SHA256 hashes).
-fn parse_chunked_mode(parts: &http::request::Parts) -> Result<ChunkedMode, ServerError> {
-    let content_sha256 = parts
-        .headers
-        .get("x-amz-content-sha256")
-        .and_then(|v| v.to_str().ok());
-
-    let Some(content_sha256) = content_sha256 else {
+fn parse_chunked_mode(req: &S3Request) -> Result<ChunkedMode, ServerError> {
+    let Some(content_sha256) = req.header("x-amz-content-sha256") else {
         return Ok(ChunkedMode::None);
     };
 
@@ -585,14 +602,10 @@ fn parse_chunked_mode(parts: &http::request::Parts) -> Result<ChunkedMode, Serve
         | "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"
         | "STREAMING-UNSIGNED-PAYLOAD-TRAILER" => {
             // content-encoding must contain aws-chunked.
-            let has_aws_chunked = parts
-                .headers
-                .get("content-encoding")
-                .and_then(|v| v.to_str().ok())
-                .is_some_and(|ce| {
-                    ce.split(',')
-                        .any(|part| part.trim().eq_ignore_ascii_case("aws-chunked"))
-                });
+            let has_aws_chunked = req.header("content-encoding").is_some_and(|ce| {
+                ce.split(',')
+                    .any(|part| part.trim().eq_ignore_ascii_case("aws-chunked"))
+            });
             if !has_aws_chunked {
                 return Err(ServerError::MalformedTrailerError {
                     reason: "content-encoding must contain aws-chunked for streaming uploads"
@@ -601,10 +614,8 @@ fn parse_chunked_mode(parts: &http::request::Parts) -> Result<ChunkedMode, Serve
             }
 
             // x-amz-decoded-content-length must be present and valid.
-            let expected_len_str = parts
-                .headers
-                .get("x-amz-decoded-content-length")
-                .and_then(|v| v.to_str().ok())
+            let expected_len_str = req
+                .header("x-amz-decoded-content-length")
                 .ok_or(ServerError::MissingContentLength)?;
             let expected_len =
                 expected_len_str
@@ -814,7 +825,7 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 async fn handle_streaming_post_object(
     state: Arc<ServerState>,
-    parts: http::request::Parts,
+    s3req: S3Request,
     body: Incoming,
     bucket: String,
     trace: observability::TraceContext,
@@ -823,10 +834,6 @@ async fn handle_streaming_post_object(
 
     let idle_timeout = state.config.body_idle_timeout;
 
-    let s3req = match S3Request::from_hyper_headers(&parts) {
-        Ok(req) => req,
-        Err(err) => return S3Response::error(&err, ""),
-    };
     let req_arc = Arc::new(s3req);
 
     let content_type = match req_arc.header("content-type") {
@@ -1100,7 +1107,7 @@ fn extract_query_param(query: &str, name: &str) -> Option<String> {
 /// lock. Between appends, no frontend is held — body reading is async.
 async fn handle_streaming_put(
     state: Arc<ServerState>,
-    parts: http::request::Parts,
+    s3req: S3Request,
     body: Incoming,
     bucket: String,
     key: String,
@@ -1109,15 +1116,19 @@ async fn handle_streaming_put(
 ) -> S3Response {
     let idle_timeout = state.config.body_idle_timeout;
 
-    // 1. Parse headers (no body) and prepare streaming session.
-    let s3req = match S3Request::from_hyper_headers(&parts) {
-        Ok(req) => req,
-        Err(err) => return S3Response::error(&err, ""),
-    };
-
     let state2 = Arc::clone(&state);
     let bucket_clone = bucket.clone();
     let key_clone = key.clone();
+    let declared_trailer = s3req.header("x-amz-trailer").map(str::to_string);
+    let claimed_payload_sha256 = claimed_payload_sha256_from_request(&s3req);
+    let mut trailing_hasher = trailing_hasher_from_request(&s3req);
+    let mut inline_checksum_claim: Option<String> = None;
+    if trailing_hasher.is_none() {
+        if let Some((h, claimed)) = inline_checksum_hasher_from_request(&s3req) {
+            trailing_hasher = Some(h);
+            inline_checksum_claim = Some(claimed);
+        }
+    }
     let ctx = match spawn_blocking_with_trace(trace, move || {
         let frontend = acquire_frontend(&state2);
         frontend.prepare_streaming_put(&s3req, &bucket_clone, &key_clone)
@@ -1131,22 +1142,9 @@ async fn handle_streaming_put(
 
     // Build chunked decoder if needed.
     let mut decoder = make_chunked_decoder(&chunked, ctx.streaming_signing.as_ref());
-    let claimed_payload_sha256 = claimed_payload_sha256_from_parts(&parts);
     let mut payload_sha256_hasher = claimed_payload_sha256
         .as_ref()
         .map(|_| ring::digest::Context::new(&ring::digest::SHA256));
-
-    // If a trailing checksum is declared, prepare an incremental hasher for validation.
-    // Otherwise, if an inline checksum header is present, prepare a hasher for that
-    // so we can verify the claimed value against the actual streamed body.
-    let mut trailing_hasher = trailing_hasher_from_parts(&parts);
-    let mut inline_checksum_claim: Option<String> = None;
-    if trailing_hasher.is_none() {
-        if let Some((h, claimed)) = inline_checksum_hasher_from_parts(&parts) {
-            trailing_hasher = Some(h);
-            inline_checksum_claim = Some(claimed);
-        }
-    }
 
     // 2. Stream body frames, accumulating into internal segment-sized buffers.
     let ctx = Arc::new(ctx);
@@ -1259,7 +1257,12 @@ async fn handle_streaming_put(
             return error_response(&ServerError::IncompleteBody);
         }
         let trailers = dec.into_trailers();
-        if let Err(err) = validate_chunked_post_decode(&chunked, total_size, &trailers, &parts) {
+        if let Err(err) = validate_chunked_post_decode(
+            &chunked,
+            total_size,
+            &trailers,
+            declared_trailer.as_deref(),
+        ) {
             abort_streaming(&state, &ctx).await;
             return error_response(&err);
         }
@@ -1639,7 +1642,7 @@ async fn abort_streaming_post_object(
 #[allow(clippy::too_many_arguments)]
 async fn handle_streaming_part(
     state: Arc<ServerState>,
-    parts: http::request::Parts,
+    s3req: S3Request,
     body: Incoming,
     bucket: String,
     key: String,
@@ -1650,16 +1653,20 @@ async fn handle_streaming_part(
 ) -> S3Response {
     let idle_timeout = state.config.body_idle_timeout;
 
-    // 1. Parse headers and prepare streaming session.
-    let s3req = match S3Request::from_hyper_headers(&parts) {
-        Ok(req) => req,
-        Err(err) => return S3Response::error(&err, ""),
-    };
-
     let state2 = Arc::clone(&state);
     let bucket_clone = bucket.clone();
     let key_clone = key.clone();
     let upload_id_clone = upload_id.clone();
+    let declared_trailer = s3req.header("x-amz-trailer").map(str::to_string);
+    let claimed_payload_sha256 = claimed_payload_sha256_from_request(&s3req);
+    let mut trailing_hasher = trailing_hasher_from_request(&s3req);
+    let mut inline_checksum_claim: Option<String> = None;
+    if trailing_hasher.is_none() {
+        if let Some((h, claimed)) = inline_checksum_hasher_from_request(&s3req) {
+            trailing_hasher = Some(h);
+            inline_checksum_claim = Some(claimed);
+        }
+    }
     let ctx = match spawn_blocking_with_trace(trace, move || {
         let frontend = acquire_frontend(&state2);
         frontend.prepare_streaming_part(
@@ -1679,22 +1686,9 @@ async fn handle_streaming_part(
 
     // Build chunked decoder if needed.
     let mut decoder = make_chunked_decoder(&chunked, ctx.streaming_signing.as_ref());
-    let claimed_payload_sha256 = claimed_payload_sha256_from_parts(&parts);
     let mut payload_sha256_hasher = claimed_payload_sha256
         .as_ref()
         .map(|_| ring::digest::Context::new(&ring::digest::SHA256));
-
-    // If a trailing checksum is declared, prepare an incremental hasher for validation.
-    // Otherwise, if an inline checksum header is present, prepare a hasher for that
-    // so we can verify the claimed value against the actual streamed body.
-    let mut trailing_hasher = trailing_hasher_from_parts(&parts);
-    let mut inline_checksum_claim: Option<String> = None;
-    if trailing_hasher.is_none() {
-        if let Some((h, claimed)) = inline_checksum_hasher_from_parts(&parts) {
-            trailing_hasher = Some(h);
-            inline_checksum_claim = Some(claimed);
-        }
-    }
     // 2. Stream body frames, accumulating into internal segment-sized buffers.
     let ctx = Arc::new(ctx);
     let mut hasher = checksum::crc64::Hasher::new();
@@ -1808,7 +1802,12 @@ async fn handle_streaming_part(
             return error_response(&ServerError::IncompleteBody);
         }
         let trailers = dec.into_trailers();
-        if let Err(err) = validate_chunked_post_decode(&chunked, total_size, &trailers, &parts) {
+        if let Err(err) = validate_chunked_post_decode(
+            &chunked,
+            total_size,
+            &trailers,
+            declared_trailer.as_deref(),
+        ) {
             abort_streaming_part_ctx(&state, &ctx).await;
             return error_response(&err);
         }
@@ -2224,7 +2223,7 @@ fn validate_chunked_post_decode(
     chunked: &ChunkedMode,
     total_decoded: u64,
     trailers: &[(String, String)],
-    parts: &http::request::Parts,
+    declared_trailer: Option<&str>,
 ) -> Result<(), ServerError> {
     // Validate decoded length matches x-amz-decoded-content-length.
     if let Some(expected) = chunked.expected_len() {
@@ -2249,11 +2248,6 @@ fn validate_chunked_post_decode(
     if !is_trailer && !content_trailers.is_empty() {
         return Err(ServerError::IncompleteBody);
     }
-
-    let declared_trailer = parts
-        .headers
-        .get("x-amz-trailer")
-        .and_then(|v| v.to_str().ok());
 
     // Trailers in body but no declaration header.
     if !content_trailers.is_empty() && declared_trailer.is_none() {
@@ -2330,11 +2324,8 @@ fn extract_checksum_trailers(
 ///
 /// Handles comma-separated trailer declarations and case-insensitive matching.
 /// Returns the hasher for the first recognized checksum trailer name.
-fn trailing_hasher_from_parts(parts: &http::request::Parts) -> Option<TrailingChecksumHasher> {
-    let header_val = parts
-        .headers
-        .get("x-amz-trailer")
-        .and_then(|v| v.to_str().ok())?;
+fn trailing_hasher_from_request(req: &S3Request) -> Option<TrailingChecksumHasher> {
+    let header_val = req.header("x-amz-trailer")?;
     for name in header_val.split(',') {
         let trimmed = name.trim();
         if let Some(h) = TrailingChecksumHasher::from_trailer_header(trimmed) {
@@ -2349,8 +2340,8 @@ fn trailing_hasher_from_parts(parts: &http::request::Parts) -> Option<TrailingCh
 /// Used when a streaming PUT includes a checksum value header but no trailing
 /// checksum declaration. Returns the hasher and the claimed base64 value so
 /// the caller can verify after body streaming completes.
-fn inline_checksum_hasher_from_parts(
-    parts: &http::request::Parts,
+fn inline_checksum_hasher_from_request(
+    req: &S3Request,
 ) -> Option<(TrailingChecksumHasher, String)> {
     // The header names in CHECKSUM_HEADERS (in mod.rs) match the trailer
     // header names used by TrailingChecksumHasher::from_trailer_header.
@@ -2361,7 +2352,7 @@ fn inline_checksum_hasher_from_parts(
         "x-amz-checksum-sha256",
         "x-amz-checksum-sha1",
     ] {
-        if let Some(val) = parts.headers.get(*name).and_then(|v| v.to_str().ok()) {
+        if let Some(val) = req.header(name) {
             if let Some(h) = TrailingChecksumHasher::from_trailer_header(name) {
                 return Some((h, val.to_string()));
             }
@@ -2373,11 +2364,8 @@ fn inline_checksum_hasher_from_parts(
 /// Return the claimed fixed payload SHA256 (hex) from `x-amz-content-sha256`.
 ///
 /// Excludes UNSIGNED-PAYLOAD and STREAMING-* sentinel values.
-fn claimed_payload_sha256_from_parts(parts: &http::request::Parts) -> Option<String> {
-    let value = parts
-        .headers
-        .get("x-amz-content-sha256")
-        .and_then(|v| v.to_str().ok())?;
+fn claimed_payload_sha256_from_request(req: &S3Request) -> Option<String> {
+    let value = req.header("x-amz-content-sha256")?;
     if value == "UNSIGNED-PAYLOAD" || value.starts_with("STREAMING-") {
         return None;
     }
@@ -2500,6 +2488,10 @@ mod tests {
         parts
     }
 
+    fn make_s3req(method: &str, uri: &str, headers: &[(&str, &str)]) -> S3Request {
+        S3Request::from_hyper_headers(make_parts(method, uri, headers)).unwrap()
+    }
+
     #[test]
     fn streaming_put_eligible() {
         let parts = make_parts(
@@ -2579,7 +2571,7 @@ mod tests {
 
     #[test]
     fn parse_chunked_mode_signed_chunked() {
-        let parts = make_parts(
+        let req = make_s3req(
             "PUT",
             "/mybucket/mykey",
             &[
@@ -2588,13 +2580,13 @@ mod tests {
                 ("x-amz-decoded-content-length", "100"),
             ],
         );
-        let mode = parse_chunked_mode(&parts).unwrap();
+        let mode = parse_chunked_mode(&req).unwrap();
         assert!(matches!(mode, ChunkedMode::Signed { expected_len: 100 }));
     }
 
     #[test]
     fn parse_chunked_mode_signed_trailer_chunked() {
-        let parts = make_parts(
+        let req = make_s3req(
             "PUT",
             "/mybucket/mykey",
             &[
@@ -2606,7 +2598,7 @@ mod tests {
                 ("x-amz-decoded-content-length", "100"),
             ],
         );
-        let mode = parse_chunked_mode(&parts).unwrap();
+        let mode = parse_chunked_mode(&req).unwrap();
         assert!(matches!(
             mode,
             ChunkedMode::SignedTrailer { expected_len: 100 }
@@ -2615,7 +2607,7 @@ mod tests {
 
     #[test]
     fn parse_chunked_mode_unsigned_trailer_chunked() {
-        let parts = make_parts(
+        let req = make_s3req(
             "PUT",
             "/mybucket/mykey",
             &[
@@ -2624,7 +2616,7 @@ mod tests {
                 ("x-amz-decoded-content-length", "100"),
             ],
         );
-        let mode = parse_chunked_mode(&parts).unwrap();
+        let mode = parse_chunked_mode(&req).unwrap();
         assert!(matches!(
             mode,
             ChunkedMode::UnsignedTrailer { expected_len: 100 }
@@ -2634,18 +2626,18 @@ mod tests {
     #[test]
     fn parse_chunked_mode_unsigned_payload_alone_rejected() {
         // STREAMING-UNSIGNED-PAYLOAD (without -TRAILER) is rejected by AWS.
-        let parts = make_parts(
+        let req = make_s3req(
             "PUT",
             "/mybucket/mykey",
             &[("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD")],
         );
-        let err = parse_chunked_mode(&parts).unwrap_err();
+        let err = parse_chunked_mode(&req).unwrap_err();
         assert!(matches!(err, ServerError::InvalidArgument { .. }));
     }
 
     #[test]
     fn parse_chunked_mode_missing_content_encoding_rejected() {
-        let parts = make_parts(
+        let req = make_s3req(
             "PUT",
             "/mybucket/mykey",
             &[
@@ -2653,13 +2645,13 @@ mod tests {
                 ("x-amz-decoded-content-length", "100"),
             ],
         );
-        let err = parse_chunked_mode(&parts).unwrap_err();
+        let err = parse_chunked_mode(&req).unwrap_err();
         assert!(matches!(err, ServerError::MalformedTrailerError { .. }));
     }
 
     #[test]
     fn parse_chunked_mode_missing_decoded_length_rejected() {
-        let parts = make_parts(
+        let req = make_s3req(
             "PUT",
             "/mybucket/mykey",
             &[
@@ -2667,7 +2659,7 @@ mod tests {
                 ("content-encoding", "aws-chunked"),
             ],
         );
-        let err = parse_chunked_mode(&parts).unwrap_err();
+        let err = parse_chunked_mode(&req).unwrap_err();
         assert!(matches!(err, ServerError::MissingContentLength));
     }
 
@@ -2904,14 +2896,14 @@ mod tests {
     }
 
     #[test]
-    fn trailing_hasher_from_parts_csv() {
+    fn trailing_hasher_from_request_csv() {
         // P1: x-amz-trailer can be comma-separated; first recognized name wins.
-        let parts = make_parts(
+        let req = make_s3req(
             "PUT",
             "/mybucket/mykey",
             &[("x-amz-trailer", "x-amz-checksum-type, x-amz-checksum-crc32")],
         );
-        let hasher = trailing_hasher_from_parts(&parts);
+        let hasher = trailing_hasher_from_request(&req);
         assert!(hasher.is_some());
         // Verify it's a CRC32 hasher by finalizing empty data.
         let cksum = hasher.unwrap().finalize_raw();
@@ -2919,49 +2911,49 @@ mod tests {
     }
 
     #[test]
-    fn trailing_hasher_from_parts_single() {
-        let parts = make_parts(
+    fn trailing_hasher_from_request_single() {
+        let req = make_s3req(
             "PUT",
             "/mybucket/mykey",
             &[("x-amz-trailer", "x-amz-checksum-sha256")],
         );
-        let hasher = trailing_hasher_from_parts(&parts);
+        let hasher = trailing_hasher_from_request(&req);
         assert!(hasher.is_some());
         let cksum = hasher.unwrap().finalize_raw();
         assert_eq!(cksum.algorithm(), ChecksumAlgorithm::Sha256);
     }
 
     #[test]
-    fn trailing_hasher_from_parts_none_when_no_header() {
-        let parts = make_parts("PUT", "/mybucket/mykey", &[]);
-        assert!(trailing_hasher_from_parts(&parts).is_none());
+    fn trailing_hasher_from_request_none_when_no_header() {
+        let req = make_s3req("PUT", "/mybucket/mykey", &[]);
+        assert!(trailing_hasher_from_request(&req).is_none());
     }
 
     #[test]
-    fn claimed_payload_sha256_from_parts_recognizes_fixed_hash() {
+    fn claimed_payload_sha256_from_request_recognizes_fixed_hash() {
         let fixed = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
-        let parts = make_parts("PUT", "/mybucket/mykey", &[("x-amz-content-sha256", fixed)]);
+        let req = make_s3req("PUT", "/mybucket/mykey", &[("x-amz-content-sha256", fixed)]);
         assert_eq!(
-            claimed_payload_sha256_from_parts(&parts).as_deref(),
+            claimed_payload_sha256_from_request(&req).as_deref(),
             Some(fixed)
         );
     }
 
     #[test]
-    fn claimed_payload_sha256_from_parts_ignores_sentinel_values() {
-        let parts = make_parts(
+    fn claimed_payload_sha256_from_request_ignores_sentinel_values() {
+        let req = make_s3req(
             "PUT",
             "/mybucket/mykey",
             &[("x-amz-content-sha256", "UNSIGNED-PAYLOAD")],
         );
-        assert!(claimed_payload_sha256_from_parts(&parts).is_none());
+        assert!(claimed_payload_sha256_from_request(&req).is_none());
 
-        let parts = make_parts(
+        let req = make_s3req(
             "PUT",
             "/mybucket/mykey",
             &[("x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")],
         );
-        assert!(claimed_payload_sha256_from_parts(&parts).is_none());
+        assert!(claimed_payload_sha256_from_request(&req).is_none());
     }
 
     #[test]
@@ -3087,12 +3079,12 @@ mod tests {
 
     #[test]
     fn inline_checksum_hasher_picks_up_crc32_header() {
-        let parts = make_parts(
+        let req = make_s3req(
             "PUT",
             "/mybucket/mykey",
             &[("x-amz-checksum-crc32", "AAAAAA==")],
         );
-        let result = inline_checksum_hasher_from_parts(&parts);
+        let result = inline_checksum_hasher_from_request(&req);
         assert!(result.is_some());
         let (h, claimed) = result.unwrap();
         assert_eq!(claimed, "AAAAAA==");
@@ -3102,18 +3094,18 @@ mod tests {
 
     #[test]
     fn inline_checksum_hasher_none_when_no_checksum() {
-        let parts = make_parts("PUT", "/mybucket/mykey", &[]);
-        assert!(inline_checksum_hasher_from_parts(&parts).is_none());
+        let req = make_s3req("PUT", "/mybucket/mykey", &[]);
+        assert!(inline_checksum_hasher_from_request(&req).is_none());
     }
 
     #[test]
     fn inline_checksum_hasher_picks_sha256() {
-        let parts = make_parts(
+        let req = make_s3req(
             "PUT",
             "/mybucket/mykey",
             &[("x-amz-checksum-sha256", "dGVzdA==")],
         );
-        let result = inline_checksum_hasher_from_parts(&parts);
+        let result = inline_checksum_hasher_from_request(&req);
         assert!(result.is_some());
         let (h, claimed) = result.unwrap();
         assert_eq!(claimed, "dGVzdA==");
@@ -3124,11 +3116,11 @@ mod tests {
     #[test]
     fn inline_checksum_hasher_not_triggered_by_non_checksum_headers() {
         // x-amz-checksum-algorithm is not a checksum value header.
-        let parts = make_parts(
+        let req = make_s3req(
             "PUT",
             "/mybucket/mykey",
             &[("x-amz-checksum-algorithm", "CRC32")],
         );
-        assert!(inline_checksum_hasher_from_parts(&parts).is_none());
+        assert!(inline_checksum_hasher_from_request(&req).is_none());
     }
 }
