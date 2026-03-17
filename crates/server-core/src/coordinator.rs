@@ -20,7 +20,8 @@ use storage::{
     ObjectLayout, ObjectPartRecord, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
     ObjectSegmentsReclaimSegmentRecord, PutDeleteMarkerReq, PutObjectReq, ReclaimWorkItem,
     SerializedMetadataBlob, SerializedTagSet, SessionId, ShardKey, SharedStorageNode, StoredObject,
-    StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, UploadId, UploadState,
+    StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, UploadId,
+    UploadState,
 };
 #[cfg(test)]
 use storage::{PutLiveObjectReq, SimplePayloadReclaimRecord};
@@ -3412,11 +3413,200 @@ impl Coordinator {
         })
     }
 
+    fn validate_stream_session_binding(
+        session: &StreamUploadRecord,
+        bucket: &str,
+        key: &str,
+    ) -> Result<(), ServerError> {
+        if session.state != StreamUploadState::InProgress {
+            return Err(ServerError::InvalidRequest {
+                reason: "stream session is not in progress".to_string(),
+            });
+        }
+        if session.bucket != bucket || session.key != key {
+            return Err(ServerError::InvalidRequest {
+                reason: "session bucket/key mismatch".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn emit_stream_segment_layout(
+        target: &StreamUploadTarget,
+        bucket: &str,
+        key: &str,
+        session_id: &str,
+        segment_index: u32,
+        data_len: usize,
+    ) {
+        let Some(trace) = observability::current_context() else {
+            return;
+        };
+        let segment_offset_start = u64::from(segment_index) * INTERNAL_SEGMENT_SIZE as u64;
+        let segment_offset_len = data_len as u64;
+        let segment_offset_end_exclusive = segment_offset_start + segment_offset_len;
+        match target {
+            StreamUploadTarget::PutObject => {
+                let _ = observability::event_in_context(
+                    &trace,
+                    TRACE_TARGET,
+                    "stream_put_segment_layout",
+                    Some(format_args!(
+                        "bucket={} key={} session_id={} segment_index={} object_offset_start={} object_offset_len={} object_offset_end_exclusive={}",
+                        bucket,
+                        key,
+                        session_id,
+                        segment_index,
+                        segment_offset_start,
+                        segment_offset_len,
+                        segment_offset_end_exclusive
+                    )),
+                );
+            }
+            StreamUploadTarget::UploadPart {
+                upload_id,
+                part_number,
+            } => {
+                let _ = observability::event_in_context(
+                    &trace,
+                    TRACE_TARGET,
+                    "stream_part_segment_layout",
+                    Some(format_args!(
+                        "bucket={} key={} upload_id={} part_number={} session_id={} segment_index={} part_offset_start={} part_offset_len={} part_offset_end_exclusive={}",
+                        bucket,
+                        key,
+                        upload_id,
+                        part_number,
+                        session_id,
+                        segment_index,
+                        segment_offset_start,
+                        segment_offset_len,
+                        segment_offset_end_exclusive
+                    )),
+                );
+            }
+        }
+    }
+
+    fn reject_duplicate_stream_segment_index(
+        meta_pg: &storage::PgStore,
+        session_id: &str,
+        segment_index: u32,
+    ) -> Result<(), ServerError> {
+        let existing_segments = meta_pg
+            .list_stream_segments(session_id)
+            .map_err(ServerError::Metadata)?;
+        if existing_segments
+            .iter()
+            .any(|segment| segment.segment_index == segment_index)
+        {
+            return Err(ServerError::InvalidRequest {
+                reason: format!("duplicate segment_index {segment_index}"),
+            });
+        }
+        Ok(())
+    }
+
+    fn write_stream_segment_shards(
+        &self,
+        shard_pg: &storage::PgStore,
+        segment_okh: &[u8; 16],
+        segment_vid: GenerationId,
+        data: &[u8],
+    ) -> Result<Vec<ShardKey>, ServerError> {
+        let k = self.ec_config.data_shards as usize;
+        let m = self.ec_config.parity_shards as usize;
+        let remainder = data.len() % k;
+        let mut padded = Vec::new();
+        let shard_source: &[u8] = if remainder == 0 {
+            data
+        } else {
+            padded.reserve_exact(data.len() + (k - remainder));
+            padded.extend_from_slice(data);
+            padded.resize(data.len() + (k - remainder), 0);
+            &padded
+        };
+
+        let shard_size = shard_source.len() / k;
+        let data_shards: Vec<&[u8]> = (0..k)
+            .map(|i| &shard_source[i * shard_size..(i + 1) * shard_size])
+            .collect();
+        let mut written_shards: Vec<ShardKey> = Vec::with_capacity(k + m);
+        let write_result: Result<(), ServerError> = if shard_size == 0 {
+            let mut parity_bufs: Vec<Vec<u8>> = (0..m).map(|_| Vec::new()).collect();
+            let mut parity_refs: Vec<&mut [u8]> = parity_bufs
+                .iter_mut()
+                .map(std::vec::Vec::as_mut_slice)
+                .collect();
+            self.ec_codec.encode(&data_shards, &mut parity_refs)?;
+            (|| {
+                for (i, shard_data) in data_shards.iter().enumerate() {
+                    let shard_key = ShardKey::new(segment_okh, segment_vid.get(), i as u8);
+                    shard_pg.write_shard(&shard_key, shard_data)?;
+                    written_shards.push(shard_key);
+                }
+                for (parity_index, shard_data) in parity_bufs.iter().enumerate() {
+                    let shard_key =
+                        ShardKey::new(segment_okh, segment_vid.get(), (k + parity_index) as u8);
+                    shard_pg.write_shard(&shard_key, shard_data)?;
+                    written_shards.push(shard_key);
+                }
+                Ok(())
+            })()
+        } else {
+            let parity_len =
+                m.checked_mul(shard_size)
+                    .ok_or_else(|| ServerError::InternalError {
+                        reason: "parity scratch length overflow".to_string(),
+                    })?;
+            let mut scratch = self.encode_scratch_pool.checkout();
+            {
+                let parity = scratch.as_mut_slice(parity_len);
+                let mut parity_refs: Vec<&mut [u8]> = parity.chunks_exact_mut(shard_size).collect();
+                self.ec_codec.encode(&data_shards, &mut parity_refs)?;
+            }
+            let parity = scratch.as_slice(parity_len);
+            (|| {
+                for (i, shard_data) in data_shards.iter().enumerate() {
+                    let shard_key = ShardKey::new(segment_okh, segment_vid.get(), i as u8);
+                    shard_pg.write_shard(&shard_key, shard_data)?;
+                    written_shards.push(shard_key);
+                }
+                for (parity_index, shard_data) in parity.chunks_exact(shard_size).enumerate() {
+                    let shard_key =
+                        ShardKey::new(segment_okh, segment_vid.get(), (k + parity_index) as u8);
+                    shard_pg.write_shard(&shard_key, shard_data)?;
+                    written_shards.push(shard_key);
+                }
+                Ok(())
+            })()
+        };
+
+        if let Err(err) = write_result {
+            for shard_key in &written_shards {
+                let _ = shard_pg.delete_shard(shard_key);
+            }
+            return Err(err);
+        }
+
+        Ok(written_shards)
+    }
+
+    fn best_effort_delete_stream_shards(&self, shard_pg_id: u32, written_shards: &[ShardKey]) {
+        let Ok(shard_pg) = self.storage_node.get_pg(shard_pg_id) else {
+            return;
+        };
+        for shard_key in written_shards {
+            let _ = shard_pg.delete_shard(shard_key);
+        }
+    }
+
     /// Append a segment of data to an in-progress streaming session.
     ///
-    /// Locks the metadata/session PG and the segment's shard PG in global
-    /// ascending order. Validates the session is InProgress, EC-encodes the
-    /// segment, writes shards, and records a staging segment row.
+    /// Validates the session in the metadata PG, EC-encodes the segment,
+    /// writes shards, and records a staging segment row. When shard placement
+    /// differs from the metadata PG, shard writes happen without holding the
+    /// metadata PG lock.
     ///
     /// The caller must not hold any PG locks when calling this method.
     pub fn append_stream_segment(
@@ -3448,168 +3638,68 @@ impl Coordinator {
             segment_vid.get(),
         );
 
-        // Lock metadata PG + shard PG in global ascending order.
-        let (meta_guard, shard_guard) = if shard_pg_id == meta_pg_id {
-            (self.storage_node.get_pg(meta_pg_id)?, None)
-        } else if meta_pg_id < shard_pg_id {
-            let mg = self.storage_node.get_pg(meta_pg_id)?;
-            let sg = self.storage_node.get_pg(shard_pg_id)?;
-            (mg, Some(sg))
-        } else {
-            let (mg, sg) = self.storage_node.lock_two_pgs(meta_pg_id, shard_pg_id)?;
-            (mg, sg)
-        };
-        let shard_pg: &storage::PgStore = shard_guard.as_deref().unwrap_or(&meta_guard);
-
-        // Validate session is InProgress and matches bucket/key/op_kind.
-        let session = meta_guard.get_stream_upload(session_id)?;
-        if session.state != StreamUploadState::InProgress {
-            return Err(ServerError::InvalidRequest {
-                reason: "stream session is not in progress".to_string(),
-            });
-        }
-        if session.bucket != bucket || session.key != key {
-            return Err(ServerError::InvalidRequest {
-                reason: "session bucket/key mismatch".to_string(),
-            });
-        }
-        if let Some(trace) = observability::current_context() {
-            let segment_offset_start = u64::from(segment_index) * INTERNAL_SEGMENT_SIZE as u64;
-            let segment_offset_len = data.len() as u64;
-            let segment_offset_end_exclusive = segment_offset_start + segment_offset_len;
-            match &session.target {
-                StreamUploadTarget::PutObject => {
-                    let _ = observability::event_in_context(
-                        &trace,
-                        TRACE_TARGET,
-                        "stream_put_segment_layout",
-                        Some(format_args!(
-                            "bucket={} key={} session_id={} segment_index={} object_offset_start={} object_offset_len={} object_offset_end_exclusive={}",
-                            bucket,
-                            key,
-                            session_id,
-                            segment_index,
-                            segment_offset_start,
-                            segment_offset_len,
-                            segment_offset_end_exclusive
-                        )),
-                    );
-                }
-                StreamUploadTarget::UploadPart {
-                    upload_id,
-                    part_number,
-                } => {
-                    let _ = observability::event_in_context(
-                        &trace,
-                        TRACE_TARGET,
-                        "stream_part_segment_layout",
-                        Some(format_args!(
-                            "bucket={} key={} upload_id={} part_number={} session_id={} segment_index={} part_offset_start={} part_offset_len={} part_offset_end_exclusive={}",
-                            bucket,
-                            key,
-                            upload_id,
-                            part_number,
-                            session_id,
-                            segment_index,
-                            segment_offset_start,
-                            segment_offset_len,
-                            segment_offset_end_exclusive
-                        )),
-                    );
-                }
-            }
-        }
-        // Reject duplicate segment_index — writing shards then failing on PK
-        // constraint would delete the already-staged segment's shard data.
-        let existing_segments = meta_guard
-            .list_stream_segments(session_id)
-            .map_err(ServerError::Metadata)?;
-        if existing_segments
-            .iter()
-            .any(|segment| segment.segment_index == segment_index)
         {
-            return Err(ServerError::InvalidRequest {
-                reason: format!("duplicate segment_index {segment_index}"),
-            });
+            let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
+            let session = meta_guard.get_stream_upload(session_id)?;
+            Self::validate_stream_session_binding(&session, bucket, key)?;
+            Self::emit_stream_segment_layout(
+                &session.target,
+                bucket,
+                key,
+                session_id,
+                segment_index,
+                data.len(),
+            );
+            Self::reject_duplicate_stream_segment_index(&meta_guard, session_id, segment_index)?;
+
+            if shard_pg_id == meta_pg_id {
+                let written_shards =
+                    self.write_stream_segment_shards(&meta_guard, &segment_okh, segment_vid, data)?;
+                let segment_result = meta_guard.append_stream_segment(&StreamUploadSegmentRecord {
+                    session_id: SessionId::from(session_id),
+                    segment_index,
+                    size: data.len() as u64,
+                    segment_crc64: Some(checksum::crc64::checksum(data)),
+                    segment_okh,
+                    segment_vid,
+                    shard_pg_id,
+                    ec_k: self.ec_config.data_shards,
+                    ec_m: self.ec_config.parity_shards,
+                });
+
+                if let Err(e) = segment_result {
+                    self.best_effort_delete_stream_shards(meta_pg_id, &written_shards);
+                    return Err(ServerError::Metadata(e));
+                }
+
+                return Ok(());
+            }
         }
 
-        // EC-encode segment data.
-        let k = self.ec_config.data_shards as usize;
-        let m = self.ec_config.parity_shards as usize;
-        let remainder = data.len() % k;
-        let mut padded = Vec::new();
-        let shard_source: &[u8] = if remainder == 0 {
-            data
-        } else {
-            padded.reserve_exact(data.len() + (k - remainder));
-            padded.extend_from_slice(data);
-            padded.resize(data.len() + (k - remainder), 0);
-            &padded
-        };
+        let shard_pg = self.storage_node.get_pg(shard_pg_id)?;
+        let written_shards =
+            self.write_stream_segment_shards(&shard_pg, &segment_okh, segment_vid, data)?;
+        drop(shard_pg);
 
-        let shard_size = shard_source.len() / k;
-        let data_shards: Vec<&[u8]> = (0..k)
-            .map(|i| &shard_source[i * shard_size..(i + 1) * shard_size])
-            .collect();
-        let mut written_shards: Vec<ShardKey> = Vec::with_capacity(k + m);
-        let write_result: Result<(), ServerError> = if shard_size == 0 {
-            let mut parity_bufs: Vec<Vec<u8>> = (0..m).map(|_| Vec::new()).collect();
-            let mut parity_refs: Vec<&mut [u8]> = parity_bufs
-                .iter_mut()
-                .map(std::vec::Vec::as_mut_slice)
-                .collect();
-            self.ec_codec.encode(&data_shards, &mut parity_refs)?;
-            (|| {
-                for (i, shard_data) in data_shards.iter().enumerate() {
-                    let shard_key = ShardKey::new(&segment_okh, segment_vid.get(), i as u8);
-                    shard_pg.write_shard(&shard_key, shard_data)?;
-                    written_shards.push(shard_key);
-                }
-                for (parity_index, shard_data) in parity_bufs.iter().enumerate() {
-                    let shard_key =
-                        ShardKey::new(&segment_okh, segment_vid.get(), (k + parity_index) as u8);
-                    shard_pg.write_shard(&shard_key, shard_data)?;
-                    written_shards.push(shard_key);
-                }
-                Ok(())
-            })()
-        } else {
-            let parity_len =
-                m.checked_mul(shard_size)
-                    .ok_or_else(|| ServerError::InternalError {
-                        reason: "parity scratch length overflow".to_string(),
-                    })?;
-            let mut scratch = self.encode_scratch_pool.checkout();
-            {
-                let parity = scratch.as_mut_slice(parity_len);
-                let mut parity_refs: Vec<&mut [u8]> = parity.chunks_exact_mut(shard_size).collect();
-                self.ec_codec.encode(&data_shards, &mut parity_refs)?;
+        let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
+        let session = match meta_guard.get_stream_upload(session_id) {
+            Ok(session) => session,
+            Err(err) => {
+                self.best_effort_delete_stream_shards(shard_pg_id, &written_shards);
+                return Err(ServerError::Metadata(err));
             }
-            let parity = scratch.as_slice(parity_len);
-            (|| {
-                for (i, shard_data) in data_shards.iter().enumerate() {
-                    let shard_key = ShardKey::new(&segment_okh, segment_vid.get(), i as u8);
-                    shard_pg.write_shard(&shard_key, shard_data)?;
-                    written_shards.push(shard_key);
-                }
-                for (parity_index, shard_data) in parity.chunks_exact(shard_size).enumerate() {
-                    let shard_key =
-                        ShardKey::new(&segment_okh, segment_vid.get(), (k + parity_index) as u8);
-                    shard_pg.write_shard(&shard_key, shard_data)?;
-                    written_shards.push(shard_key);
-                }
-                Ok(())
-            })()
         };
-
-        if let Err(e) = write_result {
-            for shard_key in &written_shards {
-                let _ = shard_pg.delete_shard(shard_key);
-            }
-            return Err(e);
+        if let Err(err) = Self::validate_stream_session_binding(&session, bucket, key) {
+            self.best_effort_delete_stream_shards(shard_pg_id, &written_shards);
+            return Err(err);
+        }
+        if let Err(err) =
+            Self::reject_duplicate_stream_segment_index(&meta_guard, session_id, segment_index)
+        {
+            self.best_effort_delete_stream_shards(shard_pg_id, &written_shards);
+            return Err(err);
         }
 
-        // Record staging segment row.
         let segment_result = meta_guard.append_stream_segment(&StreamUploadSegmentRecord {
             session_id: SessionId::from(session_id),
             segment_index,
@@ -3623,10 +3713,7 @@ impl Coordinator {
         });
 
         if let Err(e) = segment_result {
-            // Best-effort cleanup of written shards.
-            for shard_key in &written_shards {
-                let _ = shard_pg.delete_shard(shard_key);
-            }
+            self.best_effort_delete_stream_shards(shard_pg_id, &written_shards);
             return Err(ServerError::Metadata(e));
         }
 

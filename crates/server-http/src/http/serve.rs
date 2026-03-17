@@ -1141,6 +1141,7 @@ async fn handle_streaming_put(
     let mut segment_index: u32 = 0;
     let mut buf = PooledSegmentBuffer::new(&state);
     let mut total_size: u64 = 0;
+    let mut body_started_emitted = false;
     let mut body = body;
 
     loop {
@@ -1162,6 +1163,7 @@ async fn handle_streaming_put(
                             total_size: &mut total_size,
                             buf: &mut buf,
                             segment_index: &mut segment_index,
+                            body_started_emitted: &mut body_started_emitted,
                         };
                         if let Err(resp) =
                             ingest_streaming_put_payload(&state, &ctx, &payload, &mut ingest).await
@@ -1176,6 +1178,7 @@ async fn handle_streaming_put(
                             total_size: &mut total_size,
                             buf: &mut buf,
                             segment_index: &mut segment_index,
+                            body_started_emitted: &mut body_started_emitted,
                         };
                         if let Err(resp) = ingest_streaming_put_payload(
                             &state,
@@ -1205,6 +1208,19 @@ async fn handle_streaming_put(
             }
         }
     }
+    emit_streaming_put_event(
+        &ctx,
+        "streaming_put_body_read_complete",
+        format_args!(
+            "bucket={} key={} session_id={} body_bytes_received={} full_segments_flushed={} buffered_tail_bytes={}",
+            ctx.binding.bucket,
+            ctx.binding.key,
+            ctx.binding.session_id,
+            total_size,
+            segment_index,
+            buf.len()
+        ),
+    );
 
     // Verify chunked decoding completed and validate post-decode conditions.
     // Extract checksum trailers from aws-chunked body for metadata storage.
@@ -1270,8 +1286,22 @@ async fn handle_streaming_put(
     }
 
     // 3. Flush remaining buffer.
-    if !buf.is_empty() {
+    let had_tail = !buf.is_empty();
+    if had_tail {
         let idx = segment_index;
+        emit_streaming_put_event(
+            &ctx,
+            "streaming_put_tail_segment_ready",
+            format_args!(
+                "bucket={} key={} session_id={} segment_index={} segment_bytes={} body_bytes_received={}",
+                ctx.binding.bucket,
+                ctx.binding.key,
+                ctx.binding.session_id,
+                idx,
+                buf.len(),
+                total_size
+            ),
+        );
         let ctx_ref = Arc::clone(&ctx);
         let st = Arc::clone(&state);
         match tokio::task::spawn_blocking(move || {
@@ -1295,6 +1325,19 @@ async fn handle_streaming_put(
 
     // 4. Finalize the streaming upload.
     let crc64 = hasher.finalize();
+    emit_streaming_put_event(
+        &ctx,
+        "streaming_put_finalize_ready",
+        format_args!(
+            "bucket={} key={} session_id={} body_bytes_received={} segment_count={} trailer_checksums={}",
+            ctx.binding.bucket,
+            ctx.binding.key,
+            ctx.binding.session_id,
+            total_size,
+            segment_index + u32::from(had_tail),
+            trailer_checksums.len()
+        ),
+    );
     let ctx_ref = Arc::clone(&ctx);
     let st = Arc::clone(&state);
     match tokio::task::spawn_blocking(move || {
@@ -1333,6 +1376,15 @@ struct StreamingPutIngestState<'a> {
     total_size: &'a mut u64,
     buf: &'a mut PooledSegmentBuffer,
     segment_index: &'a mut u32,
+    body_started_emitted: &'a mut bool,
+}
+
+fn emit_streaming_put_event(
+    ctx: &Arc<super::StreamingPutContext>,
+    name: &'static str,
+    fields: std::fmt::Arguments<'_>,
+) {
+    let _ = observability::event_in_context(&ctx.trace, TRACE_TARGET, name, Some(fields));
 }
 
 async fn ingest_streaming_put_payload(
@@ -1360,6 +1412,21 @@ async fn ingest_streaming_put_payload(
             max: MAX_OBJECT_SIZE,
         }));
     }
+    if !*ingest.body_started_emitted {
+        *ingest.body_started_emitted = true;
+        emit_streaming_put_event(
+            ctx,
+            "streaming_put_body_started",
+            format_args!(
+                "bucket={} key={} session_id={} frame_bytes={} body_bytes_received={}",
+                ctx.binding.bucket,
+                ctx.binding.key,
+                ctx.binding.session_id,
+                payload.len(),
+                *ingest.total_size
+            ),
+        );
+    }
 
     let mut remaining = payload;
     while !remaining.is_empty() {
@@ -1375,6 +1442,19 @@ async fn ingest_streaming_put_payload(
         std::mem::swap(ingest.buf, &mut flush_data);
         let idx = *ingest.segment_index;
         *ingest.segment_index += 1;
+        emit_streaming_put_event(
+            ctx,
+            "streaming_put_segment_ready",
+            format_args!(
+                "bucket={} key={} session_id={} segment_index={} segment_bytes={} body_bytes_received={}",
+                ctx.binding.bucket,
+                ctx.binding.key,
+                ctx.binding.session_id,
+                idx,
+                flush_data.len(),
+                *ingest.total_size
+            ),
+        );
         let ctx_ref = Arc::clone(ctx);
         let st = Arc::clone(state);
         match tokio::task::spawn_blocking(move || {
@@ -1479,6 +1559,7 @@ async fn handle_streaming_part(
     let mut segment_index: u32 = 0;
     let mut buf = PooledSegmentBuffer::new(&state);
     let mut total_size: u64 = 0;
+    let mut body_started_emitted = false;
     let mut body = body;
 
     loop {
@@ -1500,6 +1581,7 @@ async fn handle_streaming_part(
                             total_size: &mut total_size,
                             buf: &mut buf,
                             segment_index: &mut segment_index,
+                            body_started_emitted: &mut body_started_emitted,
                         };
                         if let Err(resp) =
                             ingest_streaming_part_payload(&state, &ctx, &payload, &mut ingest).await
@@ -1514,6 +1596,7 @@ async fn handle_streaming_part(
                             total_size: &mut total_size,
                             buf: &mut buf,
                             segment_index: &mut segment_index,
+                            body_started_emitted: &mut body_started_emitted,
                         };
                         if let Err(resp) = ingest_streaming_part_payload(
                             &state,
@@ -1543,6 +1626,21 @@ async fn handle_streaming_part(
             }
         }
     }
+    emit_streaming_part_event(
+        &ctx,
+        "streaming_part_body_read_complete",
+        format_args!(
+            "bucket={} key={} upload_id={} part_number={} session_id={} body_bytes_received={} full_segments_flushed={} buffered_tail_bytes={}",
+            ctx.binding.object.bucket,
+            ctx.binding.object.key,
+            ctx.binding.upload_id,
+            ctx.binding.part_number,
+            ctx.binding.object.session_id,
+            total_size,
+            segment_index,
+            buf.len()
+        ),
+    );
 
     // Verify chunked decoding completed and validate post-decode conditions.
     // Extract checksum trailers from aws-chunked body.
@@ -1613,8 +1711,24 @@ async fn handle_streaming_part(
     };
 
     // 3. Flush remaining buffer.
-    if !buf.is_empty() {
+    let had_tail = !buf.is_empty();
+    if had_tail {
         let idx = segment_index;
+        emit_streaming_part_event(
+            &ctx,
+            "streaming_part_tail_segment_ready",
+            format_args!(
+                "bucket={} key={} upload_id={} part_number={} session_id={} segment_index={} segment_bytes={} body_bytes_received={}",
+                ctx.binding.object.bucket,
+                ctx.binding.object.key,
+                ctx.binding.upload_id,
+                ctx.binding.part_number,
+                ctx.binding.object.session_id,
+                idx,
+                buf.len(),
+                total_size
+            ),
+        );
         let ctx_ref = Arc::clone(&ctx);
         let st = Arc::clone(&state);
         match tokio::task::spawn_blocking(move || {
@@ -1638,6 +1752,21 @@ async fn handle_streaming_part(
 
     // 4. Finalize the streaming upload part.
     let crc64 = hasher.finalize();
+    emit_streaming_part_event(
+        &ctx,
+        "streaming_part_finalize_ready",
+        format_args!(
+            "bucket={} key={} upload_id={} part_number={} session_id={} body_bytes_received={} segment_count={} trailer_checksums={}",
+            ctx.binding.object.bucket,
+            ctx.binding.object.key,
+            ctx.binding.upload_id,
+            ctx.binding.part_number,
+            ctx.binding.object.session_id,
+            total_size,
+            segment_index + u32::from(had_tail),
+            trailer_checksums.len()
+        ),
+    );
     let ctx_ref = Arc::clone(&ctx);
     let st = Arc::clone(&state);
     match tokio::task::spawn_blocking(move || {
@@ -1685,6 +1814,15 @@ struct StreamingPartIngestState<'a> {
     total_size: &'a mut u64,
     buf: &'a mut PooledSegmentBuffer,
     segment_index: &'a mut u32,
+    body_started_emitted: &'a mut bool,
+}
+
+fn emit_streaming_part_event(
+    ctx: &Arc<super::StreamingPartContext>,
+    name: &'static str,
+    fields: std::fmt::Arguments<'_>,
+) {
+    let _ = observability::event_in_context(&ctx.trace, TRACE_TARGET, name, Some(fields));
 }
 
 async fn ingest_streaming_part_payload(
@@ -1712,6 +1850,23 @@ async fn ingest_streaming_part_payload(
             max: MAX_OBJECT_SIZE,
         }));
     }
+    if !*ingest.body_started_emitted {
+        *ingest.body_started_emitted = true;
+        emit_streaming_part_event(
+            ctx,
+            "streaming_part_body_started",
+            format_args!(
+                "bucket={} key={} upload_id={} part_number={} session_id={} frame_bytes={} body_bytes_received={}",
+                ctx.binding.object.bucket,
+                ctx.binding.object.key,
+                ctx.binding.upload_id,
+                ctx.binding.part_number,
+                ctx.binding.object.session_id,
+                payload.len(),
+                *ingest.total_size
+            ),
+        );
+    }
 
     let mut remaining = payload;
     while !remaining.is_empty() {
@@ -1727,6 +1882,21 @@ async fn ingest_streaming_part_payload(
         std::mem::swap(ingest.buf, &mut flush_data);
         let idx = *ingest.segment_index;
         *ingest.segment_index += 1;
+        emit_streaming_part_event(
+            ctx,
+            "streaming_part_segment_ready",
+            format_args!(
+                "bucket={} key={} upload_id={} part_number={} session_id={} segment_index={} segment_bytes={} body_bytes_received={}",
+                ctx.binding.object.bucket,
+                ctx.binding.object.key,
+                ctx.binding.upload_id,
+                ctx.binding.part_number,
+                ctx.binding.object.session_id,
+                idx,
+                flush_data.len(),
+                *ingest.total_size
+            ),
+        );
         let ctx_ref = Arc::clone(ctx);
         let st = Arc::clone(state);
         match tokio::task::spawn_blocking(move || {
