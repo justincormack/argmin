@@ -48,15 +48,82 @@ pub struct AuthContext {
     pub streaming: Option<StreamingSigningContext>,
 }
 
+/// Borrowed access to lowercased request headers.
+pub trait HeaderSource {
+    fn first_value<'a>(&'a self, name: &str) -> Option<&'a str>;
+
+    fn visit<'a, F>(&'a self, f: F)
+    where
+        F: FnMut(&'a str, &'a str);
+}
+
+impl<'h> HeaderSource for [(&'h str, &'h str)] {
+    fn first_value<'a>(&'a self, name: &str) -> Option<&'a str> {
+        self.iter().find(|(k, _)| *k == name).map(|(_, v)| *v)
+    }
+
+    fn visit<'a, F>(&'a self, mut f: F)
+    where
+        F: FnMut(&'a str, &'a str),
+    {
+        for (name, value) in self {
+            f(name, value);
+        }
+    }
+}
+
+impl<'h, const N: usize> HeaderSource for [(&'h str, &'h str); N] {
+    fn first_value<'a>(&'a self, name: &str) -> Option<&'a str> {
+        self.as_slice().first_value(name)
+    }
+
+    fn visit<'a, F>(&'a self, f: F)
+    where
+        F: FnMut(&'a str, &'a str),
+    {
+        self.as_slice().visit(f);
+    }
+}
+
+impl<'h> HeaderSource for Vec<(&'h str, &'h str)> {
+    fn first_value<'a>(&'a self, name: &str) -> Option<&'a str> {
+        self.as_slice().first_value(name)
+    }
+
+    fn visit<'a, F>(&'a self, f: F)
+    where
+        F: FnMut(&'a str, &'a str),
+    {
+        self.as_slice().visit(f);
+    }
+}
+
+impl HeaderSource for [(String, String)] {
+    fn first_value<'a>(&'a self, name: &str) -> Option<&'a str> {
+        self.iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    fn visit<'a, F>(&'a self, mut f: F)
+    where
+        F: FnMut(&'a str, &'a str),
+    {
+        for (name, value) in self {
+            f(name.as_str(), value.as_str());
+        }
+    }
+}
+
 /// Authenticate a request and return identity context.
 ///
 /// Phase 1 behavior: header-based SigV4 only.
 #[allow(clippy::too_many_arguments)]
-pub fn authenticate_request(
+pub fn authenticate_request<H: HeaderSource + ?Sized>(
     method: &str,
     path: &str,
     query_string: &str,
-    headers: &[(&str, &str)],
+    headers: &H,
     body: &[u8],
     store: &CredentialStore,
     expected_region: &str,
@@ -71,15 +138,21 @@ pub fn authenticate_request(
         path,
         query_string
     );
-    let authorization_headers: Vec<&str> = headers
-        .iter()
-        .filter_map(|(name, value)| (*name == "authorization").then_some(*value))
-        .collect();
-    if authorization_headers.len() > 1 {
+    let mut authorization_header = None;
+    let mut authorization_count = 0usize;
+    headers.visit(|name, value| {
+        if name == "authorization" {
+            authorization_count += 1;
+            if authorization_count == 1 {
+                authorization_header = Some(value);
+            }
+        }
+    });
+    if authorization_count > 1 {
         return Err(AuthError::DuplicateAuthorizationHeader);
     }
 
-    if let Some(auth_header) = authorization_headers.first().copied() {
+    if let Some(auth_header) = authorization_header {
         // Empty Authorization header → AccessDenied (AWS behavior)
         if auth_header.trim().is_empty() {
             return Err(AuthError::AccessDenied);
@@ -122,7 +195,7 @@ pub fn authenticate_request(
 
     // If x-amz-date is present without Authorization or presigned params,
     // AWS treats this as an incomplete signed request and returns 403.
-    if header_value(headers, "x-amz-date").is_some() {
+    if headers.first_value("x-amz-date").is_some() {
         return Err(AuthError::AccessDenied);
     }
 
@@ -130,11 +203,11 @@ pub fn authenticate_request(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn authenticate_header(
+fn authenticate_header<H: HeaderSource + ?Sized>(
     method: &str,
     path: &str,
     query_string: &str,
-    headers: &[(&str, &str)],
+    headers: &H,
     body: &[u8],
     store: &CredentialStore,
     expected_region: &str,
@@ -147,7 +220,7 @@ fn authenticate_header(
     {
         return Err(AuthError::MalformedAuth);
     }
-    let body_hash = match header_value(headers, "x-amz-content-sha256") {
+    let body_hash = match headers.first_value("x-amz-content-sha256") {
         Some("UNSIGNED-PAYLOAD") => "UNSIGNED-PAYLOAD".to_string(),
         Some(hash) => hash.to_string(),
         None => sha256_hex(body),
@@ -167,15 +240,13 @@ fn authenticate_header(
 
     validate_record_token_and_expiry(
         record,
-        header_value(headers, "x-amz-security-token"),
+        headers.first_value("x-amz-security-token"),
         now_epoch_secs,
     )?;
 
     // Build streaming signing context for STREAMING-AWS4-HMAC-SHA256-* requests.
     let streaming = if body_hash.starts_with("STREAMING-AWS4-HMAC-SHA256") {
-        let timestamp = header_value(headers, "x-amz-date")
-            .unwrap_or("")
-            .to_string();
+        let timestamp = headers.first_value("x-amz-date").unwrap_or("").to_string();
         let scope = format!(
             "{}/{}/{}/aws4_request",
             parsed.credential.date, parsed.credential.region, parsed.credential.service
@@ -202,17 +273,17 @@ fn authenticate_header(
         mode: AuthMode::HeaderSigV4,
         access_key_id: Some(access_key_id),
         principal: Some(record.principal.clone()),
-        request_epoch_secs: header_value(headers, "x-amz-date").and_then(parse_amz_date),
+        request_epoch_secs: headers.first_value("x-amz-date").and_then(parse_amz_date),
         streaming,
     })
 }
 
 #[allow(clippy::too_many_arguments)]
-fn authenticate_presigned(
+fn authenticate_presigned<H: HeaderSource + ?Sized>(
     method: &str,
     path: &str,
     query_string: &str,
-    headers: &[(&str, &str)],
+    headers: &H,
     _body: &[u8],
     store: &CredentialStore,
     expected_region: &str,
@@ -308,8 +379,11 @@ fn authenticate_presigned(
     if !record.enabled {
         return Err(AuthError::UnknownAccessKey);
     }
-    let token = query_param(query_string, "X-Amz-Security-Token")
-        .or_else(|| header_value(headers, "x-amz-security-token").map(str::to_string));
+    let token = query_param(query_string, "X-Amz-Security-Token").or_else(|| {
+        headers
+            .first_value("x-amz-security-token")
+            .map(str::to_string)
+    });
     validate_record_token_and_expiry(record, token.as_deref(), now_epoch_secs)?;
 
     let signed_header_pairs = collect_signed_headers(&signed_headers, headers)?;
@@ -320,7 +394,7 @@ fn authenticate_presigned(
     // its value (allows presigned PUTs with a known body hash). Otherwise
     // default to UNSIGNED-PAYLOAD (the common case for presigned URLs where
     // the body is unknown at signing time).
-    let body_hash = match header_value(headers, "x-amz-content-sha256") {
+    let body_hash = match headers.first_value("x-amz-content-sha256") {
         Some(hash) => hash.to_string(),
         None => "UNSIGNED-PAYLOAD".to_string(),
     };
@@ -388,19 +462,19 @@ fn parse_credential_scope(value: &str) -> Result<CredentialScope, AuthError> {
     })
 }
 
-fn collect_signed_headers<'a>(
+fn collect_signed_headers<'a, H: HeaderSource + ?Sized>(
     signed_headers: &[String],
-    headers: &[(&'a str, &'a str)],
+    headers: &'a H,
 ) -> Result<Vec<(&'a str, &'a str)>, AuthError> {
     let mut out: Vec<(&str, &str)> = Vec::new();
     for signed_name in signed_headers {
         let mut found = false;
-        for (name, value) in headers {
-            if *name == signed_name.as_str() {
+        headers.visit(|name, value| {
+            if name == signed_name.as_str() {
                 out.push((name, value));
                 found = true;
             }
-        }
+        });
         if !found {
             return Err(AuthError::MissingSignedHeader {
                 header: signed_name.clone(),
@@ -496,8 +570,9 @@ fn hex_encode_lower(bytes: &[u8]) -> String {
     s
 }
 
-fn header_value<'a>(headers: &[(&'a str, &'a str)], name: &str) -> Option<&'a str> {
-    headers.iter().find(|(k, _)| *k == name).map(|(_, v)| *v)
+#[cfg(test)]
+fn header_value<'a, H: HeaderSource + ?Sized>(headers: &'a H, name: &str) -> Option<&'a str> {
+    headers.first_value(name)
 }
 
 #[cfg(test)]

@@ -6,6 +6,7 @@ use crate::canonical::{
 };
 use crate::credential::{CredentialScope, CredentialStore, SecretKey};
 use crate::error::AuthError;
+use crate::request::HeaderSource;
 use crate::{
     is_lower_hex, MAX_ACCESS_KEY_ID_LEN, MAX_CREDENTIAL_LEN, MAX_SIGNED_HEADERS_LEN,
     MAX_SIGNED_HEADER_COUNT, SIGNATURE_HEX_LEN,
@@ -126,11 +127,11 @@ pub fn derive_signing_key(
 /// - `store`: Credential store for looking up secret keys
 ///
 /// Returns the access key ID on success.
-pub fn verify_request(
+pub fn verify_request<H: HeaderSource + ?Sized>(
     method: &str,
     uri: &str,
     query_string: &str,
-    headers: &[(&str, &str)],
+    headers: &H,
     body_hash: &str,
     auth: &SigV4Auth,
     store: &CredentialStore,
@@ -149,12 +150,12 @@ pub fn verify_request(
     let mut signed_header_pairs: Vec<(&str, &str)> = Vec::new();
     for signed_name in &auth.signed_headers {
         let mut found = false;
-        for (name, value) in headers {
-            if *name == signed_name.as_str() {
-                signed_header_pairs.push((signed_name.as_str(), *value));
+        headers.visit(|name, value| {
+            if name == signed_name.as_str() {
+                signed_header_pairs.push((signed_name.as_str(), value));
                 found = true;
             }
-        }
+        });
         if !found {
             return Err(AuthError::MissingSignedHeader {
                 header: signed_name.clone(),
@@ -165,14 +166,14 @@ pub fn verify_request(
     // AWS requires all x-amz-* headers to be signed (security: prevents injection
     // of unsigned x-amz-* headers).
     let mut unsigned_headers: Vec<String> = Vec::new();
-    for (name, _) in headers {
+    headers.visit(|name, _| {
         if name.starts_with("x-amz-")
             && !auth.signed_headers.iter().any(|sh| sh == name)
             && !unsigned_headers.iter().any(|h| h == name)
         {
-            unsigned_headers.push((*name).to_string());
+            unsigned_headers.push(name.to_string());
         }
-    }
+    });
     if !unsigned_headers.is_empty() {
         return Err(AuthError::UnsignedHeaders {
             headers: unsigned_headers,
@@ -195,9 +196,7 @@ pub fn verify_request(
 
     // Find the x-amz-date header for the timestamp
     let timestamp = headers
-        .iter()
-        .find(|(name, _)| *name == "x-amz-date")
-        .map(|(_, v)| *v)
+        .first_value("x-amz-date")
         .ok_or(AuthError::MissingSignedHeader {
             header: "x-amz-date".to_string(),
         })?;

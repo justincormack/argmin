@@ -1,4 +1,6 @@
 /// Parse HTTP requests into structured S3 request data.
+use std::borrow::Cow;
+
 use crate::error::ServerError;
 
 /// Maximum body size for the buffered request path.
@@ -161,6 +163,11 @@ impl S3Request {
     /// Get query parameter by name.
     #[must_use]
     pub fn query_param(&self, name: &str) -> Option<String> {
+        self.query_param_lossy(name).map(Cow::into_owned)
+    }
+
+    #[must_use]
+    pub fn query_param_lossy(&self, name: &str) -> Option<Cow<'_, str>> {
         self.query_string
             .split('&')
             .filter(|s| !s.is_empty())
@@ -169,7 +176,7 @@ impl S3Request {
                 let key = parts.next()?;
                 let val = parts.next().unwrap_or("");
                 if key == name {
-                    Some(percent_decode(val))
+                    Some(percent_decode_lossy(val))
                 } else {
                     None
                 }
@@ -204,9 +211,12 @@ pub(crate) fn percent_decode_strict(s: &str) -> Result<String, ServerError> {
     })
 }
 
-/// Percent-decode a string (RFC 3986). Does NOT treat + as space.
-pub(crate) fn percent_decode(s: &str) -> String {
-    String::from_utf8_lossy(&percent_decode_bytes(s)).to_string()
+/// Percent-decode a string (RFC 3986) into UTF-8, borrowing when unchanged.
+pub(crate) fn percent_decode_lossy(s: &str) -> Cow<'_, str> {
+    if !s.as_bytes().contains(&b'%') {
+        return Cow::Borrowed(s);
+    }
+    Cow::Owned(String::from_utf8_lossy(&percent_decode_bytes(s)).into_owned())
 }
 
 /// Parse the `x-amz-copy-source` header value into `(bucket, key, version_id)`.
@@ -271,15 +281,15 @@ mod tests {
 
     #[test]
     fn percent_decode_basic() {
-        assert_eq!(percent_decode("hello%20world"), "hello world");
-        assert_eq!(percent_decode("a%2Fb"), "a/b");
-        assert_eq!(percent_decode("no+encoding"), "no+encoding"); // + is NOT space
+        assert_eq!(percent_decode_lossy("hello%20world"), "hello world");
+        assert_eq!(percent_decode_lossy("a%2Fb"), "a/b");
+        assert_eq!(percent_decode_lossy("no+encoding"), "no+encoding"); // + is NOT space
     }
 
     #[test]
     fn percent_decode_passthrough() {
-        assert_eq!(percent_decode("plain"), "plain");
-        assert_eq!(percent_decode(""), "");
+        assert_eq!(percent_decode_lossy("plain"), "plain");
+        assert_eq!(percent_decode_lossy(""), "");
     }
 
     #[test]
@@ -300,22 +310,22 @@ mod tests {
     #[test]
     fn percent_decode_truncated_escape() {
         // % at end of string — not enough chars for a hex pair
-        assert_eq!(percent_decode("abc%"), "abc%");
-        assert_eq!(percent_decode("abc%2"), "abc%2");
+        assert_eq!(percent_decode_lossy("abc%"), "abc%");
+        assert_eq!(percent_decode_lossy("abc%2"), "abc%2");
     }
 
     #[test]
     fn percent_decode_non_hex_after_percent() {
-        assert_eq!(percent_decode("%ZZ"), "%ZZ");
-        assert_eq!(percent_decode("%GH"), "%GH");
+        assert_eq!(percent_decode_lossy("%ZZ"), "%ZZ");
+        assert_eq!(percent_decode_lossy("%GH"), "%GH");
     }
 
     #[test]
     fn percent_decode_uppercase_hex() {
-        assert_eq!(percent_decode("%2F"), "/");
-        assert_eq!(percent_decode("%2f"), "/");
-        assert_eq!(percent_decode("%3A"), ":");
-        assert_eq!(percent_decode("%3a"), ":");
+        assert_eq!(percent_decode_lossy("%2F"), "/");
+        assert_eq!(percent_decode_lossy("%2f"), "/");
+        assert_eq!(percent_decode_lossy("%3A"), ":");
+        assert_eq!(percent_decode_lossy("%3a"), ":");
     }
 
     #[test]

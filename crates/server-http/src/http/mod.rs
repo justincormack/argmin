@@ -66,7 +66,7 @@ fn parse_version_id_str(v: &str) -> Result<VersionId, ServerError> {
 }
 
 fn parse_version_id(req: &S3Request) -> Result<Option<VersionId>, ServerError> {
-    match req.query_param("versionId") {
+    match req.query_param_lossy("versionId") {
         None => Ok(None),
         Some(v) => parse_version_id_str(&v).map(Some),
     }
@@ -577,17 +577,17 @@ impl HttpFrontend {
                 Ok(S3Response::head_bucket(&info))
             }
             S3Operation::ListObjectsV1 { bucket } => {
-                let prefix = req.query_param("prefix");
-                let delimiter = req.query_param("delimiter").filter(|d| !d.is_empty());
-                let marker = req.query_param("marker");
-                let encoding_type = req.query_param("encoding-type");
-                let allow_unordered = req.query_param("allow-unordered");
+                let prefix = req.query_param_lossy("prefix");
+                let delimiter = req.query_param_lossy("delimiter").filter(|d| !d.is_empty());
+                let marker = req.query_param_lossy("marker");
+                let encoding_type = req.query_param_lossy("encoding-type");
+                let allow_unordered = req.query_param_lossy("allow-unordered");
                 if allow_unordered.is_some() && delimiter.is_some() {
                     return Err(ServerError::InvalidArgument {
                         reason: "allow-unordered is not supported with delimiter".to_string(),
                     });
                 }
-                let max_keys: u32 = parse_max_keys(req.query_param("max-keys"))?;
+                let max_keys: u32 = parse_max_keys(req.query_param_lossy("max-keys"))?;
                 let requester =
                     crate::coordinator::Requester::from_principal(auth.principal.as_deref());
 
@@ -612,20 +612,20 @@ impl HttpFrontend {
                 ))
             }
             S3Operation::ListObjectsV2 { bucket } => {
-                let prefix = req.query_param("prefix");
-                let delimiter = req.query_param("delimiter").filter(|d| !d.is_empty());
-                let encoding_type = req.query_param("encoding-type");
+                let prefix = req.query_param_lossy("prefix");
+                let delimiter = req.query_param_lossy("delimiter").filter(|d| !d.is_empty());
+                let encoding_type = req.query_param_lossy("encoding-type");
                 let fetch_owner = req
-                    .query_param("fetch-owner")
+                    .query_param_lossy("fetch-owner")
                     .is_some_and(|v| v == "true" || v == "1" || v == "True");
-                let allow_unordered = req.query_param("allow-unordered");
+                let allow_unordered = req.query_param_lossy("allow-unordered");
                 if allow_unordered.is_some() && delimiter.is_some() {
                     return Err(ServerError::InvalidArgument {
                         reason: "allow-unordered is not supported with delimiter".to_string(),
                     });
                 }
 
-                let continuation_token_raw = req.query_param("continuation-token");
+                let continuation_token_raw = req.query_param_lossy("continuation-token");
                 // AWS rejects empty continuation-token with InvalidArgument
                 if let Some(ref ct) = continuation_token_raw {
                     if ct.is_empty() {
@@ -634,12 +634,12 @@ impl HttpFrontend {
                         });
                     }
                 }
-                let start_after_raw = req.query_param("start-after");
+                let start_after_raw = req.query_param_lossy("start-after");
                 let continuation_token = continuation_token_raw
                     .as_deref()
                     .or(start_after_raw.as_deref())
                     .filter(|v| !v.is_empty());
-                let max_keys: u32 = parse_max_keys(req.query_param("max-keys"))?;
+                let max_keys: u32 = parse_max_keys(req.query_param_lossy("max-keys"))?;
                 let requester =
                     crate::coordinator::Requester::from_principal(auth.principal.as_deref());
 
@@ -851,7 +851,7 @@ impl HttpFrontend {
                     crate::coordinator::Requester::from_principal(auth.principal.as_deref());
                 let trace = current_trace_context();
                 // partNumber takes precedence over Range header (AWS behavior)
-                if let Some(pn_str) = req.query_param("partNumber") {
+                if let Some(pn_str) = req.query_param_lossy("partNumber") {
                     let part_number: u32 =
                         pn_str.parse().map_err(|_| ServerError::InvalidArgument {
                             reason: "partNumber must be a positive integer".into(),
@@ -1004,7 +1004,7 @@ impl HttpFrontend {
                 let requester =
                     crate::coordinator::Requester::from_principal(auth.principal.as_deref());
                 let trace = current_trace_context();
-                if let Some(pn_str) = req.query_param("partNumber") {
+                if let Some(pn_str) = req.query_param_lossy("partNumber") {
                     let part_number: u32 =
                         pn_str.parse().map_err(|_| ServerError::InvalidArgument {
                             reason: "partNumber must be a positive integer".into(),
@@ -1420,13 +1420,13 @@ impl HttpFrontend {
                 ))
             }
             S3Operation::UploadPart { bucket, key } => {
-                let upload_id =
-                    req.query_param("uploadId")
-                        .ok_or_else(|| ServerError::InvalidRequest {
-                            reason: "missing uploadId query parameter".to_string(),
-                        })?;
+                let upload_id = req.query_param_lossy("uploadId").ok_or_else(|| {
+                    ServerError::InvalidRequest {
+                        reason: "missing uploadId query parameter".to_string(),
+                    }
+                })?;
                 let part_number: u32 = req
-                    .query_param("partNumber")
+                    .query_param_lossy("partNumber")
                     .ok_or_else(|| ServerError::InvalidRequest {
                         reason: "missing partNumber query parameter".to_string(),
                     })?
@@ -1539,11 +1539,11 @@ impl HttpFrontend {
                 }
             }
             S3Operation::CompleteMultipartUpload { bucket, key } => {
-                let upload_id =
-                    req.query_param("uploadId")
-                        .ok_or_else(|| ServerError::InvalidRequest {
-                            reason: "missing uploadId query parameter".to_string(),
-                        })?;
+                let upload_id = req.query_param_lossy("uploadId").ok_or_else(|| {
+                    ServerError::InvalidRequest {
+                        reason: "missing uploadId query parameter".to_string(),
+                    }
+                })?;
                 let parts = xml::parse_complete_multipart_upload_xml(&req.body)?;
                 // Extract object-level checksum claim from request headers as a raw
                 // string. CompleteMultipartUpload checksums may be composite ("base64-N"),
@@ -1572,11 +1572,11 @@ impl HttpFrontend {
                 ))
             }
             S3Operation::AbortMultipartUpload { bucket, key } => {
-                let upload_id =
-                    req.query_param("uploadId")
-                        .ok_or_else(|| ServerError::InvalidRequest {
-                            reason: "missing uploadId query parameter".to_string(),
-                        })?;
+                let upload_id = req.query_param_lossy("uploadId").ok_or_else(|| {
+                    ServerError::InvalidRequest {
+                        reason: "missing uploadId query parameter".to_string(),
+                    }
+                })?;
                 let requester =
                     crate::coordinator::Requester::from_principal(auth.principal.as_deref());
                 self.coordinator.abort_multipart_upload(
@@ -1590,10 +1590,10 @@ impl HttpFrontend {
                 Ok(S3Response::abort_multipart_upload())
             }
             S3Operation::ListMultipartUploads { bucket } => {
-                let prefix = req.query_param("prefix");
-                let key_marker = req.query_param("key-marker");
-                let upload_id_marker = req.query_param("upload-id-marker");
-                let max_uploads: u32 = match req.query_param("max-uploads") {
+                let prefix = req.query_param_lossy("prefix");
+                let key_marker = req.query_param_lossy("key-marker");
+                let upload_id_marker = req.query_param_lossy("upload-id-marker");
+                let max_uploads: u32 = match req.query_param_lossy("max-uploads") {
                     None => 1000,
                     Some(s) => s.parse().map_err(|_| ServerError::InvalidArgument {
                         reason: "invalid max-uploads".to_string(),
@@ -1621,20 +1621,20 @@ impl HttpFrontend {
                 ))
             }
             S3Operation::ListParts { bucket, key } => {
-                let upload_id =
-                    req.query_param("uploadId")
-                        .ok_or_else(|| ServerError::InvalidRequest {
-                            reason: "missing uploadId query parameter".to_string(),
-                        })?;
+                let upload_id = req.query_param_lossy("uploadId").ok_or_else(|| {
+                    ServerError::InvalidRequest {
+                        reason: "missing uploadId query parameter".to_string(),
+                    }
+                })?;
                 let part_number_marker: Option<u32> = req
-                    .query_param("part-number-marker")
+                    .query_param_lossy("part-number-marker")
                     .map(|s| {
                         s.parse().map_err(|_| ServerError::InvalidArgument {
                             reason: "part-number-marker must be an integer".to_string(),
                         })
                     })
                     .transpose()?;
-                let max_parts: u32 = match req.query_param("max-parts") {
+                let max_parts: u32 = match req.query_param_lossy("max-parts") {
                     None => 1000,
                     Some(s) => s.parse().map_err(|_| ServerError::InvalidArgument {
                         reason: "invalid max-parts".to_string(),
@@ -1666,9 +1666,9 @@ impl HttpFrontend {
                 unreachable!("OPTIONS handled before dispatch")
             }
             S3Operation::ListObjectVersions { bucket } => {
-                let prefix = req.query_param("prefix");
-                let key_marker = req.query_param("key-marker");
-                let version_id_marker = match req.query_param("version-id-marker") {
+                let prefix = req.query_param_lossy("prefix");
+                let key_marker = req.query_param_lossy("key-marker");
+                let version_id_marker = match req.query_param_lossy("version-id-marker") {
                     None => None,
                     Some(v) if v == "null" => Some(VersionId::Null),
                     Some(v) => Some(VersionId::from_u64(v.parse::<u64>().map_err(|_| {
@@ -1678,7 +1678,7 @@ impl HttpFrontend {
                     })?)),
                 };
                 let max_keys: u32 = req
-                    .query_param("max-keys")
+                    .query_param_lossy("max-keys")
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(1000);
                 let requester =
@@ -1720,7 +1720,6 @@ impl HttpFrontend {
         req: &S3Request,
         verify_payload_hash: bool,
     ) -> Result<AuthContext, ServerError> {
-        let header_pairs = req.header_pairs();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -1747,7 +1746,7 @@ impl HttpFrontend {
             &req.method,
             &req.path,
             &req.query_string,
-            &header_pairs,
+            req.headers.as_slice(),
             &req.body,
             &self.credentials,
             self.coordinator.region(),
@@ -2787,12 +2786,15 @@ pub fn s3_response_to_hyper(
         .expect("response builder should not fail")
 }
 
-fn parse_max_keys(raw: Option<String>) -> Result<u32, ServerError> {
+fn parse_max_keys<S: AsRef<str>>(raw: Option<S>) -> Result<u32, ServerError> {
     match raw {
         None => Ok(1000),
-        Some(s) => s.parse::<u32>().map_err(|_| ServerError::InvalidArgument {
-            reason: "invalid max-keys".to_string(),
-        }),
+        Some(s) => s
+            .as_ref()
+            .parse::<u32>()
+            .map_err(|_| ServerError::InvalidArgument {
+                reason: "invalid max-keys".to_string(),
+            }),
     }
 }
 
@@ -3012,10 +3014,11 @@ fn apply_response_overrides(resp: &mut S3Response, req: &S3Request) {
         ("response-expires", "Expires"),
     ];
     for &(param, header_name) in overrides {
-        if let Some(value) = req.query_param(param) {
+        if let Some(value) = req.query_param_lossy(param) {
             resp.headers
                 .retain(|(k, _)| !k.eq_ignore_ascii_case(header_name));
-            resp.headers.push((header_name.to_string(), value));
+            resp.headers
+                .push((header_name.to_string(), value.into_owned()));
         }
     }
 }
