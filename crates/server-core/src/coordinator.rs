@@ -5,7 +5,9 @@ use std::sync::OnceLock;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 
-use checksum::{ChecksumAlgorithm, ChecksumType, MultipartChecksumConfig, RawChecksum};
+use checksum::{
+    ChecksumAlgorithm, ChecksumBytes, ChecksumType, MultipartChecksumConfig, RawChecksum,
+};
 use ec::{EcConfig, ErasureCodec};
 use s3_types::{BucketVersioningState, CanonicalUserId, VersionId};
 use storage::traits::{PgMetadataStore, ShardStore};
@@ -4003,7 +4005,7 @@ impl Coordinator {
             ec_k: self.ec_config.data_shards,
             ec_m: self.ec_config.parity_shards,
             last_modified: now,
-            checksum: checksum.as_ref().map(|value| value.bytes().to_vec()),
+            checksum: checksum.as_ref().map(ChecksumBytes::from),
         };
 
         // Atomic commit: upsert part, insert segments, delete staging.
@@ -4974,7 +4976,7 @@ impl Coordinator {
                         ServerError::InternalError {
                             reason: format!(
                                 "stored checksum length {} does not match {} (expected {})",
-                                raw.len(),
+                                raw.as_slice().len(),
                                 algo.as_str(),
                                 algo.expected_byte_length(),
                             ),
@@ -5137,7 +5139,7 @@ impl Coordinator {
                         ServerError::InternalError {
                             reason: format!(
                                 "stored checksum length {} does not match {} (expected {})",
-                                raw.len(),
+                                raw.as_slice().len(),
                                 algo.as_str(),
                                 algo.expected_byte_length(),
                             ),
@@ -6496,7 +6498,7 @@ impl Coordinator {
                 }
                 match &part.checksum {
                     Some(stored_bytes) => {
-                        if claim.expected_bytes() != stored_bytes {
+                        if claim.expected_bytes() != stored_bytes.as_slice() {
                             return Err(ServerError::InvalidRequest {
                                 reason: "part checksum mismatch".to_string(),
                             });
@@ -6600,7 +6602,7 @@ impl Coordinator {
                     let mut concat = Vec::new();
                     for part in &part_records {
                         match &part.checksum {
-                            Some(bytes) => concat.extend_from_slice(bytes),
+                            Some(bytes) => concat.extend_from_slice(bytes.as_slice()),
                             None => {
                                 return Err(ServerError::InvalidRequest {
                                     reason:

@@ -16,5 +16,6 @@ pub mod crc64;
 mod types;
 
 pub use types::{
-    ChecksumAlgorithm, ChecksumType, InvalidChecksumConfig, MultipartChecksumConfig, RawChecksum,
+    ChecksumAlgorithm, ChecksumBytes, ChecksumType, InvalidChecksumConfig, MultipartChecksumConfig,
+    RawChecksum,
 };

@@ -3,7 +3,8 @@ use crate::error::StoreError;
 use std::num::NonZeroU64;
 
 pub use checksum::{
-    ChecksumAlgorithm, ChecksumType, InvalidChecksumConfig, MultipartChecksumConfig, RawChecksum,
+    ChecksumAlgorithm, ChecksumBytes, ChecksumType, InvalidChecksumConfig, MultipartChecksumConfig,
+    RawChecksum,
 };
 pub use s3_types::{BucketVersioningState, CanonicalUserId, VersionId};
 
@@ -1017,7 +1018,7 @@ pub struct MultipartPartRecord {
     /// Last modified timestamp (unix milliseconds).
     pub last_modified: u64,
     /// Raw checksum bytes for this part (None if no checksum).
-    pub checksum: Option<Vec<u8>>,
+    pub checksum: Option<ChecksumBytes>,
 }
 
 /// Committed part record in the object manifest.
@@ -1037,7 +1038,7 @@ pub struct ObjectPartRecord {
     /// PG where this part's shards are stored.
     pub shard_pg_id: u32,
     /// Raw checksum bytes for this part (None if no checksum).
-    pub checksum: Option<Vec<u8>>,
+    pub checksum: Option<ChecksumBytes>,
 }
 
 /// Committed part record annotated with its byte offset in the completed object.

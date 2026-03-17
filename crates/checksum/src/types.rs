@@ -240,6 +240,55 @@ impl RawChecksum {
     }
 }
 
+/// Raw checksum bytes stored without algorithm context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChecksumBytes {
+    len: u8,
+    bytes: [u8; Self::MAX_LEN],
+}
+
+impl ChecksumBytes {
+    pub const MAX_LEN: usize = 32;
+
+    /// Construct inline checksum bytes, validating only the bounded size.
+    pub fn new(bytes: impl AsRef<[u8]>) -> Result<Self, &'static str> {
+        let bytes = bytes.as_ref();
+        if bytes.is_empty() || bytes.len() > Self::MAX_LEN {
+            return Err("checksum byte length must be between 1 and 32");
+        }
+
+        let mut stored = [0u8; Self::MAX_LEN];
+        stored[..bytes.len()].copy_from_slice(bytes);
+        Ok(Self {
+            len: bytes.len() as u8,
+            bytes: stored,
+        })
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes[..usize::from(self.len)]
+    }
+}
+
+impl AsRef<[u8]> for ChecksumBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl From<RawChecksum> for ChecksumBytes {
+    fn from(value: RawChecksum) -> Self {
+        Self::new(value.bytes()).expect("raw checksum bytes are bounded by construction")
+    }
+}
+
+impl From<&RawChecksum> for ChecksumBytes {
+    fn from(value: &RawChecksum) -> Self {
+        Self::new(value.bytes()).expect("raw checksum bytes are bounded by construction")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,5 +521,17 @@ mod tests {
         // SHA256 with wrong length
         let result = RawChecksum::new(ChecksumAlgorithm::Sha256, vec![0; 16]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn checksum_bytes_valid() {
+        let bytes = ChecksumBytes::new([1u8, 2, 3, 4]).unwrap();
+        assert_eq!(bytes.as_slice(), &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn checksum_bytes_invalid_length() {
+        assert!(ChecksumBytes::new([]).is_err());
+        assert!(ChecksumBytes::new([0u8; 33]).is_err());
     }
 }

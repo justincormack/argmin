@@ -737,7 +737,7 @@ fn mpu_part_checksum_round_trip() {
         })
         .unwrap();
 
-    let checksum_bytes = vec![0xDE, 0xAD, 0xBE, 0xEF];
+    let checksum_bytes = ChecksumBytes::new([0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
     store
         .upsert_multipart_part(&MultipartPartRecord {
             upload_id: "uid-pc".into(),
@@ -784,7 +784,7 @@ fn mpu_part_checksum_round_trip() {
 fn mpu_object_part_checksum_round_trip() {
     let (_dir, store) = make_pg_store();
 
-    let checksum_bytes = vec![0x01, 0x02, 0x03, 0x04];
+    let checksum_bytes = ChecksumBytes::new([0x01, 0x02, 0x03, 0x04]).unwrap();
     store
         .commit_object_parts(&[
             ObjectPartRecord {
@@ -861,7 +861,7 @@ fn mpu_complete_multipart_commit_preserves_checksums() {
         metadata_blob: Some(vec![].into()),
     };
 
-    let cksum = vec![0xDE, 0xAD];
+    let cksum = ChecksumBytes::new([0xDE, 0xAD]).unwrap();
     let parts = vec![
         ObjectPartRecord {
             bucket: "b".into(),

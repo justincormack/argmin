@@ -53,14 +53,16 @@ This is only about internal segment payload movement. It does not change:
 10. checksum claims and computed checksum values now use inline fixed-size
     storage instead of heap `Vec<u8>` allocations for 4/8/20/32-byte checksum
     values
+11. storage-side multipart and committed-part checksum fields now use inline
+    checksum storage too, so `server-core` no longer round-trips those through
+    small heap `Vec<u8>` blobs away from the SQLite bind/read edge
 
 ## Remaining
 
-1. decide whether any remaining checksum or small control-path scratch is worth
-   pooling, or whether the current hot-path reduction is enough
-   This now mostly means storage-boundary checksum blob copies and small EC
-   helper vectors such as index/reference lists, not segment-sized payload
-   buffers or computed checksum result values.
+1. decide whether any remaining small control-path scratch is worth pooling, or
+   whether the current hot-path reduction is enough
+   This now mostly means tiny EC helper vectors such as index/reference lists,
+   not segment-sized payload buffers or checksum result storage.
 2. measure whether the remaining small owner-object churn
    (`Arc`/`Bytes::from_owner`) is worth another abstraction layer, or whether
    the current pooled payload buffers are sufficient for the healthy path

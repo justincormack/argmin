@@ -113,6 +113,10 @@ impl PgStore {
 
     fn row_to_object_part(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObjectPartRecord> {
         let part_okh = Self::blob_to_okh(row.get(7)?, 7)?;
+        let checksum = row
+            .get::<_, Option<Vec<u8>>>(12)?
+            .map(|blob| Self::blob_to_checksum(blob, 12))
+            .transpose()?;
         Ok(ObjectPartRecord {
             bucket: row.get(0)?,
             key: row.get(1)?,
@@ -126,7 +130,7 @@ impl PgStore {
             ec_k: row.get::<_, u8>(9)?,
             ec_m: row.get::<_, u8>(10)?,
             shard_pg_id: row.get::<_, i64>(11)? as u32,
-            checksum: row.get(12)?,
+            checksum,
         })
     }
 
@@ -158,6 +162,10 @@ impl PgStore {
         row: &rusqlite::Row<'_>,
     ) -> Result<MultipartPartRecord, rusqlite::Error> {
         let part_okh = Self::blob_to_okh(row.get(6)?, 6)?;
+        let checksum = row
+            .get::<_, Option<Vec<u8>>>(11)?
+            .map(|blob| Self::blob_to_checksum(blob, 11))
+            .transpose()?;
         Ok(MultipartPartRecord {
             upload_id: row.get(0)?,
             part_number: row.get::<_, i64>(1)? as u32,
@@ -170,7 +178,21 @@ impl PgStore {
             ec_k: row.get::<_, u8>(8)?,
             ec_m: row.get::<_, u8>(9)?,
             last_modified: row.get::<_, i64>(10)? as u64,
-            checksum: row.get(11)?,
+            checksum,
+        })
+    }
+
+    fn blob_to_checksum(
+        blob: Vec<u8>,
+        col: usize,
+    ) -> Result<checksum::ChecksumBytes, rusqlite::Error> {
+        let len = blob.len();
+        checksum::ChecksumBytes::new(&blob).map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                col,
+                rusqlite::types::Type::Blob,
+                Box::from(format!("invalid checksum length: {len} (expected 1..=32)")),
+            )
         })
     }
 
@@ -2797,7 +2819,7 @@ impl PgMetadataStore for PgStore {
                     part.ec_k,
                     part.ec_m,
                     part.last_modified as i64,
-                    part.checksum,
+                    part.checksum.as_ref().map(|checksum| checksum.as_slice()),
                 ],
             )?;
 
@@ -2924,7 +2946,7 @@ impl PgMetadataStore for PgStore {
                         part.ec_k,
                         part.ec_m,
                         part.last_modified as i64,
-                        part.checksum,
+                        part.checksum.as_ref().map(|checksum| checksum.as_slice()),
                     ],
                 )?;
 
@@ -3144,7 +3166,7 @@ impl PgMetadataStore for PgStore {
                     part.ec_k,
                     part.ec_m,
                     part.shard_pg_id,
-                    part.checksum,
+                    part.checksum.as_ref().map(|checksum| checksum.as_slice()),
                 ])?;
                 object_offset_start += part.size;
             }
@@ -3459,7 +3481,7 @@ impl PgMetadataStore for PgStore {
                         part.ec_k,
                         part.ec_m,
                         part.shard_pg_id,
-                        part.checksum,
+                        part.checksum.as_ref().map(|checksum| checksum.as_slice()),
                     ])?;
                     object_offset_start += part.size;
                 }
@@ -4268,7 +4290,7 @@ impl PgMetadataStore for PgStore {
                         part.ec_k,
                         part.ec_m,
                         part.last_modified as i64,
-                        part.checksum,
+                        part.checksum.as_ref().map(|checksum| checksum.as_slice()),
                     ],
                 )
                 .map_err(|e| MetadataError::Db {
