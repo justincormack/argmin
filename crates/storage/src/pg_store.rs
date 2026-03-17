@@ -33,7 +33,8 @@ type StreamSessionRow = (u8, u8, BucketName, ObjectKey, Option<UploadId>, Option
 /// Per-PG store combining shard file I/O with SQLite metadata.
 pub struct PgStore {
     pg_id: u32,
-    pg_dir: PathBuf,
+    shards_dir: PathBuf,
+    tmp_dir: PathBuf,
     conn: Connection,
 }
 
@@ -43,11 +44,14 @@ impl PgStore {
     /// Creates `shards/` and `tmp/` subdirectories if they don't exist.
     /// Initializes the SQLite schema (idempotent).
     pub fn open(pg_dir: &Path, pg_id: u32) -> Result<Self, StoreError> {
-        fs::create_dir_all(pg_dir.join("shards")).map_err(|e| StoreError::Io {
+        let shards_dir = pg_dir.join("shards");
+        let tmp_dir = pg_dir.join("tmp");
+
+        fs::create_dir_all(&shards_dir).map_err(|e| StoreError::Io {
             context: "create shards dir",
             source: e,
         })?;
-        fs::create_dir_all(pg_dir.join("tmp")).map_err(|e| StoreError::Io {
+        fs::create_dir_all(&tmp_dir).map_err(|e| StoreError::Io {
             context: "create tmp dir",
             source: e,
         })?;
@@ -64,7 +68,6 @@ impl PgStore {
         })?;
 
         // Clean up any orphaned temp files from previous crashes.
-        let tmp_dir = pg_dir.join("tmp");
         if let Ok(entries) = fs::read_dir(&tmp_dir) {
             for entry in entries.flatten() {
                 let _ = fs::remove_file(entry.path());
@@ -73,7 +76,8 @@ impl PgStore {
 
         Ok(Self {
             pg_id,
-            pg_dir: pg_dir.to_path_buf(),
+            shards_dir,
+            tmp_dir,
             conn,
         })
     }
@@ -90,13 +94,18 @@ impl PgStore {
 
     /// Resolve the file path for a shard key.
     fn shard_path(&self, key: &ShardKey) -> PathBuf {
-        Self::shard_path_for_dir(&self.pg_dir, key)
+        Self::shard_path_for_shards_dir(&self.shards_dir, key)
     }
 
-    fn shard_path_for_dir(pg_dir: &Path, key: &ShardKey) -> PathBuf {
-        let prefix = key.hex_prefix();
-        let hex = key.hex();
-        pg_dir.join("shards").join(prefix).join(hex)
+    pub(crate) fn shard_path_for_shards_dir(shards_dir: &Path, key: &ShardKey) -> PathBuf {
+        let hex = key.hex_bytes();
+        let prefix =
+            std::str::from_utf8(&hex[..SHARD_KEY_HEX_PREFIX_LEN]).expect("shard key hex is ASCII");
+        let full = std::str::from_utf8(&hex).expect("shard key hex is ASCII");
+        let mut path = shards_dir.to_path_buf();
+        path.push(prefix);
+        path.push(full);
+        path
     }
 
     /// Get the current unix timestamp in seconds.
@@ -116,7 +125,8 @@ impl PgStore {
     }
 
     pub(crate) fn write_shard_file_durable(
-        pg_dir: &Path,
+        tmp_dir: &Path,
+        shards_dir: &Path,
         key: &ShardKey,
         data: &[u8],
     ) -> Result<WriteAck, StoreError> {
@@ -124,13 +134,7 @@ impl PgStore {
         let stored_size = data.len() as u64;
 
         // Write to temp file with O_EXCL (unique name via pid + timestamp).
-        let tmp_dir = pg_dir.join("tmp");
-        let tmp_name = format!(
-            "shard-{}-{}-{}",
-            std::process::id(),
-            Self::now_secs(),
-            key.hex()
-        );
+        let tmp_name = format!("shard-{}-{}-{key}", std::process::id(), Self::now_secs());
         let tmp_path = tmp_dir.join(&tmp_name);
 
         let mut file = fs::OpenOptions::new()
@@ -160,7 +164,7 @@ impl PgStore {
         })?;
 
         // Ensure prefix subdirectory exists.
-        let shard_path = Self::shard_path_for_dir(pg_dir, key);
+        let shard_path = Self::shard_path_for_shards_dir(shards_dir, key);
         if let Some(parent) = shard_path.parent() {
             fs::create_dir_all(parent).map_err(|e| {
                 let _ = fs::remove_file(&tmp_path);
@@ -746,10 +750,10 @@ impl ShardStore for PgStore {
             "PgStore::write_shard",
             "pg_id={} shard={} bytes={}",
             self.pg_id,
-            key.hex(),
+            key,
             data.len()
         );
-        let ack = Self::write_shard_file_durable(&self.pg_dir, key, data)?;
+        let ack = Self::write_shard_file_durable(&self.tmp_dir, &self.shards_dir, key, data)?;
         self.register_written_shard(key, ack)?;
         Ok(ack)
     }
@@ -760,7 +764,7 @@ impl ShardStore for PgStore {
             "PgStore::read_shard",
             "pg_id={} shard={}",
             self.pg_id,
-            key.hex()
+            key
         );
         // Look up shard in SQLite.
         let row: Option<(i64, i64, i64)> = self

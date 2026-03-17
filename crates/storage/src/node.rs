@@ -14,6 +14,11 @@ use crate::types::{GenerationId, ShardKey, WriteAck};
 
 const TRACE_TARGET: &str = "storage";
 
+struct PgDataPaths {
+    shards_dir: PathBuf,
+    tmp_dir: PathBuf,
+}
+
 pub struct BucketLockGuard<'a> {
     guard: MutexGuard<'a, ()>,
     bucket: String,
@@ -116,6 +121,7 @@ impl StorageNode for LocalStorageNode {
 /// a PG while allowing parallelism across PGs.
 pub struct SharedStorageNode {
     stores: HashMap<u32, Mutex<PgStore>>,
+    pg_paths: HashMap<u32, PgDataPaths>,
     pg_id_list: Vec<u32>,
     data_dir: PathBuf,
     bucket_locks: Vec<Mutex<()>>,
@@ -148,12 +154,22 @@ impl SharedStorageNode {
         })?;
 
         let mut stores = HashMap::with_capacity(pg_ids.len());
+        let mut pg_paths = HashMap::with_capacity(pg_ids.len());
         let mut pg_id_list = Vec::with_capacity(pg_ids.len());
 
         for &pg_id in pg_ids {
             let pg_dir = data_dir.join(format!("pg-{pg_id:04}"));
             let store = PgStore::open(&pg_dir, pg_id)?;
+            let shards_dir = pg_dir.join("shards");
+            let tmp_dir = pg_dir.join("tmp");
             stores.insert(pg_id, Mutex::new(store));
+            pg_paths.insert(
+                pg_id,
+                PgDataPaths {
+                    shards_dir,
+                    tmp_dir,
+                },
+            );
             pg_id_list.push(pg_id);
         }
 
@@ -166,6 +182,7 @@ impl SharedStorageNode {
 
         Ok(Self {
             stores,
+            pg_paths,
             pg_id_list,
             data_dir: data_dir.to_path_buf(),
             bucket_locks,
@@ -263,15 +280,14 @@ impl SharedStorageNode {
             "SharedStorageNode::write_shard_file",
             "pg_id={} shard={} bytes={}",
             pg_id,
-            key.hex(),
+            key,
             data.len()
         );
-        if !self.stores.contains_key(&pg_id) {
-            return Err(StoreError::PgNotFound { pg_id });
-        }
-
-        let pg_dir = self.data_dir.join(format!("pg-{pg_id:04}"));
-        PgStore::write_shard_file_durable(&pg_dir, key, data)
+        let paths = self
+            .pg_paths
+            .get(&pg_id)
+            .ok_or(StoreError::PgNotFound { pg_id })?;
+        PgStore::write_shard_file_durable(&paths.tmp_dir, &paths.shards_dir, key, data)
     }
 
     /// Read a shard file directly without taking the per-PG mutex.
@@ -287,18 +303,13 @@ impl SharedStorageNode {
             "SharedStorageNode::read_shard_file",
             "pg_id={} shard={}",
             pg_id,
-            key.hex()
+            key
         );
-        if !self.stores.contains_key(&pg_id) {
-            return Err(StoreError::PgNotFound { pg_id });
-        }
-
-        let shard_path = self
-            .data_dir
-            .join(format!("pg-{pg_id:04}"))
-            .join("shards")
-            .join(key.hex_prefix())
-            .join(key.hex());
+        let paths = self
+            .pg_paths
+            .get(&pg_id)
+            .ok_or(StoreError::PgNotFound { pg_id })?;
+        let shard_path = PgStore::shard_path_for_shards_dir(&paths.shards_dir, key);
         fs::read(&shard_path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 return StoreError::NotFound;
@@ -323,19 +334,14 @@ impl SharedStorageNode {
             "SharedStorageNode::read_shard_file_into",
             "pg_id={} shard={} bytes={}",
             pg_id,
-            key.hex(),
+            key,
             dst.len()
         );
-        if !self.stores.contains_key(&pg_id) {
-            return Err(StoreError::PgNotFound { pg_id });
-        }
-
-        let shard_path = self
-            .data_dir
-            .join(format!("pg-{pg_id:04}"))
-            .join("shards")
-            .join(key.hex_prefix())
-            .join(key.hex());
+        let paths = self
+            .pg_paths
+            .get(&pg_id)
+            .ok_or(StoreError::PgNotFound { pg_id })?;
+        let shard_path = PgStore::shard_path_for_shards_dir(&paths.shards_dir, key);
         let mut file = fs::File::open(&shard_path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 return StoreError::NotFound;

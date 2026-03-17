@@ -243,6 +243,10 @@ impl From<SerializedTagSet> for String {
 ///
 /// Layout: object_key_hash (16 bytes) || version_id (8 bytes) || shard_index (1 byte)
 pub const SHARD_KEY_LEN: usize = 25;
+pub const SHARD_KEY_HEX_LEN: usize = SHARD_KEY_LEN * 2;
+pub const SHARD_KEY_HEX_PREFIX_LEN: usize = 2;
+
+const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 
 /// 25-byte composite shard key. Opaque to the storage layer.
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -276,27 +280,54 @@ impl ShardKey {
         &self.0
     }
 
+    /// Hex-encode the full key into a fixed-size ASCII buffer.
+    pub fn hex_bytes(&self) -> [u8; SHARD_KEY_HEX_LEN] {
+        let mut hex = [0u8; SHARD_KEY_HEX_LEN];
+        for (i, byte) in self.0.iter().enumerate() {
+            hex[i * 2] = HEX_DIGITS[(byte >> 4) as usize];
+            hex[i * 2 + 1] = HEX_DIGITS[(byte & 0x0f) as usize];
+        }
+        hex
+    }
+
+    /// Return the first byte's hex representation as a fixed-size ASCII prefix.
+    pub fn hex_prefix_bytes(&self) -> [u8; SHARD_KEY_HEX_PREFIX_LEN] {
+        [
+            HEX_DIGITS[(self.0[0] >> 4) as usize],
+            HEX_DIGITS[(self.0[0] & 0x0f) as usize],
+        ]
+    }
+
     /// Hex-encode the full key (for file paths).
     pub fn hex(&self) -> String {
-        use std::fmt::Write as _;
-
-        let mut s = String::with_capacity(SHARD_KEY_LEN * 2);
-        for b in &self.0 {
-            let _ = write!(s, "{b:02x}");
-        }
-        s
+        let hex = self.hex_bytes();
+        std::str::from_utf8(&hex)
+            .expect("shard key hex is ASCII")
+            .to_owned()
     }
 
     /// Return the first byte's hex representation as a two-character prefix.
     /// Used for directory fan-out: `shards/<prefix>/<full_hex>`.
     pub fn hex_prefix(&self) -> String {
-        format!("{:02x}", self.0[0])
+        let prefix = self.hex_prefix_bytes();
+        std::str::from_utf8(&prefix)
+            .expect("shard key prefix hex is ASCII")
+            .to_owned()
+    }
+}
+
+impl std::fmt::Display for ShardKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for byte in &self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
     }
 }
 
 impl std::fmt::Debug for ShardKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ShardKey({})", self.hex())
+        write!(f, "ShardKey({self})")
     }
 }
 
@@ -1379,6 +1410,15 @@ mod tests {
     fn shard_key_hex_prefix() {
         let key = ShardKey::new(&[0xDE; 16], 0, 0);
         assert_eq!(key.hex_prefix(), "de");
+        assert_eq!(key.hex_prefix_bytes(), *b"de");
+    }
+
+    #[test]
+    fn shard_key_hex_bytes_match_hex_string() {
+        let key = ShardKey::new(&[0xAB; 16], 42, 3);
+        let hex = key.hex();
+        let hex_bytes = key.hex_bytes();
+        assert_eq!(std::str::from_utf8(&hex_bytes).unwrap(), hex);
     }
 
     // ── Property-based tests ────────────────────────────────────────
