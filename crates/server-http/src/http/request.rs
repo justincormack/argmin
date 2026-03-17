@@ -2,6 +2,7 @@
 use std::borrow::Cow;
 
 use crate::error::ServerError;
+use auth::HeaderSource;
 
 /// Maximum body size for the buffered request path.
 ///
@@ -26,8 +27,29 @@ pub struct S3Request {
     pub method: http::Method,
     pub path: String,
     pub query_string: String,
-    pub headers: Vec<(String, String)>,
+    pub headers: http::HeaderMap,
     pub body: Vec<u8>,
+}
+
+pub(crate) struct RequestHeaderSource<'a>(&'a http::HeaderMap);
+
+impl HeaderSource for RequestHeaderSource<'_> {
+    fn first_value<'a>(&'a self, name: &str) -> Option<&'a str> {
+        self.0.get(name).map(|value| {
+            std::str::from_utf8(value.as_bytes()).expect("S3Request stores only validated UTF-8")
+        })
+    }
+
+    fn visit<'a, F>(&'a self, mut f: F)
+    where
+        F: FnMut(&'a str, &'a str),
+    {
+        for (name, value) in self.0 {
+            let value = std::str::from_utf8(value.as_bytes())
+                .expect("S3Request stores only validated UTF-8");
+            f(name.as_str(), value);
+        }
+    }
 }
 
 impl S3Request {
@@ -42,29 +64,20 @@ impl S3Request {
         let path = parts.uri.path().to_string();
         let query_string = parts.uri.query().unwrap_or("").to_string();
 
-        // Extract headers as lowercase name/value pairs.
-        // to_str() only accepts visible ASCII. For non-ASCII bytes (obs-text),
-        // fall back to strict UTF-8. Non-UTF8 obs-text bytes (e.g. raw 0x80)
-        // are rejected here — supporting them would require carrying raw bytes
-        // through SigV4 canonicalization, which currently operates on Strings.
-        // In practice the AWS SDK always sends valid UTF-8. Latin-1
-        // reinterpretation for x-amz-meta-* storage happens later in
-        // MetadataBlob::from_headers().
-        let mut headers = Vec::with_capacity(parts.headers.len());
+        // Validate that all header values are UTF-8. We keep the original
+        // HeaderMap so later stages can borrow from it directly without first
+        // materializing String pairs.
         for (name, value) in &parts.headers {
-            let val_str = match value.to_str() {
-                Ok(s) => s.to_string(),
-                Err(_) => std::str::from_utf8(value.as_bytes())
-                    .map_err(|_| ServerError::InvalidRequest {
-                        reason: format!("invalid UTF-8 in header value for {name}"),
-                    })?
-                    .to_string(),
-            };
-            headers.push((name.as_str().to_string(), val_str));
+            std::str::from_utf8(value.as_bytes()).map_err(|_| ServerError::InvalidRequest {
+                reason: format!("invalid UTF-8 in header value for {name}"),
+            })?;
         }
+        let headers = parts.headers.clone();
 
         // Validate Content-Length header if present (reject negative/non-numeric)
-        if let Some((_, cl_value)) = headers.iter().find(|(k, _)| k == "content-length") {
+        if let Some(cl_value) = headers.get("content-length").map(|value| {
+            std::str::from_utf8(value.as_bytes()).expect("S3Request stores only validated UTF-8")
+        }) {
             validate_content_length(cl_value)?;
         }
 
@@ -91,10 +104,28 @@ impl S3Request {
     /// Get a header value by lowercase name.
     #[must_use]
     pub fn header(&self, name: &str) -> Option<&str> {
-        self.headers
-            .iter()
-            .find(|(k, _)| k == name)
-            .map(|(_, v)| v.as_str())
+        self.headers.get(name).map(|value| {
+            std::str::from_utf8(value.as_bytes()).expect("S3Request stores only validated UTF-8")
+        })
+    }
+
+    #[must_use]
+    pub fn header_count(&self, name: &str) -> usize {
+        self.headers.get_all(name).iter().count()
+    }
+
+    pub(crate) fn header_source(&self) -> RequestHeaderSource<'_> {
+        RequestHeaderSource(&self.headers)
+    }
+
+    pub(crate) fn header_iter(&self) -> impl Iterator<Item = (&str, &str)> + '_ {
+        self.headers.iter().map(|(name, value)| {
+            (
+                name.as_str(),
+                std::str::from_utf8(value.as_bytes())
+                    .expect("S3Request stores only validated UTF-8"),
+            )
+        })
     }
 
     /// Create a new `S3Request` with a decoded body and trailer headers,
@@ -105,41 +136,38 @@ impl S3Request {
     #[cfg(test)]
     #[must_use]
     pub(crate) fn with_decoded_body(&self, body: Vec<u8>, trailers: Vec<(String, String)>) -> Self {
-        let mut headers: Vec<(String, String)> = self
-            .headers
-            .iter()
-            .map(|(k, v)| {
-                if k == "content-encoding" {
-                    // Strip "aws-chunked" from Content-Encoding.
-                    let filtered: Vec<&str> = v
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|s| !s.eq_ignore_ascii_case("aws-chunked"))
-                        .collect();
-                    if filtered.is_empty() {
-                        // Drop the header entirely if nothing remains.
-                        return (k.clone(), String::new());
-                    }
-                    (k.clone(), filtered.join(", "))
-                } else if k == "content-length" {
-                    // Update to decoded length.
-                    (k.clone(), body.len().to_string())
-                } else {
-                    (k.clone(), v.clone())
-                }
-            })
-            .filter(|(k, v)| !(k == "content-encoding" && v.is_empty()))
-            .collect();
+        let mut headers = self.headers.clone();
+        if let Some(content_encoding) = self.header("content-encoding") {
+            let filtered: Vec<&str> = content_encoding
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.eq_ignore_ascii_case("aws-chunked"))
+                .collect();
+            if filtered.is_empty() {
+                headers.remove("content-encoding");
+            } else {
+                headers.insert(
+                    "content-encoding",
+                    http::HeaderValue::from_str(&filtered.join(", "))
+                        .expect("filtered content-encoding is valid"),
+                );
+            }
+        }
+        headers.insert(
+            "content-length",
+            http::HeaderValue::from_str(&body.len().to_string())
+                .expect("content-length is always valid"),
+        );
 
         // Merge trailer headers: replace existing headers with same name,
         // or append if not present. This avoids duplicate checksum headers
         // when the trailer provides a value that was also in the initial headers.
         for (tk, tv) in trailers {
-            if let Some(existing) = headers.iter_mut().find(|(k, _)| *k == tk) {
-                existing.1 = tv;
-            } else {
-                headers.push((tk, tv));
-            }
+            headers.insert(
+                http::header::HeaderName::from_bytes(tk.as_bytes())
+                    .expect("decoder only yields valid trailer names"),
+                http::HeaderValue::from_str(&tv).expect("decoder only yields valid trailer values"),
+            );
         }
 
         S3Request {
@@ -152,12 +180,10 @@ impl S3Request {
     }
 
     /// Get headers as borrowed pairs for auth verification.
+    #[cfg(test)]
     #[must_use]
     pub fn header_pairs(&self) -> Vec<(&str, &str)> {
-        self.headers
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect()
+        self.header_iter().collect()
     }
 
     /// Get query parameter by name.
@@ -276,8 +302,25 @@ fn hex_val(b: u8) -> Option<u8> {
 }
 
 #[cfg(test)]
+pub(crate) fn header_map_from_owned(headers: Vec<(String, String)>) -> http::HeaderMap {
+    let mut map = http::HeaderMap::with_capacity(headers.len());
+    for (name, value) in headers {
+        map.append(
+            http::header::HeaderName::from_bytes(name.as_bytes())
+                .expect("test headers must use valid names"),
+            http::HeaderValue::from_str(&value).expect("test headers must use valid values"),
+        );
+    }
+    map
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_headers(headers: Vec<(String, String)>) -> http::HeaderMap {
+        header_map_from_owned(headers)
+    }
 
     #[test]
     fn percent_decode_basic() {
@@ -298,7 +341,7 @@ mod tests {
             method: http::Method::GET,
             path: "/bucket".to_string(),
             query_string: "list-type=2&prefix=photos%2F&max-keys=10".to_string(),
-            headers: vec![],
+            headers: test_headers(vec![]),
             body: vec![],
         };
         assert_eq!(req.query_param("list-type"), Some("2".to_string()));
@@ -364,7 +407,7 @@ mod tests {
             method: http::Method::GET,
             path: "/".to_string(),
             query_string: String::new(),
-            headers: vec![],
+            headers: test_headers(vec![]),
             body: vec![],
         };
         assert_eq!(req.query_param("anything"), None);
@@ -376,7 +419,7 @@ mod tests {
             method: http::Method::GET,
             path: "/".to_string(),
             query_string: "flagonly&key=val".to_string(),
-            headers: vec![],
+            headers: test_headers(vec![]),
             body: vec![],
         };
         // "flagonly" with no = has empty value
@@ -390,7 +433,7 @@ mod tests {
             method: http::Method::GET,
             path: "/".to_string(),
             query_string: "a=1&b=2&c=3".to_string(),
-            headers: vec![],
+            headers: test_headers(vec![]),
             body: vec![],
         };
         assert_eq!(req.query_param("c"), Some("3".to_string()));
@@ -402,10 +445,10 @@ mod tests {
             method: http::Method::GET,
             path: "/".to_string(),
             query_string: String::new(),
-            headers: vec![
+            headers: test_headers(vec![
                 ("host".to_string(), "example.com".to_string()),
                 ("content-type".to_string(), "text/plain".to_string()),
-            ],
+            ]),
             body: vec![],
         };
         let pairs = req.header_pairs();
@@ -440,7 +483,7 @@ mod tests {
             method: http::Method::GET,
             path: "/".to_string(),
             query_string: String::new(),
-            headers: vec![("host".to_string(), "example.com".to_string())],
+            headers: test_headers(vec![("host".to_string(), "example.com".to_string())]),
             body: vec![],
         };
         assert_eq!(req.header("content-type"), None);

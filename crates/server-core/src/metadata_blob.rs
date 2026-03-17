@@ -79,8 +79,15 @@ impl MetadataBlob {
     /// - RFC 9110 §5.5 (obs-text in field values)
     /// - RFC 2047 (MIME encoded-words in headers)
     pub fn from_headers(headers: &[(&str, &str)]) -> Result<Self, ServerError> {
+        Self::from_header_iter(headers.iter().copied())
+    }
+
+    pub fn from_header_iter<'a, I>(headers: I) -> Result<Self, ServerError>
+    where
+        I: IntoIterator<Item = (&'a str, &'a str)>,
+    {
         let mut entries = Vec::new();
-        for &(name, value) in headers {
+        for (name, value) in headers {
             let lower = name.to_ascii_lowercase();
             if STORED_HEADERS.contains(&lower.as_str()) || lower.starts_with("x-amz-meta-") {
                 if has_invalid_header_bytes(value) {

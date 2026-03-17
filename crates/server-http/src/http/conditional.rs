@@ -119,10 +119,12 @@ mod tests {
             method: http::Method::GET,
             path: String::new(),
             query_string: String::new(),
-            headers: headers
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
+            headers: crate::http::request::header_map_from_owned(
+                headers
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            ),
             body: vec![],
         }
     }
