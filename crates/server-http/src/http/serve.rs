@@ -1,7 +1,7 @@
 /// Async hyper HTTP server loop with frontend pool and backpressure.
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
@@ -174,7 +174,7 @@ impl Default for ServeConfig {
 /// Shared server state: frontend pool, round-robin counter, request semaphore,
 /// and timeout configuration.
 struct ServerState {
-    pool: Vec<Mutex<HttpFrontend>>,
+    pool: Vec<Arc<HttpFrontend>>,
     counter: AtomicUsize,
     request_semaphore: Arc<Semaphore>,
     segment_buffer_pool: SegmentBufferPool,
@@ -306,7 +306,7 @@ pub async fn serve(
 
     let header_read_timeout = config.header_read_timeout;
     let state = Arc::new(ServerState {
-        pool: frontends.into_iter().map(Mutex::new).collect(),
+        pool: frontends.into_iter().map(Arc::new).collect(),
         counter: AtomicUsize::new(0),
         request_semaphore: Arc::new(Semaphore::new(max_inflight_requests as usize)),
         segment_buffer_pool: SegmentBufferPool::new(max_inflight_requests as usize),
@@ -2416,18 +2416,10 @@ fn make_chunked_decoder(
 }
 
 /// Acquire a frontend from the pool using round-robin with `try_lock`.
-fn acquire_frontend(state: &ServerState) -> MutexGuard<'_, HttpFrontend> {
+fn acquire_frontend(state: &ServerState) -> Arc<HttpFrontend> {
     let pool_size = state.pool.len();
-    let start = state.counter.fetch_add(1, Ordering::Relaxed) % pool_size;
-
-    for i in 0..pool_size {
-        let idx = (start + i) % pool_size;
-        if let Ok(frontend) = state.pool[idx].try_lock() {
-            return frontend;
-        }
-    }
-
-    state.pool[start].lock().expect("frontend mutex poisoned")
+    let idx = state.counter.fetch_add(1, Ordering::Relaxed) % pool_size;
+    Arc::clone(&state.pool[idx])
 }
 
 /// Collect a request body with size limiting and per-frame idle timeout.

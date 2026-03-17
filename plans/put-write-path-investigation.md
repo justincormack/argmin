@@ -28,6 +28,9 @@ behavior.
   cross-PG shard writes, and revalidates before publishing the staging row.
   The same-PG case is intentionally unchanged because there is no separate PG
   lock to release.
+- The remaining HTTP-side delay is not `spawn_blocking` queueing. The new trace
+  shows most of the residual PUT cost waiting in `acquire_frontend`, so the
+  frontend pool mutex is now the dominant gate on `UploadPart` append/finalize.
 
 ## Steps
 
@@ -36,10 +39,10 @@ behavior.
    completion, and finalize handoff.
 2. Done: reduce `append_stream_segment` metadata PG hold time so it does not
    keep the metadata PG locked across cross-PG encode and shard writes.
-3. Rerun the same local PUT trace and reassess whether `finalize_stream_part`
-   still contends materially on the metadata PG.
-4. If needed, tighten the finalize path after the append critical section is
-   reduced.
+3. Done: rerun the local PUT trace and confirm the next bottleneck is the
+   frontend pool mutex, not coordinator lock scope or `spawn_blocking`.
+4. In progress: remove frontend pool mutex contention for streaming
+   append/finalize and rerun the same local PUT trace.
 
 ## Notes
 
@@ -49,3 +52,6 @@ behavior.
 - The reduced lock scope relies on current request structure: a given stream
   session appends segments sequentially within one request, and clients do not
   have direct access to session IDs.
+- `prepare_streaming_put` / `prepare_streaming_part` still need the full
+  frontend for auth and request-header handling. The goal here is narrower:
+  stop serializing steady-state append/finalize on the frontend pool.
