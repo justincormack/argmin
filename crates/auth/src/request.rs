@@ -1,13 +1,15 @@
 /// High-level request authentication entrypoint.
+use std::borrow::Cow;
+
 use ring::hmac;
 
 use crate::canonical::{
     canonical_headers, canonical_query_string, canonical_request, parse_amz_date, sha256_hex,
     string_to_sign,
 };
-use crate::credential::{CredentialScope, CredentialStore};
+use crate::credential::CredentialStore;
 use crate::error::AuthError;
-use crate::sigv4::{derive_signing_key, parse_auth_header, verify_request};
+use crate::sigv4::{derive_signing_key, parse_auth_header, verify_request_record};
 use crate::{
     MAX_ACCESS_KEY_ID_LEN, MAX_AUTHORIZATION_HEADER_LEN, MAX_CREDENTIAL_LEN,
     MAX_PRESIGNED_QUERY_LEN, MAX_SESSION_TOKEN_LEN, MAX_SIGNED_HEADERS_LEN,
@@ -15,6 +17,14 @@ use crate::{
 };
 
 const TRACE_TARGET: &str = "auth";
+
+#[derive(Clone, Copy)]
+struct CredentialScopeRef<'a> {
+    access_key_id: &'a str,
+    date: &'a str,
+    region: &'a str,
+    service: &'a str,
+}
 
 /// Authentication mode used by the incoming request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -174,7 +184,7 @@ pub fn authenticate_request<H: HeaderSource + ?Sized>(
         );
     }
 
-    if query_param(query_string, "X-Amz-Algorithm").is_some() {
+    if query_param_lossy(query_string, "X-Amz-Algorithm").is_some() {
         if query_string.len() > MAX_PRESIGNED_QUERY_LEN {
             return Err(AuthError::InvalidQueryParam {
                 param: "X-Amz-Algorithm",
@@ -221,22 +231,19 @@ fn authenticate_header<H: HeaderSource + ?Sized>(
         return Err(AuthError::MalformedAuth);
     }
     let body_hash = match headers.first_value("x-amz-content-sha256") {
-        Some("UNSIGNED-PAYLOAD") => "UNSIGNED-PAYLOAD".to_string(),
-        Some(hash) => hash.to_string(),
-        None => sha256_hex(body),
+        Some("UNSIGNED-PAYLOAD") => Cow::Borrowed("UNSIGNED-PAYLOAD"),
+        Some(hash) => Cow::Borrowed(hash),
+        None => Cow::Owned(sha256_hex(body)),
     };
-    let access_key_id = verify_request(
+    let record = verify_request_record(
         method,
         path,
         query_string,
         headers,
-        &body_hash,
+        body_hash.as_ref(),
         &parsed,
         store,
     )?;
-    let record = store
-        .get_record(&access_key_id)
-        .ok_or(AuthError::UnknownAccessKey)?;
 
     validate_record_token_and_expiry(
         record,
@@ -244,24 +251,31 @@ fn authenticate_header<H: HeaderSource + ?Sized>(
         now_epoch_secs,
     )?;
 
+    let request_epoch_secs = headers.first_value("x-amz-date").and_then(parse_amz_date);
+    let crate::sigv4::SigV4Auth {
+        credential,
+        signed_headers: _,
+        signature,
+    } = parsed;
+
     // Build streaming signing context for STREAMING-AWS4-HMAC-SHA256-* requests.
-    let streaming = if body_hash.starts_with("STREAMING-AWS4-HMAC-SHA256") {
-        let timestamp = headers.first_value("x-amz-date").unwrap_or("").to_string();
+    let streaming = if body_hash.as_ref().starts_with("STREAMING-AWS4-HMAC-SHA256") {
+        let timestamp = headers.first_value("x-amz-date").unwrap_or("").to_owned();
         let scope = format!(
             "{}/{}/{}/aws4_request",
-            parsed.credential.date, parsed.credential.region, parsed.credential.service
+            credential.date, credential.region, credential.service
         );
         let signing_key = derive_signing_key(
             &record.secret_key,
-            &parsed.credential.date,
-            &parsed.credential.region,
-            &parsed.credential.service,
+            &credential.date,
+            &credential.region,
+            &credential.service,
         );
         let mut key_bytes = [0u8; 32];
         key_bytes.copy_from_slice(signing_key.as_ref());
         Some(StreamingSigningContext {
             signing_key: key_bytes,
-            seed_signature: parsed.signature.clone(),
+            seed_signature: signature,
             scope,
             timestamp,
         })
@@ -271,9 +285,9 @@ fn authenticate_header<H: HeaderSource + ?Sized>(
 
     Ok(AuthContext {
         mode: AuthMode::HeaderSigV4,
-        access_key_id: Some(access_key_id),
+        access_key_id: Some(credential.access_key_id),
         principal: Some(record.principal.clone()),
-        request_epoch_secs: headers.first_value("x-amz-date").and_then(parse_amz_date),
+        request_epoch_secs,
         streaming,
     })
 }
@@ -291,25 +305,26 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
     now_epoch_secs: u64,
 ) -> Result<AuthContext, AuthError> {
     let algorithm =
-        query_param(query_string, "X-Amz-Algorithm").ok_or(AuthError::MissingQueryParam {
+        query_param_lossy(query_string, "X-Amz-Algorithm").ok_or(AuthError::MissingQueryParam {
             param: "X-Amz-Algorithm",
         })?;
-    if algorithm != "AWS4-HMAC-SHA256" {
+    if algorithm.as_ref() != "AWS4-HMAC-SHA256" {
         return Err(AuthError::InvalidQueryParam {
             param: "X-Amz-Algorithm",
         });
     }
 
-    let credential_raw =
-        query_param(query_string, "X-Amz-Credential").ok_or(AuthError::MissingQueryParam {
+    let credential_raw = query_param_lossy(query_string, "X-Amz-Credential").ok_or(
+        AuthError::MissingQueryParam {
             param: "X-Amz-Credential",
-        })?;
+        },
+    )?;
     if credential_raw.is_empty() || credential_raw.len() > MAX_CREDENTIAL_LEN {
         return Err(AuthError::InvalidQueryParam {
             param: "X-Amz-Credential",
         });
     }
-    let credential = parse_credential_scope(&credential_raw)?;
+    let credential = parse_credential_scope_ref(credential_raw.as_ref())?;
     if credential.region != expected_region {
         return Err(AuthError::InvalidQueryParam {
             param: "X-Amz-Credential",
@@ -321,19 +336,19 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
         });
     }
 
-    let signed_headers_raw =
-        query_param(query_string, "X-Amz-SignedHeaders").ok_or(AuthError::MissingQueryParam {
+    let signed_headers_raw = query_param_lossy(query_string, "X-Amz-SignedHeaders").ok_or(
+        AuthError::MissingQueryParam {
             param: "X-Amz-SignedHeaders",
-        })?;
+        },
+    )?;
     if signed_headers_raw.is_empty() || signed_headers_raw.len() > MAX_SIGNED_HEADERS_LEN {
         return Err(AuthError::InvalidQueryParam {
             param: "X-Amz-SignedHeaders",
         });
     }
-    let signed_headers: Vec<String> = signed_headers_raw
+    let signed_headers: Vec<&str> = signed_headers_raw
         .split(';')
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
         .collect();
     if signed_headers.is_empty() || signed_headers.len() > MAX_SIGNED_HEADER_COUNT {
         return Err(AuthError::InvalidQueryParam {
@@ -342,14 +357,15 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
     }
 
     let request_date =
-        query_param(query_string, "X-Amz-Date").ok_or(AuthError::MissingQueryParam {
+        query_param_lossy(query_string, "X-Amz-Date").ok_or(AuthError::MissingQueryParam {
             param: "X-Amz-Date",
         })?;
-    let request_epoch = parse_amz_date(&request_date).ok_or(AuthError::InvalidQueryParam {
-        param: "X-Amz-Date",
-    })?;
+    let request_epoch =
+        parse_amz_date(request_date.as_ref()).ok_or(AuthError::InvalidQueryParam {
+            param: "X-Amz-Date",
+        })?;
 
-    let expires = query_param(query_string, "X-Amz-Expires")
+    let expires = query_param_lossy(query_string, "X-Amz-Expires")
         .ok_or(AuthError::MissingQueryParam {
             param: "X-Amz-Expires",
         })?
@@ -367,22 +383,22 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
     }
 
     let signature =
-        query_param(query_string, "X-Amz-Signature").ok_or(AuthError::MissingQueryParam {
+        query_param_lossy(query_string, "X-Amz-Signature").ok_or(AuthError::MissingQueryParam {
             param: "X-Amz-Signature",
         })?;
     // AWS treats malformed-looking presigned signature values as a signature
     // mismatch rather than rejecting them at query parsing time.
 
     let record = store
-        .get_record(&credential.access_key_id)
+        .get_record(credential.access_key_id)
         .ok_or(AuthError::UnknownAccessKey)?;
     if !record.enabled {
         return Err(AuthError::UnknownAccessKey);
     }
-    let token = query_param(query_string, "X-Amz-Security-Token").or_else(|| {
+    let token = query_param_lossy(query_string, "X-Amz-Security-Token").or_else(|| {
         headers
             .first_value("x-amz-security-token")
-            .map(str::to_string)
+            .map(Cow::Borrowed)
     });
     validate_record_token_and_expiry(record, token.as_deref(), now_epoch_secs)?;
 
@@ -395,8 +411,8 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
     // default to UNSIGNED-PAYLOAD (the common case for presigned URLs where
     // the body is unknown at signing time).
     let body_hash = match headers.first_value("x-amz-content-sha256") {
-        Some(hash) => hash.to_string(),
-        None => "UNSIGNED-PAYLOAD".to_string(),
+        Some(hash) => Cow::Borrowed(hash),
+        None => Cow::Borrowed("UNSIGNED-PAYLOAD"),
     };
     let canonical_req = canonical_request(
         method,
@@ -404,19 +420,19 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
         &canonical_qs,
         &canonical_hdrs,
         &signed_headers_joined,
-        &body_hash,
+        body_hash.as_ref(),
     );
     let canonical_hash = sha256_hex(canonical_req.as_bytes());
     let scope = format!(
         "{}/{}/{}/aws4_request",
         credential.date, credential.region, credential.service
     );
-    let sts = string_to_sign(&request_date, &scope, &canonical_hash);
+    let sts = string_to_sign(request_date.as_ref(), &scope, &canonical_hash);
     let signing_key = derive_signing_key(
         &record.secret_key,
-        &credential.date,
-        &credential.region,
-        &credential.service,
+        credential.date,
+        credential.region,
+        credential.service,
     );
     let expected_sig = hmac::sign(
         &hmac::Key::new(hmac::HMAC_SHA256, signing_key.as_ref()),
@@ -430,14 +446,14 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
 
     Ok(AuthContext {
         mode: AuthMode::PresignedSigV4,
-        access_key_id: Some(credential.access_key_id),
+        access_key_id: Some(credential.access_key_id.to_owned()),
         principal: Some(record.principal.clone()),
         request_epoch_secs: Some(request_epoch),
         streaming: None,
     })
 }
 
-fn parse_credential_scope(value: &str) -> Result<CredentialScope, AuthError> {
+fn parse_credential_scope_ref(value: &str) -> Result<CredentialScopeRef<'_>, AuthError> {
     if value.is_empty() || value.len() > MAX_CREDENTIAL_LEN {
         return Err(AuthError::InvalidQueryParam {
             param: "X-Amz-Credential",
@@ -454,30 +470,35 @@ fn parse_credential_scope(value: &str) -> Result<CredentialScope, AuthError> {
             param: "X-Amz-Credential",
         });
     }
-    Ok(CredentialScope {
-        access_key_id: parts[0].to_string(),
-        date: parts[1].to_string(),
-        region: parts[2].to_string(),
-        service: parts[3].to_string(),
+    Ok(CredentialScopeRef {
+        access_key_id: parts[0],
+        date: parts[1],
+        region: parts[2],
+        service: parts[3],
     })
 }
 
-fn collect_signed_headers<'a, H: HeaderSource + ?Sized>(
-    signed_headers: &[String],
+fn collect_signed_headers<'a, H, S>(
+    signed_headers: &[S],
     headers: &'a H,
-) -> Result<Vec<(&'a str, &'a str)>, AuthError> {
+) -> Result<Vec<(&'a str, &'a str)>, AuthError>
+where
+    H: HeaderSource + ?Sized,
+    S: AsRef<str>,
+{
     let mut out: Vec<(&str, &str)> = Vec::new();
     for signed_name in signed_headers {
+        let signed_name = signed_name.as_ref();
         let mut found = false;
         headers.visit(|name, value| {
-            if name == signed_name.as_str() {
+            if name == signed_name {
                 out.push((name, value));
                 found = true;
             }
         });
         if !found {
             return Err(AuthError::MissingSignedHeader {
-                header: signed_name.clone(),
+                header: signed_name.to_owned(),
             });
         }
     }
@@ -512,7 +533,12 @@ fn validate_record_token_and_expiry(
     Ok(())
 }
 
+#[cfg(test)]
 fn query_param(query: &str, name: &str) -> Option<String> {
+    query_param_lossy(query, name).map(Cow::into_owned)
+}
+
+fn query_param_lossy<'a>(query: &'a str, name: &str) -> Option<Cow<'a, str>> {
     query.split('&').filter(|s| !s.is_empty()).find_map(|pair| {
         let mut parts = pair.splitn(2, '=');
         let key = parts.next()?;
@@ -520,7 +546,7 @@ fn query_param(query: &str, name: &str) -> Option<String> {
             return None;
         }
         let val = parts.next().unwrap_or("");
-        Some(percent_decode(val))
+        Some(percent_decode_lossy(val))
     })
 }
 
@@ -533,7 +559,10 @@ fn query_without_signature(query: &str) -> String {
         .join("&")
 }
 
-fn percent_decode(s: &str) -> String {
+fn percent_decode_lossy(s: &str) -> Cow<'_, str> {
+    if !s.as_bytes().contains(&b'%') {
+        return Cow::Borrowed(s);
+    }
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -548,7 +577,7 @@ fn percent_decode(s: &str) -> String {
         out.push(bytes[i]);
         i += 1;
     }
-    String::from_utf8_lossy(&out).to_string()
+    Cow::Owned(String::from_utf8_lossy(&out).into_owned())
 }
 
 fn hex_val(b: u8) -> Option<u8> {
@@ -1447,22 +1476,22 @@ mod tests {
 
     #[test]
     fn percent_decode_basic() {
-        assert_eq!(percent_decode("hello%20world"), "hello world");
-        assert_eq!(percent_decode("no-encoding"), "no-encoding");
-        assert_eq!(percent_decode("%2F"), "/");
+        assert_eq!(percent_decode_lossy("hello%20world"), "hello world");
+        assert_eq!(percent_decode_lossy("no-encoding"), "no-encoding");
+        assert_eq!(percent_decode_lossy("%2F"), "/");
     }
 
     #[test]
     fn percent_decode_invalid_hex() {
         // %ZZ is not valid hex — should be passed through literally
-        assert_eq!(percent_decode("%ZZ"), "%ZZ");
+        assert_eq!(percent_decode_lossy("%ZZ"), "%ZZ");
     }
 
     #[test]
     fn percent_decode_truncated() {
         // % at end of string — not enough chars for hex pair
-        assert_eq!(percent_decode("abc%"), "abc%");
-        assert_eq!(percent_decode("abc%2"), "abc%2");
+        assert_eq!(percent_decode_lossy("abc%"), "abc%");
+        assert_eq!(percent_decode_lossy("abc%2"), "abc%2");
     }
 
     #[test]

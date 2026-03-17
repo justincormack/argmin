@@ -4,7 +4,7 @@ use ring::hmac;
 use crate::canonical::{
     canonical_headers, canonical_query_string, canonical_request, sha256_hex, string_to_sign,
 };
-use crate::credential::{CredentialScope, CredentialStore, SecretKey};
+use crate::credential::{CredentialRecord, CredentialScope, CredentialStore, SecretKey};
 use crate::error::AuthError;
 use crate::request::HeaderSource;
 use crate::{
@@ -136,6 +136,22 @@ pub fn verify_request<H: HeaderSource + ?Sized>(
     auth: &SigV4Auth,
     store: &CredentialStore,
 ) -> Result<String, AuthError> {
+    Ok(
+        verify_request_record(method, uri, query_string, headers, body_hash, auth, store)?
+            .access_key_id
+            .clone(),
+    )
+}
+
+pub(crate) fn verify_request_record<'a, H: HeaderSource + ?Sized>(
+    method: &str,
+    uri: &str,
+    query_string: &str,
+    headers: &H,
+    body_hash: &str,
+    auth: &SigV4Auth,
+    store: &'a CredentialStore,
+) -> Result<&'a CredentialRecord, AuthError> {
     // Look up the secret key
     let record = store
         .get_record(&auth.credential.access_key_id)
@@ -224,7 +240,7 @@ pub fn verify_request<H: HeaderSource + ?Sized>(
         return Err(AuthError::SignatureMismatch);
     }
 
-    Ok(auth.credential.access_key_id.clone())
+    Ok(record)
 }
 
 pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> hmac::Tag {
