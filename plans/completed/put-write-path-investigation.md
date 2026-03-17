@@ -1,6 +1,6 @@
 # PUT Write Path Investigation
 
-Status: active
+Status: completed
 
 ## Goal
 
@@ -8,7 +8,7 @@ Understand why local `2 GiB` multipart PUT is materially slower than `2 GiB`
 GET, and remove avoidable write-path coordination costs without changing S3
 behavior.
 
-## Current Findings
+## Outcome
 
 - The traced `GET` path is healthy: range setup is sub-millisecond and the main
   cost is shard reads.
@@ -37,6 +37,10 @@ behavior.
   row publication is batched into one SQLite transaction per segment. When the
   shard PG and metadata PG are the same, shard rows plus the stream-segment row
   publish in one transaction.
+- The latest local `2 GiB` multipart PUT trace now runs at about `800 MB/s`,
+  versus about `1000 MB/s` for the comparable read path. The remaining gap is
+  mostly the real durable shard file write path, not avoidable HTTP or metadata
+  coordination.
 
 ## Steps
 
@@ -51,7 +55,7 @@ behavior.
    and rerun the same local PUT trace.
 5. Done: split shard durable file IO from shard metadata publication so the
    shard PG mutex only covers SQLite visibility, not file write and fsync.
-6. In progress: rerun the local PUT trace and confirm the remaining cost is the
+6. Done: rerun the local PUT trace and confirm the remaining cost is the
    actual durable shard write path, not shard metadata publication or HTTP
    coordination.
 
@@ -66,3 +70,19 @@ behavior.
 - `prepare_streaming_put` / `prepare_streaming_part` still need the full
   frontend for auth and request-header handling. The goal here is narrower:
   stop serializing steady-state append/finalize on the frontend pool.
+
+## Deferred
+
+- Do not treat the remaining local PUT-vs-GET gap as a coordination bug. The
+  current traces show the remaining cost is dominated by durable shard file
+  writes.
+- Revisit this after multi-host shard placement exists. At that point the main
+  question becomes how to gather remote shard durability acknowledgements and
+  publish segment metadata once, rather than how to reduce single-host mutex
+  hold times.
+- When multi-host work starts, look first at:
+  - per-segment shard write fanout and acknowledgement strategy
+  - whether shard durability can be committed with fewer sync boundaries per
+    segment
+  - keeping the existing invariant that shard data must be durable before the
+    segment becomes visible in metadata
