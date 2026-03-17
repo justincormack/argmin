@@ -1119,6 +1119,7 @@ async fn handle_streaming_put(
     let state2 = Arc::clone(&state);
     let bucket_clone = bucket.clone();
     let key_clone = key.clone();
+    let uses_aws_chunked_transport = !matches!(chunked, ChunkedMode::None);
     let declared_trailer = s3req.header("x-amz-trailer").map(str::to_string);
     let claimed_payload_sha256 = claimed_payload_sha256_from_request(&s3req);
     let mut trailing_hasher = trailing_hasher_from_request(&s3req);
@@ -1131,7 +1132,12 @@ async fn handle_streaming_put(
     }
     let ctx = match spawn_blocking_with_trace(trace, move || {
         let frontend = acquire_frontend(&state2);
-        frontend.prepare_streaming_put(&s3req, &bucket_clone, &key_clone)
+        frontend.prepare_streaming_put(
+            &s3req,
+            &bucket_clone,
+            &key_clone,
+            uses_aws_chunked_transport,
+        )
     })
     .await
     {

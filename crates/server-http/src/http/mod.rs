@@ -2267,6 +2267,7 @@ impl HttpFrontend {
         req: &S3Request,
         bucket: &str,
         key: &str,
+        uses_aws_chunked_transport: bool,
     ) -> Result<StreamingPutContext, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
@@ -2317,8 +2318,11 @@ impl HttpFrontend {
             }
         }
 
-        let metadata_blob =
+        let mut metadata_blob =
             crate::metadata_blob::MetadataBlob::from_header_iter(req.header_iter())?;
+        if uses_aws_chunked_transport {
+            metadata_blob.strip_aws_chunked_content_encoding();
+        }
         let cond = write_condition_from_headers(req)?;
 
         // Collect checksum response headers to echo back in the response.

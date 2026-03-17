@@ -288,6 +288,35 @@ impl MetadataBlob {
         }
     }
 
+    /// Strip the transport-only `aws-chunked` token from Content-Encoding.
+    ///
+    /// This must only be applied when the server has actually processed an
+    /// aws-chunked transfer. Ordinary user-supplied `Content-Encoding` values
+    /// are stored verbatim.
+    pub fn strip_aws_chunked_content_encoding(&mut self) {
+        let Some(index) = self
+            .entries
+            .iter()
+            .position(|e| e.key == "content-encoding")
+        else {
+            return;
+        };
+
+        let filtered: Vec<&str> = self.entries[index]
+            .value
+            .split(',')
+            .map(str::trim)
+            .filter(|part| !part.eq_ignore_ascii_case("aws-chunked"))
+            .collect();
+
+        if filtered.is_empty() {
+            self.entries.remove(index);
+            return;
+        }
+
+        self.entries[index].value = filtered.join(", ");
+    }
+
     /// Return checksum value entries (x-amz-checksum-crc32, etc.) stored in the blob.
     /// Excludes x-amz-checksum-algorithm and x-amz-checksum-type which are
     /// surfaced as separate headers/elements.
@@ -554,5 +583,22 @@ mod tests {
         let headers = [("Content-Encoding", "gzip, aws-chunked")];
         let blob = MetadataBlob::from_headers(&headers).unwrap();
         assert_eq!(blob.get("content-encoding"), Some("gzip, aws-chunked"));
+    }
+
+    #[test]
+    fn strip_aws_chunked_content_encoding_removes_transport_token() {
+        let mut blob =
+            MetadataBlob::from_headers(&[("Content-Encoding", "gzip, aws-chunked")]).unwrap();
+        blob.strip_aws_chunked_content_encoding();
+        assert_eq!(blob.get("content-encoding"), Some("gzip"));
+
+        let mut blob =
+            MetadataBlob::from_headers(&[("Content-Encoding", "aws-chunked, gzip")]).unwrap();
+        blob.strip_aws_chunked_content_encoding();
+        assert_eq!(blob.get("content-encoding"), Some("gzip"));
+
+        let mut blob = MetadataBlob::from_headers(&[("Content-Encoding", "aws-chunked")]).unwrap();
+        blob.strip_aws_chunked_content_encoding();
+        assert_eq!(blob.get("content-encoding"), None);
     }
 }

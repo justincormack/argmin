@@ -686,8 +686,19 @@ fn test_signed_chunked_put() {
             .send()
             .await
             .unwrap();
+        assert_eq!(get_resp.content_encoding(), None);
         let got = get_resp.body.collect().await.unwrap().into_bytes().to_vec();
         assert_eq!(got, data);
+
+        let head = CTX
+            .client()
+            .head_object()
+            .bucket(&bucket)
+            .key("signed-chunked")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(head.content_encoding(), None);
 
         cleanup(&bucket, &["signed-chunked"]).await;
     });

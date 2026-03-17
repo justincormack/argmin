@@ -1,5 +1,7 @@
 use aws_sdk_s3::primitives::ByteStream;
+use ring::{digest, hmac};
 use s3_tests::{err_status, unique_bucket, CTX};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Create a bucket, returning its name. Tests are responsible for cleanup.
 async fn setup_bucket() -> String {
@@ -7,6 +9,123 @@ async fn setup_bucket() -> String {
     let bucket = unique_bucket();
     client.create_bucket().bucket(&bucket).send().await.unwrap();
     bucket
+}
+
+fn agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .new_agent()
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    let d = digest::digest(&digest::SHA256, data);
+    d.as_ref().iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> hmac::Tag {
+    hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, key), data)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+fn derive_signing_key(secret: &str, date: &str, region: &str, service: &str) -> hmac::Tag {
+    let k_secret = format!("AWS4{}", secret);
+    let k_date = hmac_sha256(k_secret.as_bytes(), date.as_bytes());
+    let k_region = hmac_sha256(k_date.as_ref(), region.as_bytes());
+    let k_service = hmac_sha256(k_region.as_ref(), service.as_bytes());
+    hmac_sha256(k_service.as_ref(), b"aws4_request")
+}
+
+fn days_to_ymd(days: u64) -> (u64, u64, u64) {
+    let z = days + 719468;
+    let era = z / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+fn host() -> &'static str {
+    CTX.endpoint()
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+}
+
+struct SignedHeaders {
+    authorization: String,
+    amz_date: String,
+    amz_content_sha256: String,
+}
+
+fn signed_put_with_content_encoding(bucket: &str, key: &str, body: &[u8], content_encoding: &str) {
+    let path = format!("/{}/{}", bucket, key);
+    let body_hash = sha256_hex(body);
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let days = secs / 86400;
+    let (year, month, day) = days_to_ymd(days);
+    let time_of_day = secs % 86400;
+    let hour = time_of_day / 3600;
+    let minute = (time_of_day % 3600) / 60;
+    let second = time_of_day % 60;
+    let date_long = format!(
+        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+        year, month, day, hour, minute, second
+    );
+    let date_short = &date_long[..8];
+    let host_val = host();
+    let signed_headers = "host;x-amz-content-sha256;x-amz-date";
+    let canonical_headers = format!(
+        "host:{}\nx-amz-content-sha256:{}\nx-amz-date:{}\n",
+        host_val, body_hash, date_long
+    );
+    let canonical_request = format!(
+        "PUT\n{}\n\n{}\n{}\n{}",
+        path, canonical_headers, signed_headers, body_hash
+    );
+    let canonical_hash = sha256_hex(canonical_request.as_bytes());
+    let scope = format!("{}/{}/s3/aws4_request", date_short, CTX.region());
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{}\n{}\n{}",
+        date_long, scope, canonical_hash
+    );
+    let signing_key = derive_signing_key(CTX.secret_key(), date_short, CTX.region(), "s3");
+    let signature = hmac_sha256(signing_key.as_ref(), string_to_sign.as_bytes());
+    let headers = SignedHeaders {
+        authorization: format!(
+            "AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}",
+            CTX.access_key(),
+            scope,
+            signed_headers,
+            hex_encode(signature.as_ref())
+        ),
+        amz_date: date_long,
+        amz_content_sha256: body_hash,
+    };
+    let url = format!("{}{}", CTX.endpoint(), path);
+    let resp = agent()
+        .put(&url)
+        .header("Authorization", &headers.authorization)
+        .header("x-amz-date", &headers.amz_date)
+        .header("x-amz-content-sha256", &headers.amz_content_sha256)
+        .header("Content-Encoding", content_encoding)
+        .send(body)
+        .expect("transport error");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "plain signed PUT with Content-Encoding should succeed"
+    );
 }
 
 // ── PutObject / GetObject basic ──────────────────────────────────────
@@ -1198,8 +1317,9 @@ fn test_object_write_to_nonexist_bucket() {
 // ── Content-Encoding aws-chunked stripping ──────────────────────────
 
 /// Port of Ceph test_object_content_encoding_aws_chunked.
-/// When Content-Encoding contains "aws-chunked", the server must strip it
-/// from the stored value, only persisting real content encodings.
+/// Plain user-supplied Content-Encoding values are stored verbatim; the
+/// transport-only aws-chunked token is stripped only for actual aws-chunked
+/// streaming uploads.
 #[test]
 fn test_object_content_encoding_aws_chunked() {
     s3_tests::run(async {
@@ -1245,17 +1365,8 @@ fn test_object_content_encoding_aws_chunked() {
             .unwrap();
         assert_eq!(resp.content_encoding(), Some("deflate, gzip"));
 
-        // 3. gzip, aws-chunked — stored as-is (AWS stores user-provided Content-Encoding verbatim;
-        //    aws-chunked is only stripped when the server processes actual chunked transfer)
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .content_encoding("gzip, aws-chunked")
-            .body(ByteStream::from_static(b"data"))
-            .send()
-            .await
-            .unwrap();
+        // 3. gzip, aws-chunked — stored as-is for a plain non-streaming PUT.
+        signed_put_with_content_encoding(&bucket, key, b"data", "gzip, aws-chunked");
         let resp = client
             .head_object()
             .bucket(&bucket)
@@ -1265,16 +1376,8 @@ fn test_object_content_encoding_aws_chunked() {
             .unwrap();
         assert_eq!(resp.content_encoding(), Some("gzip, aws-chunked"));
 
-        // 4. aws-chunked, gzip — stored as-is
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .content_encoding("aws-chunked, gzip")
-            .body(ByteStream::from_static(b"data"))
-            .send()
-            .await
-            .unwrap();
+        // 4. aws-chunked, gzip — stored as-is for a plain non-streaming PUT.
+        signed_put_with_content_encoding(&bucket, key, b"data", "aws-chunked, gzip");
         let resp = client
             .head_object()
             .bucket(&bucket)
@@ -1284,16 +1387,8 @@ fn test_object_content_encoding_aws_chunked() {
             .unwrap();
         assert_eq!(resp.content_encoding(), Some("aws-chunked, gzip"));
 
-        // 5. aws-chunked only — stored as-is
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .content_encoding("aws-chunked")
-            .body(ByteStream::from_static(b"data"))
-            .send()
-            .await
-            .unwrap();
+        // 5. aws-chunked only — stored as-is for a plain non-streaming PUT.
+        signed_put_with_content_encoding(&bucket, key, b"data", "aws-chunked");
         let resp = client
             .head_object()
             .bucket(&bucket)
