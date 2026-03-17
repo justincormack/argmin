@@ -362,13 +362,13 @@ impl HttpFrontend {
             "HttpFrontend::handle_s3_request",
             "method={} path={} query={}",
             s3req.method,
-            s3req.path,
-            s3req.query_string
+            s3req.path(),
+            s3req.query_string()
         );
         // Route first to detect OPTIONS requests (which bypass auth).
-        let operation = match route(s3req.method.as_str(), &s3req.path, &s3req.query_string) {
+        let operation = match route(s3req.method.as_str(), s3req.path(), s3req.query_string()) {
             Ok(op) => op,
-            Err(err) => return S3Response::error(&err, &s3req.path),
+            Err(err) => return S3Response::error(&err, s3req.path()),
         };
 
         // OPTIONS (preflight CORS) bypasses authentication.
@@ -400,17 +400,17 @@ impl HttpFrontend {
             }) => S3Response::not_modified(etag, last_modified),
             Err(ServerError::PreconditionFailed) => S3Response::precondition_failed(),
             Err(ref err @ ServerError::DeleteMarkerHit { .. }) => {
-                let mut resp = S3Response::error(err, &s3req.path);
+                let mut resp = S3Response::error(err, s3req.path());
                 resp.headers
                     .push(("x-amz-delete-marker".to_string(), "true".to_string()));
                 resp
             }
-            Err(err) => S3Response::error(&err, &s3req.path),
+            Err(err) => S3Response::error(&err, s3req.path()),
         };
 
         // CORS response headers on actual (non-preflight) requests.
         if let Some(origin) = s3req.header("origin") {
-            let bucket = self.extract_bucket_from_path(&s3req.path);
+            let bucket = self.extract_bucket_from_path(s3req.path());
             if let Some(bucket) = bucket {
                 self.apply_cors_headers(&mut resp, &bucket, origin, s3req.method.as_str());
             }
@@ -429,7 +429,7 @@ impl HttpFrontend {
                         reason: "Insufficient information. Origin request header needed."
                             .to_string(),
                     },
-                    &req.path,
+                    req.path(),
                 );
             }
         };
@@ -520,7 +520,7 @@ impl HttpFrontend {
             "HttpFrontend::dispatch_routed",
             "method={} path={} op={:?} principal={:?}",
             req.method.as_str(),
-            req.path,
+            req.path(),
             operation,
             auth.principal
         );
@@ -1729,8 +1729,8 @@ impl HttpFrontend {
 
         let auth_result = authenticate_request(
             req.method.as_str(),
-            &req.path,
-            &req.query_string,
+            req.path(),
+            req.query_string(),
             &req.header_source(),
             &req.body,
             &self.credentials,
@@ -3088,13 +3088,17 @@ mod tests {
     }
 
     fn make_req(query: &str) -> S3Request {
-        S3Request {
-            method: http::Method::GET,
-            path: String::new(),
-            query_string: query.to_string(),
-            headers: test_headers(vec![]),
-            body: vec![],
-        }
+        S3Request::new_for_test(http::Method::GET, "/", query, test_headers(vec![]), vec![])
+    }
+
+    fn new_req(
+        method: http::Method,
+        path: &str,
+        query: &str,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    ) -> S3Request {
+        S3Request::new_for_test(method, path, query, test_headers(headers), body)
     }
 
     fn test_headers(headers: Vec<(String, String)>) -> http::HeaderMap {
@@ -3178,16 +3182,16 @@ mod tests {
                <Part><PartNumber>1</PartNumber><ETag>\"x\"</ETag></Part>\
              </CompleteMultipartUpload>"
             .to_string();
-        let req = S3Request {
-            method: http::Method::GET,
-            path: String::new(),
-            query_string: format!("uploadId={upload_id}"),
-            headers: test_headers(vec![
+        let req = new_req(
+            http::Method::GET,
+            "",
+            &format!("uploadId={upload_id}"),
+            vec![
                 ("x-amz-checksum-crc32".to_string(), "AAAAAA==".to_string()),
                 ("x-amz-checksum-sha256".to_string(), "BBBBBB==".to_string()),
-            ]),
-            body: xml.into_bytes(),
-        };
+            ],
+            xml.into_bytes(),
+        );
         let op = S3Operation::CompleteMultipartUpload {
             bucket: "mybucket".to_string(),
             key: "k".to_string(),
@@ -3212,17 +3216,17 @@ mod tests {
                <Part><PartNumber>1</PartNumber><ETag>\"x\"</ETag></Part>\
              </CompleteMultipartUpload>"
             .to_string();
-        let req = S3Request {
-            method: http::Method::GET,
-            path: String::new(),
-            query_string: format!("uploadId={upload_id}"),
-            headers: test_headers(vec![
+        let req = new_req(
+            http::Method::GET,
+            "",
+            &format!("uploadId={upload_id}"),
+            vec![
                 // Algorithm header says SHA256 but value header is CRC32.
                 ("x-amz-checksum-algorithm".to_string(), "SHA256".to_string()),
                 ("x-amz-checksum-crc32".to_string(), "AAAAAA==".to_string()),
-            ]),
-            body: xml.into_bytes(),
-        };
+            ],
+            xml.into_bytes(),
+        );
         let op = S3Operation::CompleteMultipartUpload {
             bucket: "mybucket".to_string(),
             key: "k".to_string(),
@@ -3247,16 +3251,16 @@ mod tests {
                <Part><PartNumber>1</PartNumber><ETag>\"x\"</ETag></Part>\
              </CompleteMultipartUpload>"
             .to_string();
-        let req = S3Request {
-            method: http::Method::GET,
-            path: String::new(),
-            query_string: format!("uploadId={upload_id}"),
-            headers: test_headers(vec![
+        let req = new_req(
+            http::Method::GET,
+            "",
+            &format!("uploadId={upload_id}"),
+            vec![
                 ("x-amz-checksum-crc32".to_string(), "AAAAAA==".to_string()),
                 ("x-amz-checksum-crc32".to_string(), "BBBBBB==".to_string()),
-            ]),
-            body: xml.into_bytes(),
-        };
+            ],
+            xml.into_bytes(),
+        );
         let op = S3Operation::CompleteMultipartUpload {
             bucket: "mybucket".to_string(),
             key: "k".to_string(),
@@ -3281,17 +3285,17 @@ mod tests {
                <Part><PartNumber>1</PartNumber><ETag>\"x\"</ETag></Part>\
              </CompleteMultipartUpload>"
             .to_string();
-        let req = S3Request {
-            method: http::Method::GET,
-            path: String::new(),
-            query_string: format!("uploadId={upload_id}"),
-            headers: test_headers(vec![
+        let req = new_req(
+            http::Method::GET,
+            "",
+            &format!("uploadId={upload_id}"),
+            vec![
                 ("x-amz-checksum-algorithm".to_string(), "CRC32".to_string()),
                 ("x-amz-checksum-algorithm".to_string(), "SHA256".to_string()),
                 ("x-amz-checksum-crc32".to_string(), "AAAAAA==".to_string()),
-            ]),
-            body: xml.into_bytes(),
-        };
+            ],
+            xml.into_bytes(),
+        );
         let op = S3Operation::CompleteMultipartUpload {
             bucket: "mybucket".to_string(),
             key: "k".to_string(),
@@ -3318,13 +3322,13 @@ mod tests {
         let part_data = vec![0u8; 1024];
         let part_crc = checksum::crc32::checksum(&part_data);
         let part_crc_b64 = base64::engine::general_purpose::STANDARD.encode(part_crc.to_be_bytes());
-        let req = S3Request {
-            method: http::Method::GET,
-            path: String::new(),
-            query_string: format!("partNumber=1&uploadId={upload_id}"),
-            headers: test_headers(vec![("x-amz-checksum-crc32".to_string(), part_crc_b64)]),
-            body: part_data,
-        };
+        let req = new_req(
+            http::Method::GET,
+            "",
+            &format!("partNumber=1&uploadId={upload_id}"),
+            vec![("x-amz-checksum-crc32".to_string(), part_crc_b64)],
+            part_data,
+        );
         let op = S3Operation::UploadPart {
             bucket: "mybucket".to_string(),
             key: "k".to_string(),
@@ -3342,16 +3346,13 @@ mod tests {
                <Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part>\
              </CompleteMultipartUpload>"
         );
-        let req = S3Request {
-            method: http::Method::GET,
-            path: String::new(),
-            query_string: format!("uploadId={upload_id}"),
-            headers: test_headers(vec![(
-                "x-amz-checksum-sha256".to_string(),
-                "AAAAAA==".to_string(),
-            )]),
-            body: xml.into_bytes(),
-        };
+        let req = new_req(
+            http::Method::GET,
+            "",
+            &format!("uploadId={upload_id}"),
+            vec![("x-amz-checksum-sha256".to_string(), "AAAAAA==".to_string())],
+            xml.into_bytes(),
+        );
         let op = S3Operation::CompleteMultipartUpload {
             bucket: "mybucket".to_string(),
             key: "k".to_string(),
@@ -3457,19 +3458,19 @@ mod tests {
             .create_bucket_for_owner("testuser", "mybucket", false)
             .unwrap();
 
-        let req = S3Request {
-            method: http::Method::GET,
-            path: String::new(),
-            query_string: String::new(),
-            headers: test_headers(vec![
+        let req = new_req(
+            http::Method::GET,
+            "",
+            "",
+            vec![
                 (
                     "x-amz-object-attributes".to_string(),
                     "ObjectParts".to_string(),
                 ),
                 ("x-amz-max-parts".to_string(), "notanumber".to_string()),
-            ]),
-            body: vec![],
-        };
+            ],
+            vec![],
+        );
         let op = S3Operation::GetObjectAttributes {
             bucket: "mybucket".to_string(),
             key: "mykey".to_string(),
@@ -3489,19 +3490,19 @@ mod tests {
             .create_bucket_for_owner("testuser", "mybucket", false)
             .unwrap();
 
-        let req = S3Request {
-            method: http::Method::GET,
-            path: String::new(),
-            query_string: String::new(),
-            headers: test_headers(vec![
+        let req = new_req(
+            http::Method::GET,
+            "",
+            "",
+            vec![
                 (
                     "x-amz-object-attributes".to_string(),
                     "ObjectParts".to_string(),
                 ),
                 ("x-amz-part-number-marker".to_string(), "xyz".to_string()),
-            ]),
-            body: vec![],
-        };
+            ],
+            vec![],
+        );
         let op = S3Operation::GetObjectAttributes {
             bucket: "mybucket".to_string(),
             key: "mykey".to_string(),
@@ -3540,13 +3541,13 @@ mod tests {
 
         // 2. UploadPart — single part (last part is exempt from min-size)
         let part_body = vec![0u8; 1024];
-        let req = S3Request {
-            method: http::Method::GET,
-            path: String::new(),
-            query_string: format!("partNumber=1&uploadId={upload_id}"),
-            headers: test_headers(vec![]),
-            body: part_body,
-        };
+        let req = new_req(
+            http::Method::GET,
+            "",
+            &format!("partNumber=1&uploadId={upload_id}"),
+            vec![],
+            part_body,
+        );
         let op = S3Operation::UploadPart {
             bucket: "mybucket".to_string(),
             key: "mykey".to_string(),
@@ -3571,13 +3572,13 @@ mod tests {
                <Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part>\
              </CompleteMultipartUpload>"
         );
-        let req = S3Request {
-            method: http::Method::GET,
-            path: String::new(),
-            query_string: format!("uploadId={upload_id}"),
-            headers: test_headers(vec![]),
-            body: complete_xml.into_bytes(),
-        };
+        let req = new_req(
+            http::Method::GET,
+            "",
+            &format!("uploadId={upload_id}"),
+            vec![],
+            complete_xml.into_bytes(),
+        );
         let op = S3Operation::CompleteMultipartUpload {
             bucket: "mybucket".to_string(),
             key: "mykey".to_string(),
@@ -3624,16 +3625,13 @@ mod tests {
             .create_bucket_for_owner("testuser", "mybucket", false)
             .unwrap();
 
-        let req = S3Request {
-            method: http::Method::GET,
-            path: String::new(),
-            query_string: "uploads".to_string(),
-            headers: test_headers(vec![(
-                "x-amz-checksum-algorithm".to_string(),
-                "BOGUS".to_string(),
-            )]),
-            body: vec![],
-        };
+        let req = new_req(
+            http::Method::GET,
+            "",
+            "uploads",
+            vec![("x-amz-checksum-algorithm".to_string(), "BOGUS".to_string())],
+            vec![],
+        );
         let op = S3Operation::CreateMultipartUpload {
             bucket: "mybucket".to_string(),
             key: "k".to_string(),
@@ -3653,16 +3651,16 @@ mod tests {
             .create_bucket_for_owner("testuser", "mybucket", false)
             .unwrap();
 
-        let req = S3Request {
-            method: http::Method::GET,
-            path: String::new(),
-            query_string: "uploads".to_string(),
-            headers: test_headers(vec![
+        let req = new_req(
+            http::Method::GET,
+            "",
+            "uploads",
+            vec![
                 ("x-amz-checksum-algorithm".to_string(), "CRC32".to_string()),
                 ("x-amz-checksum-type".to_string(), "INVALID".to_string()),
-            ]),
-            body: vec![],
-        };
+            ],
+            vec![],
+        );
         let op = S3Operation::CreateMultipartUpload {
             bucket: "mybucket".to_string(),
             key: "k".to_string(),
@@ -3682,16 +3680,13 @@ mod tests {
             .create_bucket_for_owner("testuser", "mybucket", false)
             .unwrap();
 
-        let req = S3Request {
-            method: http::Method::GET,
-            path: String::new(),
-            query_string: "uploads".to_string(),
-            headers: test_headers(vec![(
-                "x-amz-checksum-type".to_string(),
-                "COMPOSITE".to_string(),
-            )]),
-            body: vec![],
-        };
+        let req = new_req(
+            http::Method::GET,
+            "",
+            "uploads",
+            vec![("x-amz-checksum-type".to_string(), "COMPOSITE".to_string())],
+            vec![],
+        );
         let op = S3Operation::CreateMultipartUpload {
             bucket: "mybucket".to_string(),
             key: "k".to_string(),
@@ -3711,16 +3706,16 @@ mod tests {
             .create_bucket_for_owner("testuser", "mybucket", false)
             .unwrap();
 
-        let req = S3Request {
-            method: http::Method::GET,
-            path: String::new(),
-            query_string: "uploads".to_string(),
-            headers: test_headers(vec![
+        let req = new_req(
+            http::Method::GET,
+            "",
+            "uploads",
+            vec![
                 ("x-amz-checksum-algorithm".to_string(), "SHA256".to_string()),
                 ("x-amz-checksum-type".to_string(), "FULL_OBJECT".to_string()),
-            ]),
-            body: vec![],
-        };
+            ],
+            vec![],
+        );
         let op = S3Operation::CreateMultipartUpload {
             bucket: "mybucket".to_string(),
             key: "k".to_string(),
@@ -3740,16 +3735,16 @@ mod tests {
             .create_bucket_for_owner("testuser", "mybucket", false)
             .unwrap();
 
-        let req = S3Request {
-            method: http::Method::GET,
-            path: String::new(),
-            query_string: "uploads".to_string(),
-            headers: test_headers(vec![
+        let req = new_req(
+            http::Method::GET,
+            "",
+            "uploads",
+            vec![
                 ("x-amz-checksum-algorithm".to_string(), "CRC32".to_string()),
                 ("x-amz-checksum-type".to_string(), "FULL_OBJECT".to_string()),
-            ]),
-            body: vec![],
-        };
+            ],
+            vec![],
+        );
         let op = S3Operation::CreateMultipartUpload {
             bucket: "mybucket".to_string(),
             key: "mykey".to_string(),
@@ -3775,16 +3770,16 @@ mod tests {
             .create_bucket_for_owner("testuser", "mybucket", false)
             .unwrap();
 
-        let req = S3Request {
-            method: http::Method::GET,
-            path: String::new(),
-            query_string: "uploads".to_string(),
-            headers: test_headers(vec![
+        let req = new_req(
+            http::Method::GET,
+            "",
+            "uploads",
+            vec![
                 ("x-amz-checksum-algorithm".to_string(), "CRC32".to_string()),
                 ("x-amz-checksum-type".to_string(), "COMPOSITE".to_string()),
-            ]),
-            body: vec![],
-        };
+            ],
+            vec![],
+        );
         let op = S3Operation::CreateMultipartUpload {
             bucket: "mybucket".to_string(),
             key: "mykey".to_string(),
@@ -3810,16 +3805,13 @@ mod tests {
             .create_bucket_for_owner("testuser", "mybucket", false)
             .unwrap();
 
-        let req = S3Request {
-            method: http::Method::GET,
-            path: String::new(),
-            query_string: "uploads".to_string(),
-            headers: test_headers(vec![(
-                "x-amz-checksum-algorithm".to_string(),
-                "SHA256".to_string(),
-            )]),
-            body: vec![],
-        };
+        let req = new_req(
+            http::Method::GET,
+            "",
+            "uploads",
+            vec![("x-amz-checksum-algorithm".to_string(), "SHA256".to_string())],
+            vec![],
+        );
         let op = S3Operation::CreateMultipartUpload {
             bucket: "mybucket".to_string(),
             key: "mykey".to_string(),
@@ -3851,13 +3843,7 @@ mod tests {
         if let Some(a) = algo {
             headers.push(("x-amz-checksum-algorithm".to_string(), a.to_string()));
         }
-        let req = S3Request {
-            method: http::Method::GET,
-            path: String::new(),
-            query_string: "uploads".to_string(),
-            headers: test_headers(headers),
-            body: vec![],
-        };
+        let req = new_req(http::Method::GET, "", "uploads", headers, vec![]);
         let op = S3Operation::CreateMultipartUpload {
             bucket: bucket.to_string(),
             key: key.to_string(),
@@ -3878,16 +3864,16 @@ mod tests {
             .unwrap();
 
         let upload_id = create_upload_with_checksum(&fe, "mybucket", "k", Some("CRC32"));
-        let req = S3Request {
-            method: http::Method::GET,
-            path: String::new(),
-            query_string: format!("partNumber=1&uploadId={upload_id}"),
-            headers: test_headers(vec![(
+        let req = new_req(
+            http::Method::GET,
+            "",
+            &format!("partNumber=1&uploadId={upload_id}"),
+            vec![(
                 "x-amz-checksum-crc32".to_string(),
                 "AAAAAAAA".to_string(), // wrong checksum
-            )]),
-            body: vec![1, 2, 3, 4],
-        };
+            )],
+            vec![1, 2, 3, 4],
+        );
         let op = S3Operation::UploadPart {
             bucket: "mybucket".to_string(),
             key: "k".to_string(),
@@ -3908,16 +3894,16 @@ mod tests {
             .unwrap();
 
         let upload_id = create_upload_with_checksum(&fe, "mybucket", "k", Some("CRC32"));
-        let req = S3Request {
-            method: http::Method::GET,
-            path: String::new(),
-            query_string: format!("partNumber=1&uploadId={upload_id}"),
-            headers: test_headers(vec![
+        let req = new_req(
+            http::Method::GET,
+            "",
+            &format!("partNumber=1&uploadId={upload_id}"),
+            vec![
                 ("x-amz-checksum-crc32".to_string(), "AAAAAA==".to_string()),
                 ("x-amz-checksum-sha256".to_string(), "BBBBBB==".to_string()),
-            ]),
-            body: vec![1, 2, 3, 4],
-        };
+            ],
+            vec![1, 2, 3, 4],
+        );
         let op = S3Operation::UploadPart {
             bucket: "mybucket".to_string(),
             key: "k".to_string(),
@@ -3939,16 +3925,13 @@ mod tests {
 
         // Upload configured with CRC32 but part sends SHA256 checksum.
         let upload_id = create_upload_with_checksum(&fe, "mybucket", "k", Some("CRC32"));
-        let req = S3Request {
-            method: http::Method::GET,
-            path: String::new(),
-            query_string: format!("partNumber=1&uploadId={upload_id}"),
-            headers: test_headers(vec![(
-                "x-amz-checksum-sha256".to_string(),
-                "AAAA".to_string(),
-            )]),
-            body: vec![1, 2, 3, 4],
-        };
+        let req = new_req(
+            http::Method::GET,
+            "",
+            &format!("partNumber=1&uploadId={upload_id}"),
+            vec![("x-amz-checksum-sha256".to_string(), "AAAA".to_string())],
+            vec![1, 2, 3, 4],
+        );
         let op = S3Operation::UploadPart {
             bucket: "mybucket".to_string(),
             key: "k".to_string(),
@@ -3975,13 +3958,13 @@ mod tests {
         let crc = checksum::crc32::checksum(data);
         let crc_b64 = base64::engine::general_purpose::STANDARD.encode(crc.to_be_bytes());
 
-        let req = S3Request {
-            method: http::Method::GET,
-            path: String::new(),
-            query_string: format!("partNumber=1&uploadId={upload_id}"),
-            headers: test_headers(vec![("x-amz-checksum-crc32".to_string(), crc_b64.clone())]),
-            body: data.to_vec(),
-        };
+        let req = new_req(
+            http::Method::GET,
+            "",
+            &format!("partNumber=1&uploadId={upload_id}"),
+            vec![("x-amz-checksum-crc32".to_string(), crc_b64.clone())],
+            data.to_vec(),
+        );
         let op = S3Operation::UploadPart {
             bucket: "mybucket".to_string(),
             key: "k".to_string(),
@@ -4011,13 +3994,13 @@ mod tests {
         let upload_id = create_upload_with_checksum(&fe, "mybucket", "k", Some("CRC32"));
         let data = b"test data";
 
-        let req = S3Request {
-            method: http::Method::GET,
-            path: String::new(),
-            query_string: format!("partNumber=1&uploadId={upload_id}"),
-            headers: test_headers(vec![]),
-            body: data.to_vec(),
-        };
+        let req = new_req(
+            http::Method::GET,
+            "",
+            &format!("partNumber=1&uploadId={upload_id}"),
+            vec![],
+            data.to_vec(),
+        );
         let op = S3Operation::UploadPart {
             bucket: "mybucket".to_string(),
             key: "k".to_string(),
@@ -4050,13 +4033,13 @@ mod tests {
         let data1 = b"aaa";
         let crc1 = checksum::crc32::checksum(data1);
         let crc1_b64 = base64::engine::general_purpose::STANDARD.encode(crc1.to_be_bytes());
-        let req = S3Request {
-            method: http::Method::GET,
-            path: String::new(),
-            query_string: format!("partNumber=1&uploadId={upload_id}"),
-            headers: test_headers(vec![("x-amz-checksum-crc32".to_string(), crc1_b64)]),
-            body: data1.to_vec(),
-        };
+        let req = new_req(
+            http::Method::GET,
+            "",
+            &format!("partNumber=1&uploadId={upload_id}"),
+            vec![("x-amz-checksum-crc32".to_string(), crc1_b64)],
+            data1.to_vec(),
+        );
         let op = S3Operation::UploadPart {
             bucket: "mybucket".to_string(),
             key: "k".to_string(),
@@ -4067,13 +4050,13 @@ mod tests {
         let data2 = b"bbb";
         let crc2 = checksum::crc32::checksum(data2);
         let crc2_b64 = base64::engine::general_purpose::STANDARD.encode(crc2.to_be_bytes());
-        let req = S3Request {
-            method: http::Method::GET,
-            path: String::new(),
-            query_string: format!("partNumber=1&uploadId={upload_id}"),
-            headers: test_headers(vec![("x-amz-checksum-crc32".to_string(), crc2_b64.clone())]),
-            body: data2.to_vec(),
-        };
+        let req = new_req(
+            http::Method::GET,
+            "",
+            &format!("partNumber=1&uploadId={upload_id}"),
+            vec![("x-amz-checksum-crc32".to_string(), crc2_b64.clone())],
+            data2.to_vec(),
+        );
         let op = S3Operation::UploadPart {
             bucket: "mybucket".to_string(),
             key: "k".to_string(),
@@ -4106,13 +4089,13 @@ mod tests {
         let data = vec![1u8, 2, 3, 4];
         let correct_crc = base64::engine::general_purpose::STANDARD
             .encode(checksum::crc32::checksum(&data).to_be_bytes());
-        let req = S3Request {
-            method: http::Method::GET,
-            path: String::new(),
-            query_string: format!("partNumber=1&uploadId={upload_id}"),
-            headers: test_headers(vec![("x-amz-checksum-crc32".to_string(), correct_crc)]),
-            body: data,
-        };
+        let req = new_req(
+            http::Method::GET,
+            "",
+            &format!("partNumber=1&uploadId={upload_id}"),
+            vec![("x-amz-checksum-crc32".to_string(), correct_crc)],
+            data,
+        );
         let op = S3Operation::UploadPart {
             bucket: "mybucket".to_string(),
             key: "k".to_string(),
@@ -4130,17 +4113,17 @@ mod tests {
             .unwrap();
 
         let upload_id = create_upload_with_checksum(&fe, "mybucket", "k", Some("CRC32"));
-        let req = S3Request {
-            method: http::Method::GET,
-            path: String::new(),
-            query_string: format!("partNumber=1&uploadId={upload_id}"),
-            headers: test_headers(vec![
+        let req = new_req(
+            http::Method::GET,
+            "",
+            &format!("partNumber=1&uploadId={upload_id}"),
+            vec![
                 // Algorithm header says SHA256 but value header is CRC32.
                 ("x-amz-checksum-algorithm".to_string(), "SHA256".to_string()),
                 ("x-amz-checksum-crc32".to_string(), "AAAAAA==".to_string()),
-            ]),
-            body: vec![1, 2, 3, 4],
-        };
+            ],
+            vec![1, 2, 3, 4],
+        );
         let op = S3Operation::UploadPart {
             bucket: "mybucket".to_string(),
             key: "k".to_string(),
@@ -4163,16 +4146,13 @@ mod tests {
             .unwrap();
 
         let upload_id = create_upload_with_checksum(&fe, "mybucket", "k", Some("CRC32"));
-        let req = S3Request {
-            method: http::Method::GET,
-            path: String::new(),
-            query_string: format!("partNumber=1&uploadId={upload_id}"),
-            headers: test_headers(vec![(
-                "x-amz-checksum-algorithm".to_string(),
-                "CRC32".to_string(),
-            )]),
-            body: vec![1, 2, 3, 4],
-        };
+        let req = new_req(
+            http::Method::GET,
+            "",
+            &format!("partNumber=1&uploadId={upload_id}"),
+            vec![("x-amz-checksum-algorithm".to_string(), "CRC32".to_string())],
+            vec![1, 2, 3, 4],
+        );
         let op = S3Operation::UploadPart {
             bucket: "mybucket".to_string(),
             key: "k".to_string(),
@@ -4198,17 +4178,17 @@ mod tests {
             .unwrap();
 
         let upload_id = create_upload_with_checksum(&fe, "mybucket", "k", Some("CRC32"));
-        let req = S3Request {
-            method: http::Method::GET,
-            path: String::new(),
-            query_string: format!("partNumber=1&uploadId={upload_id}"),
-            headers: test_headers(vec![
+        let req = new_req(
+            http::Method::GET,
+            "",
+            &format!("partNumber=1&uploadId={upload_id}"),
+            vec![
                 ("x-amz-checksum-algorithm".to_string(), "CRC32".to_string()),
                 ("x-amz-checksum-algorithm".to_string(), "SHA256".to_string()),
                 ("x-amz-checksum-crc32".to_string(), "AAAAAA==".to_string()),
-            ]),
-            body: vec![1, 2, 3, 4],
-        };
+            ],
+            vec![1, 2, 3, 4],
+        );
         let op = S3Operation::UploadPart {
             bucket: "mybucket".to_string(),
             key: "k".to_string(),
@@ -4253,13 +4233,13 @@ mod tests {
                 headers.push((algo_enum.header_name().to_string(), encoded.clone()));
                 checksum_b64 = Some(encoded);
             }
-            let req = S3Request {
-                method: http::Method::GET,
-                path: String::new(),
-                query_string: format!("partNumber={part_number}&uploadId={upload_id}"),
-                headers: test_headers(headers),
-                body: data.clone(),
-            };
+            let req = new_req(
+                http::Method::GET,
+                "",
+                &format!("partNumber={part_number}&uploadId={upload_id}"),
+                headers,
+                data.clone(),
+            );
             let op = S3Operation::UploadPart {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
@@ -4286,13 +4266,13 @@ mod tests {
             xml_parts.push_str("</Part>");
         }
         let xml = format!("<CompleteMultipartUpload>{xml_parts}</CompleteMultipartUpload>");
-        let req = S3Request {
-            method: http::Method::GET,
-            path: String::new(),
-            query_string: format!("uploadId={upload_id}"),
-            headers: test_headers(vec![]),
-            body: xml.into_bytes(),
-        };
+        let req = new_req(
+            http::Method::GET,
+            "",
+            &format!("uploadId={upload_id}"),
+            vec![],
+            xml.into_bytes(),
+        );
         let op = S3Operation::CompleteMultipartUpload {
             bucket: bucket.to_string(),
             key: key.to_string(),
@@ -4364,13 +4344,7 @@ mod tests {
             .unwrap();
 
         // PUT a simple object
-        let req = S3Request {
-            method: http::Method::GET,
-            path: String::new(),
-            query_string: String::new(),
-            headers: test_headers(vec![]),
-            body: b"hello".to_vec(),
-        };
+        let req = new_req(http::Method::GET, "", "", vec![], b"hello".to_vec());
         let op = S3Operation::PutObject {
             bucket: "mybucket".to_string(),
             key: "k".to_string(),
@@ -4431,13 +4405,7 @@ mod tests {
             .unwrap();
 
         let data = b"hello world";
-        let req = S3Request {
-            method: http::Method::GET,
-            path: String::new(),
-            query_string: String::new(),
-            headers: test_headers(vec![]),
-            body: data.to_vec(),
-        };
+        let req = new_req(http::Method::GET, "", "", vec![], data.to_vec());
         let op = S3Operation::PutObject {
             bucket: "mybucket".to_string(),
             key: "k".to_string(),
@@ -4483,13 +4451,7 @@ mod tests {
             .create_bucket_for_owner("testuser", "mybucket", false)
             .unwrap();
 
-        let req = S3Request {
-            method: http::Method::GET,
-            path: String::new(),
-            query_string: String::new(),
-            headers: test_headers(vec![]),
-            body: b"hello".to_vec(),
-        };
+        let req = new_req(http::Method::GET, "", "", vec![], b"hello".to_vec());
         let op = S3Operation::PutObject {
             bucket: "mybucket".to_string(),
             key: "k".to_string(),
@@ -4564,20 +4526,20 @@ mod tests {
             streaming: None, // missing!
         };
 
-        let req = S3Request {
-            method: http::Method::PUT,
-            path: "/mybucket/key".to_string(),
-            query_string: String::new(),
-            headers: test_headers(vec![
+        let req = new_req(
+            http::Method::PUT,
+            "/mybucket/key",
+            "",
+            vec![
                 (
                     "x-amz-content-sha256".to_string(),
                     "STREAMING-AWS4-HMAC-SHA256-PAYLOAD".to_string(),
                 ),
                 ("content-encoding".to_string(), "aws-chunked".to_string()),
                 ("x-amz-decoded-content-length".to_string(), "5".to_string()),
-            ]),
-            body: b"5\r\nhello\r\n0\r\n\r\n".to_vec(),
-        };
+            ],
+            b"5\r\nhello\r\n0\r\n\r\n".to_vec(),
+        );
 
         match fe.maybe_decode_chunked(&req, &auth) {
             Err(ServerError::Auth(auth::AuthError::SignatureMismatch)) => {} // expected
@@ -4590,11 +4552,11 @@ mod tests {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
 
-        let req = S3Request {
-            method: http::Method::PUT,
-            path: "/mybucket/key".to_string(),
-            query_string: String::new(),
-            headers: test_headers(vec![
+        let req = new_req(
+            http::Method::PUT,
+            "/mybucket/key",
+            "",
+            vec![
                 (
                     "x-amz-content-sha256".to_string(),
                     "STREAMING-UNSIGNED-PAYLOAD-TRAILER".to_string(),
@@ -4608,9 +4570,9 @@ mod tests {
                     "x-amz-trailer".to_string(),
                     "x-amz-checksum-crc32".to_string(),
                 ),
-            ]),
-            body: b"5\r\nhello\r\n0\r\nx-amz-checksum-crc32:AAAA\r\n\r\n".to_vec(),
-        };
+            ],
+            b"5\r\nhello\r\n0\r\nx-amz-checksum-crc32:AAAA\r\n\r\n".to_vec(),
+        );
 
         match fe.maybe_decode_chunked(&req, &test_auth()) {
             Err(ServerError::InvalidRequest { .. }) => {} // expected
@@ -4623,11 +4585,11 @@ mod tests {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
 
-        let req = S3Request {
-            method: http::Method::PUT,
-            path: "/mybucket/key".to_string(),
-            query_string: String::new(),
-            headers: test_headers(vec![
+        let req = new_req(
+            http::Method::PUT,
+            "/mybucket/key",
+            "",
+            vec![
                 (
                     "x-amz-content-sha256".to_string(),
                     "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER".to_string(),
@@ -4638,9 +4600,9 @@ mod tests {
                     "x-amz-trailer".to_string(),
                     "x-amz-checksum-crc32".to_string(),
                 ),
-            ]),
-            body: b"5\r\nhello\r\n0\r\nx-amz-checksum-crc32:AAAA\r\n\r\n".to_vec(),
-        };
+            ],
+            b"5\r\nhello\r\n0\r\nx-amz-checksum-crc32:AAAA\r\n\r\n".to_vec(),
+        );
 
         match fe.maybe_decode_chunked(&req, &test_auth()) {
             Err(ServerError::InvalidArgument { .. }) => {} // expected
@@ -4662,13 +4624,13 @@ mod tests {
 <Delete>
   <Object><Key>key1</Key><VersionId>not-a-number</VersionId></Object>
 </Delete>"#;
-        let req = S3Request {
-            method: http::Method::POST,
-            path: "/mybucket".to_string(),
-            query_string: "delete".to_string(),
-            headers: test_headers(vec![]),
-            body: xml.to_vec(),
-        };
+        let req = new_req(
+            http::Method::POST,
+            "/mybucket",
+            "delete",
+            vec![],
+            xml.to_vec(),
+        );
         let op = S3Operation::DeleteObjects {
             bucket: "mybucket".to_string(),
         };
@@ -4691,13 +4653,13 @@ mod tests {
 <Delete>
   <Object><Key>key1</Key><VersionId>null</VersionId></Object>
 </Delete>"#;
-        let req = S3Request {
-            method: http::Method::POST,
-            path: "/mybucket".to_string(),
-            query_string: "delete".to_string(),
-            headers: test_headers(vec![]),
-            body: xml.to_vec(),
-        };
+        let req = new_req(
+            http::Method::POST,
+            "/mybucket",
+            "delete",
+            vec![],
+            xml.to_vec(),
+        );
         let op = S3Operation::DeleteObjects {
             bucket: "mybucket".to_string(),
         };
@@ -4722,13 +4684,7 @@ mod tests {
             .unwrap();
 
         // First put succeeds.
-        let req = S3Request {
-            method: http::Method::GET,
-            path: String::new(),
-            query_string: String::new(),
-            headers: test_headers(vec![]),
-            body: b"hello".to_vec(),
-        };
+        let req = new_req(http::Method::GET, "", "", vec![], b"hello".to_vec());
         let op = S3Operation::PutObject {
             bucket: "mybucket".to_string(),
             key: "k".to_string(),
@@ -4736,13 +4692,13 @@ mod tests {
         fe.dispatch_routed(&req, &test_auth(), op).unwrap();
 
         // Second put with If-None-Match:* must fail.
-        let req2 = S3Request {
-            method: http::Method::GET,
-            path: String::new(),
-            query_string: String::new(),
-            headers: test_headers(vec![("if-none-match".to_string(), "*".to_string())]),
-            body: b"world".to_vec(),
-        };
+        let req2 = new_req(
+            http::Method::GET,
+            "",
+            "",
+            vec![("if-none-match".to_string(), "*".to_string())],
+            b"world".to_vec(),
+        );
         let op2 = S3Operation::PutObject {
             bucket: "mybucket".to_string(),
             key: "k".to_string(),
@@ -4772,13 +4728,13 @@ mod tests {
             .unwrap();
 
         // Create a multipart upload.
-        let create_req = S3Request {
-            method: http::Method::POST,
-            path: "/mybucket/mykey".to_string(),
-            query_string: "uploads".to_string(),
-            headers: test_headers(vec![]),
-            body: vec![],
-        };
+        let create_req = new_req(
+            http::Method::POST,
+            "/mybucket/mykey",
+            "uploads",
+            vec![],
+            vec![],
+        );
         let create_op = S3Operation::CreateMultipartUpload {
             bucket: "mybucket".to_string(),
             key: "mykey".to_string(),
@@ -4795,16 +4751,16 @@ mod tests {
         };
 
         // UploadPart with deliberately wrong CRC32 checksum.
-        let req = S3Request {
-            method: http::Method::GET,
-            path: String::new(),
-            query_string: format!("partNumber=1&uploadId={upload_id}"),
-            headers: test_headers(vec![(
+        let req = new_req(
+            http::Method::GET,
+            "",
+            &format!("partNumber=1&uploadId={upload_id}"),
+            vec![(
                 "x-amz-checksum-crc32".to_string(),
                 "AAAAAA==".to_string(), // wrong CRC32 (valid 4-byte base64)
-            )]),
-            body: b"part-data".to_vec(),
-        };
+            )],
+            b"part-data".to_vec(),
+        );
         let op = S3Operation::UploadPart {
             bucket: "mybucket".to_string(),
             key: "mykey".to_string(),

@@ -115,18 +115,18 @@ mod tests {
     use crate::http::request::S3Request;
 
     fn make_req_with_headers(headers: Vec<(&str, &str)>) -> S3Request {
-        S3Request {
-            method: http::Method::GET,
-            path: String::new(),
-            query_string: String::new(),
-            headers: crate::http::request::header_map_from_owned(
+        S3Request::new_for_test(
+            http::Method::GET,
+            "/",
+            "",
+            crate::http::request::header_map_from_owned(
                 headers
                     .into_iter()
                     .map(|(k, v)| (k.to_string(), v.to_string()))
                     .collect(),
             ),
-            body: vec![],
-        }
+            vec![],
+        )
     }
 
     // ── Write condition validation (501 rejection) ────────────────────

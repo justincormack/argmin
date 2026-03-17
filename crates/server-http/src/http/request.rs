@@ -25,8 +25,7 @@ fn validate_content_length(value: &str) -> Result<u64, ServerError> {
 /// Parsed S3 request data extracted from an HTTP request.
 pub struct S3Request {
     pub method: http::Method,
-    pub path: String,
-    pub query_string: String,
+    pub uri: http::Uri,
     pub headers: http::HeaderMap,
     pub body: Vec<u8>,
 }
@@ -61,8 +60,7 @@ impl S3Request {
         body: bytes::Bytes,
     ) -> Result<Self, ServerError> {
         let method = parts.method;
-        let path = parts.uri.path().to_string();
-        let query_string = parts.uri.query().unwrap_or("").to_string();
+        let uri = parts.uri;
 
         // Validate that all header values are UTF-8. We keep the original
         // HeaderMap so later stages can borrow from it directly without first
@@ -85,8 +83,7 @@ impl S3Request {
 
         Ok(S3Request {
             method,
-            path,
-            query_string,
+            uri,
             headers,
             body,
         })
@@ -112,6 +109,16 @@ impl S3Request {
     #[must_use]
     pub fn header_count(&self, name: &str) -> usize {
         self.headers.get_all(name).iter().count()
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &str {
+        self.uri.path()
+    }
+
+    #[must_use]
+    pub fn query_string(&self) -> &str {
+        self.uri.query().unwrap_or("")
     }
 
     pub(crate) fn header_source(&self) -> RequestHeaderSource<'_> {
@@ -172,8 +179,7 @@ impl S3Request {
 
         S3Request {
             method: self.method.clone(),
-            path: self.path.clone(),
-            query_string: self.query_string.clone(),
+            uri: self.uri.clone(),
             headers,
             body,
         }
@@ -194,7 +200,7 @@ impl S3Request {
 
     #[must_use]
     pub fn query_param_lossy(&self, name: &str) -> Option<Cow<'_, str>> {
-        self.query_string
+        self.query_string()
             .split('&')
             .filter(|s| !s.is_empty())
             .find_map(|pair| {
@@ -207,6 +213,29 @@ impl S3Request {
                     None
                 }
             })
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn new_for_test(
+        method: http::Method,
+        path: &str,
+        query_string: &str,
+        headers: http::HeaderMap,
+        body: Vec<u8>,
+    ) -> Self {
+        let path = if path.is_empty() { "/" } else { path };
+        let uri = if query_string.is_empty() {
+            path.to_string()
+        } else {
+            format!("{path}?{query_string}")
+        };
+        Self {
+            method,
+            uri: uri.parse().expect("test URI should be valid"),
+            headers,
+            body,
+        }
     }
 }
 
@@ -337,13 +366,13 @@ mod tests {
 
     #[test]
     fn query_param_lookup() {
-        let req = S3Request {
-            method: http::Method::GET,
-            path: "/bucket".to_string(),
-            query_string: "list-type=2&prefix=photos%2F&max-keys=10".to_string(),
-            headers: test_headers(vec![]),
-            body: vec![],
-        };
+        let req = S3Request::new_for_test(
+            http::Method::GET,
+            "/bucket",
+            "list-type=2&prefix=photos%2F&max-keys=10",
+            test_headers(vec![]),
+            vec![],
+        );
         assert_eq!(req.query_param("list-type"), Some("2".to_string()));
         assert_eq!(req.query_param("prefix"), Some("photos/".to_string()));
         assert_eq!(req.query_param("max-keys"), Some("10".to_string()));
@@ -403,25 +432,19 @@ mod tests {
 
     #[test]
     fn query_param_empty_query_string() {
-        let req = S3Request {
-            method: http::Method::GET,
-            path: "/".to_string(),
-            query_string: String::new(),
-            headers: test_headers(vec![]),
-            body: vec![],
-        };
+        let req = S3Request::new_for_test(http::Method::GET, "/", "", test_headers(vec![]), vec![]);
         assert_eq!(req.query_param("anything"), None);
     }
 
     #[test]
     fn query_param_no_equals() {
-        let req = S3Request {
-            method: http::Method::GET,
-            path: "/".to_string(),
-            query_string: "flagonly&key=val".to_string(),
-            headers: test_headers(vec![]),
-            body: vec![],
-        };
+        let req = S3Request::new_for_test(
+            http::Method::GET,
+            "/",
+            "flagonly&key=val",
+            test_headers(vec![]),
+            vec![],
+        );
         // "flagonly" with no = has empty value
         assert_eq!(req.query_param("flagonly"), Some(String::new()));
         assert_eq!(req.query_param("key"), Some("val".to_string()));
@@ -429,28 +452,28 @@ mod tests {
 
     #[test]
     fn query_param_match_not_first() {
-        let req = S3Request {
-            method: http::Method::GET,
-            path: "/".to_string(),
-            query_string: "a=1&b=2&c=3".to_string(),
-            headers: test_headers(vec![]),
-            body: vec![],
-        };
+        let req = S3Request::new_for_test(
+            http::Method::GET,
+            "/",
+            "a=1&b=2&c=3",
+            test_headers(vec![]),
+            vec![],
+        );
         assert_eq!(req.query_param("c"), Some("3".to_string()));
     }
 
     #[test]
     fn header_pairs_output() {
-        let req = S3Request {
-            method: http::Method::GET,
-            path: "/".to_string(),
-            query_string: String::new(),
-            headers: test_headers(vec![
+        let req = S3Request::new_for_test(
+            http::Method::GET,
+            "/",
+            "",
+            test_headers(vec![
                 ("host".to_string(), "example.com".to_string()),
                 ("content-type".to_string(), "text/plain".to_string()),
             ]),
-            body: vec![],
-        };
+            vec![],
+        );
         let pairs = req.header_pairs();
         assert_eq!(pairs.len(), 2);
         assert_eq!(pairs[0], ("host", "example.com"));
@@ -479,13 +502,13 @@ mod tests {
 
     #[test]
     fn header_returns_none_for_missing() {
-        let req = S3Request {
-            method: http::Method::GET,
-            path: "/".to_string(),
-            query_string: String::new(),
-            headers: test_headers(vec![("host".to_string(), "example.com".to_string())]),
-            body: vec![],
-        };
+        let req = S3Request::new_for_test(
+            http::Method::GET,
+            "/",
+            "",
+            test_headers(vec![("host".to_string(), "example.com".to_string())]),
+            vec![],
+        );
         assert_eq!(req.header("content-type"), None);
         assert_eq!(req.header("host"), Some("example.com"));
     }
