@@ -214,6 +214,162 @@ impl PgStore {
         Ok(())
     }
 
+    pub fn register_written_shards_batch(
+        &self,
+        shards: &[(&ShardKey, WriteAck)],
+    ) -> Result<(), StoreError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "PgStore::register_written_shards_batch",
+            "pg_id={} shards={}",
+            self.pg_id,
+            shards.len()
+        );
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| StoreError::Db {
+                context: "register written shards batch (begin txn)",
+                source: e,
+            })?;
+
+        let now = Self::now_secs() as i64;
+        let result: Result<(), StoreError> = (|| {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "INSERT OR REPLACE INTO shards (shard_key, data_size, crc64_nvme, created_at, status) \
+                     VALUES (?1, ?2, ?3, ?4, 0)",
+                )
+                .map_err(|e| StoreError::Db {
+                    context: "register written shards batch (prepare)",
+                    source: e,
+                })?;
+
+            for (key, ack) in shards {
+                stmt.execute(params![
+                    key.as_bytes().as_slice(),
+                    ack.stored_size as i64,
+                    ack.crc64 as i64,
+                    now,
+                ])
+                .map_err(|e| StoreError::Db {
+                    context: "register written shards batch (insert shard record)",
+                    source: e,
+                })?;
+            }
+
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                if let Err(e) = self.conn.execute_batch("COMMIT") {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    return Err(StoreError::Db {
+                        context: "register written shards batch (commit txn)",
+                        source: e,
+                    });
+                }
+                Ok(())
+            }
+            Err(err) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(err)
+            }
+        }
+    }
+
+    pub fn register_written_shards_and_append_stream_segment(
+        &self,
+        shards: &[(&ShardKey, WriteAck)],
+        segment: &StreamUploadSegmentRecord,
+    ) -> Result<(), MetadataError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "PgStore::register_written_shards_and_append_stream_segment",
+            "pg_id={} session_id={} segment_index={} shards={}",
+            self.pg_id,
+            segment.session_id,
+            segment.segment_index,
+            shards.len()
+        );
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| MetadataError::Db {
+                context: "append stream segment with shard publish (begin txn)",
+                source: e,
+            })?;
+
+        let now = Self::now_secs() as i64;
+        let result: Result<(), MetadataError> = (|| {
+            let mut shard_stmt = self
+                .conn
+                .prepare(
+                    "INSERT OR REPLACE INTO shards (shard_key, data_size, crc64_nvme, created_at, status) \
+                     VALUES (?1, ?2, ?3, ?4, 0)",
+                )
+                .map_err(|e| MetadataError::Db {
+                    context: "append stream segment with shard publish (prepare shard insert)",
+                    source: e,
+                })?;
+
+            for (key, ack) in shards {
+                shard_stmt
+                    .execute(params![
+                        key.as_bytes().as_slice(),
+                        ack.stored_size as i64,
+                        ack.crc64 as i64,
+                        now,
+                    ])
+                    .map_err(|e| MetadataError::Db {
+                        context: "append stream segment with shard publish (insert shard record)",
+                        source: e,
+                    })?;
+            }
+
+            self.conn
+                .execute(
+                    "INSERT INTO stream_upload_segments \
+                     (session_id, segment_index, size, segment_crc64, segment_okh, segment_vid, shard_pg_id, ec_k, ec_m) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        segment.session_id,
+                        segment.segment_index,
+                        segment.size as i64,
+                        segment.segment_crc64.map(|v| v as i64),
+                        segment.segment_okh.as_slice(),
+                        segment.segment_vid.get() as i64,
+                        segment.shard_pg_id,
+                        segment.ec_k,
+                        segment.ec_m,
+                    ],
+                )
+                .map_err(|e| MetadataError::Db {
+                    context: "append stream segment with shard publish (insert segment)",
+                    source: e,
+                })?;
+
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                if let Err(e) = self.conn.execute_batch("COMMIT") {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    return Err(MetadataError::Db {
+                        context: "append stream segment with shard publish (commit txn)",
+                        source: e,
+                    });
+                }
+                Ok(())
+            }
+            Err(err) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(err)
+            }
+        }
+    }
+
     fn row_to_object_part(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObjectPartRecord> {
         let part_okh = Self::blob_to_okh(row.get(7)?, 7)?;
         let checksum = row

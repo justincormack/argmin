@@ -33,6 +33,10 @@ behavior.
 - After removing the frontend mutex, the next bottleneck is shard-PG lock hold
   time in `PgStore::write_shard`: durable file IO and SQLite publication still
   happen together under the shard PG mutex.
+- The shard durable write path is now split from metadata visibility, and shard
+  row publication is batched into one SQLite transaction per segment. When the
+  shard PG and metadata PG are the same, shard rows plus the stream-segment row
+  publish in one transaction.
 
 ## Steps
 
@@ -45,8 +49,11 @@ behavior.
    frontend pool mutex, not coordinator lock scope or `spawn_blocking`.
 4. Done: remove frontend pool mutex contention for streaming append/finalize
    and rerun the same local PUT trace.
-5. In progress: split shard durable file IO from shard metadata publication so
-   the shard PG mutex only covers SQLite visibility, not file write and fsync.
+5. Done: split shard durable file IO from shard metadata publication so the
+   shard PG mutex only covers SQLite visibility, not file write and fsync.
+6. In progress: rerun the local PUT trace and confirm the remaining cost is the
+   actual durable shard write path, not shard metadata publication or HTTP
+   coordination.
 
 ## Notes
 

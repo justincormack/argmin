@@ -1,4 +1,4 @@
-use crate::traits::PgMetadataStore;
+use crate::traits::{PgMetadataStore, ShardStore};
 use crate::types::*;
 use std::num::NonZeroU64;
 
@@ -2641,6 +2641,56 @@ fn stream_segment_append_and_list() {
     assert_eq!(segments[2].segment_crc64, Some(12));
     assert_eq!(segments[0].segment_okh, [0u8; 16]);
     assert_eq!(segments[2].shard_pg_id, 2);
+}
+
+#[test]
+fn stream_segment_publish_with_shards_same_pg_is_atomic() {
+    let (_dir, store) = make_pg_store();
+
+    store
+        .create_stream_upload(&CreateStreamUploadReq {
+            session_id: "sess-publish".into(),
+            bucket: "b".into(),
+            key: "k".into(),
+            target: StreamUploadTarget::PutObject,
+        })
+        .unwrap();
+
+    let shard = ShardKey::new(&[0xA1; 16], 1, 0);
+    let ack = store.write_shard(&shard, b"bbbb").unwrap();
+    store
+        .connection()
+        .execute(
+            "DELETE FROM shards WHERE shard_key = ?1",
+            rusqlite::params![shard.as_bytes().as_slice()],
+        )
+        .unwrap();
+    assert!(matches!(
+        store.read_shard(&shard),
+        Err(crate::StoreError::NotFound)
+    ));
+
+    let segment = StreamUploadSegmentRecord {
+        session_id: "sess-publish".into(),
+        segment_index: 0,
+        size: 4,
+        segment_crc64: Some(99),
+        segment_okh: [0x44; 16],
+        segment_vid: GenerationId::new(1).unwrap(),
+        shard_pg_id: 0,
+        ec_k: 4,
+        ec_m: 2,
+    };
+    let shard_batch = [(&shard, ack)];
+
+    store
+        .register_written_shards_and_append_stream_segment(&shard_batch, &segment)
+        .unwrap();
+
+    let segments = store.list_stream_segments("sess-publish").unwrap();
+    assert_eq!(segments.len(), 1);
+    assert_eq!(segments[0].segment_index, 0);
+    assert_eq!(store.read_shard(&shard).unwrap().data, b"bbbb");
 }
 
 #[test]

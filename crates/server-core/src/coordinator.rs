@@ -3621,18 +3621,6 @@ impl Coordinator {
         }
     }
 
-    fn register_stream_shards_locked(
-        shard_pg: &storage::PgStore,
-        written_shards: &[WrittenShard],
-    ) -> Result<(), ServerError> {
-        for written in written_shards {
-            shard_pg
-                .register_written_shard(&written.key, written.ack)
-                .map_err(ServerError::Store)?;
-        }
-        Ok(())
-    }
-
     fn best_effort_delete_stream_shards(&self, shard_pg_id: u32, written_shards: &[WrittenShard]) {
         let Ok(shard_pg) = self.storage_node.get_pg(shard_pg_id) else {
             return;
@@ -3719,6 +3707,10 @@ impl Coordinator {
             Some(pg) => pg,
             None => &meta_guard,
         };
+        let shard_batch: Vec<(&ShardKey, storage::WriteAck)> = written_shards
+            .iter()
+            .map(|written| (&written.key, written.ack))
+            .collect();
 
         let session = match meta_guard.get_stream_upload(session_id) {
             Ok(session) => session,
@@ -3737,9 +3729,20 @@ impl Coordinator {
             Self::cleanup_stream_shards_locked(shard_guard, &written_shards);
             return Err(err);
         }
-        if let Err(err) = Self::register_stream_shards_locked(shard_guard, &written_shards) {
+
+        if shard_guard_opt.is_none() {
+            if let Err(err) = meta_guard
+                .register_written_shards_and_append_stream_segment(&shard_batch, &segment_record)
+            {
+                Self::cleanup_stream_shards_locked(shard_guard, &written_shards);
+                return Err(ServerError::Metadata(err));
+            }
+            return Ok(());
+        }
+
+        if let Err(err) = shard_guard.register_written_shards_batch(&shard_batch) {
             Self::cleanup_stream_shards_locked(shard_guard, &written_shards);
-            return Err(err);
+            return Err(ServerError::Store(err));
         }
         if let Err(err) = meta_guard.append_stream_segment(&segment_record) {
             Self::cleanup_stream_shards_locked(shard_guard, &written_shards);
