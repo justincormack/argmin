@@ -23,7 +23,7 @@ fn validate_content_length(value: &str) -> Result<u64, ServerError> {
 
 /// Parsed S3 request data extracted from an HTTP request.
 pub struct S3Request {
-    pub method: String,
+    pub method: http::Method,
     pub path: String,
     pub query_string: String,
     pub headers: Vec<(String, String)>,
@@ -38,7 +38,7 @@ impl S3Request {
         parts: &http::request::Parts,
         body: bytes::Bytes,
     ) -> Result<Self, ServerError> {
-        let method = parts.method.as_str().to_string();
+        let method = parts.method.clone();
         let path = parts.uri.path().to_string();
         let query_string = parts.uri.query().unwrap_or("").to_string();
 
@@ -295,7 +295,7 @@ mod tests {
     #[test]
     fn query_param_lookup() {
         let req = S3Request {
-            method: "GET".to_string(),
+            method: http::Method::GET,
             path: "/bucket".to_string(),
             query_string: "list-type=2&prefix=photos%2F&max-keys=10".to_string(),
             headers: vec![],
@@ -361,7 +361,7 @@ mod tests {
     #[test]
     fn query_param_empty_query_string() {
         let req = S3Request {
-            method: "GET".to_string(),
+            method: http::Method::GET,
             path: "/".to_string(),
             query_string: String::new(),
             headers: vec![],
@@ -373,7 +373,7 @@ mod tests {
     #[test]
     fn query_param_no_equals() {
         let req = S3Request {
-            method: "GET".to_string(),
+            method: http::Method::GET,
             path: "/".to_string(),
             query_string: "flagonly&key=val".to_string(),
             headers: vec![],
@@ -387,7 +387,7 @@ mod tests {
     #[test]
     fn query_param_match_not_first() {
         let req = S3Request {
-            method: "GET".to_string(),
+            method: http::Method::GET,
             path: "/".to_string(),
             query_string: "a=1&b=2&c=3".to_string(),
             headers: vec![],
@@ -399,7 +399,7 @@ mod tests {
     #[test]
     fn header_pairs_output() {
         let req = S3Request {
-            method: "GET".to_string(),
+            method: http::Method::GET,
             path: "/".to_string(),
             query_string: String::new(),
             headers: vec![
@@ -437,7 +437,7 @@ mod tests {
     #[test]
     fn header_returns_none_for_missing() {
         let req = S3Request {
-            method: "GET".to_string(),
+            method: http::Method::GET,
             path: "/".to_string(),
             query_string: String::new(),
             headers: vec![("host".to_string(), "example.com".to_string())],

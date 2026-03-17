@@ -116,7 +116,7 @@ mod tests {
 
     fn make_req_with_headers(headers: Vec<(&str, &str)>) -> S3Request {
         S3Request {
-            method: String::new(),
+            method: http::Method::GET,
             path: String::new(),
             query_string: String::new(),
             headers: headers
