@@ -1,6 +1,6 @@
 # Segment Buffer Reuse
 
-Status: active
+Status: completed
 
 ## Goal
 
@@ -57,15 +57,18 @@ This is only about internal segment payload movement. It does not change:
     checksum storage too, so `server-core` no longer round-trips those through
     small heap `Vec<u8>` blobs away from the SQLite bind/read edge
 
-## Remaining
+## Deferred
 
-1. decide whether any remaining small control-path scratch is worth pooling, or
-   whether the current hot-path reduction is enough
-   This now mostly means tiny EC helper vectors such as index/reference lists,
-   not segment-sized payload buffers or checksum result storage.
-2. measure whether the remaining small owner-object churn
-   (`Arc`/`Bytes::from_owner`) is worth another abstraction layer, or whether
-   the current pooled payload buffers are sufficient for the healthy path
+1. tiny control-path scratch such as EC helper vectors
+   This is not segment-sized payload churn anymore, and it is not on the
+   healthy hot path. The expected payoff is allocator-noise reduction and code
+   tidying only, so we are not pursuing it in this plan.
+2. remaining owner-object churn around `ReadChunk`/`Arc`/`Bytes::from_owner`
+   The payload copies and segment-sized allocations are already gone. What
+   remains is small ownership machinery needed to hand buffers safely across
+   the async HTTP boundary. Removing it would require a more invasive
+   abstraction, and the likely upside is marginal unless profiling shows this
+   exact path has become hot under small-range/high-QPS workloads.
 
 ## Notes
 
@@ -75,3 +78,6 @@ This is only about internal segment payload movement. It does not change:
   priority is the healthy data path.
 - `CopyObject` and `UploadPartCopy` now benefit automatically from the pooled
   read path because they stream through `ReadHandle`.
+- This plan is considered complete because the remaining work is no longer
+  about segment-scale payload allocation on the healthy path; it is deferred
+  until profiling shows a concrete need.
