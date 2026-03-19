@@ -3536,38 +3536,32 @@ impl Coordinator {
         let data_shards: Vec<&[u8]> = (0..k)
             .map(|i| &shard_source[i * shard_size..(i + 1) * shard_size])
             .collect();
-        let mut written_shards: Vec<WrittenShard> = Vec::with_capacity(k + m);
-        let write_result: Result<(), ServerError> = if shard_size == 0 {
+        let written_shards = if shard_size == 0 {
             let mut parity_bufs: Vec<Vec<u8>> = (0..m).map(|_| Vec::new()).collect();
             let mut parity_refs: Vec<&mut [u8]> = parity_bufs
                 .iter_mut()
                 .map(std::vec::Vec::as_mut_slice)
                 .collect();
             self.ec_codec.encode(&data_shards, &mut parity_refs)?;
-            (|| {
-                for (i, shard_data) in data_shards.iter().enumerate() {
-                    let shard_key = ShardKey::new(segment_okh, segment_vid.get(), i as u8);
-                    let ack =
-                        self.storage_node
-                            .write_shard_file(shard_pg_id, &shard_key, shard_data)?;
-                    written_shards.push(WrittenShard {
-                        key: shard_key,
-                        ack,
-                    });
-                }
-                for (parity_index, shard_data) in parity_bufs.iter().enumerate() {
-                    let shard_key =
-                        ShardKey::new(segment_okh, segment_vid.get(), (k + parity_index) as u8);
-                    let ack =
-                        self.storage_node
-                            .write_shard_file(shard_pg_id, &shard_key, shard_data)?;
-                    written_shards.push(WrittenShard {
-                        key: shard_key,
-                        ack,
-                    });
-                }
-                Ok(())
-            })()
+
+            let mut shard_batch: Vec<(ShardKey, &[u8])> = Vec::with_capacity(k + m);
+            for (i, shard_data) in data_shards.iter().enumerate() {
+                shard_batch.push((
+                    ShardKey::new(segment_okh, segment_vid.get(), i as u8),
+                    *shard_data,
+                ));
+            }
+            for (parity_index, shard_data) in parity_bufs.iter().enumerate() {
+                shard_batch.push((
+                    ShardKey::new(segment_okh, segment_vid.get(), (k + parity_index) as u8),
+                    shard_data.as_slice(),
+                ));
+            }
+            self.storage_node
+                .write_shard_files(shard_pg_id, &shard_batch)?
+                .into_iter()
+                .map(|(key, ack)| WrittenShard { key, ack })
+                .collect()
         } else {
             let parity_len =
                 m.checked_mul(shard_size)
@@ -3581,36 +3575,25 @@ impl Coordinator {
                 self.ec_codec.encode(&data_shards, &mut parity_refs)?;
             }
             let parity = scratch.as_slice(parity_len);
-            (|| {
-                for (i, shard_data) in data_shards.iter().enumerate() {
-                    let shard_key = ShardKey::new(segment_okh, segment_vid.get(), i as u8);
-                    let ack =
-                        self.storage_node
-                            .write_shard_file(shard_pg_id, &shard_key, shard_data)?;
-                    written_shards.push(WrittenShard {
-                        key: shard_key,
-                        ack,
-                    });
-                }
-                for (parity_index, shard_data) in parity.chunks_exact(shard_size).enumerate() {
-                    let shard_key =
-                        ShardKey::new(segment_okh, segment_vid.get(), (k + parity_index) as u8);
-                    let ack =
-                        self.storage_node
-                            .write_shard_file(shard_pg_id, &shard_key, shard_data)?;
-                    written_shards.push(WrittenShard {
-                        key: shard_key,
-                        ack,
-                    });
-                }
-                Ok(())
-            })()
+            let mut shard_batch: Vec<(ShardKey, &[u8])> = Vec::with_capacity(k + m);
+            for (i, shard_data) in data_shards.iter().enumerate() {
+                shard_batch.push((
+                    ShardKey::new(segment_okh, segment_vid.get(), i as u8),
+                    *shard_data,
+                ));
+            }
+            for (parity_index, shard_data) in parity.chunks_exact(shard_size).enumerate() {
+                shard_batch.push((
+                    ShardKey::new(segment_okh, segment_vid.get(), (k + parity_index) as u8),
+                    shard_data,
+                ));
+            }
+            self.storage_node
+                .write_shard_files(shard_pg_id, &shard_batch)?
+                .into_iter()
+                .map(|(key, ack)| WrittenShard { key, ack })
+                .collect()
         };
-
-        if let Err(err) = write_result {
-            self.best_effort_delete_stream_shards(shard_pg_id, &written_shards);
-            return Err(err);
-        }
 
         Ok(written_shards)
     }

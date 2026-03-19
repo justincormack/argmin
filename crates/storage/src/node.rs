@@ -290,6 +290,32 @@ impl SharedStorageNode {
         PgStore::write_shard_file_durable(&paths.tmp_dir, &paths.shards_dir, key, data)
     }
 
+    /// Write multiple shard files durably without taking the per-PG mutex.
+    ///
+    /// This batches the rename durability step across the affected shard
+    /// directories for one segment write, while preserving the existing rule
+    /// that shards do not become visible until metadata rows are published.
+    pub fn write_shard_files(
+        &self,
+        pg_id: u32,
+        shards: &[(ShardKey, &[u8])],
+    ) -> Result<Vec<(ShardKey, WriteAck)>, StoreError> {
+        let total_bytes: usize = shards.iter().map(|(_, data)| data.len()).sum();
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "SharedStorageNode::write_shard_files",
+            "pg_id={} shards={} bytes={}",
+            pg_id,
+            shards.len(),
+            total_bytes
+        );
+        let paths = self
+            .pg_paths
+            .get(&pg_id)
+            .ok_or(StoreError::PgNotFound { pg_id })?;
+        PgStore::write_shard_files_durable(&paths.tmp_dir, &paths.shards_dir, shards)
+    }
+
     /// Read a shard file directly without taking the per-PG mutex.
     ///
     /// The coordinator uses this on the healthy read path and validates the
@@ -698,6 +724,35 @@ mod tests {
         assert!(matches!(err, StoreError::NotFound));
         pg.register_written_shard(&key, ack).unwrap();
         assert_eq!(pg.read_shard(&key).unwrap().data, b"hello");
+    }
+
+    #[test]
+    fn shared_node_write_shard_files_requires_metadata_registration() {
+        let tmp = test_util::tempdir();
+        let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();
+        let key_a = crate::types::ShardKey::new(&[0xEE; 16], 7, 0);
+        let key_b = crate::types::ShardKey::new(&[0xEE; 16], 7, 1);
+
+        let written = node
+            .write_shard_files(
+                0,
+                &[
+                    (key_a.clone(), b"hello".as_slice()),
+                    (key_b.clone(), b"world".as_slice()),
+                ],
+            )
+            .unwrap();
+        assert_eq!(node.read_shard_file(0, &key_a).unwrap(), b"hello");
+        assert_eq!(node.read_shard_file(0, &key_b).unwrap(), b"world");
+
+        let pg = node.get_pg(0).unwrap();
+        assert!(matches!(pg.read_shard(&key_a), Err(StoreError::NotFound)));
+        assert!(matches!(pg.read_shard(&key_b), Err(StoreError::NotFound)));
+        for (key, ack) in written {
+            pg.register_written_shard(&key, ack).unwrap();
+        }
+        assert_eq!(pg.read_shard(&key_a).unwrap().data, b"hello");
+        assert_eq!(pg.read_shard(&key_b).unwrap().data, b"world");
     }
 
     #[test]

@@ -30,6 +30,13 @@ const TRACE_TARGET: &str = "storage";
 const PART_SEGMENT_STAGING_VERSION_ID: VersionId = MULTIPART_PART_SEGMENT_STAGING_VERSION_ID;
 type StreamSessionRow = (u8, u8, BucketName, ObjectKey, Option<UploadId>, Option<i64>);
 
+struct PreparedShardFile {
+    key: ShardKey,
+    ack: WriteAck,
+    tmp_path: PathBuf,
+    shard_path: PathBuf,
+}
+
 /// Per-PG store combining shard file I/O with SQLite metadata.
 pub struct PgStore {
     pg_id: u32,
@@ -196,6 +203,118 @@ impl PgStore {
             crc64: crc,
             stored_size,
         })
+    }
+
+    pub(crate) fn write_shard_files_durable(
+        tmp_dir: &Path,
+        shards_dir: &Path,
+        shards: &[(ShardKey, &[u8])],
+    ) -> Result<Vec<(ShardKey, WriteAck)>, StoreError> {
+        let mut prepared: Vec<PreparedShardFile> = Vec::with_capacity(shards.len());
+        let mut parents_to_fsync: Vec<PathBuf> = Vec::new();
+
+        let cleanup = |prepared: &[PreparedShardFile]| {
+            for shard in prepared {
+                let _ = fs::remove_file(&shard.tmp_path);
+                let _ = fs::remove_file(&shard.shard_path);
+            }
+        };
+
+        for (key, data) in shards {
+            let crc = checksum::crc64::checksum(data);
+            let stored_size = data.len() as u64;
+            let tmp_name = format!("shard-{}-{}-{key}", std::process::id(), Self::now_secs());
+            let tmp_path = tmp_dir.join(&tmp_name);
+            let shard_path = Self::shard_path_for_shards_dir(shards_dir, key);
+
+            let Some(parent) = shard_path.parent() else {
+                cleanup(&prepared);
+                return Err(StoreError::Io {
+                    context: "resolve shard prefix dir",
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "shard path missing parent directory",
+                    ),
+                });
+            };
+
+            fs::create_dir_all(parent).map_err(|e| {
+                cleanup(&prepared);
+                StoreError::Io {
+                    context: "create shard prefix dir",
+                    source: e,
+                }
+            })?;
+
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)
+                .map_err(|e| {
+                    cleanup(&prepared);
+                    StoreError::Io {
+                        context: "create temp shard file",
+                        source: e,
+                    }
+                })?;
+
+            file.write_all(data).map_err(|e| {
+                let _ = fs::remove_file(&tmp_path);
+                cleanup(&prepared);
+                StoreError::Io {
+                    context: "write shard data",
+                    source: e,
+                }
+            })?;
+
+            file.sync_data().map_err(|e| {
+                let _ = fs::remove_file(&tmp_path);
+                cleanup(&prepared);
+                StoreError::Io {
+                    context: "fdatasync shard",
+                    source: e,
+                }
+            })?;
+
+            if !parents_to_fsync.iter().any(|p| p == parent) {
+                parents_to_fsync.push(parent.to_path_buf());
+            }
+
+            prepared.push(PreparedShardFile {
+                key: key.clone(),
+                ack: WriteAck {
+                    crc64: crc,
+                    stored_size,
+                },
+                tmp_path,
+                shard_path,
+            });
+        }
+
+        for shard in &prepared {
+            fs::rename(&shard.tmp_path, &shard.shard_path).map_err(|e| {
+                cleanup(&prepared);
+                StoreError::Io {
+                    context: "rename shard into place",
+                    source: e,
+                }
+            })?;
+        }
+
+        for parent in &parents_to_fsync {
+            fsync_dir(parent).map_err(|e| {
+                cleanup(&prepared);
+                StoreError::Io {
+                    context: "fsync shard parent dir",
+                    source: e,
+                }
+            })?;
+        }
+
+        Ok(prepared
+            .into_iter()
+            .map(|shard| (shard.key, shard.ack))
+            .collect())
     }
 
     pub fn register_written_shard(&self, key: &ShardKey, ack: WriteAck) -> Result<(), StoreError> {
