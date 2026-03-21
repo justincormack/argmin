@@ -333,6 +333,9 @@ pub async fn serve(
                 continue;
             }
         };
+        if let Err(e) = stream.set_nodelay(true) {
+            eprintln!("set_nodelay error: {e}");
+        }
 
         let state = Arc::clone(&state);
         tokio::spawn(async move {
