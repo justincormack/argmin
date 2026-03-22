@@ -122,12 +122,14 @@ Done:
    - begin the drain barrier
    - wait for active reservation publishers to finish
    - treat live stream sessions as bucket content
+5. Converted `CreateMultipartUpload` and `CompleteMultipartUpload` to use bucket reservations instead of the coarse bucket lock.
+6. Removed the coarse bucket lock from `DeleteBucket`; it now relies on the drain barrier directly and retries if another delete is already in the draining phase.
+7. Re-evaluated the remaining bucket mutex uses and left them only on non-hot lifecycle paths.
 
-Still to do:
+Deferred:
 
-1. Convert multipart create/complete onto reservations.
-2. Remove the coarse bucket lock from `DeleteBucket` once multipart no longer depends on it.
-3. Re-evaluate whether any remaining write paths still need the bucket mutex or can move to the barrier.
+1. `CreateBucket` still uses the coarse bucket mutex for lifecycle serialization and idempotent create/create-delete races. This path is not hot and does not affect the tiny-object write bottleneck.
+2. Async delete finalization still uses the coarse bucket mutex to serialize bucket-row removal and reclaim-root teardown against other lifecycle operations. This path is not on request latency.
 
 ## Validation
 
@@ -142,7 +144,21 @@ Still to do:
 
 ## Notes
 
-- The current bucket lock is still intentionally retained on `DeleteBucket` in
-  the first phase so older multipart paths remain fenced while streamed
-  `PutObject` moves to the reservation barrier.
+- The coarse bucket lock is no longer on hot write paths. Remaining uses are on
+  non-hot lifecycle/finalization paths such as bucket create and delete
+  finalization, and should only move if there is a clear correctness or
+  contention reason.
 - This work should be done before introducing a direct tiny-`PutObject` fast path, so the fast path has a correct bucket-deletion story from the start.
+
+## Outcome
+
+The reservation barrier now covers the hot bucket-mutating request paths:
+
+- streamed `PutObject` begin/finalize
+- `CreateMultipartUpload`
+- `CompleteMultipartUpload`
+- `DeleteBucket`
+
+That removes the coarse bucket mutex from the small-object write critical path
+while preserving the bucket deletion fence that was previously implicit in the
+mutex.
