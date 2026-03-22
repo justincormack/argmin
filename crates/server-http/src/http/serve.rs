@@ -1158,6 +1158,7 @@ async fn handle_streaming_put(
     // 2. Stream body frames, accumulating into internal segment-sized buffers.
     let ctx = Arc::new(ctx);
     let mut hasher = checksum::crc64::Hasher::new();
+    let mut session_id: Option<String> = None;
     let mut segment_index: u32 = 0;
     let mut buf = PooledSegmentBuffer::new(&state);
     let mut total_size: u64 = 0;
@@ -1180,7 +1181,7 @@ async fn handle_streaming_put(
                         let payload = match payload {
                             Ok(p) => p,
                             Err(err) => {
-                                abort_streaming(&state, &ctx).await;
+                                abort_streaming(&state, &ctx, session_id.clone()).await;
                                 return error_response(&err);
                             }
                         };
@@ -1190,6 +1191,7 @@ async fn handle_streaming_put(
                             trailing_hasher: &mut trailing_hasher,
                             total_size: &mut total_size,
                             buf: &mut buf,
+                            session_id: &mut session_id,
                             segment_index: &mut segment_index,
                             body_started_emitted: &mut body_started_emitted,
                             timing: &mut body_timing,
@@ -1206,6 +1208,7 @@ async fn handle_streaming_put(
                             trailing_hasher: &mut trailing_hasher,
                             total_size: &mut total_size,
                             buf: &mut buf,
+                            session_id: &mut session_id,
                             segment_index: &mut segment_index,
                             body_started_emitted: &mut body_started_emitted,
                             timing: &mut body_timing,
@@ -1224,14 +1227,14 @@ async fn handle_streaming_put(
                 }
             }
             Ok(Some(Err(_))) => {
-                abort_streaming(&state, &ctx).await;
+                abort_streaming(&state, &ctx, session_id.clone()).await;
                 return error_response(&ServerError::InvalidRequest {
                     reason: "failed to read request body".to_string(),
                 });
             }
             Ok(None) => break, // Body complete
             Err(_) => {
-                abort_streaming(&state, &ctx).await;
+                abort_streaming(&state, &ctx, session_id.clone()).await;
                 return error_response(&ServerError::InvalidRequest {
                     reason: "request body read timed out".to_string(),
                 });
@@ -1243,9 +1246,9 @@ async fn handle_streaming_put(
         "streaming_put_body_read_complete",
         format_args!(
             "bucket={} key={} session_id={} body_bytes_received={} full_segments_flushed={} buffered_tail_bytes={} data_frames={} frame_wait_us={} decode_us={} ingest_local_us={} append_wait_us={}",
-            ctx.binding.bucket,
-            ctx.binding.key,
-            ctx.binding.session_id,
+            ctx.bucket,
+            ctx.key,
+            streaming_put_session_label(session_id.as_deref()),
             total_size,
             segment_index,
             buf.len(),
@@ -1262,7 +1265,7 @@ async fn handle_streaming_put(
     let mut trailer_checksums: Vec<(String, String)> = Vec::new();
     if let Some(dec) = decoder {
         if !dec.is_done() {
-            abort_streaming(&state, &ctx).await;
+            abort_streaming(&state, &ctx, session_id.clone()).await;
             return error_response(&ServerError::IncompleteBody);
         }
         let trailers = dec.into_trailers();
@@ -1272,13 +1275,13 @@ async fn handle_streaming_put(
             &trailers,
             declared_trailer.as_deref(),
         ) {
-            abort_streaming(&state, &ctx).await;
+            abort_streaming(&state, &ctx, session_id.clone()).await;
             return error_response(&err);
         }
         match extract_checksum_trailers(&trailers) {
             Ok(tc) => trailer_checksums = tc,
             Err(err) => {
-                abort_streaming(&state, &ctx).await;
+                abort_streaming(&state, &ctx, session_id.clone()).await;
                 return error_response(&err);
             }
         }
@@ -1287,7 +1290,7 @@ async fn handle_streaming_put(
     if let (Some(claimed), Some(h)) = (claimed_payload_sha256.as_ref(), payload_sha256_hasher) {
         let actual = sha256_hex_from_digest(h.finish().as_ref());
         if &actual != claimed {
-            abort_streaming(&state, &ctx).await;
+            abort_streaming(&state, &ctx, session_id.clone()).await;
             return error_response(&ServerError::XAmzContentSHA256Mismatch {
                 client_hash: claimed.clone(),
                 server_hash: actual,
@@ -1301,7 +1304,7 @@ async fn handle_streaming_put(
         if let Some(ref claimed) = inline_checksum_claim {
             // Inline checksum header: verify against streamed body.
             if *claimed != actual_b64 {
-                abort_streaming(&state, &ctx).await;
+                abort_streaming(&state, &ctx, session_id.clone()).await;
                 return error_response(&ServerError::BadDigest);
             }
         } else {
@@ -1309,14 +1312,14 @@ async fn handle_streaming_put(
             match trailer_checksums.len() {
                 1 => {
                     if trailer_checksums[0].1 != actual_b64 {
-                        abort_streaming(&state, &ctx).await;
+                        abort_streaming(&state, &ctx, session_id.clone()).await;
                         return error_response(&ServerError::BadDigest);
                     }
                 }
                 0 => {} // No checksum trailer in body — nothing to validate.
                 _ => {
                     // Multiple distinct checksum trailers — reject.
-                    abort_streaming(&state, &ctx).await;
+                    abort_streaming(&state, &ctx, session_id.clone()).await;
                     return error_response(&ServerError::InvalidRequest {
                         reason: "multiple checksum trailers not supported".to_string(),
                     });
@@ -1325,8 +1328,36 @@ async fn handle_streaming_put(
         }
     }
 
-    // 3. Flush remaining buffer.
+    let crc64 = hasher.finalize();
     let had_tail = !buf.is_empty();
+    if session_id.is_none() {
+        emit_streaming_put_event(
+            &ctx,
+            "streaming_put_direct_ready",
+            format_args!(
+                "bucket={} key={} body_bytes_received={} segment_bytes={} trailer_checksums={}",
+                ctx.bucket,
+                ctx.key,
+                total_size,
+                buf.len(),
+                trailer_checksums.len()
+            ),
+        );
+        let ctx_ref = Arc::clone(&ctx);
+        let st = Arc::clone(&state);
+        let trace = ctx.trace.clone();
+        return match spawn_blocking_with_trace(trace, move || {
+            let frontend = acquire_frontend(&st);
+            frontend.put_single_segment_object(&ctx_ref, &buf, &trailer_checksums)
+        })
+        .await
+        {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(err)) => error_response(&err),
+            Err(_) => internal_error_response(),
+        };
+    }
+
     if had_tail {
         let idx = segment_index;
         emit_streaming_put_event(
@@ -1334,85 +1365,41 @@ async fn handle_streaming_put(
             "streaming_put_tail_segment_ready",
             format_args!(
                 "bucket={} key={} session_id={} segment_index={} segment_bytes={} body_bytes_received={}",
-                ctx.binding.bucket,
-                ctx.binding.key,
-                ctx.binding.session_id,
+                ctx.bucket,
+                ctx.key,
+                streaming_put_session_label(session_id.as_deref()),
                 idx,
                 buf.len(),
                 total_size
             ),
         );
-        let ctx_ref = Arc::clone(&ctx);
-        let st = Arc::clone(&state);
-        emit_streaming_put_event(
+        if let Err(resp) = append_streaming_put_buffer(
+            &state,
             &ctx,
-            "streaming_put_append_dispatch",
-            format_args!(
-                "bucket={} key={} session_id={} segment_index={} segment_bytes={} body_bytes_received={}",
-                ctx.binding.bucket,
-                ctx.binding.key,
-                ctx.binding.session_id,
-                idx,
-                buf.len(),
-                total_size
-            ),
-        );
-        let trace = ctx.trace.clone();
-        match spawn_blocking_with_trace(trace, move || {
-            emit_streaming_put_event(
-                &ctx_ref,
-                "streaming_put_append_worker_start",
-                format_args!(
-                    "bucket={} key={} session_id={} segment_index={} segment_bytes={}",
-                    ctx_ref.binding.bucket,
-                    ctx_ref.binding.key,
-                    ctx_ref.binding.session_id,
-                    idx,
-                    buf.len()
-                ),
-            );
-            let frontend = acquire_frontend(&st);
-            emit_streaming_put_event(
-                &ctx_ref,
-                "streaming_put_append_frontend_acquired",
-                format_args!(
-                    "bucket={} key={} session_id={} segment_index={} segment_bytes={}",
-                    ctx_ref.binding.bucket,
-                    ctx_ref.binding.key,
-                    ctx_ref.binding.session_id,
-                    idx,
-                    buf.len()
-                ),
-            );
-            let result = frontend.streaming_append_segment(&ctx_ref, idx, &buf);
-            (result, buf)
-        })
+            &mut session_id,
+            &mut segment_index,
+            buf,
+            total_size,
+            &mut body_timing,
+        )
         .await
         {
-            Ok((Ok(()), _buf)) => {}
-            Ok((Err(err), _buf)) => {
-                abort_streaming(&state, &ctx).await;
-                return error_response(&err);
-            }
-            Err(_) => {
-                abort_streaming(&state, &ctx).await;
-                return internal_error_response();
-            }
+            return resp;
         }
     }
 
-    // 4. Finalize the streaming upload.
-    let crc64 = hasher.finalize();
+    // 4. Finalize the promoted streaming upload.
+    let active_session_id = session_id.expect("streaming put session must exist before finalize");
     emit_streaming_put_event(
         &ctx,
         "streaming_put_finalize_ready",
         format_args!(
             "bucket={} key={} session_id={} body_bytes_received={} segment_count={} trailer_checksums={}",
-            ctx.binding.bucket,
-            ctx.binding.key,
-            ctx.binding.session_id,
+            ctx.bucket,
+            ctx.key,
+            active_session_id,
             total_size,
-            segment_index + u32::from(had_tail),
+            segment_index,
             trailer_checksums.len()
         ),
     );
@@ -1423,22 +1410,23 @@ async fn handle_streaming_put(
         "streaming_put_finalize_dispatch",
         format_args!(
             "bucket={} key={} session_id={} body_bytes_received={} segment_count={} trailer_checksums={}",
-            ctx.binding.bucket,
-            ctx.binding.key,
-            ctx.binding.session_id,
+            ctx.bucket,
+            ctx.key,
+            active_session_id,
             total_size,
-            segment_index + u32::from(had_tail),
+            segment_index,
             trailer_checksums.len()
         ),
     );
     let trace = ctx.trace.clone();
+    let session_id_for_finalize = active_session_id.clone();
     match spawn_blocking_with_trace(trace, move || {
         emit_streaming_put_event(
             &ctx_ref,
             "streaming_put_finalize_worker_start",
             format_args!(
                 "bucket={} key={} session_id={} body_bytes_received={}",
-                ctx_ref.binding.bucket, ctx_ref.binding.key, ctx_ref.binding.session_id, total_size
+                ctx_ref.bucket, ctx_ref.key, session_id_for_finalize, total_size
             ),
         );
         let frontend = acquire_frontend(&st);
@@ -1447,32 +1435,45 @@ async fn handle_streaming_put(
             "streaming_put_finalize_frontend_acquired",
             format_args!(
                 "bucket={} key={} session_id={} body_bytes_received={}",
-                ctx_ref.binding.bucket, ctx_ref.binding.key, ctx_ref.binding.session_id, total_size
+                ctx_ref.bucket, ctx_ref.key, session_id_for_finalize, total_size
             ),
         );
-        frontend.finalize_streaming_put(&ctx_ref, crc64, total_size, &trailer_checksums)
+        frontend.finalize_streaming_put(
+            &ctx_ref,
+            &session_id_for_finalize,
+            crc64,
+            total_size,
+            &trailer_checksums,
+        )
     })
     .await
     {
         Ok(Ok(resp)) => resp,
         Ok(Err(err)) => {
-            abort_streaming(&state, &ctx).await;
+            abort_streaming(&state, &ctx, Some(active_session_id.clone())).await;
             error_response(&err)
         }
         Err(_) => {
-            abort_streaming(&state, &ctx).await;
+            abort_streaming(&state, &ctx, Some(active_session_id)).await;
             internal_error_response()
         }
     }
 }
 
 /// Best-effort abort of a streaming upload session.
-async fn abort_streaming(state: &Arc<ServerState>, ctx: &Arc<super::StreamingPutContext>) {
+async fn abort_streaming(
+    state: &Arc<ServerState>,
+    ctx: &Arc<super::StreamingPutContext>,
+    session_id: Option<String>,
+) {
+    let Some(session_id) = session_id else {
+        return;
+    };
     let st = Arc::clone(state);
     let ctx = Arc::clone(ctx);
     let _ = tokio::task::spawn_blocking(move || {
         let frontend = acquire_frontend(&st);
-        frontend.abort_streaming_put(&ctx);
+        frontend.abort_streaming_put(&ctx, &session_id);
     })
     .await;
 }
@@ -1483,9 +1484,14 @@ struct StreamingPutIngestState<'a> {
     trailing_hasher: &'a mut Option<TrailingChecksumHasher>,
     total_size: &'a mut u64,
     buf: &'a mut PooledSegmentBuffer,
+    session_id: &'a mut Option<String>,
     segment_index: &'a mut u32,
     body_started_emitted: &'a mut bool,
     timing: &'a mut StreamingBodyTiming,
+}
+
+fn streaming_put_session_label(session_id: Option<&str>) -> &str {
+    session_id.unwrap_or("-")
 }
 
 fn emit_streaming_put_event(
@@ -1494,6 +1500,153 @@ fn emit_streaming_put_event(
     fields: std::fmt::Arguments<'_>,
 ) {
     let _ = observability::event_in_context(&ctx.trace, TRACE_TARGET, name, Some(fields));
+}
+
+async fn ensure_streaming_put_session(
+    state: &Arc<ServerState>,
+    ctx: &Arc<super::StreamingPutContext>,
+    session_id: &mut Option<String>,
+    body_bytes_received: u64,
+) -> Result<(), S3Response> {
+    if session_id.is_some() {
+        return Ok(());
+    }
+
+    emit_streaming_put_event(
+        ctx,
+        "streaming_put_session_start_dispatch",
+        format_args!(
+            "bucket={} key={} body_bytes_received={}",
+            ctx.bucket, ctx.key, body_bytes_received
+        ),
+    );
+    let ctx_ref = Arc::clone(ctx);
+    let st = Arc::clone(state);
+    let trace = ctx.trace.clone();
+    match spawn_blocking_with_trace(trace, move || {
+        emit_streaming_put_event(
+            &ctx_ref,
+            "streaming_put_session_start_worker",
+            format_args!("bucket={} key={}", ctx_ref.bucket, ctx_ref.key),
+        );
+        let frontend = acquire_frontend(&st);
+        emit_streaming_put_event(
+            &ctx_ref,
+            "streaming_put_session_start_frontend_acquired",
+            format_args!("bucket={} key={}", ctx_ref.bucket, ctx_ref.key),
+        );
+        frontend.start_streaming_put_session(&ctx_ref)
+    })
+    .await
+    {
+        Ok(Ok(new_session_id)) => {
+            emit_streaming_put_event(
+                ctx,
+                "streaming_put_session_started",
+                format_args!(
+                    "bucket={} key={} session_id={} body_bytes_received={}",
+                    ctx.bucket, ctx.key, new_session_id, body_bytes_received
+                ),
+            );
+            *session_id = Some(new_session_id);
+            Ok(())
+        }
+        Ok(Err(err)) => Err(error_response(&err)),
+        Err(_) => Err(internal_error_response()),
+    }
+}
+
+async fn append_streaming_put_buffer(
+    state: &Arc<ServerState>,
+    ctx: &Arc<super::StreamingPutContext>,
+    session_id: &mut Option<String>,
+    segment_index: &mut u32,
+    flush_data: PooledSegmentBuffer,
+    body_bytes_received: u64,
+    timing: &mut StreamingBodyTiming,
+) -> Result<(), S3Response> {
+    ensure_streaming_put_session(state, ctx, session_id, body_bytes_received).await?;
+    let session_id_value = session_id
+        .as_deref()
+        .expect("session must exist before appending a promoted segment");
+    let idx = *segment_index;
+    emit_streaming_put_event(
+        ctx,
+        "streaming_put_segment_ready",
+        format_args!(
+            "bucket={} key={} session_id={} segment_index={} segment_bytes={} body_bytes_received={}",
+            ctx.bucket,
+            ctx.key,
+            session_id_value,
+            idx,
+            flush_data.len(),
+            body_bytes_received
+        ),
+    );
+    let ctx_ref = Arc::clone(ctx);
+    let st = Arc::clone(state);
+    let dispatch_start = Instant::now();
+    emit_streaming_put_event(
+        ctx,
+        "streaming_put_append_dispatch",
+        format_args!(
+            "bucket={} key={} session_id={} segment_index={} segment_bytes={} body_bytes_received={}",
+            ctx.bucket,
+            ctx.key,
+            session_id_value,
+            idx,
+            flush_data.len(),
+            body_bytes_received
+        ),
+    );
+    let trace = ctx.trace.clone();
+    let session_id_owned = session_id_value.to_string();
+    match spawn_blocking_with_trace(trace, move || {
+        emit_streaming_put_event(
+            &ctx_ref,
+            "streaming_put_append_worker_start",
+            format_args!(
+                "bucket={} key={} session_id={} segment_index={} segment_bytes={}",
+                ctx_ref.bucket,
+                ctx_ref.key,
+                session_id_owned,
+                idx,
+                flush_data.len()
+            ),
+        );
+        let frontend = acquire_frontend(&st);
+        emit_streaming_put_event(
+            &ctx_ref,
+            "streaming_put_append_frontend_acquired",
+            format_args!(
+                "bucket={} key={} session_id={} segment_index={} segment_bytes={}",
+                ctx_ref.bucket,
+                ctx_ref.key,
+                session_id_owned,
+                idx,
+                flush_data.len()
+            ),
+        );
+        let result =
+            frontend.streaming_append_segment(&ctx_ref, &session_id_owned, idx, &flush_data);
+        (result, flush_data)
+    })
+    .await
+    {
+        Ok((Ok(()), _flush_data)) => {
+            *segment_index += 1;
+            timing.append_wait_us += elapsed_micros(dispatch_start);
+            Ok(())
+        }
+        Ok((Err(err), _flush_data)) => {
+            abort_streaming(state, ctx, session_id.clone()).await;
+            Err(error_response(&err))
+        }
+        Err(_) => {
+            abort_streaming(state, ctx, session_id.clone()).await;
+            Err(internal_error_response())
+        }
+    }
 }
 
 async fn ingest_streaming_put_payload(
@@ -1516,7 +1669,7 @@ async fn ingest_streaming_put_payload(
     }
     *ingest.total_size += payload.len() as u64;
     if *ingest.total_size > MAX_OBJECT_SIZE {
-        abort_streaming(state, ctx).await;
+        abort_streaming(state, ctx, ingest.session_id.clone()).await;
         return Err(error_response(&ServerError::ObjectTooLarge {
             size: *ingest.total_size,
             max: MAX_OBJECT_SIZE,
@@ -1529,9 +1682,9 @@ async fn ingest_streaming_put_payload(
             "streaming_put_body_started",
             format_args!(
                 "bucket={} key={} session_id={} frame_bytes={} body_bytes_received={}",
-                ctx.binding.bucket,
-                ctx.binding.key,
-                ctx.binding.session_id,
+                ctx.bucket,
+                ctx.key,
+                streaming_put_session_label(ingest.session_id.as_deref()),
                 payload.len(),
                 *ingest.total_size
             ),
@@ -1541,93 +1694,27 @@ async fn ingest_streaming_put_payload(
 
     let mut remaining = payload;
     while !remaining.is_empty() {
+        if ingest.buf.len() == crate::coordinator::INTERNAL_SEGMENT_SIZE {
+            let mut flush_data = PooledSegmentBuffer::new(state);
+            std::mem::swap(ingest.buf, &mut flush_data);
+            append_streaming_put_buffer(
+                state,
+                ctx,
+                ingest.session_id,
+                ingest.segment_index,
+                flush_data,
+                *ingest.total_size,
+                ingest.timing,
+            )
+            .await?;
+        }
+
         let fill_start = Instant::now();
         let needed = crate::coordinator::INTERNAL_SEGMENT_SIZE - ingest.buf.len();
         let take = needed.min(remaining.len());
         ingest.buf.extend_from_slice(&remaining[..take]);
         remaining = &remaining[take..];
-        if ingest.buf.len() < crate::coordinator::INTERNAL_SEGMENT_SIZE {
-            ingest.timing.ingest_local_us += elapsed_micros(fill_start);
-            continue;
-        }
-
-        let mut flush_data = PooledSegmentBuffer::new(state);
-        std::mem::swap(ingest.buf, &mut flush_data);
-        let idx = *ingest.segment_index;
-        *ingest.segment_index += 1;
-        emit_streaming_put_event(
-            ctx,
-            "streaming_put_segment_ready",
-            format_args!(
-                "bucket={} key={} session_id={} segment_index={} segment_bytes={} body_bytes_received={}",
-                ctx.binding.bucket,
-                ctx.binding.key,
-                ctx.binding.session_id,
-                idx,
-                flush_data.len(),
-                *ingest.total_size
-            ),
-        );
         ingest.timing.ingest_local_us += elapsed_micros(fill_start);
-        let ctx_ref = Arc::clone(ctx);
-        let st = Arc::clone(state);
-        let dispatch_start = Instant::now();
-        emit_streaming_put_event(
-            ctx,
-            "streaming_put_append_dispatch",
-            format_args!(
-                "bucket={} key={} session_id={} segment_index={} segment_bytes={} body_bytes_received={}",
-                ctx.binding.bucket,
-                ctx.binding.key,
-                ctx.binding.session_id,
-                idx,
-                flush_data.len(),
-                *ingest.total_size
-            ),
-        );
-        let trace = ctx.trace.clone();
-        match spawn_blocking_with_trace(trace, move || {
-            emit_streaming_put_event(
-                &ctx_ref,
-                "streaming_put_append_worker_start",
-                format_args!(
-                    "bucket={} key={} session_id={} segment_index={} segment_bytes={}",
-                    ctx_ref.binding.bucket,
-                    ctx_ref.binding.key,
-                    ctx_ref.binding.session_id,
-                    idx,
-                    flush_data.len()
-                ),
-            );
-            let frontend = acquire_frontend(&st);
-            emit_streaming_put_event(
-                &ctx_ref,
-                "streaming_put_append_frontend_acquired",
-                format_args!(
-                    "bucket={} key={} session_id={} segment_index={} segment_bytes={}",
-                    ctx_ref.binding.bucket,
-                    ctx_ref.binding.key,
-                    ctx_ref.binding.session_id,
-                    idx,
-                    flush_data.len()
-                ),
-            );
-            let result = frontend.streaming_append_segment(&ctx_ref, idx, &flush_data);
-            (result, flush_data)
-        })
-        .await
-        {
-            Ok((Ok(()), _flush_data)) => {}
-            Ok((Err(err), _flush_data)) => {
-                abort_streaming(state, ctx).await;
-                return Err(error_response(&err));
-            }
-            Err(_) => {
-                abort_streaming(state, ctx).await;
-                return Err(internal_error_response());
-            }
-        }
-        ingest.timing.append_wait_us += elapsed_micros(dispatch_start);
     }
 
     Ok(())

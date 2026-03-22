@@ -11,20 +11,20 @@ use checksum::{
 use ec::{EcConfig, ErasureCodec};
 use s3_types::{BucketVersioningState, CanonicalUserId, VersionId};
 use storage::traits::{PgMetadataStore, ShardStore};
+#[cfg(test)]
+use storage::SimplePayloadReclaimRecord;
 use storage::{
-    BucketInfo, BucketName, BucketState, CommitMultipartReq, CommitStreamPutReq,
-    CreateMultipartUploadReq, CreateStreamUploadReq, EcShape, GenerationId,
+    BucketInfo, BucketName, BucketState, CommitMultipartReq,
+    CommitStreamPutReq, CreateMultipartUploadReq, CreateStreamUploadReq, EcShape, GenerationId,
     ListMultipartUploadsReq, ListObjectVersionsReq, ListObjectsReq, ListPartsReq,
     MultipartPartRecord, MultipartPartSegmentRecord, MultipartReclaimPartRecord,
     MultipartReclaimPartSegmentRecord, MultipartReclaimRecord, MultipartUploadRecord, ObjectKey,
     ObjectLayout, ObjectPartRecord, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
-    ObjectSegmentsReclaimSegmentRecord, PutDeleteMarkerReq, PutObjectReq, ReclaimWorkItem,
-    SerializedMetadataBlob, SerializedTagSet, SessionId, ShardKey, SharedStorageNode, StoredObject,
-    StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, UploadId,
-    UploadState,
+    ObjectSegmentsReclaimSegmentRecord, PutDeleteMarkerReq, PutLiveObjectReq, PutObjectReq,
+    ReclaimWorkItem, SerializedMetadataBlob, SerializedTagSet, SessionId, ShardKey,
+    SharedStorageNode, StoredObject, StreamUploadRecord, StreamUploadSegmentRecord,
+    StreamUploadState, StreamUploadTarget, UploadId, UploadState,
 };
-#[cfg(test)]
-use storage::{PutLiveObjectReq, SimplePayloadReclaimRecord};
 
 use crate::conditional::{
     check_copy_source_conditions, check_delete_conditions, check_read_conditions,
@@ -1018,8 +1018,7 @@ pub struct UploadPartCopyRequest<'a> {
     pub requester: Requester<'a>,
 }
 
-/// Request for a PutObject operation (test-only convenience wrapper).
-#[cfg(any(test, feature = "test-utils"))]
+/// Request for a PutObject operation.
 #[derive(Debug)]
 pub struct PutObjectRequest<'a> {
     pub bucket: &'a str,
@@ -1030,6 +1029,22 @@ pub struct PutObjectRequest<'a> {
     pub cond: &'a WriteCondition,
     pub requester: Requester<'a>,
     pub acl: PutObjectAcl<'a>,
+}
+
+struct PreparedPutCommit {
+    version_id: VersionId,
+    generation_id: GenerationId,
+    tags: Option<SerializedTagSet>,
+    metadata_blob: SerializedMetadataBlob,
+    stale_payload: Option<StaleObjectPayload>,
+}
+
+struct PutCommitRequest<'a> {
+    bucket: &'a str,
+    key: &'a str,
+    metadata_blob: &'a MetadataBlob,
+    tags: Option<&'a str>,
+    cond: &'a WriteCondition,
 }
 
 /// Authenticated requester context needed by core-side authorization.
@@ -3387,6 +3402,266 @@ impl Coordinator {
 
     // ── Object operations ─────────────────────────────────────────────
 
+    fn prepare_put_commit_locked(
+        &self,
+        meta_pg: &storage::PgStore,
+        bucket_info: &BucketSummary,
+        req: &PutCommitRequest<'_>,
+    ) -> Result<PreparedPutCommit, ServerError> {
+        let metadata_blob = SerializedMetadataBlob::from(req.metadata_blob.serialize()?);
+
+        if !req.cond.is_empty() {
+            let existing_etag = match meta_pg.get_object_meta(req.bucket, req.key) {
+                Ok(stored) => stored.as_live().map(|record| record.etag.format()),
+                Err(storage::MetadataError::ObjectNotFound) => None,
+                Err(e) => return Err(ServerError::Metadata(e)),
+            };
+            if matches!(req.cond, WriteCondition::IfMatch(_)) && existing_etag.is_none() {
+                return Err(ServerError::ObjectNotFound {
+                    bucket: req.bucket.to_string(),
+                    key: req.key.to_string(),
+                });
+            }
+            check_write_conditions(req.cond, existing_etag.as_deref())?;
+        }
+
+        let version_id = if bucket_info.versioning == BucketVersioningState::Enabled {
+            meta_pg.next_version_id(req.bucket, req.key)?
+        } else {
+            VersionId::Null
+        };
+        let generation_id = meta_pg.next_generation_id(req.bucket, req.key)?;
+        let stale_payload = if version_id.is_null() {
+            Self::snapshot_overwritten_null_version_payload(meta_pg, req.bucket, req.key)?
+        } else {
+            None
+        };
+
+        Ok(PreparedPutCommit {
+            version_id,
+            generation_id,
+            tags: req.tags.map(SerializedTagSet::from),
+            metadata_blob,
+            stale_payload,
+        })
+    }
+
+    fn finalize_put_commit_metadata_locked(
+        meta_pg: &storage::PgStore,
+        bucket: &str,
+        key: &str,
+        version_id: VersionId,
+        stale_payload: Option<&StaleObjectPayload>,
+    ) -> Result<(), ServerError> {
+        if let Some(payload) = stale_payload {
+            match payload {
+                StaleObjectPayload::Segments {
+                    generation_id,
+                    segments,
+                } => {
+                    Self::enqueue_object_segments_reclaim(
+                        meta_pg,
+                        bucket,
+                        key,
+                        *generation_id,
+                        segments,
+                    )?;
+                }
+                StaleObjectPayload::Multipart { .. } => {
+                    Self::delete_stale_object_payload_metadata(
+                        meta_pg, bucket, key, version_id, payload,
+                    )?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Put an object, using a direct single-segment commit when possible.
+    pub fn put_object(&self, req: &PutObjectRequest<'_>) -> Result<PutObjectResult, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::put_object",
+            "bucket={} key={} bytes={}",
+            req.bucket,
+            req.key,
+            req.data.len()
+        );
+
+        if req.data.len() > INTERNAL_SEGMENT_SIZE {
+            let session_id = self.begin_stream_put(&BeginStreamPutRequest {
+                bucket: req.bucket,
+                key: req.key,
+                requester: req.requester,
+                acl: req.acl,
+            })?;
+            let result = (|| {
+                for (idx, chunk) in req.data.chunks(INTERNAL_SEGMENT_SIZE).enumerate() {
+                    self.append_stream_segment(
+                        req.bucket,
+                        req.key,
+                        &session_id,
+                        idx as u32,
+                        chunk,
+                    )?;
+                }
+                self.finalize_stream_put(&FinalizeStreamPutRequest {
+                    bucket: req.bucket,
+                    key: req.key,
+                    session_id: &session_id,
+                    crc64: checksum::crc64::checksum(req.data),
+                    total_size: req.data.len() as u64,
+                    metadata_blob: req.metadata,
+                    tags: req.tags,
+                    cond: req.cond,
+                })
+            })();
+            if result.is_err() {
+                let _ = self.abort_stream_put(req.bucket, req.key, &session_id);
+            }
+            return result;
+        }
+
+        self.with_bucket_write_reservation(req.bucket, |bucket_info| {
+            if !Self::requester_can_object_write(
+                req.requester,
+                &bucket_info.owner_principal,
+                Self::effective_public_write(&bucket_info),
+            ) {
+                return Err(ServerError::AccessDenied);
+            }
+            if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_deref())
+                && !matches!(
+                    req.acl,
+                    PutObjectAcl::None
+                        | PutObjectAcl::Private
+                        | PutObjectAcl::BucketOwnerFullControl
+                )
+            {
+                return Err(ServerError::AccessControlListNotSupported);
+            }
+
+            let transient_segment_id = {
+                let rng = ring::rand::SystemRandom::new();
+                let mut id_bytes = [0u8; 16];
+                ring::rand::SecureRandom::fill(&rng, &mut id_bytes).map_err(|_| {
+                    ServerError::InternalError {
+                        reason: "failed to generate direct put segment ID".to_string(),
+                    }
+                })?;
+                id_bytes.iter().fold(String::with_capacity(32), |mut s, b| {
+                    use std::fmt::Write;
+                    write!(s, "{b:02x}").unwrap();
+                    s
+                })
+            };
+
+            let segment_index = 0;
+            let segment_okh = stream_segment_key_hash(&transient_segment_id, segment_index);
+            let segment_vid = GenerationId::MIN;
+            let shard_pg_id = self.shard_pg_id_raw(
+                &format!("segment/{transient_segment_id}"),
+                &segment_index.to_string(),
+                segment_vid.get(),
+            );
+
+            let written_shards =
+                self.write_segment_shards(shard_pg_id, &segment_okh, segment_vid, req.data)?;
+
+            let meta_pg_id = self.object_pg_id(req.bucket, req.key);
+            let (meta_pg, shard_pg_opt) =
+                match self.storage_node.lock_two_pgs(meta_pg_id, shard_pg_id) {
+                    Ok(guards) => guards,
+                    Err(err) => {
+                        self.best_effort_delete_written_shards(shard_pg_id, &written_shards);
+                        return Err(ServerError::Store(err));
+                    }
+                };
+            let shard_pg: &storage::PgStore = match shard_pg_opt.as_ref() {
+                Some(pg) => pg,
+                None => &meta_pg,
+            };
+            let shard_batch: Vec<(&ShardKey, storage::WriteAck)> = written_shards
+                .iter()
+                .map(|written| (&written.key, written.ack))
+                .collect();
+
+            let prepared = match self.prepare_put_commit_locked(
+                &meta_pg,
+                &bucket_info,
+                &PutCommitRequest {
+                    bucket: req.bucket,
+                    key: req.key,
+                    metadata_blob: req.metadata,
+                    tags: req.tags,
+                    cond: req.cond,
+                },
+            ) {
+                Ok(prepared) => prepared,
+                Err(err) => {
+                    Self::cleanup_written_shards_locked(shard_pg, &written_shards);
+                    return Err(err);
+                }
+            };
+
+            let segment_record = ObjectSegmentRecord {
+                bucket: BucketName::from(req.bucket),
+                key: ObjectKey::from(req.key),
+                version_id: prepared.version_id,
+                segment_index,
+                size: req.data.len() as u64,
+                segment_crc64: Some(checksum::crc64::checksum(req.data)),
+                segment_okh,
+                segment_vid,
+                shard_pg_id,
+                ec_k: self.ec_config.data_shards,
+                ec_m: self.ec_config.parity_shards,
+            };
+            let live_req = PutLiveObjectReq {
+                bucket: BucketName::from(req.bucket),
+                key: ObjectKey::from(req.key),
+                version_id: prepared.version_id,
+                generation_id: prepared.generation_id,
+                size: req.data.len() as u64,
+                etag: storage::ObjectEtag::single_part(checksum::crc64::checksum(req.data)),
+                ec: EcShape {
+                    k: self.ec_config.data_shards,
+                    m: self.ec_config.parity_shards,
+                },
+                layout: ObjectLayout::Standard,
+                tags: prepared.tags.clone(),
+                metadata_blob: Some(prepared.metadata_blob.clone()),
+            };
+
+            if let Err(err) = shard_pg.register_written_shards_batch(&shard_batch) {
+                Self::cleanup_written_shards_locked(shard_pg, &written_shards);
+                return Err(ServerError::Store(err));
+            }
+            if let Err(err) = meta_pg.put_object_with_segments(&live_req, &[segment_record]) {
+                Self::cleanup_written_shards_locked(shard_pg, &written_shards);
+                return Err(ServerError::Metadata(err));
+            }
+            Self::finalize_put_commit_metadata_locked(
+                &meta_pg,
+                req.bucket,
+                req.key,
+                prepared.version_id,
+                prepared.stale_payload.as_ref(),
+            )?;
+
+            drop(meta_pg);
+            if let Some(ref payload) = prepared.stale_payload {
+                self.delete_stale_object_payload(req.bucket, req.key, payload);
+            }
+
+            Ok(PutObjectResult {
+                etag: format_etag(checksum::crc64::checksum(req.data)),
+                version_id: prepared.version_id,
+            })
+        })
+    }
+
     // ── Streaming upload session API ──────────────────────────────────
 
     /// Begin a streaming PutObject upload session.
@@ -3620,7 +3895,7 @@ impl Coordinator {
         Ok(())
     }
 
-    fn write_stream_segment_shards(
+    fn write_segment_shards(
         &self,
         shard_pg_id: u32,
         segment_okh: &[u8; 16],
@@ -3706,17 +3981,17 @@ impl Coordinator {
         Ok(written_shards)
     }
 
-    fn cleanup_stream_shards_locked(shard_pg: &storage::PgStore, written_shards: &[WrittenShard]) {
+    fn cleanup_written_shards_locked(shard_pg: &storage::PgStore, written_shards: &[WrittenShard]) {
         for written in written_shards {
             let _ = shard_pg.delete_shard(&written.key);
         }
     }
 
-    fn best_effort_delete_stream_shards(&self, shard_pg_id: u32, written_shards: &[WrittenShard]) {
+    fn best_effort_delete_written_shards(&self, shard_pg_id: u32, written_shards: &[WrittenShard]) {
         let Ok(shard_pg) = self.storage_node.get_pg(shard_pg_id) else {
             return;
         };
-        Self::cleanup_stream_shards_locked(&shard_pg, written_shards);
+        Self::cleanup_written_shards_locked(&shard_pg, written_shards);
     }
 
     /// Append a segment of data to an in-progress streaming session.
@@ -3784,13 +4059,13 @@ impl Coordinator {
         }
 
         let written_shards =
-            self.write_stream_segment_shards(shard_pg_id, &segment_okh, segment_vid, data)?;
+            self.write_segment_shards(shard_pg_id, &segment_okh, segment_vid, data)?;
 
         let (meta_guard, shard_guard_opt) =
             match self.storage_node.lock_two_pgs(meta_pg_id, shard_pg_id) {
                 Ok(guards) => guards,
                 Err(err) => {
-                    self.best_effort_delete_stream_shards(shard_pg_id, &written_shards);
+                    self.best_effort_delete_written_shards(shard_pg_id, &written_shards);
                     return Err(ServerError::Store(err));
                 }
             };
@@ -3806,18 +4081,18 @@ impl Coordinator {
         let session = match meta_guard.get_stream_upload(session_id) {
             Ok(session) => session,
             Err(err) => {
-                Self::cleanup_stream_shards_locked(shard_guard, &written_shards);
+                Self::cleanup_written_shards_locked(shard_guard, &written_shards);
                 return Err(ServerError::Metadata(err));
             }
         };
         if let Err(err) = Self::validate_stream_session_binding(&session, bucket, key) {
-            Self::cleanup_stream_shards_locked(shard_guard, &written_shards);
+            Self::cleanup_written_shards_locked(shard_guard, &written_shards);
             return Err(err);
         }
         if let Err(err) =
             Self::reject_duplicate_stream_segment_index(&meta_guard, session_id, segment_index)
         {
-            Self::cleanup_stream_shards_locked(shard_guard, &written_shards);
+            Self::cleanup_written_shards_locked(shard_guard, &written_shards);
             return Err(err);
         }
 
@@ -3825,18 +4100,18 @@ impl Coordinator {
             if let Err(err) = meta_guard
                 .register_written_shards_and_append_stream_segment(&shard_batch, &segment_record)
             {
-                Self::cleanup_stream_shards_locked(shard_guard, &written_shards);
+                Self::cleanup_written_shards_locked(shard_guard, &written_shards);
                 return Err(ServerError::Metadata(err));
             }
             return Ok(());
         }
 
         if let Err(err) = shard_guard.register_written_shards_batch(&shard_batch) {
-            Self::cleanup_stream_shards_locked(shard_guard, &written_shards);
+            Self::cleanup_written_shards_locked(shard_guard, &written_shards);
             return Err(ServerError::Store(err));
         }
         if let Err(err) = meta_guard.append_stream_segment(&segment_record) {
-            Self::cleanup_stream_shards_locked(shard_guard, &written_shards);
+            Self::cleanup_written_shards_locked(shard_guard, &written_shards);
             return Err(ServerError::Metadata(err));
         }
 
@@ -3873,8 +4148,6 @@ impl Coordinator {
         let tags = req.tags;
         let cond = req.cond;
         self.with_bucket_write_reservation(bucket, |bucket_info| {
-            let blob_bytes = metadata_blob.serialize()?;
-
             let meta_pg_id = self.object_pg_id(bucket, key);
             let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
 
@@ -3895,32 +4168,17 @@ impl Coordinator {
                 });
             }
 
-            if !cond.is_empty() {
-                let existing_etag = match meta_guard.get_object_meta(bucket, key) {
-                    Ok(stored) => stored.as_live().map(|record| record.etag.format()),
-                    Err(storage::MetadataError::ObjectNotFound) => None,
-                    Err(e) => return Err(ServerError::Metadata(e)),
-                };
-                if matches!(cond, WriteCondition::IfMatch(_)) && existing_etag.is_none() {
-                    return Err(ServerError::ObjectNotFound {
-                        bucket: bucket.to_string(),
-                        key: key.to_string(),
-                    });
-                }
-                check_write_conditions(cond, existing_etag.as_deref())?;
-            }
-
-            let version_id = if bucket_info.versioning == BucketVersioningState::Enabled {
-                meta_guard.next_version_id(bucket, key)?
-            } else {
-                VersionId::Null
-            };
-            let generation_id = meta_guard.next_generation_id(bucket, key)?;
-            let stale_payload = if version_id.is_null() {
-                Self::snapshot_overwritten_null_version_payload(&meta_guard, bucket, key)?
-            } else {
-                None
-            };
+            let prepared = self.prepare_put_commit_locked(
+                &meta_guard,
+                &bucket_info,
+                &PutCommitRequest {
+                    bucket,
+                    key,
+                    metadata_blob,
+                    tags,
+                    cond,
+                },
+            )?;
 
             let staging_segments = meta_guard
                 .list_stream_segments(session_id)
@@ -3938,7 +4196,7 @@ impl Coordinator {
                 .map(|segment| ObjectSegmentRecord {
                     bucket: BucketName::from(bucket),
                     key: ObjectKey::from(key),
-                    version_id,
+                    version_id: prepared.version_id,
                     segment_index: segment.segment_index,
                     size: segment.size,
                     segment_crc64: segment.segment_crc64,
@@ -3956,55 +4214,36 @@ impl Coordinator {
                     &CommitStreamPutReq {
                         bucket: BucketName::from(bucket),
                         key: ObjectKey::from(key),
-                        version_id,
-                        generation_id,
+                        version_id: prepared.version_id,
+                        generation_id: prepared.generation_id,
                         size: total_size,
                         etag_crc64: crc64,
                         ec: EcShape {
                             k: self.ec_config.data_shards,
                             m: self.ec_config.parity_shards,
                         },
-                        tags: tags.map(SerializedTagSet::from),
-                        metadata_blob: Some(SerializedMetadataBlob::from(blob_bytes)),
+                        tags: prepared.tags.clone(),
+                        metadata_blob: Some(prepared.metadata_blob.clone()),
                     },
                     &committed_segments,
                 )
                 .map_err(ServerError::Metadata)?;
-
-            if let Some(ref payload) = stale_payload {
-                match payload {
-                    StaleObjectPayload::Segments {
-                        generation_id,
-                        segments,
-                    } => {
-                        Self::enqueue_object_segments_reclaim(
-                            &meta_guard,
-                            bucket,
-                            key,
-                            *generation_id,
-                            segments,
-                        )?;
-                    }
-                    StaleObjectPayload::Multipart { .. } => {
-                        Self::delete_stale_object_payload_metadata(
-                            &meta_guard,
-                            bucket,
-                            key,
-                            version_id,
-                            payload,
-                        )?;
-                    }
-                }
-            }
+            Self::finalize_put_commit_metadata_locked(
+                &meta_guard,
+                bucket,
+                key,
+                prepared.version_id,
+                prepared.stale_payload.as_ref(),
+            )?;
 
             drop(meta_guard);
-            if let Some(ref payload) = stale_payload {
+            if let Some(ref payload) = prepared.stale_payload {
                 self.delete_stale_object_payload(bucket, key, payload);
             }
 
             Ok(PutObjectResult {
                 etag: format_etag(crc64),
-                version_id,
+                version_id: prepared.version_id,
             })
         })
     }
@@ -7386,32 +7625,7 @@ pub mod test_helpers {
         coord: &Coordinator,
         req: &PutObjectRequest<'_>,
     ) -> Result<PutObjectResult, ServerError> {
-        let session_id = coord.begin_stream_put(&BeginStreamPutRequest {
-            bucket: req.bucket,
-            key: req.key,
-            requester: req.requester,
-            acl: req.acl,
-        })?;
-        let result = (|| {
-            for (idx, chunk) in req.data.chunks(INTERNAL_SEGMENT_SIZE).enumerate() {
-                coord.append_stream_segment(req.bucket, req.key, &session_id, idx as u32, chunk)?;
-            }
-            let crc = checksum::crc64::checksum(req.data);
-            coord.finalize_stream_put(&FinalizeStreamPutRequest {
-                bucket: req.bucket,
-                key: req.key,
-                session_id: &session_id,
-                crc64: crc,
-                total_size: req.data.len() as u64,
-                metadata_blob: req.metadata,
-                tags: req.tags,
-                cond: req.cond,
-            })
-        })();
-        if result.is_err() {
-            let _ = coord.abort_stream_put(req.bucket, req.key, &session_id);
-        }
-        result
+        coord.put_object(req)
     }
 
     /// Upload a multipart part via the streaming path (begin → append → finalize).
@@ -17521,6 +17735,80 @@ mod tests {
             })
             .unwrap();
         assert_eq!(result.body.read_all().unwrap(), b"copy-me");
+    }
+
+    #[test]
+    fn buffered_put_single_segment_skips_stream_session_rows() {
+        let dir = test_util::tempdir();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let result = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"tiny-data",
+                metadata: &MetadataBlob::new(),
+                tags: None,
+                cond: &WriteCondition::default(),
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
+            },
+        )
+        .unwrap();
+
+        let meta_pg_id = coord.object_pg_id("bucket", "key");
+        let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
+        let segments = pg
+            .get_object_segments("bucket", "key", result.version_id)
+            .unwrap();
+        assert_eq!(segments.len(), 1);
+        assert!(pg.list_all_stream_uploads().unwrap().is_empty());
+        drop(pg);
+
+        let get = coord
+            .get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: NO_READ,
+                requester: TEST_REQUESTER,
+            })
+            .unwrap();
+        assert_eq!(get.body.read_all().unwrap(), b"tiny-data");
+    }
+
+    #[test]
+    fn buffered_put_exact_segment_skips_stream_session_rows() {
+        let dir = test_util::tempdir();
+        let coord = setup_coordinator(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let data = vec![0xAB; INTERNAL_SEGMENT_SIZE];
+        let result = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                bucket: "bucket",
+                key: "exact",
+                data: &data,
+                metadata: &MetadataBlob::new(),
+                tags: None,
+                cond: &WriteCondition::default(),
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
+            },
+        )
+        .unwrap();
+
+        let meta_pg_id = coord.object_pg_id("bucket", "exact");
+        let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
+        let segments = pg
+            .get_object_segments("bucket", "exact", result.version_id)
+            .unwrap();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].size, INTERNAL_SEGMENT_SIZE as u64);
+        assert!(pg.list_all_stream_uploads().unwrap().is_empty());
     }
 
     #[test]

@@ -811,48 +811,18 @@ impl HttpFrontend {
                     let requester =
                         crate::coordinator::Requester::from_principal(auth.principal.as_deref());
                     let acl = parse_put_object_acl(req.header("x-amz-acl"));
-                    let session_id = self.coordinator.begin_stream_put(
-                        &crate::coordinator::BeginStreamPutRequest {
-                            bucket: &bucket,
-                            key: &key,
-                            requester,
-                            acl,
-                        },
-                    )?;
-                    let result = (|| {
-                        for (idx, chunk) in req
-                            .body
-                            .chunks(crate::coordinator::INTERNAL_SEGMENT_SIZE)
-                            .enumerate()
-                        {
-                            self.coordinator.append_stream_segment(
-                                &bucket,
-                                &key,
-                                &session_id,
-                                idx as u32,
-                                chunk,
-                            )?;
-                        }
-                        let crc = checksum::crc64::checksum(&req.body);
-                        self.coordinator.finalize_stream_put(
-                            &crate::coordinator::FinalizeStreamPutRequest {
+                    let result =
+                        self.coordinator
+                            .put_object(&crate::coordinator::PutObjectRequest {
                                 bucket: &bucket,
                                 key: &key,
-                                session_id: &session_id,
-                                crc64: crc,
-                                total_size: req.body.len() as u64,
-                                metadata_blob: &metadata_blob,
+                                data: &req.body,
+                                metadata: &metadata_blob,
                                 tags: inline_tags_xml.as_deref(),
                                 cond: &cond,
-                            },
-                        )
-                    })();
-                    if result.is_err() {
-                        let _ = self
-                            .coordinator
-                            .abort_stream_put(&bucket, &key, &session_id);
-                    }
-                    let result = result?;
+                                requester,
+                                acl,
+                            })?;
                     let mut resp = S3Response::put_object(&result);
                     for &(_, header) in CHECKSUM_HEADERS {
                         if let Some(value) = req.header(header) {
@@ -2286,10 +2256,51 @@ impl HttpFrontend {
         );
     }
 
-    /// Prepare a streaming `PutObject`: authenticate, validate, begin session.
+    fn merged_streaming_put_metadata_blob(
+        ctx: &StreamingPutContext,
+        trailer_checksums: &[(String, String)],
+    ) -> crate::metadata_blob::MetadataBlob {
+        if trailer_checksums.is_empty() {
+            return ctx.metadata_blob.clone();
+        }
+
+        let mut blob = ctx.metadata_blob.clone();
+        for (k, v) in trailer_checksums {
+            blob.set(k, v);
+        }
+        blob
+    }
+
+    fn apply_streaming_put_checksum_headers(
+        ctx: &StreamingPutContext,
+        resp: &mut S3Response,
+        trailer_checksums: &[(String, String)],
+    ) {
+        for (name, value) in &ctx.checksum.response_headers.0 {
+            if let Some((_, tv)) = trailer_checksums.iter().find(|(k, _)| k == name) {
+                resp.headers.push((name.clone(), tv.clone()));
+            } else {
+                resp.headers.push((name.clone(), value.clone()));
+            }
+        }
+        for (name, value) in trailer_checksums {
+            if !ctx
+                .checksum
+                .response_headers
+                .0
+                .iter()
+                .any(|(k, _)| k == name)
+            {
+                resp.headers.push((name.clone(), value.clone()));
+            }
+        }
+    }
+
+    /// Prepare a streaming `PutObject`: authenticate and validate the request.
     ///
     /// Returns a context struct that the async streaming loop uses to drive
-    /// segment appends and finalization.
+    /// either the direct single-segment fast path or a promoted streaming
+    /// session once the body exceeds one internal segment.
     pub fn prepare_streaming_put(
         &self,
         req: &S3Request,
@@ -2361,20 +2372,12 @@ impl HttpFrontend {
             }
         }
 
-        let session_id = self.coordinator.begin_stream_put(&BeginStreamPutRequest {
-            bucket,
-            key,
-            requester: crate::coordinator::Requester::from_principal(auth.principal.as_deref()),
-            acl: parse_put_object_acl(req.header("x-amz-acl")),
-        })?;
-
         Ok(StreamingPutContext {
             trace: current_trace_context(),
-            binding: StreamObjectBinding {
-                session_id,
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-            },
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            requester_principal: auth.principal,
+            acl_header: req.header("x-amz-acl").map(str::to_string),
             metadata_blob,
             cond,
             inline_tags_xml,
@@ -2385,10 +2388,35 @@ impl HttpFrontend {
         })
     }
 
+    /// Start a stream-backed `PutObject` session after the body has exceeded
+    /// one internal segment.
+    pub fn start_streaming_put_session(
+        &self,
+        ctx: &StreamingPutContext,
+    ) -> Result<String, ServerError> {
+        let _trace = observability::AttachedTrace::new(ctx.trace.clone());
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "HttpFrontend::start_streaming_put_session",
+            "bucket={} key={}",
+            ctx.bucket,
+            ctx.key
+        );
+        self.coordinator.begin_stream_put(&BeginStreamPutRequest {
+            bucket: &ctx.bucket,
+            key: &ctx.key,
+            requester: crate::coordinator::Requester::from_principal(
+                ctx.requester_principal.as_deref(),
+            ),
+            acl: parse_put_object_acl(ctx.acl_header.as_deref()),
+        })
+    }
+
     /// Append a segment to a streaming session.
     pub fn streaming_append_segment(
         &self,
         ctx: &StreamingPutContext,
+        session_id: &str,
         segment_index: u32,
         data: &[u8],
     ) -> Result<(), ServerError> {
@@ -2397,18 +2425,56 @@ impl HttpFrontend {
             TRACE_TARGET,
             "HttpFrontend::streaming_append_segment",
             "bucket={} key={} segment_index={} bytes={}",
-            ctx.binding.bucket,
-            ctx.binding.key,
+            ctx.bucket,
+            ctx.key,
             segment_index,
             data.len()
         );
         self.coordinator.append_stream_segment(
-            &ctx.binding.bucket,
-            &ctx.binding.key,
-            &ctx.binding.session_id,
+            &ctx.bucket,
+            &ctx.key,
+            session_id,
             segment_index,
             data,
         )
+    }
+
+    /// Commit a single-segment `PutObject` without creating a stream session.
+    pub fn put_single_segment_object(
+        &self,
+        ctx: &StreamingPutContext,
+        data: &[u8],
+        trailer_checksums: &[(String, String)],
+    ) -> Result<S3Response, ServerError> {
+        let _trace = observability::AttachedTrace::new(ctx.trace.clone());
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "HttpFrontend::put_single_segment_object",
+            "bucket={} key={} bytes={} trailer_checksums={}",
+            ctx.bucket,
+            ctx.key,
+            data.len(),
+            trailer_checksums.len()
+        );
+        let metadata_blob = Self::merged_streaming_put_metadata_blob(ctx, trailer_checksums);
+        let result = self
+            .coordinator
+            .put_object(&crate::coordinator::PutObjectRequest {
+                bucket: &ctx.bucket,
+                key: &ctx.key,
+                data,
+                metadata: &metadata_blob,
+                tags: ctx.inline_tags_xml.as_deref(),
+                cond: &ctx.cond,
+                requester: crate::coordinator::Requester::from_principal(
+                    ctx.requester_principal.as_deref(),
+                ),
+                acl: parse_put_object_acl(ctx.acl_header.as_deref()),
+            })?;
+
+        let mut resp = S3Response::put_object(&result);
+        Self::apply_streaming_put_checksum_headers(ctx, &mut resp, trailer_checksums);
+        Ok(resp)
     }
 
     /// Finalize a streaming `PutObject` session and return an `S3Response`.
@@ -2419,6 +2485,7 @@ impl HttpFrontend {
     pub fn finalize_streaming_put(
         &self,
         ctx: &StreamingPutContext,
+        session_id: &str,
         crc64: u64,
         total_size: u64,
         trailer_checksums: &[(String, String)],
@@ -2428,29 +2495,19 @@ impl HttpFrontend {
             TRACE_TARGET,
             "HttpFrontend::finalize_streaming_put",
             "bucket={} key={} bytes={} trailer_checksums={}",
-            ctx.binding.bucket,
-            ctx.binding.key,
+            ctx.bucket,
+            ctx.key,
             total_size,
             trailer_checksums.len()
         );
-        // Merge trailer checksums into metadata blob so they're persisted.
-        // Trailer values override any matching initial header entries.
-        let metadata_blob = if trailer_checksums.is_empty() {
-            ctx.metadata_blob.clone()
-        } else {
-            let mut blob = ctx.metadata_blob.clone();
-            for (k, v) in trailer_checksums {
-                blob.set(k, v);
-            }
-            blob
-        };
+        let metadata_blob = Self::merged_streaming_put_metadata_blob(ctx, trailer_checksums);
 
         let result = self
             .coordinator
             .finalize_stream_put(&FinalizeStreamPutRequest {
-                bucket: &ctx.binding.bucket,
-                key: &ctx.binding.key,
-                session_id: &ctx.binding.session_id,
+                bucket: &ctx.bucket,
+                key: &ctx.key,
+                session_id,
                 crc64,
                 total_size,
                 metadata_blob: &metadata_blob,
@@ -2459,43 +2516,23 @@ impl HttpFrontend {
             })?;
 
         let mut resp = S3Response::put_object(&result);
-        // Echo checksum headers. Trailer values override initial header values.
-        for (name, value) in &ctx.checksum.response_headers.0 {
-            if let Some((_, tv)) = trailer_checksums.iter().find(|(k, _)| k == name) {
-                resp.headers.push((name.clone(), tv.clone()));
-            } else {
-                resp.headers.push((name.clone(), value.clone()));
-            }
-        }
-        for (name, value) in trailer_checksums {
-            if !ctx
-                .checksum
-                .response_headers
-                .0
-                .iter()
-                .any(|(k, _)| k == name)
-            {
-                resp.headers.push((name.clone(), value.clone()));
-            }
-        }
+        Self::apply_streaming_put_checksum_headers(ctx, &mut resp, trailer_checksums);
         Ok(resp)
     }
 
     /// Abort a streaming session (best-effort cleanup).
-    pub fn abort_streaming_put(&self, ctx: &StreamingPutContext) {
+    pub fn abort_streaming_put(&self, ctx: &StreamingPutContext, session_id: &str) {
         let _trace = observability::AttachedTrace::new(ctx.trace.clone());
         observability::trace_scope!(
             TRACE_TARGET,
             "HttpFrontend::abort_streaming_put",
             "bucket={} key={}",
-            ctx.binding.bucket,
-            ctx.binding.key
+            ctx.bucket,
+            ctx.key
         );
-        let _ = self.coordinator.abort_stream_put(
-            &ctx.binding.bucket,
-            &ctx.binding.key,
-            &ctx.binding.session_id,
-        );
+        let _ = self
+            .coordinator
+            .abort_stream_put(&ctx.bucket, &ctx.key, session_id);
     }
 
     /// Prepare a streaming `UploadPart` session.
@@ -2726,7 +2763,10 @@ pub struct StreamingPartChecksumContract {
 /// Created by `prepare_streaming_put`, used across async/blocking boundaries.
 pub struct StreamingPutContext {
     pub trace: observability::TraceContext,
-    pub binding: StreamObjectBinding,
+    pub bucket: String,
+    pub key: String,
+    pub requester_principal: Option<String>,
+    pub acl_header: Option<String>,
     pub metadata_blob: crate::metadata_blob::MetadataBlob,
     pub cond: crate::conditional::WriteCondition,
     pub inline_tags_xml: Option<String>,
