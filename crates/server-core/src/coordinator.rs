@@ -14,7 +14,7 @@ use storage::traits::{PgMetadataStore, ShardStore};
 #[cfg(test)]
 use storage::SimplePayloadReclaimRecord;
 use storage::{
-    BucketInfo, BucketName, BucketState, CommitMultipartReq,
+    BucketFastPathInfo, BucketInfo, BucketName, BucketState, CommitMultipartReq,
     CommitStreamPutReq, CreateMultipartUploadReq, CreateStreamUploadReq, EcShape, GenerationId,
     ListMultipartUploadsReq, ListObjectVersionsReq, ListObjectsReq, ListPartsReq,
     MultipartPartRecord, MultipartPartSegmentRecord, MultipartReclaimPartRecord,
@@ -2399,7 +2399,7 @@ impl Coordinator {
         requester: Requester<'_>,
         bucket: &str,
     ) -> Result<BucketSummary, ServerError> {
-        let info = self.head_bucket(bucket)?;
+        let info = self.active_bucket_summary(bucket)?;
         if Self::requester_can_read_bucket(
             requester,
             &info.owner_principal,
@@ -2416,7 +2416,7 @@ impl Coordinator {
         requester: Requester<'_>,
         bucket: &str,
     ) -> Result<BucketSummary, ServerError> {
-        let info = self.head_bucket(bucket)?;
+        let info = self.active_bucket_summary(bucket)?;
         if Self::requester_can_bucket_admin(requester, &info.owner_principal) {
             Ok(info)
         } else {
@@ -2429,7 +2429,7 @@ impl Coordinator {
         requester: Requester<'_>,
         bucket: &str,
     ) -> Result<BucketSummary, ServerError> {
-        let info = self.head_bucket(bucket)?;
+        let info = self.active_bucket_summary(bucket)?;
         if Self::requester_can_object_write(
             requester,
             &info.owner_principal,
@@ -2445,7 +2445,10 @@ impl Coordinator {
         loop {
             let bucket_pg = self.get_bucket_pg(bucket)?;
             match bucket_pg.acquire_bucket_write_reservation(bucket) {
-                Ok(info) => return Ok(Self::bucket_summary(info)),
+                Ok(info) => {
+                    self.storage_node.upsert_bucket_fast_path((&info).into());
+                    return Ok(Self::bucket_summary(info));
+                }
                 Err(storage::MetadataError::BucketWriteDraining) => {
                     drop(bucket_pg);
                     std::thread::sleep(std::time::Duration::from_millis(1));
@@ -2536,6 +2539,41 @@ impl Coordinator {
             public_access_block: info.public_access_block,
             ownership_controls: info.ownership_controls,
         }
+    }
+
+    fn bucket_summary_fast(info: BucketFastPathInfo) -> BucketSummary {
+        BucketSummary {
+            name: info.name.into_string(),
+            owner_principal: info.owner_principal,
+            owner_canonical_id: info.owner_canonical_id,
+            created_at: info.created_at,
+            public_read: info.public_read,
+            public_write: info.public_write,
+            versioning: info.versioning,
+            public_access_block: info.public_access_block,
+            ownership_controls: info.ownership_controls,
+        }
+    }
+
+    fn active_bucket_summary(&self, name: &str) -> Result<BucketSummary, ServerError> {
+        if let Some(info) = self.storage_node.get_bucket_fast_path(name) {
+            if info.state == BucketState::Active {
+                return Ok(Self::bucket_summary_fast(info));
+            }
+            return Err(ServerError::BucketNotFound {
+                name: name.to_string(),
+            });
+        }
+
+        let bucket_pg = self.get_bucket_pg(name)?;
+        let info = bucket_pg.head_bucket(name).map_err(|e| match e {
+            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                name: name.to_string(),
+            },
+            other => ServerError::Metadata(other),
+        })?;
+        self.storage_node.upsert_bucket_fast_path((&info).into());
+        Ok(Self::bucket_summary(info))
     }
 
     /// Create a new coordinator.
@@ -2712,7 +2750,18 @@ impl Coordinator {
             public_read,
             public_write,
         ) {
-            Ok(()) => Ok(BucketCreateOutcome::Created),
+            Ok(()) => {
+                let info = bucket_pg.head_bucket_raw(name).map_err(|e| match e {
+                    storage::MetadataError::BucketNotFound { name } => {
+                        ServerError::BucketNotFound {
+                            name: name.to_string(),
+                        }
+                    }
+                    other => ServerError::Metadata(other),
+                })?;
+                self.storage_node.upsert_bucket_fast_path((&info).into());
+                Ok(BucketCreateOutcome::Created)
+            }
             Err(storage::MetadataError::BucketAlreadyExists) => {
                 let existing = bucket_pg.head_bucket_raw(name).map_err(|e| match e {
                     storage::MetadataError::BucketNotFound { name } => {
@@ -2789,6 +2838,7 @@ impl Coordinator {
                 },
                 other => ServerError::Metadata(other),
             })?;
+            self.storage_node.remove_bucket_fast_path(name);
             marked_deleting = true;
             self.read_runtime().enqueue_bucket_delete_finalize(name);
             Ok(())
@@ -2803,16 +2853,7 @@ impl Coordinator {
     }
 
     pub fn head_bucket(&self, name: &str) -> Result<BucketSummary, ServerError> {
-        let bucket_pg = self.get_bucket_pg(name)?;
-        bucket_pg
-            .head_bucket(name)
-            .map(Self::bucket_summary)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })
+        self.active_bucket_summary(name)
     }
 
     pub fn head_bucket_for_requester(
@@ -2882,7 +2923,10 @@ impl Coordinator {
                     }
                 }
                 other => ServerError::Metadata(other),
-            })
+            })?;
+        self.storage_node
+            .update_bucket_fast_path_if_present(name, |info| info.versioning = state);
+        Ok(())
     }
 
     pub fn get_bucket_versioning(
@@ -3068,7 +3112,13 @@ impl Coordinator {
                     name: name.to_string(),
                 },
                 other => ServerError::Metadata(other),
-            })
+            })?;
+        let config = config.to_string();
+        self.storage_node
+            .update_bucket_fast_path_if_present(name, |info| {
+                info.public_access_block = Some(config);
+            });
+        Ok(())
     }
 
     pub fn get_bucket_public_access_block(
@@ -3114,7 +3164,10 @@ impl Coordinator {
                     name: name.to_string(),
                 },
                 other => ServerError::Metadata(other),
-            })
+            })?;
+        self.storage_node
+            .update_bucket_fast_path_if_present(name, |info| info.public_access_block = None);
+        Ok(())
     }
 
     // ── Bucket ACL ───────────────────────────────────────────────────
@@ -3163,7 +3216,13 @@ impl Coordinator {
                     name: name.to_string(),
                 },
                 other => ServerError::Metadata(other),
-            })
+            })?;
+        self.storage_node
+            .update_bucket_fast_path_if_present(name, |info| {
+                info.public_read = public_read;
+                info.public_write = public_write;
+            });
+        Ok(())
     }
 
     pub fn get_bucket_acl(
@@ -3221,7 +3280,13 @@ impl Coordinator {
                     name: name.to_string(),
                 },
                 other => ServerError::Metadata(other),
-            })
+            })?;
+        let config = config.to_string();
+        self.storage_node
+            .update_bucket_fast_path_if_present(name, |info| {
+                info.ownership_controls = Some(config);
+            });
+        Ok(())
     }
 
     pub fn get_bucket_ownership_controls(
@@ -3267,7 +3332,10 @@ impl Coordinator {
                     name: name.to_string(),
                 },
                 other => ServerError::Metadata(other),
-            })
+            })?;
+        self.storage_node
+            .update_bucket_fast_path_if_present(name, |info| info.ownership_controls = None);
+        Ok(())
     }
 
     // ── Object tagging ──────────────────────────────────────────────
@@ -7805,6 +7873,21 @@ mod tests {
         panic!("failed to find a key with meta_pg_id > shard_pg_id");
     }
 
+    fn find_key_with_object_pg_ne_bucket_pg(
+        coord: &Coordinator,
+        bucket: &str,
+        prefix: &str,
+    ) -> String {
+        let bucket_pg_id = coord.bucket_pg_id(bucket);
+        for suffix in 0..1024 {
+            let key = format!("{prefix}-{suffix}");
+            if coord.object_pg_id(bucket, &key) != bucket_pg_id {
+                return key;
+            }
+        }
+        panic!("failed to find a key with object_pg_id != bucket_pg_id");
+    }
+
     fn assert_object_maps_meta_pg_gt_shard_pg(coord: &Coordinator, bucket: &str, key: &str) {
         let meta_pg_id = coord.object_pg_id(bucket, key);
         let meta_pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
@@ -8369,6 +8452,200 @@ mod tests {
             res.is_ok(),
             "delete_bucket should succeed without waiting on bucket lock: {res:?}"
         );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn head_object_lazily_populates_bucket_fast_path() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+        let key = find_key_with_object_pg_ne_bucket_pg(&coord, "bucket", "head-fast");
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                bucket: "bucket",
+                key: &key,
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                tags: None,
+                cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
+            },
+        )
+        .unwrap();
+
+        coord.storage_node.remove_bucket_fast_path("bucket");
+        assert!(coord.storage_node.get_bucket_fast_path("bucket").is_none());
+
+        let head = coord
+            .head_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: &key,
+                version_id: None,
+                cond: NO_READ,
+                requester: TEST_REQUESTER,
+            })
+            .unwrap();
+        assert_eq!(head.size, 4);
+
+        let cached = coord
+            .storage_node
+            .get_bucket_fast_path("bucket")
+            .expect("head_object should repopulate bucket fast path");
+        assert_eq!(cached.name.as_str(), "bucket");
+        assert_eq!(cached.state, BucketState::Active);
+    }
+
+    #[test]
+    fn head_object_does_not_wait_for_bucket_pg_when_fast_path_is_warm() {
+        let tmp = test_util::tempdir();
+        let pg_ids: Vec<u32> = (0..4).collect();
+        let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
+        let ec_config = EcConfig::new(4, 2).unwrap();
+
+        let admin = Coordinator::new(
+            Arc::clone(&storage_node),
+            ec_config,
+            "us-east-1".to_string(),
+        )
+        .unwrap();
+        let reader = Coordinator::new(
+            Arc::clone(&storage_node),
+            ec_config,
+            "us-east-1".to_string(),
+        )
+        .unwrap();
+
+        admin.create_bucket("bucket").unwrap();
+        let key = find_key_with_object_pg_ne_bucket_pg(&admin, "bucket", "head-fast");
+        test_helpers::put_object(
+            &admin,
+            &PutObjectRequest {
+                bucket: "bucket",
+                key: &key,
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                tags: None,
+                cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
+            },
+        )
+        .unwrap();
+
+        storage_node.remove_bucket_fast_path("bucket");
+        reader
+            .head_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: &key,
+                version_id: None,
+                cond: NO_READ,
+                requester: TEST_REQUESTER,
+            })
+            .unwrap();
+
+        let bucket_pg = admin.get_bucket_pg("bucket").unwrap();
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let res = reader.head_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: &key,
+                version_id: None,
+                cond: NO_READ,
+                requester: TEST_REQUESTER,
+            });
+            tx.send(res).unwrap();
+        });
+
+        let head = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("head_object should not block on bucket pg")
+            .unwrap();
+        drop(bucket_pg);
+        assert_eq!(head.size, 4);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn delete_object_does_not_wait_for_bucket_pg_when_fast_path_is_warm() {
+        let tmp = test_util::tempdir();
+        let pg_ids: Vec<u32> = (0..4).collect();
+        let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
+        let ec_config = EcConfig::new(4, 2).unwrap();
+
+        let admin = Coordinator::new(
+            Arc::clone(&storage_node),
+            ec_config,
+            "us-east-1".to_string(),
+        )
+        .unwrap();
+        let deleter = Coordinator::new(
+            Arc::clone(&storage_node),
+            ec_config,
+            "us-east-1".to_string(),
+        )
+        .unwrap();
+
+        admin.create_bucket("bucket").unwrap();
+        let key = find_key_with_object_pg_ne_bucket_pg(&admin, "bucket", "delete-fast");
+        test_helpers::put_object(
+            &admin,
+            &PutObjectRequest {
+                bucket: "bucket",
+                key: &key,
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                tags: None,
+                cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
+            },
+        )
+        .unwrap();
+
+        storage_node.remove_bucket_fast_path("bucket");
+        admin
+            .head_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: &key,
+                version_id: None,
+                cond: NO_READ,
+                requester: TEST_REQUESTER,
+            })
+            .unwrap();
+
+        let bucket_pg = admin.get_bucket_pg("bucket").unwrap();
+        let (tx, rx) = mpsc::channel();
+        let key_for_delete = key.clone();
+        let handle = thread::spawn(move || {
+            let res = deleter.delete_object(&DeleteObjectRequest {
+                bucket: "bucket",
+                key: &key_for_delete,
+                version_id: None,
+                cond: NO_DELETE,
+                requester: TEST_REQUESTER,
+            });
+            tx.send(res).unwrap();
+        });
+
+        let deleted = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("delete_object should not block on bucket pg")
+            .unwrap();
+        drop(bucket_pg);
+        assert!(!deleted.delete_marker);
+        assert!(matches!(
+            admin.get_object(&GetObjectRequest {
+                bucket: "bucket",
+                key: &key,
+                version_id: None,
+                cond: NO_READ,
+                requester: TEST_REQUESTER,
+            }),
+            Err(ServerError::ObjectNotFound { .. })
+        ));
         handle.join().unwrap();
     }
 
