@@ -1,11 +1,13 @@
 use std::cell::RefCell;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TraceContext {
@@ -51,13 +53,90 @@ struct TraceConfig {
 
 static TRACE_CONFIG: OnceLock<TraceConfig> = OnceLock::new();
 static TRACE_CONFIG_OVERRIDE: OnceLock<TraceConfig> = OnceLock::new();
+
 enum TraceSink {
     Stderr,
-    File(Mutex<File>),
+    AsyncFile(AsyncTraceSink),
+    SyncFile(Mutex<BufWriter<File>>),
 }
 
 static TRACE_SINK: OnceLock<TraceSink> = OnceLock::new();
 static TRACE_SINK_OVERRIDE: OnceLock<TraceSink> = OnceLock::new();
+
+const TRACE_FILE_QUEUE_CAPACITY: usize = 16_384;
+const TRACE_FILE_IDLE_FLUSH_INTERVAL: Duration = Duration::from_millis(50);
+
+struct AsyncTraceSink {
+    sender: mpsc::SyncSender<Box<str>>,
+    writer_failed: AtomicBool,
+    dropped_lines: AtomicU64,
+}
+
+impl AsyncTraceSink {
+    fn new(file: File) -> io::Result<Self> {
+        let (sender, receiver) = mpsc::sync_channel::<Box<str>>(TRACE_FILE_QUEUE_CAPACITY);
+        thread::Builder::new()
+            .name("argmin-trace-writer".to_string())
+            .spawn(move || trace_writer_loop(file, receiver))?;
+        Ok(Self {
+            sender,
+            writer_failed: AtomicBool::new(false),
+            dropped_lines: AtomicU64::new(0),
+        })
+    }
+
+    fn write_line(&self, args: fmt::Arguments<'_>) {
+        if self.writer_failed.load(Ordering::Relaxed) {
+            write_stderr_line(args);
+            return;
+        }
+
+        let line = fmt::format(args).into_boxed_str();
+        match self.sender.try_send(line) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_line)) => {
+                self.dropped_lines.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(TrySendError::Disconnected(line)) => {
+                self.writer_failed.store(true, Ordering::Relaxed);
+                write_stderr_str(&line);
+            }
+        }
+    }
+}
+
+fn trace_writer_loop(file: File, receiver: mpsc::Receiver<Box<str>>) {
+    let mut writer = BufWriter::new(file);
+    loop {
+        match receiver.recv_timeout(TRACE_FILE_IDLE_FLUSH_INTERVAL) {
+            Ok(line) => {
+                let _ = writer.write_all(line.as_bytes());
+                let _ = writer.write_all(b"\n");
+                while let Ok(line) = receiver.try_recv() {
+                    let _ = writer.write_all(line.as_bytes());
+                    let _ = writer.write_all(b"\n");
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                let _ = writer.flush();
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                let _ = writer.flush();
+                break;
+            }
+        }
+    }
+}
+
+fn write_stderr_line(args: fmt::Arguments<'_>) {
+    let mut stderr = io::stderr().lock();
+    let _ = writeln!(stderr, "{args}");
+}
+
+fn write_stderr_str(line: &str) {
+    let mut stderr = io::stderr().lock();
+    let _ = writeln!(stderr, "{line}");
+}
 
 fn trace_config() -> &'static TraceConfig {
     TRACE_CONFIG_OVERRIDE
@@ -87,7 +166,29 @@ fn init_trace_sink(config: &TraceConfig) -> TraceSink {
     }
 
     match OpenOptions::new().create(true).append(true).open(path) {
-        Ok(file) => TraceSink::File(Mutex::new(file)),
+        Ok(file) => match AsyncTraceSink::new(file) {
+            Ok(sink) => TraceSink::AsyncFile(sink),
+            Err(err) => {
+                let _ = writeln!(
+                    io::stderr(),
+                    "observability: failed to start trace writer thread for {}: {}",
+                    path.display(),
+                    err
+                );
+                match OpenOptions::new().create(true).append(true).open(path) {
+                    Ok(file) => TraceSink::SyncFile(Mutex::new(BufWriter::new(file))),
+                    Err(err) => {
+                        let _ = writeln!(
+                            io::stderr(),
+                            "observability: failed to reopen trace file {}: {}",
+                            path.display(),
+                            err
+                        );
+                        TraceSink::Stderr
+                    }
+                }
+            }
+        },
         Err(err) => {
             let _ = writeln!(
                 io::stderr(),
@@ -154,11 +255,9 @@ pub fn configure(enabled: bool, filter: Option<&str>, file_path: Option<&str>) -
 
 fn write_trace_line(args: fmt::Arguments<'_>) {
     match trace_sink() {
-        TraceSink::Stderr => {
-            let mut stderr = io::stderr().lock();
-            let _ = writeln!(stderr, "{args}");
-        }
-        TraceSink::File(file) => {
+        TraceSink::Stderr => write_stderr_line(args),
+        TraceSink::AsyncFile(file) => file.write_line(args),
+        TraceSink::SyncFile(file) => {
             let mut file = file.lock().unwrap_or_else(|err| err.into_inner());
             let _ = writeln!(file, "{args}");
         }
