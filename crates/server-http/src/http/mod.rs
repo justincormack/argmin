@@ -394,9 +394,19 @@ impl HttpFrontend {
             s3req.query_string()
         );
         // Route first to detect OPTIONS requests (which bypass auth).
-        let operation = match route(s3req.method.as_str(), s3req.path(), s3req.query_string()) {
-            Ok(op) => op,
-            Err(err) => return S3Response::error(&err, s3req.path()),
+        let operation = {
+            observability::trace_scope!(
+                TRACE_TARGET,
+                "HttpFrontend::route_request",
+                "method={} path={} query={}",
+                s3req.method.as_str(),
+                s3req.path(),
+                s3req.query_string()
+            );
+            match route(s3req.method.as_str(), s3req.path(), s3req.query_string()) {
+                Ok(op) => op,
+                Err(err) => return S3Response::error(&err, s3req.path()),
+            }
         };
 
         // OPTIONS (preflight CORS) bypasses authentication.
@@ -404,7 +414,16 @@ impl HttpFrontend {
             return self.handle_options_request(s3req, bucket);
         }
 
-        let auth = self.authenticate(s3req);
+        let auth = {
+            observability::trace_scope!(
+                TRACE_TARGET,
+                "HttpFrontend::authenticate",
+                "method={} path={}",
+                s3req.method.as_str(),
+                s3req.path()
+            );
+            self.authenticate(s3req)
+        };
         let result = match auth {
             Ok(auth) => {
                 // Streaming requests (STREAMING-*) should be handled by serve.rs's
@@ -420,26 +439,43 @@ impl HttpFrontend {
             Err(err) => Err(err),
         };
 
-        let mut resp = match result {
-            Ok(resp) => resp,
-            Err(ServerError::NotModified {
-                ref etag,
-                last_modified,
-            }) => S3Response::not_modified(etag, last_modified),
-            Err(ServerError::PreconditionFailed) => S3Response::precondition_failed(),
-            Err(ref err @ ServerError::DeleteMarkerHit { .. }) => {
-                let mut resp = S3Response::error(err, s3req.path());
-                resp.headers
-                    .push(("x-amz-delete-marker".to_string(), "true".to_string()));
-                resp
+        let mut resp = {
+            observability::trace_scope!(
+                TRACE_TARGET,
+                "HttpFrontend::map_dispatch_result",
+                "method={} path={}",
+                s3req.method.as_str(),
+                s3req.path()
+            );
+            match result {
+                Ok(resp) => resp,
+                Err(ServerError::NotModified {
+                    ref etag,
+                    last_modified,
+                }) => S3Response::not_modified(etag, last_modified),
+                Err(ServerError::PreconditionFailed) => S3Response::precondition_failed(),
+                Err(ref err @ ServerError::DeleteMarkerHit { .. }) => {
+                    let mut resp = S3Response::error(err, s3req.path());
+                    resp.headers
+                        .push(("x-amz-delete-marker".to_string(), "true".to_string()));
+                    resp
+                }
+                Err(err) => S3Response::error(&err, s3req.path()),
             }
-            Err(err) => S3Response::error(&err, s3req.path()),
         };
 
         // CORS response headers on actual (non-preflight) requests.
         if let Some(origin) = s3req.header("origin") {
             let bucket = self.extract_bucket_from_path(s3req.path());
             if let Some(bucket) = bucket {
+                observability::trace_scope!(
+                    TRACE_TARGET,
+                    "HttpFrontend::apply_actual_cors",
+                    "method={} path={} bucket={}",
+                    s3req.method.as_str(),
+                    s3req.path(),
+                    bucket
+                );
                 self.apply_cors_headers(&mut resp, &bucket, origin, s3req.method.as_str());
             }
         }
