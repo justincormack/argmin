@@ -2426,6 +2426,70 @@ impl Coordinator {
         }
     }
 
+    fn acquire_bucket_write_reservation(&self, bucket: &str) -> Result<BucketSummary, ServerError> {
+        loop {
+            let bucket_pg = self.get_bucket_pg(bucket)?;
+            match bucket_pg.acquire_bucket_write_reservation(bucket) {
+                Ok(info) => return Ok(Self::bucket_summary(info)),
+                Err(storage::MetadataError::BucketWriteDraining) => {
+                    drop(bucket_pg);
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(storage::MetadataError::BucketNotFound { name }) => {
+                    return Err(ServerError::BucketNotFound {
+                        name: name.to_string(),
+                    });
+                }
+                Err(other) => return Err(ServerError::Metadata(other)),
+            }
+        }
+    }
+
+    fn release_bucket_write_reservation(&self, bucket: &str) -> Result<(), ServerError> {
+        let bucket_pg = self.get_bucket_pg(bucket)?;
+        bucket_pg
+            .release_bucket_write_reservation(bucket)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })
+    }
+
+    fn with_bucket_write_reservation<T>(
+        &self,
+        bucket: &str,
+        action: impl FnOnce(BucketSummary) -> Result<T, ServerError>,
+    ) -> Result<T, ServerError> {
+        let bucket_info = self.acquire_bucket_write_reservation(bucket)?;
+        let result = action(bucket_info);
+        let release_result = self.release_bucket_write_reservation(bucket);
+        match (result, release_result) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Ok(_), Err(err)) => Err(err),
+            (Err(err), Ok(())) => Err(err),
+            (Err(err), Err(_)) => Err(err),
+        }
+    }
+
+    fn wait_for_bucket_write_reservations_to_drain(&self, bucket: &str) -> Result<(), ServerError> {
+        loop {
+            let bucket_pg = self.get_bucket_pg(bucket)?;
+            let info = bucket_pg.head_bucket_raw(bucket).map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })?;
+            if info.active_write_reservations == 0 {
+                return Ok(());
+            }
+            drop(bucket_pg);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
     fn bucket_summary(info: BucketInfo) -> BucketSummary {
         BucketSummary {
             name: info.name.into_string(),
@@ -2646,43 +2710,72 @@ impl Coordinator {
         let name = req.name;
         let _bucket_guard = self.storage_node.lock_bucket(name);
         let _bucket_info = self.authorize_bucket_admin_requester(req.requester, name)?;
-
-        // Check emptiness: list all object versions (including delete markers)
-        // and multipart uploads across all PGs.
-        self.pg_topology.for_each_pg(|pg_id| {
-            let pg = self.storage_node.get_pg(pg_id)?;
-            let resp = pg.list_object_versions(&ListObjectVersionsReq {
-                bucket: BucketName::from(name),
-                prefix: None,
-                key_marker: None,
-                version_id_marker: None,
-                max_keys: 1,
-            })?;
-            if !resp.versions.is_empty() {
-                return Err(ServerError::BucketNotEmpty);
-            }
-            let mpu_resp = pg.list_multipart_uploads(&ListMultipartUploadsReq {
-                bucket: BucketName::from(name),
-                prefix: None,
-                key_marker: None,
-                upload_id_marker: None,
-                max_uploads: 1,
-            })?;
-            if !mpu_resp.uploads.is_empty() {
-                return Err(ServerError::BucketNotEmpty);
-            }
-            Ok::<(), ServerError>(())
-        })?;
-
         let bucket_pg = self.get_bucket_pg(name)?;
-        bucket_pg.mark_bucket_deleting(name).map_err(|e| match e {
-            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                name: name.to_string(),
-            },
-            other => ServerError::Metadata(other),
-        })?;
-        self.read_runtime().enqueue_bucket_delete_finalize(name);
-        Ok(())
+        bucket_pg
+            .begin_bucket_write_drain(name)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })?;
+        drop(bucket_pg);
+
+        let mut marked_deleting = false;
+        let result = (|| {
+            self.wait_for_bucket_write_reservations_to_drain(name)?;
+
+            // Check emptiness: list all object versions (including delete markers),
+            // multipart uploads, and in-progress stream sessions across all PGs.
+            self.pg_topology.for_each_pg(|pg_id| {
+                let pg = self.storage_node.get_pg(pg_id)?;
+                let resp = pg.list_object_versions(&ListObjectVersionsReq {
+                    bucket: BucketName::from(name),
+                    prefix: None,
+                    key_marker: None,
+                    version_id_marker: None,
+                    max_keys: 1,
+                })?;
+                if !resp.versions.is_empty() {
+                    return Err(ServerError::BucketNotEmpty);
+                }
+                let mpu_resp = pg.list_multipart_uploads(&ListMultipartUploadsReq {
+                    bucket: BucketName::from(name),
+                    prefix: None,
+                    key_marker: None,
+                    upload_id_marker: None,
+                    max_uploads: 1,
+                })?;
+                if !mpu_resp.uploads.is_empty() {
+                    return Err(ServerError::BucketNotEmpty);
+                }
+                let sessions = pg
+                    .list_all_stream_uploads()
+                    .map_err(ServerError::Metadata)?;
+                if sessions.iter().any(|session| session.bucket == name) {
+                    return Err(ServerError::BucketNotEmpty);
+                }
+                Ok::<(), ServerError>(())
+            })?;
+
+            let bucket_pg = self.get_bucket_pg(name)?;
+            bucket_pg.mark_bucket_deleting(name).map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })?;
+            marked_deleting = true;
+            self.read_runtime().enqueue_bucket_delete_finalize(name);
+            Ok(())
+        })();
+
+        if !marked_deleting {
+            let bucket_pg = self.get_bucket_pg(name)?;
+            let _ = bucket_pg.end_bucket_write_drain(name);
+        }
+
+        result
     }
 
     pub fn head_bucket(&self, name: &str) -> Result<BucketSummary, ServerError> {
@@ -3302,43 +3395,49 @@ impl Coordinator {
         );
         let bucket = req.bucket;
         let key = req.key;
-        let _bucket_guard = self.storage_node.lock_bucket(bucket);
-
-        let bucket_info = self.authorize_object_write_requester(req.requester, bucket)?;
-        if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_deref())
-            && !matches!(
-                req.acl,
-                PutObjectAcl::None | PutObjectAcl::Private | PutObjectAcl::BucketOwnerFullControl
-            )
-        {
-            return Err(ServerError::AccessControlListNotSupported);
-        }
-
-        // Generate session ID (same pattern as multipart upload_id).
-        let rng = ring::rand::SystemRandom::new();
-        let mut id_bytes = [0u8; 16];
-        ring::rand::SecureRandom::fill(&rng, &mut id_bytes).map_err(|_| {
-            ServerError::InternalError {
-                reason: "failed to generate session ID".to_string(),
+        self.with_bucket_write_reservation(bucket, |bucket_info| {
+            if !Self::requester_can_object_write(
+                req.requester,
+                &bucket_info.owner_principal,
+                Self::effective_public_write(&bucket_info),
+            ) {
+                return Err(ServerError::AccessDenied);
             }
-        })?;
-        let session_id = id_bytes.iter().fold(String::with_capacity(32), |mut s, b| {
-            use std::fmt::Write;
-            write!(s, "{b:02x}").unwrap();
-            s
-        });
+            if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_deref())
+                && !matches!(
+                    req.acl,
+                    PutObjectAcl::None
+                        | PutObjectAcl::Private
+                        | PutObjectAcl::BucketOwnerFullControl
+                )
+            {
+                return Err(ServerError::AccessControlListNotSupported);
+            }
 
-        // Lock metadata PG and create session.
-        let meta_pg_id = self.object_pg_id(bucket, key);
-        let pg = self.storage_node.get_pg(meta_pg_id)?;
-        pg.create_stream_upload(&CreateStreamUploadReq {
-            session_id: SessionId::from(session_id.as_str()),
-            bucket: BucketName::from(bucket),
-            key: ObjectKey::from(key),
-            target: StreamUploadTarget::PutObject,
-        })?;
+            let rng = ring::rand::SystemRandom::new();
+            let mut id_bytes = [0u8; 16];
+            ring::rand::SecureRandom::fill(&rng, &mut id_bytes).map_err(|_| {
+                ServerError::InternalError {
+                    reason: "failed to generate session ID".to_string(),
+                }
+            })?;
+            let session_id = id_bytes.iter().fold(String::with_capacity(32), |mut s, b| {
+                use std::fmt::Write;
+                write!(s, "{b:02x}").unwrap();
+                s
+            });
 
-        Ok(session_id)
+            let meta_pg_id = self.object_pg_id(bucket, key);
+            let pg = self.storage_node.get_pg(meta_pg_id)?;
+            pg.create_stream_upload(&CreateStreamUploadReq {
+                session_id: SessionId::from(session_id.as_str()),
+                bucket: BucketName::from(bucket),
+                key: ObjectKey::from(key),
+                target: StreamUploadTarget::PutObject,
+            })?;
+
+            Ok(session_id)
+        })
     }
 
     /// Begin a streaming UploadPart session.
@@ -3764,148 +3863,140 @@ impl Coordinator {
         let metadata_blob = req.metadata_blob;
         let tags = req.tags;
         let cond = req.cond;
-        let _bucket_guard = self.storage_node.lock_bucket(bucket);
+        self.with_bucket_write_reservation(bucket, |bucket_info| {
+            let blob_bytes = metadata_blob.serialize()?;
 
-        let bucket_info = self.head_bucket(bucket)?;
-        let blob_bytes = metadata_blob.serialize()?;
+            let meta_pg_id = self.object_pg_id(bucket, key);
+            let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
 
-        let meta_pg_id = self.object_pg_id(bucket, key);
-        let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
-
-        // Validate session is InProgress and matches bucket/key.
-        let session = meta_guard.get_stream_upload(session_id)?;
-        if session.state != StreamUploadState::InProgress {
-            return Err(ServerError::InvalidRequest {
-                reason: "stream session is not in progress".to_string(),
-            });
-        }
-        if session.bucket != bucket || session.key != key {
-            return Err(ServerError::InvalidRequest {
-                reason: "session bucket/key mismatch".to_string(),
-            });
-        }
-        if session.target != StreamUploadTarget::PutObject {
-            return Err(ServerError::InvalidRequest {
-                reason: "session is not a PutObject session".to_string(),
-            });
-        }
-
-        // Check write conditions.
-        if !cond.is_empty() {
-            let existing_etag = match meta_guard.get_object_meta(bucket, key) {
-                Ok(stored) => stored.as_live().map(|record| record.etag.format()),
-                Err(storage::MetadataError::ObjectNotFound) => None,
-                Err(e) => return Err(ServerError::Metadata(e)),
-            };
-            if matches!(cond, WriteCondition::IfMatch(_)) && existing_etag.is_none() {
-                return Err(ServerError::ObjectNotFound {
-                    bucket: bucket.to_string(),
-                    key: key.to_string(),
+            let session = meta_guard.get_stream_upload(session_id)?;
+            if session.state != StreamUploadState::InProgress {
+                return Err(ServerError::InvalidRequest {
+                    reason: "stream session is not in progress".to_string(),
                 });
             }
-            check_write_conditions(cond, existing_etag.as_deref())?;
-        }
+            if session.bucket != bucket || session.key != key {
+                return Err(ServerError::InvalidRequest {
+                    reason: "session bucket/key mismatch".to_string(),
+                });
+            }
+            if session.target != StreamUploadTarget::PutObject {
+                return Err(ServerError::InvalidRequest {
+                    reason: "session is not a PutObject session".to_string(),
+                });
+            }
 
-        // Allocate version_id.
-        let version_id = if bucket_info.versioning == BucketVersioningState::Enabled {
-            meta_guard.next_version_id(bucket, key)?
-        } else {
-            VersionId::Null
-        };
-        let generation_id = meta_guard.next_generation_id(bucket, key)?;
-        let stale_payload = if version_id.is_null() {
-            Self::snapshot_overwritten_null_version_payload(&meta_guard, bucket, key)?
-        } else {
-            None
-        };
+            if !cond.is_empty() {
+                let existing_etag = match meta_guard.get_object_meta(bucket, key) {
+                    Ok(stored) => stored.as_live().map(|record| record.etag.format()),
+                    Err(storage::MetadataError::ObjectNotFound) => None,
+                    Err(e) => return Err(ServerError::Metadata(e)),
+                };
+                if matches!(cond, WriteCondition::IfMatch(_)) && existing_etag.is_none() {
+                    return Err(ServerError::ObjectNotFound {
+                        bucket: bucket.to_string(),
+                        key: key.to_string(),
+                    });
+                }
+                check_write_conditions(cond, existing_etag.as_deref())?;
+            }
 
-        // Build committed object segments from staging rows and validate total_size.
-        let staging_segments = meta_guard
-            .list_stream_segments(session_id)
-            .map_err(ServerError::Metadata)?;
-        let segments_total: u64 = staging_segments.iter().map(|segment| segment.size).sum();
-        if segments_total != total_size {
-            return Err(ServerError::InvalidRequest {
-                reason: format!(
-                    "total_size mismatch: caller passed {total_size} but staged segments sum to {segments_total}"
-                ),
-            });
-        }
-        let committed_segments: Vec<ObjectSegmentRecord> = staging_segments
-            .iter()
-            .map(|segment| ObjectSegmentRecord {
-                bucket: BucketName::from(bucket),
-                key: ObjectKey::from(key),
-                version_id,
-                segment_index: segment.segment_index,
-                size: segment.size,
-                segment_crc64: segment.segment_crc64,
-                segment_okh: segment.segment_okh,
-                segment_vid: segment.segment_vid,
-                shard_pg_id: segment.shard_pg_id,
-                ec_k: segment.ec_k,
-                ec_m: segment.ec_m,
-            })
-            .collect();
+            let version_id = if bucket_info.versioning == BucketVersioningState::Enabled {
+                meta_guard.next_version_id(bucket, key)?
+            } else {
+                VersionId::Null
+            };
+            let generation_id = meta_guard.next_generation_id(bucket, key)?;
+            let stale_payload = if version_id.is_null() {
+                Self::snapshot_overwritten_null_version_payload(&meta_guard, bucket, key)?
+            } else {
+                None
+            };
 
-        // Atomic finalize: commit object metadata + object segments, delete staging.
-        meta_guard
-            .commit_stream_put(
-                session_id,
-                &CommitStreamPutReq {
+            let staging_segments = meta_guard
+                .list_stream_segments(session_id)
+                .map_err(ServerError::Metadata)?;
+            let segments_total: u64 = staging_segments.iter().map(|segment| segment.size).sum();
+            if segments_total != total_size {
+                return Err(ServerError::InvalidRequest {
+                    reason: format!(
+                        "total_size mismatch: caller passed {total_size} but staged segments sum to {segments_total}"
+                    ),
+                });
+            }
+            let committed_segments: Vec<ObjectSegmentRecord> = staging_segments
+                .iter()
+                .map(|segment| ObjectSegmentRecord {
                     bucket: BucketName::from(bucket),
                     key: ObjectKey::from(key),
                     version_id,
-                    generation_id,
-                    size: total_size,
-                    etag_crc64: crc64,
-                    ec: EcShape {
-                        k: self.ec_config.data_shards,
-                        m: self.ec_config.parity_shards,
-                    },
-                    tags: tags.map(SerializedTagSet::from),
-                    metadata_blob: Some(SerializedMetadataBlob::from(blob_bytes)),
-                },
-                &committed_segments,
-            )
-            .map_err(ServerError::Metadata)?;
+                    segment_index: segment.segment_index,
+                    size: segment.size,
+                    segment_crc64: segment.segment_crc64,
+                    segment_okh: segment.segment_okh,
+                    segment_vid: segment.segment_vid,
+                    shard_pg_id: segment.shard_pg_id,
+                    ec_k: segment.ec_k,
+                    ec_m: segment.ec_m,
+                })
+                .collect();
 
-        if let Some(ref payload) = stale_payload {
-            match payload {
-                StaleObjectPayload::Segments {
-                    generation_id,
-                    segments,
-                } => {
-                    // `commit_stream_put` already replaced the live object segments rows
-                    // for VersionId::Null, so only enqueue reclaim for the old payload.
-                    Self::enqueue_object_segments_reclaim(
-                        &meta_guard,
-                        bucket,
-                        key,
-                        *generation_id,
-                        segments,
-                    )?;
-                }
-                StaleObjectPayload::Multipart { .. } => {
-                    Self::delete_stale_object_payload_metadata(
-                        &meta_guard,
-                        bucket,
-                        key,
+            meta_guard
+                .commit_stream_put(
+                    session_id,
+                    &CommitStreamPutReq {
+                        bucket: BucketName::from(bucket),
+                        key: ObjectKey::from(key),
                         version_id,
-                        payload,
-                    )?;
+                        generation_id,
+                        size: total_size,
+                        etag_crc64: crc64,
+                        ec: EcShape {
+                            k: self.ec_config.data_shards,
+                            m: self.ec_config.parity_shards,
+                        },
+                        tags: tags.map(SerializedTagSet::from),
+                        metadata_blob: Some(SerializedMetadataBlob::from(blob_bytes)),
+                    },
+                    &committed_segments,
+                )
+                .map_err(ServerError::Metadata)?;
+
+            if let Some(ref payload) = stale_payload {
+                match payload {
+                    StaleObjectPayload::Segments {
+                        generation_id,
+                        segments,
+                    } => {
+                        Self::enqueue_object_segments_reclaim(
+                            &meta_guard,
+                            bucket,
+                            key,
+                            *generation_id,
+                            segments,
+                        )?;
+                    }
+                    StaleObjectPayload::Multipart { .. } => {
+                        Self::delete_stale_object_payload_metadata(
+                            &meta_guard,
+                            bucket,
+                            key,
+                            version_id,
+                            payload,
+                        )?;
+                    }
                 }
             }
-        }
 
-        drop(meta_guard);
-        if let Some(ref payload) = stale_payload {
-            self.delete_stale_object_payload(bucket, key, payload);
-        }
+            drop(meta_guard);
+            if let Some(ref payload) = stale_payload {
+                self.delete_stale_object_payload(bucket, key, payload);
+            }
 
-        Ok(PutObjectResult {
-            etag: format_etag(crc64),
-            version_id,
+            Ok(PutObjectResult {
+                etag: format_etag(crc64),
+                version_id,
+            })
         })
     }
 
@@ -7953,7 +8044,7 @@ mod tests {
     }
 
     #[test]
-    fn put_object_waits_for_bucket_lock() {
+    fn put_object_does_not_wait_for_bucket_lock() {
         let tmp = test_util::tempdir();
         let pg_ids: Vec<u32> = (0..4).collect();
         let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
@@ -7992,14 +8083,11 @@ mod tests {
             tx.send(res).unwrap();
         });
 
-        // Writer should block while bucket lock is held.
-        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
-        drop(guard);
-
         let res = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        drop(guard);
         assert!(
             res.is_ok(),
-            "put_object should succeed after lock release: {res:?}"
+            "put_object should succeed without waiting on bucket lock: {res:?}"
         );
         handle.join().unwrap();
     }
@@ -8042,6 +8130,27 @@ mod tests {
             "delete_bucket should succeed after lock release: {res:?}"
         );
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn delete_bucket_rejects_active_stream_put_session() {
+        let tmp = test_util::tempdir();
+        let pg_ids: Vec<u32> = (0..4).collect();
+        let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
+        let ec_config = EcConfig::new(4, 2).unwrap();
+
+        let coord = Coordinator::new(storage_node, ec_config, "us-east-1".to_string()).unwrap();
+        coord.create_bucket("bucket").unwrap();
+
+        let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
+        let err = delete_bucket_test(&coord, "bucket").unwrap_err();
+        assert!(matches!(err, ServerError::BucketNotEmpty));
+
+        coord
+            .abort_stream_put("bucket", "key", &session_id)
+            .unwrap();
+        delete_bucket_test(&coord, "bucket").unwrap();
+        wait_until_bucket_gone(&coord, "bucket");
     }
 
     #[test]

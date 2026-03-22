@@ -41,6 +41,9 @@ pub enum MetadataError {
     #[error("bucket not empty")]
     BucketNotEmpty,
 
+    #[error("bucket write reservations are draining")]
+    BucketWriteDraining,
+
     #[error("object not found")]
     ObjectNotFound,
 

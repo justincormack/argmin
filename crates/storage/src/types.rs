@@ -851,6 +851,8 @@ pub struct BucketInfo {
     pub versioning: BucketVersioningState,
     pub public_read: bool,
     pub public_write: bool,
+    pub write_reservations_blocked: bool,
+    pub active_write_reservations: u32,
     /// Serialized CORS configuration XML (None = no CORS config).
     pub cors_config: Option<String>,
     /// Serialized tagging XML (None = no tags).

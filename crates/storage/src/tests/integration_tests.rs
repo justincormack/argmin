@@ -856,6 +856,7 @@ fn bucket_deletion_lifecycle() {
     store.delete_object_meta("doomed", "file.txt").unwrap();
 
     // Mark bucket as deleting.
+    store.begin_bucket_write_drain("doomed").unwrap();
     store.mark_bucket_deleting("doomed").unwrap();
 
     // head_bucket no longer sees it.

@@ -37,21 +37,23 @@ Replace the coarse bucket mutex on normal writes with a reservation barrier that
 
 ### Bucket states
 
-Bucket lifecycle should distinguish at least:
+The first implementation keeps the persisted lifecycle enum as:
 
 - `Active`
-- `Draining`
 - `Deleting`
 
-`Active` allows new write reservations.
+and layers an internal drain barrier on top with two bucket metadata fields:
 
-`Draining` rejects new write reservations but allows existing reserved operations to finish.
+- `write_reservations_blocked`
+- `active_write_reservations`
 
-`Deleting` means no visible or in-flight bucket content remains and final deletion can proceed.
+That gives the coordinator an effective `Draining` phase without changing the
+bucket state enum itself.
 
 ### Write reservations
 
-Normal bucket-mutating object operations acquire a bucket write reservation before publishing object/session state:
+Normal bucket-mutating object operations acquire a short-lived bucket write
+reservation before publishing cross-PG state:
 
 - direct `PutObject`
 - `begin_stream_put`
@@ -68,7 +70,15 @@ Reservation acquisition should:
 Reservation release should:
 
 - decrement the in-flight write counter
-- trigger bucket-delete wakeup/finalization if the bucket is draining and the count reaches zero
+- happen immediately after the protected publish step completes
+
+For streamed `PutObject`, the current implementation uses reservations around:
+
+- `begin_stream_put` session publication
+- `finalize_stream_put` object publication
+
+not for the full lifetime of an in-progress stream session. Live stream sessions
+are treated as bucket content during delete-bucket emptiness checks instead.
 
 ### DeleteBucket flow
 
@@ -101,14 +111,23 @@ It also unlocks a cleaner direct small-object `PutObject` fast path later:
 - one object publish
 - no streamed session lifecycle for single-segment known-length puts
 
-## Implementation plan
+## Current status
 
-1. Add bucket lifecycle and in-flight reservation metadata to the bucket PG.
-2. Add reservation acquire/release APIs on storage/core.
-3. Convert streamed `PutObject` to hold a reservation for the session lifetime instead of using the coarse bucket lock.
-4. Convert multipart create/complete to use reservations.
-5. Update `DeleteBucket` to use `Draining` plus reservation drain, and to treat live stream sessions as bucket content.
-6. Remove the coarse bucket lock from hot object write paths once the new barrier is proven.
+Done:
+
+1. Added bucket drain/reservation metadata to the bucket PG.
+2. Added storage/core acquire/release/drain APIs.
+3. Converted streamed `PutObject` begin/finalize to use bucket reservations instead of the coarse bucket lock.
+4. Updated `DeleteBucket` to:
+   - begin the drain barrier
+   - wait for active reservation publishers to finish
+   - treat live stream sessions as bucket content
+
+Still to do:
+
+1. Convert multipart create/complete onto reservations.
+2. Remove the coarse bucket lock from `DeleteBucket` once multipart no longer depends on it.
+3. Re-evaluate whether any remaining write paths still need the bucket mutex or can move to the barrier.
 
 ## Validation
 
@@ -123,5 +142,7 @@ It also unlocks a cleaner direct small-object `PutObject` fast path later:
 
 ## Notes
 
-- The current bucket lock is still needed until this barrier exists.
+- The current bucket lock is still intentionally retained on `DeleteBucket` in
+  the first phase so older multipart paths remain fenced while streamed
+  `PutObject` moves to the reservation barrier.
 - This work should be done before introducing a direct tiny-`PutObject` fast path, so the fast path has a correct bucket-deletion story from the start.

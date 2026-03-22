@@ -64,6 +64,22 @@ pub trait PgMetadataStore {
     /// background cleanup drains outstanding reclaim work.
     fn mark_bucket_deleting(&self, name: &str) -> Result<(), MetadataError>;
 
+    /// Acquire a short-lived bucket write reservation.
+    ///
+    /// Reservations fence bucket deletion while cross-PG write publication is
+    /// in progress. Returns the current bucket metadata on success.
+    fn acquire_bucket_write_reservation(&self, name: &str) -> Result<BucketInfo, MetadataError>;
+
+    /// Release a previously acquired bucket write reservation.
+    fn release_bucket_write_reservation(&self, name: &str) -> Result<(), MetadataError>;
+
+    /// Block new bucket write reservations while deletion drains in-flight
+    /// writers and verifies emptiness.
+    fn begin_bucket_write_drain(&self, name: &str) -> Result<(), MetadataError>;
+
+    /// Re-open the bucket for new write reservations after a failed delete.
+    fn end_bucket_write_drain(&self, name: &str) -> Result<(), MetadataError>;
+
     /// Set bucket versioning state.
     ///
     /// Validates transitions: Disabled→Enabled and Enabled↔Suspended are allowed.

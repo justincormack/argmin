@@ -292,6 +292,8 @@ CREATE TABLE IF NOT EXISTS buckets (
     versioning       INTEGER NOT NULL DEFAULT 0 CHECK (versioning IN (0, 1, 2)),
     public_read      INTEGER NOT NULL DEFAULT 0 CHECK (public_read IN (0, 1)),
     public_write     INTEGER NOT NULL DEFAULT 0 CHECK (public_write IN (0, 1)),
+    write_reservations_blocked INTEGER NOT NULL DEFAULT 0 CHECK (write_reservations_blocked IN (0, 1)),
+    active_write_reservations INTEGER NOT NULL DEFAULT 0 CHECK (active_write_reservations >= 0),
     cors_config      TEXT,
     tags             TEXT,
     public_access_block TEXT,
@@ -339,6 +341,7 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     migrate_checksum_columns(conn)?;
     migrate_segment_crc_columns(conn)?;
     migrate_owner_identity_columns(conn)?;
+    migrate_bucket_write_reservation_columns(conn)?;
     Ok(())
 }
 
@@ -457,5 +460,21 @@ fn migrate_owner_identity_columns(conn: &Connection) -> Result<(), rusqlite::Err
         }
     }
 
+    Ok(())
+}
+
+fn migrate_bucket_write_reservation_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let migrations = [
+        "ALTER TABLE buckets ADD COLUMN write_reservations_blocked INTEGER NOT NULL DEFAULT 0 CHECK (write_reservations_blocked IN (0, 1))",
+        "ALTER TABLE buckets ADD COLUMN active_write_reservations INTEGER NOT NULL DEFAULT 0 CHECK (active_write_reservations >= 0)",
+    ];
+    for sql in &migrations {
+        match conn.execute(sql, []) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
+                if msg.contains("duplicate column name") => {}
+            Err(e) => return Err(e),
+        }
+    }
     Ok(())
 }

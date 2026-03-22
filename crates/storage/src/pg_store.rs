@@ -687,6 +687,19 @@ impl PgStore {
             .transpose()
     }
 
+    fn parse_u32(value: i64, col: usize, field: &str) -> Result<u32, rusqlite::Error> {
+        u32::try_from(value).map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                col,
+                rusqlite::types::Type::Integer,
+                Box::from(format!(
+                    "invalid {field}: {value} (expected integer in 0..={})",
+                    u32::MAX
+                )),
+            )
+        })
+    }
+
     fn row_to_bucket_info(row: &rusqlite::Row<'_>) -> Result<BucketInfo, rusqlite::Error> {
         let owner_canonical_id_raw: String = row.get(2)?;
         let owner_canonical_id =
@@ -714,12 +727,18 @@ impl PgStore {
             )?,
             public_read: row.get::<_, i64>(7)? != 0,
             public_write: row.get::<_, i64>(8)? != 0,
-            cors_config: row.get(9)?,
+            write_reservations_blocked: row.get::<_, i64>(9)? != 0,
+            active_write_reservations: Self::parse_u32(
+                row.get::<_, i64>(10)?,
+                10,
+                "active_write_reservations",
+            )?,
+            cors_config: row.get(11)?,
             tags: row
-                .get::<_, Option<String>>(10)?
+                .get::<_, Option<String>>(12)?
                 .map(SerializedTagSet::from),
-            public_access_block: row.get(11)?,
-            ownership_controls: row.get(12)?,
+            public_access_block: row.get(13)?,
+            ownership_controls: row.get(14)?,
         })
     }
 
@@ -1038,7 +1057,7 @@ impl PgMetadataStore for PgStore {
         );
         let now = PgStore::now_millis() as i64;
         let result = self.conn.execute(
-            "INSERT INTO buckets (name, owner_principal, owner_canonical_id, created_at, state, public_read, public_write) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO buckets (name, owner_principal, owner_canonical_id, created_at, state, public_read, public_write, write_reservations_blocked, active_write_reservations) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0)",
             params![
                 name,
                 owner_principal,
@@ -1106,7 +1125,7 @@ impl PgMetadataStore for PgStore {
     fn head_bucket_raw(&self, name: &str) -> Result<BucketInfo, MetadataError> {
         self.conn
             .query_row(
-                "SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, public_read, public_write, cors_config, tags, public_access_block, ownership_controls \
+                "SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, public_read, public_write, write_reservations_blocked, active_write_reservations, cors_config, tags, public_access_block, ownership_controls \
                  FROM buckets WHERE name = ?1",
                 params![name],
                 Self::row_to_bucket_info,
@@ -1132,7 +1151,7 @@ impl PgMetadataStore for PgStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, public_read, public_write, cors_config, tags, public_access_block, ownership_controls \
+                "SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, public_read, public_write, write_reservations_blocked, active_write_reservations, cors_config, tags, public_access_block, ownership_controls \
                  FROM buckets WHERE owner_principal = ?1 AND state = ?2 ORDER BY name ASC",
             )
             .map_err(|e| MetadataError::Db {
@@ -1163,11 +1182,108 @@ impl PgMetadataStore for PgStore {
         let updated = self
             .conn
             .execute(
-                "UPDATE buckets SET state = ?1 WHERE name = ?2 AND state = ?3",
+                "UPDATE buckets \
+                 SET state = ?1 \
+                 WHERE name = ?2 \
+                   AND state = ?3 \
+                   AND write_reservations_blocked = 1 \
+                   AND active_write_reservations = 0",
                 params![BucketState::Deleting as u8, name, BucketState::Active as u8],
             )
             .map_err(|e| MetadataError::Db {
                 context: "mark bucket deleting",
+                source: e,
+            })?;
+        if updated == 0 {
+            return Err(MetadataError::BucketNotFound {
+                name: BucketName::from(name),
+            });
+        }
+        Ok(())
+    }
+
+    fn acquire_bucket_write_reservation(&self, name: &str) -> Result<BucketInfo, MetadataError> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE buckets \
+                 SET active_write_reservations = active_write_reservations + 1 \
+                 WHERE name = ?1 AND state = ?2 AND write_reservations_blocked = 0",
+                params![name, BucketState::Active as u8],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "acquire bucket write reservation",
+                source: e,
+            })?;
+        if updated == 1 {
+            return self.head_bucket_raw(name);
+        }
+        let info = self.head_bucket_raw(name)?;
+        if info.state == BucketState::Active && info.write_reservations_blocked {
+            return Err(MetadataError::BucketWriteDraining);
+        }
+        Err(MetadataError::BucketNotFound {
+            name: BucketName::from(name),
+        })
+    }
+
+    fn release_bucket_write_reservation(&self, name: &str) -> Result<(), MetadataError> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE buckets \
+                 SET active_write_reservations = active_write_reservations - 1 \
+                 WHERE name = ?1 AND active_write_reservations > 0",
+                params![name],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "release bucket write reservation",
+                source: e,
+            })?;
+        if updated == 0 {
+            return Err(MetadataError::BucketNotFound {
+                name: BucketName::from(name),
+            });
+        }
+        Ok(())
+    }
+
+    fn begin_bucket_write_drain(&self, name: &str) -> Result<(), MetadataError> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE buckets \
+                 SET write_reservations_blocked = 1 \
+                 WHERE name = ?1 AND state = ?2 AND write_reservations_blocked = 0",
+                params![name, BucketState::Active as u8],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "begin bucket write drain",
+                source: e,
+            })?;
+        if updated == 0 {
+            let info = self.head_bucket_raw(name)?;
+            if info.state == BucketState::Active && info.write_reservations_blocked {
+                return Err(MetadataError::BucketWriteDraining);
+            }
+            return Err(MetadataError::BucketNotFound {
+                name: BucketName::from(name),
+            });
+        }
+        Ok(())
+    }
+
+    fn end_bucket_write_drain(&self, name: &str) -> Result<(), MetadataError> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE buckets \
+                 SET write_reservations_blocked = 0 \
+                 WHERE name = ?1 AND state = ?2 AND write_reservations_blocked = 1",
+                params![name, BucketState::Active as u8],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "end bucket write drain",
                 source: e,
             })?;
         if updated == 0 {
