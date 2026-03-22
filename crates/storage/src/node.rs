@@ -4,13 +4,13 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Condvar, Mutex, MutexGuard};
+use std::sync::{Condvar, Mutex, MutexGuard, RwLock};
 use std::time::Instant;
 
 use crate::error::StoreError;
 use crate::pg_store::PgStore;
 use crate::traits::{ShardStore, StorageNode};
-use crate::types::{GenerationId, ShardKey, WriteAck};
+use crate::types::{BucketFastPathInfo, GenerationId, ShardKey, WriteAck};
 
 const TRACE_TARGET: &str = "storage";
 
@@ -125,6 +125,7 @@ pub struct SharedStorageNode {
     pg_id_list: Vec<u32>,
     data_dir: PathBuf,
     bucket_locks: Vec<Mutex<()>>,
+    bucket_fast_path: RwLock<HashMap<String, BucketFastPathInfo>>,
     object_payload_leases: Mutex<HashMap<(String, String, GenerationId), usize>>,
     reclaim_queue: (Mutex<ReclaimQueueState>, Condvar),
 }
@@ -186,6 +187,7 @@ impl SharedStorageNode {
             pg_id_list,
             data_dir: data_dir.to_path_buf(),
             bucket_locks,
+            bucket_fast_path: RwLock::new(HashMap::new()),
             object_payload_leases: Mutex::new(HashMap::new()),
             reclaim_queue: (
                 Mutex::new(ReclaimQueueState {
@@ -211,6 +213,35 @@ impl SharedStorageNode {
 
     fn bucket_lock_index(&self, bucket: &str) -> usize {
         (rapidhash::rapidhash(bucket.as_bytes()) as usize) % self.bucket_locks.len()
+    }
+
+    /// Return the cached active-bucket fast-path metadata for `bucket`.
+    pub fn get_bucket_fast_path(&self, bucket: &str) -> Option<BucketFastPathInfo> {
+        self.bucket_fast_path.read().unwrap().get(bucket).cloned()
+    }
+
+    /// Insert or replace the cached active-bucket fast-path metadata.
+    pub fn upsert_bucket_fast_path(&self, info: BucketFastPathInfo) {
+        self.bucket_fast_path
+            .write()
+            .unwrap()
+            .insert(info.name.to_string(), info);
+    }
+
+    /// Mutate the cached fast-path metadata if present.
+    pub fn update_bucket_fast_path_if_present(
+        &self,
+        bucket: &str,
+        update: impl FnOnce(&mut BucketFastPathInfo),
+    ) {
+        if let Some(info) = self.bucket_fast_path.write().unwrap().get_mut(bucket) {
+            update(info);
+        }
+    }
+
+    /// Remove cached fast-path metadata for `bucket`.
+    pub fn remove_bucket_fast_path(&self, bucket: &str) {
+        self.bucket_fast_path.write().unwrap().remove(bucket);
     }
 
     /// Lock a bucket-scoped stripe mutex.

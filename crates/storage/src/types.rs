@@ -863,6 +863,55 @@ pub struct BucketInfo {
     pub ownership_controls: Option<String>,
 }
 
+/// Authoritative in-memory subset of bucket metadata used on hot object paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BucketFastPathInfo {
+    pub name: BucketName,
+    pub owner_principal: String,
+    pub owner_canonical_id: CanonicalUserId,
+    pub created_at: u64,
+    pub state: BucketState,
+    pub versioning: BucketVersioningState,
+    pub public_read: bool,
+    pub public_write: bool,
+    pub public_access_block: Option<String>,
+    pub ownership_controls: Option<String>,
+}
+
+impl From<BucketInfo> for BucketFastPathInfo {
+    fn from(info: BucketInfo) -> Self {
+        Self {
+            name: info.name,
+            owner_principal: info.owner_principal,
+            owner_canonical_id: info.owner_canonical_id,
+            created_at: info.created_at,
+            state: info.state,
+            versioning: info.versioning,
+            public_read: info.public_read,
+            public_write: info.public_write,
+            public_access_block: info.public_access_block,
+            ownership_controls: info.ownership_controls,
+        }
+    }
+}
+
+impl From<&BucketInfo> for BucketFastPathInfo {
+    fn from(info: &BucketInfo) -> Self {
+        Self {
+            name: info.name.clone(),
+            owner_principal: info.owner_principal.clone(),
+            owner_canonical_id: info.owner_canonical_id.clone(),
+            created_at: info.created_at,
+            state: info.state,
+            versioning: info.versioning,
+            public_read: info.public_read,
+            public_write: info.public_write,
+            public_access_block: info.public_access_block.clone(),
+            ownership_controls: info.ownership_controls.clone(),
+        }
+    }
+}
+
 /// Request to store object metadata.
 pub enum PutObjectReq {
     Live(PutLiveObjectReq),

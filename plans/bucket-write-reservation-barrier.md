@@ -125,6 +125,7 @@ Done:
 5. Converted `CreateMultipartUpload` and `CompleteMultipartUpload` to use bucket reservations instead of the coarse bucket lock.
 6. Removed the coarse bucket lock from `DeleteBucket`; it now relies on the drain barrier directly and retries if another delete is already in the draining phase.
 7. Re-evaluated the remaining bucket mutex uses and left them only on non-hot lifecycle paths.
+8. Added a shared active-bucket fast path for hot object auth, so `GET`/`HEAD`/`DELETE`/`PUT` no longer serialize on `head_bucket()` reads against the bucket PG.
 
 Deferred:
 
@@ -139,6 +140,10 @@ Deferred:
   - `DeleteBucket` vs `finalize_stream_put`
   - `DeleteBucket` vs `create_multipart_upload`
   - `DeleteBucket` vs `complete_multipart_upload`
+- bucket fast-path correctness:
+  - object `HEAD` and `DELETE` continue to work while the bucket PG mutex is held elsewhere
+  - bucket ACL updates become visible to object-read auth without waiting for a DB fallback
+  - bucket versioning updates become visible to object-delete semantics without waiting for a DB fallback
 - trace confirmation that small-object `PUT` no longer waits on `SharedStorageNode::lock_bucket`
 - targeted warp small-object rerun
 
@@ -162,3 +167,11 @@ The reservation barrier now covers the hot bucket-mutating request paths:
 That removes the coarse bucket mutex from the small-object write critical path
 while preserving the bucket deletion fence that was previously implicit in the
 mutex.
+
+That work is now paired with a shared active-bucket fast path for hot object
+auth. The fast path lives on the shared storage node, is updated synchronously
+by the owning bucket PG on active-bucket mutations, and serves the steady-state
+bucket fields object ops need (`owner`, `public_read`, `public_write`,
+`versioning`, `public_access_block`, `ownership_controls`, and active
+visibility) without taking the bucket PG mutex or hitting SQLite on every
+request.
