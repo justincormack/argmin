@@ -117,3 +117,20 @@ Follow-up:
 - if tiny `PUT` is still dominated by fixed overhead after this change, the next
   likely step is direct single-segment `UploadPart`, followed by inline tiny
   object storage
+
+### Outcome
+
+The direct single-segment `PutObject` path is now the steady-state path for
+tiny and exact-one-segment uploads:
+
+- no stream-session rows for one-segment `PutObject`
+- one bucket write reservation instead of streamed begin/finalize
+- one shard batch write and direct metadata publish
+
+This materially reduced small-object `PUT` fixed cost and improved the `warp`
+tiny-object benchmark, but it did not remove the remaining gap to rustfs. The
+next major write-path steps, if we return to this area, are:
+
+1. direct single-segment `UploadPart`
+2. inline tiny-object / tiny-part storage
+3. lower-cost shard durability, potentially via group commit

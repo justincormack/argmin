@@ -175,3 +175,6 @@ bucket fields object ops need (`owner`, `public_read`, `public_write`,
 `versioning`, `public_access_block`, `ownership_controls`, and active
 visibility) without taking the bucket PG mutex or hitting SQLite on every
 request.
+
+This plan is complete. The remaining coarse bucket mutex uses are intentionally
+deferred lifecycle paths, not part of the hot request path.
