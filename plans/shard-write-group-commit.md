@@ -135,6 +135,41 @@ If a batch durability cycle fails:
 
 ## Phasing
 
+### Phase 0: Batch=1 precursor
+
+Before true batching, introduce an explicit asynchronous shard-durability
+submission boundary with immediate flush behavior:
+
+1. prepare request-local write state on the request thread
+2. submit shard durability work to a dedicated write executor
+3. let the request wait for completion
+4. after durable success, run the existing metadata publish path
+
+This does **not** reduce the underlying fsync cost by itself. Its purpose is:
+
+- to decouple request handling from the current synchronous durability call
+- to let request workers hand off write work instead of blocking in the file
+  durability path
+- to establish the completion/error accounting API that real group commit will
+  later need
+
+Important note:
+
+- this is not about freeing the metadata PG during shard writes; the direct
+  `PutObject` path already does shard durability before taking the metadata PG
+  lock
+- it is about freeing the request-side worker and making the durability step an
+  explicit asynchronous phase
+
+The safest first version keeps:
+
+- the current bucket write reservation held across the wait
+- the current durable-before-visible invariant
+- existing request-scoped metadata publish after durability completion
+
+Once that interface exists, a later batcher can replace "flush immediately"
+with "flush this group".
+
 ### Phase 1: Measurement
 
 Add finer tracing inside `write_shard_files_durable` to split:
@@ -148,8 +183,8 @@ That confirms exactly which durability step dominates on real runs.
 
 ### Phase 2: Prototype local batcher
 
-Add a single-node durability batcher behind the existing direct single-segment
-`PutObject` path only:
+Replace the Phase 0 immediate-flush executor with a single-node durability
+batcher behind the existing direct single-segment `PutObject` path only:
 
 - no behavior change for reads
 - no behavior change for streaming multi-segment paths yet
