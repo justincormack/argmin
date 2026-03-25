@@ -45,11 +45,6 @@ impl EcConfig {
                 reason: "data_shards must be >= 1",
             });
         }
-        if parity_shards == 0 {
-            return Err(EcError::InvalidConfig {
-                reason: "parity_shards must be >= 1",
-            });
-        }
         let total = data_shards as usize + parity_shards as usize;
         if total > MAX_TOTAL_SHARDS {
             return Err(EcError::InvalidConfig {
@@ -173,13 +168,15 @@ impl ErasureCodec {
         // and writes exactly 32*k*m bytes to encode_tables.
         unsafe {
             ec_sys::gf_gen_cauchy1_matrix(encode_matrix.as_mut_ptr(), total as i32, k as i32);
-            // Parity rows start at offset k*k within encode_matrix.
-            ec_sys::ec_init_tables(
-                k as i32,
-                m as i32,
-                encode_matrix[k * k..].as_mut_ptr(),
-                encode_tables.as_mut_ptr(),
-            );
+            if m > 0 {
+                // Parity rows start at offset k*k within encode_matrix.
+                ec_sys::ec_init_tables(
+                    k as i32,
+                    m as i32,
+                    encode_matrix[k * k..].as_mut_ptr(),
+                    encode_tables.as_mut_ptr(),
+                );
+            }
         }
 
         Ok(Self {
@@ -267,7 +264,7 @@ impl ErasureCodec {
             }
         }
 
-        if shard_size == 0 {
+        if m == 0 || shard_size == 0 {
             return Ok(());
         }
 
@@ -376,7 +373,7 @@ impl ErasureCodec {
             });
         }
 
-        if shard_size == 0 {
+        if m == 0 || shard_size == 0 {
             return Ok(VerifyResult::Ok);
         }
 

@@ -31,6 +31,7 @@ fn encode(codec: &ErasureCodec, data: &[Vec<u8>]) -> Vec<Vec<u8>> {
 
 #[test]
 fn config_valid_cases() {
+    assert!(EcConfig::new(1, 0).is_ok());
     assert!(EcConfig::new(1, 1).is_ok());
     assert!(EcConfig::new(4, 2).is_ok());
     assert!(EcConfig::new(16, 8).is_ok());
@@ -43,16 +44,6 @@ fn config_zero_data_shards() {
         EcConfig::new(0, 2),
         Err(EcError::InvalidConfig {
             reason: "data_shards must be >= 1"
-        })
-    );
-}
-
-#[test]
-fn config_zero_parity_shards() {
-    assert_eq!(
-        EcConfig::new(2, 0),
-        Err(EcError::InvalidConfig {
-            reason: "parity_shards must be >= 1"
         })
     );
 }
@@ -100,6 +91,47 @@ fn encode_all_zeros_gives_zero_parity() {
             "expected zero parity for zero data"
         );
     }
+}
+
+#[test]
+fn zero_parity_codec_construction() {
+    let codec = ErasureCodec::new(EcConfig::new(4, 0).unwrap()).unwrap();
+    assert_eq!(codec.config().data_shards, 4);
+    assert_eq!(codec.config().parity_shards, 0);
+    assert_eq!(codec.verify_scratch_size(1024), 0);
+}
+
+#[test]
+fn zero_parity_encode_ok() {
+    let codec = ErasureCodec::new(EcConfig::new(4, 0).unwrap()).unwrap();
+    let data = make_data(4, 512);
+    let data_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+    let mut parity: Vec<&mut [u8]> = Vec::new();
+    assert!(codec.encode(&data_refs, &mut parity).is_ok());
+}
+
+#[test]
+fn zero_parity_verify_ok() {
+    let codec = ErasureCodec::new(EcConfig::new(4, 0).unwrap()).unwrap();
+    let data = make_data(4, 512);
+    let data_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+    let parity: Vec<&[u8]> = Vec::new();
+    let mut scratch = Vec::new();
+    assert_eq!(
+        codec.verify(&data_refs, &parity, &mut scratch).unwrap(),
+        VerifyResult::Ok
+    );
+}
+
+#[test]
+fn zero_parity_reconstruct_requires_no_recovery() {
+    let codec = ErasureCodec::new(EcConfig::new(4, 0).unwrap()).unwrap();
+    let present = make_data(4, 64);
+    let present_refs: Vec<&[u8]> = present.iter().map(|v| v.as_slice()).collect();
+    let mut outputs: Vec<&mut [u8]> = Vec::new();
+    assert!(codec
+        .reconstruct(&[0, 1, 2, 3], &present_refs, &[], &mut outputs)
+        .is_ok());
 }
 
 #[test]
