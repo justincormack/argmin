@@ -1,5 +1,8 @@
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{BucketVersioningStatus, Tag, Tagging, VersioningConfiguration};
+use aws_sdk_s3::types::{
+    BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, Tag, Tagging,
+    VersioningConfiguration,
+};
 use s3_tests::{assert_s3_err_code, cleanup_versioned_bucket, err_status, unique_bucket, CTX};
 
 /// Cleanup helper.
@@ -1475,13 +1478,86 @@ fn test_delete_tagged_object_no_tags_on_delete_marker() {
 // ── Multipart upload with tagging ─────────────────────────────────────
 
 #[test]
-#[ignore = "not implemented: multipart upload"]
 fn test_set_multipart_tagging() {
     s3_tests::run(async {
-        let _client = CTX.client();
-        // CreateMultipartUpload with Tagging parameter, upload parts, complete,
-        // then verify tags via GetObjectTagging and delete them.
-        todo!("multipart upload with tagging");
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let key = "multipart-tagged";
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .tagging("foo=bar&bar")
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap();
+
+        let data = vec![b'a'; 5 * 1024 * 1024];
+        let upload = client
+            .upload_part()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(1)
+            .body(ByteStream::from(data))
+            .send()
+            .await
+            .unwrap();
+
+        client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(upload.e_tag().unwrap())
+                            .part_number(1)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let result = client
+            .get_object_tagging()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let tag_set = result.tag_set();
+        assert_eq!(tag_set.len(), 2);
+        assert!(tag_set
+            .iter()
+            .any(|t| t.key() == "foo" && t.value() == "bar"));
+        assert!(tag_set.iter().any(|t| t.key() == "bar" && t.value() == ""));
+
+        client
+            .delete_object_tagging()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+
+        let result = client
+            .get_object_tagging()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert!(result.tag_set().is_empty());
+
+        cleanup(&bucket, &[key]).await;
     });
 }
 

@@ -2856,17 +2856,19 @@ impl PgMetadataStore for PgStore {
         let now = PgStore::now_millis();
         let algo = req.checksum.map(|c| c.algorithm() as u8);
         let ctype = req.checksum.map(|c| c.checksum_type() as u8);
+        let tags = req.tags.as_ref().map(SerializedTagSet::as_str);
         self.conn
             .execute(
                 "INSERT INTO multipart_uploads \
-                 (upload_id, bucket, key, initiated_at, state, metadata_blob, owner_principal, \
+                 (upload_id, bucket, key, initiated_at, state, tags, metadata_blob, owner_principal, \
                   checksum_algorithm, checksum_type) \
-                 VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, ?8)",
+                 VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     req.upload_id,
                     req.bucket,
                     req.key,
                     now as i64,
+                    tags,
                     req.metadata_blob.as_slice(),
                     req.owner_principal,
                     algo,
@@ -2886,18 +2888,18 @@ impl PgMetadataStore for PgStore {
     ) -> Result<MultipartUploadRecord, MetadataError> {
         self.conn
             .query_row(
-                "SELECT upload_id, bucket, key, initiated_at, state, metadata_blob, \
+                "SELECT upload_id, bucket, key, initiated_at, state, tags, metadata_blob, \
                  owner_principal, checksum_algorithm, checksum_type \
                  FROM multipart_uploads WHERE upload_id = ?1",
                 params![upload_id],
                 |row| {
                     let state_raw = row.get::<_, u8>(4)?;
-                    let algo_raw: Option<u8> = row.get(7)?;
-                    let ctype_raw: Option<u8> = row.get(8)?;
+                    let algo_raw: Option<u8> = row.get(8)?;
+                    let ctype_raw: Option<u8> = row.get(9)?;
                     let checksum = if let Some(algo_val) = algo_raw {
                         let algo = ChecksumAlgorithm::from_u8(algo_val).ok_or_else(|| {
                             rusqlite::Error::FromSqlConversionFailure(
-                                7,
+                                8,
                                 rusqlite::types::Type::Integer,
                                 Box::from(format!("invalid checksum algorithm: {algo_val}")),
                             )
@@ -2906,7 +2908,7 @@ impl PgMetadataStore for PgStore {
                             .map(|v| {
                                 ChecksumType::from_u8(v).ok_or_else(|| {
                                     rusqlite::Error::FromSqlConversionFailure(
-                                        8,
+                                        9,
                                         rusqlite::types::Type::Integer,
                                         Box::from(format!("invalid checksum type: {v}")),
                                     )
@@ -2915,7 +2917,7 @@ impl PgMetadataStore for PgStore {
                             .transpose()?;
                         Some(MultipartChecksumConfig::new(algo, ctype).map_err(|e| {
                             rusqlite::Error::FromSqlConversionFailure(
-                                7,
+                                8,
                                 rusqlite::types::Type::Integer,
                                 Box::from(e.reason),
                             )
@@ -2935,8 +2937,9 @@ impl PgMetadataStore for PgStore {
                                 Box::from(format!("invalid upload state: {state_raw}")),
                             )
                         })?,
-                        metadata_blob: SerializedMetadataBlob::from(row.get::<_, Vec<u8>>(5)?),
-                        owner_principal: row.get(6)?,
+                        tags: row.get::<_, Option<String>>(5)?.map(SerializedTagSet::from),
+                        metadata_blob: SerializedMetadataBlob::from(row.get::<_, Vec<u8>>(6)?),
+                        owner_principal: row.get(7)?,
                         checksum,
                     })
                 },
@@ -3094,7 +3097,7 @@ impl PgMetadataStore for PgStore {
 
         let where_str = where_clauses.join(" AND ");
         let sql = format!(
-            "SELECT upload_id, bucket, key, initiated_at, state, metadata_blob, \
+            "SELECT upload_id, bucket, key, initiated_at, state, tags, metadata_blob, \
              owner_principal, checksum_algorithm, checksum_type \
              FROM multipart_uploads \
              WHERE {where_str} \
@@ -3113,12 +3116,12 @@ impl PgMetadataStore for PgStore {
         let rows = stmt
             .query_map(params_refs.as_slice(), |row| {
                 let state_raw = row.get::<_, u8>(4)?;
-                let algo_raw: Option<u8> = row.get(7)?;
-                let ctype_raw: Option<u8> = row.get(8)?;
+                let algo_raw: Option<u8> = row.get(8)?;
+                let ctype_raw: Option<u8> = row.get(9)?;
                 let checksum = if let Some(algo_val) = algo_raw {
                     let algo = ChecksumAlgorithm::from_u8(algo_val).ok_or_else(|| {
                         rusqlite::Error::FromSqlConversionFailure(
-                            7,
+                            8,
                             rusqlite::types::Type::Integer,
                             Box::from(format!("invalid checksum algorithm: {algo_val}")),
                         )
@@ -3127,7 +3130,7 @@ impl PgMetadataStore for PgStore {
                         .map(|v| {
                             ChecksumType::from_u8(v).ok_or_else(|| {
                                 rusqlite::Error::FromSqlConversionFailure(
-                                    8,
+                                    9,
                                     rusqlite::types::Type::Integer,
                                     Box::from(format!("invalid checksum type: {v}")),
                                 )
@@ -3136,7 +3139,7 @@ impl PgMetadataStore for PgStore {
                         .transpose()?;
                     Some(MultipartChecksumConfig::new(algo, ctype).map_err(|e| {
                         rusqlite::Error::FromSqlConversionFailure(
-                            7,
+                            8,
                             rusqlite::types::Type::Integer,
                             Box::from(e.reason),
                         )
@@ -3156,8 +3159,9 @@ impl PgMetadataStore for PgStore {
                             Box::from(format!("invalid upload state: {state_raw}")),
                         )
                     })?,
-                    metadata_blob: SerializedMetadataBlob::from(row.get::<_, Vec<u8>>(5)?),
-                    owner_principal: row.get(6)?,
+                    tags: row.get::<_, Option<String>>(5)?.map(SerializedTagSet::from),
+                    metadata_blob: SerializedMetadataBlob::from(row.get::<_, Vec<u8>>(6)?),
+                    owner_principal: row.get(7)?,
                     checksum,
                 })
             })
@@ -3781,6 +3785,7 @@ impl PgMetadataStore for PgStore {
         let now = PgStore::now_millis();
         let data_layout = DataLayout::MultipartManifest as u8;
         let parts_count = Some(parts.len() as i64);
+        let tags = obj.tags.as_ref().map(SerializedTagSet::as_str);
         let metadata_blob = obj
             .metadata_blob
             .as_ref()
@@ -3836,13 +3841,13 @@ impl PgMetadataStore for PgStore {
             let obj_sql = if obj.version_id.is_null() {
                 "INSERT OR REPLACE INTO objects \
                  (bucket, key, version_id, generation_id, size, etag, etag_kind, last_modified, \
-                  storage_class, ec_k, ec_m, status, data_layout, parts_count, metadata_blob) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14)"
+                  storage_class, ec_k, ec_m, status, tags, data_layout, parts_count, metadata_blob) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"
             } else {
                 "INSERT INTO objects \
                  (bucket, key, version_id, generation_id, size, etag, etag_kind, last_modified, \
-                  storage_class, ec_k, ec_m, status, data_layout, parts_count, metadata_blob) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14)"
+                  storage_class, ec_k, ec_m, status, tags, data_layout, parts_count, metadata_blob) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"
             };
             self.conn.execute(
                 obj_sql,
@@ -3858,6 +3863,7 @@ impl PgMetadataStore for PgStore {
                     obj.ec.k,
                     obj.ec.m,
                     ObjectState::Live as u8,
+                    tags,
                     data_layout,
                     parts_count,
                     metadata_blob,

@@ -988,6 +988,8 @@ pub struct CommitMultipartReq {
     /// Composite CRC64-NVME bytes (CRC of concatenated per-part CRC64s).
     pub etag_crc64: [u8; 8],
     pub ec: EcShape,
+    /// Serialized tagging XML (None = no tags).
+    pub tags: Option<SerializedTagSet>,
     /// Serialized user metadata headers.
     pub metadata_blob: Option<SerializedMetadataBlob>,
 }
@@ -1075,6 +1077,8 @@ pub struct MultipartUploadRecord {
     /// Initiation timestamp (unix milliseconds).
     pub initiated_at: u64,
     pub state: UploadState,
+    /// Serialized tagging XML (None = no tags).
+    pub tags: Option<SerializedTagSet>,
     /// Serialized user metadata headers.
     pub metadata_blob: SerializedMetadataBlob,
     pub owner_principal: Option<String>,
@@ -1135,6 +1139,7 @@ pub struct CreateMultipartUploadReq {
     pub upload_id: UploadId,
     pub bucket: BucketName,
     pub key: ObjectKey,
+    pub tags: Option<SerializedTagSet>,
     pub metadata_blob: SerializedMetadataBlob,
     pub owner_principal: Option<String>,
     pub checksum: Option<MultipartChecksumConfig>,

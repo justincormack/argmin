@@ -1288,6 +1288,7 @@ pub struct CreateMultipartUploadRequest<'a> {
     pub bucket: &'a str,
     pub key: &'a str,
     pub metadata: &'a MetadataBlob,
+    pub tags: Option<&'a str>,
     pub checksum: Option<MultipartChecksumConfig>,
     pub requester: Requester<'a>,
 }
@@ -6676,6 +6677,7 @@ impl Coordinator {
                 upload_id: UploadId::from(upload_id.as_str()),
                 bucket: BucketName::from(bucket),
                 key: ObjectKey::from(key),
+                tags: req.tags.map(SerializedTagSet::from),
                 metadata_blob: SerializedMetadataBlob::from(metadata_blob),
                 owner_principal: Some(bucket_info.owner_principal),
                 checksum: req.checksum,
@@ -7236,6 +7238,7 @@ impl Coordinator {
                 size: total_size,
                 etag_crc64,
                 ec: EcShape { k: 0, m: 0 },
+                tags: upload.tags.clone(),
                 metadata_blob: Some(metadata_blob_bytes),
             };
 
@@ -8245,6 +8248,7 @@ mod tests {
                 bucket,
                 key,
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -8403,6 +8407,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                tags: None,
                 checksum: None,
                 requester: TEST_REQUESTER,
             });
@@ -10514,6 +10519,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -11310,6 +11316,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 checksum: None,
                 requester: Requester::principal("other-user"),
             })
@@ -11330,6 +11337,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 checksum: None,
                 requester: Requester::principal("owner-a"),
             })
@@ -11364,6 +11372,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 checksum: None,
                 requester: Requester::principal("owner-a"),
             })
@@ -11395,6 +11404,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 checksum: None,
                 requester: Requester::principal("owner-a"),
             })
@@ -11443,6 +11453,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 checksum: None,
                 requester: Requester::principal("owner-a"),
             })
@@ -13221,6 +13232,7 @@ mod tests {
                     bucket: "bucket",
                     key: &dst_key,
                     metadata: &MetadataBlob::new(),
+                    tags: None,
                     checksum: None,
                     requester: TEST_REQUESTER,
                 })
@@ -13670,6 +13682,7 @@ mod tests {
                 bucket: "race-bucket",
                 key: "dst",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -13847,6 +13860,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -13870,6 +13884,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -13880,6 +13895,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -13899,6 +13915,7 @@ mod tests {
                 bucket: "no-such-bucket",
                 key: "key",
                 metadata: &metadata,
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -13939,6 +13956,7 @@ mod tests {
                 bucket: "bucket",
                 key: "alpha",
                 metadata: &metadata,
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -13949,6 +13967,7 @@ mod tests {
                 bucket: "bucket",
                 key: "beta",
                 metadata: &metadata,
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -13988,6 +14007,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -13998,6 +14018,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -14041,6 +14062,7 @@ mod tests {
                 bucket: "bucket",
                 key: "a",
                 metadata: &metadata,
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -14051,6 +14073,7 @@ mod tests {
                 bucket: "bucket",
                 key: "b",
                 metadata: &metadata,
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -14061,6 +14084,7 @@ mod tests {
                 bucket: "bucket",
                 key: "c",
                 metadata: &metadata,
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -14113,6 +14137,7 @@ mod tests {
                 bucket: "bucket",
                 key: "photos/a.jpg",
                 metadata: &metadata,
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -14123,6 +14148,7 @@ mod tests {
                 bucket: "bucket",
                 key: "photos/b.jpg",
                 metadata: &metadata,
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -14133,6 +14159,7 @@ mod tests {
                 bucket: "bucket",
                 key: "docs/readme.md",
                 metadata: &metadata,
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -14165,6 +14192,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -14214,12 +14242,15 @@ mod tests {
             ("X-Amz-Meta-Author", "test"),
         ])
         .unwrap();
+        let tags_xml =
+            "<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag></TagSet></Tagging>";
 
         let result = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
                 bucket: "bucket",
                 key: "photo.png",
                 metadata: &metadata,
+                tags: Some(tags_xml),
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -14232,6 +14263,7 @@ mod tests {
         let record = pg.get_multipart_upload(&result.upload_id).unwrap();
         assert_eq!(record.bucket, "bucket");
         assert_eq!(record.key, "photo.png");
+        assert_eq!(record.tags.as_deref(), Some(tags_xml));
 
         // Deserialize and verify the metadata blob.
         let (blob, _) = MetadataBlob::deserialize(record.metadata_blob.as_slice()).unwrap();
@@ -14251,6 +14283,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -14426,6 +14459,7 @@ mod tests {
                     bucket: "bucket",
                     key: "key",
                     metadata: &metadata,
+                    tags: None,
                     checksum: None,
 
                     requester: TEST_REQUESTER,
@@ -14494,6 +14528,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -14550,6 +14585,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -14611,6 +14647,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -14646,6 +14683,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -14704,6 +14742,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -14782,6 +14821,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -14825,6 +14865,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -14880,6 +14921,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -14934,6 +14976,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -15016,6 +15059,7 @@ mod tests {
                 bucket,
                 key,
                 metadata: &metadata,
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -15301,6 +15345,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -15637,6 +15682,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -15683,6 +15729,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -15767,6 +15814,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -15935,6 +15983,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -15991,6 +16040,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -16054,6 +16104,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -16109,6 +16160,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -16160,6 +16212,7 @@ mod tests {
                 bucket,
                 key,
                 metadata: &metadata,
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -16211,6 +16264,7 @@ mod tests {
                 bucket,
                 key,
                 metadata: &metadata,
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -16814,6 +16868,7 @@ mod tests {
                 bucket,
                 key,
                 metadata: &metadata,
+                tags: None,
                 checksum: Some(MultipartChecksumConfig::new(algo, ctype).unwrap()),
 
                 requester: TEST_REQUESTER,
@@ -18473,6 +18528,7 @@ mod tests {
                 bucket: "bucket",
                 key: "dst",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -18537,6 +18593,7 @@ mod tests {
                 bucket: "bucket",
                 key: "dst",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 checksum: Some(
                     MultipartChecksumConfig::new(ChecksumAlgorithm::Crc32c, None).unwrap(),
                 ),
@@ -18639,6 +18696,7 @@ mod tests {
                 bucket: "bucket",
                 key: "dst",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -18793,6 +18851,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -18848,6 +18907,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -18905,6 +18965,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &MetadataBlob::new(),
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -18944,6 +19005,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -18954,6 +19016,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -19075,6 +19138,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                tags: None,
                 checksum: None,
 
                 requester: TEST_REQUESTER,

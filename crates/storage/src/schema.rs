@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS multipart_uploads (
     key              TEXT NOT NULL,
     initiated_at     INTEGER NOT NULL,
     state            INTEGER NOT NULL DEFAULT 0,
+    tags             TEXT,
     metadata_blob    BLOB NOT NULL,
     owner_principal  TEXT CHECK (owner_principal IS NULL OR length(owner_principal) BETWEEN 1 AND 256)
 )";
@@ -342,6 +343,7 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     migrate_segment_crc_columns(conn)?;
     migrate_owner_identity_columns(conn)?;
     migrate_bucket_write_reservation_columns(conn)?;
+    migrate_multipart_upload_tag_columns(conn)?;
     Ok(())
 }
 
@@ -420,6 +422,16 @@ fn migrate_segment_crc_columns(conn: &Connection) -> Result<(), rusqlite::Error>
             }
             Err(e) => return Err(e),
         }
+    }
+    Ok(())
+}
+
+fn migrate_multipart_upload_tag_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
+    match conn.execute("ALTER TABLE multipart_uploads ADD COLUMN tags TEXT", []) {
+        Ok(_) => {}
+        Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
+            if msg.contains("duplicate column name") => {}
+        Err(e) => return Err(e),
     }
     Ok(())
 }

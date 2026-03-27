@@ -1421,6 +1421,16 @@ impl HttpFrontend {
                 let checksum = checksum_algorithm
                     .map(|algo| MultipartChecksumConfig::new(algo, checksum_type))
                     .transpose()?;
+                let inline_tags_xml = if let Some(tagging_header) = req.header("x-amz-tagging") {
+                    let tags = xml::parse_url_encoded_tags(tagging_header)?;
+                    if tags.is_empty() {
+                        None
+                    } else {
+                        Some(xml::get_tagging_xml(&tags))
+                    }
+                } else {
+                    None
+                };
                 let requester =
                     crate::coordinator::Requester::from_principal(auth.principal.as_deref());
 
@@ -1429,6 +1439,7 @@ impl HttpFrontend {
                         bucket: &bucket,
                         key: &key,
                         metadata: &metadata,
+                        tags: inline_tags_xml.as_deref(),
                         checksum,
                         requester,
                     },

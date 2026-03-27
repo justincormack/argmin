@@ -651,11 +651,13 @@ fn file_metadata_invalid_data_layout_returns_error() {
 #[test]
 fn mpu_create_and_get_upload() {
     let (_dir, store) = make_pg_store();
+    let tags = "<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag></TagSet></Tagging>";
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
             upload_id: "uid-1".into(),
             bucket: "b".into(),
             key: "k".into(),
+            tags: Some(tags.into()),
             metadata_blob: vec![1, 2, 3].into(),
             owner_principal: Some("alice".to_string()),
             checksum: None,
@@ -667,6 +669,7 @@ fn mpu_create_and_get_upload() {
     assert_eq!(rec.bucket, "b");
     assert_eq!(rec.key, "k");
     assert_eq!(rec.state, UploadState::InProgress);
+    assert_eq!(rec.tags.as_deref(), Some(tags));
     assert_eq!(rec.metadata_blob, vec![1, 2, 3].into());
     assert_eq!(rec.owner_principal, Some("alice".to_string()));
     assert!(rec.initiated_at > 0);
@@ -680,6 +683,7 @@ fn mpu_create_upload_with_checksum_fields() {
             upload_id: "uid-cksum".into(),
             bucket: "b".into(),
             key: "k".into(),
+            tags: None,
             metadata_blob: vec![].into(),
             owner_principal: None,
             checksum: Some(
@@ -708,6 +712,7 @@ fn mpu_create_upload_with_checksum_fields() {
             upload_id: "uid-no-cksum".into(),
             bucket: "b".into(),
             key: "k2".into(),
+            tags: None,
             metadata_blob: vec![].into(),
             owner_principal: None,
             checksum: None,
@@ -725,6 +730,7 @@ fn mpu_part_checksum_round_trip() {
             upload_id: "uid-pc".into(),
             bucket: "b".into(),
             key: "k".into(),
+            tags: None,
             metadata_blob: vec![].into(),
             owner_principal: None,
             checksum: Some(
@@ -831,6 +837,7 @@ fn mpu_object_part_checksum_round_trip() {
 #[test]
 fn mpu_complete_multipart_commit_preserves_checksums() {
     let (_dir, store) = make_pg_store();
+    let tags = "<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag></TagSet></Tagging>";
 
     // Create upload and object row (needed for complete_multipart_commit).
     store
@@ -838,6 +845,7 @@ fn mpu_complete_multipart_commit_preserves_checksums() {
             upload_id: "uid-cmc".into(),
             bucket: "b".into(),
             key: "k".into(),
+            tags: Some(tags.into()),
             metadata_blob: vec![].into(),
             owner_principal: None,
             checksum: Some(
@@ -858,6 +866,7 @@ fn mpu_complete_multipart_commit_preserves_checksums() {
         size: 6 * 1024 * 1024,
         etag_crc64: [0xCC, 0, 0, 0, 0, 0, 0, 0],
         ec: EcShape { k: 4, m: 2 },
+        tags: Some(tags.into()),
         metadata_blob: Some(vec![].into()),
     };
 
@@ -903,6 +912,12 @@ fn mpu_complete_multipart_commit_preserves_checksums() {
     assert_eq!(committed.len(), 2);
     assert_eq!(committed[0].checksum, Some(cksum));
     assert_eq!(committed[1].checksum, None);
+    let live = store
+        .get_object_meta("b", "k")
+        .unwrap()
+        .into_live()
+        .unwrap();
+    assert_eq!(live.tags.as_deref(), Some(tags));
 }
 
 #[test]
@@ -923,6 +938,7 @@ fn mpu_set_upload_state_transition() {
             upload_id: "uid-2".into(),
             bucket: "b".into(),
             key: "k".into(),
+            tags: None,
             metadata_blob: vec![].into(),
             owner_principal: None,
             checksum: None,
@@ -966,6 +982,7 @@ fn mpu_delete_upload_cascades_parts() {
             upload_id: "uid-3".into(),
             bucket: "b".into(),
             key: "k".into(),
+            tags: None,
             metadata_blob: vec![].into(),
             owner_principal: None,
             checksum: None,
@@ -1017,6 +1034,7 @@ fn mpu_upsert_part_and_get() {
             upload_id: "uid-4".into(),
             bucket: "b".into(),
             key: "k".into(),
+            tags: None,
             metadata_blob: vec![].into(),
             owner_principal: None,
             checksum: None,
@@ -1082,6 +1100,7 @@ fn mpu_list_parts_pagination() {
             upload_id: "uid-5".into(),
             bucket: "b".into(),
             key: "k".into(),
+            tags: None,
             metadata_blob: vec![].into(),
             owner_principal: None,
             checksum: None,
@@ -1159,6 +1178,7 @@ fn mpu_list_uploads_pagination() {
                 upload_id: uid.into(),
                 bucket: "bkt".into(),
                 key: key.into(),
+                tags: None,
                 metadata_blob: vec![].into(),
                 owner_principal: None,
                 checksum: None,
@@ -1210,6 +1230,7 @@ fn mpu_list_uploads_with_prefix() {
                 upload_id: uid.into(),
                 bucket: "bkt".into(),
                 key: key.into(),
+                tags: None,
                 metadata_blob: vec![].into(),
                 owner_principal: None,
                 checksum: None,
@@ -1241,6 +1262,7 @@ fn mpu_list_uploads_same_key_multiple_upload_ids() {
                 upload_id: uid.into(),
                 bucket: "bkt".into(),
                 key: "same-key".into(),
+                tags: None,
                 metadata_blob: vec![].into(),
                 owner_principal: None,
                 checksum: None,
@@ -1290,6 +1312,7 @@ fn mpu_list_uploads_stale_marker_returns_remaining() {
                 upload_id: uid.into(),
                 bucket: "bkt".into(),
                 key: "key".into(),
+                tags: None,
                 metadata_blob: vec![].into(),
                 owner_principal: None,
                 checksum: None,
@@ -1329,6 +1352,7 @@ fn mpu_corrupted_part_okh_returns_error() {
             upload_id: "uid-okh".into(),
             bucket: "b".into(),
             key: "k".into(),
+            tags: None,
             metadata_blob: vec![].into(),
             owner_principal: None,
             checksum: None,
@@ -1420,6 +1444,7 @@ fn mpu_get_missing_part_returns_part_not_found() {
             upload_id: "uid-pnf".into(),
             bucket: "b".into(),
             key: "k".into(),
+            tags: None,
             metadata_blob: vec![].into(),
             owner_principal: None,
             checksum: None,
@@ -1447,6 +1472,7 @@ fn mpu_set_upload_state_rejects_in_progress_target() {
             upload_id: "uid-ip".into(),
             bucket: "b".into(),
             key: "k".into(),
+            tags: None,
             metadata_blob: vec![].into(),
             owner_principal: None,
             checksum: None,
@@ -1756,6 +1782,7 @@ fn create_upload(store: &dyn PgMetadataStore, upload_id: &str) {
             upload_id: upload_id.into(),
             bucket: "b".into(),
             key: "k".into(),
+            tags: None,
             metadata_blob: vec![].into(),
             owner_principal: None,
             checksum: None,
@@ -3232,6 +3259,7 @@ fn upsert_multipart_part_segments_replaces_prior_segments() {
             upload_id: "mpu-1".into(),
             bucket: "b".into(),
             key: "k".into(),
+            tags: None,
             metadata_blob: vec![].into(),
             owner_principal: None,
             checksum: None,
@@ -3309,6 +3337,7 @@ fn commit_stream_part_replaces_prior_segments_on_reupload() {
             upload_id: "mpu-1".into(),
             bucket: "b".into(),
             key: "k".into(),
+            tags: None,
             metadata_blob: vec![].into(),
             owner_principal: None,
             checksum: None,
@@ -3505,6 +3534,7 @@ fn commit_stream_part_rejects_wrong_upload_id() {
             upload_id: "mpu-correct".into(),
             bucket: "b".into(),
             key: "k".into(),
+            tags: None,
             metadata_blob: vec![].into(),
             owner_principal: None,
             checksum: None,
@@ -3562,6 +3592,7 @@ fn commit_stream_part_zero_segments_clears_prior() {
             upload_id: "mpu-zc".into(),
             bucket: "b".into(),
             key: "k".into(),
+            tags: None,
             metadata_blob: vec![].into(),
             owner_principal: None,
             checksum: None,
@@ -3937,6 +3968,7 @@ fn commit_stream_part_rejects_mismatched_segment_part_number() {
             upload_id: "mpu-cpc".into(),
             bucket: "b".into(),
             key: "k".into(),
+            tags: None,
             metadata_blob: vec![].into(),
             owner_principal: None,
             checksum: None,
@@ -4008,6 +4040,7 @@ fn commit_stream_part_rejects_non_staging_segment_version_id() {
             upload_id: "mpu-vid".into(),
             bucket: "b".into(),
             key: "k".into(),
+            tags: None,
             metadata_blob: vec![].into(),
             owner_principal: None,
             checksum: None,
@@ -4629,6 +4662,7 @@ fn delete_multipart_part_segments_by_upload_id_cleans_up() {
             upload_id: "mpu-seg".into(),
             bucket: "b".into(),
             key: "k".into(),
+            tags: None,
             metadata_blob: vec![].into(),
             owner_principal: None,
             checksum: None,
@@ -4867,6 +4901,7 @@ fn complete_multipart_commit_no_such_upload() {
         size: 1024,
         etag_crc64: [0; 8],
         ec: EcShape { k: 4, m: 2 },
+        tags: None,
         metadata_blob: None,
     };
     let parts = vec![ObjectPartRecord {
