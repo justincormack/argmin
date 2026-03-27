@@ -9,6 +9,7 @@ use crate::error::ServerError;
 use checksum::{ChecksumAlgorithm, ChecksumType, RawChecksum};
 use s3_types::{BucketVersioningState, CanonicalUserId, VersionId};
 use server_core::sse::{SseCustomerResponseHeaders, SSE_CUSTOMER_ALGORITHM};
+use server_core::system_metadata::SystemMetadata;
 
 use super::xml;
 
@@ -118,6 +119,49 @@ impl S3Response {
         )
     }
 
+    fn apply_system_metadata_headers(mut self, metadata: &SystemMetadata) -> Self {
+        if let Some(content_type) = metadata.content_type() {
+            self = self.header("Content-Type", content_type);
+        } else {
+            self = self.header("Content-Type", "application/octet-stream");
+        }
+        if let Some(content_encoding) = metadata.content_encoding() {
+            self = self.header("Content-Encoding", content_encoding);
+        }
+        if let Some(cache_control) = metadata.cache_control() {
+            self = self.header("Cache-Control", cache_control);
+        }
+        if let Some(content_disposition) = metadata.content_disposition() {
+            self = self.header("Content-Disposition", content_disposition);
+        }
+        if let Some(content_language) = metadata.content_language() {
+            self = self.header("Content-Language", content_language);
+        }
+        if let Some(expires) = metadata.expires() {
+            self = self.header("Expires", expires);
+        }
+        self
+    }
+
+    fn apply_user_metadata_headers(
+        mut self,
+        metadata: &crate::metadata_blob::MetadataBlob,
+    ) -> Self {
+        for entry in metadata.iter() {
+            if entry.key.starts_with("x-amz-meta-") {
+                self = self.meta_header(&entry.key, &entry.value);
+            }
+        }
+        self
+    }
+
+    fn apply_checksum_mode_headers(mut self, metadata: &SystemMetadata) -> Self {
+        for (name, value) in metadata.checksum_header_pairs() {
+            self = self.header(name, value);
+        }
+        self
+    }
+
     /// Build a response for a successful `PutObject`.
     #[must_use]
     pub fn put_object(result: &PutObjectResult) -> Self {
@@ -182,44 +226,13 @@ impl S3Response {
             let vid = format_version_id(result.version_id);
             resp = resp.header("x-amz-version-id", &vid);
         }
-
-        // Add metadata headers
-        if let Some(ct) = result.metadata.get("content-type") {
-            resp = resp.header("Content-Type", ct);
-        } else {
-            resp = resp.header("Content-Type", "application/octet-stream");
-        }
-        if let Some(ce) = result.metadata.get("content-encoding") {
-            resp = resp.header("Content-Encoding", ce);
-        }
-        if let Some(cc) = result.metadata.get("cache-control") {
-            resp = resp.header("Cache-Control", cc);
-        }
-        if let Some(cd) = result.metadata.get("content-disposition") {
-            resp = resp.header("Content-Disposition", cd);
-        }
-        if let Some(cl) = result.metadata.get("content-language") {
-            resp = resp.header("Content-Language", cl);
-        }
-        if let Some(ex) = result.metadata.get("expires") {
-            resp = resp.header("Expires", ex);
-        }
-
-        // x-amz-meta-* headers
-        for entry in result.metadata.iter() {
-            if entry.key.starts_with("x-amz-meta-") {
-                resp = resp.meta_header(&entry.key, &entry.value);
-            }
-        }
+        resp = resp
+            .apply_system_metadata_headers(&result.system_metadata)
+            .apply_user_metadata_headers(&result.metadata);
 
         // Checksum headers (only when ChecksumMode=ENABLED)
         if checksum_mode.is_some_and(|m| m.eq_ignore_ascii_case("ENABLED")) {
-            for entry in result.metadata.checksum_entries() {
-                resp = resp.header(&entry.key, &entry.value);
-            }
-            if let Some(ct) = result.metadata.get("x-amz-checksum-type") {
-                resp = resp.header("x-amz-checksum-type", ct);
-            }
+            resp = resp.apply_checksum_mode_headers(&result.system_metadata);
         }
 
         resp.apply_sse_customer_headers(result.sse_customer.as_ref())
@@ -255,42 +268,13 @@ impl S3Response {
             let vid = format_version_id(result.version_id);
             resp = resp.header("x-amz-version-id", &vid);
         }
-
-        if let Some(ct) = result.metadata.get("content-type") {
-            resp = resp.header("Content-Type", ct);
-        } else {
-            resp = resp.header("Content-Type", "application/octet-stream");
-        }
-        if let Some(ce) = result.metadata.get("content-encoding") {
-            resp = resp.header("Content-Encoding", ce);
-        }
-        if let Some(cc) = result.metadata.get("cache-control") {
-            resp = resp.header("Cache-Control", cc);
-        }
-        if let Some(cd) = result.metadata.get("content-disposition") {
-            resp = resp.header("Content-Disposition", cd);
-        }
-        if let Some(cl) = result.metadata.get("content-language") {
-            resp = resp.header("Content-Language", cl);
-        }
-        if let Some(ex) = result.metadata.get("expires") {
-            resp = resp.header("Expires", ex);
-        }
-
-        for entry in result.metadata.iter() {
-            if entry.key.starts_with("x-amz-meta-") {
-                resp = resp.meta_header(&entry.key, &entry.value);
-            }
-        }
+        resp = resp
+            .apply_system_metadata_headers(&result.system_metadata)
+            .apply_user_metadata_headers(&result.metadata);
 
         // Checksum headers (only when ChecksumMode=ENABLED)
         if checksum_mode.is_some_and(|m| m.eq_ignore_ascii_case("ENABLED")) {
-            for entry in result.metadata.checksum_entries() {
-                resp = resp.header(&entry.key, &entry.value);
-            }
-            if let Some(ct) = result.metadata.get("x-amz-checksum-type") {
-                resp = resp.header("x-amz-checksum-type", ct);
-            }
+            resp = resp.apply_checksum_mode_headers(&result.system_metadata);
         }
 
         resp.apply_sse_customer_headers(result.sse_customer.as_ref())
@@ -310,33 +294,9 @@ impl S3Response {
             let vid = format_version_id(result.version_id);
             resp = resp.header("x-amz-version-id", &vid);
         }
-
-        if let Some(ct) = result.metadata.get("content-type") {
-            resp = resp.header("Content-Type", ct);
-        } else {
-            resp = resp.header("Content-Type", "application/octet-stream");
-        }
-        if let Some(ce) = result.metadata.get("content-encoding") {
-            resp = resp.header("Content-Encoding", ce);
-        }
-        if let Some(cc) = result.metadata.get("cache-control") {
-            resp = resp.header("Cache-Control", cc);
-        }
-        if let Some(cd) = result.metadata.get("content-disposition") {
-            resp = resp.header("Content-Disposition", cd);
-        }
-        if let Some(cl) = result.metadata.get("content-language") {
-            resp = resp.header("Content-Language", cl);
-        }
-        if let Some(ex) = result.metadata.get("expires") {
-            resp = resp.header("Expires", ex);
-        }
-
-        for entry in result.metadata.iter() {
-            if entry.key.starts_with("x-amz-meta-") {
-                resp = resp.meta_header(&entry.key, &entry.value);
-            }
-        }
+        resp = resp
+            .apply_system_metadata_headers(&result.system_metadata)
+            .apply_user_metadata_headers(&result.metadata);
 
         // Per-part checksum (always emitted for part-level requests)
         if let Some(ref cksum) = result.checksum {
@@ -344,8 +304,8 @@ impl S3Response {
             let b64 = base64::engine::general_purpose::STANDARD.encode(cksum.bytes());
             resp = resp.header(cksum.algorithm().header_name(), &b64);
         }
-        if let Some(ct) = result.metadata.get("x-amz-checksum-type") {
-            resp = resp.header("x-amz-checksum-type", ct);
+        if let Some(checksum_type) = result.system_metadata.checksum_type() {
+            resp = resp.header("x-amz-checksum-type", checksum_type.as_str());
         }
 
         resp
@@ -367,33 +327,9 @@ impl S3Response {
             let vid = format_version_id(result.version_id);
             resp = resp.header("x-amz-version-id", &vid);
         }
-
-        if let Some(ct) = result.metadata.get("content-type") {
-            resp = resp.header("Content-Type", ct);
-        } else {
-            resp = resp.header("Content-Type", "application/octet-stream");
-        }
-        if let Some(ce) = result.metadata.get("content-encoding") {
-            resp = resp.header("Content-Encoding", ce);
-        }
-        if let Some(cc) = result.metadata.get("cache-control") {
-            resp = resp.header("Cache-Control", cc);
-        }
-        if let Some(cd) = result.metadata.get("content-disposition") {
-            resp = resp.header("Content-Disposition", cd);
-        }
-        if let Some(cl) = result.metadata.get("content-language") {
-            resp = resp.header("Content-Language", cl);
-        }
-        if let Some(ex) = result.metadata.get("expires") {
-            resp = resp.header("Expires", ex);
-        }
-
-        for entry in result.metadata.iter() {
-            if entry.key.starts_with("x-amz-meta-") {
-                resp = resp.meta_header(&entry.key, &entry.value);
-            }
-        }
+        resp = resp
+            .apply_system_metadata_headers(&result.system_metadata)
+            .apply_user_metadata_headers(&result.metadata);
 
         resp.apply_sse_customer_headers(result.sse_customer.as_ref())
             .streaming_body(result.body, result.range_end - result.range_start + 1)
@@ -423,33 +359,9 @@ impl S3Response {
             let vid = format_version_id(result.version_id);
             resp = resp.header("x-amz-version-id", &vid);
         }
-
-        if let Some(ct) = result.metadata.get("content-type") {
-            resp = resp.header("Content-Type", ct);
-        } else {
-            resp = resp.header("Content-Type", "application/octet-stream");
-        }
-        if let Some(ce) = result.metadata.get("content-encoding") {
-            resp = resp.header("Content-Encoding", ce);
-        }
-        if let Some(cc) = result.metadata.get("cache-control") {
-            resp = resp.header("Cache-Control", cc);
-        }
-        if let Some(cd) = result.metadata.get("content-disposition") {
-            resp = resp.header("Content-Disposition", cd);
-        }
-        if let Some(cl) = result.metadata.get("content-language") {
-            resp = resp.header("Content-Language", cl);
-        }
-        if let Some(ex) = result.metadata.get("expires") {
-            resp = resp.header("Expires", ex);
-        }
-
-        for entry in result.metadata.iter() {
-            if entry.key.starts_with("x-amz-meta-") {
-                resp = resp.meta_header(&entry.key, &entry.value);
-            }
-        }
+        resp = resp
+            .apply_system_metadata_headers(&result.system_metadata)
+            .apply_user_metadata_headers(&result.metadata);
 
         // Per-part checksum (always emitted for part-level GETs)
         if let Some(ref cksum) = result.checksum {
@@ -458,8 +370,8 @@ impl S3Response {
             resp = resp.header(cksum.algorithm().header_name(), &b64);
         }
         // Checksum type (e.g. COMPOSITE, FULL_OBJECT)
-        if let Some(ct) = result.metadata.get("x-amz-checksum-type") {
-            resp = resp.header("x-amz-checksum-type", ct);
+        if let Some(checksum_type) = result.system_metadata.checksum_type() {
+            resp = resp.header("x-amz-checksum-type", checksum_type.as_str());
         }
 
         resp.apply_sse_customer_headers(result.sse_customer.as_ref())
@@ -1062,6 +974,10 @@ mod tests {
     };
     use crate::metadata_blob::MetadataBlob;
 
+    fn system_metadata(headers: &[(&str, &str)]) -> SystemMetadata {
+        SystemMetadata::from_pairs(headers)
+    }
+
     fn find_header<'a>(resp: &'a S3Response, name: &str) -> Option<&'a str> {
         resp.headers
             .iter()
@@ -1150,7 +1066,8 @@ mod tests {
         let result = GetObjectResult {
             sse_customer: None,
             body: ReadHandle::from_buffered_bytes(b"hello".to_vec()),
-            metadata: MetadataBlob::from_pairs(&[("content-type", "text/plain")]),
+            metadata: MetadataBlob::new(),
+            system_metadata: system_metadata(&[("content-type", "text/plain")]),
             etag: "\"etag\"".into(),
             size: 5,
             last_modified: 0,
@@ -1169,6 +1086,7 @@ mod tests {
             sse_customer: None,
             body: ReadHandle::from_buffered_bytes(b"data".to_vec()),
             metadata: MetadataBlob::new(),
+            system_metadata: SystemMetadata::new(),
             etag: "\"etag\"".into(),
             size: 4,
             last_modified: 0,
@@ -1188,6 +1106,7 @@ mod tests {
             sse_customer: None,
             body: ReadHandle::from_buffered_bytes(vec![]),
             metadata: MetadataBlob::from_pairs(&[("x-amz-meta-author", "alice")]),
+            system_metadata: SystemMetadata::new(),
             etag: "\"e\"".into(),
             size: 0,
             last_modified: 0,
@@ -1203,7 +1122,8 @@ mod tests {
         let result = GetObjectResult {
             sse_customer: None,
             body: ReadHandle::from_buffered_bytes(vec![]),
-            metadata: MetadataBlob::from_pairs(&[
+            metadata: MetadataBlob::new(),
+            system_metadata: system_metadata(&[
                 ("content-type", "text/html"),
                 ("content-encoding", "gzip"),
                 ("cache-control", "max-age=3600"),
@@ -1237,7 +1157,8 @@ mod tests {
         let result = GetObjectResult {
             sse_customer: None,
             body: ReadHandle::from_buffered_bytes(vec![]),
-            metadata: MetadataBlob::from_pairs(&[
+            metadata: MetadataBlob::new(),
+            system_metadata: system_metadata(&[
                 ("x-amz-checksum-crc32", "AAAAAA=="),
                 ("x-amz-checksum-type", "FULL_OBJECT"),
             ]),
@@ -1260,7 +1181,8 @@ mod tests {
         let result = GetObjectResult {
             sse_customer: None,
             body: ReadHandle::from_buffered_bytes(vec![]),
-            metadata: MetadataBlob::from_pairs(&[
+            metadata: MetadataBlob::new(),
+            system_metadata: system_metadata(&[
                 ("x-amz-checksum-crc32", "AAAAAA=="),
                 ("x-amz-checksum-type", "FULL_OBJECT"),
             ]),
@@ -1281,7 +1203,8 @@ mod tests {
     fn head_object_response() {
         let result = HeadObjectResult {
             sse_customer: None,
-            metadata: MetadataBlob::from_pairs(&[("content-type", "image/png")]),
+            metadata: MetadataBlob::new(),
+            system_metadata: system_metadata(&[("content-type", "image/png")]),
             etag: "\"etag\"".into(),
             size: 1024,
             last_modified: 0,
@@ -1301,6 +1224,7 @@ mod tests {
         let result = HeadObjectResult {
             sse_customer: None,
             metadata: MetadataBlob::new(),
+            system_metadata: SystemMetadata::new(),
             etag: "\"e\"".into(),
             size: 0,
             last_modified: 0,
@@ -1318,7 +1242,8 @@ mod tests {
     fn head_object_with_encoding_and_cache() {
         let result = HeadObjectResult {
             sse_customer: None,
-            metadata: MetadataBlob::from_pairs(&[
+            metadata: MetadataBlob::new(),
+            system_metadata: system_metadata(&[
                 ("content-encoding", "br"),
                 ("cache-control", "no-cache"),
             ]),
@@ -1338,6 +1263,7 @@ mod tests {
         let result = HeadObjectResult {
             sse_customer: None,
             metadata: MetadataBlob::from_pairs(&[("x-amz-meta-tag", "value")]),
+            system_metadata: SystemMetadata::new(),
             etag: "\"e\"".into(),
             size: 0,
             last_modified: 0,
@@ -1352,7 +1278,8 @@ mod tests {
     fn head_object_checksum_type_with_checksum_mode_enabled() {
         let result = HeadObjectResult {
             sse_customer: None,
-            metadata: MetadataBlob::from_pairs(&[
+            metadata: MetadataBlob::new(),
+            system_metadata: system_metadata(&[
                 ("x-amz-checksum-crc32", "AAAAAA=="),
                 ("x-amz-checksum-type", "COMPOSITE"),
             ]),
@@ -1371,7 +1298,8 @@ mod tests {
     fn head_object_checksum_type_omitted_without_checksum_mode() {
         let result = HeadObjectResult {
             sse_customer: None,
-            metadata: MetadataBlob::from_pairs(&[
+            metadata: MetadataBlob::new(),
+            system_metadata: system_metadata(&[
                 ("x-amz-checksum-crc32", "AAAAAA=="),
                 ("x-amz-checksum-type", "COMPOSITE"),
             ]),

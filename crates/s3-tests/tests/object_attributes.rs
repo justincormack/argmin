@@ -378,6 +378,54 @@ fn test_get_sse_c_object_attributes_rejects_wrong_key() {
     });
 }
 
+#[test]
+fn test_get_sse_c_checksum_object_attributes() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let key = test_sse_c_key();
+        let (key_b64, key_md5_b64) = sse_c_header_values(&key);
+        let checksum_sha256 = "arcu6553sHVAiX4MjW0j7I7vD4w6R+Gz9Ok0Q9lTa+0=";
+
+        with_sse_c_headers!(
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key("obj")
+                .body(ByteStream::from(vec![b'A'; 1024]))
+                .checksum_algorithm(ChecksumAlgorithm::Sha256)
+                .checksum_sha256(checksum_sha256),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+
+        let resp = with_sse_c_headers!(
+            client
+                .get_object_attributes()
+                .bucket(&bucket)
+                .key("obj")
+                .object_attributes(ObjectAttributes::Checksum)
+                .object_attributes(ObjectAttributes::ObjectSize),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+
+        assert_eq!(resp.object_size(), Some(1024));
+        let checksum = resp.checksum().expect("expected checksum");
+        assert_eq!(checksum.checksum_sha256(), Some(checksum_sha256));
+
+        cleanup(&bucket, &["obj"]).await;
+    });
+}
+
 /// Helper: create multipart upload, upload parts, complete, return etag.
 async fn do_multipart_upload(bucket: &str, key: &str, parts_data: &[Vec<u8>]) -> String {
     let client = CTX.client();

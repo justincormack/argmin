@@ -21,9 +21,10 @@ use storage::{
     MultipartReclaimPartSegmentRecord, MultipartReclaimRecord, MultipartUploadRecord,
     ObjectEncryption, ObjectKey, ObjectLayout, ObjectPartRecord, ObjectSegmentRecord,
     ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord, PutDeleteMarkerReq,
-    PutLiveObjectReq, PutObjectReq, ReclaimWorkItem, SerializedMetadataBlob, SerializedTagSet,
-    SessionId, ShardKey, SharedStorageNode, StoredObject, StreamUploadRecord,
-    StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, UploadId, UploadState,
+    PutLiveObjectReq, PutObjectReq, ReclaimWorkItem, SerializedMetadataBlob,
+    SerializedSystemMetadataBlob, SerializedTagSet, SessionId, ShardKey, SharedStorageNode,
+    StoredObject, StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadState,
+    StreamUploadTarget, UploadId, UploadState,
 };
 
 use crate::conditional::{
@@ -36,10 +37,12 @@ use crate::metadata_blob::MetadataBlob;
 use crate::pg::{object_key_hash, part_key_hash, stream_segment_key_hash, PgTopology};
 use crate::range::ByteRange;
 use crate::sse::{
-    decrypt_sse_customer_segment, prepare_sse_customer_write, resume_sse_customer_write,
-    validate_sse_customer_read, SseCustomerRequest, SseCustomerResponseHeaders,
-    SseCustomerValidatorConfig, SseCustomerWriteContext, SSE_C_SEGMENT_TAG_LEN,
+    decrypt_sse_customer_checksum, decrypt_sse_customer_segment, prepare_sse_customer_write,
+    resume_sse_customer_write, validate_sse_customer_read, SseCustomerRequest,
+    SseCustomerResponseHeaders, SseCustomerValidatorConfig, SseCustomerWriteContext,
+    SSE_C_SEGMENT_TAG_LEN,
 };
+use crate::system_metadata::SystemMetadata;
 
 const TRACE_TARGET: &str = "server_core";
 
@@ -912,6 +915,7 @@ fn segment_payloads_from_object_segments(
 pub struct GetObjectResult {
     pub body: ReadHandle,
     pub metadata: MetadataBlob,
+    pub system_metadata: SystemMetadata,
     pub etag: String,
     pub size: u64,
     pub last_modified: u64,
@@ -924,6 +928,7 @@ pub struct GetObjectResult {
 #[derive(Debug)]
 pub struct HeadObjectResult {
     pub metadata: MetadataBlob,
+    pub system_metadata: SystemMetadata,
     pub etag: String,
     pub size: u64,
     pub last_modified: u64,
@@ -936,6 +941,7 @@ pub struct HeadObjectResult {
 #[derive(Debug)]
 pub struct HeadObjectPartResult {
     pub metadata: MetadataBlob,
+    pub system_metadata: SystemMetadata,
     pub etag: String,
     pub part_size: u64,
     pub total_size: u64,
@@ -975,6 +981,7 @@ pub struct ObjectPartsInfo {
 #[derive(Debug)]
 pub struct GetObjectAttributesResult {
     pub metadata: MetadataBlob,
+    pub system_metadata: SystemMetadata,
     pub etag: String,
     pub size: u64,
     pub last_modified: u64,
@@ -988,6 +995,7 @@ pub struct GetObjectAttributesResult {
 pub struct GetObjectRangeResult {
     pub body: ReadHandle,
     pub metadata: MetadataBlob,
+    pub system_metadata: SystemMetadata,
     pub etag: String,
     pub size: u64,
     pub last_modified: u64,
@@ -1003,6 +1011,7 @@ pub struct GetObjectRangeResult {
 pub struct GetObjectPartResult {
     pub body: ReadHandle,
     pub metadata: MetadataBlob,
+    pub system_metadata: SystemMetadata,
     pub etag: String,
     pub size: u64,
     pub part_size: u64,
@@ -1030,6 +1039,7 @@ pub enum MetadataDirective<'a> {
     /// from the copied data.
     Replace {
         metadata: &'a MetadataBlob,
+        system_metadata: &'a SystemMetadata,
         checksum_algorithm: Option<ChecksumAlgorithm>,
     },
 }
@@ -1086,6 +1096,7 @@ pub struct PutObjectRequest<'a> {
     pub key: &'a str,
     pub data: &'a [u8],
     pub metadata: &'a MetadataBlob,
+    pub system_metadata: &'a SystemMetadata,
     pub tags: Option<&'a str>,
     pub cond: &'a WriteCondition,
     pub requester: Requester<'a>,
@@ -1098,6 +1109,8 @@ struct PreparedPutCommit {
     generation_id: GenerationId,
     tags: Option<SerializedTagSet>,
     metadata_blob: SerializedMetadataBlob,
+    system_metadata_blob: SerializedSystemMetadataBlob,
+    encryption: ObjectEncryption,
     stale_payload: Option<StaleObjectPayload>,
 }
 
@@ -1105,6 +1118,9 @@ struct PutCommitRequest<'a> {
     bucket: &'a str,
     key: &'a str,
     metadata_blob: &'a MetadataBlob,
+    system_metadata: &'a SystemMetadata,
+    encryption: &'a ObjectEncryption,
+    sse_customer_write: Option<&'a SseCustomerWriteContext>,
     tags: Option<&'a str>,
     cond: &'a WriteCondition,
 }
@@ -1353,6 +1369,7 @@ pub struct CreateMultipartUploadRequest<'a> {
     pub bucket: &'a str,
     pub key: &'a str,
     pub metadata: &'a MetadataBlob,
+    pub system_metadata: &'a SystemMetadata,
     pub tags: Option<&'a str>,
     pub checksum: Option<MultipartChecksumConfig>,
     pub requester: Requester<'a>,
@@ -1429,6 +1446,8 @@ pub struct FinalizeStreamPutRequest<'a> {
     pub crc64: u64,
     pub total_size: u64,
     pub metadata_blob: &'a MetadataBlob,
+    pub system_metadata: &'a SystemMetadata,
+    pub sse_customer: Option<&'a SseCustomerWriteContext>,
     pub tags: Option<&'a str>,
     pub cond: &'a WriteCondition,
 }
@@ -3612,6 +3631,11 @@ impl Coordinator {
         req: &PutCommitRequest<'_>,
     ) -> Result<PreparedPutCommit, ServerError> {
         let metadata_blob = SerializedMetadataBlob::from(req.metadata_blob.serialize()?);
+        let (system_metadata_blob, encryption) = Self::prepare_stored_system_metadata(
+            req.system_metadata,
+            req.encryption,
+            req.sse_customer_write,
+        )?;
 
         if !req.cond.is_empty() {
             let existing_etag = match meta_pg.get_object_meta(req.bucket, req.key) {
@@ -3645,6 +3669,8 @@ impl Coordinator {
             generation_id,
             tags: req.tags.map(SerializedTagSet::from),
             metadata_blob,
+            system_metadata_blob,
+            encryption,
             stale_payload,
         })
     }
@@ -3804,6 +3830,8 @@ impl Coordinator {
                     crc64: checksum::crc64::checksum(req.data),
                     total_size: req.data.len() as u64,
                     metadata_blob: req.metadata,
+                    system_metadata: req.system_metadata,
+                    sse_customer: write_encryption.as_ref(),
                     tags: req.tags,
                     cond: req.cond,
                 })
@@ -3890,6 +3918,12 @@ impl Coordinator {
                     bucket: req.bucket,
                     key: req.key,
                     metadata_blob: req.metadata,
+                    system_metadata: req.system_metadata,
+                    encryption: write_encryption
+                        .as_ref()
+                        .map(SseCustomerWriteContext::encryption)
+                        .unwrap_or(&ObjectEncryption::None),
+                    sse_customer_write: write_encryption.as_ref(),
                     tags: req.tags,
                     cond: req.cond,
                 },
@@ -3925,13 +3959,11 @@ impl Coordinator {
                     k: self.ec_config.data_shards,
                     m: self.ec_config.parity_shards,
                 },
-                encryption: write_encryption
-                    .as_ref()
-                    .map(|ctx| ctx.encryption().clone())
-                    .unwrap_or_default(),
+                encryption: prepared.encryption.clone(),
                 layout: ObjectLayout::Standard,
                 tags: prepared.tags.clone(),
                 metadata_blob: Some(prepared.metadata_blob.clone()),
+                system_metadata_blob: Some(prepared.system_metadata_blob.clone()),
             };
 
             if let Err(err) = shard_pg.register_written_shards_batch(&shard_batch) {
@@ -4494,6 +4526,9 @@ impl Coordinator {
                     bucket,
                     key,
                     metadata_blob,
+                    system_metadata: req.system_metadata,
+                    encryption: &session.encryption,
+                    sse_customer_write: req.sse_customer,
                     tags,
                     cond,
                 },
@@ -4541,9 +4576,10 @@ impl Coordinator {
                             k: self.ec_config.data_shards,
                             m: self.ec_config.parity_shards,
                         },
-                        encryption: session.encryption.clone(),
+                        encryption: prepared.encryption.clone(),
                         tags: prepared.tags.clone(),
                         metadata_blob: Some(prepared.metadata_blob.clone()),
+                        system_metadata_blob: Some(prepared.system_metadata_blob.clone()),
                     },
                     &committed_segments,
                 )
@@ -4965,7 +5001,7 @@ impl Coordinator {
         let _src_bucket_info = self.authorize_bucket_read_requester(requester, src_bucket)?;
 
         // Phase 1: Snapshot source metadata and prepare a read handle.
-        let (src_metadata, src_tags, mut source_body) = {
+        let (src_metadata, src_system_metadata, src_tags, mut source_body) = {
             let LockedReadObject {
                 record: src_stored,
                 pgs,
@@ -5052,14 +5088,14 @@ impl Coordinator {
                     body
                 };
 
-                let metadata = src_record
-                    .metadata_blob
-                    .as_ref()
-                    .map(|b| MetadataBlob::deserialize(b.as_slice()).map(|(m, _)| m))
-                    .transpose()?
-                    .unwrap_or_default();
+                let metadata = Self::deserialize_user_metadata(src_record.metadata_blob.as_ref())?;
+                let system_metadata = self.deserialize_visible_system_metadata(
+                    src_record.system_metadata_blob.as_ref(),
+                    &src_record.encryption,
+                    source_sse_customer,
+                )?;
 
-                (metadata, src_record.tags.clone(), body)
+                (metadata, system_metadata, src_record.tags.clone(), body)
             } else {
                 // Non-multipart source: metadata from DB row, user data from shards.
                 let src_etag_crc = src_record.etag.crc64();
@@ -5093,24 +5129,37 @@ impl Coordinator {
                     body
                 };
 
-                let src_metadata = src_record
-                    .metadata_blob
-                    .as_ref()
-                    .map(|b| MetadataBlob::deserialize(b.as_slice()).map(|(m, _)| m))
-                    .transpose()?
-                    .unwrap_or_default();
+                let src_metadata =
+                    Self::deserialize_user_metadata(src_record.metadata_blob.as_ref())?;
+                let src_system_metadata = self.deserialize_visible_system_metadata(
+                    src_record.system_metadata_blob.as_ref(),
+                    &src_record.encryption,
+                    source_sse_customer,
+                )?;
 
-                (src_metadata, src_record.tags.clone(), body)
+                (
+                    src_metadata,
+                    src_system_metadata,
+                    src_record.tags.clone(),
+                    body,
+                )
             }
         }; // source locks dropped here
 
         // Phase 2: Stream into destination staging session.
-        let mut metadata_blob = match directive {
+        let metadata_blob = match directive {
             MetadataDirective::Copy => src_metadata,
             MetadataDirective::Replace {
                 metadata: new_metadata,
                 ..
             } => (*new_metadata).clone(),
+        };
+        let mut system_metadata = match directive {
+            MetadataDirective::Copy => src_system_metadata,
+            MetadataDirective::Replace {
+                system_metadata: new_system_metadata,
+                ..
+            } => (*new_system_metadata).clone(),
         };
         let tags = match &req.tagging {
             TaggingDirective::Copy => src_tags,
@@ -5184,7 +5233,7 @@ impl Coordinator {
                 let algo = checksum.algorithm();
                 let finalized = checksum.finalize();
                 let b64 = base64::engine::general_purpose::STANDARD.encode(finalized.bytes());
-                metadata_blob.set(algo.header_name(), &b64);
+                system_metadata.set_checksum(algo, None, b64);
             }
 
             let put_result = self.finalize_stream_put(&FinalizeStreamPutRequest {
@@ -5194,6 +5243,8 @@ impl Coordinator {
                 crc64: crc64.finalize(),
                 total_size,
                 metadata_blob: &metadata_blob,
+                system_metadata: &system_metadata,
+                sse_customer: dst_write_sse_customer.as_ref(),
                 tags: tags.as_deref(),
                 cond: dst_cond,
             })?;
@@ -5242,6 +5293,72 @@ impl Coordinator {
             },
             other => ServerError::Metadata(other),
         })
+    }
+
+    fn deserialize_user_metadata(
+        metadata_blob: Option<&SerializedMetadataBlob>,
+    ) -> Result<MetadataBlob, ServerError> {
+        metadata_blob
+            .map(|blob| MetadataBlob::deserialize(blob.as_slice()).map(|(m, _)| m))
+            .transpose()?
+            .map_or(Ok(MetadataBlob::new()), Ok)
+    }
+
+    fn deserialize_system_metadata(
+        system_metadata_blob: Option<&SerializedSystemMetadataBlob>,
+    ) -> Result<SystemMetadata, ServerError> {
+        system_metadata_blob.map_or(Ok(SystemMetadata::new()), |blob| {
+            SystemMetadata::deserialize(blob.as_slice())
+        })
+    }
+
+    fn prepare_stored_system_metadata(
+        system_metadata: &SystemMetadata,
+        encryption: &ObjectEncryption,
+        sse_customer_write: Option<&SseCustomerWriteContext>,
+    ) -> Result<(SerializedSystemMetadataBlob, ObjectEncryption), ServerError> {
+        let mut stored_system_metadata = system_metadata.clone();
+        let stored_encryption = match encryption {
+            ObjectEncryption::None => ObjectEncryption::None,
+            ObjectEncryption::SseCustomer(_) => {
+                let sse_customer_write = sse_customer_write.ok_or(ServerError::InternalError {
+                    reason: "missing SSE-C write context for encrypted object".to_string(),
+                })?;
+                let checksum = stored_system_metadata.take_checksum();
+                sse_customer_write.seal_checksum_metadata(checksum.as_ref())?
+            }
+        };
+        Ok((
+            SerializedSystemMetadataBlob::from(stored_system_metadata.serialize()?),
+            stored_encryption,
+        ))
+    }
+
+    fn deserialize_visible_system_metadata(
+        &self,
+        system_metadata_blob: Option<&SerializedSystemMetadataBlob>,
+        encryption: &ObjectEncryption,
+        sse_customer: Option<&SseCustomerRequest>,
+    ) -> Result<SystemMetadata, ServerError> {
+        let mut system_metadata = Self::deserialize_system_metadata(system_metadata_blob)?;
+        if let (ObjectEncryption::SseCustomer(state), Some(request)) = (encryption, sse_customer) {
+            if !state.encrypted_checksum_metadata.is_empty() {
+                let validator =
+                    self.sse_c_validator
+                        .as_ref()
+                        .ok_or(ServerError::InternalError {
+                            reason: "SSE-C validator key is not configured".to_string(),
+                        })?;
+                if let Some(checksum) = decrypt_sse_customer_checksum(validator, state, request)? {
+                    system_metadata.set_checksum(
+                        checksum.algorithm(),
+                        checksum.checksum_type(),
+                        checksum.value(),
+                    );
+                }
+            }
+        }
+        Ok(system_metadata)
     }
 
     /// Lock metadata PG for a consistent object read/delete view.
@@ -5648,12 +5765,12 @@ impl Coordinator {
                 &record.encryption,
             )?;
 
-            let metadata = record
-                .metadata_blob
-                .as_ref()
-                .map(|b| MetadataBlob::deserialize(b.as_slice()).map(|(m, _)| m))
-                .transpose()?
-                .unwrap_or_default();
+            let metadata = Self::deserialize_user_metadata(record.metadata_blob.as_ref())?;
+            let system_metadata = self.deserialize_visible_system_metadata(
+                record.system_metadata_blob.as_ref(),
+                &record.encryption,
+                req.sse_customer,
+            )?;
 
             let body = ReadHandle::from_multipart(
                 self.read_runtime(),
@@ -5671,6 +5788,7 @@ impl Coordinator {
             Ok(GetObjectResult {
                 body,
                 metadata,
+                system_metadata,
                 etag: etag_str,
                 size: record.size,
                 last_modified: record.last_modified,
@@ -5689,12 +5807,12 @@ impl Coordinator {
                 .get_object_segments(bucket, key, record.version_id)
                 .map_err(ServerError::Metadata)?;
 
-            let metadata = record
-                .metadata_blob
-                .as_ref()
-                .map(|b| MetadataBlob::deserialize(b.as_slice()).map(|(m, _)| m))
-                .transpose()?
-                .unwrap_or_default();
+            let metadata = Self::deserialize_user_metadata(record.metadata_blob.as_ref())?;
+            let system_metadata = self.deserialize_visible_system_metadata(
+                record.system_metadata_blob.as_ref(),
+                &record.encryption,
+                req.sse_customer,
+            )?;
 
             let body = if user_size == 0 {
                 drop(pgs);
@@ -5719,6 +5837,7 @@ impl Coordinator {
             Ok(GetObjectResult {
                 body,
                 metadata,
+                system_metadata,
                 etag: etag_str,
                 size: record.size,
                 last_modified: record.last_modified,
@@ -5794,19 +5913,16 @@ impl Coordinator {
             let part_end = part_start + part.record.size.saturating_sub(1);
 
             // Decode per-part checksum
-            let metadata = record
-                .metadata_blob
-                .as_ref()
-                .map(|b| MetadataBlob::deserialize(b.as_slice()).map(|(m, _)| m))
-                .transpose()?
-                .unwrap_or_default();
+            let metadata = Self::deserialize_user_metadata(record.metadata_blob.as_ref())?;
+            let system_metadata = self.deserialize_visible_system_metadata(
+                record.system_metadata_blob.as_ref(),
+                &record.encryption,
+                req.sse_customer,
+            )?;
 
             let checksum = if let Some(raw) = &part.record.checksum {
                 // Look up algorithm from object metadata and validate byte length.
-                match metadata
-                    .get("x-amz-checksum-algorithm")
-                    .and_then(ChecksumAlgorithm::parse)
-                {
+                match system_metadata.checksum_algorithm() {
                     Some(algo) => Some(RawChecksum::new(algo, raw.as_slice()).map_err(|_| {
                         ServerError::InternalError {
                             reason: format!(
@@ -5841,6 +5957,7 @@ impl Coordinator {
             Ok(GetObjectPartResult {
                 body,
                 metadata,
+                system_metadata,
                 etag: etag_str,
                 size: record.size,
                 part_size: part.record.size,
@@ -5888,16 +6005,17 @@ impl Coordinator {
                 body
             };
 
-            let metadata = record
-                .metadata_blob
-                .as_ref()
-                .map(|b| MetadataBlob::deserialize(b.as_slice()).map(|(m, _)| m))
-                .transpose()?
-                .unwrap_or_default();
+            let metadata = Self::deserialize_user_metadata(record.metadata_blob.as_ref())?;
+            let system_metadata = self.deserialize_visible_system_metadata(
+                record.system_metadata_blob.as_ref(),
+                &record.encryption,
+                req.sse_customer,
+            )?;
 
             Ok(GetObjectPartResult {
                 body,
                 metadata,
+                system_metadata,
                 etag: etag_str,
                 size: record.size,
                 part_size: record.size,
@@ -5966,18 +6084,15 @@ impl Coordinator {
                 .find(|p| p.part_number == part_number)
                 .ok_or(ServerError::InvalidPart { part_number })?;
 
-            let metadata = record
-                .metadata_blob
-                .as_ref()
-                .map(|b| MetadataBlob::deserialize(b.as_slice()).map(|(m, _)| m))
-                .transpose()?
-                .unwrap_or_default();
+            let metadata = Self::deserialize_user_metadata(record.metadata_blob.as_ref())?;
+            let system_metadata = self.deserialize_visible_system_metadata(
+                record.system_metadata_blob.as_ref(),
+                &record.encryption,
+                req.sse_customer,
+            )?;
 
             let checksum = if let Some(raw) = &part.checksum {
-                match metadata
-                    .get("x-amz-checksum-algorithm")
-                    .and_then(ChecksumAlgorithm::parse)
-                {
+                match system_metadata.checksum_algorithm() {
                     Some(algo) => Some(RawChecksum::new(algo, raw.as_slice()).map_err(|_| {
                         ServerError::InternalError {
                             reason: format!(
@@ -5996,6 +6111,7 @@ impl Coordinator {
 
             Ok(HeadObjectPartResult {
                 metadata,
+                system_metadata,
                 etag: etag_str,
                 part_size: part.size,
                 total_size: record.size,
@@ -6011,15 +6127,16 @@ impl Coordinator {
                 return Err(ServerError::InvalidPart { part_number });
             }
 
-            let metadata = record
-                .metadata_blob
-                .as_ref()
-                .map(|b| MetadataBlob::deserialize(b.as_slice()).map(|(m, _)| m))
-                .transpose()?
-                .unwrap_or_default();
+            let metadata = Self::deserialize_user_metadata(record.metadata_blob.as_ref())?;
+            let system_metadata = self.deserialize_visible_system_metadata(
+                record.system_metadata_blob.as_ref(),
+                &record.encryption,
+                req.sse_customer,
+            )?;
 
             Ok(HeadObjectPartResult {
                 metadata,
+                system_metadata,
                 etag: etag_str,
                 part_size: record.size,
                 total_size: record.size,
@@ -6071,15 +6188,16 @@ impl Coordinator {
             self.prepare_sse_customer_read_access(&record.encryption, req.sse_customer)?;
 
         // Metadata always from DB row (both multipart and non-multipart).
-        let metadata = record
-            .metadata_blob
-            .as_ref()
-            .map(|b| MetadataBlob::deserialize(b.as_slice()).map(|(m, _)| m))
-            .transpose()?
-            .unwrap_or_default();
+        let metadata = Self::deserialize_user_metadata(record.metadata_blob.as_ref())?;
+        let system_metadata = self.deserialize_visible_system_metadata(
+            record.system_metadata_blob.as_ref(),
+            &record.encryption,
+            req.sse_customer,
+        )?;
 
         Ok(HeadObjectResult {
             metadata,
+            system_metadata,
             etag: etag_str,
             size: record.size,
             last_modified: record.last_modified,
@@ -6134,17 +6252,17 @@ impl Coordinator {
             self.prepare_sse_customer_read_access(&record.encryption, req.sse_customer)?;
 
         // Metadata always from DB row (both multipart and non-multipart).
-        let metadata = record
-            .metadata_blob
-            .as_ref()
-            .map(|b| MetadataBlob::deserialize(b.as_slice()).map(|(m, _)| m))
-            .transpose()?
-            .unwrap_or_default();
+        let metadata = Self::deserialize_user_metadata(record.metadata_blob.as_ref())?;
+        let system_metadata = self.deserialize_visible_system_metadata(
+            record.system_metadata_blob.as_ref(),
+            &record.encryption,
+            req.sse_customer,
+        )?;
 
         let object_parts =
             if want_parts && matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
                 // Check if this multipart upload used checksums
-                let has_checksum = metadata.get("x-amz-checksum-algorithm").is_some();
+                let has_checksum = system_metadata.checksum_algorithm().is_some();
 
                 if has_checksum {
                     // Checksummed multipart: full detail with parts, pagination
@@ -6213,6 +6331,7 @@ impl Coordinator {
 
         Ok(GetObjectAttributesResult {
             metadata,
+            system_metadata,
             etag: etag_str,
             size: record.size,
             last_modified: record.last_modified,
@@ -6305,7 +6424,10 @@ impl Coordinator {
             );
         }
 
-        let (metadata, body) = if matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
+        let (metadata, system_metadata, body) = if matches!(
+            record.layout,
+            ObjectLayout::MultipartManifest { .. }
+        ) {
             // Multipart: metadata from object row, data spans parts.
             let meta_pg = pgs.meta();
             let obj_parts = Self::snapshot_multipart_parts_overlapping_range(
@@ -6325,12 +6447,12 @@ impl Coordinator {
                 });
             }
 
-            let metadata = record
-                .metadata_blob
-                .as_ref()
-                .map(|b| MetadataBlob::deserialize(b.as_slice()).map(|(m, _)| m))
-                .transpose()?
-                .unwrap_or_default();
+            let metadata = Self::deserialize_user_metadata(record.metadata_blob.as_ref())?;
+            let system_metadata = self.deserialize_visible_system_metadata(
+                record.system_metadata_blob.as_ref(),
+                &record.encryption,
+                req.sse_customer,
+            )?;
 
             let body = ReadHandle::from_multipart_range(
                 self.read_runtime(),
@@ -6344,15 +6466,15 @@ impl Coordinator {
             drop(pgs);
             #[cfg(test)]
             maybe_run_multipart_snapshot_hook(bucket, key);
-            (metadata, body)
+            (metadata, system_metadata, body)
         } else {
             // Non-multipart: metadata from DB row, user data from shards.
-            let metadata = record
-                .metadata_blob
-                .as_ref()
-                .map(|b| MetadataBlob::deserialize(b.as_slice()).map(|(m, _)| m))
-                .transpose()?
-                .unwrap_or_default();
+            let metadata = Self::deserialize_user_metadata(record.metadata_blob.as_ref())?;
+            let system_metadata = self.deserialize_visible_system_metadata(
+                record.system_metadata_blob.as_ref(),
+                &record.encryption,
+                req.sse_customer,
+            )?;
 
             // Non-multipart payloads now read through committed object segments.
             let meta_pg = pgs.meta();
@@ -6374,12 +6496,13 @@ impl Coordinator {
             );
             drop(pgs);
 
-            (metadata, body)
+            (metadata, system_metadata, body)
         };
 
         Ok(GetObjectRangeResult {
             body,
             metadata,
+            system_metadata,
             etag: etag_str,
             size: record.size,
             last_modified: record.last_modified,
@@ -6993,7 +7116,6 @@ impl Coordinator {
         );
         let bucket = req.bucket;
         let key = req.key;
-        let metadata = req.metadata;
         self.with_bucket_write_reservation(bucket, |bucket_info| {
             if !Self::requester_can_object_write(
                 req.requester,
@@ -7017,7 +7139,8 @@ impl Coordinator {
                 s
             });
 
-            let metadata_blob = metadata.serialize()?;
+            let metadata_blob = req.metadata.serialize()?;
+            let system_metadata_blob = req.system_metadata.serialize()?;
             let sse_customer = self.prepare_sse_customer_write_context(req.sse_customer)?;
             let encryption = sse_customer
                 .as_ref()
@@ -7032,6 +7155,7 @@ impl Coordinator {
                 key: ObjectKey::from(key),
                 tags: req.tags.map(SerializedTagSet::from),
                 metadata_blob: SerializedMetadataBlob::from(metadata_blob),
+                system_metadata_blob: SerializedSystemMetadataBlob::from(system_metadata_blob),
                 owner_principal: Some(bucket_info.owner_principal),
                 checksum: req.checksum,
                 encryption,
@@ -7344,23 +7468,8 @@ impl Coordinator {
                     upload_id: upload_id.to_string(),
                 });
             }
-            match &upload.encryption {
-                ObjectEncryption::None => {
-                    if req.sse_customer.is_some() {
-                        return Err(ServerError::InvalidRequest {
-                            reason:
-                                "SSE-C headers may not be used for an unencrypted multipart upload"
-                                    .to_string(),
-                        });
-                    }
-                }
-                ObjectEncryption::SseCustomer(_) => {
-                    if upload.checksum.is_some() || req.sse_customer.is_some() {
-                        let _ = self
-                            .prepare_sse_customer_read_access(&upload.encryption, req.sse_customer)?;
-                    }
-                }
-            }
+            let multipart_sse_write =
+                self.prepare_existing_sse_customer_write_context(&upload.encryption, req.sse_customer)?;
 
             let checksum_algo = upload.checksum.map(MultipartChecksumConfig::algorithm);
             let checksum_type = upload.checksum.map(MultipartChecksumConfig::checksum_type);
@@ -7608,22 +7717,15 @@ impl Coordinator {
                 }
             }
 
-            let mut metadata_blob_bytes = upload.metadata_blob.clone();
+            let mut system_metadata = SystemMetadata::deserialize(upload.system_metadata_blob.as_slice())?;
             if let (Some(algo), Some(ref val)) = (checksum_algo, &checksum_value) {
-                let (mut blob, _) =
-                    crate::metadata_blob::MetadataBlob::deserialize(metadata_blob_bytes.as_slice())?;
-                blob.set(algo.header_name(), val);
-                blob.set("x-amz-checksum-algorithm", algo.as_str());
-                if let Some(ctype) = checksum_type {
-                    blob.set("x-amz-checksum-type", ctype.as_str());
-                }
-                metadata_blob_bytes =
-                    SerializedMetadataBlob::from(blob.serialize().map_err(|e| {
-                        ServerError::InvalidRequest {
-                            reason: format!("failed to serialize metadata blob: {e}"),
-                        }
-                    })?);
+                system_metadata.set_checksum(algo, checksum_type, val.clone());
             }
+            let (system_metadata_bytes, final_encryption) = Self::prepare_stored_system_metadata(
+                &system_metadata,
+                &upload.encryption,
+                multipart_sse_write.as_ref(),
+            )?;
 
             let obj_req = CommitMultipartReq {
                 bucket: BucketName::from(bucket),
@@ -7634,8 +7736,9 @@ impl Coordinator {
                 etag_crc64,
                 ec: EcShape { k: 0, m: 0 },
                 tags: upload.tags.clone(),
-                metadata_blob: Some(metadata_blob_bytes),
-                encryption: upload.encryption.clone(),
+                metadata_blob: Some(upload.metadata_blob.clone()),
+                system_metadata_blob: Some(system_metadata_bytes),
+                encryption: final_encryption,
             };
 
             let object_parts: Vec<ObjectPartRecord> = part_records
@@ -8153,6 +8256,7 @@ mod tests {
     use super::test_helpers;
     use super::*;
     use crate::conditional::{DeleteCondition, ReadCondition, SpecificEtag, WriteCondition};
+    use crate::sse::SSE_C_CUSTOMER_KEY_LEN;
     use std::path::{Path, PathBuf};
     use std::sync::mpsc;
     use std::sync::Barrier;
@@ -8208,6 +8312,30 @@ mod tests {
         let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
         let ec_config = EcConfig::new(4, 2).unwrap();
         Coordinator::new(storage_node, ec_config, "us-east-1".to_string()).unwrap()
+    }
+
+    fn setup_coordinator_with_sse_c(dir: &Path) -> Coordinator {
+        use base64::Engine;
+
+        let pg_ids: Vec<u32> = (0..4).collect();
+        let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
+        let ec_config = EcConfig::new(4, 2).unwrap();
+        let validator = SseCustomerValidatorConfig::from_base64(
+            1,
+            &base64::engine::general_purpose::STANDARD.encode([9u8; 32]),
+        )
+        .unwrap();
+        Coordinator::new_with_sse_c_validator(
+            storage_node,
+            ec_config,
+            "us-east-1".to_string(),
+            Some(validator),
+        )
+        .unwrap()
+    }
+
+    fn test_sse_customer_request() -> SseCustomerRequest {
+        SseCustomerRequest::new([7u8; SSE_C_CUSTOMER_KEY_LEN], "dummy-md5".to_string())
     }
 
     fn delete_bucket_test(coord: &Coordinator, name: &str) -> Result<(), ServerError> {
@@ -8652,6 +8780,7 @@ mod tests {
                 bucket,
                 key,
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -8688,6 +8817,7 @@ mod tests {
                 key: "key",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -8716,6 +8846,7 @@ mod tests {
                 key: "key",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: Some(tags_xml),
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -8769,6 +8900,7 @@ mod tests {
                     key: "key",
                     data: b"data",
                     metadata: &MetadataBlob::new(),
+                    system_metadata: &SystemMetadata::EMPTY,
                     tags: None,
                     cond: NO_WRITE,
                     requester: TEST_REQUESTER,
@@ -8816,6 +8948,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
                 requester: TEST_REQUESTER,
@@ -8884,6 +9017,7 @@ mod tests {
                 key: &key,
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -8945,6 +9079,7 @@ mod tests {
                 key: &key,
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -9018,6 +9153,7 @@ mod tests {
                 key: &key,
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -9148,6 +9284,8 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let headers = [("Content-Type", "text/plain")];
+        let metadata = MetadataBlob::from_headers(&headers).unwrap();
+        let system_metadata = SystemMetadata::from_headers(&headers).unwrap();
         let result = test_helpers::put_object(
             &coord,
             &PutObjectRequest {
@@ -9155,7 +9293,8 @@ mod tests {
                 bucket: "bucket",
                 key: "hello.txt",
                 data: b"Hello, world!",
-                metadata: &MetadataBlob::from_headers(&headers).unwrap(),
+                metadata: &metadata,
+                system_metadata: &system_metadata,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -9177,7 +9316,7 @@ mod tests {
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), b"Hello, world!");
         assert_eq!(obj.size, 13);
-        assert_eq!(obj.metadata.get("content-type"), Some("text/plain"));
+        assert_eq!(obj.system_metadata.content_type(), Some("text/plain"));
     }
 
     #[test]
@@ -9192,6 +9331,8 @@ mod tests {
             ("X-Amz-Meta-Author", "alice"),
             ("X-Amz-Meta-Version", "42"),
         ];
+        let metadata = MetadataBlob::from_headers(&headers).unwrap();
+        let system_metadata = SystemMetadata::from_headers(&headers).unwrap();
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
@@ -9199,7 +9340,8 @@ mod tests {
                 bucket: "bucket",
                 key: "obj",
                 data: b"{}",
-                metadata: &MetadataBlob::from_headers(&headers).unwrap(),
+                metadata: &metadata,
+                system_metadata: &system_metadata,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -9219,7 +9361,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), b"{}");
-        assert_eq!(obj.metadata.get("content-type"), Some("application/json"));
+        assert_eq!(obj.system_metadata.content_type(), Some("application/json"));
         assert_eq!(obj.metadata.get("x-amz-meta-author"), Some("alice"));
         assert_eq!(obj.metadata.get("x-amz-meta-version"), Some("42"));
     }
@@ -9230,6 +9372,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord.create_bucket("bucket").unwrap();
+        let metadata = MetadataBlob::from_headers(&[("Content-Type", "text/plain")]).unwrap();
+        let system_metadata =
+            SystemMetadata::from_headers(&[("Content-Type", "text/plain")]).unwrap();
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
@@ -9237,7 +9382,8 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
-                metadata: &MetadataBlob::from_headers(&[("Content-Type", "text/plain")]).unwrap(),
+                metadata: &metadata,
+                system_metadata: &system_metadata,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -9257,7 +9403,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(head.size, 4);
-        assert_eq!(head.metadata.get("content-type"), Some("text/plain"));
+        assert_eq!(head.system_metadata.content_type(), Some("text/plain"));
     }
 
     #[test]
@@ -9274,6 +9420,7 @@ mod tests {
                 key: "key",
                 data: b"v1",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -9289,6 +9436,7 @@ mod tests {
                 key: "key",
                 data: b"v2",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -9324,6 +9472,7 @@ mod tests {
                 key: "empty",
                 data: b"",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -9360,6 +9509,7 @@ mod tests {
                 key: "key",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -9404,6 +9554,7 @@ mod tests {
                 key: "key",
                 data: b"simple-data",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -9470,6 +9621,7 @@ mod tests {
                 key: "a/1",
                 data: b"1",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -9485,6 +9637,7 @@ mod tests {
                 key: "a/2",
                 data: b"2",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -9500,6 +9653,7 @@ mod tests {
                 key: "b/1",
                 data: b"3",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -9539,6 +9693,7 @@ mod tests {
                 key: "photos/cat.jpg",
                 data: b"cat",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -9554,6 +9709,7 @@ mod tests {
                 key: "photos/dog.jpg",
                 data: b"dog",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -9569,6 +9725,7 @@ mod tests {
                 key: "docs/readme.md",
                 data: b"md",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -9604,6 +9761,7 @@ mod tests {
                 key: "photos/cat.jpg",
                 data: b"cat",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -9619,6 +9777,7 @@ mod tests {
                 key: "photos/dog.jpg",
                 data: b"dog",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -9634,6 +9793,7 @@ mod tests {
                 key: "docs/readme.md",
                 data: b"md",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -9649,6 +9809,7 @@ mod tests {
                 key: "root.txt",
                 data: b"root",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -9687,6 +9848,7 @@ mod tests {
                 key: "folder/",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -9837,6 +9999,7 @@ mod tests {
                 key: "resilient",
                 data,
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -9877,6 +10040,7 @@ mod tests {
                 key: "obj1",
                 data,
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -9915,6 +10079,7 @@ mod tests {
                 key: "obj-reconstruct",
                 data: &data,
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -9970,6 +10135,7 @@ mod tests {
                 key: "obj2",
                 data,
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -10011,6 +10177,7 @@ mod tests {
                 key: "obj3",
                 data,
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -10054,6 +10221,7 @@ mod tests {
                 key: "obj4",
                 data,
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -10092,6 +10260,7 @@ mod tests {
                 key: "obj5",
                 data,
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -10134,6 +10303,7 @@ mod tests {
                 key: "obj6",
                 data,
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -10173,6 +10343,7 @@ mod tests {
                 key: "obj7",
                 data,
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -10228,6 +10399,7 @@ mod tests {
                 key: "obj8",
                 data,
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -10282,6 +10454,7 @@ mod tests {
                 key: "key",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -10325,6 +10498,7 @@ mod tests {
                 key: "key",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -10372,6 +10546,7 @@ mod tests {
                 key: "a/1",
                 data: b"1",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -10387,6 +10562,7 @@ mod tests {
                 key: "a/2",
                 data: b"2",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -10402,6 +10578,7 @@ mod tests {
                 key: "b/1",
                 data: b"3",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -10417,6 +10594,7 @@ mod tests {
                 key: "c/1",
                 data: b"4",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -10432,6 +10610,7 @@ mod tests {
                 key: "root.txt",
                 data: b"5",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -10494,6 +10673,7 @@ mod tests {
                     key: &key,
                     data: b"data",
                     metadata: &MetadataBlob::new(),
+                    system_metadata: &SystemMetadata::EMPTY,
                     tags: None,
                     cond: NO_WRITE,
                     requester: TEST_REQUESTER,
@@ -10532,6 +10712,7 @@ mod tests {
                 key: "key",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -10567,6 +10748,7 @@ mod tests {
                     key: &key,
                     data: b"data",
                     metadata: &MetadataBlob::new(),
+                    system_metadata: &SystemMetadata::EMPTY,
                     tags: None,
                     cond: NO_WRITE,
                     requester: TEST_REQUESTER,
@@ -10608,6 +10790,7 @@ mod tests {
                     key: &key,
                     data: b"data",
                     metadata: &MetadataBlob::new(),
+                    system_metadata: &SystemMetadata::EMPTY,
                     tags: None,
                     cond: NO_WRITE,
                     requester: TEST_REQUESTER,
@@ -10677,6 +10860,7 @@ mod tests {
                 key: "photos/2024/jan.jpg",
                 data: b"j",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -10692,6 +10876,7 @@ mod tests {
                 key: "photos/2024/feb.jpg",
                 data: b"f",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -10707,6 +10892,7 @@ mod tests {
                 key: "photos/2025/mar.jpg",
                 data: b"m",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -10722,6 +10908,7 @@ mod tests {
                 key: "photos/top.jpg",
                 data: b"t",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -10764,6 +10951,7 @@ mod tests {
                 key: "only-one",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -10801,6 +10989,7 @@ mod tests {
                 key: "key1",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -10839,6 +11028,7 @@ mod tests {
                 key: "a/1",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -10894,6 +11084,7 @@ mod tests {
                 key: "key1",
                 data: b"data1",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -10909,6 +11100,7 @@ mod tests {
                 key: "key2",
                 data: b"data2",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -11010,6 +11202,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -11120,6 +11313,7 @@ mod tests {
                 key: "key",
                 data: b"Hello, World!",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -11160,6 +11354,7 @@ mod tests {
                 key: "key",
                 data: b"Hello, World!",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -11199,6 +11394,7 @@ mod tests {
                 key: "key",
                 data: b"Hello, World!",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -11236,6 +11432,7 @@ mod tests {
                 key: "key",
                 data: b"Hello",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -11273,6 +11470,7 @@ mod tests {
                 key: "key",
                 data: b"Hello",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -11318,6 +11516,7 @@ mod tests {
                 key: "new-key",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: &cond,
                 requester: TEST_REQUESTER,
@@ -11341,6 +11540,7 @@ mod tests {
                 key: "key",
                 data: b"v1",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -11358,6 +11558,7 @@ mod tests {
                 key: "key",
                 data: b"v2",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: &cond,
                 requester: TEST_REQUESTER,
@@ -11382,6 +11583,7 @@ mod tests {
                 key: "key",
                 data: b"v1",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -11398,6 +11600,7 @@ mod tests {
                 key: "key",
                 data: b"v2",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: &cond,
                 requester: TEST_REQUESTER,
@@ -11434,6 +11637,7 @@ mod tests {
                 key: "key",
                 data: b"v1",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -11450,6 +11654,7 @@ mod tests {
                 key: "key",
                 data: b"v2",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -11467,6 +11672,7 @@ mod tests {
                 key: "key",
                 data: b"v3",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: &cond,
                 requester: TEST_REQUESTER,
@@ -11491,6 +11697,7 @@ mod tests {
                 key: "key",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: Requester::principal("other-user"),
@@ -11522,6 +11729,7 @@ mod tests {
                 key: "key",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -11593,6 +11801,7 @@ mod tests {
                 key: "key",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
@@ -11622,6 +11831,7 @@ mod tests {
                 key: "key",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
@@ -11680,6 +11890,7 @@ mod tests {
                 key: "key",
                 data: b"secret",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
@@ -11716,6 +11927,7 @@ mod tests {
                 key: "key",
                 data: b"public",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
@@ -11786,6 +11998,7 @@ mod tests {
                 key: "key",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
@@ -11837,6 +12050,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
                 requester: Requester::principal("other-user"),
@@ -11859,6 +12073,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
                 requester: Requester::principal("owner-a"),
@@ -11896,6 +12111,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
                 requester: Requester::principal("owner-a"),
@@ -11930,6 +12146,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
                 requester: Requester::principal("owner-a"),
@@ -11981,6 +12198,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
                 requester: Requester::principal("owner-a"),
@@ -12042,6 +12260,7 @@ mod tests {
                 key: "key",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -12079,6 +12298,7 @@ mod tests {
                 key: "key",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -12118,6 +12338,7 @@ mod tests {
                 key: "key",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -12156,6 +12377,7 @@ mod tests {
                 key: "key",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -12194,6 +12416,7 @@ mod tests {
                 key: "key",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -12236,6 +12459,7 @@ mod tests {
                 key: "key",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -12271,6 +12495,7 @@ mod tests {
                 key: "key1",
                 data: b"data1",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -12286,6 +12511,7 @@ mod tests {
                 key: "key2",
                 data: b"data2",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -12334,6 +12560,7 @@ mod tests {
                 key: "key",
                 data: b"Hello, World!",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -12368,6 +12595,8 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let headers = [("Content-Type", "text/plain")];
+        let metadata = MetadataBlob::from_headers(&headers).unwrap();
+        let system_metadata = SystemMetadata::from_headers(&headers).unwrap();
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
@@ -12375,7 +12604,8 @@ mod tests {
                 bucket: "bucket",
                 key: "src",
                 data: b"hello copy",
-                metadata: &MetadataBlob::from_headers(&headers).unwrap(),
+                metadata: &metadata,
+                system_metadata: &system_metadata,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -12437,6 +12667,7 @@ mod tests {
                 key: "src",
                 data: b"private",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
@@ -12487,6 +12718,7 @@ mod tests {
                 key: "src",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -12527,6 +12759,8 @@ mod tests {
             ("Content-Type", "image/png"),
             ("X-Amz-Meta-Author", "alice"),
         ];
+        let metadata = MetadataBlob::from_headers(&headers).unwrap();
+        let system_metadata = SystemMetadata::from_headers(&headers).unwrap();
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
@@ -12534,7 +12768,8 @@ mod tests {
                 bucket: "bucket",
                 key: "src",
                 data: b"data",
-                metadata: &MetadataBlob::from_headers(&headers).unwrap(),
+                metadata: &metadata,
+                system_metadata: &system_metadata,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -12573,7 +12808,7 @@ mod tests {
                 requester: TEST_REQUESTER,
             })
             .unwrap();
-        assert_eq!(obj.metadata.get("content-type"), Some("image/png"));
+        assert_eq!(obj.system_metadata.content_type(), Some("image/png"));
         assert_eq!(obj.metadata.get("x-amz-meta-author"), Some("alice"));
     }
 
@@ -12587,6 +12822,8 @@ mod tests {
             ("Content-Type", "image/png"),
             ("X-Amz-Meta-Author", "alice"),
         ];
+        let metadata = MetadataBlob::from_headers(&headers).unwrap();
+        let system_metadata = SystemMetadata::from_headers(&headers).unwrap();
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
@@ -12594,7 +12831,8 @@ mod tests {
                 bucket: "bucket",
                 key: "src",
                 data: b"data",
-                metadata: &MetadataBlob::from_headers(&headers).unwrap(),
+                metadata: &metadata,
+                system_metadata: &system_metadata,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -12605,6 +12843,7 @@ mod tests {
 
         let new_headers = [("Content-Type", "text/html"), ("X-Amz-Meta-Version", "2")];
         let new_metadata = MetadataBlob::from_headers(&new_headers).unwrap();
+        let new_system_metadata = SystemMetadata::from_headers(&new_headers).unwrap();
         coord
             .copy_object(&CopyObjectRequest {
                 source: CopySource {
@@ -12618,6 +12857,7 @@ mod tests {
                 dst_condition: NO_WRITE,
                 directive: MetadataDirective::Replace {
                     metadata: &new_metadata,
+                    system_metadata: &new_system_metadata,
                     checksum_algorithm: None,
                 },
                 tagging: TaggingDirective::Copy,
@@ -12639,7 +12879,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), b"data");
-        assert_eq!(obj.metadata.get("content-type"), Some("text/html"));
+        assert_eq!(obj.system_metadata.content_type(), Some("text/html"));
         assert_eq!(obj.metadata.get("x-amz-meta-version"), Some("2"));
         // Old metadata should be gone
         assert_eq!(obj.metadata.get("x-amz-meta-author"), None);
@@ -12652,6 +12892,8 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
 
         let headers = [("Content-Type", "text/plain")];
+        let metadata = MetadataBlob::from_headers(&headers).unwrap();
+        let system_metadata = SystemMetadata::from_headers(&headers).unwrap();
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
@@ -12659,7 +12901,8 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
-                metadata: &MetadataBlob::from_headers(&headers).unwrap(),
+                metadata: &metadata,
+                system_metadata: &system_metadata,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -12668,8 +12911,9 @@ mod tests {
         )
         .unwrap();
 
-        let new_metadata =
-            MetadataBlob::from_headers(&[("Content-Type", "application/json")]).unwrap();
+        let new_headers = [("Content-Type", "application/json")];
+        let new_metadata = MetadataBlob::from_headers(&new_headers).unwrap();
+        let new_system_metadata = SystemMetadata::from_headers(&new_headers).unwrap();
         coord
             .copy_object(&CopyObjectRequest {
                 source: CopySource {
@@ -12683,6 +12927,7 @@ mod tests {
                 dst_condition: NO_WRITE,
                 directive: MetadataDirective::Replace {
                     metadata: &new_metadata,
+                    system_metadata: &new_system_metadata,
                     checksum_algorithm: None,
                 },
                 tagging: TaggingDirective::Copy,
@@ -12704,7 +12949,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), b"data");
-        assert_eq!(obj.metadata.get("content-type"), Some("application/json"));
+        assert_eq!(obj.system_metadata.content_type(), Some("application/json"));
     }
 
     #[test]
@@ -12723,6 +12968,7 @@ mod tests {
                 key: "src",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: Some(tags_xml),
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -12782,6 +13028,7 @@ mod tests {
                 key: "src",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: Some(src_tags),
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -12839,6 +13086,7 @@ mod tests {
                 key: "src",
                 data: b"hello",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -12849,7 +13097,9 @@ mod tests {
 
         // Metadata blob with only content-type (checksum value headers should
         // be stripped at the HTTP boundary before reaching the coordinator).
-        let new_metadata = MetadataBlob::from_headers(&[("Content-Type", "text/plain")]).unwrap();
+        let new_headers = [("Content-Type", "text/plain")];
+        let new_metadata = MetadataBlob::from_headers(&new_headers).unwrap();
+        let new_system_metadata = SystemMetadata::from_headers(&new_headers).unwrap();
         coord
             .copy_object(&CopyObjectRequest {
                 source: CopySource {
@@ -12863,6 +13113,7 @@ mod tests {
                 dst_condition: NO_WRITE,
                 directive: MetadataDirective::Replace {
                     metadata: &new_metadata,
+                    system_metadata: &new_system_metadata,
                     checksum_algorithm: None,
                 },
                 tagging: TaggingDirective::Copy,
@@ -12885,7 +13136,7 @@ mod tests {
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), b"hello");
         // No checksum should be present since none was requested.
-        assert_eq!(obj.metadata.get("x-amz-checksum-crc32c"), None);
+        assert!(obj.system_metadata.checksum().is_none());
     }
 
     #[test]
@@ -12906,6 +13157,7 @@ mod tests {
                 key: "src",
                 data,
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -12914,7 +13166,9 @@ mod tests {
         )
         .unwrap();
 
-        let new_metadata = MetadataBlob::from_headers(&[("Content-Type", "text/plain")]).unwrap();
+        let new_headers = [("Content-Type", "text/plain")];
+        let new_metadata = MetadataBlob::from_headers(&new_headers).unwrap();
+        let new_system_metadata = SystemMetadata::from_headers(&new_headers).unwrap();
         coord
             .copy_object(&CopyObjectRequest {
                 source: CopySource {
@@ -12928,6 +13182,7 @@ mod tests {
                 dst_condition: NO_WRITE,
                 directive: MetadataDirective::Replace {
                     metadata: &new_metadata,
+                    system_metadata: &new_system_metadata,
                     checksum_algorithm: Some(ChecksumAlgorithm::Crc32c),
                 },
                 tagging: TaggingDirective::Copy,
@@ -12953,10 +13208,9 @@ mod tests {
         let expected_crc = checksum::crc32c::checksum(data);
         let expected_b64 =
             base64::engine::general_purpose::STANDARD.encode(expected_crc.to_be_bytes());
-        assert_eq!(
-            obj.metadata.get("x-amz-checksum-crc32c"),
-            Some(expected_b64.as_str())
-        );
+        let checksum = obj.system_metadata.checksum().unwrap();
+        assert_eq!(checksum.algorithm(), ChecksumAlgorithm::Crc32c);
+        assert_eq!(checksum.value(), expected_b64.as_str());
     }
 
     #[test]
@@ -13013,6 +13267,7 @@ mod tests {
                 key: "src",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -13056,6 +13311,7 @@ mod tests {
                 key: "src",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -13104,6 +13360,7 @@ mod tests {
                 key: "src",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -13119,6 +13376,7 @@ mod tests {
                 key: "dst",
                 data: b"existing",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -13164,6 +13422,7 @@ mod tests {
                 key: "src",
                 data: b"new data",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -13179,6 +13438,7 @@ mod tests {
                 key: "dst",
                 data: b"old data",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -13230,6 +13490,8 @@ mod tests {
         coord.create_bucket("dst-bucket").unwrap();
 
         let headers = [("Content-Type", "text/plain")];
+        let metadata = MetadataBlob::from_headers(&headers).unwrap();
+        let system_metadata = SystemMetadata::from_headers(&headers).unwrap();
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
@@ -13237,7 +13499,8 @@ mod tests {
                 bucket: "src-bucket",
                 key: "key",
                 data: b"cross bucket data",
-                metadata: &MetadataBlob::from_headers(&headers).unwrap(),
+                metadata: &metadata,
+                system_metadata: &system_metadata,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -13277,7 +13540,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), b"cross bucket data");
-        assert_eq!(obj.metadata.get("content-type"), Some("text/plain"));
+        assert_eq!(obj.system_metadata.content_type(), Some("text/plain"));
 
         // Source should still exist
         let src = coord
@@ -13425,6 +13688,7 @@ mod tests {
                 key: "key",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -13449,6 +13713,7 @@ mod tests {
                 key: "key",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -13483,6 +13748,7 @@ mod tests {
                 key: "key",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -13547,6 +13813,7 @@ mod tests {
                         key: &key_a,
                         data: b"v1",
                         metadata: &MetadataBlob::new(),
+                        system_metadata: &SystemMetadata::EMPTY,
                         tags: None,
                         cond: NO_WRITE,
                         requester: TEST_REQUESTER,
@@ -13564,6 +13831,7 @@ mod tests {
                         key: &key_b,
                         data: b"v2",
                         metadata: &MetadataBlob::new(),
+                        system_metadata: &SystemMetadata::EMPTY,
                         tags: None,
                         cond: NO_WRITE,
                         requester: TEST_REQUESTER,
@@ -13614,6 +13882,7 @@ mod tests {
                 key: "key",
                 data: &vec![b'A'; object_size],
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -13643,6 +13912,7 @@ mod tests {
                         key: "key",
                         data: &new_payload,
                         metadata: &MetadataBlob::new(),
+                        system_metadata: &SystemMetadata::EMPTY,
                         tags: None,
                         cond: NO_WRITE,
                         requester: TEST_REQUESTER,
@@ -13713,6 +13983,7 @@ mod tests {
                 key: "src",
                 data: &vec![b'A'; object_size],
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -13744,6 +14015,7 @@ mod tests {
                         key: "src",
                         data: &new_payload,
                         metadata: &MetadataBlob::new(),
+                        system_metadata: &SystemMetadata::EMPTY,
                         tags: None,
                         cond: NO_WRITE,
                         requester: TEST_REQUESTER,
@@ -13836,6 +14108,7 @@ mod tests {
                 key: "src",
                 data: &vec![b'A'; object_size],
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -13854,6 +14127,7 @@ mod tests {
                     bucket: "bucket",
                     key: &dst_key,
                     metadata: &MetadataBlob::new(),
+                    system_metadata: &SystemMetadata::EMPTY,
                     tags: None,
                     checksum: None,
                     requester: TEST_REQUESTER,
@@ -13879,6 +14153,7 @@ mod tests {
                         key: "src",
                         data: &new_payload,
                         metadata: &MetadataBlob::new(),
+                        system_metadata: &SystemMetadata::EMPTY,
                         tags: None,
                         cond: NO_WRITE,
                         requester: TEST_REQUESTER,
@@ -13983,6 +14258,7 @@ mod tests {
                 key: "key",
                 data: &vec![b'A'; object_size],
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -14011,6 +14287,7 @@ mod tests {
                         key: "key",
                         data: &payload,
                         metadata: &MetadataBlob::new(),
+                        system_metadata: &SystemMetadata::EMPTY,
                         tags: None,
                         cond: NO_WRITE,
                         requester: TEST_REQUESTER,
@@ -14243,6 +14520,8 @@ mod tests {
                 crc64: checksum::crc64::checksum(&expected),
                 total_size: expected.len() as u64,
                 metadata_blob: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
             })
@@ -14316,6 +14595,7 @@ mod tests {
                 bucket: "race-bucket",
                 key: "dst",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -14467,6 +14747,7 @@ mod tests {
                 key: "key",
                 data: b"data",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -14501,6 +14782,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -14526,6 +14808,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -14538,6 +14821,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -14559,6 +14843,7 @@ mod tests {
                 bucket: "no-such-bucket",
                 key: "key",
                 metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -14601,6 +14886,7 @@ mod tests {
                 bucket: "bucket",
                 key: "alpha",
                 metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -14613,6 +14899,7 @@ mod tests {
                 bucket: "bucket",
                 key: "beta",
                 metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -14654,6 +14941,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -14666,6 +14954,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -14711,6 +15000,7 @@ mod tests {
                 bucket: "bucket",
                 key: "a",
                 metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -14723,6 +15013,7 @@ mod tests {
                 bucket: "bucket",
                 key: "b",
                 metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -14735,6 +15026,7 @@ mod tests {
                 bucket: "bucket",
                 key: "c",
                 metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -14789,6 +15081,7 @@ mod tests {
                 bucket: "bucket",
                 key: "photos/a.jpg",
                 metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -14801,6 +15094,7 @@ mod tests {
                 bucket: "bucket",
                 key: "photos/b.jpg",
                 metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -14813,6 +15107,7 @@ mod tests {
                 bucket: "bucket",
                 key: "docs/readme.md",
                 metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -14847,6 +15142,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -14893,11 +15189,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         coord.create_bucket("bucket").unwrap();
 
-        let metadata = MetadataBlob::from_headers(&[
-            ("Content-Type", "image/png"),
-            ("X-Amz-Meta-Author", "test"),
-        ])
-        .unwrap();
+        let headers = [("Content-Type", "image/png"), ("X-Amz-Meta-Author", "test")];
+        let metadata = MetadataBlob::from_headers(&headers).unwrap();
+        let system_metadata = SystemMetadata::from_headers(&headers).unwrap();
         let tags_xml =
             "<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag></TagSet></Tagging>";
 
@@ -14906,6 +15200,7 @@ mod tests {
                 bucket: "bucket",
                 key: "photo.png",
                 metadata: &metadata,
+                system_metadata: &system_metadata,
                 tags: Some(tags_xml),
                 checksum: None,
 
@@ -14924,8 +15219,10 @@ mod tests {
 
         // Deserialize and verify the metadata blob.
         let (blob, _) = MetadataBlob::deserialize(record.metadata_blob.as_slice()).unwrap();
-        assert_eq!(blob.get("content-type"), Some("image/png"));
         assert_eq!(blob.get("x-amz-meta-author"), Some("test"));
+        let stored_system =
+            SystemMetadata::deserialize(record.system_metadata_blob.as_slice()).unwrap();
+        assert_eq!(stored_system.content_type(), Some("image/png"));
     }
 
     #[test]
@@ -14940,6 +15237,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -15018,6 +15316,7 @@ mod tests {
                 key: "key",
                 data: b"hello world",
                 metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -15119,6 +15418,7 @@ mod tests {
                     bucket: "bucket",
                     key: "key",
                     metadata: &metadata,
+                    system_metadata: &SystemMetadata::EMPTY,
                     tags: None,
                     checksum: None,
 
@@ -15189,6 +15489,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -15248,6 +15549,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -15313,6 +15615,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -15351,6 +15654,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -15413,6 +15717,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -15496,6 +15801,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -15542,6 +15848,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -15601,6 +15908,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -15659,6 +15967,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -15746,6 +16055,7 @@ mod tests {
                 bucket,
                 key,
                 metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -16041,6 +16351,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -16389,6 +16700,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -16437,6 +16749,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -16524,6 +16837,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -16696,6 +17010,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -16754,6 +17069,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -16821,6 +17137,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -16879,6 +17196,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -16932,6 +17250,7 @@ mod tests {
                 bucket,
                 key,
                 metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -16987,6 +17306,7 @@ mod tests {
                 bucket,
                 key,
                 metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -17411,6 +17731,7 @@ mod tests {
                 key: "key",
                 data: b"hello world",
                 metadata: &MetadataBlob::from_headers(&[("x-amz-meta-foo", "bar")]).unwrap(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -17465,6 +17786,7 @@ mod tests {
                 key: "key",
                 data: b"",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -17618,6 +17940,7 @@ mod tests {
                 bucket,
                 key,
                 metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: Some(MultipartChecksumConfig::new(algo, ctype).unwrap()),
 
@@ -18029,6 +18352,8 @@ mod tests {
                 crc64: crc,
                 total_size: full_data.len() as u64,
                 metadata_blob: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
+                sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
             })
@@ -18054,6 +18379,90 @@ mod tests {
     }
 
     #[test]
+    fn sse_c_checksum_metadata_is_not_stored_in_cleartext() {
+        let dir = test_util::tempdir();
+        let coord = setup_coordinator_with_sse_c(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let sse_customer = test_sse_customer_request();
+        let metadata = MetadataBlob::from_headers(&[("x-amz-meta-owner", "alice")]).unwrap();
+        let mut system_metadata = SystemMetadata::new();
+        system_metadata.set_checksum(
+            ChecksumAlgorithm::Sha256,
+            Some(ChecksumType::FullObject),
+            "arcu6553sHVAiX4MjW0j7I7vD4w6R+Gz9Ok0Q9lTa+0=".to_string(),
+        );
+
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: Some(&sse_customer),
+                bucket: "bucket",
+                key: "obj",
+                data: b"checksum-body",
+                metadata: &metadata,
+                system_metadata: &system_metadata,
+                tags: None,
+                cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
+            },
+        )
+        .unwrap();
+
+        {
+            let meta_pg = coord
+                .storage_node
+                .get_pg(coord.object_pg_id("bucket", "obj"))
+                .unwrap();
+            let record = meta_pg.get_object_meta("bucket", "obj").unwrap();
+            let live = record.as_live().unwrap();
+            let stored_system =
+                SystemMetadata::deserialize(live.system_metadata_blob.as_ref().unwrap().as_slice())
+                    .unwrap();
+            assert!(stored_system.checksum().is_none());
+            let stored_user =
+                Coordinator::deserialize_user_metadata(live.metadata_blob.as_ref()).unwrap();
+            assert_eq!(stored_user.get("x-amz-meta-owner"), Some("alice"));
+            let ObjectEncryption::SseCustomer(state) = &live.encryption else {
+                panic!("expected SSE-C encryption state");
+            };
+            assert!(!state.encrypted_checksum_metadata.is_empty());
+        }
+
+        let head = coord
+            .head_object(&GetObjectRequest {
+                sse_customer: Some(&sse_customer),
+                bucket: "bucket",
+                key: "obj",
+                version_id: None,
+                cond: NO_READ,
+                requester: TEST_REQUESTER,
+            })
+            .unwrap();
+        let checksum = head.system_metadata.checksum().unwrap();
+        assert_eq!(checksum.algorithm(), ChecksumAlgorithm::Sha256);
+        assert_eq!(checksum.checksum_type(), Some(ChecksumType::FullObject));
+        assert_eq!(
+            checksum.value(),
+            "arcu6553sHVAiX4MjW0j7I7vD4w6R+Gz9Ok0Q9lTa+0="
+        );
+
+        let wrong = SseCustomerRequest::new([1u8; SSE_C_CUSTOMER_KEY_LEN], "wrong".to_string());
+        let err = coord
+            .head_object(&GetObjectRequest {
+                sse_customer: Some(&wrong),
+                bucket: "bucket",
+                key: "obj",
+                version_id: None,
+                cond: NO_READ,
+                requester: TEST_REQUESTER,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
     fn stream_put_zero_byte_object() {
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
@@ -18072,6 +18481,8 @@ mod tests {
                 crc64: crc,
                 total_size: 0,
                 metadata_blob: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
+                sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
             })
@@ -18113,6 +18524,8 @@ mod tests {
                 crc64: checksum::crc64::checksum(b"hello"),
                 total_size: 5,
                 metadata_blob: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                sse_customer: None,
                 tags: Some(tags_xml),
                 cond: &WriteCondition::default(),
             })
@@ -18179,6 +18592,8 @@ mod tests {
                 crc64: crc,
                 total_size: 0,
                 metadata_blob: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
+                sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
             })
@@ -18218,6 +18633,8 @@ mod tests {
                 crc64: crc,
                 total_size: 0,
                 metadata_blob: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
+                sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
             })
@@ -18273,6 +18690,8 @@ mod tests {
                 crc64: crc,
                 total_size: 0,
                 metadata_blob: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
+                sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
             })
@@ -18311,6 +18730,7 @@ mod tests {
                 key: "key",
                 data: b"old-data",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
@@ -18336,6 +18756,8 @@ mod tests {
                 crc64: crc,
                 total_size: new_data.len() as u64,
                 metadata_blob: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
+                sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
             })
@@ -18371,6 +18793,7 @@ mod tests {
                 key: "key",
                 data: b"initial",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
@@ -18395,6 +18818,8 @@ mod tests {
                 crc64: crc,
                 total_size: 7,
                 metadata_blob: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
+                sse_customer: None,
                 tags: None,
                 cond: &cond,
             })
@@ -18415,6 +18840,8 @@ mod tests {
                 crc64: checksum::crc64::checksum(b"third"),
                 total_size: 5,
                 metadata_blob: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
+                sse_customer: None,
                 tags: None,
                 cond: &bad_cond,
             })
@@ -18455,6 +18882,8 @@ mod tests {
                 crc64: crc,
                 total_size: full_data.len() as u64,
                 metadata_blob: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
+                sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
             })
@@ -18526,6 +18955,8 @@ mod tests {
                 crc64: crc,
                 total_size: 5,
                 metadata_blob: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
+                sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
             })
@@ -18587,6 +19018,8 @@ mod tests {
                 crc64: crc,
                 total_size: 10,
                 metadata_blob: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
             })
@@ -18658,6 +19091,8 @@ mod tests {
                 crc64: checksum::crc64::checksum(&data),
                 total_size: data.len() as u64,
                 metadata_blob: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                sse_customer: None,
                 tags: None,
                 cond: NO_WRITE,
             })
@@ -18717,6 +19152,8 @@ mod tests {
                 crc64: crc,
                 total_size: 8,
                 metadata_blob: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
             })
@@ -18799,6 +19236,8 @@ mod tests {
                 crc64: crc,
                 total_size: 7,
                 metadata_blob: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
             })
@@ -18864,6 +19303,7 @@ mod tests {
                 key: "key",
                 data: b"tiny-data",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
@@ -18909,6 +19349,7 @@ mod tests {
                 key: "exact",
                 data: &data,
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
@@ -18942,6 +19383,7 @@ mod tests {
                 key: "key",
                 data: &data,
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
@@ -18993,6 +19435,7 @@ mod tests {
                 key: "key",
                 data: &old_data,
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
@@ -19017,6 +19460,7 @@ mod tests {
                 key: "key",
                 data: b"new-data",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
@@ -19056,6 +19500,8 @@ mod tests {
                 crc64: crc,
                 total_size: 0,
                 metadata_blob: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
             })
@@ -19095,6 +19541,8 @@ mod tests {
                 crc64: crc,
                 total_size: 8,
                 metadata_blob: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
             })
@@ -19136,6 +19584,8 @@ mod tests {
                 crc64: crc,
                 total_size: 11,
                 metadata_blob: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
             })
@@ -19163,6 +19613,7 @@ mod tests {
                 key: "key",
                 data: b"normal-data",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
@@ -19205,6 +19656,8 @@ mod tests {
                 crc64: crc,
                 total_size: 9,
                 metadata_blob: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
             })
@@ -19254,6 +19707,8 @@ mod tests {
                 crc64: crc,
                 total_size: 9,
                 metadata_blob: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
             })
@@ -19311,6 +19766,8 @@ mod tests {
                 crc64: crc,
                 total_size: 11,
                 metadata_blob: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
             })
@@ -19322,6 +19779,7 @@ mod tests {
                 bucket: "bucket",
                 key: "dst",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -19380,6 +19838,8 @@ mod tests {
                 crc64: crc64.finalize(),
                 total_size: data.len() as u64,
                 metadata_blob: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
             })
@@ -19390,6 +19850,7 @@ mod tests {
                 bucket: "bucket",
                 key: "dst",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: Some(
                     MultipartChecksumConfig::new(ChecksumAlgorithm::Crc32c, None).unwrap(),
@@ -19486,6 +19947,7 @@ mod tests {
                 key: "src",
                 data: b"source-data",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -19499,6 +19961,7 @@ mod tests {
                 bucket: "bucket",
                 key: "dst",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -19559,6 +20022,8 @@ mod tests {
                 crc64: crc,
                 total_size: 5,
                 metadata_blob: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
+                sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
             })
@@ -19587,6 +20052,8 @@ mod tests {
                 crc64: crc,
                 total_size: 999, // wrong — actual is 5
                 metadata_blob: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
+                sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
             })
@@ -19658,6 +20125,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -19715,6 +20183,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -19774,6 +20243,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -19815,6 +20285,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -19827,6 +20298,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -19954,6 +20426,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
@@ -20104,6 +20577,8 @@ mod tests {
                 crc64: crc,
                 total_size: 9,
                 metadata_blob: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
             })
@@ -20191,6 +20666,8 @@ mod tests {
                 crc64: crc,
                 total_size: 16,
                 metadata_blob: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
             })
@@ -20252,6 +20729,7 @@ mod tests {
                 key: "bad-segment-crc",
                 data: b"segment-data",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
@@ -20286,6 +20764,7 @@ mod tests {
                         layout: live.layout,
                         tags: live.tags.clone(),
                         metadata_blob: live.metadata_blob.clone(),
+                        system_metadata_blob: live.system_metadata_blob.clone(),
                         encryption: storage::ObjectEncryption::None,
                     },
                     &segments,
@@ -20331,6 +20810,8 @@ mod tests {
                 crc64: crc,
                 total_size: 2,
                 metadata_blob: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
             })
@@ -20356,6 +20837,7 @@ mod tests {
                 key: "cycle",
                 data: b"v2-normal",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
@@ -20398,6 +20880,8 @@ mod tests {
                 crc64: checksum::crc64::checksum(b"old-data"),
                 total_size: 8,
                 metadata_blob: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
             })
@@ -20416,6 +20900,8 @@ mod tests {
                 crc64: checksum::crc64::checksum(b"new-data"),
                 total_size: 8,
                 metadata_blob: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
             })

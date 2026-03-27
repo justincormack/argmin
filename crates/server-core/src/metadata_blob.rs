@@ -24,28 +24,11 @@ pub struct MetadataEntry {
     pub value: String,
 }
 
-/// Metadata blob containing user-specified headers.
+/// Metadata blob containing user-specified `x-amz-meta-*` headers only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetadataBlob {
     entries: Vec<MetadataEntry>,
 }
-
-/// Standard S3 headers that get stored in the metadata blob.
-const STORED_HEADERS: &[&str] = &[
-    "content-type",
-    "content-encoding",
-    "cache-control",
-    "content-disposition",
-    "content-language",
-    "expires",
-    // Checksum headers (stored so they can be returned with ChecksumMode=ENABLED)
-    "x-amz-checksum-sha256",
-    "x-amz-checksum-crc64nvme",
-    "x-amz-checksum-crc32",
-    "x-amz-checksum-crc32c",
-    "x-amz-checksum-sha1",
-    "x-amz-checksum-algorithm",
-];
 
 /// Check if a string contains bytes invalid in HTTP headers:
 /// ASCII control characters (0x00-0x1F) and DEL (0x7F). Non-ASCII
@@ -63,8 +46,7 @@ impl MetadataBlob {
     }
 
     /// Build a metadata blob from request headers.
-    /// Extracts content-type, content-encoding, cache-control, content-disposition,
-    /// content-language, expires, and all x-amz-meta-* headers.
+    /// Extracts only `x-amz-meta-*` headers.
     /// Rejects values containing control characters to prevent header injection.
     ///
     /// For `x-amz-meta-*` headers with non-ASCII values, bytes are reinterpreted
@@ -89,7 +71,7 @@ impl MetadataBlob {
         let mut entries = Vec::new();
         for (name, value) in headers {
             let lower = name.to_ascii_lowercase();
-            if STORED_HEADERS.contains(&lower.as_str()) || lower.starts_with("x-amz-meta-") {
+            if lower.starts_with("x-amz-meta-") {
                 if has_invalid_header_bytes(value) {
                     return Err(ServerError::InvalidRequest {
                         reason: format!(
@@ -97,7 +79,7 @@ impl MetadataBlob {
                         ),
                     });
                 }
-                let stored_value = if lower.starts_with("x-amz-meta-") && !value.is_ascii() {
+                let stored_value = if !value.is_ascii() {
                     // AWS compatibility: reinterpret non-ASCII bytes as
                     // Latin-1 code points for user metadata only.
                     value.bytes().map(|b| b as char).collect()
@@ -278,62 +260,19 @@ impl MetadataBlob {
 
     /// Set a metadata key-value pair, replacing any existing entry with the same key.
     pub fn set(&mut self, key: &str, value: &str) {
-        if let Some(entry) = self.entries.iter_mut().find(|e| e.key == key) {
+        let lower = key.to_ascii_lowercase();
+        assert!(
+            lower.starts_with("x-amz-meta-"),
+            "MetadataBlob only accepts x-amz-meta-* keys"
+        );
+        if let Some(entry) = self.entries.iter_mut().find(|e| e.key == lower) {
             entry.value = value.to_string();
         } else {
             self.entries.push(MetadataEntry {
-                key: key.to_string(),
+                key: lower,
                 value: value.to_string(),
             });
         }
-    }
-
-    /// Strip the transport-only `aws-chunked` token from Content-Encoding.
-    ///
-    /// This must only be applied when the server has actually processed an
-    /// aws-chunked transfer. Ordinary user-supplied `Content-Encoding` values
-    /// are stored verbatim.
-    pub fn strip_aws_chunked_content_encoding(&mut self) {
-        let Some(index) = self
-            .entries
-            .iter()
-            .position(|e| e.key == "content-encoding")
-        else {
-            return;
-        };
-
-        let filtered: Vec<&str> = self.entries[index]
-            .value
-            .split(',')
-            .map(str::trim)
-            .filter(|part| !part.eq_ignore_ascii_case("aws-chunked"))
-            .collect();
-
-        if filtered.is_empty() {
-            self.entries.remove(index);
-            return;
-        }
-
-        self.entries[index].value = filtered.join(", ");
-    }
-
-    /// Return checksum value entries (x-amz-checksum-crc32, etc.) stored in the blob.
-    /// Excludes x-amz-checksum-algorithm and x-amz-checksum-type which are
-    /// surfaced as separate headers/elements.
-    pub fn checksum_entries(&self) -> impl Iterator<Item = &MetadataEntry> {
-        self.entries.iter().filter(|e| {
-            e.key.starts_with("x-amz-checksum-")
-                && e.key != "x-amz-checksum-algorithm"
-                && e.key != "x-amz-checksum-type"
-        })
-    }
-
-    /// Return all checksum-related entries including x-amz-checksum-type.
-    /// Used for GetObjectAttributes where ChecksumType appears inside <Checksum>.
-    pub fn checksum_entries_with_type(&self) -> impl Iterator<Item = &MetadataEntry> {
-        self.entries
-            .iter()
-            .filter(|e| e.key.starts_with("x-amz-checksum-") && e.key != "x-amz-checksum-algorithm")
     }
 
     /// Build a metadata blob from raw key-value pairs without header filtering.
@@ -343,9 +282,16 @@ impl MetadataBlob {
         Self {
             entries: pairs
                 .iter()
-                .map(|(k, v)| MetadataEntry {
-                    key: k.to_string(),
-                    value: v.to_string(),
+                .map(|(k, v)| {
+                    let lower = k.to_ascii_lowercase();
+                    assert!(
+                        lower.starts_with("x-amz-meta-"),
+                        "MetadataBlob only accepts x-amz-meta-* keys"
+                    );
+                    MetadataEntry {
+                        key: lower,
+                        value: v.to_string(),
+                    }
                 })
                 .collect(),
         }
@@ -364,21 +310,6 @@ impl MetadataBlob {
     /// Iterate over all entries.
     pub fn iter(&self) -> impl Iterator<Item = &MetadataEntry> {
         self.entries.iter()
-    }
-
-    /// Remove checksum value headers (x-amz-checksum-crc32, etc.) that cannot
-    /// be verified. Used at the HTTP boundary for CopyObject REPLACE, where
-    /// there is no body to verify checksums against.
-    pub fn strip_checksum_values(&mut self) {
-        const CHECKSUM_VALUE_HEADERS: &[&str] = &[
-            "x-amz-checksum-crc32",
-            "x-amz-checksum-crc32c",
-            "x-amz-checksum-crc64nvme",
-            "x-amz-checksum-sha256",
-            "x-amz-checksum-sha1",
-        ];
-        self.entries
-            .retain(|e| !CHECKSUM_VALUE_HEADERS.contains(&e.key.as_str()));
     }
 }
 
@@ -406,7 +337,7 @@ mod tests {
     fn round_trip_single_entry() {
         let blob = MetadataBlob {
             entries: vec![MetadataEntry {
-                key: "content-type".to_string(),
+                key: "x-amz-meta-type".to_string(),
                 value: "application/json".to_string(),
             }],
         };
@@ -421,7 +352,7 @@ mod tests {
         let blob = MetadataBlob {
             entries: vec![
                 MetadataEntry {
-                    key: "content-type".to_string(),
+                    key: "x-amz-meta-type".to_string(),
                     value: "text/plain".to_string(),
                 },
                 MetadataEntry {
@@ -429,7 +360,7 @@ mod tests {
                     value: "test-user".to_string(),
                 },
                 MetadataEntry {
-                    key: "cache-control".to_string(),
+                    key: "x-amz-meta-cache".to_string(),
                     value: "max-age=3600".to_string(),
                 },
             ],
@@ -459,7 +390,7 @@ mod tests {
     fn deserialize_truncated() {
         let blob = MetadataBlob {
             entries: vec![MetadataEntry {
-                key: "content-type".to_string(),
+                key: "x-amz-meta-type".to_string(),
                 value: "text/plain".to_string(),
             }],
         };
@@ -495,17 +426,15 @@ mod tests {
             ("X-Amz-Meta-Version", "1"),
         ];
         let blob = MetadataBlob::from_headers(&headers).unwrap();
-        assert_eq!(blob.entries.len(), 4);
-        assert_eq!(blob.get("content-type"), Some("text/html"));
+        assert_eq!(blob.entries.len(), 2);
         assert_eq!(blob.get("x-amz-meta-author"), Some("alice"));
-        assert_eq!(blob.get("cache-control"), Some("no-cache"));
         assert_eq!(blob.get("x-amz-meta-version"), Some("1"));
     }
 
     #[test]
     fn get_missing_key() {
         let blob = MetadataBlob::new();
-        assert_eq!(blob.get("content-type"), None);
+        assert_eq!(blob.get("x-amz-meta-missing"), None);
     }
 
     #[test]
@@ -552,16 +481,13 @@ mod tests {
         assert!(MetadataBlob::from_headers(&headers).is_err());
 
         let headers = [("Content-Type", "text/plain\n")];
-        assert!(MetadataBlob::from_headers(&headers).is_err());
+        assert!(MetadataBlob::from_headers(&headers).is_ok());
     }
 
     #[test]
     fn from_headers_accepts_non_ascii() {
         // AWS accepts unicode metadata values
         let headers = [("X-Amz-Meta-Name", "caf\u{00e9}")]; // "café"
-        assert!(MetadataBlob::from_headers(&headers).is_ok());
-
-        let headers = [("Content-Type", "text/plain; charset=\u{00fc}")];
         assert!(MetadataBlob::from_headers(&headers).is_ok());
 
         // DEL (0x7F) is a control character and should be rejected
@@ -571,34 +497,7 @@ mod tests {
 
     #[test]
     fn from_headers_accepts_clean_values() {
-        let headers = [
-            ("Content-Type", "text/plain; charset=utf-8"),
-            ("X-Amz-Meta-Tag", "hello world 123 !@#$%"),
-        ];
+        let headers = [("X-Amz-Meta-Tag", "hello world 123 !@#$%")];
         assert!(MetadataBlob::from_headers(&headers).is_ok());
-    }
-
-    #[test]
-    fn from_headers_stores_content_encoding_as_is() {
-        let headers = [("Content-Encoding", "gzip, aws-chunked")];
-        let blob = MetadataBlob::from_headers(&headers).unwrap();
-        assert_eq!(blob.get("content-encoding"), Some("gzip, aws-chunked"));
-    }
-
-    #[test]
-    fn strip_aws_chunked_content_encoding_removes_transport_token() {
-        let mut blob =
-            MetadataBlob::from_headers(&[("Content-Encoding", "gzip, aws-chunked")]).unwrap();
-        blob.strip_aws_chunked_content_encoding();
-        assert_eq!(blob.get("content-encoding"), Some("gzip"));
-
-        let mut blob =
-            MetadataBlob::from_headers(&[("Content-Encoding", "aws-chunked, gzip")]).unwrap();
-        blob.strip_aws_chunked_content_encoding();
-        assert_eq!(blob.get("content-encoding"), Some("gzip"));
-
-        let mut blob = MetadataBlob::from_headers(&[("Content-Encoding", "aws-chunked")]).unwrap();
-        blob.strip_aws_chunked_content_encoding();
-        assert_eq!(blob.get("content-encoding"), None);
     }
 }

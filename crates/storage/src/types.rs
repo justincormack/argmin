@@ -192,6 +192,45 @@ impl From<SerializedMetadataBlob> for Vec<u8> {
     }
 }
 
+/// Serialized system metadata blob.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SerializedSystemMetadataBlob(Vec<u8>);
+
+impl SerializedSystemMetadataBlob {
+    #[must_use]
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn into_inner(self) -> Vec<u8> {
+        self.0
+    }
+}
+
+impl AsRef<[u8]> for SerializedSystemMetadataBlob {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl From<Vec<u8>> for SerializedSystemMetadataBlob {
+    fn from(value: Vec<u8>) -> Self {
+        Self(value)
+    }
+}
+
+impl From<SerializedSystemMetadataBlob> for Vec<u8> {
+    fn from(value: SerializedSystemMetadataBlob) -> Self {
+        value.0
+    }
+}
+
 /// Serialized tag-set XML.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SerializedTagSet(String);
@@ -264,6 +303,7 @@ pub const SSE_C_WRAP_SALT_LEN: usize = 16;
 pub const SSE_C_WRAP_NONCE_LEN: usize = 12;
 pub const SSE_C_WRAPPED_DEK_LEN: usize = 48;
 pub const SSE_C_SEGMENT_NONCE_PREFIX_LEN: usize = 8;
+pub const SSE_C_CHECKSUM_NONCE_LEN: usize = 12;
 
 /// Stored per-object `SSE-C` state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -275,22 +315,29 @@ pub struct SseCustomerObjectState {
     pub wrap_nonce: [u8; SSE_C_WRAP_NONCE_LEN],
     pub wrapped_dek: [u8; SSE_C_WRAPPED_DEK_LEN],
     pub segment_nonce_prefix: [u8; SSE_C_SEGMENT_NONCE_PREFIX_LEN],
+    pub checksum_nonce: [u8; SSE_C_CHECKSUM_NONCE_LEN],
+    pub encrypted_checksum_metadata: Vec<u8>,
 }
 
 impl SseCustomerObjectState {
-    const VERSION: u8 = 1;
-    const ENCODED_LEN: usize = 1
+    const VERSION: u8 = 2;
+    const FIXED_ENCODED_LEN: usize = 1
         + 4
         + SSE_C_VALIDATOR_SALT_LEN
         + SSE_C_VALIDATOR_HMAC_LEN
         + SSE_C_WRAP_SALT_LEN
         + SSE_C_WRAP_NONCE_LEN
         + SSE_C_WRAPPED_DEK_LEN
-        + SSE_C_SEGMENT_NONCE_PREFIX_LEN;
+        + SSE_C_SEGMENT_NONCE_PREFIX_LEN
+        + SSE_C_CHECKSUM_NONCE_LEN
+        + 2;
 
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(Self::ENCODED_LEN);
+        let checksum_len = u16::try_from(self.encrypted_checksum_metadata.len())
+            .expect("encrypted checksum metadata length should fit in u16");
+        let mut out =
+            Vec::with_capacity(Self::FIXED_ENCODED_LEN + self.encrypted_checksum_metadata.len());
         out.push(Self::VERSION);
         out.extend_from_slice(&self.validator_key_id.to_be_bytes());
         out.extend_from_slice(&self.validator_salt);
@@ -299,15 +346,18 @@ impl SseCustomerObjectState {
         out.extend_from_slice(&self.wrap_nonce);
         out.extend_from_slice(&self.wrapped_dek);
         out.extend_from_slice(&self.segment_nonce_prefix);
+        out.extend_from_slice(&self.checksum_nonce);
+        out.extend_from_slice(&checksum_len.to_be_bytes());
+        out.extend_from_slice(&self.encrypted_checksum_metadata);
         out
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
-        if bytes.len() != Self::ENCODED_LEN {
+        if bytes.len() < Self::FIXED_ENCODED_LEN {
             return Err(format!(
-                "invalid SSE-C state length {} (expected {})",
+                "invalid SSE-C state length {} (minimum {})",
                 bytes.len(),
-                Self::ENCODED_LEN
+                Self::FIXED_ENCODED_LEN
             ));
         }
         if bytes[0] != Self::VERSION {
@@ -345,6 +395,22 @@ impl SseCustomerObjectState {
         let segment_nonce_prefix = take(&mut cursor, SSE_C_SEGMENT_NONCE_PREFIX_LEN)
             .try_into()
             .expect("slice length checked");
+        let checksum_nonce = take(&mut cursor, SSE_C_CHECKSUM_NONCE_LEN)
+            .try_into()
+            .expect("slice length checked");
+        let checksum_len = u16::from_be_bytes(
+            take(&mut cursor, 2)
+                .try_into()
+                .expect("slice length checked"),
+        ) as usize;
+        if cursor + checksum_len != bytes.len() {
+            return Err(format!(
+                "invalid SSE-C checksum metadata length {} (remaining {})",
+                checksum_len,
+                bytes.len().saturating_sub(cursor)
+            ));
+        }
+        let encrypted_checksum_metadata = take(&mut cursor, checksum_len).to_vec();
 
         Ok(Self {
             validator_key_id,
@@ -354,6 +420,8 @@ impl SseCustomerObjectState {
             wrap_nonce,
             wrapped_dek,
             segment_nonce_prefix,
+            checksum_nonce,
+            encrypted_checksum_metadata,
         })
     }
 }
@@ -871,6 +939,8 @@ pub struct LiveObjectRecord {
     pub tags: Option<SerializedTagSet>,
     /// Serialized user metadata headers.
     pub metadata_blob: Option<SerializedMetadataBlob>,
+    /// Serialized system metadata headers.
+    pub system_metadata_blob: Option<SerializedSystemMetadataBlob>,
     pub encryption: ObjectEncryption,
 }
 
@@ -1104,6 +1174,8 @@ pub struct PutLiveObjectReq {
     pub tags: Option<SerializedTagSet>,
     /// Serialized user metadata headers.
     pub metadata_blob: Option<SerializedMetadataBlob>,
+    /// Serialized system metadata headers.
+    pub system_metadata_blob: Option<SerializedSystemMetadataBlob>,
     pub encryption: ObjectEncryption,
 }
 
@@ -1161,6 +1233,8 @@ pub struct CommitMultipartReq {
     pub tags: Option<SerializedTagSet>,
     /// Serialized user metadata headers.
     pub metadata_blob: Option<SerializedMetadataBlob>,
+    /// Serialized system metadata headers.
+    pub system_metadata_blob: Option<SerializedSystemMetadataBlob>,
     pub encryption: ObjectEncryption,
 }
 
@@ -1182,6 +1256,8 @@ pub struct CommitStreamPutReq {
     pub tags: Option<SerializedTagSet>,
     /// Serialized user metadata headers.
     pub metadata_blob: Option<SerializedMetadataBlob>,
+    /// Serialized system metadata headers.
+    pub system_metadata_blob: Option<SerializedSystemMetadataBlob>,
     pub encryption: ObjectEncryption,
 }
 
@@ -1252,6 +1328,8 @@ pub struct MultipartUploadRecord {
     pub tags: Option<SerializedTagSet>,
     /// Serialized user metadata headers.
     pub metadata_blob: SerializedMetadataBlob,
+    /// Serialized system metadata headers.
+    pub system_metadata_blob: SerializedSystemMetadataBlob,
     pub owner_principal: Option<String>,
     /// Validated checksum configuration for this upload.
     pub checksum: Option<MultipartChecksumConfig>,
@@ -1313,6 +1391,7 @@ pub struct CreateMultipartUploadReq {
     pub key: ObjectKey,
     pub tags: Option<SerializedTagSet>,
     pub metadata_blob: SerializedMetadataBlob,
+    pub system_metadata_blob: SerializedSystemMetadataBlob,
     pub owner_principal: Option<String>,
     pub checksum: Option<MultipartChecksumConfig>,
     pub encryption: ObjectEncryption,

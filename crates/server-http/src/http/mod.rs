@@ -45,6 +45,7 @@ use s3_types::VersionId;
 use server_core::sse::{
     SseCustomerRequest, SseCustomerWriteContext, SSE_CUSTOMER_ALGORITHM, SSE_C_CUSTOMER_KEY_LEN,
 };
+use server_core::system_metadata::SystemMetadata;
 use tokio::sync::{mpsc, OwnedSemaphorePermit};
 
 const TRACE_TARGET: &str = "server_http";
@@ -67,6 +68,17 @@ fn parse_version_id_str(v: &str) -> Result<VersionId, ServerError> {
                 reason: format!("invalid versionId: {v}"),
             })
     }
+}
+
+fn parse_request_metadata<'a, I>(headers: I) -> Result<(MetadataBlob, SystemMetadata), ServerError>
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+{
+    let headers: Vec<(&str, &str)> = headers.into_iter().collect();
+    Ok((
+        MetadataBlob::from_header_iter(headers.iter().copied())?,
+        SystemMetadata::from_header_iter(headers)?,
+    ))
 }
 
 fn parse_version_id(req: &S3Request) -> Result<Option<VersionId>, ServerError> {
@@ -757,14 +769,15 @@ impl HttpFrontend {
                     // Parse metadata and checksum algorithm at the HTTP boundary
                     // so the coordinator never sees raw headers.
                     let replace_metadata;
+                    let replace_system_metadata;
                     let replace_checksum_algo;
                     let directive = match req.header("x-amz-metadata-directive") {
                         Some(d) if d.eq_ignore_ascii_case("REPLACE") => {
-                            let mut blob = MetadataBlob::from_header_iter(req.header_iter())?;
-                            // Strip unverifiable checksum value headers — CopyObject
-                            // has no body so these can't be verified.
-                            blob.strip_checksum_values();
+                            let (blob, mut system_metadata) =
+                                parse_request_metadata(req.header_iter())?;
+                            system_metadata.strip_checksum_values();
                             replace_metadata = blob;
+                            replace_system_metadata = system_metadata;
 
                             // Parse checksum algorithm if present.
                             replace_checksum_algo = match req.header("x-amz-checksum-algorithm") {
@@ -778,6 +791,7 @@ impl HttpFrontend {
 
                             MetadataDirective::Replace {
                                 metadata: &replace_metadata,
+                                system_metadata: &replace_system_metadata,
                                 checksum_algorithm: replace_checksum_algo,
                             }
                         }
@@ -843,7 +857,8 @@ impl HttpFrontend {
                     } else {
                         None
                     };
-                    let metadata_blob = MetadataBlob::from_header_iter(req.header_iter())?;
+                    let (metadata_blob, system_metadata) =
+                        parse_request_metadata(req.header_iter())?;
                     let cond = write_condition_from_headers(req)?;
                     let requester =
                         crate::coordinator::Requester::from_principal(auth.principal.as_deref());
@@ -855,6 +870,7 @@ impl HttpFrontend {
                                 key: &key,
                                 data: &req.body,
                                 metadata: &metadata_blob,
+                                system_metadata: &system_metadata,
                                 tags: inline_tags_xml.as_deref(),
                                 cond: &cond,
                                 requester,
@@ -1167,16 +1183,9 @@ impl HttpFrontend {
                         sse_customer: sse_customer.as_ref(),
                     },
                 )?;
-                let checksum_entries: Vec<(&str, &str)> = result
-                    .metadata
-                    .checksum_entries_with_type()
-                    .map(|e| (e.key.as_str(), e.value.as_str()))
-                    .collect();
+                let checksum_entries = result.system_metadata.checksum_header_pairs();
                 // Extract checksum algorithm from metadata for per-part checksum XML elements.
-                let obj_checksum_algo = result
-                    .metadata
-                    .get("x-amz-checksum-algorithm")
-                    .and_then(ChecksumAlgorithm::parse);
+                let obj_checksum_algo = result.system_metadata.checksum_algorithm();
                 let body_xml = xml::get_object_attributes_xml(
                     &requested,
                     &result.etag,
@@ -1406,7 +1415,7 @@ impl HttpFrontend {
                 let sse_customer_headers = sse_customer
                     .as_ref()
                     .map(SseCustomerRequest::response_headers);
-                let metadata = MetadataBlob::from_header_iter(req.header_iter())?;
+                let (metadata, system_metadata) = parse_request_metadata(req.header_iter())?;
 
                 // Parse optional checksum algorithm/type headers.
                 let checksum_algorithm = match req.header("x-amz-checksum-algorithm") {
@@ -1455,6 +1464,7 @@ impl HttpFrontend {
                         bucket: &bucket,
                         key: &key,
                         metadata: &metadata,
+                        system_metadata: &system_metadata,
                         tags: inline_tags_xml.as_deref(),
                         checksum,
                         requester,
@@ -2166,7 +2176,7 @@ impl HttpFrontend {
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
-        let metadata_blob = MetadataBlob::from_header_iter(hp_refs.iter().copied())?;
+        let (metadata_blob, system_metadata) = parse_request_metadata(hp_refs.iter().copied())?;
         let tags_xml = if let Some(tagging_field) = field("tagging") {
             let tags = xml::parse_tagging_xml(tagging_field.as_bytes(), 10)?;
             if tags.is_empty() {
@@ -2209,6 +2219,7 @@ impl HttpFrontend {
                 key,
             },
             metadata_blob,
+            system_metadata,
             success_status,
             form_fields: form_fields.to_vec(),
             policy_b64: field("policy").map(std::string::ToString::to_string),
@@ -2299,6 +2310,8 @@ impl HttpFrontend {
                 crc64,
                 total_size,
                 metadata_blob: &ctx.metadata_blob,
+                system_metadata: &ctx.system_metadata,
+                sse_customer: ctx.sse_customer.as_ref(),
                 tags: ctx.tags_xml.as_deref(),
                 cond: &crate::conditional::WriteCondition::default(),
             })?;
@@ -2370,15 +2383,25 @@ impl HttpFrontend {
         ctx: &StreamingPutContext,
         trailer_checksums: &[(String, String)],
     ) -> crate::metadata_blob::MetadataBlob {
+        let _ = trailer_checksums;
+        ctx.metadata_blob.clone()
+    }
+
+    fn merged_streaming_put_system_metadata(
+        ctx: &StreamingPutContext,
+        trailer_checksums: &[(String, String)],
+    ) -> SystemMetadata {
         if trailer_checksums.is_empty() {
-            return ctx.metadata_blob.clone();
+            return ctx.system_metadata.clone();
         }
 
-        let mut blob = ctx.metadata_blob.clone();
-        for (k, v) in trailer_checksums {
-            blob.set(k, v);
+        let mut metadata = ctx.system_metadata.clone();
+        for (name, value) in trailer_checksums {
+            if let Some(algo) = checksum_algo_from_header(name) {
+                metadata.set_checksum(algo, None, value.clone());
+            }
         }
-        blob
+        metadata
     }
 
     fn apply_streaming_put_checksum_headers(
@@ -2472,10 +2495,9 @@ impl HttpFrontend {
             }
         }
 
-        let mut metadata_blob =
-            crate::metadata_blob::MetadataBlob::from_header_iter(req.header_iter())?;
+        let (metadata_blob, mut system_metadata) = parse_request_metadata(req.header_iter())?;
         if uses_aws_chunked_transport {
-            metadata_blob.strip_aws_chunked_content_encoding();
+            system_metadata.strip_aws_chunked_content_encoding();
         }
         let cond = write_condition_from_headers(req)?;
 
@@ -2494,6 +2516,7 @@ impl HttpFrontend {
             requester_principal: auth.principal,
             acl_header: req.header("x-amz-acl").map(str::to_string),
             metadata_blob,
+            system_metadata,
             cond,
             inline_tags_xml,
             checksum: StreamingPutChecksumContract {
@@ -2584,6 +2607,7 @@ impl HttpFrontend {
             trailer_checksums.len()
         );
         let metadata_blob = Self::merged_streaming_put_metadata_blob(ctx, trailer_checksums);
+        let system_metadata = Self::merged_streaming_put_system_metadata(ctx, trailer_checksums);
         let result = self
             .coordinator
             .put_object(&crate::coordinator::PutObjectRequest {
@@ -2591,6 +2615,7 @@ impl HttpFrontend {
                 key: &ctx.key,
                 data,
                 metadata: &metadata_blob,
+                system_metadata: &system_metadata,
                 tags: ctx.inline_tags_xml.as_deref(),
                 cond: &ctx.cond,
                 requester: crate::coordinator::Requester::from_principal(
@@ -2638,6 +2663,7 @@ impl HttpFrontend {
             trailer_checksums.len()
         );
         let metadata_blob = Self::merged_streaming_put_metadata_blob(ctx, trailer_checksums);
+        let system_metadata = Self::merged_streaming_put_system_metadata(ctx, trailer_checksums);
 
         let result = self
             .coordinator
@@ -2648,6 +2674,8 @@ impl HttpFrontend {
                 crc64,
                 total_size,
                 metadata_blob: &metadata_blob,
+                system_metadata: &system_metadata,
+                sse_customer: ctx.sse_customer.as_ref(),
                 tags: ctx.inline_tags_xml.as_deref(),
                 cond: &ctx.cond,
             })?;
@@ -2931,6 +2959,7 @@ pub struct StreamingPutContext {
     pub requester_principal: Option<String>,
     pub acl_header: Option<String>,
     pub metadata_blob: crate::metadata_blob::MetadataBlob,
+    pub system_metadata: SystemMetadata,
     pub cond: crate::conditional::WriteCondition,
     pub inline_tags_xml: Option<String>,
     pub checksum: StreamingPutChecksumContract,
@@ -2944,6 +2973,7 @@ pub struct StreamingPostContext {
     pub trace: observability::TraceContext,
     pub binding: StreamObjectBinding,
     pub metadata_blob: crate::metadata_blob::MetadataBlob,
+    pub system_metadata: SystemMetadata,
     pub success_status: u16,
     pub form_fields: Vec<(String, String)>,
     pub policy_b64: Option<String>,

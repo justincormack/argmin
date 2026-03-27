@@ -2455,6 +2455,7 @@ mod tests {
     };
     use crate::metadata_blob::MetadataBlob;
     use ec::EcConfig;
+    use server_core::system_metadata::SystemMetadata;
     use std::sync::Arc;
     use storage::SharedStorageNode;
 
@@ -4293,6 +4294,7 @@ mod tests {
                 key: "dir/file1.txt",
                 data: b"hello",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -4308,6 +4310,7 @@ mod tests {
                 key: "dir/file2.txt",
                 data: b"world",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -4323,6 +4326,7 @@ mod tests {
                 key: "root.txt",
                 data: b"root",
                 metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
@@ -4427,6 +4431,7 @@ mod tests {
                     key: &key,
                     data: b"data",
                     metadata: &MetadataBlob::new(),
+                    system_metadata: &SystemMetadata::EMPTY,
                     tags: None,
                     cond: NO_WRITE,
                     requester: TEST_REQUESTER,

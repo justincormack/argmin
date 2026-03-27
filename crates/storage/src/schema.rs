@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS objects (
     data_layout   INTEGER NOT NULL DEFAULT 0,
     parts_count   INTEGER,
     metadata_blob BLOB,
+    system_metadata_blob BLOB,
     encryption_type INTEGER NOT NULL DEFAULT 0,
     encryption_state BLOB,
     CHECK (status IN (0, 1)),
@@ -43,7 +44,7 @@ CREATE TABLE IF NOT EXISTS objects (
             (data_layout = 0 AND parts_count IS NULL) OR
             (data_layout = 1 AND parts_count IS NOT NULL AND parts_count > 0)
         )) OR
-        (status = 1 AND generation_id IS NULL AND data_layout = 0 AND parts_count IS NULL AND tags IS NULL AND metadata_blob IS NULL
+        (status = 1 AND generation_id IS NULL AND data_layout = 0 AND parts_count IS NULL AND tags IS NULL AND metadata_blob IS NULL AND system_metadata_blob IS NULL
          AND size = 0 AND etag = X'' AND etag_kind = 0 AND storage_class = 0 AND ec_k = 0 AND ec_m = 0
          AND encryption_type = 0 AND encryption_state IS NULL)
     ),
@@ -60,6 +61,7 @@ CREATE TABLE IF NOT EXISTS multipart_uploads (
     state            INTEGER NOT NULL DEFAULT 0,
     tags             TEXT,
     metadata_blob    BLOB NOT NULL,
+    system_metadata_blob BLOB NOT NULL,
     owner_principal  TEXT CHECK (owner_principal IS NULL OR length(owner_principal) BETWEEN 1 AND 256)
     ,
     encryption_type  INTEGER NOT NULL DEFAULT 0 CHECK (encryption_type IN (0, 1)),

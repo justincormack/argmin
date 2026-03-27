@@ -744,8 +744,8 @@ impl PgStore {
 
     /// Map a row with columns (bucket, key, version_id, generation_id, size,
     /// etag, etag_kind, last_modified, storage_class, ec_k, ec_m, status,
-    /// tags, data_layout, parts_count, metadata_blob, encryption_type,
-    /// encryption_state) to a StoredObject.
+    /// tags, data_layout, parts_count, metadata_blob, system_metadata_blob,
+    /// encryption_type, encryption_state) to a StoredObject.
     /// Parse a u8-backed enum from a row column.
     fn parse_enum<T>(
         raw: u8,
@@ -817,11 +817,14 @@ impl PgStore {
                 let metadata_blob: Option<SerializedMetadataBlob> = row
                     .get::<_, Option<Vec<u8>>>(15)?
                     .map(SerializedMetadataBlob::from);
+                let system_metadata_blob: Option<SerializedSystemMetadataBlob> = row
+                    .get::<_, Option<Vec<u8>>>(16)?
+                    .map(SerializedSystemMetadataBlob::from);
                 let encryption = Self::parse_object_encryption(
-                    row.get::<_, u8>(16)?,
-                    row.get::<_, Option<Vec<u8>>>(17)?,
-                    16,
+                    row.get::<_, u8>(17)?,
+                    row.get::<_, Option<Vec<u8>>>(18)?,
                     17,
+                    18,
                 )?;
                 if size != 0
                     || generation_id.is_some()
@@ -832,6 +835,7 @@ impl PgStore {
                     || ec_m != 0
                     || tags.is_some()
                     || metadata_blob.is_some()
+                    || system_metadata_blob.is_some()
                     || encryption != ObjectEncryption::None
                 {
                     return Err(rusqlite::Error::FromSqlConversionFailure(
@@ -884,10 +888,10 @@ impl PgStore {
                         )
                     })?;
                 let encryption = Self::parse_object_encryption(
-                    row.get::<_, u8>(16)?,
-                    row.get::<_, Option<Vec<u8>>>(17)?,
-                    16,
+                    row.get::<_, u8>(17)?,
+                    row.get::<_, Option<Vec<u8>>>(18)?,
                     17,
+                    18,
                 )?;
 
                 Ok(StoredObject::Live(LiveObjectRecord {
@@ -910,6 +914,9 @@ impl PgStore {
                     metadata_blob: row
                         .get::<_, Option<Vec<u8>>>(15)?
                         .map(SerializedMetadataBlob::from),
+                    system_metadata_blob: row
+                        .get::<_, Option<Vec<u8>>>(16)?
+                        .map(SerializedSystemMetadataBlob::from),
                     encryption,
                 }))
             }
@@ -1654,18 +1661,22 @@ impl PgMetadataStore for PgStore {
                     .metadata_blob
                     .as_ref()
                     .map(SerializedMetadataBlob::as_slice);
+                let system_metadata_blob = req
+                    .system_metadata_blob
+                    .as_ref()
+                    .map(SerializedSystemMetadataBlob::as_slice);
                 let encryption_type = req.encryption.encryption_type() as u8;
                 let encryption_state = req.encryption.encode_state();
                 let sql = if req.version_id.is_null() {
                     "INSERT OR REPLACE INTO objects \
                      (bucket, key, version_id, generation_id, size, etag, etag_kind, last_modified, \
-                      storage_class, ec_k, ec_m, status, data_layout, parts_count, tags, metadata_blob, encryption_type, encryption_state) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"
+                      storage_class, ec_k, ec_m, status, data_layout, parts_count, tags, metadata_blob, system_metadata_blob, encryption_type, encryption_state) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)"
                 } else {
                     "INSERT INTO objects \
                      (bucket, key, version_id, generation_id, size, etag, etag_kind, last_modified, \
-                      storage_class, ec_k, ec_m, status, data_layout, parts_count, tags, metadata_blob, encryption_type, encryption_state) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"
+                      storage_class, ec_k, ec_m, status, data_layout, parts_count, tags, metadata_blob, system_metadata_blob, encryption_type, encryption_state) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)"
                 };
                 self.conn
                     .execute(
@@ -1686,6 +1697,7 @@ impl PgMetadataStore for PgStore {
                             parts_count,
                             tags,
                             metadata_blob,
+                            system_metadata_blob,
                             encryption_type,
                             encryption_state,
                         ],
@@ -1699,13 +1711,13 @@ impl PgMetadataStore for PgStore {
                 let sql = if req.version_id.is_null() {
                     "INSERT OR REPLACE INTO objects \
                      (bucket, key, version_id, generation_id, size, etag, etag_kind, last_modified, \
-                      storage_class, ec_k, ec_m, status, data_layout, parts_count, metadata_blob, encryption_type, encryption_state) \
-                     VALUES (?1, ?2, ?3, NULL, 0, zeroblob(0), 0, ?4, 0, 0, 0, 1, 0, NULL, NULL, 0, NULL)"
+                      storage_class, ec_k, ec_m, status, data_layout, parts_count, metadata_blob, system_metadata_blob, encryption_type, encryption_state) \
+                     VALUES (?1, ?2, ?3, NULL, 0, zeroblob(0), 0, ?4, 0, 0, 0, 1, 0, NULL, NULL, NULL, 0, NULL)"
                 } else {
                     "INSERT INTO objects \
                      (bucket, key, version_id, generation_id, size, etag, etag_kind, last_modified, \
-                      storage_class, ec_k, ec_m, status, data_layout, parts_count, metadata_blob, encryption_type, encryption_state) \
-                     VALUES (?1, ?2, ?3, NULL, 0, zeroblob(0), 0, ?4, 0, 0, 0, 1, 0, NULL, NULL, 0, NULL)"
+                      storage_class, ec_k, ec_m, status, data_layout, parts_count, metadata_blob, system_metadata_blob, encryption_type, encryption_state) \
+                     VALUES (?1, ?2, ?3, NULL, 0, zeroblob(0), 0, ?4, 0, 0, 0, 1, 0, NULL, NULL, NULL, 0, NULL)"
                 };
                 self.conn
                     .execute(
@@ -1739,7 +1751,7 @@ impl PgMetadataStore for PgStore {
             .query_row(
                 "SELECT bucket, key, version_id, generation_id, size, etag, etag_kind, \
                  last_modified, storage_class, ec_k, ec_m, status, tags, \
-                 data_layout, parts_count, metadata_blob, encryption_type, encryption_state \
+                 data_layout, parts_count, metadata_blob, system_metadata_blob, encryption_type, encryption_state \
                  FROM objects WHERE bucket = ?1 AND key = ?2 \
                  ORDER BY last_modified DESC, version_id DESC LIMIT 1",
                 params![bucket, key],
@@ -1772,7 +1784,7 @@ impl PgMetadataStore for PgStore {
             .query_row(
                 "SELECT bucket, key, version_id, generation_id, size, etag, etag_kind, \
                  last_modified, storage_class, ec_k, ec_m, status, tags, \
-                 data_layout, parts_count, metadata_blob, encryption_type, encryption_state \
+                 data_layout, parts_count, metadata_blob, system_metadata_blob, encryption_type, encryption_state \
                  FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
                 params![bucket, key, version_id.to_u64() as i64],
                 Self::row_to_object_record,
@@ -1881,7 +1893,8 @@ impl PgMetadataStore for PgStore {
             ) \
             SELECT o.bucket, o.key, o.version_id, o.generation_id, o.size, o.etag, o.etag_kind, \
                    o.last_modified, o.storage_class, o.ec_k, o.ec_m, o.status, o.tags, \
-                   o.data_layout, o.parts_count, o.metadata_blob, o.encryption_type, o.encryption_state \
+                   o.data_layout, o.parts_count, o.metadata_blob, o.system_metadata_blob, \
+                   o.encryption_type, o.encryption_state \
             FROM objects o \
             INNER JOIN latest l ON o.bucket = l.bucket AND o.key = l.key AND o.version_id = l.max_vid \
             WHERE {where_str} AND o.status = 0 \
@@ -1984,7 +1997,7 @@ impl PgMetadataStore for PgStore {
         let sql = format!(
             "SELECT bucket, key, version_id, generation_id, size, etag, etag_kind, \
              last_modified, storage_class, ec_k, ec_m, status, tags, \
-             data_layout, parts_count, metadata_blob, encryption_type, encryption_state \
+             data_layout, parts_count, metadata_blob, system_metadata_blob, encryption_type, encryption_state \
              FROM objects \
              WHERE {where_str} \
              ORDER BY key ASC, version_id DESC LIMIT ?{param_idx}"
@@ -2899,12 +2912,13 @@ impl PgMetadataStore for PgStore {
         let tags = req.tags.as_ref().map(SerializedTagSet::as_str);
         let encryption_type = req.encryption.encryption_type() as u8;
         let encryption_state = req.encryption.encode_state();
+        let system_metadata_blob = req.system_metadata_blob.as_slice();
         self.conn
             .execute(
                 "INSERT INTO multipart_uploads \
-                 (upload_id, bucket, key, initiated_at, state, tags, metadata_blob, owner_principal, \
+                 (upload_id, bucket, key, initiated_at, state, tags, metadata_blob, system_metadata_blob, owner_principal, \
                   checksum_algorithm, checksum_type, encryption_type, encryption_state) \
-                 VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     req.upload_id,
                     req.bucket,
@@ -2912,6 +2926,7 @@ impl PgMetadataStore for PgStore {
                     now as i64,
                     tags,
                     req.metadata_blob.as_slice(),
+                    system_metadata_blob,
                     req.owner_principal,
                     algo,
                     ctype,
@@ -2933,13 +2948,13 @@ impl PgMetadataStore for PgStore {
         self.conn
             .query_row(
                 "SELECT upload_id, bucket, key, initiated_at, state, tags, metadata_blob, \
-                 owner_principal, checksum_algorithm, checksum_type, encryption_type, encryption_state \
+                 system_metadata_blob, owner_principal, checksum_algorithm, checksum_type, encryption_type, encryption_state \
                  FROM multipart_uploads WHERE upload_id = ?1",
                 params![upload_id],
                 |row| {
                     let state_raw = row.get::<_, u8>(4)?;
-                    let algo_raw: Option<u8> = row.get(8)?;
-                    let ctype_raw: Option<u8> = row.get(9)?;
+                    let algo_raw: Option<u8> = row.get(9)?;
+                    let ctype_raw: Option<u8> = row.get(10)?;
                     let checksum = if let Some(algo_val) = algo_raw {
                         let algo = ChecksumAlgorithm::from_u8(algo_val).ok_or_else(|| {
                             rusqlite::Error::FromSqlConversionFailure(
@@ -2983,13 +2998,16 @@ impl PgMetadataStore for PgStore {
                         })?,
                         tags: row.get::<_, Option<String>>(5)?.map(SerializedTagSet::from),
                         metadata_blob: SerializedMetadataBlob::from(row.get::<_, Vec<u8>>(6)?),
-                        owner_principal: row.get(7)?,
+                        system_metadata_blob: SerializedSystemMetadataBlob::from(
+                            row.get::<_, Vec<u8>>(7)?,
+                        ),
+                        owner_principal: row.get(8)?,
                         checksum,
                         encryption: Self::parse_object_encryption(
-                            row.get::<_, u8>(10)?,
-                            row.get::<_, Option<Vec<u8>>>(11)?,
-                            10,
+                            row.get::<_, u8>(11)?,
+                            row.get::<_, Option<Vec<u8>>>(12)?,
                             11,
+                            12,
                         )?,
                     })
                 },
@@ -3148,7 +3166,7 @@ impl PgMetadataStore for PgStore {
         let where_str = where_clauses.join(" AND ");
         let sql = format!(
             "SELECT upload_id, bucket, key, initiated_at, state, tags, metadata_blob, \
-             owner_principal, checksum_algorithm, checksum_type, encryption_type, encryption_state \
+             system_metadata_blob, owner_principal, checksum_algorithm, checksum_type, encryption_type, encryption_state \
              FROM multipart_uploads \
              WHERE {where_str} \
              ORDER BY key ASC, initiated_at ASC, upload_id ASC \
@@ -3166,8 +3184,8 @@ impl PgMetadataStore for PgStore {
         let rows = stmt
             .query_map(params_refs.as_slice(), |row| {
                 let state_raw = row.get::<_, u8>(4)?;
-                let algo_raw: Option<u8> = row.get(8)?;
-                let ctype_raw: Option<u8> = row.get(9)?;
+                let algo_raw: Option<u8> = row.get(9)?;
+                let ctype_raw: Option<u8> = row.get(10)?;
                 let checksum = if let Some(algo_val) = algo_raw {
                     let algo = ChecksumAlgorithm::from_u8(algo_val).ok_or_else(|| {
                         rusqlite::Error::FromSqlConversionFailure(
@@ -3211,13 +3229,16 @@ impl PgMetadataStore for PgStore {
                     })?,
                     tags: row.get::<_, Option<String>>(5)?.map(SerializedTagSet::from),
                     metadata_blob: SerializedMetadataBlob::from(row.get::<_, Vec<u8>>(6)?),
-                    owner_principal: row.get(7)?,
+                    system_metadata_blob: SerializedSystemMetadataBlob::from(
+                        row.get::<_, Vec<u8>>(7)?,
+                    ),
+                    owner_principal: row.get(8)?,
                     checksum,
                     encryption: Self::parse_object_encryption(
-                        row.get::<_, u8>(10)?,
-                        row.get::<_, Option<Vec<u8>>>(11)?,
-                        10,
+                        row.get::<_, u8>(11)?,
+                        row.get::<_, Option<Vec<u8>>>(12)?,
                         11,
+                        12,
                     )?,
                 })
             })
@@ -3846,6 +3867,10 @@ impl PgMetadataStore for PgStore {
             .metadata_blob
             .as_ref()
             .map(SerializedMetadataBlob::as_slice);
+        let system_metadata_blob = obj
+            .system_metadata_blob
+            .as_ref()
+            .map(SerializedSystemMetadataBlob::as_slice);
         let encryption_type = obj.encryption.encryption_type() as u8;
         let encryption_state = obj.encryption.encode_state();
 
@@ -3899,13 +3924,13 @@ impl PgMetadataStore for PgStore {
             let obj_sql = if obj.version_id.is_null() {
                 "INSERT OR REPLACE INTO objects \
                  (bucket, key, version_id, generation_id, size, etag, etag_kind, last_modified, \
-                  storage_class, ec_k, ec_m, status, tags, data_layout, parts_count, metadata_blob, encryption_type, encryption_state) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"
+                  storage_class, ec_k, ec_m, status, tags, data_layout, parts_count, metadata_blob, system_metadata_blob, encryption_type, encryption_state) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)"
             } else {
                 "INSERT INTO objects \
                  (bucket, key, version_id, generation_id, size, etag, etag_kind, last_modified, \
-                  storage_class, ec_k, ec_m, status, tags, data_layout, parts_count, metadata_blob, encryption_type, encryption_state) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"
+                  storage_class, ec_k, ec_m, status, tags, data_layout, parts_count, metadata_blob, system_metadata_blob, encryption_type, encryption_state) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)"
             };
             self.conn.execute(
                 obj_sql,
@@ -3925,6 +3950,7 @@ impl PgMetadataStore for PgStore {
                     data_layout,
                     parts_count,
                     metadata_blob,
+                    system_metadata_blob,
                     encryption_type,
                     encryption_state,
                 ],
@@ -4384,17 +4410,21 @@ impl PgMetadataStore for PgStore {
             let tags = obj.tags.as_ref().map(SerializedTagSet::as_str);
             let encryption_type = obj.encryption.encryption_type() as u8;
             let encryption_state = obj.encryption.encode_state();
+            let system_metadata_blob = obj
+                .system_metadata_blob
+                .as_ref()
+                .map(SerializedSystemMetadataBlob::as_slice);
 
             let obj_sql = if obj.version_id.is_null() {
                 "INSERT OR REPLACE INTO objects \
                  (bucket, key, version_id, generation_id, size, etag, etag_kind, last_modified, \
-                  storage_class, ec_k, ec_m, status, data_layout, parts_count, tags, metadata_blob, encryption_type, encryption_state) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"
+                  storage_class, ec_k, ec_m, status, data_layout, parts_count, tags, metadata_blob, system_metadata_blob, encryption_type, encryption_state) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)"
             } else {
                 "INSERT INTO objects \
                  (bucket, key, version_id, generation_id, size, etag, etag_kind, last_modified, \
-                  storage_class, ec_k, ec_m, status, data_layout, parts_count, tags, metadata_blob, encryption_type, encryption_state) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"
+                  storage_class, ec_k, ec_m, status, data_layout, parts_count, tags, metadata_blob, system_metadata_blob, encryption_type, encryption_state) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)"
             };
             self.conn
                 .execute(
@@ -4417,6 +4447,7 @@ impl PgMetadataStore for PgStore {
                         obj.metadata_blob
                             .as_ref()
                             .map(SerializedMetadataBlob::as_slice),
+                        system_metadata_blob,
                         encryption_type,
                         encryption_state,
                     ],
@@ -4555,19 +4586,23 @@ impl PgMetadataStore for PgStore {
                 .metadata_blob
                 .as_ref()
                 .map(SerializedMetadataBlob::as_slice);
+            let system_metadata_blob = obj
+                .system_metadata_blob
+                .as_ref()
+                .map(SerializedSystemMetadataBlob::as_slice);
             let encryption_type = obj.encryption.encryption_type() as u8;
             let encryption_state = obj.encryption.encode_state();
 
             let obj_sql = if obj.version_id.is_null() {
                 "INSERT OR REPLACE INTO objects \
                  (bucket, key, version_id, generation_id, size, etag, etag_kind, last_modified, \
-                  storage_class, ec_k, ec_m, status, data_layout, parts_count, tags, metadata_blob, encryption_type, encryption_state) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"
+                  storage_class, ec_k, ec_m, status, data_layout, parts_count, tags, metadata_blob, system_metadata_blob, encryption_type, encryption_state) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)"
             } else {
                 "INSERT INTO objects \
                  (bucket, key, version_id, generation_id, size, etag, etag_kind, last_modified, \
-                  storage_class, ec_k, ec_m, status, data_layout, parts_count, tags, metadata_blob, encryption_type, encryption_state) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"
+                  storage_class, ec_k, ec_m, status, data_layout, parts_count, tags, metadata_blob, system_metadata_blob, encryption_type, encryption_state) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)"
             };
             self.conn
                 .execute(
@@ -4588,6 +4623,7 @@ impl PgMetadataStore for PgStore {
                         parts_count,
                         tags,
                         metadata_blob,
+                        system_metadata_blob,
                         encryption_type,
                         encryption_state,
                     ],
@@ -5216,6 +5252,7 @@ mod tests {
                     layout: ObjectLayout::Standard,
                     tags: None,
                     metadata_blob: None,
+                    system_metadata_blob: None,
                     encryption: ObjectEncryption::None,
                 }))
                 .unwrap();
@@ -5373,6 +5410,7 @@ mod tests {
                     layout: ObjectLayout::Standard,
                     tags: None,
                     metadata_blob: None,
+                    system_metadata_blob: None,
                     encryption: ObjectEncryption::None,
                 }))
                 .unwrap();

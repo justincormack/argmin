@@ -2,12 +2,13 @@ use std::fmt;
 
 use ring::{aead, hmac, rand::SecureRandom};
 use storage::{
-    ObjectEncryption, SseCustomerObjectState, SSE_C_SEGMENT_NONCE_PREFIX_LEN,
-    SSE_C_VALIDATOR_HMAC_LEN, SSE_C_VALIDATOR_SALT_LEN, SSE_C_WRAPPED_DEK_LEN,
-    SSE_C_WRAP_NONCE_LEN, SSE_C_WRAP_SALT_LEN,
+    ObjectEncryption, SseCustomerObjectState, SSE_C_CHECKSUM_NONCE_LEN,
+    SSE_C_SEGMENT_NONCE_PREFIX_LEN, SSE_C_VALIDATOR_HMAC_LEN, SSE_C_VALIDATOR_SALT_LEN,
+    SSE_C_WRAPPED_DEK_LEN, SSE_C_WRAP_NONCE_LEN, SSE_C_WRAP_SALT_LEN,
 };
 
 use crate::error::ServerError;
+use crate::system_metadata::ObjectChecksumMetadata;
 
 pub const SSE_CUSTOMER_ALGORITHM: &str = "AES256";
 pub const SSE_C_CUSTOMER_KEY_LEN: usize = 32;
@@ -15,7 +16,9 @@ pub const SSE_C_DEK_LEN: usize = 32;
 pub const SSE_C_SEGMENT_TAG_LEN: usize = 16;
 const SSE_C_WRAP_AAD: &[u8] = b"argmin:sse-c:wrap:v1";
 const SSE_C_SEGMENT_AAD: &[u8] = b"argmin:sse-c:segment:v1";
+const SSE_C_CHECKSUM_AAD: &[u8] = b"argmin:sse-c:checksum:v1";
 const SSE_C_HKDF_INFO: &[u8] = b"argmin:sse-c:kek:v1";
+const SSE_C_CHECKSUM_METADATA_VERSION: u8 = 1;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct SseCustomerRequest {
@@ -124,6 +127,30 @@ impl SseCustomerWriteContext {
         };
         encrypt_segment_with_dek(&self.dek, state, segment_index, plaintext)
     }
+
+    pub fn seal_checksum_metadata(
+        &self,
+        checksum: Option<&ObjectChecksumMetadata>,
+    ) -> Result<ObjectEncryption, ServerError> {
+        let ObjectEncryption::SseCustomer(state) = &self.encryption else {
+            return Err(ServerError::InternalError {
+                reason: "SSE-C write context missing encryption state".to_string(),
+            });
+        };
+        let (checksum_nonce, encrypted_checksum_metadata) =
+            encrypt_checksum_with_dek(&self.dek, checksum)?;
+        Ok(ObjectEncryption::SseCustomer(SseCustomerObjectState {
+            validator_key_id: state.validator_key_id,
+            validator_salt: state.validator_salt,
+            validator_hmac: state.validator_hmac,
+            wrap_salt: state.wrap_salt,
+            wrap_nonce: state.wrap_nonce,
+            wrapped_dek: state.wrapped_dek,
+            segment_nonce_prefix: state.segment_nonce_prefix,
+            checksum_nonce,
+            encrypted_checksum_metadata,
+        }))
+    }
 }
 
 impl fmt::Debug for SseCustomerWriteContext {
@@ -185,6 +212,8 @@ pub fn prepare_sse_customer_write(
             wrap_nonce,
             wrapped_dek,
             segment_nonce_prefix,
+            checksum_nonce: [0u8; SSE_C_CHECKSUM_NONCE_LEN],
+            encrypted_checksum_metadata: Vec::new(),
         }),
         dek,
     })
@@ -234,6 +263,20 @@ pub fn decrypt_sse_customer_segment(
     let kek = derive_wrap_key(request.customer_key(), &state.wrap_salt)?;
     let dek = unwrap_dek(&kek, &state.wrap_nonce, &state.wrapped_dek)?;
     decrypt_segment_with_dek(&dek, state, segment_index, ciphertext, plaintext_len)
+}
+
+pub fn decrypt_sse_customer_checksum(
+    validator: &SseCustomerValidatorConfig,
+    state: &SseCustomerObjectState,
+    request: &SseCustomerRequest,
+) -> Result<Option<ObjectChecksumMetadata>, ServerError> {
+    if state.encrypted_checksum_metadata.is_empty() {
+        return Ok(None);
+    }
+    validate_sse_customer_read(validator, state, request)?;
+    let kek = derive_wrap_key(request.customer_key(), &state.wrap_salt)?;
+    let dek = unwrap_dek(&kek, &state.wrap_nonce, &state.wrapped_dek)?;
+    decrypt_checksum_with_dek(&dek, state)
 }
 
 fn compute_validator_hmac(
@@ -386,6 +429,117 @@ fn segment_nonce(state: &SseCustomerObjectState, segment_index: u32) -> aead::No
     aead::Nonce::assume_unique_for_key(nonce)
 }
 
+fn encode_checksum_metadata(checksum: &ObjectChecksumMetadata) -> Result<Vec<u8>, ServerError> {
+    let value = checksum.value().as_bytes();
+    let value_len = u16::try_from(value.len()).map_err(|_| ServerError::InternalError {
+        reason: "SSE-C checksum metadata value too long".to_string(),
+    })?;
+    let mut out = Vec::with_capacity(1 + 1 + 1 + 2 + value.len());
+    out.push(SSE_C_CHECKSUM_METADATA_VERSION);
+    out.push(checksum.algorithm() as u8);
+    out.push(checksum.checksum_type().map_or(u8::MAX, |v| v as u8));
+    out.extend_from_slice(&value_len.to_be_bytes());
+    out.extend_from_slice(value);
+    Ok(out)
+}
+
+fn decode_checksum_metadata(data: &[u8]) -> Result<ObjectChecksumMetadata, ServerError> {
+    if data.len() < 5 {
+        return Err(ServerError::InternalError {
+            reason: "SSE-C checksum metadata blob too short".to_string(),
+        });
+    }
+    if data[0] != SSE_C_CHECKSUM_METADATA_VERSION {
+        return Err(ServerError::InternalError {
+            reason: format!("unsupported SSE-C checksum metadata version {}", data[0]),
+        });
+    }
+    let algorithm = checksum::ChecksumAlgorithm::from_u8(data[1]).ok_or_else(|| {
+        ServerError::InternalError {
+            reason: format!("invalid stored checksum algorithm {}", data[1]),
+        }
+    })?;
+    let checksum_type = if data[2] == u8::MAX {
+        None
+    } else {
+        Some(checksum::ChecksumType::from_u8(data[2]).ok_or_else(|| {
+            ServerError::InternalError {
+                reason: format!("invalid stored checksum type {}", data[2]),
+            }
+        })?)
+    };
+    let value_len = u16::from_be_bytes([data[3], data[4]]) as usize;
+    if data.len() != 5 + value_len {
+        return Err(ServerError::InternalError {
+            reason: "invalid stored checksum metadata length".to_string(),
+        });
+    }
+    let value = std::str::from_utf8(&data[5..]).map_err(|_| ServerError::InternalError {
+        reason: "stored checksum metadata is not valid UTF-8".to_string(),
+    })?;
+    Ok(ObjectChecksumMetadata::new(
+        algorithm,
+        checksum_type,
+        value.to_string(),
+    ))
+}
+
+fn encrypt_checksum_with_dek(
+    dek: &[u8; SSE_C_DEK_LEN],
+    checksum: Option<&ObjectChecksumMetadata>,
+) -> Result<([u8; SSE_C_CHECKSUM_NONCE_LEN], Vec<u8>), ServerError> {
+    let Some(checksum) = checksum else {
+        return Ok(([0u8; SSE_C_CHECKSUM_NONCE_LEN], Vec::new()));
+    };
+    let unbound =
+        aead::UnboundKey::new(&aead::AES_256_GCM, dek).map_err(|_| ServerError::InternalError {
+            reason: "failed to create SSE-C checksum sealing key".to_string(),
+        })?;
+    let sealing_key = aead::LessSafeKey::new(unbound);
+    let rng = ring::rand::SystemRandom::new();
+    let mut nonce = [0u8; SSE_C_CHECKSUM_NONCE_LEN];
+    rng.fill(&mut nonce)
+        .map_err(|_| ServerError::InternalError {
+            reason: "failed to generate SSE-C checksum nonce".to_string(),
+        })?;
+    let mut buf = encode_checksum_metadata(checksum)?;
+    sealing_key
+        .seal_in_place_append_tag(
+            aead::Nonce::assume_unique_for_key(nonce),
+            aead::Aad::from(SSE_C_CHECKSUM_AAD),
+            &mut buf,
+        )
+        .map_err(|_| ServerError::InternalError {
+            reason: "failed to encrypt SSE-C checksum metadata".to_string(),
+        })?;
+    Ok((nonce, buf))
+}
+
+fn decrypt_checksum_with_dek(
+    dek: &[u8; SSE_C_DEK_LEN],
+    state: &SseCustomerObjectState,
+) -> Result<Option<ObjectChecksumMetadata>, ServerError> {
+    if state.encrypted_checksum_metadata.is_empty() {
+        return Ok(None);
+    }
+    let unbound =
+        aead::UnboundKey::new(&aead::AES_256_GCM, dek).map_err(|_| ServerError::InternalError {
+            reason: "failed to create SSE-C checksum opening key".to_string(),
+        })?;
+    let opening_key = aead::LessSafeKey::new(unbound);
+    let mut buf = state.encrypted_checksum_metadata.clone();
+    let plaintext = opening_key
+        .open_in_place(
+            aead::Nonce::assume_unique_for_key(state.checksum_nonce),
+            aead::Aad::from(SSE_C_CHECKSUM_AAD),
+            &mut buf,
+        )
+        .map_err(|_| ServerError::InternalError {
+            reason: "failed to decrypt SSE-C checksum metadata".to_string(),
+        })?;
+    Ok(Some(decode_checksum_metadata(plaintext)?))
+}
+
 struct Aes256GcmLen;
 
 impl ring::hkdf::KeyType for Aes256GcmLen {
@@ -397,6 +551,8 @@ impl ring::hkdf::KeyType for Aes256GcmLen {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::system_metadata::ObjectChecksumMetadata;
+    use checksum::{ChecksumAlgorithm, ChecksumType};
 
     fn request() -> SseCustomerRequest {
         SseCustomerRequest::new([7u8; SSE_C_CUSTOMER_KEY_LEN], "dummy-md5".to_string())
@@ -436,5 +592,27 @@ mod tests {
         let err =
             decrypt_sse_customer_segment(&validator, state, &wrong, 0, &ciphertext, 3).unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn sse_c_checksum_metadata_round_trip() {
+        let req = request();
+        let validator = validator();
+        let ctx = prepare_sse_customer_write(&validator, &req).unwrap();
+        let checksum = ObjectChecksumMetadata::new(
+            ChecksumAlgorithm::Sha256,
+            Some(ChecksumType::FullObject),
+            "deadbeef".to_string(),
+        );
+        let ObjectEncryption::SseCustomer(state) =
+            ctx.seal_checksum_metadata(Some(&checksum)).unwrap()
+        else {
+            panic!("expected SSE-C object state");
+        };
+        assert!(!state.encrypted_checksum_metadata.is_empty());
+        let decrypted = decrypt_sse_customer_checksum(&validator, &state, &req)
+            .unwrap()
+            .expect("expected checksum metadata");
+        assert_eq!(decrypted, checksum);
     }
 }
