@@ -1,10 +1,17 @@
 # Threat model
 
-Note this will change as more features around users, TLS support and encryption are added.
+Note this will continue to evolve as more features around users, direct TLS
+support, and encryption are added.
 
 ## 1. Overview
 Argmin2 is a single-node, S3-compatible object storage server written in Rust (the `argmin-s3` binary). It exposes an HTTP/1 endpoint implementing a subset of S3 APIs (bucket/object CRUD, multipart uploads, tagging, CORS, ACLs, etc.) using path-style addressing. Requests are parsed in `server-http`, authenticated using AWS Signature Version 4 in the `auth` crate, and dispatched to `server-core`, which enforces bucket/object authorization and orchestrates erasure-coded storage. Object data and metadata are persisted locally: shard files on disk plus per-placement-group SQLite metadata databases (`storage` crate). Data integrity uses CRC64-NVME checksums and verified reads; erasure coding via ISA‑L (`ec`/`ec-sys`) provides redundancy.
-Typical deployments are local or internal S3-compatible storage for testing or lightweight environments, configured by environment variables. Security is centered on SigV4 authentication plus optional public bucket ACLs. The server does not include TLS or encryption at rest, so confidentiality depends on external transport protection and filesystem permissions.
+Typical deployments are local or internal S3-compatible storage for testing or
+lightweight environments, configured by environment variables. Security is
+centered on SigV4 authentication plus optional public bucket ACLs. The server
+now includes object encryption features such as `SSE-C`, but direct TLS support
+is still being implemented. Until that lands, confidentiality depends on
+external transport protection and filesystem permissions. That external-TLS
+assumption is transitional, not the intended end state for `SSE-C`.
 
 ## 2. Threat model, Trust boundaries and assumptions
 ### Assets
@@ -24,7 +31,10 @@ Typical deployments are local or internal S3-compatible storage for testing or l
 ### Assumptions
 - Host OS and filesystem permissions are trusted; unprivileged local users cannot modify `ARGMIN_DATA_DIR` contents.
 - System clock is reasonably accurate for SigV4 expiry checks.
-- TLS is provided externally (reverse proxy or trusted network). Secrets are not logged or exposed via tracing.
+- Until direct server TLS lands, TLS is provided externally (trusted network or
+  external terminator). This is a temporary assumption and is not sufficient
+  for AWS-compatible `SSE-C`, which must ultimately be enforced over direct
+  HTTPS. Secrets are not logged or exposed via tracing.
 - The server is effectively single-tenant; ACLs primarily govern public vs owner access rather than multi-user isolation.
 
 ## 3. Attack surface, mitigations and attacker stories
@@ -72,4 +82,3 @@ Typical deployments are local or internal S3-compatible storage for testing or l
 - **High:** authorization bugs that allow public write/read when ACLs forbid it, path traversal allowing writes outside `ARGMIN_DATA_DIR`, or metadata corruption causing permanent data loss.
 - **Medium:** transient denial of service (CPU/memory spikes, excessive multipart uploads) or information disclosure of bucket metadata that does not expose object data.
 - **Low:** minor logging of non-sensitive metadata, incorrect error codes, or edge-case canonicalization mismatches that only affect interoperability.
-
