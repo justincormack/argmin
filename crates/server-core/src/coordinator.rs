@@ -39,8 +39,8 @@ use crate::range::ByteRange;
 use crate::sse::{
     decrypt_sse_customer_checksum, decrypt_sse_customer_segment, prepare_sse_customer_write,
     resume_sse_customer_write, validate_sse_customer_read, SseCustomerRequest,
-    SseCustomerResponseHeaders, SseCustomerValidatorConfig, SseCustomerWriteContext,
-    SSE_C_SEGMENT_TAG_LEN,
+    SseCustomerResponseHeaders, SseCustomerSegmentScope, SseCustomerValidatorConfig,
+    SseCustomerWriteContext, SSE_C_SEGMENT_TAG_LEN,
 };
 use crate::system_metadata::SystemMetadata;
 
@@ -2079,6 +2079,7 @@ impl ReadRuntime {
     fn read_segment_payload(
         &self,
         segment: &SegmentPayloadRecord,
+        part_number: Option<u32>,
         sse_customer_request: Option<&SseCustomerRequest>,
     ) -> Result<Arc<SharedPayloadBuffer>, ServerError> {
         let k = segment.ec_k as usize;
@@ -2087,12 +2088,14 @@ impl ReadRuntime {
         let shard_size = padded / k;
 
         if shard_size == 0 {
-            let plaintext = self.decrypt_segment_if_needed(segment, sse_customer_request, &[])?;
+            let plaintext =
+                self.decrypt_segment_if_needed(segment, part_number, sse_customer_request, &[])?;
             return Ok(Arc::new(SharedPayloadBuffer::from_unpooled(plaintext)));
         }
 
         if let Some(buf) = self.try_read_segment_payload_direct(
             segment,
+            part_number,
             sse_customer_request,
             k,
             shard_size,
@@ -2101,13 +2104,22 @@ impl ReadRuntime {
             return Ok(buf.into_shared());
         }
 
-        self.read_segment_payload_locked(segment, sse_customer_request, k, m, padded, shard_size)
-            .map(PooledPayloadBuffer::into_shared)
+        self.read_segment_payload_locked(
+            segment,
+            part_number,
+            sse_customer_request,
+            k,
+            m,
+            padded,
+            shard_size,
+        )
+        .map(PooledPayloadBuffer::into_shared)
     }
 
     fn try_read_segment_payload_direct(
         &self,
         segment: &SegmentPayloadRecord,
+        part_number: Option<u32>,
         sse_customer_request: Option<&SseCustomerRequest>,
         k: usize,
         shard_size: usize,
@@ -2143,15 +2155,18 @@ impl ReadRuntime {
         if actual_crc64 != expected_crc64 {
             return Ok(None);
         }
-        let plaintext = self.decrypt_segment_if_needed(segment, sse_customer_request, &buf)?;
+        let plaintext =
+            self.decrypt_segment_if_needed(segment, part_number, sse_customer_request, &buf)?;
         buf.resize_zeroed(0);
         buf.extend_from_slice(&plaintext);
         Ok(Some(buf))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn read_segment_payload_locked(
         &self,
         segment: &SegmentPayloadRecord,
+        part_number: Option<u32>,
         sse_customer_request: Option<&SseCustomerRequest>,
         k: usize,
         m: usize,
@@ -2257,7 +2272,8 @@ impl ReadRuntime {
                 }));
             }
         }
-        let plaintext = self.decrypt_segment_if_needed(segment, sse_customer_request, &buf)?;
+        let plaintext =
+            self.decrypt_segment_if_needed(segment, part_number, sse_customer_request, &buf)?;
         buf.resize_zeroed(0);
         buf.extend_from_slice(&plaintext);
         Ok(buf)
@@ -2266,6 +2282,7 @@ impl ReadRuntime {
     fn decrypt_segment_if_needed(
         &self,
         segment: &SegmentPayloadRecord,
+        part_number: Option<u32>,
         sse_customer_request: Option<&SseCustomerRequest>,
         stored_bytes: &[u8],
     ) -> Result<Vec<u8>, ServerError> {
@@ -2281,10 +2298,15 @@ impl ReadRuntime {
                         .ok_or(ServerError::InternalError {
                             reason: "SSE-C validator key is not configured".to_string(),
                         })?;
+                let segment_scope = part_number
+                    .map_or(Ok(SseCustomerSegmentScope::object()), |p| {
+                        SseCustomerSegmentScope::multipart_part(p)
+                    })?;
                 decrypt_sse_customer_segment(
                     validator,
                     state,
                     request,
+                    segment_scope,
                     segment.segment_index,
                     stored_bytes,
                     segment.size as usize,
@@ -2390,7 +2412,11 @@ impl SegmentListReader {
 
             let data = self
                 .runtime
-                .read_segment_payload(&slice.payload, self.sse_customer_request.as_ref())
+                .read_segment_payload(
+                    &slice.payload,
+                    slice.part_number,
+                    self.sse_customer_request.as_ref(),
+                )
                 .map_err(|e| match e {
                     ServerError::Store(storage::StoreError::NotFound) => {
                         ServerError::ObjectNotFound {
@@ -3782,6 +3808,7 @@ impl Coordinator {
         &self,
         encryption: &ObjectEncryption,
         sse_customer: Option<&SseCustomerRequest>,
+        segment_scope: SseCustomerSegmentScope,
     ) -> Result<Option<SseCustomerWriteContext>, ServerError> {
         match encryption {
             ObjectEncryption::None => {
@@ -3803,7 +3830,12 @@ impl Coordinator {
                         .ok_or(ServerError::InternalError {
                             reason: "SSE-C validator key is not configured".to_string(),
                         })?;
-                Ok(Some(resume_sse_customer_write(validator, state, request)?))
+                Ok(Some(resume_sse_customer_write(
+                    validator,
+                    state,
+                    request,
+                    segment_scope,
+                )?))
             }
         }
     }
@@ -4165,8 +4197,11 @@ impl Coordinator {
             &bucket_info,
             matches!(upload.encryption, ObjectEncryption::SseCustomer(_)),
         )?;
-        let sse_customer =
-            self.prepare_existing_sse_customer_write_context(&upload.encryption, req.sse_customer)?;
+        let sse_customer = self.prepare_existing_sse_customer_write_context(
+            &upload.encryption,
+            req.sse_customer,
+            SseCustomerSegmentScope::multipart_part(part_number)?,
+        )?;
 
         // Generate session ID.
         let rng = ring::rand::SystemRandom::new();
@@ -7535,8 +7570,11 @@ impl Coordinator {
                 &bucket_info,
                 matches!(upload.encryption, ObjectEncryption::SseCustomer(_)),
             )?;
-            let multipart_sse_write =
-                self.prepare_existing_sse_customer_write_context(&upload.encryption, req.sse_customer)?;
+            let multipart_sse_write = self.prepare_existing_sse_customer_write_context(
+                &upload.encryption,
+                req.sse_customer,
+                SseCustomerSegmentScope::object(),
+            )?;
 
             let checksum_algo = upload.checksum.map(MultipartChecksumConfig::algorithm);
             let checksum_type = upload.checksum.map(MultipartChecksumConfig::checksum_type);
@@ -18744,6 +18782,66 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn sse_c_multipart_parts_with_same_plaintext_use_distinct_nonce_scopes() {
+        let dir = test_util::tempdir();
+        let coord = setup_coordinator_with_sse_c(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let sse_customer = test_sse_customer_request();
+        let upload = coord
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                checksum: None,
+                requester: TEST_REQUESTER,
+                sse_customer: Some(&sse_customer),
+            })
+            .unwrap();
+
+        for part_number in [1u32, 2u32] {
+            test_helpers::upload_part(
+                &coord,
+                &UploadPartRequest {
+                    bucket: "bucket",
+                    key: "key",
+                    upload_id: &upload.upload_id,
+                    part_number,
+                    data: b"identical-multipart-segment",
+                    claimed_checksum: None,
+                    requester: TEST_REQUESTER,
+                    sse_customer: Some(&sse_customer),
+                },
+            )
+            .unwrap();
+        }
+
+        let meta_pg = coord
+            .storage_node
+            .get_pg(coord.object_pg_id("bucket", "key"))
+            .unwrap();
+        let segments = meta_pg
+            .get_all_multipart_part_segments_for_upload(&upload.upload_id)
+            .unwrap();
+        let part1: Vec<_> = segments
+            .iter()
+            .filter(|segment| segment.part_number == 1)
+            .collect();
+        let part2: Vec<_> = segments
+            .iter()
+            .filter(|segment| segment.part_number == 2)
+            .collect();
+
+        assert_eq!(part1.len(), 1);
+        assert_eq!(part2.len(), 1);
+        assert_eq!(part1[0].segment_index, 0);
+        assert_eq!(part2[0].segment_index, 0);
+        assert_ne!(part1[0].segment_crc64, part2[0].segment_crc64);
     }
 
     #[test]

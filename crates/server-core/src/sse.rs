@@ -3,8 +3,8 @@ use std::fmt;
 use ring::{aead, hmac, rand::SecureRandom};
 use storage::{
     ObjectEncryption, SseCustomerObjectState, SSE_C_CHECKSUM_NONCE_LEN,
-    SSE_C_SEGMENT_NONCE_PREFIX_LEN, SSE_C_VALIDATOR_HMAC_LEN, SSE_C_VALIDATOR_SALT_LEN,
-    SSE_C_WRAPPED_DEK_LEN, SSE_C_WRAP_NONCE_LEN, SSE_C_WRAP_SALT_LEN,
+    SSE_C_SEGMENT_NONCE_PREFIX_LEN, SSE_C_SEGMENT_NONCE_SCOPE_LEN, SSE_C_VALIDATOR_HMAC_LEN,
+    SSE_C_VALIDATOR_SALT_LEN, SSE_C_WRAPPED_DEK_LEN, SSE_C_WRAP_NONCE_LEN, SSE_C_WRAP_SALT_LEN,
 };
 
 use crate::error::ServerError;
@@ -102,6 +102,7 @@ pub struct SseCustomerWriteContext {
     request: SseCustomerRequest,
     encryption: ObjectEncryption,
     dek: [u8; SSE_C_DEK_LEN],
+    segment_scope: SseCustomerSegmentScope,
 }
 
 impl SseCustomerWriteContext {
@@ -125,7 +126,13 @@ impl SseCustomerWriteContext {
                 reason: "SSE-C write context missing encryption state".to_string(),
             });
         };
-        encrypt_segment_with_dek(&self.dek, state, segment_index, plaintext)
+        encrypt_segment_with_dek(
+            &self.dek,
+            state,
+            self.segment_scope,
+            segment_index,
+            plaintext,
+        )
     }
 
     pub fn seal_checksum_metadata(
@@ -159,6 +166,34 @@ impl fmt::Debug for SseCustomerWriteContext {
             .field("request", &self.request)
             .field("encryption", &self.encryption)
             .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SseCustomerSegmentScope(u16);
+
+impl SseCustomerSegmentScope {
+    #[must_use]
+    pub(crate) fn object() -> Self {
+        Self(0)
+    }
+
+    pub(crate) fn multipart_part(part_number: u32) -> Result<Self, ServerError> {
+        if part_number == 0 {
+            return Err(ServerError::InternalError {
+                reason: "multipart SSE-C nonce scope requires a positive part number".to_string(),
+            });
+        }
+        let part_number = u16::try_from(part_number).map_err(|_| ServerError::InternalError {
+            reason: format!(
+                "multipart SSE-C part number {part_number} does not fit in the nonce scope"
+            ),
+        })?;
+        Ok(Self(part_number))
+    }
+
+    fn encode(self) -> [u8; SSE_C_SEGMENT_NONCE_SCOPE_LEN] {
+        self.0.to_be_bytes()
     }
 }
 
@@ -216,13 +251,15 @@ pub fn prepare_sse_customer_write(
             encrypted_checksum_metadata: Vec::new(),
         }),
         dek,
+        segment_scope: SseCustomerSegmentScope::object(),
     })
 }
 
-pub fn resume_sse_customer_write(
+pub(crate) fn resume_sse_customer_write(
     validator: &SseCustomerValidatorConfig,
     state: &SseCustomerObjectState,
     request: &SseCustomerRequest,
+    segment_scope: SseCustomerSegmentScope,
 ) -> Result<SseCustomerWriteContext, ServerError> {
     validate_sse_customer_read(validator, state, request)?;
     let kek = derive_wrap_key(request.customer_key(), &state.wrap_salt)?;
@@ -231,6 +268,7 @@ pub fn resume_sse_customer_write(
         request: request.clone(),
         encryption: ObjectEncryption::SseCustomer(state.clone()),
         dek,
+        segment_scope,
     })
 }
 
@@ -251,10 +289,11 @@ pub fn validate_sse_customer_read(
     Ok(request.response_headers())
 }
 
-pub fn decrypt_sse_customer_segment(
+pub(crate) fn decrypt_sse_customer_segment(
     validator: &SseCustomerValidatorConfig,
     state: &SseCustomerObjectState,
     request: &SseCustomerRequest,
+    segment_scope: SseCustomerSegmentScope,
     segment_index: u32,
     ciphertext: &[u8],
     plaintext_len: usize,
@@ -262,7 +301,14 @@ pub fn decrypt_sse_customer_segment(
     validate_sse_customer_read(validator, state, request)?;
     let kek = derive_wrap_key(request.customer_key(), &state.wrap_salt)?;
     let dek = unwrap_dek(&kek, &state.wrap_nonce, &state.wrapped_dek)?;
-    decrypt_segment_with_dek(&dek, state, segment_index, ciphertext, plaintext_len)
+    decrypt_segment_with_dek(
+        &dek,
+        state,
+        segment_scope,
+        segment_index,
+        ciphertext,
+        plaintext_len,
+    )
 }
 
 pub fn decrypt_sse_customer_checksum(
@@ -367,6 +413,7 @@ fn unwrap_dek(
 fn encrypt_segment_with_dek(
     dek: &[u8; SSE_C_DEK_LEN],
     state: &SseCustomerObjectState,
+    segment_scope: SseCustomerSegmentScope,
     segment_index: u32,
     plaintext: &[u8],
 ) -> Result<Vec<u8>, ServerError> {
@@ -378,7 +425,7 @@ fn encrypt_segment_with_dek(
     let mut buf = plaintext.to_vec();
     sealing_key
         .seal_in_place_append_tag(
-            segment_nonce(state, segment_index),
+            segment_nonce(state, segment_scope, segment_index),
             aead::Aad::from(SSE_C_SEGMENT_AAD),
             &mut buf,
         )
@@ -391,6 +438,7 @@ fn encrypt_segment_with_dek(
 fn decrypt_segment_with_dek(
     dek: &[u8; SSE_C_DEK_LEN],
     state: &SseCustomerObjectState,
+    segment_scope: SseCustomerSegmentScope,
     segment_index: u32,
     ciphertext: &[u8],
     plaintext_len: usize,
@@ -403,7 +451,7 @@ fn decrypt_segment_with_dek(
     let mut buf = ciphertext.to_vec();
     let plaintext = opening_key
         .open_in_place(
-            segment_nonce(state, segment_index),
+            segment_nonce(state, segment_scope, segment_index),
             aead::Aad::from(SSE_C_SEGMENT_AAD),
             &mut buf,
         )
@@ -422,10 +470,17 @@ fn decrypt_segment_with_dek(
     Ok(plaintext.to_vec())
 }
 
-fn segment_nonce(state: &SseCustomerObjectState, segment_index: u32) -> aead::Nonce {
+fn segment_nonce(
+    state: &SseCustomerObjectState,
+    segment_scope: SseCustomerSegmentScope,
+    segment_index: u32,
+) -> aead::Nonce {
     let mut nonce = [0u8; 12];
     nonce[..SSE_C_SEGMENT_NONCE_PREFIX_LEN].copy_from_slice(&state.segment_nonce_prefix);
-    nonce[SSE_C_SEGMENT_NONCE_PREFIX_LEN..].copy_from_slice(&segment_index.to_be_bytes());
+    let scope_start = SSE_C_SEGMENT_NONCE_PREFIX_LEN;
+    let scope_end = scope_start + SSE_C_SEGMENT_NONCE_SCOPE_LEN;
+    nonce[scope_start..scope_end].copy_from_slice(&segment_scope.encode());
+    nonce[scope_end..].copy_from_slice(&segment_index.to_be_bytes());
     aead::Nonce::assume_unique_for_key(nonce)
 }
 
@@ -574,8 +629,16 @@ mod tests {
             panic!("expected SSE-C object state");
         };
         let ciphertext = ctx.encrypt_segment(3, b"hello world").unwrap();
-        let plaintext =
-            decrypt_sse_customer_segment(&validator, state, &req, 3, &ciphertext, 11).unwrap();
+        let plaintext = decrypt_sse_customer_segment(
+            &validator,
+            state,
+            &req,
+            SseCustomerSegmentScope::object(),
+            3,
+            &ciphertext,
+            11,
+        )
+        .unwrap();
         assert_eq!(plaintext, b"hello world");
     }
 
@@ -589,9 +652,69 @@ mod tests {
         };
         let ciphertext = ctx.encrypt_segment(0, b"abc").unwrap();
         let wrong = SseCustomerRequest::new([1u8; SSE_C_CUSTOMER_KEY_LEN], "wrong".to_string());
-        let err =
-            decrypt_sse_customer_segment(&validator, state, &wrong, 0, &ciphertext, 3).unwrap_err();
+        let err = decrypt_sse_customer_segment(
+            &validator,
+            state,
+            &wrong,
+            SseCustomerSegmentScope::object(),
+            0,
+            &ciphertext,
+            3,
+        )
+        .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn sse_c_multipart_nonce_scope_is_part_specific() {
+        let req = request();
+        let validator = validator();
+        let base_ctx = prepare_sse_customer_write(&validator, &req).unwrap();
+        let ObjectEncryption::SseCustomer(state) = base_ctx.encryption() else {
+            panic!("expected SSE-C object state");
+        };
+        let part1_ctx = resume_sse_customer_write(
+            &validator,
+            state,
+            &req,
+            SseCustomerSegmentScope::multipart_part(1).unwrap(),
+        )
+        .unwrap();
+        let part2_ctx = resume_sse_customer_write(
+            &validator,
+            state,
+            &req,
+            SseCustomerSegmentScope::multipart_part(2).unwrap(),
+        )
+        .unwrap();
+
+        let part1_ciphertext = part1_ctx.encrypt_segment(0, b"same-data").unwrap();
+        let part2_ciphertext = part2_ctx.encrypt_segment(0, b"same-data").unwrap();
+        assert_ne!(part1_ciphertext, part2_ciphertext);
+
+        let part1_plaintext = decrypt_sse_customer_segment(
+            &validator,
+            state,
+            &req,
+            SseCustomerSegmentScope::multipart_part(1).unwrap(),
+            0,
+            &part1_ciphertext,
+            9,
+        )
+        .unwrap();
+        assert_eq!(part1_plaintext, b"same-data");
+
+        let err = decrypt_sse_customer_segment(
+            &validator,
+            state,
+            &req,
+            SseCustomerSegmentScope::multipart_part(2).unwrap(),
+            0,
+            &part1_ciphertext,
+            9,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ServerError::InternalError { .. }));
     }
 
     #[test]

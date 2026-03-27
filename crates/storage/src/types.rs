@@ -302,7 +302,8 @@ pub const SSE_C_VALIDATOR_HMAC_LEN: usize = 32;
 pub const SSE_C_WRAP_SALT_LEN: usize = 16;
 pub const SSE_C_WRAP_NONCE_LEN: usize = 12;
 pub const SSE_C_WRAPPED_DEK_LEN: usize = 48;
-pub const SSE_C_SEGMENT_NONCE_PREFIX_LEN: usize = 8;
+pub const SSE_C_SEGMENT_NONCE_PREFIX_LEN: usize = 6;
+pub const SSE_C_SEGMENT_NONCE_SCOPE_LEN: usize = 2;
 pub const SSE_C_CHECKSUM_NONCE_LEN: usize = 12;
 
 /// Stored per-object `SSE-C` state.
@@ -320,7 +321,7 @@ pub struct SseCustomerObjectState {
 }
 
 impl SseCustomerObjectState {
-    const VERSION: u8 = 2;
+    const VERSION: u8 = 3;
     const FIXED_ENCODED_LEN: usize = 1
         + 4
         + SSE_C_VALIDATOR_SALT_LEN
