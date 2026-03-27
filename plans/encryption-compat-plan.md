@@ -23,23 +23,29 @@ This does not yet choose the final key-management architecture.
 ## Current Status
 
 Implemented:
+- SSE-C object encryption/decryption
+- SSE-C multipart, copy, POST, presigned, and object-attributes coverage
+- SSE-C checksum-metadata protection
+- SSE-C bucket-level gating subset
+- direct TLS support and HTTPS enforcement for SSE-C
 - transport/auth support needed to carry encryption headers through the HTTP layer
 
 Not implemented:
 - SSE-S3 object encryption/decryption
 - SSE-KMS object encryption/decryption
-- SSE-C object encryption/decryption
 - default bucket encryption
-- encryption-aware object attribute responses
 - encryption policy/enforcement behavior
 
+Partially implemented:
+- encryption-aware object attribute responses for SSE-C; broader SSE-S3/SSE-KMS
+  behavior remains open
+
 Known test surface still blocked on this work:
-- `encryption_sse_c.rs`
 - `encryption_kms.rs`
 - `encryption_s3.rs`
 - `encryption_kms_default.rs`
 - `policy_encryption.rs`
-- ignored encryption cases in `object_attributes.rs`
+- remaining non-SSE-C encryption cases in `object_attributes.rs`
 
 ## Compatibility Areas
 
@@ -81,9 +87,8 @@ writes, copy, multipart, and reporting APIs.
 
 1. SSE-S3 core object encryption model
 2. default bucket encryption on top of SSE-S3
-3. SSE-C compatibility surface
-4. SSE-KMS abstraction and compatibility
-5. encryption policy/enforcement tests
+3. SSE-KMS abstraction and compatibility
+4. encryption policy/enforcement tests
 
 ## Initial Design Defaults
 

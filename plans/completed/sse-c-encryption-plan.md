@@ -33,10 +33,8 @@ Important behavior from the AWS docs:
    server-side encryption, so the checksum-related metadata surface must be
    treated differently from ordinary unencrypted object metadata.
 2. Requests using `SSE-C` headers must use HTTPS. AWS rejects HTTP.
-   Temporary implementation note:
-   local integration testing may allow HTTP initially so the crypto/read-write
-   path can be exercised before HTTPS-only enforcement lands. Restoring the AWS
-   HTTPS requirement remains a deferred compatibility item before completion.
+   This is now implemented in Argmin via direct TLS support plus HTTP-edge
+   rejection of insecure SSE-C requests.
 3. The request header triad is:
    - `x-amz-server-side-encryption-customer-algorithm: AES256`
    - `x-amz-server-side-encryption-customer-key`
@@ -557,11 +555,13 @@ This work should include direct AWS verification for:
 9. Implement copy paths.
 10. Add bucket-level SSE-C blocking support.
 
-The ordered SSE-C implementation work above is now complete. Remaining follow-up
-work is:
+The ordered SSE-C implementation work above is now complete. Remaining
+follow-up work is outside the core SSE-C feature itself:
 
-1. extend bucket encryption support beyond the SSE-C block/unblock subset
-2. keep validating exact AWS behavior for edge-case error mappings
+1. broader bucket encryption compatibility beyond the SSE-C block/unblock
+   subset
+2. ongoing AWS conformance checking for edge-case error mappings as part of the
+   wider encryption compatibility surface
 
 ## Open Questions To Resolve Early
 

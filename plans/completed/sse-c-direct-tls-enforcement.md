@@ -34,18 +34,9 @@ This work is now implemented:
    has been updated to reflect direct TLS support and the current proxy
    out-of-scope boundary.
 
-## Current Gaps
-
-1. [`crates/argmin-s3/src/config.rs`](/home/justin/src/github.com/justincormack/argmin/crates/argmin-s3/src/config.rs)
-   has no TLS listener configuration.
-2. [`crates/argmin-s3/src/main.rs`](/home/justin/src/github.com/justincormack/argmin/crates/argmin-s3/src/main.rs)
-   only binds a plain `TcpListener`.
-3. [`crates/server-http/src/http/request.rs`](/home/justin/src/github.com/justincormack/argmin/crates/server-http/src/http/request.rs)
-   does not carry transport-security state.
-4. [`crates/server-http/src/http/mod.rs`](/home/justin/src/github.com/justincormack/argmin/crates/server-http/src/http/mod.rs)
-   parses SSE-C headers but cannot reject insecure transport.
-5. [`crates/s3-tests/src/server.rs`](/home/justin/src/github.com/justincormack/argmin/crates/s3-tests/src/server.rs)
-   only starts an HTTP test server.
+This plan is complete for its intended scope. Remaining future work, if needed,
+would be separate proxy-termination support with an explicit trust model rather
+than more direct-TLS enforcement work.
 
 ## Implementation Plan
 
