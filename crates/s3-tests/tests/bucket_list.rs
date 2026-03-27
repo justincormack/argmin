@@ -1717,10 +1717,7 @@ fn test_bucket_list_return_data() {
 // ── Anonymous access ────────────────────────────────────────────────
 
 fn anon_agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .build()
-        .new_agent()
+    s3_tests::test_agent()
 }
 
 #[test]

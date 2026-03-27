@@ -14,3 +14,6 @@ server-core = { path = "../server-core" }
 server-http = { path = "../server-http" }
 storage = { path = "../storage" }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros"] }
+tokio-rustls = "0.26"
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pemfile = "2"

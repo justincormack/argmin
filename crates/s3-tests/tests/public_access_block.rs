@@ -16,10 +16,7 @@ fn assert_canonical_owner_id(id: &str) {
 
 /// Build an agent that returns all HTTP responses (including 4xx/5xx) as Ok.
 fn agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .build()
-        .new_agent()
+    s3_tests::test_agent()
 }
 
 /// Cleanup helper.

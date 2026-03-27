@@ -39,6 +39,8 @@ The server is configured via environment variables:
 | `ARGMIN_ACCESS_KEY_ID` | *(required)* | S3 access key |
 | `ARGMIN_SECRET_ACCESS_KEY` | *(required)* | S3 secret key |
 | `ARGMIN_LISTEN_ADDR` | `127.0.0.1:9000` | Listen address |
+| `ARGMIN_TLS_CERT_PATH` | *(unset)* | PEM certificate path for direct HTTPS |
+| `ARGMIN_TLS_KEY_PATH` | *(unset)* | PEM private key path for direct HTTPS |
 | `ARGMIN_DATA_DIR` | `./data` | Data directory |
 | `ARGMIN_PG_COUNT` | `16` | Number of placement groups |
 | `ARGMIN_EC_K` | `4` | Erasure coding data shards |
@@ -51,6 +53,10 @@ The server is configured via environment variables:
 | `ARGMIN_TRACE` | `0` | Enable local tracing when truthy |
 | `ARGMIN_TRACE_FILTER` | *(all targets)* | Comma-separated trace target filter |
 | `ARGMIN_TRACE_FILE` | *(stderr)* | Write trace lines to a file instead of stderr |
+
+If both `ARGMIN_TLS_CERT_PATH` and `ARGMIN_TLS_KEY_PATH` are set, the server
+accepts direct HTTPS on `ARGMIN_LISTEN_ADDR`. Both variables must be set
+together.
 
 Start the server:
 
@@ -68,6 +74,16 @@ ARGMIN_SECRET_ACCESS_KEY=useasecuresecretkey \
 ARGMIN_TRACE=1 \
 ARGMIN_TRACE_FILTER=server_http,auth,server_core,storage,ec \
 ARGMIN_TRACE_FILE=/tmp/argmin.trace \
+  ./target/release/argmin-s3
+```
+
+Start the server with direct HTTPS:
+
+```bash
+ARGMIN_ACCESS_KEY_ID=admin \
+ARGMIN_SECRET_ACCESS_KEY=useasecuresecretkey \
+ARGMIN_TLS_CERT_PATH=/path/to/cert.pem \
+ARGMIN_TLS_KEY_PATH=/path/to/key.pem \
   ./target/release/argmin-s3
 ```
 

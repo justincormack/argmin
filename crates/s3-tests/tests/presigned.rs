@@ -3,7 +3,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;
 use ring::{digest, hmac};
-use s3_tests::{sse_c_header_values, test_sse_c_key, unique_bucket, CTX};
+use s3_tests::{
+    build_client_with_ca, build_test_agent, sse_c_header_values, test_sse_c_key, unique_bucket,
+    TestServer, CTX,
+};
 
 /// Create a bucket, returning its name.
 async fn setup_bucket() -> String {
@@ -15,10 +18,15 @@ async fn setup_bucket() -> String {
 
 /// Build an agent that returns all HTTP responses (including 4xx/5xx) as Ok.
 fn agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .build()
-        .new_agent()
+    s3_tests::test_agent()
+}
+
+fn is_external() -> bool {
+    std::env::var("S3_TEST_ENDPOINT").is_ok()
+}
+
+fn endpoint_is_https() -> bool {
+    CTX.endpoint().starts_with("https://")
 }
 
 macro_rules! with_presigned_headers {
@@ -280,6 +288,9 @@ fn test_presigned_put_object() {
 
 #[test]
 fn test_presigned_sse_c_put_object() {
+    if !endpoint_is_https() {
+        return;
+    }
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = setup_bucket().await;
@@ -329,6 +340,61 @@ fn test_presigned_sse_c_put_object() {
         assert_eq!(&data[..], body);
 
         cleanup(&bucket, &["uploaded-sse-c"]).await;
+    });
+}
+
+#[test]
+fn test_presigned_sse_c_put_requires_https() {
+    if is_external() && endpoint_is_https() {
+        return;
+    }
+    s3_tests::run(async {
+        let (_server, endpoint, client) = if is_external() {
+            (None, CTX.endpoint().to_string(), CTX.client().clone())
+        } else {
+            let server = TestServer::start_http().await;
+            let endpoint = server.endpoint().to_string();
+            let client = build_client_with_ca(
+                &endpoint,
+                s3_tests::server::TEST_ACCESS_KEY,
+                s3_tests::server::TEST_SECRET_KEY,
+                s3_tests::server::TEST_REGION,
+                None,
+            )
+            .await;
+            (Some(server), endpoint, client)
+        };
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let body = b"presigned insecure sse-c put";
+        let customer_key = test_sse_c_key();
+        let (key_b64, key_md5_b64) = sse_c_header_values(&customer_key);
+
+        let presign_config = PresigningConfig::expires_in(Duration::from_secs(900)).unwrap();
+        let presigned = client
+            .put_object()
+            .bucket(&bucket)
+            .key("uploaded-sse-c-http")
+            .sse_customer_algorithm("AES256")
+            .sse_customer_key(key_b64)
+            .sse_customer_key_md5(key_md5_b64)
+            .presigned(presign_config)
+            .await
+            .unwrap();
+
+        let agent = build_test_agent(&endpoint, None);
+        let mut resp = with_presigned_headers!(agent.put(presigned.uri()), presigned)
+            .send(&body[..])
+            .expect("transport error");
+        assert_eq!(resp.status().as_u16(), 400);
+        let body = resp.body_mut().read_to_string().unwrap_or_default();
+        assert!(
+            body.contains("<Code>InvalidArgument</Code>"),
+            "expected InvalidArgument, got {body}"
+        );
+
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
 }
 
@@ -503,6 +569,9 @@ fn test_presigned_head_object() {
 
 #[test]
 fn test_presigned_sse_c_get_object() {
+    if !endpoint_is_https() {
+        return;
+    }
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = setup_bucket().await;
@@ -557,6 +626,9 @@ fn test_presigned_sse_c_get_object() {
 
 #[test]
 fn test_presigned_sse_c_get_requires_signed_headers() {
+    if !endpoint_is_https() {
+        return;
+    }
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = setup_bucket().await;
@@ -601,6 +673,9 @@ fn test_presigned_sse_c_get_requires_signed_headers() {
 
 #[test]
 fn test_presigned_sse_c_head_object() {
+    if !endpoint_is_https() {
+        return;
+    }
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = setup_bucket().await;

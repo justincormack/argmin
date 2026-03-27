@@ -12,6 +12,8 @@ pub use server::TestServer;
 use std::sync::LazyLock;
 
 use aws_sdk_s3::Client;
+use aws_smithy_http_client::tls::{rustls_provider::CryptoMode, Provider, TlsContext, TrustStore};
+use ureq::tls::{Certificate, RootCerts, TlsConfig, TlsProvider};
 
 /// Shared tokio runtime for all tests in a binary.
 ///
@@ -100,18 +102,20 @@ impl TestContext {
             // Local server mode
             let server = TestServer::start().await;
             let endpoint = server.endpoint().to_string();
-            let client = build_client(
+            let client = build_client_with_ca(
                 &endpoint,
                 server::TEST_ACCESS_KEY,
                 server::TEST_SECRET_KEY,
                 server::TEST_REGION,
+                server.tls_ca_pem(),
             )
             .await;
-            let alt_client = build_client(
+            let alt_client = build_client_with_ca(
                 &endpoint,
                 server::ALT_ACCESS_KEY,
                 server::ALT_SECRET_KEY,
                 server::TEST_REGION,
+                server.tls_ca_pem(),
             )
             .await;
             TestContext {
@@ -158,6 +162,16 @@ impl TestContext {
 }
 
 async fn build_client(endpoint: &str, access_key: &str, secret_key: &str, region: &str) -> Client {
+    build_client_with_ca(endpoint, access_key, secret_key, region, None).await
+}
+
+pub async fn build_client_with_ca(
+    endpoint: &str,
+    access_key: &str,
+    secret_key: &str,
+    region: &str,
+    tls_ca_pem: Option<&[u8]>,
+) -> Client {
     use std::time::Duration;
 
     let creds = aws_credential_types::Credentials::new(
@@ -175,17 +189,48 @@ async fn build_client(endpoint: &str, access_key: &str, secret_key: &str, region
         .operation_attempt_timeout(Duration::from_secs(timeout_secs))
         .build();
 
-    let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+    let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .credentials_provider(creds)
         .region(aws_config::Region::new(region.to_string()))
         .endpoint_url(endpoint)
-        .timeout_config(timeout_config)
-        .load()
-        .await;
+        .timeout_config(timeout_config);
+    if let Some(tls_ca_pem) = tls_ca_pem.filter(|_| endpoint.starts_with("https://")) {
+        let tls_context = TlsContext::builder()
+            .with_trust_store(TrustStore::empty().with_pem_certificate(tls_ca_pem))
+            .build()
+            .expect("valid custom trust store");
+        let http_client = aws_smithy_http_client::Builder::new()
+            .tls_provider(Provider::Rustls(CryptoMode::Ring))
+            .tls_context(tls_context)
+            .build_https();
+        loader = loader.http_client(http_client);
+    }
+    let config = loader.load().await;
 
     let s3_config = aws_sdk_s3::config::Builder::from(&config)
         .force_path_style(true)
         .build();
 
     Client::from_conf(s3_config)
+}
+
+pub fn test_agent() -> ureq::Agent {
+    build_test_agent(
+        CTX.endpoint(),
+        CTX._server.as_ref().and_then(TestServer::tls_ca_pem),
+    )
+}
+
+pub fn build_test_agent(endpoint: &str, tls_ca_pem: Option<&[u8]>) -> ureq::Agent {
+    let mut builder = ureq::config::Config::builder().http_status_as_error(false);
+    if let Some(tls_ca_pem) = tls_ca_pem.filter(|_| endpoint.starts_with("https://")) {
+        let cert = Certificate::from_pem(tls_ca_pem).expect("valid test TLS PEM");
+        builder = builder.tls_config(
+            TlsConfig::builder()
+                .provider(TlsProvider::Rustls)
+                .root_certs(RootCerts::from([cert]))
+                .build(),
+        );
+    }
+    builder.build().new_agent()
 }

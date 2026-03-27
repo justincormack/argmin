@@ -7,6 +7,10 @@ use s3_tests::{
     assert_s3_err_code, err_status, sse_c_header_values, test_sse_c_key, unique_bucket, CTX,
 };
 
+fn endpoint_is_https() -> bool {
+    CTX.endpoint().starts_with("https://")
+}
+
 macro_rules! with_sse_c_headers {
     ($op:expr, $key_b64:expr, $key_md5_b64:expr) => {{
         $op.customize().mutate_request({
@@ -151,6 +155,9 @@ fn test_put_get_bucket_encryption_blocks_and_unblocks_sse_c() {
 
 #[test]
 fn test_bucket_encryption_blocks_sse_c_put_object() {
+    if !endpoint_is_https() {
+        return;
+    }
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
@@ -186,6 +193,9 @@ fn test_bucket_encryption_blocks_sse_c_put_object() {
 
 #[test]
 fn test_bucket_encryption_blocks_sse_c_create_multipart_upload() {
+    if !endpoint_is_https() {
+        return;
+    }
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
@@ -217,6 +227,9 @@ fn test_bucket_encryption_blocks_sse_c_create_multipart_upload() {
 
 #[test]
 fn test_bucket_encryption_does_not_block_existing_sse_c_reads() {
+    if !endpoint_is_https() {
+        return;
+    }
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();

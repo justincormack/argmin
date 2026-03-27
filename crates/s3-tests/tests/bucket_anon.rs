@@ -4,10 +4,7 @@ use s3_tests::{unique_bucket, CTX};
 
 /// Build an agent that returns all HTTP responses (including 4xx/5xx) as Ok.
 fn agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .build()
-        .new_agent()
+    s3_tests::test_agent()
 }
 
 fn is_external() -> bool {

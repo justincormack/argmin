@@ -94,10 +94,7 @@ fn normalize_query(raw: &str) -> String {
 }
 
 fn send_signed_post(url_str: &str, body: &[u8], extra_headers: &[(&str, &str)]) -> (u16, String) {
-    let agent = ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .build()
-        .new_agent();
+    let agent = s3_tests::test_agent();
     let parsed = url::Url::parse(url_str).expect("parse URL");
     let path = parsed.path();
     let query = normalize_query(parsed.query().unwrap_or(""));

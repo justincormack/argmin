@@ -2,7 +2,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ring::hmac;
 use s3_tests::{
-    assert_s3_err_code, err_status, sse_c_header_values, test_sse_c_key, unique_bucket, CTX,
+    assert_s3_err_code, build_client_with_ca, build_test_agent, err_status, sse_c_header_values,
+    test_sse_c_key, unique_bucket, TestServer, CTX,
 };
 
 /// Create a bucket, returning its name.
@@ -15,14 +16,15 @@ async fn setup_bucket() -> String {
 
 /// Build an agent that returns all HTTP responses (including 4xx/5xx) as Ok.
 fn agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .build()
-        .new_agent()
+    s3_tests::test_agent()
 }
 
 fn is_external() -> bool {
     std::env::var("S3_TEST_ENDPOINT").is_ok()
+}
+
+fn endpoint_is_https() -> bool {
+    CTX.endpoint().starts_with("https://")
 }
 
 /// Derive the SigV4 signing key.
@@ -237,10 +239,28 @@ fn post_object(
     file_data: &[u8],
     file_name: &str,
 ) -> (u16, String) {
-    let url = format!("{}/{}", CTX.endpoint(), bucket);
+    post_object_to_endpoint(
+        CTX.endpoint(),
+        &agent(),
+        bucket,
+        fields,
+        file_data,
+        file_name,
+    )
+}
+
+fn post_object_to_endpoint(
+    endpoint: &str,
+    agent: &ureq::Agent,
+    bucket: &str,
+    fields: &[(&str, &str)],
+    file_data: &[u8],
+    file_name: &str,
+) -> (u16, String) {
+    let url = format!("{}/{}", endpoint, bucket);
     let (content_type, body) = build_multipart(fields, file_data, file_name);
 
-    let mut resp = agent()
+    let mut resp = agent
         .post(&url)
         .header("Content-Type", &content_type)
         .send(&body[..])
@@ -302,6 +322,9 @@ fn test_post_object_authenticated_request() {
 
 #[test]
 fn test_post_object_sse_c_round_trip() {
+    if !endpoint_is_https() {
+        return;
+    }
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = setup_bucket().await;
@@ -380,7 +403,81 @@ fn test_post_object_sse_c_round_trip() {
 }
 
 #[test]
+fn test_post_object_sse_c_requires_https() {
+    if is_external() && endpoint_is_https() {
+        return;
+    }
+    s3_tests::run(async {
+        let (_server, endpoint, client) = if is_external() {
+            (None, CTX.endpoint().to_string(), CTX.client().clone())
+        } else {
+            let server = TestServer::start_http().await;
+            let endpoint = server.endpoint().to_string();
+            let client = build_client_with_ca(
+                &endpoint,
+                s3_tests::server::TEST_ACCESS_KEY,
+                s3_tests::server::TEST_SECRET_KEY,
+                s3_tests::server::TEST_REGION,
+                None,
+            )
+            .await;
+            (Some(server), endpoint, client)
+        };
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let key = "post-sse-c-http";
+        let file_data = b"insecure post sse-c";
+        let customer_key = test_sse_c_key();
+        let (key_b64, key_md5_b64) = sse_c_header_values(&customer_key);
+
+        let mut fields = sigv4_fields(
+            &bucket,
+            key,
+            &[
+                serde_json::json!({"x-amz-server-side-encryption-customer-algorithm": "AES256"}),
+                serde_json::json!({"x-amz-server-side-encryption-customer-key": &key_b64}),
+                serde_json::json!({"x-amz-server-side-encryption-customer-key-md5": &key_md5_b64}),
+            ],
+        );
+        fields.push((
+            "x-amz-server-side-encryption-customer-algorithm".to_string(),
+            "AES256".to_string(),
+        ));
+        fields.push((
+            "x-amz-server-side-encryption-customer-key".to_string(),
+            key_b64,
+        ));
+        fields.push((
+            "x-amz-server-side-encryption-customer-key-md5".to_string(),
+            key_md5_b64,
+        ));
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+
+        let agent = build_test_agent(&endpoint, None);
+        let (status, body) = post_object_to_endpoint(
+            &endpoint,
+            &agent,
+            &bucket,
+            &field_refs,
+            file_data,
+            "test.txt",
+        );
+        assert_eq!(status, 400, "expected 400, got {} body={}", status, body);
+        assert_error_code(&body, "InvalidArgument");
+
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
 fn test_post_object_sse_c_requires_complete_form_fields() {
+    if !endpoint_is_https() {
+        return;
+    }
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = setup_bucket().await;

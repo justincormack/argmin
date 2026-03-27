@@ -13,10 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 // ── Helpers ─────────────────────────────────────────────────────────────
 
 fn agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .build()
-        .new_agent()
+    s3_tests::test_agent()
 }
 
 async fn setup_bucket() -> String {

@@ -15,8 +15,9 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use md5_legacy::Digest;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
+use tokio_rustls::TlsAcceptor;
 
-use super::request::{S3Request, MAX_BUFFERED_CONTROL_BODY_SIZE};
+use super::request::{S3Request, TransportSecurity, MAX_BUFFERED_CONTROL_BODY_SIZE};
 use super::response::S3Response;
 use super::router::{route, S3Operation};
 use super::s3_response_to_hyper;
@@ -146,8 +147,9 @@ enum StreamingWriteOp {
 
 /// Tunable timeouts for the HTTP serve layer.
 pub struct ServeConfig {
-    /// Time allowed for a client to send request headers. Also serves as the
-    /// idle timeout between keep-alive requests.
+    /// Time allowed for TLS handshake completion and for a client to send
+    /// request headers. Also serves as the idle timeout between keep-alive
+    /// requests.
     pub header_read_timeout: Duration,
     /// Time a request will wait for a processing slot before being shed with
     /// 503 `SlowDown`.
@@ -303,6 +305,44 @@ pub async fn serve(
     max_inflight_requests: u32,
     config: ServeConfig,
 ) {
+    serve_plain_or_tls(
+        listener,
+        frontends,
+        max_connections,
+        max_inflight_requests,
+        config,
+        None,
+    )
+    .await;
+}
+
+pub async fn serve_tls(
+    listener: TcpListener,
+    tls_acceptor: TlsAcceptor,
+    frontends: Vec<HttpFrontend>,
+    max_connections: u32,
+    max_inflight_requests: u32,
+    config: ServeConfig,
+) {
+    serve_plain_or_tls(
+        listener,
+        frontends,
+        max_connections,
+        max_inflight_requests,
+        config,
+        Some(tls_acceptor),
+    )
+    .await;
+}
+
+async fn serve_plain_or_tls(
+    listener: TcpListener,
+    frontends: Vec<HttpFrontend>,
+    max_connections: u32,
+    max_inflight_requests: u32,
+    config: ServeConfig,
+    tls_acceptor: Option<TlsAcceptor>,
+) {
     assert!(!frontends.is_empty(), "at least one frontend required");
 
     let header_read_timeout = config.header_read_timeout;
@@ -339,28 +379,65 @@ pub async fn serve(
         }
 
         let state = Arc::clone(&state);
+        let tls_acceptor = tls_acceptor.clone();
         tokio::spawn(async move {
             let _conn_permit = conn_permit;
-            let io = TokioIo::new(stream);
-
-            // header_read_timeout doubles as the idle timeout between
-            // keep-alive requests: after sending a response, hyper waits
-            // for the next request's headers and closes the connection if
-            // none arrive within the timeout. This releases the connection
-            // permit without killing active transfers.
-            let _ = http1::Builder::new()
-                .timer(TokioTimer::new())
-                .header_read_timeout(header_read_timeout)
-                .serve_connection(
-                    io,
-                    service_fn(move |req: Request<Incoming>| {
-                        let state = Arc::clone(&state);
-                        async move { handle(state, req).await }
-                    }),
-                )
-                .await;
+            match tls_acceptor {
+                Some(acceptor) => {
+                    match tokio::time::timeout(header_read_timeout, acceptor.accept(stream)).await {
+                        Ok(Ok(tls_stream)) => {
+                            serve_connection(
+                                Arc::clone(&state),
+                                TokioIo::new(tls_stream),
+                                header_read_timeout,
+                                TransportSecurity::Tls,
+                            )
+                            .await;
+                        }
+                        Ok(Err(e)) => {
+                            eprintln!("tls handshake error: {e}");
+                        }
+                        Err(_) => {
+                            eprintln!(
+                                "tls handshake timeout after {} ms",
+                                header_read_timeout.as_millis()
+                            );
+                        }
+                    }
+                }
+                None => {
+                    serve_connection(
+                        Arc::clone(&state),
+                        TokioIo::new(stream),
+                        header_read_timeout,
+                        TransportSecurity::InsecureHttp,
+                    )
+                    .await;
+                }
+            }
         });
     }
+}
+
+async fn serve_connection<IO>(
+    state: Arc<ServerState>,
+    io: TokioIo<IO>,
+    header_read_timeout: Duration,
+    transport_security: TransportSecurity,
+) where
+    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let _ = http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(header_read_timeout)
+        .serve_connection(
+            io,
+            service_fn(move |req: Request<Incoming>| {
+                let state = Arc::clone(&state);
+                async move { handle(state, req, transport_security).await }
+            }),
+        )
+        .await;
 }
 
 /// Handle a single HTTP request: parse, route streaming writes, or buffer body
@@ -374,6 +451,7 @@ pub async fn serve(
 async fn handle(
     state: Arc<ServerState>,
     req: Request<Incoming>,
+    transport_security: TransportSecurity,
 ) -> Result<http::Response<S3HyperBody>, Infallible> {
     let trace = observability::TraceContext::new_request();
     let method = req.method().to_string();
@@ -418,7 +496,7 @@ async fn handle(
 
     // Check if this request should use the streaming write path.
     if let Some(op) = is_streaming_write(&parts) {
-        let s3req = match S3Request::from_hyper_headers(parts) {
+        let s3req = match S3Request::from_hyper_headers(parts, transport_security) {
             Ok(req) => req,
             Err(err) => {
                 return Ok(s3_response_to_hyper(
@@ -482,7 +560,7 @@ async fn handle(
     }
 
     if let Some(bucket) = post_object_bucket(&parts) {
-        let s3req = match S3Request::from_hyper_headers(parts) {
+        let s3req = match S3Request::from_hyper_headers(parts, transport_security) {
             Ok(req) => req,
             Err(err) => {
                 return Ok(s3_response_to_hyper(
@@ -518,7 +596,7 @@ async fn handle(
         }
     };
 
-    let s3req = match S3Request::from_hyper(parts, body_bytes) {
+    let s3req = match S3Request::from_hyper(parts, body_bytes, transport_security) {
         Ok(req) => req,
         Err(err) => {
             return Ok(s3_response_to_hyper(
@@ -2620,7 +2698,8 @@ mod tests {
     }
 
     fn make_s3req(method: &str, uri: &str, headers: &[(&str, &str)]) -> S3Request {
-        S3Request::from_hyper_headers(make_parts(method, uri, headers)).unwrap()
+        S3Request::from_hyper_headers(make_parts(method, uri, headers), TransportSecurity::Tls)
+            .unwrap()
     }
 
     #[test]

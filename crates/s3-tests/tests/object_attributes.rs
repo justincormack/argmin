@@ -9,6 +9,10 @@ use s3_tests::{
 
 const PART_SIZE: usize = 5 * 1024 * 1024; // 5 MB minimum part size
 
+fn endpoint_is_https() -> bool {
+    CTX.endpoint().starts_with("https://")
+}
+
 macro_rules! with_sse_c_headers {
     ($op:expr, $key_b64:expr, $key_md5_b64:expr) => {{
         $op.customize().mutate_request({
@@ -254,6 +258,9 @@ fn test_get_checksum_object_attributes() {
 
 #[test]
 fn test_get_sse_c_encrypted_object_attributes() {
+    if !endpoint_is_https() {
+        return;
+    }
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
@@ -298,6 +305,9 @@ fn test_get_sse_c_encrypted_object_attributes() {
 
 #[test]
 fn test_get_sse_c_object_attributes_requires_headers() {
+    if !endpoint_is_https() {
+        return;
+    }
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
@@ -336,6 +346,9 @@ fn test_get_sse_c_object_attributes_requires_headers() {
 
 #[test]
 fn test_get_sse_c_object_attributes_rejects_wrong_key() {
+    if !endpoint_is_https() {
+        return;
+    }
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
@@ -380,6 +393,9 @@ fn test_get_sse_c_object_attributes_rejects_wrong_key() {
 
 #[test]
 fn test_get_sse_c_checksum_object_attributes() {
+    if !endpoint_is_https() {
+        return;
+    }
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();

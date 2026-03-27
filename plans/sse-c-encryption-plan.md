@@ -560,10 +560,8 @@ This work should include direct AWS verification for:
 The ordered SSE-C implementation work above is now complete. Remaining follow-up
 work is:
 
-1. enforce HTTPS-only SSE-C requests
-   - tracked in [`plans/sse-c-direct-tls-enforcement.md`](/home/justin/src/github.com/justincormack/argmin/plans/sse-c-direct-tls-enforcement.md)
-2. extend bucket encryption support beyond the SSE-C block/unblock subset
-3. keep validating exact AWS behavior for edge-case error mappings
+1. extend bucket encryption support beyond the SSE-C block/unblock subset
+2. keep validating exact AWS behavior for edge-case error mappings
 
 ## Open Questions To Resolve Early
 

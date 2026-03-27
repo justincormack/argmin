@@ -38,7 +38,7 @@ use conditional::{
     write_condition_from_headers,
 };
 use md5_legacy::Digest;
-use request::S3Request;
+use request::{S3Request, TransportSecurity};
 use response::S3Response;
 use router::{route, S3Operation};
 use s3_types::VersionId;
@@ -2201,7 +2201,8 @@ impl HttpFrontend {
         } else {
             None
         };
-        let sse_customer_request = parse_sse_customer_form_fields(form_fields)?;
+        let sse_customer_request =
+            parse_sse_customer_form_fields(req.transport_security, form_fields)?;
         let sse_customer = self
             .coordinator
             .prepare_sse_customer_write_context(sse_customer_request.as_ref())?;
@@ -3109,6 +3110,7 @@ fn parse_sse_customer_request_with_names(
     else {
         return Ok(None);
     };
+    require_secure_transport_for_sse_c(req.transport_security)?;
     if !algorithm.eq_ignore_ascii_case(SSE_CUSTOMER_ALGORITHM) {
         return Err(ServerError::InvalidArgument {
             reason: format!(
@@ -3176,6 +3178,7 @@ fn parse_form_field_once<'a>(
 }
 
 fn parse_sse_customer_form_fields(
+    transport_security: TransportSecurity,
     form_fields: &[(String, String)],
 ) -> Result<Option<SseCustomerRequest>, ServerError> {
     use base64::Engine;
@@ -3189,6 +3192,7 @@ fn parse_sse_customer_form_fields(
     else {
         return Ok(None);
     };
+    require_secure_transport_for_sse_c(transport_security)?;
     if !algorithm.eq_ignore_ascii_case(SSE_CUSTOMER_ALGORITHM) {
         return Err(ServerError::InvalidArgument {
             reason: format!(
@@ -3274,6 +3278,18 @@ fn require_complete_sse_customer_fields<'a>(
         customer_key.expect("checked above"),
         customer_key_md5.expect("checked above"),
     )))
+}
+
+fn require_secure_transport_for_sse_c(
+    transport_security: TransportSecurity,
+) -> Result<(), ServerError> {
+    if transport_security.is_secure() {
+        Ok(())
+    } else {
+        Err(ServerError::InvalidArgument {
+            reason: "Requests specifying Server Side Encryption with Customer provided keys must be made over a secure connection.".to_string(),
+        })
+    }
 }
 
 fn apply_sse_customer_write_response_headers(

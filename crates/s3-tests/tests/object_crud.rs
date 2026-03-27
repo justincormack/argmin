@@ -12,10 +12,7 @@ async fn setup_bucket() -> String {
 }
 
 fn agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .build()
-        .new_agent()
+    s3_tests::test_agent()
 }
 
 fn sha256_hex(data: &[u8]) -> String {

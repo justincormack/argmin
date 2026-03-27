@@ -3,6 +3,8 @@
 #[derive(Debug, Clone)]
 pub(crate) struct ServerConfig {
     pub(crate) listen_addr: String,
+    pub(crate) tls_cert_path: Option<String>,
+    pub(crate) tls_key_path: Option<String>,
     pub(crate) data_dir: String,
     pub(crate) pg_count: u32,
     pub(crate) ec_k: u8,
@@ -23,6 +25,7 @@ impl ServerConfig {
     /// Required: `ARGMIN_ACCESS_KEY_ID`, `ARGMIN_SECRET_ACCESS_KEY`
     /// Optional (with defaults):
     ///   `ARGMIN_LISTEN_ADDR` (127.0.0.1:9000)
+    ///   `ARGMIN_TLS_CERT_PATH` / `ARGMIN_TLS_KEY_PATH` (unset)
     ///   `ARGMIN_DATA_DIR` (./data)
     ///   `ARGMIN_PG_COUNT` (16)
     ///   `ARGMIN_EC_K` (4)
@@ -46,6 +49,8 @@ impl ServerConfig {
         let sse_c_validator_key_b64 = get("ARGMIN_SSE_C_VALIDATOR_KEY");
 
         let listen_addr = get("ARGMIN_LISTEN_ADDR").unwrap_or_else(|| "127.0.0.1:9000".to_string());
+        let tls_cert_path = get("ARGMIN_TLS_CERT_PATH");
+        let tls_key_path = get("ARGMIN_TLS_KEY_PATH");
         let data_dir = get("ARGMIN_DATA_DIR").unwrap_or_else(|| "./data".to_string());
         let pg_count: u32 = get("ARGMIN_PG_COUNT")
             .unwrap_or_else(|| "16".to_string())
@@ -92,9 +97,24 @@ impl ServerConfig {
         if stream_read_chunk_size == 0 {
             return Err("ARGMIN_STREAM_READ_CHUNK_SIZE must be > 0".to_string());
         }
+        match (&tls_cert_path, &tls_key_path) {
+            (Some(_), None) => {
+                return Err(
+                    "ARGMIN_TLS_KEY_PATH is required when ARGMIN_TLS_CERT_PATH is set".to_string(),
+                )
+            }
+            (None, Some(_)) => {
+                return Err(
+                    "ARGMIN_TLS_CERT_PATH is required when ARGMIN_TLS_KEY_PATH is set".to_string(),
+                )
+            }
+            _ => {}
+        }
 
         Ok(Self {
             listen_addr,
+            tls_cert_path,
+            tls_key_path,
             data_dir,
             pg_count,
             ec_k,
@@ -155,6 +175,8 @@ mod tests {
         let m = required_only();
         let cfg = ServerConfig::from_lookup(lookup(&m)).unwrap();
         assert_eq!(cfg.listen_addr, "127.0.0.1:9000");
+        assert_eq!(cfg.tls_cert_path, None);
+        assert_eq!(cfg.tls_key_path, None);
         assert_eq!(cfg.data_dir, "./data");
         assert_eq!(cfg.pg_count, 16);
         assert_eq!(cfg.ec_k, 4);
@@ -179,6 +201,8 @@ mod tests {
             ("ARGMIN_SECRET_ACCESS_KEY", "mysecret"),
             ("ARGMIN_SSE_C_VALIDATOR_KEY", "Zm9v"),
             ("ARGMIN_LISTEN_ADDR", "0.0.0.0:8080"),
+            ("ARGMIN_TLS_CERT_PATH", "/tmp/cert.pem"),
+            ("ARGMIN_TLS_KEY_PATH", "/tmp/key.pem"),
             ("ARGMIN_DATA_DIR", "/tmp/storage"),
             ("ARGMIN_PG_COUNT", "32"),
             ("ARGMIN_EC_K", "8"),
@@ -187,6 +211,8 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(cfg.listen_addr, "0.0.0.0:8080");
+        assert_eq!(cfg.tls_cert_path.as_deref(), Some("/tmp/cert.pem"));
+        assert_eq!(cfg.tls_key_path.as_deref(), Some("/tmp/key.pem"));
         assert_eq!(cfg.data_dir, "/tmp/storage");
         assert_eq!(cfg.pg_count, 32);
         assert_eq!(cfg.ec_k, 8);

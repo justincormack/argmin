@@ -23,11 +23,25 @@ fn validate_content_length(value: &str) -> Result<u64, ServerError> {
 }
 
 /// Parsed S3 request data extracted from an HTTP request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransportSecurity {
+    InsecureHttp,
+    Tls,
+}
+
+impl TransportSecurity {
+    #[must_use]
+    pub fn is_secure(self) -> bool {
+        matches!(self, Self::Tls)
+    }
+}
+
 pub struct S3Request {
     pub method: http::Method,
     pub uri: http::Uri,
     pub headers: http::HeaderMap,
     pub body: Vec<u8>,
+    pub transport_security: TransportSecurity,
 }
 
 pub(crate) struct RequestHeaderSource<'a>(&'a http::HeaderMap);
@@ -58,6 +72,7 @@ impl S3Request {
     pub fn from_hyper(
         parts: http::request::Parts,
         body: bytes::Bytes,
+        transport_security: TransportSecurity,
     ) -> Result<Self, ServerError> {
         let method = parts.method;
         let uri = parts.uri;
@@ -86,6 +101,7 @@ impl S3Request {
             uri,
             headers,
             body,
+            transport_security,
         })
     }
 
@@ -94,8 +110,11 @@ impl S3Request {
     /// Used by the streaming write path where the body is consumed frame-by-frame
     /// rather than collected upfront. Auth works because the `x-amz-content-sha256`
     /// header provides the body hash (typically `UNSIGNED-PAYLOAD`).
-    pub fn from_hyper_headers(parts: http::request::Parts) -> Result<Self, ServerError> {
-        Self::from_hyper(parts, bytes::Bytes::new())
+    pub fn from_hyper_headers(
+        parts: http::request::Parts,
+        transport_security: TransportSecurity,
+    ) -> Result<Self, ServerError> {
+        Self::from_hyper(parts, bytes::Bytes::new(), transport_security)
     }
 
     /// Get a header value by lowercase name.
@@ -182,6 +201,7 @@ impl S3Request {
             uri: self.uri.clone(),
             headers,
             body,
+            transport_security: self.transport_security,
         }
     }
 
@@ -224,6 +244,25 @@ impl S3Request {
         headers: http::HeaderMap,
         body: Vec<u8>,
     ) -> Self {
+        Self::new_for_test_with_transport(
+            method,
+            path,
+            query_string,
+            headers,
+            body,
+            TransportSecurity::Tls,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test_with_transport(
+        method: http::Method,
+        path: &str,
+        query_string: &str,
+        headers: http::HeaderMap,
+        body: Vec<u8>,
+        transport_security: TransportSecurity,
+    ) -> Self {
         let path = if path.is_empty() { "/" } else { path };
         let uri = if query_string.is_empty() {
             path.to_string()
@@ -235,6 +274,7 @@ impl S3Request {
             uri: uri.parse().expect("test URI should be valid"),
             headers,
             body,
+            transport_security,
         }
     }
 }
@@ -608,7 +648,8 @@ mod tests {
             .unwrap()
             .into_parts();
         parts.headers = headers;
-        let req = S3Request::from_hyper(parts, bytes::Bytes::new()).unwrap();
+        let req =
+            S3Request::from_hyper(parts, bytes::Bytes::new(), TransportSecurity::Tls).unwrap();
         assert_eq!(req.header("x-amz-meta-tag"), Some("caf\u{e9}"));
     }
 
@@ -631,7 +672,7 @@ mod tests {
             .unwrap()
             .into_parts();
         parts.headers = headers;
-        match S3Request::from_hyper(parts, bytes::Bytes::new()) {
+        match S3Request::from_hyper(parts, bytes::Bytes::new(), TransportSecurity::Tls) {
             Err(ServerError::InvalidRequest { reason }) => {
                 assert!(
                     reason.contains("invalid UTF-8") && reason.contains("x-amz-meta-raw"),

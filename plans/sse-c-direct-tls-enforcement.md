@@ -17,6 +17,23 @@ AWS requires `SSE-C` requests to use HTTPS because the customer key is sent in
 request headers or form fields. Our current server only speaks plain HTTP, so
 we cannot enforce this compatibility requirement yet.
 
+## Current Status
+
+This work is now implemented:
+
+1. `argmin-s3` supports direct TLS with `ARGMIN_TLS_CERT_PATH` and
+   `ARGMIN_TLS_KEY_PATH`.
+2. `S3Request` carries typed transport security state.
+3. SSE-C request parsing rejects insecure HTTP for header, copy-source, and
+   POST-form SSE-C entry points.
+4. The local `s3-tests` harness runs over HTTPS by default with a dedicated
+   test CA and an explicit HTTP mode for negative tests.
+5. Integration coverage exists for HTTPS success and HTTP rejection on SSE-C
+   `PUT`, `GET`, `HEAD`, `POST Object`, and presigned requests.
+6. [`guides/threat_model.md`](/home/justin/src/github.com/justincormack/argmin/guides/threat_model.md)
+   has been updated to reflect direct TLS support and the current proxy
+   out-of-scope boundary.
+
 ## Current Gaps
 
 1. [`crates/argmin-s3/src/config.rs`](/home/justin/src/github.com/justincormack/argmin/crates/argmin-s3/src/config.rs)
