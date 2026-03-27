@@ -6,6 +6,7 @@ use storage::{
     SSE_C_SEGMENT_NONCE_PREFIX_LEN, SSE_C_SEGMENT_NONCE_SCOPE_LEN, SSE_C_VALIDATOR_HMAC_LEN,
     SSE_C_VALIDATOR_SALT_LEN, SSE_C_WRAPPED_DEK_LEN, SSE_C_WRAP_NONCE_LEN, SSE_C_WRAP_SALT_LEN,
 };
+use subtle::ConstantTimeEq;
 
 use crate::error::ServerError;
 use crate::system_metadata::ObjectChecksumMetadata;
@@ -283,7 +284,7 @@ pub fn validate_sse_customer_read(
         });
     }
     let actual = compute_validator_hmac(validator, &state.validator_salt, request.customer_key());
-    if state.validator_hmac != actual {
+    if !constant_time_eq(&state.validator_hmac, &actual) {
         return Err(ServerError::AccessDenied);
     }
     Ok(request.response_headers())
@@ -338,6 +339,13 @@ fn compute_validator_hmac(
     tag.as_ref()
         .try_into()
         .expect("HMAC-SHA256 output length should be 32 bytes")
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.ct_eq(b).into()
 }
 
 fn derive_wrap_key(

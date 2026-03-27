@@ -21,6 +21,8 @@ pub mod post;
 pub mod request;
 pub mod sigv4;
 
+use subtle::ConstantTimeEq;
+
 pub(crate) const MAX_ACCESS_KEY_ID_LEN: usize = 128;
 pub(crate) const MAX_SESSION_TOKEN_LEN: usize = 4096;
 pub(crate) const MAX_AUTHORIZATION_HEADER_LEN: usize = 8192;
@@ -39,13 +41,7 @@ pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    // XOR each byte pair; accumulate into `diff`. If any byte differs,
-    // diff will be non-zero, but the loop always runs to completion.
-    let diff = a
-        .iter()
-        .zip(b.iter())
-        .fold(0u8, |acc, (&x, &y)| acc | (x ^ y));
-    diff == 0
+    a.ct_eq(b).into()
 }
 
 pub(crate) fn is_lower_hex(value: &str) -> bool {

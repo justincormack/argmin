@@ -13,6 +13,7 @@ s3-types = { path = "../s3-types" }
 base64 = "0.22"
 rapidhash = "1"
 ring = "0.17"
+subtle = "2"
 thiserror = "2"
 
 [features]

@@ -47,6 +47,7 @@ dependencies = [
  "proptest",
  "ring",
  "serde_json",
+ "subtle",
  "thiserror",
 ]
 
@@ -2078,6 +2079,7 @@ dependencies = [
  "ring",
  "s3-types",
  "storage",
+ "subtle",
  "test-util",
  "thiserror",
 ]
