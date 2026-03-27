@@ -9,6 +9,7 @@ pub(crate) struct ServerConfig {
     pub(crate) ec_m: u8,
     pub(crate) access_key_id: String,
     pub(crate) secret_access_key: String,
+    pub(crate) sse_c_validator_key_b64: Option<String>,
     pub(crate) region: String,
     pub(crate) workers: u32,
     pub(crate) max_connections: u32,
@@ -42,6 +43,7 @@ impl ServerConfig {
             .ok_or_else(|| "ARGMIN_ACCESS_KEY_ID is required".to_string())?;
         let secret_access_key = get("ARGMIN_SECRET_ACCESS_KEY")
             .ok_or_else(|| "ARGMIN_SECRET_ACCESS_KEY is required".to_string())?;
+        let sse_c_validator_key_b64 = get("ARGMIN_SSE_C_VALIDATOR_KEY");
 
         let listen_addr = get("ARGMIN_LISTEN_ADDR").unwrap_or_else(|| "127.0.0.1:9000".to_string());
         let data_dir = get("ARGMIN_DATA_DIR").unwrap_or_else(|| "./data".to_string());
@@ -99,6 +101,7 @@ impl ServerConfig {
             ec_m,
             access_key_id,
             secret_access_key,
+            sse_c_validator_key_b64,
             region,
             workers,
             max_connections,
@@ -166,6 +169,7 @@ mod tests {
         );
         assert_eq!(cfg.access_key_id, "AKID");
         assert_eq!(cfg.secret_access_key, "SECRET");
+        assert_eq!(cfg.sse_c_validator_key_b64, None);
     }
 
     #[test]
@@ -173,6 +177,7 @@ mod tests {
         let cfg = ServerConfig::from_lookup(make_env(&[
             ("ARGMIN_ACCESS_KEY_ID", "mykey"),
             ("ARGMIN_SECRET_ACCESS_KEY", "mysecret"),
+            ("ARGMIN_SSE_C_VALIDATOR_KEY", "Zm9v"),
             ("ARGMIN_LISTEN_ADDR", "0.0.0.0:8080"),
             ("ARGMIN_DATA_DIR", "/tmp/storage"),
             ("ARGMIN_PG_COUNT", "32"),
@@ -195,6 +200,7 @@ mod tests {
         );
         assert_eq!(cfg.access_key_id, "mykey");
         assert_eq!(cfg.secret_access_key, "mysecret");
+        assert_eq!(cfg.sse_c_validator_key_b64, Some("Zm9v".to_string()));
     }
 
     #[test]

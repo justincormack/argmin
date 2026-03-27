@@ -14,6 +14,7 @@ ec = { path = "../ec" }
 observability = { path = "../observability" }
 server-core = { path = "../server-core" }
 s3-types = { path = "../s3-types" }
+storage = { path = "../storage" }
 base64 = "0.22"
 ec-sys = { path = "../ec-sys" }
 ring = "0.17"
@@ -28,5 +29,4 @@ md5_legacy = { package = "md-5", version = "0.10" }
 
 [dev-dependencies]
 test-util = { path = "../test-util" }
-storage = { path = "../storage" }
 server-core = { path = "../server-core", features = ["test-utils"] }

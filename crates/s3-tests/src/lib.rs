@@ -4,7 +4,8 @@ pub mod server;
 pub use helpers::{
     assert_s3_err_code, bucket_prefix, cleanup_versioned_bucket, create_objects,
     create_objects_with_keys, create_public_bucket, create_public_write_bucket,
-    delete_all_and_bucket, delete_objects_with_md5, err_status, unique_bucket,
+    delete_all_and_bucket, delete_objects_with_md5, err_status, sse_c_header_values,
+    test_sse_c_key, unique_bucket,
 };
 pub use server::TestServer;
 

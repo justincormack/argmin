@@ -31,9 +31,12 @@ CREATE TABLE IF NOT EXISTS objects (
     data_layout   INTEGER NOT NULL DEFAULT 0,
     parts_count   INTEGER,
     metadata_blob BLOB,
+    encryption_type INTEGER NOT NULL DEFAULT 0,
+    encryption_state BLOB,
     CHECK (status IN (0, 1)),
     CHECK (etag_kind IN (0, 1)),
     CHECK (data_layout IN (0, 1)),
+    CHECK (encryption_type IN (0, 1)),
     CHECK (
         (status = 0 AND (
             generation_id IS NOT NULL AND generation_id > 0 AND
@@ -41,7 +44,8 @@ CREATE TABLE IF NOT EXISTS objects (
             (data_layout = 1 AND parts_count IS NOT NULL AND parts_count > 0)
         )) OR
         (status = 1 AND generation_id IS NULL AND data_layout = 0 AND parts_count IS NULL AND tags IS NULL AND metadata_blob IS NULL
-         AND size = 0 AND etag = X'' AND etag_kind = 0 AND storage_class = 0 AND ec_k = 0 AND ec_m = 0)
+         AND size = 0 AND etag = X'' AND etag_kind = 0 AND storage_class = 0 AND ec_k = 0 AND ec_m = 0
+         AND encryption_type = 0 AND encryption_state IS NULL)
     ),
     PRIMARY KEY (bucket, key, version_id)
 )";
@@ -57,6 +61,9 @@ CREATE TABLE IF NOT EXISTS multipart_uploads (
     tags             TEXT,
     metadata_blob    BLOB NOT NULL,
     owner_principal  TEXT CHECK (owner_principal IS NULL OR length(owner_principal) BETWEEN 1 AND 256)
+    ,
+    encryption_type  INTEGER NOT NULL DEFAULT 0 CHECK (encryption_type IN (0, 1)),
+    encryption_state BLOB
 )";
 
 /// Index for listing multipart uploads by bucket/key.
@@ -116,6 +123,8 @@ CREATE TABLE IF NOT EXISTS stream_uploads (
     part_number   INTEGER,
     state         INTEGER NOT NULL DEFAULT 0,
     created_at    INTEGER NOT NULL,
+    encryption_type INTEGER NOT NULL DEFAULT 0 CHECK (encryption_type IN (0, 1)),
+    encryption_state BLOB,
     CHECK (op_kind IN (0, 1)),
     CHECK (state IN (0, 1, 2, 3)),
     CHECK (

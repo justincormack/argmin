@@ -42,6 +42,9 @@ use request::S3Request;
 use response::S3Response;
 use router::{route, S3Operation};
 use s3_types::VersionId;
+use server_core::sse::{
+    SseCustomerRequest, SseCustomerWriteContext, SSE_CUSTOMER_ALGORITHM, SSE_C_CUSTOMER_KEY_LEN,
+};
 use tokio::sync::{mpsc, OwnedSemaphorePermit};
 
 const TRACE_TARGET: &str = "server_http";
@@ -732,6 +735,7 @@ impl HttpFrontend {
             }
             S3Operation::PutObject { bucket, key } => {
                 if let Some(copy_source) = req.header("x-amz-copy-source") {
+                    ensure_sse_customer_not_requested(req, "SSE-C CopyObject")?;
                     // CopyObject path
                     let (src_bucket, src_key, src_version_id_str) =
                         request::parse_copy_source(copy_source)?;
@@ -833,6 +837,7 @@ impl HttpFrontend {
                     // Normal PutObject — use streaming upload path directly.
                     validate_content_md5(req)?;
                     validate_checksum_headers(req, true)?;
+                    let sse_customer = parse_sse_customer_request(req)?;
                     let inline_tags_xml = if let Some(tagging_header) = req.header("x-amz-tagging")
                     {
                         let tags = xml::parse_url_encoded_tags(tagging_header)?;
@@ -860,8 +865,10 @@ impl HttpFrontend {
                                 cond: &cond,
                                 requester,
                                 acl,
+                                sse_customer: sse_customer.as_ref(),
                             })?;
                     let mut resp = S3Response::put_object(&result);
+                    apply_sse_customer_write_response_headers(&mut resp, sse_customer.as_ref());
                     for &(_, header) in CHECKSUM_HEADERS {
                         if let Some(value) = req.header(header) {
                             resp.headers.push((header.to_string(), value.to_string()));
@@ -871,6 +878,7 @@ impl HttpFrontend {
                 }
             }
             S3Operation::GetObject { bucket, key } => {
+                let sse_customer = parse_sse_customer_request(req)?;
                 let cond = read_condition_from_headers(req);
                 let vid = parse_version_id(req)?;
                 let requester =
@@ -905,6 +913,7 @@ impl HttpFrontend {
                             part_number,
                             cond: &cond,
                             requester,
+                            sse_customer: sse_customer.as_ref(),
                         })
                         .map_err(|e| match e {
                             ServerError::InvalidPart { .. } => {
@@ -939,6 +948,7 @@ impl HttpFrontend {
                                     range: byte_range,
                                     cond: &cond,
                                     requester,
+                                    sse_customer: sse_customer.as_ref(),
                                 },
                             ) {
                                 Ok(result) => {
@@ -975,6 +985,7 @@ impl HttpFrontend {
                                     version_id: vid,
                                     cond: &cond,
                                     requester,
+                                    sse_customer: sse_customer.as_ref(),
                                 },
                             )?;
                             let checksum_mode = req.header("x-amz-checksum-mode");
@@ -996,6 +1007,7 @@ impl HttpFrontend {
                                 version_id: vid,
                                 cond: &cond,
                                 requester,
+                                sse_customer: sse_customer.as_ref(),
                             })?;
                     let checksum_mode = req.header("x-amz-checksum-mode");
                     let tags = result.tags.clone();
@@ -1025,6 +1037,7 @@ impl HttpFrontend {
                 Ok(S3Response::delete_object(&result))
             }
             S3Operation::HeadObject { bucket, key } => {
+                let sse_customer = parse_sse_customer_request(req)?;
                 let cond = read_condition_from_headers(req);
                 let vid = parse_version_id(req)?;
                 let requester =
@@ -1058,6 +1071,7 @@ impl HttpFrontend {
                             part_number,
                             cond: &cond,
                             requester,
+                            sse_customer: sse_customer.as_ref(),
                         })
                         .map_err(|e| match e {
                             ServerError::InvalidPart { .. } => {
@@ -1079,6 +1093,7 @@ impl HttpFrontend {
                                 version_id: vid,
                                 cond: &cond,
                                 requester,
+                                sse_customer: sse_customer.as_ref(),
                             })?;
                     let checksum_mode = req.header("x-amz-checksum-mode");
                     let mut resp = S3Response::head_object(&result, checksum_mode);
@@ -1089,6 +1104,7 @@ impl HttpFrontend {
                 }
             }
             S3Operation::GetObjectAttributes { bucket, key } => {
+                let sse_customer = parse_sse_customer_request(req)?;
                 // Parse x-amz-object-attributes header (required, comma-separated).
                 // The AWS Rust SDK may send one header per list element; accept both
                 // repeated headers and comma-delimited header values.
@@ -1154,6 +1170,7 @@ impl HttpFrontend {
                         part_number_marker,
                         max_parts,
                         requester: requester_ctx,
+                        sse_customer: sse_customer.as_ref(),
                     },
                 )?;
                 let checksum_entries: Vec<(&str, &str)> = result
@@ -1178,6 +1195,7 @@ impl HttpFrontend {
                     &body_xml,
                     result.last_modified,
                     result.version_id,
+                    result.sse_customer.as_ref(),
                 ))
             }
             S3Operation::DeleteObjects { bucket } => {
@@ -1225,6 +1243,7 @@ impl HttpFrontend {
                 Ok(S3Response::get_bucket_versioning(state))
             }
             S3Operation::PostObject { .. } => {
+                ensure_sse_customer_not_requested(req, "SSE-C POST Object")?;
                 // POST Object is handled by the streaming path in serve.rs.
                 // If it reaches dispatch_routed, something is wrong.
                 Err(ServerError::InvalidRequest {
@@ -1390,6 +1409,10 @@ impl HttpFrontend {
                 Ok(S3Response::put_bucket_acl())
             }
             S3Operation::CreateMultipartUpload { bucket, key } => {
+                let sse_customer = parse_sse_customer_request(req)?;
+                let sse_customer_headers = sse_customer
+                    .as_ref()
+                    .map(SseCustomerRequest::response_headers);
                 let metadata = MetadataBlob::from_header_iter(req.header_iter())?;
 
                 // Parse optional checksum algorithm/type headers.
@@ -1442,6 +1465,7 @@ impl HttpFrontend {
                         tags: inline_tags_xml.as_deref(),
                         checksum,
                         requester,
+                        sse_customer: sse_customer.as_ref(),
                     },
                 )?;
                 Ok(S3Response::create_multipart_upload(
@@ -1450,6 +1474,7 @@ impl HttpFrontend {
                     &result.upload_id,
                     checksum_algorithm,
                     checksum_type,
+                    sse_customer_headers.as_ref(),
                 ))
             }
             S3Operation::UploadPart { bucket, key } => {
@@ -1469,6 +1494,7 @@ impl HttpFrontend {
                     })?;
 
                 if let Some(copy_source) = req.header("x-amz-copy-source") {
+                    ensure_sse_customer_not_requested(req, "SSE-C UploadPartCopy")?;
                     // UploadPartCopy path
                     let (src_bucket, src_key, src_version_id_str) =
                         request::parse_copy_source(copy_source)?;
@@ -1512,6 +1538,7 @@ impl HttpFrontend {
                     // Normal UploadPart — use streaming upload path directly.
                     validate_content_md5(req)?;
                     let claimed_checksum = extract_checksum_header(req)?;
+                    let sse_customer_request = parse_sse_customer_request(req)?;
                     let requester =
                         crate::coordinator::Requester::from_principal(auth.principal.as_deref());
                     let session = self.coordinator.begin_stream_part(
@@ -1521,6 +1548,7 @@ impl HttpFrontend {
                             upload_id: &upload_id,
                             part_number,
                             requester,
+                            sse_customer: sse_customer_request.as_ref(),
                         },
                     )?;
                     let session_id = session.session_id;
@@ -1530,12 +1558,17 @@ impl HttpFrontend {
                             .chunks(crate::coordinator::INTERNAL_SEGMENT_SIZE)
                             .enumerate()
                         {
+                            let data = if let Some(sse_customer) = session.sse_customer.as_ref() {
+                                sse_customer.encrypt_segment(idx as u32, chunk)?
+                            } else {
+                                chunk.to_vec()
+                            };
                             self.coordinator.append_stream_segment(
                                 &bucket,
                                 &key,
                                 &session_id,
                                 idx as u32,
-                                chunk,
+                                &data,
                             )?;
                         }
                         let crc = checksum::crc64::checksum(&req.body);
@@ -1566,9 +1599,14 @@ impl HttpFrontend {
                             .abort_stream_put(&bucket, &key, &session_id);
                     }
                     let result = result?;
+                    let sse_customer_headers = session
+                        .sse_customer
+                        .as_ref()
+                        .map(|ctx| ctx.request().response_headers());
                     Ok(S3Response::upload_part(
                         &result.etag,
                         result.checksum.as_ref(),
+                        sse_customer_headers.as_ref(),
                     ))
                 }
             }
@@ -1583,6 +1621,7 @@ impl HttpFrontend {
                 // string. CompleteMultipartUpload checksums may be composite ("base64-N"),
                 // so we cannot decode them as plain base64.
                 let claimed_checksum = extract_encoded_checksum_header(req)?;
+                let sse_customer = parse_sse_customer_request(req)?;
                 let requester =
                     crate::coordinator::Requester::from_principal(auth.principal.as_deref());
                 let result = self.coordinator.complete_multipart_upload(
@@ -1593,6 +1632,7 @@ impl HttpFrontend {
                         parts: &parts,
                         claimed_checksum: claimed_checksum.as_ref(),
                         requester,
+                        sse_customer: sse_customer.as_ref(),
                     },
                 )?;
                 Ok(S3Response::complete_multipart_upload(
@@ -2037,6 +2077,7 @@ impl HttpFrontend {
             bucket,
             file_name.is_some()
         );
+        ensure_sse_customer_not_requested(req, "SSE-C POST Object")?;
         let header_auth = self.authenticate_with_payload_check(req, false)?;
 
         let field = |name: &str| -> Option<&str> {
@@ -2149,6 +2190,7 @@ impl HttpFrontend {
             key: &key,
             requester,
             acl,
+            encryption: storage::ObjectEncryption::None,
         })?;
 
         let success_status = field("success_action_status")
@@ -2370,6 +2412,10 @@ impl HttpFrontend {
 
         let content_md5 = ContentMd5Claim::from_request(req)?;
         validate_checksum_headers(req, false)?;
+        let sse_customer_request = parse_sse_customer_request(req)?;
+        let sse_customer = self
+            .coordinator
+            .prepare_sse_customer_write_context(sse_customer_request.as_ref())?;
 
         // Parse inline tags before starting the session.
         let inline_tags_xml = if let Some(tagging_header) = req.header("x-amz-tagging") {
@@ -2437,6 +2483,7 @@ impl HttpFrontend {
                 content_md5,
                 response_headers: ChecksumResponseHeaders(checksum_response),
             },
+            sse_customer,
             streaming_signing: auth.streaming,
         })
     }
@@ -2462,6 +2509,12 @@ impl HttpFrontend {
                 ctx.requester_principal.as_deref(),
             ),
             acl: parse_put_object_acl(ctx.acl_header.as_deref()),
+            encryption: ctx
+                .sse_customer
+                .as_ref()
+                .map_or(storage::ObjectEncryption::None, |ctx| {
+                    ctx.encryption().clone()
+                }),
         })
     }
 
@@ -2483,12 +2536,16 @@ impl HttpFrontend {
             segment_index,
             data.len()
         );
+        let segment_data = match ctx.sse_customer.as_ref() {
+            Some(sse_customer) => sse_customer.encrypt_segment(segment_index, data)?,
+            None => data.to_vec(),
+        };
         self.coordinator.append_stream_segment(
             &ctx.bucket,
             &ctx.key,
             session_id,
             segment_index,
-            data,
+            &segment_data,
         )
     }
 
@@ -2523,9 +2580,19 @@ impl HttpFrontend {
                     ctx.requester_principal.as_deref(),
                 ),
                 acl: parse_put_object_acl(ctx.acl_header.as_deref()),
+                sse_customer: ctx
+                    .sse_customer
+                    .as_ref()
+                    .map(SseCustomerWriteContext::request),
             })?;
 
         let mut resp = S3Response::put_object(&result);
+        apply_sse_customer_write_response_headers(
+            &mut resp,
+            ctx.sse_customer
+                .as_ref()
+                .map(SseCustomerWriteContext::request),
+        );
         Self::apply_streaming_put_checksum_headers(ctx, &mut resp, trailer_checksums);
         Ok(resp)
     }
@@ -2569,6 +2636,12 @@ impl HttpFrontend {
             })?;
 
         let mut resp = S3Response::put_object(&result);
+        apply_sse_customer_write_response_headers(
+            &mut resp,
+            ctx.sse_customer
+                .as_ref()
+                .map(SseCustomerWriteContext::request),
+        );
         Self::apply_streaming_put_checksum_headers(ctx, &mut resp, trailer_checksums);
         Ok(resp)
     }
@@ -2610,6 +2683,7 @@ impl HttpFrontend {
 
         let content_md5 = ContentMd5Claim::from_request(req)?;
         let claimed_checksum = extract_checksum_header(req)?;
+        let sse_customer_request = parse_sse_customer_request(req)?;
 
         let mut checksum_response: Vec<(String, String)> = Vec::new();
         for &(_, header) in CHECKSUM_HEADERS {
@@ -2626,6 +2700,7 @@ impl HttpFrontend {
                 upload_id,
                 part_number,
                 requester: crate::coordinator::Requester::from_principal(auth.principal.as_deref()),
+                sse_customer: sse_customer_request.as_ref(),
             })?;
 
         Ok(StreamingPartContext {
@@ -2645,6 +2720,7 @@ impl HttpFrontend {
                 claim: claimed_checksum,
                 response_headers: ChecksumResponseHeaders(checksum_response),
             },
+            sse_customer: begin.sse_customer,
             streaming_signing: auth.streaming,
         })
     }
@@ -2668,12 +2744,17 @@ impl HttpFrontend {
             segment_index,
             data.len()
         );
+        let data = if let Some(sse_customer) = ctx.sse_customer.as_ref() {
+            sse_customer.encrypt_segment(segment_index, data)?
+        } else {
+            data.to_vec()
+        };
         self.coordinator.append_stream_segment(
             &ctx.binding.object.bucket,
             &ctx.binding.object.key,
             &ctx.binding.object.session_id,
             segment_index,
-            data,
+            &data,
         )
     }
 
@@ -2729,7 +2810,15 @@ impl HttpFrontend {
                 computed_checksum,
             })?;
 
-        let mut resp = S3Response::upload_part(&result.etag, result.checksum.as_ref());
+        let sse_customer_headers = ctx
+            .sse_customer
+            .as_ref()
+            .map(|sse_customer| sse_customer.request().response_headers());
+        let mut resp = S3Response::upload_part(
+            &result.etag,
+            result.checksum.as_ref(),
+            sse_customer_headers.as_ref(),
+        );
         // The coordinator's result already includes the checksum via
         // S3Response::upload_part. Only echo headers NOT already present
         // (e.g. x-amz-checksum-type). Trailer values take precedence.
@@ -2828,6 +2917,7 @@ pub struct StreamingPutContext {
     pub cond: crate::conditional::WriteCondition,
     pub inline_tags_xml: Option<String>,
     pub checksum: StreamingPutChecksumContract,
+    pub sse_customer: Option<SseCustomerWriteContext>,
     /// Signing context for aws-chunked modes, None for unsigned/plain.
     pub streaming_signing: Option<auth::StreamingSigningContext>,
 }
@@ -2851,6 +2941,7 @@ pub struct StreamingPartContext {
     pub trace: observability::TraceContext,
     pub binding: StreamPartBinding,
     pub checksum: StreamingPartChecksumContract,
+    pub sse_customer: Option<SseCustomerWriteContext>,
     /// Signing context for aws-chunked modes, None for unsigned/plain.
     pub streaming_signing: Option<auth::StreamingSigningContext>,
 }
@@ -2917,6 +3008,122 @@ const CHECKSUM_HEADERS: &[(&str, &str)] = &[
     ("CRC32C", "x-amz-checksum-crc32c"),
     ("SHA1", "x-amz-checksum-sha1"),
 ];
+
+const SSE_C_ALGORITHM_HEADER: &str = "x-amz-server-side-encryption-customer-algorithm";
+const SSE_C_KEY_HEADER: &str = "x-amz-server-side-encryption-customer-key";
+const SSE_C_KEY_MD5_HEADER: &str = "x-amz-server-side-encryption-customer-key-md5";
+const SSE_C_COPY_SOURCE_ALGORITHM_HEADER: &str =
+    "x-amz-copy-source-server-side-encryption-customer-algorithm";
+const SSE_C_COPY_SOURCE_KEY_HEADER: &str = "x-amz-copy-source-server-side-encryption-customer-key";
+const SSE_C_COPY_SOURCE_KEY_MD5_HEADER: &str =
+    "x-amz-copy-source-server-side-encryption-customer-key-md5";
+
+fn any_sse_customer_headers(req: &S3Request) -> bool {
+    req.header(SSE_C_ALGORITHM_HEADER).is_some()
+        || req.header(SSE_C_KEY_HEADER).is_some()
+        || req.header(SSE_C_KEY_MD5_HEADER).is_some()
+}
+
+fn any_sse_customer_copy_source_headers(req: &S3Request) -> bool {
+    req.header(SSE_C_COPY_SOURCE_ALGORITHM_HEADER).is_some()
+        || req.header(SSE_C_COPY_SOURCE_KEY_HEADER).is_some()
+        || req.header(SSE_C_COPY_SOURCE_KEY_MD5_HEADER).is_some()
+}
+
+fn ensure_sse_customer_not_requested(req: &S3Request, feature: &str) -> Result<(), ServerError> {
+    if any_sse_customer_headers(req) || any_sse_customer_copy_source_headers(req) {
+        return Err(ServerError::NotImplemented {
+            feature: feature.to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn parse_sse_customer_request(req: &S3Request) -> Result<Option<SseCustomerRequest>, ServerError> {
+    use base64::Engine;
+
+    for header in [
+        SSE_C_ALGORITHM_HEADER,
+        SSE_C_KEY_HEADER,
+        SSE_C_KEY_MD5_HEADER,
+    ] {
+        if header_count(req, header) > 1 {
+            return Err(ServerError::InvalidRequest {
+                reason: format!("duplicate header: {header}"),
+            });
+        }
+    }
+
+    let algorithm = req.header(SSE_C_ALGORITHM_HEADER);
+    let customer_key = req.header(SSE_C_KEY_HEADER);
+    let customer_key_md5 = req.header(SSE_C_KEY_MD5_HEADER);
+
+    if algorithm.is_none() && customer_key.is_none() && customer_key_md5.is_none() {
+        return Ok(None);
+    }
+    let (Some(algorithm), Some(customer_key), Some(customer_key_md5)) =
+        (algorithm, customer_key, customer_key_md5)
+    else {
+        return Err(ServerError::InvalidRequest {
+            reason: "all SSE-C headers must be provided together".to_string(),
+        });
+    };
+    if !algorithm.eq_ignore_ascii_case(SSE_CUSTOMER_ALGORITHM) {
+        return Err(ServerError::InvalidArgument {
+            reason: format!(
+                "unsupported SSE-C algorithm {algorithm}; expected {SSE_CUSTOMER_ALGORITHM}"
+            ),
+        });
+    }
+
+    let decoded_key = base64::engine::general_purpose::STANDARD
+        .decode(customer_key)
+        .map_err(|_| ServerError::InvalidArgument {
+            reason: "invalid base64 in SSE-C key".to_string(),
+        })?;
+    let customer_key_bytes: [u8; SSE_C_CUSTOMER_KEY_LEN] =
+        decoded_key
+            .try_into()
+            .map_err(|_| ServerError::InvalidArgument {
+                reason: format!("SSE-C key must decode to exactly {SSE_C_CUSTOMER_KEY_LEN} bytes"),
+            })?;
+
+    let decoded_md5 = base64::engine::general_purpose::STANDARD
+        .decode(customer_key_md5)
+        .map_err(|_| ServerError::InvalidDigest)?;
+    let claimed_md5: [u8; 16] = decoded_md5
+        .try_into()
+        .map_err(|_| ServerError::InvalidDigest)?;
+
+    let actual_md5 = md5_legacy::Md5::digest(customer_key_bytes);
+    let mut actual_md5_bytes = [0u8; 16];
+    actual_md5_bytes.copy_from_slice(actual_md5.as_ref());
+    if claimed_md5 != actual_md5_bytes {
+        return Err(ServerError::BadDigest);
+    }
+
+    Ok(Some(SseCustomerRequest::new(
+        customer_key_bytes,
+        base64::engine::general_purpose::STANDARD.encode(actual_md5_bytes),
+    )))
+}
+
+fn apply_sse_customer_write_response_headers(
+    resp: &mut S3Response,
+    sse_customer: Option<&SseCustomerRequest>,
+) {
+    let Some(sse_customer) = sse_customer else {
+        return;
+    };
+    resp.headers.push((
+        SSE_C_ALGORITHM_HEADER.to_string(),
+        SSE_CUSTOMER_ALGORITHM.to_string(),
+    ));
+    resp.headers.push((
+        SSE_C_KEY_MD5_HEADER.to_string(),
+        sse_customer.response_headers().key_md5_b64,
+    ));
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ContentMd5Claim([u8; 16]);

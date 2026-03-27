@@ -1,0 +1,440 @@
+use std::fmt;
+
+use ring::{aead, hmac, rand::SecureRandom};
+use storage::{
+    ObjectEncryption, SseCustomerObjectState, SSE_C_SEGMENT_NONCE_PREFIX_LEN,
+    SSE_C_VALIDATOR_HMAC_LEN, SSE_C_VALIDATOR_SALT_LEN, SSE_C_WRAPPED_DEK_LEN,
+    SSE_C_WRAP_NONCE_LEN, SSE_C_WRAP_SALT_LEN,
+};
+
+use crate::error::ServerError;
+
+pub const SSE_CUSTOMER_ALGORITHM: &str = "AES256";
+pub const SSE_C_CUSTOMER_KEY_LEN: usize = 32;
+pub const SSE_C_DEK_LEN: usize = 32;
+pub const SSE_C_SEGMENT_TAG_LEN: usize = 16;
+const SSE_C_WRAP_AAD: &[u8] = b"argmin:sse-c:wrap:v1";
+const SSE_C_SEGMENT_AAD: &[u8] = b"argmin:sse-c:segment:v1";
+const SSE_C_HKDF_INFO: &[u8] = b"argmin:sse-c:kek:v1";
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct SseCustomerRequest {
+    customer_key: [u8; SSE_C_CUSTOMER_KEY_LEN],
+    customer_key_md5_b64: String,
+}
+
+impl SseCustomerRequest {
+    #[must_use]
+    pub fn new(customer_key: [u8; SSE_C_CUSTOMER_KEY_LEN], customer_key_md5_b64: String) -> Self {
+        Self {
+            customer_key,
+            customer_key_md5_b64,
+        }
+    }
+
+    #[must_use]
+    pub fn customer_key(&self) -> &[u8; SSE_C_CUSTOMER_KEY_LEN] {
+        &self.customer_key
+    }
+
+    #[must_use]
+    pub fn response_headers(&self) -> SseCustomerResponseHeaders {
+        SseCustomerResponseHeaders {
+            key_md5_b64: self.customer_key_md5_b64.clone(),
+        }
+    }
+}
+
+impl fmt::Debug for SseCustomerRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SseCustomerRequest")
+            .field("algorithm", &SSE_CUSTOMER_ALGORITHM)
+            .field("customer_key_md5_b64", &self.customer_key_md5_b64)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SseCustomerResponseHeaders {
+    pub key_md5_b64: String,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct SseCustomerValidatorConfig {
+    pub key_id: u32,
+    validator_key: [u8; 32],
+}
+
+impl SseCustomerValidatorConfig {
+    pub fn from_base64(key_id: u32, encoded: &str) -> Result<Self, String> {
+        use base64::Engine;
+
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|_| "invalid base64 in ARGMIN_SSE_C_VALIDATOR_KEY".to_string())?;
+        let validator_key = decoded.try_into().map_err(|_| {
+            "ARGMIN_SSE_C_VALIDATOR_KEY must decode to exactly 32 bytes".to_string()
+        })?;
+        Ok(Self {
+            key_id,
+            validator_key,
+        })
+    }
+
+    fn hmac_key(&self) -> hmac::Key {
+        hmac::Key::new(hmac::HMAC_SHA256, &self.validator_key)
+    }
+}
+
+impl fmt::Debug for SseCustomerValidatorConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SseCustomerValidatorConfig")
+            .field("key_id", &self.key_id)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone)]
+pub struct SseCustomerWriteContext {
+    request: SseCustomerRequest,
+    encryption: ObjectEncryption,
+    dek: [u8; SSE_C_DEK_LEN],
+}
+
+impl SseCustomerWriteContext {
+    #[must_use]
+    pub fn request(&self) -> &SseCustomerRequest {
+        &self.request
+    }
+
+    #[must_use]
+    pub fn encryption(&self) -> &ObjectEncryption {
+        &self.encryption
+    }
+
+    pub fn encrypt_segment(
+        &self,
+        segment_index: u32,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, ServerError> {
+        let ObjectEncryption::SseCustomer(state) = &self.encryption else {
+            return Err(ServerError::InternalError {
+                reason: "SSE-C write context missing encryption state".to_string(),
+            });
+        };
+        encrypt_segment_with_dek(&self.dek, state, segment_index, plaintext)
+    }
+}
+
+impl fmt::Debug for SseCustomerWriteContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SseCustomerWriteContext")
+            .field("request", &self.request)
+            .field("encryption", &self.encryption)
+            .finish()
+    }
+}
+
+pub fn prepare_sse_customer_write(
+    validator: &SseCustomerValidatorConfig,
+    request: &SseCustomerRequest,
+) -> Result<SseCustomerWriteContext, ServerError> {
+    let rng = ring::rand::SystemRandom::new();
+
+    let mut validator_salt = [0u8; SSE_C_VALIDATOR_SALT_LEN];
+    rng.fill(&mut validator_salt)
+        .map_err(|_| ServerError::InternalError {
+            reason: "failed to generate SSE-C validator salt".to_string(),
+        })?;
+
+    let validator_hmac = compute_validator_hmac(validator, &validator_salt, request.customer_key());
+
+    let mut wrap_salt = [0u8; SSE_C_WRAP_SALT_LEN];
+    rng.fill(&mut wrap_salt)
+        .map_err(|_| ServerError::InternalError {
+            reason: "failed to generate SSE-C wrap salt".to_string(),
+        })?;
+
+    let mut wrap_nonce = [0u8; SSE_C_WRAP_NONCE_LEN];
+    rng.fill(&mut wrap_nonce)
+        .map_err(|_| ServerError::InternalError {
+            reason: "failed to generate SSE-C wrap nonce".to_string(),
+        })?;
+
+    let mut dek = [0u8; SSE_C_DEK_LEN];
+    rng.fill(&mut dek).map_err(|_| ServerError::InternalError {
+        reason: "failed to generate SSE-C object DEK".to_string(),
+    })?;
+
+    let kek = derive_wrap_key(request.customer_key(), &wrap_salt)?;
+    let wrapped_dek = wrap_dek(&kek, &wrap_nonce, &dek)?;
+
+    let mut segment_nonce_prefix = [0u8; SSE_C_SEGMENT_NONCE_PREFIX_LEN];
+    rng.fill(&mut segment_nonce_prefix)
+        .map_err(|_| ServerError::InternalError {
+            reason: "failed to generate SSE-C segment nonce prefix".to_string(),
+        })?;
+
+    Ok(SseCustomerWriteContext {
+        request: request.clone(),
+        encryption: ObjectEncryption::SseCustomer(SseCustomerObjectState {
+            validator_key_id: validator.key_id,
+            validator_salt,
+            validator_hmac,
+            wrap_salt,
+            wrap_nonce,
+            wrapped_dek,
+            segment_nonce_prefix,
+        }),
+        dek,
+    })
+}
+
+pub fn resume_sse_customer_write(
+    validator: &SseCustomerValidatorConfig,
+    state: &SseCustomerObjectState,
+    request: &SseCustomerRequest,
+) -> Result<SseCustomerWriteContext, ServerError> {
+    validate_sse_customer_read(validator, state, request)?;
+    let kek = derive_wrap_key(request.customer_key(), &state.wrap_salt)?;
+    let dek = unwrap_dek(&kek, &state.wrap_nonce, &state.wrapped_dek)?;
+    Ok(SseCustomerWriteContext {
+        request: request.clone(),
+        encryption: ObjectEncryption::SseCustomer(state.clone()),
+        dek,
+    })
+}
+
+pub fn validate_sse_customer_read(
+    validator: &SseCustomerValidatorConfig,
+    state: &SseCustomerObjectState,
+    request: &SseCustomerRequest,
+) -> Result<SseCustomerResponseHeaders, ServerError> {
+    if state.validator_key_id != validator.key_id {
+        return Err(ServerError::InvalidRequest {
+            reason: "SSE-C validator key for object is not available".to_string(),
+        });
+    }
+    let actual = compute_validator_hmac(validator, &state.validator_salt, request.customer_key());
+    if state.validator_hmac != actual {
+        return Err(ServerError::AccessDenied);
+    }
+    Ok(request.response_headers())
+}
+
+pub fn decrypt_sse_customer_segment(
+    validator: &SseCustomerValidatorConfig,
+    state: &SseCustomerObjectState,
+    request: &SseCustomerRequest,
+    segment_index: u32,
+    ciphertext: &[u8],
+    plaintext_len: usize,
+) -> Result<Vec<u8>, ServerError> {
+    validate_sse_customer_read(validator, state, request)?;
+    let kek = derive_wrap_key(request.customer_key(), &state.wrap_salt)?;
+    let dek = unwrap_dek(&kek, &state.wrap_nonce, &state.wrapped_dek)?;
+    decrypt_segment_with_dek(&dek, state, segment_index, ciphertext, plaintext_len)
+}
+
+fn compute_validator_hmac(
+    validator: &SseCustomerValidatorConfig,
+    validator_salt: &[u8; SSE_C_VALIDATOR_SALT_LEN],
+    customer_key: &[u8; SSE_C_CUSTOMER_KEY_LEN],
+) -> [u8; SSE_C_VALIDATOR_HMAC_LEN] {
+    let key = validator.hmac_key();
+    let mut msg = [0u8; SSE_C_VALIDATOR_SALT_LEN + SSE_C_CUSTOMER_KEY_LEN];
+    msg[..SSE_C_VALIDATOR_SALT_LEN].copy_from_slice(validator_salt);
+    msg[SSE_C_VALIDATOR_SALT_LEN..].copy_from_slice(customer_key);
+    let tag = hmac::sign(&key, &msg);
+    tag.as_ref()
+        .try_into()
+        .expect("HMAC-SHA256 output length should be 32 bytes")
+}
+
+fn derive_wrap_key(
+    customer_key: &[u8; SSE_C_CUSTOMER_KEY_LEN],
+    wrap_salt: &[u8; SSE_C_WRAP_SALT_LEN],
+) -> Result<[u8; 32], ServerError> {
+    let salt = ring::hkdf::Salt::new(ring::hkdf::HKDF_SHA256, wrap_salt);
+    let prk = salt.extract(customer_key);
+    let okm =
+        prk.expand(&[SSE_C_HKDF_INFO], Aes256GcmLen)
+            .map_err(|_| ServerError::InternalError {
+                reason: "failed to derive SSE-C wrapping key".to_string(),
+            })?;
+    let mut out = [0u8; 32];
+    okm.fill(&mut out).map_err(|_| ServerError::InternalError {
+        reason: "failed to fill SSE-C wrapping key".to_string(),
+    })?;
+    Ok(out)
+}
+
+fn wrap_dek(
+    kek: &[u8; 32],
+    wrap_nonce: &[u8; SSE_C_WRAP_NONCE_LEN],
+    dek: &[u8; SSE_C_DEK_LEN],
+) -> Result<[u8; SSE_C_WRAPPED_DEK_LEN], ServerError> {
+    let unbound =
+        aead::UnboundKey::new(&aead::AES_256_GCM, kek).map_err(|_| ServerError::InternalError {
+            reason: "failed to create SSE-C wrapping key".to_string(),
+        })?;
+    let sealing_key = aead::LessSafeKey::new(unbound);
+    let mut buf = dek.to_vec();
+    sealing_key
+        .seal_in_place_append_tag(
+            aead::Nonce::assume_unique_for_key(*wrap_nonce),
+            aead::Aad::from(SSE_C_WRAP_AAD),
+            &mut buf,
+        )
+        .map_err(|_| ServerError::InternalError {
+            reason: "failed to wrap SSE-C DEK".to_string(),
+        })?;
+    buf.try_into().map_err(|_| ServerError::InternalError {
+        reason: "wrapped SSE-C DEK length mismatch".to_string(),
+    })
+}
+
+fn unwrap_dek(
+    kek: &[u8; 32],
+    wrap_nonce: &[u8; SSE_C_WRAP_NONCE_LEN],
+    wrapped_dek: &[u8; SSE_C_WRAPPED_DEK_LEN],
+) -> Result<[u8; SSE_C_DEK_LEN], ServerError> {
+    let unbound =
+        aead::UnboundKey::new(&aead::AES_256_GCM, kek).map_err(|_| ServerError::InternalError {
+            reason: "failed to create SSE-C unwrap key".to_string(),
+        })?;
+    let opening_key = aead::LessSafeKey::new(unbound);
+    let mut buf = wrapped_dek.to_vec();
+    let plaintext = opening_key
+        .open_in_place(
+            aead::Nonce::assume_unique_for_key(*wrap_nonce),
+            aead::Aad::from(SSE_C_WRAP_AAD),
+            &mut buf,
+        )
+        .map_err(|_| ServerError::InvalidRequest {
+            reason: "The provided SSE-C key is invalid".to_string(),
+        })?;
+    plaintext
+        .try_into()
+        .map_err(|_| ServerError::InternalError {
+            reason: "unwrapped SSE-C DEK length mismatch".to_string(),
+        })
+}
+
+fn encrypt_segment_with_dek(
+    dek: &[u8; SSE_C_DEK_LEN],
+    state: &SseCustomerObjectState,
+    segment_index: u32,
+    plaintext: &[u8],
+) -> Result<Vec<u8>, ServerError> {
+    let unbound =
+        aead::UnboundKey::new(&aead::AES_256_GCM, dek).map_err(|_| ServerError::InternalError {
+            reason: "failed to create SSE-C segment sealing key".to_string(),
+        })?;
+    let sealing_key = aead::LessSafeKey::new(unbound);
+    let mut buf = plaintext.to_vec();
+    sealing_key
+        .seal_in_place_append_tag(
+            segment_nonce(state, segment_index),
+            aead::Aad::from(SSE_C_SEGMENT_AAD),
+            &mut buf,
+        )
+        .map_err(|_| ServerError::InternalError {
+            reason: "failed to encrypt SSE-C segment".to_string(),
+        })?;
+    Ok(buf)
+}
+
+fn decrypt_segment_with_dek(
+    dek: &[u8; SSE_C_DEK_LEN],
+    state: &SseCustomerObjectState,
+    segment_index: u32,
+    ciphertext: &[u8],
+    plaintext_len: usize,
+) -> Result<Vec<u8>, ServerError> {
+    let unbound =
+        aead::UnboundKey::new(&aead::AES_256_GCM, dek).map_err(|_| ServerError::InternalError {
+            reason: "failed to create SSE-C segment opening key".to_string(),
+        })?;
+    let opening_key = aead::LessSafeKey::new(unbound);
+    let mut buf = ciphertext.to_vec();
+    let plaintext = opening_key
+        .open_in_place(
+            segment_nonce(state, segment_index),
+            aead::Aad::from(SSE_C_SEGMENT_AAD),
+            &mut buf,
+        )
+        .map_err(|_| ServerError::InternalError {
+            reason: "failed to decrypt SSE-C segment".to_string(),
+        })?;
+    if plaintext.len() != plaintext_len {
+        return Err(ServerError::InternalError {
+            reason: format!(
+                "decrypted SSE-C segment length {} did not match expected {}",
+                plaintext.len(),
+                plaintext_len
+            ),
+        });
+    }
+    Ok(plaintext.to_vec())
+}
+
+fn segment_nonce(state: &SseCustomerObjectState, segment_index: u32) -> aead::Nonce {
+    let mut nonce = [0u8; 12];
+    nonce[..SSE_C_SEGMENT_NONCE_PREFIX_LEN].copy_from_slice(&state.segment_nonce_prefix);
+    nonce[SSE_C_SEGMENT_NONCE_PREFIX_LEN..].copy_from_slice(&segment_index.to_be_bytes());
+    aead::Nonce::assume_unique_for_key(nonce)
+}
+
+struct Aes256GcmLen;
+
+impl ring::hkdf::KeyType for Aes256GcmLen {
+    fn len(&self) -> usize {
+        32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request() -> SseCustomerRequest {
+        SseCustomerRequest::new([7u8; SSE_C_CUSTOMER_KEY_LEN], "dummy-md5".to_string())
+    }
+
+    fn validator() -> SseCustomerValidatorConfig {
+        SseCustomerValidatorConfig {
+            key_id: 1,
+            validator_key: [9u8; 32],
+        }
+    }
+
+    #[test]
+    fn sse_c_round_trip() {
+        let req = request();
+        let validator = validator();
+        let ctx = prepare_sse_customer_write(&validator, &req).unwrap();
+        let ObjectEncryption::SseCustomer(state) = ctx.encryption() else {
+            panic!("expected SSE-C object state");
+        };
+        let ciphertext = ctx.encrypt_segment(3, b"hello world").unwrap();
+        let plaintext =
+            decrypt_sse_customer_segment(&validator, state, &req, 3, &ciphertext, 11).unwrap();
+        assert_eq!(plaintext, b"hello world");
+    }
+
+    #[test]
+    fn sse_c_rejects_wrong_key() {
+        let req = request();
+        let validator = validator();
+        let ctx = prepare_sse_customer_write(&validator, &req).unwrap();
+        let ObjectEncryption::SseCustomer(state) = ctx.encryption() else {
+            panic!("expected SSE-C object state");
+        };
+        let ciphertext = ctx.encrypt_segment(0, b"abc").unwrap();
+        let wrong = SseCustomerRequest::new([1u8; SSE_C_CUSTOMER_KEY_LEN], "wrong".to_string());
+        let err =
+            decrypt_sse_customer_segment(&validator, state, &wrong, 0, &ciphertext, 3).unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+}

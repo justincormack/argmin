@@ -18,12 +18,12 @@ use storage::{
     CommitStreamPutReq, CreateMultipartUploadReq, CreateStreamUploadReq, EcShape, GenerationId,
     ListMultipartUploadsReq, ListObjectVersionsReq, ListObjectsReq, ListPartsReq,
     MultipartPartRecord, MultipartPartSegmentRecord, MultipartReclaimPartRecord,
-    MultipartReclaimPartSegmentRecord, MultipartReclaimRecord, MultipartUploadRecord, ObjectKey,
-    ObjectLayout, ObjectPartRecord, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
-    ObjectSegmentsReclaimSegmentRecord, PutDeleteMarkerReq, PutLiveObjectReq, PutObjectReq,
-    ReclaimWorkItem, SerializedMetadataBlob, SerializedTagSet, SessionId, ShardKey,
-    SharedStorageNode, StoredObject, StreamUploadRecord, StreamUploadSegmentRecord,
-    StreamUploadState, StreamUploadTarget, UploadId, UploadState,
+    MultipartReclaimPartSegmentRecord, MultipartReclaimRecord, MultipartUploadRecord,
+    ObjectEncryption, ObjectKey, ObjectLayout, ObjectPartRecord, ObjectSegmentRecord,
+    ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord, PutDeleteMarkerReq,
+    PutLiveObjectReq, PutObjectReq, ReclaimWorkItem, SerializedMetadataBlob, SerializedTagSet,
+    SessionId, ShardKey, SharedStorageNode, StoredObject, StreamUploadRecord,
+    StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, UploadId, UploadState,
 };
 
 use crate::conditional::{
@@ -35,6 +35,11 @@ use crate::etag::{compute_multipart_etag, crc64_to_etag_bytes, etag_bytes_to_crc
 use crate::metadata_blob::MetadataBlob;
 use crate::pg::{object_key_hash, part_key_hash, stream_segment_key_hash, PgTopology};
 use crate::range::ByteRange;
+use crate::sse::{
+    decrypt_sse_customer_segment, prepare_sse_customer_write, resume_sse_customer_write,
+    validate_sse_customer_read, SseCustomerRequest, SseCustomerResponseHeaders,
+    SseCustomerValidatorConfig, SseCustomerWriteContext, SSE_C_SEGMENT_TAG_LEN,
+};
 
 const TRACE_TARGET: &str = "server_core";
 
@@ -166,6 +171,7 @@ pub struct GetBucketAclResult {
 pub struct BeginStreamPartResult {
     pub session_id: String,
     pub checksum_algorithm: Option<ChecksumAlgorithm>,
+    pub sse_customer: Option<SseCustomerWriteContext>,
 }
 
 #[derive(Debug, Clone)]
@@ -447,10 +453,12 @@ struct ReadRuntime {
     ec_config: EcConfig,
     pg_topology: PgTopology,
     payload_buffer_pool: Arc<PayloadBufferPool>,
+    sse_c_validator: Option<SseCustomerValidatorConfig>,
 }
 
 #[derive(Debug, Clone)]
 struct SegmentPayloadRecord {
+    segment_index: u32,
     size: u64,
     segment_crc64: Option<u64>,
     segment_okh: [u8; 16],
@@ -458,6 +466,16 @@ struct SegmentPayloadRecord {
     shard_pg_id: u32,
     ec_k: u8,
     ec_m: u8,
+    encryption: ObjectEncryption,
+}
+
+impl SegmentPayloadRecord {
+    fn stored_size(&self) -> usize {
+        match self.encryption {
+            ObjectEncryption::None => self.size as usize,
+            ObjectEncryption::SseCustomer(_) => self.size as usize + SSE_C_SEGMENT_TAG_LEN,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -494,6 +512,7 @@ struct SegmentListReader {
     segments: Vec<SegmentSliceRecord>,
     next_segment_index: usize,
     loaded_segment: Option<(Arc<SharedPayloadBuffer>, usize, usize)>,
+    sse_customer_request: Option<SseCustomerRequest>,
 }
 
 #[derive(Debug, Clone)]
@@ -509,8 +528,19 @@ struct MultipartReader {
     parts: Vec<SnapshottedMultipartPartRange>,
     next_part_index: usize,
     current_part: Option<SegmentListReader>,
+    sse_customer_request: Option<SseCustomerRequest>,
 }
 
+struct ReadObjectContext<'a> {
+    runtime: ReadRuntime,
+    bucket: &'a str,
+    key: &'a str,
+    generation_id: GenerationId,
+    sse_customer_request: Option<SseCustomerRequest>,
+}
+
+// Boxing the segment reader would add heap traffic on the normal read path.
+#[allow(clippy::large_enum_variant)]
 enum ReadHandleInner {
     Segments(SegmentListReader),
     Multipart(Box<MultipartReader>),
@@ -653,17 +683,23 @@ impl ReadHandle {
     }
 
     fn from_segments(
-        runtime: ReadRuntime,
-        bucket: &str,
-        key: &str,
-        generation_id: GenerationId,
+        ctx: ReadObjectContext<'_>,
         segments: Vec<SegmentPayloadRecord>,
         expected_size: usize,
         expected_crc64: Option<u64>,
     ) -> Self {
+        let ReadObjectContext {
+            runtime,
+            bucket,
+            key,
+            generation_id,
+            sse_customer_request,
+        } = ctx;
+        let bucket_owned = bucket.to_string();
+        let key_owned = key.to_string();
         Self {
-            bucket: bucket.to_string(),
-            key: key.to_string(),
+            bucket: bucket_owned.clone(),
+            key: key_owned.clone(),
             lease: Some(runtime.acquire_object_payload_lease(bucket, key, generation_id)),
             trace: observability::current_context(),
             expected_size,
@@ -672,8 +708,8 @@ impl ReadHandle {
             crc64: checksum::crc64::Hasher::new(),
             inner: ReadHandleInner::Segments(SegmentListReader {
                 runtime,
-                bucket: bucket.to_string(),
-                key: key.to_string(),
+                bucket: bucket_owned,
+                key: key_owned,
                 segments: Self::segment_slices_for_range(
                     segments,
                     0,
@@ -683,23 +719,30 @@ impl ReadHandle {
                 ),
                 next_segment_index: 0,
                 loaded_segment: None,
+                sse_customer_request,
             }),
         }
     }
 
     fn from_segments_range(
-        runtime: ReadRuntime,
-        bucket: &str,
-        key: &str,
-        generation_id: GenerationId,
+        ctx: ReadObjectContext<'_>,
         segments: Vec<SegmentPayloadRecord>,
         start: usize,
         end: usize,
     ) -> Self {
+        let ReadObjectContext {
+            runtime,
+            bucket,
+            key,
+            generation_id,
+            sse_customer_request,
+        } = ctx;
         let expected_size = end - start + 1;
+        let bucket_owned = bucket.to_string();
+        let key_owned = key.to_string();
         Self {
-            bucket: bucket.to_string(),
-            key: key.to_string(),
+            bucket: bucket_owned.clone(),
+            key: key_owned.clone(),
             lease: Some(runtime.acquire_object_payload_lease(bucket, key, generation_id)),
             trace: observability::current_context(),
             expected_size,
@@ -708,11 +751,12 @@ impl ReadHandle {
             crc64: checksum::crc64::Hasher::new(),
             inner: ReadHandleInner::Segments(SegmentListReader {
                 runtime,
-                bucket: bucket.to_string(),
-                key: key.to_string(),
+                bucket: bucket_owned,
+                key: key_owned,
                 segments: Self::segment_slices_for_range(segments, start, end, 0, None),
                 next_segment_index: 0,
                 loaded_segment: None,
+                sse_customer_request,
             }),
         }
     }
@@ -724,6 +768,7 @@ impl ReadHandle {
         generation_id: GenerationId,
         parts: Vec<SnapshottedMultipartPart>,
         expected_size: usize,
+        sse_customer_request: Option<SseCustomerRequest>,
     ) -> Self {
         Self {
             bucket: bucket.to_string(),
@@ -741,6 +786,7 @@ impl ReadHandle {
                 parts: Self::multipart_ranges_for_range(parts, 0, expected_size.saturating_sub(1)),
                 next_part_index: 0,
                 current_part: None,
+                sse_customer_request,
             })),
         }
     }
@@ -751,9 +797,10 @@ impl ReadHandle {
         key: &str,
         generation_id: GenerationId,
         parts: Vec<SnapshottedMultipartPart>,
-        start: usize,
-        end: usize,
+        range: (usize, usize),
+        sse_customer_request: Option<SseCustomerRequest>,
     ) -> Self {
+        let (start, end) = range;
         let expected_size = end - start + 1;
         Self {
             bucket: bucket.to_string(),
@@ -771,6 +818,7 @@ impl ReadHandle {
                 parts: Self::multipart_ranges_for_range(parts, start, end),
                 next_part_index: 0,
                 current_part: None,
+                sse_customer_request,
             })),
         }
     }
@@ -841,10 +889,12 @@ impl ReadHandle {
 
 fn segment_payloads_from_object_segments(
     segments: Vec<ObjectSegmentRecord>,
+    encryption: ObjectEncryption,
 ) -> Vec<SegmentPayloadRecord> {
     segments
         .into_iter()
         .map(|segment| SegmentPayloadRecord {
+            segment_index: segment.segment_index,
             size: segment.size,
             segment_crc64: segment.segment_crc64,
             segment_okh: segment.segment_okh,
@@ -852,6 +902,7 @@ fn segment_payloads_from_object_segments(
             shard_pg_id: segment.shard_pg_id,
             ec_k: segment.ec_k,
             ec_m: segment.ec_m,
+            encryption: encryption.clone(),
         })
         .collect()
 }
@@ -866,6 +917,7 @@ pub struct GetObjectResult {
     pub last_modified: u64,
     pub version_id: VersionId,
     pub tags: Option<String>,
+    pub sse_customer: Option<SseCustomerResponseHeaders>,
 }
 
 /// Result of a HeadObject operation.
@@ -877,6 +929,7 @@ pub struct HeadObjectResult {
     pub last_modified: u64,
     pub version_id: VersionId,
     pub tags: Option<String>,
+    pub sse_customer: Option<SseCustomerResponseHeaders>,
 }
 
 /// Result of a HeadObject with partNumber.
@@ -892,6 +945,7 @@ pub struct HeadObjectPartResult {
     pub tags: Option<String>,
     /// Per-part checksum (algorithm + raw bytes).
     pub checksum: Option<RawChecksum>,
+    pub sse_customer: Option<SseCustomerResponseHeaders>,
 }
 
 /// A single part entry for GetObjectAttributes ObjectParts response.
@@ -926,6 +980,7 @@ pub struct GetObjectAttributesResult {
     pub last_modified: u64,
     pub version_id: VersionId,
     pub object_parts: Option<ObjectPartsInfo>,
+    pub sse_customer: Option<SseCustomerResponseHeaders>,
 }
 
 /// Result of a range GetObject operation (206 Partial Content).
@@ -940,6 +995,7 @@ pub struct GetObjectRangeResult {
     pub range_end: u64,
     pub version_id: VersionId,
     pub tags: Option<String>,
+    pub sse_customer: Option<SseCustomerResponseHeaders>,
 }
 
 /// Result of a part-level GetObject operation (206 Partial Content).
@@ -958,6 +1014,7 @@ pub struct GetObjectPartResult {
     pub tags: Option<String>,
     /// Per-part checksum (algorithm + raw bytes).
     pub checksum: Option<RawChecksum>,
+    pub sse_customer: Option<SseCustomerResponseHeaders>,
 }
 
 /// Metadata handling directive for `CopyObject`.
@@ -1029,6 +1086,7 @@ pub struct PutObjectRequest<'a> {
     pub cond: &'a WriteCondition,
     pub requester: Requester<'a>,
     pub acl: PutObjectAcl<'a>,
+    pub sse_customer: Option<&'a SseCustomerRequest>,
 }
 
 struct PreparedPutCommit {
@@ -1165,6 +1223,7 @@ pub struct GetObjectRequest<'a> {
     pub version_id: Option<VersionId>,
     pub cond: &'a ReadCondition,
     pub requester: Requester<'a>,
+    pub sse_customer: Option<&'a SseCustomerRequest>,
 }
 
 /// Request for a HeadBucket operation.
@@ -1183,6 +1242,7 @@ pub struct GetObjectPartRequest<'a> {
     pub part_number: u32,
     pub cond: &'a ReadCondition,
     pub requester: Requester<'a>,
+    pub sse_customer: Option<&'a SseCustomerRequest>,
 }
 
 /// Request for a GetObjectRange operation.
@@ -1194,6 +1254,7 @@ pub struct GetObjectRangeRequest<'a> {
     pub range: ByteRange,
     pub cond: &'a ReadCondition,
     pub requester: Requester<'a>,
+    pub sse_customer: Option<&'a SseCustomerRequest>,
 }
 
 /// Request for a DeleteObject operation.
@@ -1291,6 +1352,7 @@ pub struct CreateMultipartUploadRequest<'a> {
     pub tags: Option<&'a str>,
     pub checksum: Option<MultipartChecksumConfig>,
     pub requester: Requester<'a>,
+    pub sse_customer: Option<&'a SseCustomerRequest>,
 }
 
 /// Request for an UploadPart operation (test-only convenience wrapper).
@@ -1304,6 +1366,7 @@ pub struct UploadPartRequest<'a> {
     pub data: &'a [u8],
     pub claimed_checksum: Option<&'a ChecksumClaim>,
     pub requester: Requester<'a>,
+    pub sse_customer: Option<&'a SseCustomerRequest>,
 }
 
 /// Request for a GetObjectAttributes operation.
@@ -1317,6 +1380,7 @@ pub struct GetObjectAttributesRequest<'a> {
     pub part_number_marker: Option<u32>,
     pub max_parts: u32,
     pub requester: Requester<'a>,
+    pub sse_customer: Option<&'a SseCustomerRequest>,
 }
 
 /// Request for a CompleteMultipartUpload operation.
@@ -1328,6 +1392,7 @@ pub struct CompleteMultipartUploadRequest<'a> {
     pub parts: &'a [CompletePart],
     pub claimed_checksum: Option<&'a EncodedChecksumClaim>,
     pub requester: Requester<'a>,
+    pub sse_customer: Option<&'a SseCustomerRequest>,
 }
 
 /// Request for beginning a streaming PutObject session.
@@ -1337,6 +1402,7 @@ pub struct BeginStreamPutRequest<'a> {
     pub key: &'a str,
     pub requester: Requester<'a>,
     pub acl: PutObjectAcl<'a>,
+    pub encryption: ObjectEncryption,
 }
 
 /// Request for beginning a streaming UploadPart session.
@@ -1347,6 +1413,7 @@ pub struct BeginStreamPartRequest<'a> {
     pub upload_id: &'a str,
     pub part_number: u32,
     pub requester: Requester<'a>,
+    pub sse_customer: Option<&'a SseCustomerRequest>,
 }
 
 /// Parsed request for finalizing a streaming PutObject.
@@ -1641,6 +1708,7 @@ pub struct Coordinator {
     encode_scratch_pool: EncodeScratchPool,
     payload_buffer_pool: Arc<PayloadBufferPool>,
     region: String,
+    sse_c_validator: Option<SseCustomerValidatorConfig>,
     _reclaim_sweeper: ReclaimSweeper,
 }
 
@@ -1985,27 +2053,36 @@ impl ReadRuntime {
     fn read_segment_payload(
         &self,
         segment: &SegmentPayloadRecord,
+        sse_customer_request: Option<&SseCustomerRequest>,
     ) -> Result<Arc<SharedPayloadBuffer>, ServerError> {
         let k = segment.ec_k as usize;
         let m = segment.ec_m as usize;
-        let padded = (segment.size as usize).div_ceil(k) * k;
+        let padded = segment.stored_size().div_ceil(k) * k;
         let shard_size = padded / k;
 
         if shard_size == 0 {
-            return Ok(Arc::new(SharedPayloadBuffer::from_unpooled(Vec::new())));
+            let plaintext = self.decrypt_segment_if_needed(segment, sse_customer_request, &[])?;
+            return Ok(Arc::new(SharedPayloadBuffer::from_unpooled(plaintext)));
         }
 
-        if let Some(buf) = self.try_read_segment_payload_direct(segment, k, shard_size, padded)? {
+        if let Some(buf) = self.try_read_segment_payload_direct(
+            segment,
+            sse_customer_request,
+            k,
+            shard_size,
+            padded,
+        )? {
             return Ok(buf.into_shared());
         }
 
-        self.read_segment_payload_locked(segment, k, m, padded, shard_size)
+        self.read_segment_payload_locked(segment, sse_customer_request, k, m, padded, shard_size)
             .map(PooledPayloadBuffer::into_shared)
     }
 
     fn try_read_segment_payload_direct(
         &self,
         segment: &SegmentPayloadRecord,
+        sse_customer_request: Option<&SseCustomerRequest>,
         k: usize,
         shard_size: usize,
         padded: usize,
@@ -2035,17 +2112,21 @@ impl ReadRuntime {
             }
         }
 
-        buf.truncate(segment.size as usize);
+        buf.truncate(segment.stored_size());
         let actual_crc64 = checksum::crc64::checksum(&buf);
         if actual_crc64 != expected_crc64 {
             return Ok(None);
         }
+        let plaintext = self.decrypt_segment_if_needed(segment, sse_customer_request, &buf)?;
+        buf.resize_zeroed(0);
+        buf.extend_from_slice(&plaintext);
         Ok(Some(buf))
     }
 
     fn read_segment_payload_locked(
         &self,
         segment: &SegmentPayloadRecord,
+        sse_customer_request: Option<&SseCustomerRequest>,
         k: usize,
         m: usize,
         padded: usize,
@@ -2140,7 +2221,7 @@ impl ReadRuntime {
                 unreachable!("missing reconstructed shard for data index {idx}");
             }
         }
-        buf.truncate(segment.size as usize);
+        buf.truncate(segment.stored_size());
         if let Some(expected_crc64) = segment.segment_crc64 {
             let actual_crc64 = checksum::crc64::checksum(&buf);
             if actual_crc64 != expected_crc64 {
@@ -2150,7 +2231,40 @@ impl ReadRuntime {
                 }));
             }
         }
+        let plaintext = self.decrypt_segment_if_needed(segment, sse_customer_request, &buf)?;
+        buf.resize_zeroed(0);
+        buf.extend_from_slice(&plaintext);
         Ok(buf)
+    }
+
+    fn decrypt_segment_if_needed(
+        &self,
+        segment: &SegmentPayloadRecord,
+        sse_customer_request: Option<&SseCustomerRequest>,
+        stored_bytes: &[u8],
+    ) -> Result<Vec<u8>, ServerError> {
+        match &segment.encryption {
+            ObjectEncryption::None => Ok(stored_bytes.to_vec()),
+            ObjectEncryption::SseCustomer(state) => {
+                let request = sse_customer_request.ok_or(ServerError::InvalidRequest {
+                    reason: "SSE-C headers are required for this object".to_string(),
+                })?;
+                let validator =
+                    self.sse_c_validator
+                        .as_ref()
+                        .ok_or(ServerError::InternalError {
+                            reason: "SSE-C validator key is not configured".to_string(),
+                        })?;
+                decrypt_sse_customer_segment(
+                    validator,
+                    state,
+                    request,
+                    segment.segment_index,
+                    stored_bytes,
+                    segment.size as usize,
+                )
+            }
+        }
     }
 }
 
@@ -2250,7 +2364,7 @@ impl SegmentListReader {
 
             let data = self
                 .runtime
-                .read_segment_payload(&slice.payload)
+                .read_segment_payload(&slice.payload, self.sse_customer_request.as_ref())
                 .map_err(|e| match e {
                     ServerError::Store(storage::StoreError::NotFound) => {
                         ServerError::ObjectNotFound {
@@ -2312,6 +2426,7 @@ impl MultipartReader {
                 segments: part.segments,
                 next_segment_index: 0,
                 loaded_segment: None,
+                sse_customer_request: self.sse_customer_request.clone(),
             });
         }
     }
@@ -2583,6 +2698,16 @@ impl Coordinator {
         ec_config: EcConfig,
         region: String,
     ) -> Result<Self, ServerError> {
+        Self::new_with_sse_c_validator(storage_node, ec_config, region, None)
+    }
+
+    /// Create a new coordinator with an optional SSE-C validator key.
+    pub fn new_with_sse_c_validator(
+        storage_node: Arc<SharedStorageNode>,
+        ec_config: EcConfig,
+        region: String,
+        sse_c_validator: Option<SseCustomerValidatorConfig>,
+    ) -> Result<Self, ServerError> {
         let ec_codec = Arc::new(ErasureCodec::new(ec_config)?);
         let pg_topology = PgTopology::new(storage_node.pg_ids()).map_err(|reason| {
             ServerError::InternalError {
@@ -2596,6 +2721,7 @@ impl Coordinator {
             ec_config,
             pg_topology: pg_topology.clone(),
             payload_buffer_pool: Arc::clone(&payload_buffer_pool),
+            sse_c_validator: sse_c_validator.clone(),
         };
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
@@ -2630,6 +2756,7 @@ impl Coordinator {
             encode_scratch_pool: EncodeScratchPool::new(ec_config),
             payload_buffer_pool,
             region,
+            sse_c_validator,
             _reclaim_sweeper: ReclaimSweeper {
                 storage_node: sweeper_storage_node,
                 stop,
@@ -2645,6 +2772,7 @@ impl Coordinator {
             ec_config: self.ec_config,
             pg_topology: self.pg_topology.clone(),
             payload_buffer_pool: Arc::clone(&self.payload_buffer_pool),
+            sse_c_validator: self.sse_c_validator.clone(),
         }
     }
 
@@ -3547,6 +3675,84 @@ impl Coordinator {
         Ok(())
     }
 
+    pub fn prepare_sse_customer_write_context(
+        &self,
+        sse_customer: Option<&SseCustomerRequest>,
+    ) -> Result<Option<crate::sse::SseCustomerWriteContext>, ServerError> {
+        match sse_customer {
+            None => Ok(None),
+            Some(request) => {
+                let validator =
+                    self.sse_c_validator
+                        .as_ref()
+                        .ok_or(ServerError::NotImplemented {
+                            feature: "SSE-C requires ARGMIN_SSE_C_VALIDATOR_KEY".to_string(),
+                        })?;
+                Ok(Some(prepare_sse_customer_write(validator, request)?))
+            }
+        }
+    }
+
+    fn prepare_existing_sse_customer_write_context(
+        &self,
+        encryption: &ObjectEncryption,
+        sse_customer: Option<&SseCustomerRequest>,
+    ) -> Result<Option<SseCustomerWriteContext>, ServerError> {
+        match encryption {
+            ObjectEncryption::None => {
+                if sse_customer.is_some() {
+                    return Err(ServerError::InvalidRequest {
+                        reason: "SSE-C headers may not be used for an unencrypted multipart upload"
+                            .to_string(),
+                    });
+                }
+                Ok(None)
+            }
+            ObjectEncryption::SseCustomer(state) => {
+                let request = sse_customer.ok_or(ServerError::InvalidRequest {
+                    reason: "SSE-C headers are required for this multipart upload".to_string(),
+                })?;
+                let validator =
+                    self.sse_c_validator
+                        .as_ref()
+                        .ok_or(ServerError::InternalError {
+                            reason: "SSE-C validator key is not configured".to_string(),
+                        })?;
+                Ok(Some(resume_sse_customer_write(validator, state, request)?))
+            }
+        }
+    }
+
+    fn prepare_sse_customer_read_access(
+        &self,
+        encryption: &ObjectEncryption,
+        sse_customer: Option<&SseCustomerRequest>,
+    ) -> Result<Option<SseCustomerResponseHeaders>, ServerError> {
+        match encryption {
+            ObjectEncryption::None => {
+                if sse_customer.is_some() {
+                    return Err(ServerError::InvalidRequest {
+                        reason: "SSE-C headers may not be used for an unencrypted object"
+                            .to_string(),
+                    });
+                }
+                Ok(None)
+            }
+            ObjectEncryption::SseCustomer(state) => {
+                let request = sse_customer.ok_or(ServerError::InvalidRequest {
+                    reason: "SSE-C headers are required for this object".to_string(),
+                })?;
+                let validator =
+                    self.sse_c_validator
+                        .as_ref()
+                        .ok_or(ServerError::InternalError {
+                            reason: "SSE-C validator key is not configured".to_string(),
+                        })?;
+                Ok(Some(validate_sse_customer_read(validator, state, request)?))
+            }
+        }
+    }
+
     /// Put an object, using a direct single-segment commit when possible.
     pub fn put_object(&self, req: &PutObjectRequest<'_>) -> Result<PutObjectResult, ServerError> {
         observability::trace_scope!(
@@ -3557,6 +3763,7 @@ impl Coordinator {
             req.key,
             req.data.len()
         );
+        let write_encryption = self.prepare_sse_customer_write_context(req.sse_customer)?;
 
         if req.data.len() > INTERNAL_SEGMENT_SIZE {
             let session_id = self.begin_stream_put(&BeginStreamPutRequest {
@@ -3564,15 +3771,24 @@ impl Coordinator {
                 key: req.key,
                 requester: req.requester,
                 acl: req.acl,
+                encryption: write_encryption
+                    .as_ref()
+                    .map(|ctx| ctx.encryption().clone())
+                    .unwrap_or_default(),
             })?;
             let result = (|| {
                 for (idx, chunk) in req.data.chunks(INTERNAL_SEGMENT_SIZE).enumerate() {
+                    let chunk_storage = if let Some(ctx) = &write_encryption {
+                        ctx.encrypt_segment(idx as u32, chunk)?
+                    } else {
+                        chunk.to_vec()
+                    };
                     self.append_stream_segment(
                         req.bucket,
                         req.key,
                         &session_id,
                         idx as u32,
-                        chunk,
+                        &chunk_storage,
                     )?;
                 }
                 self.finalize_stream_put(&FinalizeStreamPutRequest {
@@ -3634,9 +3850,14 @@ impl Coordinator {
                 &segment_index.to_string(),
                 segment_vid.get(),
             );
+            let storage_bytes = if let Some(ctx) = &write_encryption {
+                ctx.encrypt_segment(segment_index, req.data)?
+            } else {
+                req.data.to_vec()
+            };
 
             let written_shards =
-                self.write_segment_shards(shard_pg_id, &segment_okh, segment_vid, req.data)?;
+                self.write_segment_shards(shard_pg_id, &segment_okh, segment_vid, &storage_bytes)?;
 
             let meta_pg_id = self.object_pg_id(req.bucket, req.key);
             let (meta_pg, shard_pg_opt) =
@@ -3680,7 +3901,7 @@ impl Coordinator {
                 version_id: prepared.version_id,
                 segment_index,
                 size: req.data.len() as u64,
-                segment_crc64: Some(checksum::crc64::checksum(req.data)),
+                segment_crc64: Some(checksum::crc64::checksum(&storage_bytes)),
                 segment_okh,
                 segment_vid,
                 shard_pg_id,
@@ -3698,6 +3919,10 @@ impl Coordinator {
                     k: self.ec_config.data_shards,
                     m: self.ec_config.parity_shards,
                 },
+                encryption: write_encryption
+                    .as_ref()
+                    .map(|ctx| ctx.encryption().clone())
+                    .unwrap_or_default(),
                 layout: ObjectLayout::Standard,
                 tags: prepared.tags.clone(),
                 metadata_blob: Some(prepared.metadata_blob.clone()),
@@ -3787,6 +4012,7 @@ impl Coordinator {
                 bucket: BucketName::from(bucket),
                 key: ObjectKey::from(key),
                 target: StreamUploadTarget::PutObject,
+                encryption: req.encryption.clone(),
             })?;
 
             Ok(session_id)
@@ -3839,6 +4065,8 @@ impl Coordinator {
                 upload_id: upload_id.to_string(),
             });
         }
+        let sse_customer =
+            self.prepare_existing_sse_customer_write_context(&upload.encryption, req.sse_customer)?;
 
         // Generate session ID.
         let rng = ring::rand::SystemRandom::new();
@@ -3862,11 +4090,13 @@ impl Coordinator {
                 upload_id: UploadId::from(upload_id),
                 part_number,
             },
+            encryption: upload.encryption.clone(),
         })?;
 
         Ok(BeginStreamPartResult {
             session_id,
             checksum_algorithm: upload.checksum.map(MultipartChecksumConfig::algorithm),
+            sse_customer,
         })
     }
 
@@ -4100,32 +4330,46 @@ impl Coordinator {
             &segment_index.to_string(),
             segment_vid.get(),
         );
-        let segment_record = StreamUploadSegmentRecord {
-            session_id: SessionId::from(session_id),
-            segment_index,
-            size: data.len() as u64,
-            segment_crc64: Some(checksum::crc64::checksum(data)),
-            segment_okh,
-            segment_vid,
-            shard_pg_id,
-            ec_k: self.ec_config.data_shards,
-            ec_m: self.ec_config.parity_shards,
-        };
 
-        {
+        let segment_record = {
             let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
             let session = meta_guard.get_stream_upload(session_id)?;
             Self::validate_stream_session_binding(&session, bucket, key)?;
+            let logical_size = match &session.encryption {
+                ObjectEncryption::None => data.len() as u64,
+                ObjectEncryption::SseCustomer(_) => {
+                    let ciphertext_len = data.len();
+                    let logical_len = ciphertext_len.checked_sub(SSE_C_SEGMENT_TAG_LEN).ok_or(
+                        ServerError::InvalidRequest {
+                            reason: "encrypted stream segment shorter than authentication tag"
+                                .to_string(),
+                        },
+                    )?;
+                    logical_len as u64
+                }
+            };
+            let segment_record = StreamUploadSegmentRecord {
+                session_id: SessionId::from(session_id),
+                segment_index,
+                size: logical_size,
+                segment_crc64: Some(checksum::crc64::checksum(data)),
+                segment_okh,
+                segment_vid,
+                shard_pg_id,
+                ec_k: self.ec_config.data_shards,
+                ec_m: self.ec_config.parity_shards,
+            };
             Self::emit_stream_segment_layout(
                 &session.target,
                 bucket,
                 key,
                 session_id,
                 segment_index,
-                data.len(),
+                logical_size as usize,
             );
             Self::reject_duplicate_stream_segment_index(&meta_guard, session_id, segment_index)?;
-        }
+            segment_record
+        };
 
         let written_shards =
             self.write_segment_shards(shard_pg_id, &segment_okh, segment_vid, data)?;
@@ -4291,6 +4535,7 @@ impl Coordinator {
                             k: self.ec_config.data_shards,
                             m: self.ec_config.parity_shards,
                         },
+                        encryption: session.encryption.clone(),
                         tags: prepared.tags.clone(),
                         metadata_blob: Some(prepared.metadata_blob.clone()),
                     },
@@ -4751,6 +4996,7 @@ impl Coordinator {
                     src_bucket,
                     src_key,
                     src_record.version_id,
+                    &src_record.encryption,
                 )?;
                 let body = if src_record.size == 0 {
                     drop(pgs);
@@ -4765,6 +5011,7 @@ impl Coordinator {
                         src_record.generation_id,
                         obj_parts,
                         src_record.size as usize,
+                        None,
                     );
                     drop(pgs);
                     #[cfg(test)]
@@ -4795,11 +5042,17 @@ impl Coordinator {
                     ReadHandle::from_buffered_bytes(Vec::new())
                 } else {
                     let body = ReadHandle::from_segments(
-                        self.read_runtime(),
-                        src_bucket,
-                        src_key,
-                        src_record.generation_id,
-                        segment_payloads_from_object_segments(segments),
+                        ReadObjectContext {
+                            runtime: self.read_runtime(),
+                            bucket: src_bucket,
+                            key: src_key,
+                            generation_id: src_record.generation_id,
+                            sse_customer_request: None,
+                        },
+                        segment_payloads_from_object_segments(
+                            segments,
+                            src_record.encryption.clone(),
+                        ),
                         src_record.size as usize,
                         Some(src_etag_crc),
                     );
@@ -4842,6 +5095,7 @@ impl Coordinator {
             key: dst_key,
             requester,
             acl,
+            encryption: ObjectEncryption::None,
         })?;
         let not_found = |e: ServerError| match e {
             ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
@@ -4976,9 +5230,11 @@ impl Coordinator {
         key: &str,
         version_id: VersionId,
         part: &ObjectPartRecord,
+        encryption: &ObjectEncryption,
     ) -> Result<Vec<SegmentPayloadRecord>, ServerError> {
         if part.part_okh != [0u8; 16] {
             return Ok(vec![SegmentPayloadRecord {
+                segment_index: 0,
                 size: part.size,
                 segment_crc64: None,
                 segment_okh: part.part_okh,
@@ -4986,6 +5242,7 @@ impl Coordinator {
                 shard_pg_id: part.shard_pg_id,
                 ec_k: part.ec_k,
                 ec_m: part.ec_m,
+                encryption: encryption.clone(),
             }]);
         }
 
@@ -4995,6 +5252,7 @@ impl Coordinator {
                 segments
                     .into_iter()
                     .map(|segment| SegmentPayloadRecord {
+                        segment_index: segment.segment_index,
                         size: segment.size,
                         segment_crc64: segment.segment_crc64,
                         segment_okh: segment.segment_okh,
@@ -5002,6 +5260,7 @@ impl Coordinator {
                         shard_pg_id: segment.shard_pg_id,
                         ec_k: segment.ec_k,
                         ec_m: segment.ec_m,
+                        encryption: encryption.clone(),
                     })
                     .collect()
             })
@@ -5013,6 +5272,7 @@ impl Coordinator {
         bucket: &str,
         key: &str,
         version_id: VersionId,
+        encryption: &ObjectEncryption,
     ) -> Result<Vec<SnapshottedMultipartPart>, ServerError> {
         let parts = meta_pg
             .get_object_parts(bucket, key, version_id)
@@ -5021,7 +5281,8 @@ impl Coordinator {
         let mut object_offset_start = 0usize;
         for part in parts {
             let part_size = part.size as usize;
-            let segments = Self::multipart_part_payloads(meta_pg, bucket, key, version_id, &part)?;
+            let segments =
+                Self::multipart_part_payloads(meta_pg, bucket, key, version_id, &part, encryption)?;
             snapshotted.push(SnapshottedMultipartPart {
                 record: part,
                 object_offset_start,
@@ -5037,6 +5298,7 @@ impl Coordinator {
         bucket: &str,
         key: &str,
         version_id: VersionId,
+        encryption: &ObjectEncryption,
         start: u64,
         end_exclusive: u64,
     ) -> Result<Vec<SnapshottedMultipartPart>, ServerError> {
@@ -5045,8 +5307,9 @@ impl Coordinator {
             .map_err(ServerError::Metadata)?;
         let mut snapshotted = Vec::with_capacity(parts.len());
         for part in parts {
-            let segments =
-                Self::multipart_part_payloads(meta_pg, bucket, key, version_id, &part.part)?;
+            let segments = Self::multipart_part_payloads(
+                meta_pg, bucket, key, version_id, &part.part, encryption,
+            )?;
             snapshotted.push(SnapshottedMultipartPart {
                 record: part.part,
                 object_offset_start: part.object_offset_start as usize,
@@ -5329,12 +5592,19 @@ impl Coordinator {
 
         let etag_str = record.etag.format();
         check_read_conditions(cond, &etag_str, record.last_modified)?;
+        let sse_customer =
+            self.prepare_sse_customer_read_access(&record.encryption, req.sse_customer)?;
 
         if matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
             // Multipart: metadata is in object row, data spans multiple parts.
             let meta_pg = pgs.meta();
-            let obj_parts =
-                Self::snapshot_multipart_parts(meta_pg, bucket, key, record.version_id)?;
+            let obj_parts = Self::snapshot_multipart_parts(
+                meta_pg,
+                bucket,
+                key,
+                record.version_id,
+                &record.encryption,
+            )?;
 
             let metadata = record
                 .metadata_blob
@@ -5350,6 +5620,7 @@ impl Coordinator {
                 record.generation_id,
                 obj_parts,
                 record.size as usize,
+                req.sse_customer.cloned(),
             );
             drop(pgs);
             #[cfg(test)]
@@ -5363,6 +5634,7 @@ impl Coordinator {
                 last_modified: record.last_modified,
                 version_id: record.version_id,
                 tags: record.tags.map(Into::into),
+                sse_customer,
             })
         } else {
             // Non-multipart: metadata from DB row, user data from shards.
@@ -5387,11 +5659,14 @@ impl Coordinator {
                 ReadHandle::from_buffered_bytes(vec![])
             } else {
                 let body = ReadHandle::from_segments(
-                    self.read_runtime(),
-                    bucket,
-                    key,
-                    record.generation_id,
-                    segment_payloads_from_object_segments(segments),
+                    ReadObjectContext {
+                        runtime: self.read_runtime(),
+                        bucket,
+                        key,
+                        generation_id: record.generation_id,
+                        sse_customer_request: req.sse_customer.cloned(),
+                    },
+                    segment_payloads_from_object_segments(segments, record.encryption.clone()),
                     user_size,
                     Some(etag_crc),
                 );
@@ -5407,6 +5682,7 @@ impl Coordinator {
                 last_modified: record.last_modified,
                 version_id: record.version_id,
                 tags: record.tags.map(Into::into),
+                sse_customer,
             })
         }
     }
@@ -5453,11 +5729,18 @@ impl Coordinator {
 
         let etag_str = record.etag.format();
         check_read_conditions(cond, &etag_str, record.last_modified)?;
+        let sse_customer =
+            self.prepare_sse_customer_read_access(&record.encryption, req.sse_customer)?;
 
         if matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
             let meta_pg = pgs.meta();
-            let obj_parts =
-                Self::snapshot_multipart_parts(meta_pg, bucket, key, record.version_id)?;
+            let obj_parts = Self::snapshot_multipart_parts(
+                meta_pg,
+                bucket,
+                key,
+                record.version_id,
+                &record.encryption,
+            )?;
 
             // Find the requested part
             let part = obj_parts
@@ -5507,6 +5790,7 @@ impl Coordinator {
                 record.generation_id,
                 vec![part_body],
                 part.record.size as usize,
+                req.sse_customer.cloned(),
             );
             drop(pgs);
             #[cfg(test)]
@@ -5525,6 +5809,7 @@ impl Coordinator {
                 version_id: record.version_id,
                 tags: record.tags.map(Into::into),
                 checksum,
+                sse_customer,
             })
         } else {
             // Non-multipart: only partNumber=1 is valid
@@ -5546,11 +5831,14 @@ impl Coordinator {
                 ReadHandle::from_buffered_bytes(vec![])
             } else {
                 let body = ReadHandle::from_segments(
-                    self.read_runtime(),
-                    bucket,
-                    key,
-                    record.generation_id,
-                    segment_payloads_from_object_segments(segments),
+                    ReadObjectContext {
+                        runtime: self.read_runtime(),
+                        bucket,
+                        key,
+                        generation_id: record.generation_id,
+                        sse_customer_request: req.sse_customer.cloned(),
+                    },
+                    segment_payloads_from_object_segments(segments, record.encryption.clone()),
                     user_size,
                     Some(etag_crc),
                 );
@@ -5578,6 +5866,7 @@ impl Coordinator {
                 version_id: record.version_id,
                 tags: record.tags.map(Into::into),
                 checksum: None,
+                sse_customer,
             })
         }
     }
@@ -5620,6 +5909,8 @@ impl Coordinator {
 
         let etag_str = record.etag.format();
         check_read_conditions(cond, &etag_str, record.last_modified)?;
+        let sse_customer =
+            self.prepare_sse_customer_read_access(&record.encryption, req.sse_customer)?;
 
         if matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
             let meta_pg = pgs.meta();
@@ -5671,6 +5962,7 @@ impl Coordinator {
                 version_id: record.version_id,
                 tags: record.tags.map(Into::into),
                 checksum,
+                sse_customer,
             })
         } else {
             if part_number != 1 {
@@ -5694,6 +5986,7 @@ impl Coordinator {
                 version_id: record.version_id,
                 tags: record.tags.map(Into::into),
                 checksum: None,
+                sse_customer,
             })
         }
     }
@@ -5732,6 +6025,8 @@ impl Coordinator {
 
         let etag_str = record.etag.format();
         check_read_conditions(cond, &etag_str, record.last_modified)?;
+        let sse_customer =
+            self.prepare_sse_customer_read_access(&record.encryption, req.sse_customer)?;
 
         // Metadata always from DB row (both multipart and non-multipart).
         let metadata = record
@@ -5748,6 +6043,7 @@ impl Coordinator {
             last_modified: record.last_modified,
             version_id: record.version_id,
             tags: record.tags.map(Into::into),
+            sse_customer,
         })
     }
 
@@ -5792,6 +6088,8 @@ impl Coordinator {
 
         let etag_str = record.etag.format();
         check_read_conditions(cond, &etag_str, record.last_modified)?;
+        let sse_customer =
+            self.prepare_sse_customer_read_access(&record.encryption, req.sse_customer)?;
 
         // Metadata always from DB row (both multipart and non-multipart).
         let metadata = record
@@ -5878,6 +6176,7 @@ impl Coordinator {
             last_modified: record.last_modified,
             version_id: record.version_id,
             object_parts,
+            sse_customer,
         })
     }
 
@@ -5922,6 +6221,8 @@ impl Coordinator {
 
         let etag_str = record.etag.format();
         check_read_conditions(cond, &etag_str, record.last_modified)?;
+        let sse_customer =
+            self.prepare_sse_customer_read_access(&record.encryption, req.sse_customer)?;
 
         // Resolve byte range against user data size
         let (user_start, user_end) = match range.resolve(record.size) {
@@ -5970,6 +6271,7 @@ impl Coordinator {
                 bucket,
                 key,
                 record.version_id,
+                &record.encryption,
                 user_start,
                 user_end + 1,
             )?;
@@ -5994,8 +6296,8 @@ impl Coordinator {
                 key,
                 record.generation_id,
                 obj_parts,
-                user_start as usize,
-                user_end as usize,
+                (user_start as usize, user_end as usize),
+                req.sse_customer.cloned(),
             );
             drop(pgs);
             #[cfg(test)]
@@ -6017,11 +6319,14 @@ impl Coordinator {
                 .map_err(ServerError::Metadata)?;
 
             let body = ReadHandle::from_segments_range(
-                self.read_runtime(),
-                bucket,
-                key,
-                record.generation_id,
-                segment_payloads_from_object_segments(segments),
+                ReadObjectContext {
+                    runtime: self.read_runtime(),
+                    bucket,
+                    key,
+                    generation_id: record.generation_id,
+                    sse_customer_request: req.sse_customer.cloned(),
+                },
+                segment_payloads_from_object_segments(segments, record.encryption.clone()),
                 user_start as usize,
                 user_end as usize,
             );
@@ -6040,6 +6345,7 @@ impl Coordinator {
             range_end: user_end,
             version_id: record.version_id,
             tags: record.tags.map(Into::into),
+            sse_customer,
         })
     }
 
@@ -6670,6 +6976,11 @@ impl Coordinator {
             });
 
             let metadata_blob = metadata.serialize()?;
+            let sse_customer = self.prepare_sse_customer_write_context(req.sse_customer)?;
+            let encryption = sse_customer
+                .as_ref()
+                .map(|ctx| ctx.encryption().clone())
+                .unwrap_or_default();
 
             let meta_pg_id = self.object_pg_id(bucket, key);
             let pg = self.storage_node.get_pg(meta_pg_id)?;
@@ -6681,6 +6992,7 @@ impl Coordinator {
                 metadata_blob: SerializedMetadataBlob::from(metadata_blob),
                 owner_principal: Some(bucket_info.owner_principal),
                 checksum: req.checksum,
+                encryption,
             })?;
 
             Ok(CreateMultipartUploadResult { upload_id })
@@ -6790,6 +7102,7 @@ impl Coordinator {
                     src_bucket,
                     src_key,
                     src_record.version_id,
+                    &src_record.encryption,
                 )?;
                 let body = ReadHandle::from_multipart_range(
                     self.read_runtime(),
@@ -6797,8 +7110,8 @@ impl Coordinator {
                     src_key,
                     src_record.generation_id,
                     obj_parts,
-                    read_start as usize,
-                    read_end as usize,
+                    (read_start as usize, read_end as usize),
+                    None,
                 );
                 drop(pgs);
                 #[cfg(test)]
@@ -6812,11 +7125,14 @@ impl Coordinator {
                     .map_err(ServerError::Metadata)?;
 
                 let body = ReadHandle::from_segments_range(
-                    self.read_runtime(),
-                    src_bucket,
-                    src_key,
-                    src_record.generation_id,
-                    segment_payloads_from_object_segments(segments),
+                    ReadObjectContext {
+                        runtime: self.read_runtime(),
+                        bucket: src_bucket,
+                        key: src_key,
+                        generation_id: src_record.generation_id,
+                        sse_customer_request: None,
+                    },
+                    segment_payloads_from_object_segments(segments, src_record.encryption.clone()),
                     read_start as usize,
                     read_end as usize,
                 );
@@ -6832,6 +7148,7 @@ impl Coordinator {
             upload_id,
             part_number,
             requester,
+            sse_customer: None,
         })?;
         let session_id = &session.session_id;
         let result = (|| {
@@ -6965,6 +7282,23 @@ impl Coordinator {
                 return Err(ServerError::NoSuchUpload {
                     upload_id: upload_id.to_string(),
                 });
+            }
+            match &upload.encryption {
+                ObjectEncryption::None => {
+                    if req.sse_customer.is_some() {
+                        return Err(ServerError::InvalidRequest {
+                            reason:
+                                "SSE-C headers may not be used for an unencrypted multipart upload"
+                                    .to_string(),
+                        });
+                    }
+                }
+                ObjectEncryption::SseCustomer(_) => {
+                    if upload.checksum.is_some() || req.sse_customer.is_some() {
+                        let _ = self
+                            .prepare_sse_customer_read_access(&upload.encryption, req.sse_customer)?;
+                    }
+                }
             }
 
             let checksum_algo = upload.checksum.map(MultipartChecksumConfig::algorithm);
@@ -7240,6 +7574,7 @@ impl Coordinator {
                 ec: EcShape { k: 0, m: 0 },
                 tags: upload.tags.clone(),
                 metadata_blob: Some(metadata_blob_bytes),
+                encryption: upload.encryption.clone(),
             };
 
             let object_parts: Vec<ObjectPartRecord> = part_records
@@ -7713,11 +8048,17 @@ pub mod test_helpers {
             upload_id: req.upload_id,
             part_number: req.part_number,
             requester: req.requester,
+            sse_customer: req.sse_customer,
         })?;
         let session_id = &session.session_id;
         let result = (|| {
             for (idx, chunk) in req.data.chunks(INTERNAL_SEGMENT_SIZE).enumerate() {
-                coord.append_stream_segment(req.bucket, req.key, session_id, idx as u32, chunk)?;
+                let data = if let Some(sse_customer) = session.sse_customer.as_ref() {
+                    sse_customer.encrypt_segment(idx as u32, chunk)?
+                } else {
+                    chunk.to_vec()
+                };
+                coord.append_stream_segment(req.bucket, req.key, session_id, idx as u32, &data)?;
             }
             let crc = checksum::crc64::checksum(req.data);
             let computed_checksum = {
@@ -7841,6 +8182,7 @@ mod tests {
             key,
             requester: TEST_REQUESTER,
             acl: NO_PUT_OBJECT_ACL,
+            encryption: ObjectEncryption::None,
         })
     }
 
@@ -7857,6 +8199,7 @@ mod tests {
             upload_id,
             part_number,
             requester: TEST_REQUESTER,
+            sse_customer: None,
         })
     }
 
@@ -8252,6 +8595,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -8278,6 +8622,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -8305,6 +8650,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -8319,6 +8665,7 @@ mod tests {
 
         let obj = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -8356,6 +8703,7 @@ mod tests {
             let res = test_helpers::put_object(
                 &writer,
                 &PutObjectRequest {
+                    sse_customer: None,
                     bucket: "bucket",
                     key: "key",
                     data: b"data",
@@ -8410,6 +8758,7 @@ mod tests {
                 tags: None,
                 checksum: None,
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             });
             tx.send(res).unwrap();
         });
@@ -8469,6 +8818,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: &key,
                 data: b"data",
@@ -8486,6 +8836,7 @@ mod tests {
 
         let head = coord
             .head_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: &key,
                 version_id: None,
@@ -8528,6 +8879,7 @@ mod tests {
         test_helpers::put_object(
             &admin,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: &key,
                 data: b"data",
@@ -8543,6 +8895,7 @@ mod tests {
         storage_node.remove_bucket_fast_path("bucket");
         reader
             .head_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: &key,
                 version_id: None,
@@ -8555,6 +8908,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let handle = thread::spawn(move || {
             let res = reader.head_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: &key,
                 version_id: None,
@@ -8598,6 +8952,7 @@ mod tests {
         test_helpers::put_object(
             &admin,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: &key,
                 data: b"data",
@@ -8613,6 +8968,7 @@ mod tests {
         storage_node.remove_bucket_fast_path("bucket");
         admin
             .head_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: &key,
                 version_id: None,
@@ -8643,6 +8999,7 @@ mod tests {
         assert!(!deleted.delete_marker);
         assert!(matches!(
             admin.get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: &key,
                 version_id: None,
@@ -8687,6 +9044,7 @@ mod tests {
                 parts: &parts,
                 claimed_checksum: None,
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             });
             tx.send(res).unwrap();
         });
@@ -8732,6 +9090,7 @@ mod tests {
         let result = test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "hello.txt",
                 data: b"Hello, world!",
@@ -8747,6 +9106,7 @@ mod tests {
 
         let obj = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "hello.txt",
                 version_id: None,
@@ -8774,6 +9134,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "obj",
                 data: b"{}",
@@ -8788,6 +9149,7 @@ mod tests {
 
         let obj = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "obj",
                 version_id: None,
@@ -8810,6 +9172,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -8824,6 +9187,7 @@ mod tests {
 
         let head = coord
             .head_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -8844,6 +9208,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"v1",
@@ -8858,6 +9223,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"v2",
@@ -8872,6 +9238,7 @@ mod tests {
 
         let obj = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -8891,6 +9258,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "empty",
                 data: b"",
@@ -8905,6 +9273,7 @@ mod tests {
 
         let obj = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "empty",
                 version_id: None,
@@ -8925,6 +9294,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -8948,6 +9318,7 @@ mod tests {
 
         let err = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -8967,6 +9338,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"simple-data",
@@ -9032,6 +9404,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "a/1",
                 data: b"1",
@@ -9046,6 +9419,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "a/2",
                 data: b"2",
@@ -9060,6 +9434,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "b/1",
                 data: b"3",
@@ -9098,6 +9473,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "photos/cat.jpg",
                 data: b"cat",
@@ -9112,6 +9488,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "photos/dog.jpg",
                 data: b"dog",
@@ -9126,6 +9503,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "docs/readme.md",
                 data: b"md",
@@ -9160,6 +9538,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "photos/cat.jpg",
                 data: b"cat",
@@ -9174,6 +9553,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "photos/dog.jpg",
                 data: b"dog",
@@ -9188,6 +9568,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "docs/readme.md",
                 data: b"md",
@@ -9202,6 +9583,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "root.txt",
                 data: b"root",
@@ -9239,6 +9621,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "folder/",
                 data: b"data",
@@ -9253,6 +9636,7 @@ mod tests {
 
         let obj = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "folder/",
                 version_id: None,
@@ -9387,6 +9771,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "resilient",
                 data,
@@ -9405,6 +9790,7 @@ mod tests {
         // Get should still succeed via EC reconstruction
         let obj = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "resilient",
                 version_id: None,
@@ -9425,6 +9811,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "obj1",
                 data,
@@ -9441,6 +9828,7 @@ mod tests {
 
         let obj = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "obj1",
                 version_id: None,
@@ -9461,6 +9849,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "obj-reconstruct",
                 data: &data,
@@ -9479,6 +9868,7 @@ mod tests {
 
         let first = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "obj-reconstruct",
                 version_id: None,
@@ -9491,6 +9881,7 @@ mod tests {
 
         let second = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "obj-reconstruct",
                 version_id: None,
@@ -9513,6 +9904,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "obj2",
                 data,
@@ -9531,6 +9923,7 @@ mod tests {
 
         let obj = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "obj2",
                 version_id: None,
@@ -9552,6 +9945,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "obj3",
                 data,
@@ -9571,6 +9965,7 @@ mod tests {
 
         let obj = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "obj3",
                 version_id: None,
@@ -9593,6 +9988,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "obj4",
                 data,
@@ -9609,6 +10005,7 @@ mod tests {
 
         let obj = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "obj4",
                 version_id: None,
@@ -9629,6 +10026,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "obj5",
                 data,
@@ -9647,6 +10045,7 @@ mod tests {
         // Range get should still succeed via EC reconstruction
         let result = coord
             .get_object_range(&GetObjectRangeRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "obj5",
                 version_id: None,
@@ -9669,6 +10068,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "obj6",
                 data,
@@ -9686,6 +10086,7 @@ mod tests {
 
         let obj = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "obj6",
                 version_id: None,
@@ -9706,6 +10107,7 @@ mod tests {
         let put = test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "obj7",
                 data,
@@ -9732,6 +10134,7 @@ mod tests {
 
         let obj = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "obj7",
                 version_id: None,
@@ -9759,6 +10162,7 @@ mod tests {
         let put = test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "obj8",
                 data,
@@ -9786,6 +10190,7 @@ mod tests {
 
         let obj = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "obj8",
                 version_id: None,
@@ -9811,6 +10216,7 @@ mod tests {
         let err = test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "no-such-bucket",
                 key: "key",
                 data: b"data",
@@ -9833,6 +10239,7 @@ mod tests {
         coord.create_bucket("bucket").unwrap();
         let err = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "no-such-key",
                 version_id: None,
@@ -9852,6 +10259,7 @@ mod tests {
         let result = test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -9866,6 +10274,7 @@ mod tests {
 
         let obj = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -9877,6 +10286,7 @@ mod tests {
 
         let head = coord
             .head_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -9896,6 +10306,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "a/1",
                 data: b"1",
@@ -9910,6 +10321,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "a/2",
                 data: b"2",
@@ -9924,6 +10336,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "b/1",
                 data: b"3",
@@ -9938,6 +10351,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "c/1",
                 data: b"4",
@@ -9952,6 +10366,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "root.txt",
                 data: b"5",
@@ -10013,6 +10428,7 @@ mod tests {
             test_helpers::put_object(
                 &coord,
                 &PutObjectRequest {
+                    sse_customer: None,
                     bucket: "bucket",
                     key: &key,
                     data: b"data",
@@ -10050,6 +10466,7 @@ mod tests {
         let err = test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "no-bucket",
                 key: "key",
                 data: b"data",
@@ -10084,6 +10501,7 @@ mod tests {
             test_helpers::put_object(
                 &coord,
                 &PutObjectRequest {
+                    sse_customer: None,
                     bucket: "bucket",
                     key: &key,
                     data: b"data",
@@ -10124,6 +10542,7 @@ mod tests {
             test_helpers::put_object(
                 &coord,
                 &PutObjectRequest {
+                    sse_customer: None,
                     bucket: "bucket",
                     key: &key,
                     data: b"data",
@@ -10192,6 +10611,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "photos/2024/jan.jpg",
                 data: b"j",
@@ -10206,6 +10626,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "photos/2024/feb.jpg",
                 data: b"f",
@@ -10220,6 +10641,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "photos/2025/mar.jpg",
                 data: b"m",
@@ -10234,6 +10656,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "photos/top.jpg",
                 data: b"t",
@@ -10275,6 +10698,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "only-one",
                 data: b"data",
@@ -10311,6 +10735,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key1",
                 data: b"data",
@@ -10348,6 +10773,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "a/1",
                 data: b"data",
@@ -10402,6 +10828,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key1",
                 data: b"data1",
@@ -10416,6 +10843,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key2",
                 data: b"data2",
@@ -10458,6 +10886,7 @@ mod tests {
         // Verify objects are actually gone
         assert!(coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key1",
                 version_id: None,
@@ -10467,6 +10896,7 @@ mod tests {
             .is_err());
         assert!(coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key2",
                 version_id: None,
@@ -10523,6 +10953,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -10544,6 +10975,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidRequest { .. }));
@@ -10622,6 +11054,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"Hello, World!",
@@ -10637,6 +11070,7 @@ mod tests {
         // bytes=0-4 → "Hello"
         let result = coord
             .get_object_range(&GetObjectRangeRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -10660,6 +11094,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"Hello, World!",
@@ -10675,6 +11110,7 @@ mod tests {
         // bytes=-6 → "World!"  (last 6 bytes)
         let result = coord
             .get_object_range(&GetObjectRangeRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -10697,6 +11133,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"Hello, World!",
@@ -10712,6 +11149,7 @@ mod tests {
         // bytes=7- → "World!"
         let result = coord
             .get_object_range(&GetObjectRangeRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -10732,6 +11170,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"Hello",
@@ -10747,6 +11186,7 @@ mod tests {
         // bytes=100- → unsatisfiable
         let err = coord
             .get_object_range(&GetObjectRangeRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -10767,6 +11207,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"Hello",
@@ -10782,6 +11223,7 @@ mod tests {
         // bytes=0-99999 on 5-byte object → clamp to 0-4
         let result = coord
             .get_object_range(&GetObjectRangeRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -10810,6 +11252,7 @@ mod tests {
         let result = test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "new-key",
                 data: b"data",
@@ -10832,6 +11275,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"v1",
@@ -10848,6 +11292,7 @@ mod tests {
         let err = test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"v2",
@@ -10871,6 +11316,7 @@ mod tests {
         let r1 = test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"v1",
@@ -10886,6 +11332,7 @@ mod tests {
         let r2 = test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"v2",
@@ -10901,6 +11348,7 @@ mod tests {
 
         let obj = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -10920,6 +11368,7 @@ mod tests {
         let r1 = test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"v1",
@@ -10935,6 +11384,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"v2",
@@ -10951,6 +11401,7 @@ mod tests {
         let err = test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"v3",
@@ -10974,6 +11425,7 @@ mod tests {
         let err = test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -11004,6 +11456,7 @@ mod tests {
         let err = test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -11074,6 +11527,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -11102,6 +11556,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -11159,6 +11614,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"secret",
@@ -11173,6 +11629,7 @@ mod tests {
 
         let err = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -11193,6 +11650,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"public",
@@ -11207,6 +11665,7 @@ mod tests {
 
         let obj = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -11261,6 +11720,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -11319,6 +11779,7 @@ mod tests {
                 tags: None,
                 checksum: None,
                 requester: Requester::principal("other-user"),
+                sse_customer: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -11340,6 +11801,7 @@ mod tests {
                 tags: None,
                 checksum: None,
                 requester: Requester::principal("owner-a"),
+                sse_customer: None,
             })
             .unwrap();
 
@@ -11353,6 +11815,7 @@ mod tests {
                 data: b"data",
                 claimed_checksum: None,
                 requester: Requester::principal("other-user"),
+                sse_customer: None,
             },
         )
         .unwrap_err();
@@ -11375,6 +11838,7 @@ mod tests {
                 tags: None,
                 checksum: None,
                 requester: Requester::principal("owner-a"),
+                sse_customer: None,
             })
             .unwrap();
 
@@ -11386,6 +11850,7 @@ mod tests {
                 parts: &[],
                 claimed_checksum: None,
                 requester: Requester::principal("other-user"),
+                sse_customer: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -11407,6 +11872,7 @@ mod tests {
                 tags: None,
                 checksum: None,
                 requester: Requester::principal("owner-a"),
+                sse_customer: None,
             })
             .unwrap();
 
@@ -11435,6 +11901,7 @@ mod tests {
                 key: "key",
                 requester: Requester::principal("other-user"),
                 acl: NO_PUT_OBJECT_ACL,
+                encryption: ObjectEncryption::None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -11456,6 +11923,7 @@ mod tests {
                 tags: None,
                 checksum: None,
                 requester: Requester::principal("owner-a"),
+                sse_customer: None,
             })
             .unwrap();
 
@@ -11466,6 +11934,7 @@ mod tests {
                 upload_id: &upload.upload_id,
                 part_number: 1,
                 requester: Requester::principal("other-user"),
+                sse_customer: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -11492,6 +11961,7 @@ mod tests {
                 key: "key",
                 requester: Requester::principal("owner-a"),
                 acl: PutObjectAcl::Other("public-read"),
+                encryption: ObjectEncryption::None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessControlListNotSupported));
@@ -11506,6 +11976,7 @@ mod tests {
         let put = test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -11523,6 +11994,7 @@ mod tests {
         };
         let obj = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -11541,6 +12013,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -11559,6 +12032,7 @@ mod tests {
         };
         let err = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -11578,6 +12052,7 @@ mod tests {
         let put = test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -11595,6 +12070,7 @@ mod tests {
         };
         let err = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -11614,6 +12090,7 @@ mod tests {
         let put = test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -11631,6 +12108,7 @@ mod tests {
         };
         let err = coord
             .head_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -11650,6 +12128,7 @@ mod tests {
         let put = test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -11673,6 +12152,7 @@ mod tests {
             .unwrap();
         assert!(coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -11690,6 +12170,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -11724,6 +12205,7 @@ mod tests {
         let p1 = test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key1",
                 data: b"data1",
@@ -11738,6 +12220,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key2",
                 data: b"data2",
@@ -11785,6 +12268,7 @@ mod tests {
         let put = test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"Hello, World!",
@@ -11802,6 +12286,7 @@ mod tests {
         };
         let result = coord
             .get_object_range(&GetObjectRangeRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -11825,6 +12310,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "src",
                 data: b"hello copy",
@@ -11858,6 +12344,7 @@ mod tests {
 
         let obj = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "dst",
                 version_id: None,
@@ -11882,6 +12369,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "src-bucket",
                 key: "src",
                 data: b"private",
@@ -11929,6 +12417,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "src",
                 data: b"data",
@@ -11974,6 +12463,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "src",
                 data: b"data",
@@ -12006,6 +12496,7 @@ mod tests {
 
         let obj = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "dst",
                 version_id: None,
@@ -12030,6 +12521,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "src",
                 data: b"data",
@@ -12067,6 +12559,7 @@ mod tests {
 
         let obj = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "dst",
                 version_id: None,
@@ -12091,6 +12584,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -12128,6 +12622,7 @@ mod tests {
 
         let obj = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -12150,6 +12645,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "src",
                 data: b"data",
@@ -12182,6 +12678,7 @@ mod tests {
 
         let obj = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "dst",
                 version_id: None,
@@ -12205,6 +12702,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "src",
                 data: b"data",
@@ -12237,6 +12735,7 @@ mod tests {
 
         let obj = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "dst",
                 version_id: None,
@@ -12258,6 +12757,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "src",
                 data: b"hello",
@@ -12296,6 +12796,7 @@ mod tests {
 
         let obj = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "dst",
                 version_id: None,
@@ -12321,6 +12822,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "src",
                 data,
@@ -12357,6 +12859,7 @@ mod tests {
 
         let obj = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "dst",
                 version_id: None,
@@ -12422,6 +12925,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "src",
                 data: b"data",
@@ -12462,6 +12966,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "src",
                 data: b"data",
@@ -12507,6 +13012,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "src",
                 data: b"data",
@@ -12521,6 +13027,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "dst",
                 data: b"existing",
@@ -12563,6 +13070,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "src",
                 data: b"new data",
@@ -12577,6 +13085,7 @@ mod tests {
         let existing = test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "dst",
                 data: b"old data",
@@ -12611,6 +13120,7 @@ mod tests {
 
         let obj = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "dst",
                 version_id: None,
@@ -12632,6 +13142,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "src-bucket",
                 key: "key",
                 data: b"cross bucket data",
@@ -12664,6 +13175,7 @@ mod tests {
 
         let obj = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "dst-bucket",
                 key: "key",
                 version_id: None,
@@ -12677,6 +13189,7 @@ mod tests {
         // Source should still exist
         let src = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "src-bucket",
                 key: "key",
                 version_id: None,
@@ -12814,6 +13327,7 @@ mod tests {
         let result = test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -12837,6 +13351,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -12850,6 +13365,7 @@ mod tests {
         .unwrap();
         let obj = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -12869,6 +13385,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -12882,6 +13399,7 @@ mod tests {
         .unwrap();
         let head = coord
             .head_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -12931,6 +13449,7 @@ mod tests {
                 test_helpers::put_object(
                     &coord_a,
                     &PutObjectRequest {
+                        sse_customer: None,
                         bucket: "bucket",
                         key: &key_a,
                         data: b"v1",
@@ -12947,6 +13466,7 @@ mod tests {
                 test_helpers::put_object(
                     &coord_b,
                     &PutObjectRequest {
+                        sse_customer: None,
                         bucket: "bucket",
                         key: &key_b,
                         data: b"v2",
@@ -12996,6 +13516,7 @@ mod tests {
         test_helpers::put_object(
             &admin,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: &vec![b'A'; object_size],
@@ -13024,6 +13545,7 @@ mod tests {
                 test_helpers::put_object(
                     &writer,
                     &PutObjectRequest {
+                        sse_customer: None,
                         bucket: "bucket",
                         key: "key",
                         data: &new_payload,
@@ -13038,6 +13560,7 @@ mod tests {
             let t_read = thread::spawn(move || {
                 b2.wait();
                 reader.get_object(&GetObjectRequest {
+                    sse_customer: None,
                     bucket: "bucket",
                     key: "key",
                     version_id: None,
@@ -13092,6 +13615,7 @@ mod tests {
         test_helpers::put_object(
             &admin,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "src-bucket",
                 key: "src",
                 data: &vec![b'A'; object_size],
@@ -13122,6 +13646,7 @@ mod tests {
                 test_helpers::put_object(
                     &writer,
                     &PutObjectRequest {
+                        sse_customer: None,
                         bucket: "src-bucket",
                         key: "src",
                         data: &new_payload,
@@ -13168,6 +13693,7 @@ mod tests {
 
             let copied_obj = admin
                 .get_object(&GetObjectRequest {
+                    sse_customer: None,
                     bucket: "dst-bucket",
                     key: &dst_key,
                     version_id: None,
@@ -13210,6 +13736,7 @@ mod tests {
         test_helpers::put_object(
             &admin,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "src",
                 data: &vec![b'A'; object_size],
@@ -13235,6 +13762,7 @@ mod tests {
                     tags: None,
                     checksum: None,
                     requester: TEST_REQUESTER,
+                    sse_customer: None,
                 })
                 .unwrap();
             let dst_key_for_copy = dst_key.clone();
@@ -13251,6 +13779,7 @@ mod tests {
                 test_helpers::put_object(
                     &writer,
                     &PutObjectRequest {
+                        sse_customer: None,
                         bucket: "bucket",
                         key: "src",
                         data: &new_payload,
@@ -13301,6 +13830,7 @@ mod tests {
                         etag: copy_res.etag,
                         checksum: None,
                     }],
+                    sse_customer: None,
                     claimed_checksum: None,
                     requester: TEST_REQUESTER,
                 })
@@ -13308,6 +13838,7 @@ mod tests {
 
             let copied_obj = admin
                 .get_object(&GetObjectRequest {
+                    sse_customer: None,
                     bucket: "bucket",
                     key: &dst_key,
                     version_id: None,
@@ -13350,6 +13881,7 @@ mod tests {
         test_helpers::put_object(
             &admin,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: &vec![b'A'; object_size],
@@ -13377,6 +13909,7 @@ mod tests {
                 test_helpers::put_object(
                     &writer,
                     &PutObjectRequest {
+                        sse_customer: None,
                         bucket: "bucket",
                         key: "key",
                         data: &payload,
@@ -13414,6 +13947,7 @@ mod tests {
             );
 
             let check = make_coord().get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -13467,6 +14001,7 @@ mod tests {
         let t_read = thread::spawn(move || {
             reader
                 .get_object(&GetObjectRequest {
+                    sse_customer: None,
                     bucket: "race-bucket",
                     key: &read_key,
                     version_id: None,
@@ -13535,6 +14070,7 @@ mod tests {
         let t_read = thread::spawn(move || {
             reader
                 .get_object_part(&GetObjectPartRequest {
+                    sse_customer: None,
                     bucket: "race-bucket",
                     key: &read_key,
                     version_id: None,
@@ -13625,6 +14161,7 @@ mod tests {
         let t_read = thread::spawn(move || {
             reader
                 .get_object(&GetObjectRequest {
+                    sse_customer: None,
                     bucket: "race-bucket",
                     key: &read_key,
                     version_id: None,
@@ -13686,6 +14223,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -13803,6 +14341,7 @@ mod tests {
 
         let dst = admin
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "dst-bucket",
                 key: "copied",
                 version_id: None,
@@ -13822,6 +14361,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -13864,6 +14404,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -13888,6 +14429,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
         let r2 = coord
@@ -13899,6 +14441,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
         assert_ne!(r1.upload_id, r2.upload_id);
@@ -13919,6 +14462,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
@@ -13960,6 +14504,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
         let r2 = coord
@@ -13971,6 +14516,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -14011,6 +14557,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
         let r2 = coord
@@ -14022,6 +14569,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -14066,6 +14614,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
         coord
@@ -14077,6 +14626,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
         coord
@@ -14088,6 +14638,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -14141,6 +14692,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
         coord
@@ -14152,6 +14704,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
         coord
@@ -14163,6 +14716,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -14196,6 +14750,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -14254,6 +14809,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -14287,6 +14843,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -14355,6 +14912,7 @@ mod tests {
         test_helpers::put_object(
             &admin,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"hello world",
@@ -14369,6 +14927,7 @@ mod tests {
 
         let held_read = admin
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -14463,6 +15022,7 @@ mod tests {
                     checksum: None,
 
                     requester: TEST_REQUESTER,
+                    sse_customer: None,
                 })
                 .unwrap();
             upload_ids.push(r.upload_id);
@@ -14532,6 +15092,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -14546,6 +15107,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             },
         )
         .unwrap();
@@ -14589,6 +15151,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -14604,6 +15167,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             },
         )
         .unwrap();
@@ -14620,6 +15184,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             },
         )
         .unwrap();
@@ -14651,6 +15216,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -14665,6 +15231,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             },
         )
         .unwrap_err();
@@ -14687,6 +15254,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -14701,6 +15269,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             },
         )
         .unwrap_err();
@@ -14724,6 +15293,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             },
         )
         .unwrap_err();
@@ -14746,6 +15316,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -14760,6 +15331,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             },
         )
         .unwrap();
@@ -14774,6 +15346,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             },
         )
         .unwrap();
@@ -14788,6 +15361,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             },
         )
         .unwrap();
@@ -14825,6 +15399,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -14841,6 +15416,7 @@ mod tests {
                     data: data.as_bytes(),
                     claimed_checksum: None,
                     requester: TEST_REQUESTER,
+                    sse_customer: None,
                 },
             )
             .unwrap();
@@ -14869,6 +15445,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -14884,6 +15461,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             },
         )
         .unwrap();
@@ -14899,6 +15477,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             },
         )
         .unwrap();
@@ -14925,6 +15504,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -14940,6 +15520,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             },
         )
         .unwrap_err();
@@ -14958,6 +15539,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             },
         )
         .unwrap_err();
@@ -14980,6 +15562,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -14996,6 +15579,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             },
         )
         .unwrap()
@@ -15011,6 +15595,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             },
         )
         .unwrap()
@@ -15026,6 +15611,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             },
         )
         .unwrap()
@@ -15063,6 +15649,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
         let mut complete_parts = Vec::new();
@@ -15077,6 +15664,7 @@ mod tests {
                     data,
                     claimed_checksum: None,
                     requester: TEST_REQUESTER,
+                    sse_customer: None,
                 },
             )
             .unwrap();
@@ -15111,6 +15699,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -15161,6 +15750,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -15223,6 +15813,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidPart { part_number: 2 }));
@@ -15249,6 +15840,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidPart { part_number: 1 }));
@@ -15274,6 +15866,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidPartOrder));
@@ -15302,6 +15895,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap_err();
         assert!(matches!(
@@ -15328,6 +15922,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
         assert!(result.etag.ends_with("-1\""));
@@ -15349,6 +15944,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -15361,6 +15957,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidRequest { .. }));
@@ -15386,6 +15983,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::EntityTooSmall { .. }));
@@ -15403,6 +16001,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             },
         )
         .unwrap();
@@ -15424,6 +16023,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
         assert!(result.etag.ends_with("-2\""));
@@ -15449,6 +16049,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidPartOrder));
@@ -15472,6 +16073,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
         assert!(result1.etag.ends_with("-1\""));
@@ -15493,6 +16095,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
         assert!(result2.etag.ends_with("-2\""));
@@ -15529,6 +16132,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -15572,6 +16176,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -15627,6 +16232,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             },
         )
         .unwrap_err();
@@ -15686,6 +16292,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -15733,6 +16340,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -15769,6 +16377,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -15818,6 +16427,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
         test_helpers::upload_part(
@@ -15831,6 +16441,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             },
         )
         .unwrap();
@@ -15856,6 +16467,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             },
         )
         .unwrap_err();
@@ -15987,6 +16599,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -16044,6 +16657,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -16059,6 +16673,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             },
         )
         .unwrap();
@@ -16073,6 +16688,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             },
         )
         .unwrap();
@@ -16108,6 +16724,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
         test_helpers::upload_part(
@@ -16121,6 +16738,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             },
         )
         .unwrap();
@@ -16164,6 +16782,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -16216,6 +16835,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
         let mut complete_parts = Vec::new();
@@ -16231,6 +16851,7 @@ mod tests {
                     claimed_checksum: None,
 
                     requester: TEST_REQUESTER,
+                    sse_customer: None,
                 },
             )
             .unwrap();
@@ -16249,6 +16870,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap()
     }
@@ -16268,6 +16890,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -16283,6 +16906,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             },
         )
         .unwrap();
@@ -16324,6 +16948,7 @@ mod tests {
                         checksum: None,
                     },
                 ],
+                sse_customer: None,
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
@@ -16349,6 +16974,7 @@ mod tests {
 
         let obj = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -16372,6 +16998,7 @@ mod tests {
 
         let obj = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -16397,6 +17024,7 @@ mod tests {
 
         let head = coord
             .head_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -16423,6 +17051,7 @@ mod tests {
         // Range within first part: bytes 10-19
         let range = coord
             .get_object_range(&GetObjectRangeRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -16457,6 +17086,7 @@ mod tests {
         let boundary = MIN_PART as u64;
         let range = coord
             .get_object_range(&GetObjectRangeRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -16487,6 +17117,7 @@ mod tests {
         // Suffix range: last 50 bytes (all within part2)
         let range = coord
             .get_object_range(&GetObjectRangeRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -16533,6 +17164,7 @@ mod tests {
         // Destination should have the concatenated data as inline object.
         let dst = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "dst-bucket",
                 key: "dst-key",
                 version_id: None,
@@ -16553,6 +17185,7 @@ mod tests {
 
         let obj = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -16577,6 +17210,7 @@ mod tests {
 
         let obj = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -16598,6 +17232,7 @@ mod tests {
 
         let result = coord
             .get_object_part(&GetObjectPartRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -16626,6 +17261,7 @@ mod tests {
         // Part 1 should return full data
         let result = coord
             .get_object_part(&GetObjectPartRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -16642,6 +17278,7 @@ mod tests {
         // Part 2 (zero-byte) should return empty data
         let result = coord
             .get_object_part(&GetObjectPartRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -16666,6 +17303,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"hello world",
@@ -16681,6 +17319,7 @@ mod tests {
         // partNumber=1 on non-multipart object returns the full object.
         let result = coord
             .head_object_part(&GetObjectPartRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -16697,6 +17336,7 @@ mod tests {
         // partNumber=2 on non-multipart object returns InvalidPart.
         let err = coord
             .head_object_part(&GetObjectPartRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -16717,6 +17357,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"",
@@ -16731,6 +17372,7 @@ mod tests {
 
         let result = coord
             .head_object_part(&GetObjectPartRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -16754,6 +17396,7 @@ mod tests {
 
         let head = coord
             .head_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -16793,6 +17436,7 @@ mod tests {
 
         let dst = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "dst",
                 key: "key",
                 version_id: None,
@@ -16831,6 +17475,7 @@ mod tests {
 
         let err = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -16872,6 +17517,7 @@ mod tests {
                 checksum: Some(MultipartChecksumConfig::new(algo, ctype).unwrap()),
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
         let mut complete_parts = Vec::new();
@@ -16889,6 +17535,7 @@ mod tests {
                     data,
                     claimed_checksum: Some(&claim),
                     requester: TEST_REQUESTER,
+                    sse_customer: None,
                 },
             )
             .unwrap();
@@ -16929,6 +17576,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -16977,6 +17625,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -17019,6 +17668,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -17060,6 +17710,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -17105,6 +17756,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -17154,6 +17806,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap_err();
         assert!(
@@ -17182,6 +17835,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -17225,6 +17879,7 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap_err();
         assert!(
@@ -17280,6 +17935,7 @@ mod tests {
         // Verify object is visible via head_object.
         let head = coord
             .head_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "mykey",
                 version_id: None,
@@ -17320,6 +17976,7 @@ mod tests {
 
         let head = coord
             .head_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "mykey",
                 version_id: None,
@@ -17359,6 +18016,7 @@ mod tests {
 
         let obj = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "mykey",
                 version_id: None,
@@ -17388,6 +18046,7 @@ mod tests {
         // Object should not exist.
         let err = coord
             .head_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "mykey",
                 version_id: None,
@@ -17542,6 +18201,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"old-data",
@@ -17580,6 +18240,7 @@ mod tests {
         // Head should show the new object.
         let head = coord
             .head_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -17600,6 +18261,7 @@ mod tests {
         let initial = test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"initial",
@@ -17767,6 +18429,7 @@ mod tests {
         // HEAD works (metadata-only).
         let head = coord
             .head_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -17779,6 +18442,7 @@ mod tests {
         // GET returns the correct data.
         let result = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -17825,6 +18489,7 @@ mod tests {
 
         let result = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -17846,6 +18511,7 @@ mod tests {
             ec_config,
             pg_topology: PgTopology::new(&[0]).unwrap(),
             payload_buffer_pool: PayloadBufferPool::new(ec_config),
+            sse_c_validator: None,
         };
 
         let data = vec![1u8, 2, 3, 4];
@@ -17858,6 +18524,7 @@ mod tests {
             segments: vec![],
             next_segment_index: 0,
             loaded_segment: Some((Arc::new(SharedPayloadBuffer::from_unpooled(data)), 0, len)),
+            sse_customer_request: None,
         };
 
         let chunk = reader.next_chunk(len).unwrap().unwrap();
@@ -17895,6 +18562,7 @@ mod tests {
 
         let first = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -17907,6 +18575,7 @@ mod tests {
 
         let second = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -17951,6 +18620,7 @@ mod tests {
         // Range within first segment.
         let r1 = coord
             .get_object_range(&GetObjectRangeRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -17964,6 +18634,7 @@ mod tests {
         // Range spanning segments.
         let r2 = coord
             .get_object_range(&GetObjectRangeRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -17977,6 +18648,7 @@ mod tests {
         // Range within second segment.
         let r3 = coord
             .get_object_range(&GetObjectRangeRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -17990,6 +18662,7 @@ mod tests {
         // Suffix range.
         let r4 = coord
             .get_object_range(&GetObjectRangeRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -18059,6 +18732,7 @@ mod tests {
 
         let result = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "dst",
                 version_id: None,
@@ -18078,6 +18752,7 @@ mod tests {
         let result = test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"tiny-data",
@@ -18101,6 +18776,7 @@ mod tests {
 
         let get = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -18121,6 +18797,7 @@ mod tests {
         let result = test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "exact",
                 data: &data,
@@ -18153,6 +18830,7 @@ mod tests {
         let result = test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: &data,
@@ -18182,6 +18860,7 @@ mod tests {
 
         let get = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -18202,6 +18881,7 @@ mod tests {
         let first = test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: &old_data,
@@ -18225,6 +18905,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"new-data",
@@ -18275,6 +18956,7 @@ mod tests {
 
         let result = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "empty",
                 version_id: None,
@@ -18313,6 +18995,7 @@ mod tests {
 
         let result = coord
             .get_object_part(&GetObjectPartRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -18354,6 +19037,7 @@ mod tests {
         // Verify stream-put is readable.
         let r1 = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -18367,6 +19051,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 data: b"normal-data",
@@ -18382,6 +19067,7 @@ mod tests {
         // GET should return the new data, not stale segment data.
         let r2 = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -18431,6 +19117,7 @@ mod tests {
         // Object should be gone.
         let err = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -18532,6 +19219,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -18598,6 +19286,7 @@ mod tests {
                     MultipartChecksumConfig::new(ChecksumAlgorithm::Crc32c, None).unwrap(),
                 ),
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -18653,6 +19342,7 @@ mod tests {
                         .unwrap(),
                     ),
                 }],
+                sse_customer: None,
                 claimed_checksum: None,
                 requester: TEST_REQUESTER,
             })
@@ -18660,6 +19350,7 @@ mod tests {
 
         let copied = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "dst",
                 version_id: None,
@@ -18679,6 +19370,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "src",
                 data: b"source-data",
@@ -18700,6 +19392,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -18808,6 +19501,7 @@ mod tests {
                 upload_id: UploadId::from("mpu-123"),
                 part_number: 1,
             },
+            encryption: storage::ObjectEncryption::None,
         })
         .unwrap();
         drop(pg);
@@ -18855,6 +19549,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -18911,6 +19606,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -18969,6 +19665,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -19009,6 +19706,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
         let mpu_b = coord
@@ -19020,6 +19718,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -19069,12 +19768,14 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
         // Read back A's data — should be A's content.
         let obj_a = coord
             .get_object_part(&GetObjectPartRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -19099,12 +19800,14 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
         // Read back B's data — should be B's content, not A's.
         let obj_b = coord
             .get_object_part(&GetObjectPartRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -19142,6 +19845,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -19299,6 +20003,7 @@ mod tests {
         // Object should still be readable.
         let result = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
@@ -19324,6 +20029,7 @@ mod tests {
         // Key should not exist yet.
         let err = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "new-key",
                 version_id: None,
@@ -19336,6 +20042,7 @@ mod tests {
         // HEAD should also fail.
         let err = coord
             .head_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "new-key",
                 version_id: None,
@@ -19403,6 +20110,7 @@ mod tests {
         // Verify full readback via coordinator.
         let result = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "verify",
                 version_id: None,
@@ -19426,6 +20134,7 @@ mod tests {
         let put = test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "bad-segment-crc",
                 data: b"segment-data",
@@ -19464,6 +20173,7 @@ mod tests {
                         layout: live.layout,
                         tags: live.tags.clone(),
                         metadata_blob: live.metadata_blob.clone(),
+                        encryption: storage::ObjectEncryption::None,
                     },
                     &segments,
                 )
@@ -19472,6 +20182,7 @@ mod tests {
 
         let result = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "bad-segment-crc",
                 version_id: None,
@@ -19527,6 +20238,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "cycle",
                 data: b"v2-normal",
@@ -19542,6 +20254,7 @@ mod tests {
         // 4. GET should return normal-put data, no object segments interference.
         let result = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "cycle",
                 version_id: None,
@@ -19597,6 +20310,7 @@ mod tests {
 
         let result = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
                 bucket: "bucket",
                 key: "key",
                 version_id: None,

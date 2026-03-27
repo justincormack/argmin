@@ -28,6 +28,7 @@ fn shard_and_metadata_roundtrip() {
         layout: ObjectLayout::Standard,
         tags: None,
         metadata_blob: None,
+        encryption: ObjectEncryption::None,
     });
     store.put_object_meta(&req).unwrap();
 
@@ -127,6 +128,7 @@ fn full_lifecycle() {
         layout: ObjectLayout::Standard,
         tags: None,
         metadata_blob: None,
+        encryption: ObjectEncryption::None,
     }))
     .unwrap();
 
@@ -178,6 +180,7 @@ fn pg_store_persistence() {
                 layout: ObjectLayout::Standard,
                 tags: None,
                 metadata_blob: None,
+                encryption: ObjectEncryption::None,
             }))
             .unwrap();
     }
@@ -224,6 +227,7 @@ fn multipart_upload_lifecycle() {
             metadata_blob: vec![].into(),
             owner_principal: Some("owner".into()),
             checksum: None,
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
 
@@ -295,6 +299,7 @@ fn multipart_upload_lifecycle() {
         ec: EcShape { k: 4, m: 2 },
         tags: None,
         metadata_blob: Some(vec![].into()),
+        encryption: ObjectEncryption::None,
     };
     let committed_parts = vec![
         ObjectPartRecord {
@@ -383,6 +388,7 @@ fn streaming_put_object_lifecycle() {
             bucket: "b".into(),
             key: "k".into(),
             target: StreamUploadTarget::PutObject,
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
 
@@ -462,6 +468,7 @@ fn streaming_put_object_lifecycle() {
                 ec: EcShape { k: 4, m: 2 },
                 tags: None,
                 metadata_blob: None,
+                encryption: ObjectEncryption::None,
             },
             &committed_segments,
         )
@@ -511,6 +518,7 @@ fn streaming_upload_part_lifecycle() {
             metadata_blob: vec![].into(),
             owner_principal: None,
             checksum: None,
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
 
@@ -530,6 +538,7 @@ fn streaming_upload_part_lifecycle() {
                 upload_id: "mpu-sp".into(),
                 part_number: 1,
             },
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
 
@@ -656,6 +665,7 @@ fn versioned_object_lifecycle() {
                 layout: ObjectLayout::Standard,
                 tags: None,
                 metadata_blob: None,
+                encryption: ObjectEncryption::None,
             }))
             .unwrap();
     }
@@ -745,6 +755,7 @@ fn object_overwrite_with_reclaim() {
             layout: ObjectLayout::Standard,
             tags: None,
             metadata_blob: None,
+            encryption: ObjectEncryption::None,
         }))
         .unwrap();
 
@@ -776,6 +787,7 @@ fn object_overwrite_with_reclaim() {
             layout: ObjectLayout::Standard,
             tags: None,
             metadata_blob: None,
+            encryption: ObjectEncryption::None,
         }))
         .unwrap();
 
@@ -847,6 +859,7 @@ fn bucket_deletion_lifecycle() {
             layout: ObjectLayout::Standard,
             tags: None,
             metadata_blob: None,
+            encryption: ObjectEncryption::None,
         }))
         .unwrap();
 
@@ -907,6 +920,7 @@ fn multipart_abort_cleanup() {
             metadata_blob: vec![].into(),
             owner_principal: None,
             checksum: None,
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
 
@@ -1024,6 +1038,7 @@ fn object_tags_through_overwrite_and_versioned_delete() {
             layout: ObjectLayout::Standard,
             tags: Some("<t>old</t>".into()),
             metadata_blob: None,
+            encryption: ObjectEncryption::None,
         }))
         .unwrap();
 
@@ -1043,6 +1058,7 @@ fn object_tags_through_overwrite_and_versioned_delete() {
             layout: ObjectLayout::Standard,
             tags: None,
             metadata_blob: None,
+            encryption: ObjectEncryption::None,
         }))
         .unwrap();
 
@@ -1070,6 +1086,7 @@ fn object_tags_through_overwrite_and_versioned_delete() {
                 layout: ObjectLayout::Standard,
                 tags: Some(tag.into()),
                 metadata_blob: None,
+                encryption: ObjectEncryption::None,
             }))
             .unwrap();
     }
@@ -1126,6 +1143,7 @@ fn persistence_complex_state_through_reopen() {
                 bucket: "b".into(),
                 key: "k1".into(),
                 target: StreamUploadTarget::PutObject,
+                encryption: ObjectEncryption::None,
             })
             .unwrap();
 
@@ -1154,6 +1172,7 @@ fn persistence_complex_state_through_reopen() {
                 metadata_blob: vec![].into(),
                 owner_principal: Some("owner".into()),
                 checksum: None,
+                encryption: ObjectEncryption::None,
             })
             .unwrap();
 

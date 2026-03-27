@@ -12,6 +12,8 @@ use md5_legacy::Digest;
 
 static BUCKET_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+const TEST_SSE_C_KEY_BYTES: [u8; 32] = *b"abcdefghijklmnopqrstuvwxyzABCDEF";
+
 /// Bucket name prefix, configurable via `S3_TEST_BUCKET_PREFIX`.
 /// Defaults to `"test"`.
 static BUCKET_PREFIX: LazyLock<String> =
@@ -20,6 +22,19 @@ static BUCKET_PREFIX: LazyLock<String> =
 /// Return the bucket prefix (from `S3_TEST_BUCKET_PREFIX` or `"test"`).
 pub fn bucket_prefix() -> &'static str {
     &BUCKET_PREFIX
+}
+
+/// Fixed 32-byte customer key for SSE-C integration tests.
+pub fn test_sse_c_key() -> [u8; 32] {
+    TEST_SSE_C_KEY_BYTES
+}
+
+/// Return base64-encoded SSE-C key and key MD5 header values.
+pub fn sse_c_header_values(key: &[u8; 32]) -> (String, String) {
+    let key_b64 = base64::engine::general_purpose::STANDARD.encode(key);
+    let md5 = md5_legacy::Md5::digest(key);
+    let key_md5_b64 = base64::engine::general_purpose::STANDARD.encode(&md5[..]);
+    (key_b64, key_md5_b64)
 }
 
 /// Generate a unique bucket name for a test.

@@ -15,6 +15,7 @@ fn metadata_put_get_delete(store: &dyn PgMetadataStore) {
         layout: ObjectLayout::Standard,
         tags: None,
         metadata_blob: None,
+        encryption: ObjectEncryption::None,
     });
 
     // Put
@@ -58,6 +59,7 @@ fn metadata_put_overwrites(store: &dyn PgMetadataStore) {
         layout: ObjectLayout::Standard,
         tags: None,
         metadata_blob: None,
+        encryption: ObjectEncryption::None,
     });
     store.put_object_meta(&req1).unwrap();
 
@@ -72,6 +74,7 @@ fn metadata_put_overwrites(store: &dyn PgMetadataStore) {
         layout: ObjectLayout::Standard,
         tags: None,
         metadata_blob: None,
+        encryption: ObjectEncryption::None,
     });
     store.put_object_meta(&req2).unwrap();
 
@@ -99,6 +102,7 @@ fn metadata_list_basic(store: &dyn PgMetadataStore) {
             layout: ObjectLayout::Standard,
             tags: None,
             metadata_blob: None,
+            encryption: ObjectEncryption::None,
         });
         store.put_object_meta(&req).unwrap();
     }
@@ -133,6 +137,7 @@ fn metadata_list_with_prefix(store: &dyn PgMetadataStore) {
             layout: ObjectLayout::Standard,
             tags: None,
             metadata_blob: None,
+            encryption: ObjectEncryption::None,
         });
         store.put_object_meta(&req).unwrap();
     }
@@ -163,6 +168,7 @@ fn metadata_list_pagination(store: &dyn PgMetadataStore) {
             layout: ObjectLayout::Standard,
             tags: None,
             metadata_blob: None,
+            encryption: ObjectEncryption::None,
         });
         store.put_object_meta(&req).unwrap();
     }
@@ -254,6 +260,7 @@ fn metadata_empty_key(store: &dyn PgMetadataStore) {
         layout: ObjectLayout::Standard,
         tags: None,
         metadata_blob: None,
+        encryption: ObjectEncryption::None,
     });
     store.put_object_meta(&req).unwrap();
 
@@ -275,6 +282,7 @@ fn metadata_long_key(store: &dyn PgMetadataStore) {
         layout: ObjectLayout::Standard,
         tags: None,
         metadata_blob: None,
+        encryption: ObjectEncryption::None,
     });
     store.put_object_meta(&req).unwrap();
 
@@ -294,6 +302,7 @@ fn metadata_zero_size_object(store: &dyn PgMetadataStore) {
         layout: ObjectLayout::Standard,
         tags: None,
         metadata_blob: None,
+        encryption: ObjectEncryption::None,
     });
     store.put_object_meta(&req).unwrap();
 
@@ -599,6 +608,7 @@ fn file_metadata_object_has_inline_legacy_layout() {
             layout: ObjectLayout::Standard,
             tags: None,
             metadata_blob: None,
+            encryption: ObjectEncryption::None,
         }))
         .unwrap();
 
@@ -625,6 +635,7 @@ fn file_metadata_invalid_data_layout_returns_error() {
             layout: ObjectLayout::Standard,
             tags: None,
             metadata_blob: None,
+            encryption: ObjectEncryption::None,
         }))
         .unwrap();
 
@@ -661,6 +672,7 @@ fn mpu_create_and_get_upload() {
             metadata_blob: vec![1, 2, 3].into(),
             owner_principal: Some("alice".to_string()),
             checksum: None,
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
 
@@ -693,6 +705,7 @@ fn mpu_create_upload_with_checksum_fields() {
                 )
                 .unwrap(),
             ),
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
 
@@ -716,6 +729,7 @@ fn mpu_create_upload_with_checksum_fields() {
             metadata_blob: vec![].into(),
             owner_principal: None,
             checksum: None,
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
     let rec2 = store.get_multipart_upload("uid-no-cksum").unwrap();
@@ -740,6 +754,7 @@ fn mpu_part_checksum_round_trip() {
                 )
                 .unwrap(),
             ),
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
 
@@ -855,6 +870,7 @@ fn mpu_complete_multipart_commit_preserves_checksums() {
                 )
                 .unwrap(),
             ),
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
 
@@ -868,6 +884,7 @@ fn mpu_complete_multipart_commit_preserves_checksums() {
         ec: EcShape { k: 4, m: 2 },
         tags: Some(tags.into()),
         metadata_blob: Some(vec![].into()),
+        encryption: ObjectEncryption::None,
     };
 
     let cksum = ChecksumBytes::new([0xDE, 0xAD]).unwrap();
@@ -942,6 +959,7 @@ fn mpu_set_upload_state_transition() {
             metadata_blob: vec![].into(),
             owner_principal: None,
             checksum: None,
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
 
@@ -986,6 +1004,7 @@ fn mpu_delete_upload_cascades_parts() {
             metadata_blob: vec![].into(),
             owner_principal: None,
             checksum: None,
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
 
@@ -1038,6 +1057,7 @@ fn mpu_upsert_part_and_get() {
             metadata_blob: vec![].into(),
             owner_principal: None,
             checksum: None,
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
 
@@ -1104,6 +1124,7 @@ fn mpu_list_parts_pagination() {
             metadata_blob: vec![].into(),
             owner_principal: None,
             checksum: None,
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
 
@@ -1182,6 +1203,7 @@ fn mpu_list_uploads_pagination() {
                 metadata_blob: vec![].into(),
                 owner_principal: None,
                 checksum: None,
+                encryption: ObjectEncryption::None,
             })
             .unwrap();
     }
@@ -1234,6 +1256,7 @@ fn mpu_list_uploads_with_prefix() {
                 metadata_blob: vec![].into(),
                 owner_principal: None,
                 checksum: None,
+                encryption: ObjectEncryption::None,
             })
             .unwrap();
     }
@@ -1266,6 +1289,7 @@ fn mpu_list_uploads_same_key_multiple_upload_ids() {
                 metadata_blob: vec![].into(),
                 owner_principal: None,
                 checksum: None,
+                encryption: ObjectEncryption::None,
             })
             .unwrap();
     }
@@ -1316,6 +1340,7 @@ fn mpu_list_uploads_stale_marker_returns_remaining() {
                 metadata_blob: vec![].into(),
                 owner_principal: None,
                 checksum: None,
+                encryption: ObjectEncryption::None,
             })
             .unwrap();
     }
@@ -1356,6 +1381,7 @@ fn mpu_corrupted_part_okh_returns_error() {
             metadata_blob: vec![].into(),
             owner_principal: None,
             checksum: None,
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
 
@@ -1448,6 +1474,7 @@ fn mpu_get_missing_part_returns_part_not_found() {
             metadata_blob: vec![].into(),
             owner_principal: None,
             checksum: None,
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
 
@@ -1476,6 +1503,7 @@ fn mpu_set_upload_state_rejects_in_progress_target() {
             metadata_blob: vec![].into(),
             owner_principal: None,
             checksum: None,
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
 
@@ -1786,6 +1814,7 @@ fn create_upload(store: &dyn PgMetadataStore, upload_id: &str) {
             metadata_blob: vec![].into(),
             owner_principal: None,
             checksum: None,
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
 }
@@ -2437,6 +2466,7 @@ mod prop_tests {
                 layout: ObjectLayout::Standard,
                 tags: None,
                 metadata_blob: None,
+                encryption: ObjectEncryption::None,
             });
             store.put_object_meta(&req).unwrap();
         }
@@ -2532,6 +2562,7 @@ fn stream_upload_create_get_delete() {
             bucket: "b".into(),
             key: "k".into(),
             target: StreamUploadTarget::PutObject,
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
 
@@ -2561,6 +2592,7 @@ fn stream_upload_state_transitions() {
             bucket: "b".into(),
             key: "k".into(),
             target: StreamUploadTarget::PutObject,
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
 
@@ -2614,6 +2646,7 @@ fn stream_upload_upload_part_kind() {
                 upload_id: "mpu-123".into(),
                 part_number: 3,
             },
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
 
@@ -2637,6 +2670,7 @@ fn stream_segment_append_and_list() {
             bucket: "b".into(),
             key: "k".into(),
             target: StreamUploadTarget::PutObject,
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
 
@@ -2680,6 +2714,7 @@ fn stream_segment_publish_with_shards_same_pg_is_atomic() {
             bucket: "b".into(),
             key: "k".into(),
             target: StreamUploadTarget::PutObject,
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
 
@@ -2730,6 +2765,7 @@ fn stream_segment_cascade_delete() {
             bucket: "b".into(),
             key: "k".into(),
             target: StreamUploadTarget::PutObject,
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
 
@@ -2765,6 +2801,7 @@ fn commit_stream_put_atomic() {
             bucket: "b".into(),
             key: "k".into(),
             target: StreamUploadTarget::PutObject,
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
 
@@ -2807,6 +2844,7 @@ fn commit_stream_put_atomic() {
         ec: EcShape { k: 4, m: 2 },
         tags: None,
         metadata_blob: None,
+        encryption: ObjectEncryption::None,
     };
 
     let committed_segments = vec![
@@ -2884,6 +2922,7 @@ fn commit_stream_put_overwrite_unversioned() {
             bucket: "b".into(),
             key: "k".into(),
             target: StreamUploadTarget::PutObject,
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
     store
@@ -2899,6 +2938,7 @@ fn commit_stream_put_overwrite_unversioned() {
                 ec: EcShape { k: 4, m: 2 },
                 tags: None,
                 metadata_blob: None,
+                encryption: ObjectEncryption::None,
             },
             &[ObjectSegmentRecord {
                 bucket: "b".into(),
@@ -2923,6 +2963,7 @@ fn commit_stream_put_overwrite_unversioned() {
             bucket: "b".into(),
             key: "k".into(),
             target: StreamUploadTarget::PutObject,
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
     store
@@ -2938,6 +2979,7 @@ fn commit_stream_put_overwrite_unversioned() {
                 ec: EcShape { k: 4, m: 2 },
                 tags: None,
                 metadata_blob: None,
+                encryption: ObjectEncryption::None,
             },
             &[ObjectSegmentRecord {
                 bucket: "b".into(),
@@ -2985,6 +3027,7 @@ fn put_object_with_segments_persists_manifest() {
                 layout: ObjectLayout::Standard,
                 tags: None,
                 metadata_blob: None,
+                encryption: ObjectEncryption::None,
             },
             &[
                 ObjectSegmentRecord {
@@ -3047,6 +3090,7 @@ fn put_object_with_segments_overwrite_unversioned_replaces_manifest() {
                 layout: ObjectLayout::Standard,
                 tags: None,
                 metadata_blob: None,
+                encryption: ObjectEncryption::None,
             },
             &[ObjectSegmentRecord {
                 bucket: "b".into(),
@@ -3077,6 +3121,7 @@ fn put_object_with_segments_overwrite_unversioned_replaces_manifest() {
                 layout: ObjectLayout::Standard,
                 tags: None,
                 metadata_blob: None,
+                encryption: ObjectEncryption::None,
             },
             &[ObjectSegmentRecord {
                 bucket: "b".into(),
@@ -3115,6 +3160,7 @@ fn delete_object_segments_cleanup() {
             bucket: "b".into(),
             key: "k".into(),
             target: StreamUploadTarget::PutObject,
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
     store
@@ -3130,6 +3176,7 @@ fn delete_object_segments_cleanup() {
                 ec: EcShape { k: 4, m: 2 },
                 tags: None,
                 metadata_blob: None,
+                encryption: ObjectEncryption::None,
             },
             &[ObjectSegmentRecord {
                 bucket: "b".into(),
@@ -3172,6 +3219,7 @@ fn commit_stream_put_rejects_non_in_progress() {
             bucket: "b".into(),
             key: "k".into(),
             target: StreamUploadTarget::PutObject,
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
 
@@ -3194,6 +3242,7 @@ fn commit_stream_put_rejects_non_in_progress() {
                 ec: EcShape { k: 4, m: 2 },
                 tags: None,
                 metadata_blob: None,
+                encryption: ObjectEncryption::None,
             },
             &[],
         )
@@ -3263,6 +3312,7 @@ fn upsert_multipart_part_segments_replaces_prior_segments() {
             metadata_blob: vec![].into(),
             owner_principal: None,
             checksum: None,
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
 
@@ -3341,6 +3391,7 @@ fn commit_stream_part_replaces_prior_segments_on_reupload() {
             metadata_blob: vec![].into(),
             owner_principal: None,
             checksum: None,
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
 
@@ -3369,6 +3420,7 @@ fn commit_stream_part_replaces_prior_segments_on_reupload() {
                 upload_id: "mpu-1".into(),
                 part_number: 1,
             },
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
 
@@ -3409,6 +3461,7 @@ fn commit_stream_part_replaces_prior_segments_on_reupload() {
                 upload_id: "mpu-1".into(),
                 part_number: 1,
             },
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
 
@@ -3455,6 +3508,7 @@ fn commit_stream_put_rejects_wrong_kind() {
                 upload_id: "mpu-x".into(),
                 part_number: 1,
             },
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
 
@@ -3472,6 +3526,7 @@ fn commit_stream_put_rejects_wrong_kind() {
                 ec: EcShape { k: 4, m: 2 },
                 tags: None,
                 metadata_blob: None,
+                encryption: ObjectEncryption::None,
             },
             &[],
         )
@@ -3495,6 +3550,7 @@ fn commit_stream_put_rejects_wrong_bucket_key() {
             bucket: "b1".into(),
             key: "k1".into(),
             target: StreamUploadTarget::PutObject,
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
 
@@ -3512,6 +3568,7 @@ fn commit_stream_put_rejects_wrong_bucket_key() {
                 ec: EcShape { k: 4, m: 2 },
                 tags: None,
                 metadata_blob: None,
+                encryption: ObjectEncryption::None,
             },
             &[],
         )
@@ -3538,6 +3595,7 @@ fn commit_stream_part_rejects_wrong_upload_id() {
             metadata_blob: vec![].into(),
             owner_principal: None,
             checksum: None,
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
 
@@ -3550,6 +3608,7 @@ fn commit_stream_part_rejects_wrong_upload_id() {
                 upload_id: "mpu-correct".into(),
                 part_number: 1,
             },
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
 
@@ -3596,6 +3655,7 @@ fn commit_stream_part_zero_segments_clears_prior() {
             metadata_blob: vec![].into(),
             owner_principal: None,
             checksum: None,
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
 
@@ -3609,6 +3669,7 @@ fn commit_stream_part_zero_segments_clears_prior() {
                 upload_id: "mpu-zc".into(),
                 part_number: 1,
             },
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
     store
@@ -3681,6 +3742,7 @@ fn commit_stream_part_zero_segments_clears_prior() {
                 upload_id: "mpu-zc".into(),
                 part_number: 1,
             },
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
     store
@@ -3723,6 +3785,7 @@ fn commit_stream_put_rejects_mismatched_segment_target() {
             bucket: "b".into(),
             key: "k".into(),
             target: StreamUploadTarget::PutObject,
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
 
@@ -3740,6 +3803,7 @@ fn commit_stream_put_rejects_mismatched_segment_target() {
                 ec: EcShape { k: 4, m: 2 },
                 tags: None,
                 metadata_blob: None,
+                encryption: ObjectEncryption::None,
             },
             &[ObjectSegmentRecord {
                 bucket: "WRONG".into(),
@@ -3972,6 +4036,7 @@ fn commit_stream_part_rejects_mismatched_segment_part_number() {
             metadata_blob: vec![].into(),
             owner_principal: None,
             checksum: None,
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
 
@@ -3984,6 +4049,7 @@ fn commit_stream_part_rejects_mismatched_segment_part_number() {
                 upload_id: "mpu-cpc".into(),
                 part_number: 1,
             },
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
 
@@ -4044,6 +4110,7 @@ fn commit_stream_part_rejects_non_staging_segment_version_id() {
             metadata_blob: vec![].into(),
             owner_principal: None,
             checksum: None,
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
 
@@ -4056,6 +4123,7 @@ fn commit_stream_part_rejects_non_staging_segment_version_id() {
                 upload_id: "mpu-vid".into(),
                 part_number: 1,
             },
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
 
@@ -4168,6 +4236,7 @@ fn get_object_version_null() {
             layout: ObjectLayout::Standard,
             tags: None,
             metadata_blob: None,
+            encryption: ObjectEncryption::None,
         }))
         .unwrap();
 
@@ -4192,6 +4261,7 @@ fn get_object_version_versioned() {
             layout: ObjectLayout::Standard,
             tags: None,
             metadata_blob: None,
+            encryption: ObjectEncryption::None,
         }))
         .unwrap();
 
@@ -4225,6 +4295,7 @@ fn delete_object_version_null() {
             layout: ObjectLayout::Standard,
             tags: None,
             metadata_blob: None,
+            encryption: ObjectEncryption::None,
         }))
         .unwrap();
 
@@ -4256,6 +4327,7 @@ fn delete_object_version_specific_leaves_others() {
                 layout: ObjectLayout::Standard,
                 tags: None,
                 metadata_blob: None,
+                encryption: ObjectEncryption::None,
             }))
             .unwrap();
     }
@@ -4291,6 +4363,7 @@ fn list_object_versions_basic() {
                 layout: ObjectLayout::Standard,
                 tags: None,
                 metadata_blob: None,
+                encryption: ObjectEncryption::None,
             }))
             .unwrap();
     }
@@ -4327,6 +4400,7 @@ fn list_object_versions_pagination() {
                 layout: ObjectLayout::Standard,
                 tags: None,
                 metadata_blob: None,
+                encryption: ObjectEncryption::None,
             }))
             .unwrap();
     }
@@ -4377,6 +4451,7 @@ fn list_object_versions_with_prefix() {
                 layout: ObjectLayout::Standard,
                 tags: None,
                 metadata_blob: None,
+                encryption: ObjectEncryption::None,
             }))
             .unwrap();
     }
@@ -4411,6 +4486,7 @@ fn list_object_versions_includes_delete_markers() {
             layout: ObjectLayout::Standard,
             tags: None,
             metadata_blob: None,
+            encryption: ObjectEncryption::None,
         }))
         .unwrap();
 
@@ -4462,6 +4538,7 @@ fn next_version_id_increments() {
             layout: ObjectLayout::Standard,
             tags: None,
             metadata_blob: None,
+            encryption: ObjectEncryption::None,
         }))
         .unwrap();
 
@@ -4497,6 +4574,7 @@ fn object_tags_round_trip() {
             layout: ObjectLayout::Standard,
             tags: None,
             metadata_blob: None,
+            encryption: ObjectEncryption::None,
         }))
         .unwrap();
 
@@ -4632,6 +4710,7 @@ fn list_all_stream_uploads_returns_sessions() {
             bucket: "b".into(),
             key: "k1".into(),
             target: StreamUploadTarget::PutObject,
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
     store
@@ -4640,6 +4719,7 @@ fn list_all_stream_uploads_returns_sessions() {
             bucket: "b".into(),
             key: "k2".into(),
             target: StreamUploadTarget::PutObject,
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
 
@@ -4666,6 +4746,7 @@ fn delete_multipart_part_segments_by_upload_id_cleans_up() {
             metadata_blob: vec![].into(),
             owner_principal: None,
             checksum: None,
+            encryption: ObjectEncryption::None,
         })
         .unwrap();
 
@@ -4903,6 +4984,7 @@ fn complete_multipart_commit_no_such_upload() {
         ec: EcShape { k: 4, m: 2 },
         tags: None,
         metadata_blob: None,
+        encryption: ObjectEncryption::None,
     };
     let parts = vec![ObjectPartRecord {
         bucket: "b".into(),

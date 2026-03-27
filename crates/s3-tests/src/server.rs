@@ -10,6 +10,7 @@ pub const TEST_REGION: &str = "us-east-1";
 /// Alternate test credentials (non-owner user).
 pub const ALT_ACCESS_KEY: &str = "AKIAI44QH8DHBEXAMPLE";
 pub const ALT_SECRET_KEY: &str = "je7MtGbClwBF/2Zp9Utk/h3yCo8nvbEXAMPLEKEY";
+pub const TEST_SSE_C_VALIDATOR_KEY_B64: &str = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
 
 /// Number of frontend instances in the pool.
 ///
@@ -79,10 +80,16 @@ impl TestServer {
         let frontends: Vec<server_http::http::HttpFrontend> = (0..POOL_SIZE)
             .map(|_| {
                 let ec_config = ec::EcConfig::new(4, 2).expect("EC config");
-                let coordinator = server_core::coordinator::Coordinator::new(
+                let sse_c_validator = server_core::sse::SseCustomerValidatorConfig::from_base64(
+                    1,
+                    TEST_SSE_C_VALIDATOR_KEY_B64,
+                )
+                .expect("valid test SSE-C validator key");
+                let coordinator = server_core::coordinator::Coordinator::new_with_sse_c_validator(
                     Arc::clone(&storage_node),
                     ec_config,
                     TEST_REGION.to_string(),
+                    Some(sse_c_validator),
                 )
                 .expect("create coordinator");
 

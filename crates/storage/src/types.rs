@@ -239,6 +239,169 @@ impl From<SerializedTagSet> for String {
     }
 }
 
+/// Stored object encryption discriminator.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectEncryptionType {
+    None = 0,
+    SseCustomer = 1,
+}
+
+impl ObjectEncryptionType {
+    #[must_use]
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::None),
+            1 => Some(Self::SseCustomer),
+            _ => None,
+        }
+    }
+}
+
+pub const SSE_C_VALIDATOR_SALT_LEN: usize = 16;
+pub const SSE_C_VALIDATOR_HMAC_LEN: usize = 32;
+pub const SSE_C_WRAP_SALT_LEN: usize = 16;
+pub const SSE_C_WRAP_NONCE_LEN: usize = 12;
+pub const SSE_C_WRAPPED_DEK_LEN: usize = 48;
+pub const SSE_C_SEGMENT_NONCE_PREFIX_LEN: usize = 8;
+
+/// Stored per-object `SSE-C` state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SseCustomerObjectState {
+    pub validator_key_id: u32,
+    pub validator_salt: [u8; SSE_C_VALIDATOR_SALT_LEN],
+    pub validator_hmac: [u8; SSE_C_VALIDATOR_HMAC_LEN],
+    pub wrap_salt: [u8; SSE_C_WRAP_SALT_LEN],
+    pub wrap_nonce: [u8; SSE_C_WRAP_NONCE_LEN],
+    pub wrapped_dek: [u8; SSE_C_WRAPPED_DEK_LEN],
+    pub segment_nonce_prefix: [u8; SSE_C_SEGMENT_NONCE_PREFIX_LEN],
+}
+
+impl SseCustomerObjectState {
+    const VERSION: u8 = 1;
+    const ENCODED_LEN: usize = 1
+        + 4
+        + SSE_C_VALIDATOR_SALT_LEN
+        + SSE_C_VALIDATOR_HMAC_LEN
+        + SSE_C_WRAP_SALT_LEN
+        + SSE_C_WRAP_NONCE_LEN
+        + SSE_C_WRAPPED_DEK_LEN
+        + SSE_C_SEGMENT_NONCE_PREFIX_LEN;
+
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(Self::ENCODED_LEN);
+        out.push(Self::VERSION);
+        out.extend_from_slice(&self.validator_key_id.to_be_bytes());
+        out.extend_from_slice(&self.validator_salt);
+        out.extend_from_slice(&self.validator_hmac);
+        out.extend_from_slice(&self.wrap_salt);
+        out.extend_from_slice(&self.wrap_nonce);
+        out.extend_from_slice(&self.wrapped_dek);
+        out.extend_from_slice(&self.segment_nonce_prefix);
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() != Self::ENCODED_LEN {
+            return Err(format!(
+                "invalid SSE-C state length {} (expected {})",
+                bytes.len(),
+                Self::ENCODED_LEN
+            ));
+        }
+        if bytes[0] != Self::VERSION {
+            return Err(format!("unsupported SSE-C state version {}", bytes[0]));
+        }
+
+        let mut cursor = 1;
+        let take = |cursor: &mut usize, len: usize| {
+            let start = *cursor;
+            let end = start + len;
+            *cursor = end;
+            &bytes[start..end]
+        };
+
+        let validator_key_id = u32::from_be_bytes(
+            take(&mut cursor, 4)
+                .try_into()
+                .expect("slice length checked"),
+        );
+        let validator_salt = take(&mut cursor, SSE_C_VALIDATOR_SALT_LEN)
+            .try_into()
+            .expect("slice length checked");
+        let validator_hmac = take(&mut cursor, SSE_C_VALIDATOR_HMAC_LEN)
+            .try_into()
+            .expect("slice length checked");
+        let wrap_salt = take(&mut cursor, SSE_C_WRAP_SALT_LEN)
+            .try_into()
+            .expect("slice length checked");
+        let wrap_nonce = take(&mut cursor, SSE_C_WRAP_NONCE_LEN)
+            .try_into()
+            .expect("slice length checked");
+        let wrapped_dek = take(&mut cursor, SSE_C_WRAPPED_DEK_LEN)
+            .try_into()
+            .expect("slice length checked");
+        let segment_nonce_prefix = take(&mut cursor, SSE_C_SEGMENT_NONCE_PREFIX_LEN)
+            .try_into()
+            .expect("slice length checked");
+
+        Ok(Self {
+            validator_key_id,
+            validator_salt,
+            validator_hmac,
+            wrap_salt,
+            wrap_nonce,
+            wrapped_dek,
+            segment_nonce_prefix,
+        })
+    }
+}
+
+/// Persisted object encryption state.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ObjectEncryption {
+    #[default]
+    None,
+    SseCustomer(SseCustomerObjectState),
+}
+
+impl ObjectEncryption {
+    #[must_use]
+    pub fn encryption_type(&self) -> ObjectEncryptionType {
+        match self {
+            Self::None => ObjectEncryptionType::None,
+            Self::SseCustomer(_) => ObjectEncryptionType::SseCustomer,
+        }
+    }
+
+    #[must_use]
+    pub fn encode_state(&self) -> Option<Vec<u8>> {
+        match self {
+            Self::None => None,
+            Self::SseCustomer(state) => Some(state.encode()),
+        }
+    }
+
+    pub fn decode(
+        encryption_type: ObjectEncryptionType,
+        state: Option<Vec<u8>>,
+    ) -> Result<Self, String> {
+        match (encryption_type, state) {
+            (ObjectEncryptionType::None, None) => Ok(Self::None),
+            (ObjectEncryptionType::None, Some(_)) => {
+                Err("unexpected encryption_state for unencrypted object".to_string())
+            }
+            (ObjectEncryptionType::SseCustomer, Some(bytes)) => {
+                Ok(Self::SseCustomer(SseCustomerObjectState::decode(&bytes)?))
+            }
+            (ObjectEncryptionType::SseCustomer, None) => {
+                Err("missing encryption_state for SSE-C object".to_string())
+            }
+        }
+    }
+}
+
 /// Length of a composite shard key in bytes.
 ///
 /// Layout: object_key_hash (16 bytes) || version_id (8 bytes) || shard_index (1 byte)
@@ -635,6 +798,8 @@ impl ObjectLayout {
 
 /// An object record read from storage — either a live object or a delete marker.
 #[derive(Debug, Clone)]
+// Boxing the live variant would add heap traffic on the hot metadata path.
+#[allow(clippy::large_enum_variant)]
 pub enum StoredObject {
     Live(LiveObjectRecord),
     DeleteMarker(DeleteMarkerRecord),
@@ -706,6 +871,7 @@ pub struct LiveObjectRecord {
     pub tags: Option<SerializedTagSet>,
     /// Serialized user metadata headers.
     pub metadata_blob: Option<SerializedMetadataBlob>,
+    pub encryption: ObjectEncryption,
 }
 
 /// A delete marker record.
@@ -913,6 +1079,8 @@ impl From<&BucketInfo> for BucketFastPathInfo {
 }
 
 /// Request to store object metadata.
+// This request is frequently assembled inline on hot paths; avoid heap indirection.
+#[allow(clippy::large_enum_variant)]
 pub enum PutObjectReq {
     Live(PutLiveObjectReq),
     DeleteMarker(PutDeleteMarkerReq),
@@ -936,6 +1104,7 @@ pub struct PutLiveObjectReq {
     pub tags: Option<SerializedTagSet>,
     /// Serialized user metadata headers.
     pub metadata_blob: Option<SerializedMetadataBlob>,
+    pub encryption: ObjectEncryption,
 }
 
 impl PutLiveObjectReq {
@@ -992,6 +1161,7 @@ pub struct CommitMultipartReq {
     pub tags: Option<SerializedTagSet>,
     /// Serialized user metadata headers.
     pub metadata_blob: Option<SerializedMetadataBlob>,
+    pub encryption: ObjectEncryption,
 }
 
 /// Request to finalize a streaming PutObject into a live object.
@@ -1012,6 +1182,7 @@ pub struct CommitStreamPutReq {
     pub tags: Option<SerializedTagSet>,
     /// Serialized user metadata headers.
     pub metadata_blob: Option<SerializedMetadataBlob>,
+    pub encryption: ObjectEncryption,
 }
 
 /// Request to list objects in a PG.
@@ -1084,6 +1255,7 @@ pub struct MultipartUploadRecord {
     pub owner_principal: Option<String>,
     /// Validated checksum configuration for this upload.
     pub checksum: Option<MultipartChecksumConfig>,
+    pub encryption: ObjectEncryption,
 }
 
 /// In-progress multipart part record.
@@ -1143,6 +1315,7 @@ pub struct CreateMultipartUploadReq {
     pub metadata_blob: SerializedMetadataBlob,
     pub owner_principal: Option<String>,
     pub checksum: Option<MultipartChecksumConfig>,
+    pub encryption: ObjectEncryption,
 }
 
 /// Request to list multipart uploads.
@@ -1269,6 +1442,7 @@ pub struct StreamUploadRecord {
     pub target: StreamUploadTarget,
     pub state: StreamUploadState,
     pub created_at: u64,
+    pub encryption: ObjectEncryption,
 }
 
 /// Request to create a streaming upload session.
@@ -1277,6 +1451,7 @@ pub struct CreateStreamUploadReq {
     pub bucket: BucketName,
     pub key: ObjectKey,
     pub target: StreamUploadTarget,
+    pub encryption: ObjectEncryption,
 }
 
 /// Staging segment record for an in-progress streaming session.

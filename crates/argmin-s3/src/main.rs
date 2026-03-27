@@ -6,6 +6,7 @@ use std::sync::Arc;
 use auth::{CredentialStore, SecretKey};
 use ec::EcConfig;
 use server_core::coordinator::Coordinator;
+use server_core::sse::SseCustomerValidatorConfig;
 use storage::SharedStorageNode;
 use tokio::net::TcpListener;
 
@@ -39,6 +40,15 @@ async fn main() {
 
     let pg_ids: Vec<u32> = (0..config.pg_count).collect();
     let data_dir = Path::new(&config.data_dir);
+    let sse_c_validator = config
+        .sse_c_validator_key_b64
+        .as_deref()
+        .map(|key| SseCustomerValidatorConfig::from_base64(1, key))
+        .transpose()
+        .unwrap_or_else(|e| {
+            eprintln!("invalid SSE-C validator key: {e}");
+            std::process::exit(1);
+        });
 
     // Create one shared storage node for all workers.
     let storage_node = match SharedStorageNode::open(data_dir, &pg_ids) {
@@ -53,14 +63,18 @@ async fn main() {
     // (PG access serialized by mutex).
     let mut frontends = Vec::with_capacity(config.workers as usize);
     for _ in 0..config.workers {
-        let coordinator =
-            match Coordinator::new(Arc::clone(&storage_node), ec_config, config.region.clone()) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("failed to create coordinator: {e}");
-                    std::process::exit(1);
-                }
-            };
+        let coordinator = match Coordinator::new_with_sse_c_validator(
+            Arc::clone(&storage_node),
+            ec_config,
+            config.region.clone(),
+            sse_c_validator.clone(),
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("failed to create coordinator: {e}");
+                std::process::exit(1);
+            }
+        };
         let mut credentials = CredentialStore::new();
         credentials.add(
             config.access_key_id.clone(),

@@ -19,3 +19,4 @@ pub mod etag;
 pub mod metadata_blob;
 pub mod pg;
 pub mod range;
+pub mod sse;

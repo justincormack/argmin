@@ -4288,6 +4288,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "test-bucket",
                 key: "dir/file1.txt",
                 data: b"hello",
@@ -4302,6 +4303,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "test-bucket",
                 key: "dir/file2.txt",
                 data: b"world",
@@ -4316,6 +4318,7 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
+                sse_customer: None,
                 bucket: "test-bucket",
                 key: "root.txt",
                 data: b"root",
@@ -4419,6 +4422,7 @@ mod tests {
             test_helpers::put_object(
                 &coord,
                 &PutObjectRequest {
+                    sse_customer: None,
                     bucket: "bucket",
                     key: &key,
                     data: b"data",

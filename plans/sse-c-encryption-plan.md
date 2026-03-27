@@ -25,8 +25,18 @@ Primary references:
 
 Important behavior from the AWS docs:
 
-1. `SSE-C` encrypts object data only, not object metadata.
+1. `SSE-C` encrypts object data only, not all object metadata at rest.
+   However, AWS still requires the SSE-C header triad for some metadata-bearing
+   APIs such as `HeadObject` and `GetObjectAttributes`, so metadata access is
+   not freely available without the customer key.
+   Also, AWS documents that stored object checksum metadata is protected under
+   server-side encryption, so the checksum-related metadata surface must be
+   treated differently from ordinary unencrypted object metadata.
 2. Requests using `SSE-C` headers must use HTTPS. AWS rejects HTTP.
+   Temporary implementation note:
+   local integration testing may allow HTTP initially so the crypto/read-write
+   path can be exercised before HTTPS-only enforcement lands. Restoring the AWS
+   HTTPS requirement remains a deferred compatibility item before completion.
 3. The request header triad is:
    - `x-amz-server-side-encryption-customer-algorithm: AES256`
    - `x-amz-server-side-encryption-customer-key`
@@ -279,6 +289,13 @@ This needs direct `s3-tests` coverage against AWS, because the docs are not
 perfectly consistent around multipart-complete headers and the new April 2026
 bucket setting.
 
+Current discovery from AWS-backed `s3-tests`:
+
+1. `HeadObject` without SSE-C headers fails with `400`, but the AWS SDK does
+   not surface a parsed S3 error code on that `HEAD` failure path.
+2. plain SSE-C `CompleteMultipartUpload` succeeds without repeating the SSE-C
+   headers in the non-checksum case, so we must not over-constrain that path.
+
 ## Phase 1: Core happy path
 
 Implement:
@@ -293,8 +310,14 @@ Implement:
 
 Notes:
 
-1. `DeleteObject`, tagging, listing, and most metadata-only operations should
-   not need customer keys because object metadata is not encrypted.
+1. `DeleteObject`, tagging, listing, and many metadata-only operations should
+   not need customer keys because most object metadata is not encrypted at
+   rest.
+   But AWS does require SSE-C headers on specific metadata reads like
+   `HeadObject` and `GetObjectAttributes`, and stored S3 checksum metadata is
+   protected under server-side encryption, so those paths must stay explicitly
+   compatibility-tested rather than inferred from a blanket “metadata is clear”
+   assumption.
 2. `HeadObject` still must validate the customer key on SSE-C objects.
 3. multipart upload state must persist the encryption state from initiate time,
    so later part uploads can validate “same key as initiate”.
@@ -310,12 +333,10 @@ Implement once Phase 1 is stable:
 1. `CopyObject`
 2. `UploadPartCopy`
 3. `POST Object`
-4. `GetObjectAttributes`
-5. presigned SSE-C requests
+4. presigned SSE-C requests
 
-This phase should unignore:
-
-- [`test_get_sse_c_encrypted_object_attributes`](/home/justin/src/github.com/justincormack/argmin/crates/s3-tests/tests/object_attributes.rs)
+`GetObjectAttributes` is already part of the implemented happy-path slice and
+should stay covered in [`object_attributes.rs`](/home/justin/src/github.com/justincormack/argmin/crates/s3-tests/tests/object_attributes.rs).
 
 ## Phase 3: Bucket-level gating
 
@@ -414,6 +435,23 @@ Checksums exposed via S3 APIs should remain checksums of the logical object
 data, not of ciphertext-at-rest. That means the checksum metadata model remains
 an object-level concern separate from shard CRC64.
 
+For encrypted objects, the persisted S3-visible checksum metadata itself should
+be treated as protected metadata:
+
+1. internal shard CRC64 remains cleartext so offline storage integrity checks do
+   not need decryption keys
+2. S3-visible object checksum metadata (`Content-MD5`, `x-amz-checksum-*`,
+   checksum type) remains a logical-object property, not a ciphertext checksum
+3. when server-side encryption is in use, the stored checksum metadata should
+   be encrypted or otherwise cryptographically protected as part of the
+   encryption envelope rather than left as ordinary plaintext object metadata
+4. that checksum metadata is only exposed after the normal SSE-C read gate
+   succeeds
+
+This matches the AWS documentation distinction: storage-layer integrity data can
+remain clear for offline validation, while persisted API checksum metadata is
+part of the protected object state.
+
 ### ETag
 
 AWS docs explicitly say SSE-C ETags are not MD5. Our current ETag model is
@@ -478,9 +516,11 @@ This work should include direct AWS verification for:
 4. Implement direct `PutObject` / `GetObject` / `HeadObject`.
 5. Implement streamed `PutObject`.
 6. Implement multipart initiate/upload/complete.
-7. Unignore `GetObjectAttributes` SSE-C test and implement attributes path.
-8. Implement copy paths.
-9. Add bucket-level SSE-C blocking support.
+7. Protect persisted S3 checksum metadata under the SSE object envelope while
+   keeping internal shard CRC64 cleartext.
+8. Unignore `GetObjectAttributes` SSE-C test and implement attributes path.
+9. Implement copy paths.
+10. Add bucket-level SSE-C blocking support.
 
 ## Open Questions To Resolve Early
 

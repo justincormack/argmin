@@ -3,9 +3,30 @@ use aws_sdk_s3::types::{
     BucketVersioningStatus, ChecksumAlgorithm, CompletedMultipartUpload, CompletedPart,
     ObjectAttributes, StorageClass, VersioningConfiguration,
 };
-use s3_tests::{unique_bucket, CTX};
+use s3_tests::{
+    assert_s3_err_code, err_status, sse_c_header_values, test_sse_c_key, unique_bucket, CTX,
+};
 
 const PART_SIZE: usize = 5 * 1024 * 1024; // 5 MB minimum part size
+
+macro_rules! with_sse_c_headers {
+    ($op:expr, $key_b64:expr, $key_md5_b64:expr) => {{
+        $op.customize().mutate_request({
+            let key_b64 = $key_b64.clone();
+            let key_md5_b64 = $key_md5_b64.clone();
+            move |req| {
+                req.headers_mut()
+                    .insert("x-amz-server-side-encryption-customer-algorithm", "AES256");
+                req.headers_mut()
+                    .insert("x-amz-server-side-encryption-customer-key", key_b64.clone());
+                req.headers_mut().insert(
+                    "x-amz-server-side-encryption-customer-key-md5",
+                    key_md5_b64.clone(),
+                );
+            }
+        })
+    }};
+}
 
 /// Cleanup helper: delete all given keys then the bucket.
 async fn cleanup(bucket: &str, keys: &[&str]) {
@@ -231,12 +252,130 @@ fn test_get_checksum_object_attributes() {
     });
 }
 
-// ── Ignored tests (need encryption) ──────────────────────────────────
+#[test]
+fn test_get_sse_c_encrypted_object_attributes() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let key = test_sse_c_key();
+        let (key_b64, key_md5_b64) = sse_c_header_values(&key);
+        let body = b"encrypted-object-attributes".to_vec();
+
+        with_sse_c_headers!(
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key("obj")
+                .body(ByteStream::from(body.clone())),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+
+        let resp = with_sse_c_headers!(
+            client
+                .get_object_attributes()
+                .bucket(&bucket)
+                .key("obj")
+                .object_attributes(ObjectAttributes::Etag)
+                .object_attributes(ObjectAttributes::ObjectSize),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+
+        assert_eq!(resp.object_size(), Some(body.len() as i64));
+        assert!(resp.e_tag().is_some());
+        cleanup(&bucket, &["obj"]).await;
+    });
+}
 
 #[test]
-#[ignore = "not implemented: SSE-C encryption"]
-fn test_get_sse_c_encrypted_object_attributes() {
-    s3_tests::run(async {});
+fn test_get_sse_c_object_attributes_requires_headers() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let key = test_sse_c_key();
+        let (key_b64, key_md5_b64) = sse_c_header_values(&key);
+
+        with_sse_c_headers!(
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key("obj")
+                .body(ByteStream::from_static(b"encrypted-object-attributes")),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+
+        let result = client
+            .get_object_attributes()
+            .bucket(&bucket)
+            .key("obj")
+            .object_attributes(ObjectAttributes::Etag)
+            .object_attributes(ObjectAttributes::ObjectSize)
+            .send()
+            .await;
+
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "InvalidRequest");
+        cleanup(&bucket, &["obj"]).await;
+    });
+}
+
+#[test]
+fn test_get_sse_c_object_attributes_rejects_wrong_key() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let key = test_sse_c_key();
+        let (key_b64, key_md5_b64) = sse_c_header_values(&key);
+        let wrong_key = [42u8; 32];
+        let (wrong_key_b64, wrong_key_md5_b64) = sse_c_header_values(&wrong_key);
+
+        with_sse_c_headers!(
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key("obj")
+                .body(ByteStream::from_static(b"encrypted-object-attributes")),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+
+        let result = with_sse_c_headers!(
+            client
+                .get_object_attributes()
+                .bucket(&bucket)
+                .key("obj")
+                .object_attributes(ObjectAttributes::Etag)
+                .object_attributes(ObjectAttributes::ObjectSize),
+            wrong_key_b64,
+            wrong_key_md5_b64
+        )
+        .send()
+        .await;
+
+        assert_eq!(err_status(&result), 403);
+        assert_s3_err_code(&result, "AccessDenied");
+        cleanup(&bucket, &["obj"]).await;
+    });
 }
 
 /// Helper: create multipart upload, upload parts, complete, return etag.

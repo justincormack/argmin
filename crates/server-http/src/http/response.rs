@@ -8,6 +8,7 @@ use crate::coordinator::{
 use crate::error::ServerError;
 use checksum::{ChecksumAlgorithm, ChecksumType, RawChecksum};
 use s3_types::{BucketVersioningState, CanonicalUserId, VersionId};
+use server_core::sse::{SseCustomerResponseHeaders, SSE_CUSTOMER_ALGORITHM};
 
 use super::xml;
 
@@ -98,6 +99,23 @@ impl S3Response {
         self.body = Vec::new();
         self.stream = Some(body);
         self
+    }
+
+    fn apply_sse_customer_headers(
+        mut self,
+        sse_customer: Option<&SseCustomerResponseHeaders>,
+    ) -> Self {
+        let Some(sse_customer) = sse_customer else {
+            return self;
+        };
+        self = self.header(
+            "x-amz-server-side-encryption-customer-algorithm",
+            SSE_CUSTOMER_ALGORITHM,
+        );
+        self.header(
+            "x-amz-server-side-encryption-customer-key-md5",
+            &sse_customer.key_md5_b64,
+        )
     }
 
     /// Build a response for a successful `PutObject`.
@@ -204,7 +222,8 @@ impl S3Response {
             }
         }
 
-        resp.streaming_body(result.body, result.size)
+        resp.apply_sse_customer_headers(result.sse_customer.as_ref())
+            .streaming_body(result.body, result.size)
     }
 
     #[cfg(test)]
@@ -274,7 +293,7 @@ impl S3Response {
             }
         }
 
-        resp
+        resp.apply_sse_customer_headers(result.sse_customer.as_ref())
     }
 
     /// Build a response for `HeadObject` with partNumber.
@@ -376,7 +395,8 @@ impl S3Response {
             }
         }
 
-        resp.streaming_body(result.body, result.range_end - result.range_start + 1)
+        resp.apply_sse_customer_headers(result.sse_customer.as_ref())
+            .streaming_body(result.body, result.range_end - result.range_start + 1)
     }
 
     /// Build a response for a part-level `GetObject` (206 Partial Content).
@@ -442,7 +462,8 @@ impl S3Response {
             resp = resp.header("x-amz-checksum-type", ct);
         }
 
-        resp.streaming_body(result.body, result.part_size)
+        resp.apply_sse_customer_headers(result.sse_customer.as_ref())
+            .streaming_body(result.body, result.part_size)
     }
 
     /// Build a 416 Range Not Satisfiable response.
@@ -704,6 +725,7 @@ impl S3Response {
         body_xml: &str,
         last_modified: u64,
         version_id: VersionId,
+        sse_customer: Option<&SseCustomerResponseHeaders>,
     ) -> Self {
         let mut resp = Self::new(200)
             .xml_body(body_xml.to_string())
@@ -711,7 +733,7 @@ impl S3Response {
         if version_id.is_versioned() {
             resp = resp.header("x-amz-version-id", &format_version_id(version_id));
         }
-        resp
+        resp.apply_sse_customer_headers(sse_customer)
     }
 
     /// Build a response for `PutBucketAcl` (200 OK, no body).
@@ -738,6 +760,7 @@ impl S3Response {
         upload_id: &str,
         checksum_algorithm: Option<ChecksumAlgorithm>,
         checksum_type: Option<ChecksumType>,
+        sse_customer: Option<&SseCustomerResponseHeaders>,
     ) -> Self {
         let body = xml::initiate_multipart_upload_xml(
             bucket,
@@ -746,19 +769,25 @@ impl S3Response {
             checksum_algorithm.map(ChecksumAlgorithm::as_str),
             checksum_type.map(ChecksumType::as_str),
         );
-        Self::new(200).xml_body(body)
+        Self::new(200)
+            .xml_body(body)
+            .apply_sse_customer_headers(sse_customer)
     }
 
     /// Build a response for `UploadPart` (200 OK, `ETag` header, optional checksum).
     #[must_use]
-    pub fn upload_part(etag: &str, checksum: Option<&RawChecksum>) -> Self {
+    pub fn upload_part(
+        etag: &str,
+        checksum: Option<&RawChecksum>,
+        sse_customer: Option<&SseCustomerResponseHeaders>,
+    ) -> Self {
         let mut resp = Self::new(200).header("ETag", etag);
         if let Some(cksum) = checksum {
             use base64::Engine;
             let b64 = base64::engine::general_purpose::STANDARD.encode(cksum.bytes());
             resp = resp.header(cksum.algorithm().header_name(), &b64);
         }
-        resp
+        resp.apply_sse_customer_headers(sse_customer)
     }
 
     /// Build a response for `UploadPartCopy` (200 OK, XML body with `CopyPartResult`).
@@ -1113,6 +1142,7 @@ mod tests {
     #[test]
     fn get_object_with_content_type() {
         let result = GetObjectResult {
+            sse_customer: None,
             body: ReadHandle::from_buffered_bytes(b"hello".to_vec()),
             metadata: MetadataBlob::from_pairs(&[("content-type", "text/plain")]),
             etag: "\"etag\"".into(),
@@ -1130,6 +1160,7 @@ mod tests {
     #[test]
     fn get_object_default_content_type() {
         let result = GetObjectResult {
+            sse_customer: None,
             body: ReadHandle::from_buffered_bytes(b"data".to_vec()),
             metadata: MetadataBlob::new(),
             etag: "\"etag\"".into(),
@@ -1148,6 +1179,7 @@ mod tests {
     #[test]
     fn get_object_with_amz_meta_headers() {
         let result = GetObjectResult {
+            sse_customer: None,
             body: ReadHandle::from_buffered_bytes(vec![]),
             metadata: MetadataBlob::from_pairs(&[("x-amz-meta-author", "alice")]),
             etag: "\"e\"".into(),
@@ -1163,6 +1195,7 @@ mod tests {
     #[test]
     fn get_object_with_all_standard_metadata() {
         let result = GetObjectResult {
+            sse_customer: None,
             body: ReadHandle::from_buffered_bytes(vec![]),
             metadata: MetadataBlob::from_pairs(&[
                 ("content-type", "text/html"),
@@ -1196,6 +1229,7 @@ mod tests {
     #[test]
     fn get_object_checksum_type_with_checksum_mode_enabled() {
         let result = GetObjectResult {
+            sse_customer: None,
             body: ReadHandle::from_buffered_bytes(vec![]),
             metadata: MetadataBlob::from_pairs(&[
                 ("x-amz-checksum-crc32", "AAAAAA=="),
@@ -1218,6 +1252,7 @@ mod tests {
     #[test]
     fn get_object_checksum_type_omitted_without_checksum_mode() {
         let result = GetObjectResult {
+            sse_customer: None,
             body: ReadHandle::from_buffered_bytes(vec![]),
             metadata: MetadataBlob::from_pairs(&[
                 ("x-amz-checksum-crc32", "AAAAAA=="),
@@ -1239,6 +1274,7 @@ mod tests {
     #[test]
     fn head_object_response() {
         let result = HeadObjectResult {
+            sse_customer: None,
             metadata: MetadataBlob::from_pairs(&[("content-type", "image/png")]),
             etag: "\"etag\"".into(),
             size: 1024,
@@ -1257,6 +1293,7 @@ mod tests {
     #[test]
     fn head_object_default_content_type() {
         let result = HeadObjectResult {
+            sse_customer: None,
             metadata: MetadataBlob::new(),
             etag: "\"e\"".into(),
             size: 0,
@@ -1274,6 +1311,7 @@ mod tests {
     #[test]
     fn head_object_with_encoding_and_cache() {
         let result = HeadObjectResult {
+            sse_customer: None,
             metadata: MetadataBlob::from_pairs(&[
                 ("content-encoding", "br"),
                 ("cache-control", "no-cache"),
@@ -1292,6 +1330,7 @@ mod tests {
     #[test]
     fn head_object_with_amz_meta() {
         let result = HeadObjectResult {
+            sse_customer: None,
             metadata: MetadataBlob::from_pairs(&[("x-amz-meta-tag", "value")]),
             etag: "\"e\"".into(),
             size: 0,
@@ -1306,6 +1345,7 @@ mod tests {
     #[test]
     fn head_object_checksum_type_with_checksum_mode_enabled() {
         let result = HeadObjectResult {
+            sse_customer: None,
             metadata: MetadataBlob::from_pairs(&[
                 ("x-amz-checksum-crc32", "AAAAAA=="),
                 ("x-amz-checksum-type", "COMPOSITE"),
@@ -1324,6 +1364,7 @@ mod tests {
     #[test]
     fn head_object_checksum_type_omitted_without_checksum_mode() {
         let result = HeadObjectResult {
+            sse_customer: None,
             metadata: MetadataBlob::from_pairs(&[
                 ("x-amz-checksum-crc32", "AAAAAA=="),
                 ("x-amz-checksum-type", "COMPOSITE"),
