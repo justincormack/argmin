@@ -309,7 +309,8 @@ CREATE TABLE IF NOT EXISTS buckets (
     cors_config      TEXT,
     tags             TEXT,
     public_access_block TEXT,
-    ownership_controls TEXT
+    ownership_controls TEXT,
+    sse_c_blocked    INTEGER NOT NULL DEFAULT 0 CHECK (sse_c_blocked IN (0, 1))
 )";
 
 /// Index for bucket listing by owner and bucket name.

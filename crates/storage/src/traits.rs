@@ -135,6 +135,16 @@ pub trait PgMetadataStore {
     /// Delete a bucket's ownership controls. Idempotent.
     fn delete_bucket_ownership_controls(&self, name: &str) -> Result<(), MetadataError>;
 
+    /// Store the currently supported bucket encryption configuration subset.
+    fn put_bucket_encryption(
+        &self,
+        name: &str,
+        config: BucketEncryptionConfig,
+    ) -> Result<(), MetadataError>;
+
+    /// Retrieve the currently supported bucket encryption configuration subset.
+    fn get_bucket_encryption(&self, name: &str) -> Result<BucketEncryptionConfig, MetadataError>;
+
     /// Insert or replace an object record.
     ///
     /// For VersionId::Null (unversioned): INSERT OR REPLACE (overwrite).

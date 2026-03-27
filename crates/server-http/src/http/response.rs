@@ -10,6 +10,7 @@ use checksum::{ChecksumAlgorithm, ChecksumType, RawChecksum};
 use s3_types::{BucketVersioningState, CanonicalUserId, VersionId};
 use server_core::sse::{SseCustomerResponseHeaders, SSE_CUSTOMER_ALGORITHM};
 use server_core::system_metadata::SystemMetadata;
+use storage::BucketEncryptionConfig;
 
 use super::xml;
 
@@ -436,6 +437,19 @@ impl S3Response {
     #[must_use]
     pub fn get_bucket_versioning(state: BucketVersioningState) -> Self {
         let body = xml::get_bucket_versioning_xml(state);
+        Self::new(200).xml_body(body)
+    }
+
+    /// Build a response for `PutBucketEncryption`.
+    #[must_use]
+    pub fn put_bucket_encryption() -> Self {
+        Self::new(200)
+    }
+
+    /// Build a response for `GetBucketEncryption`.
+    #[must_use]
+    pub fn get_bucket_encryption(config: BucketEncryptionConfig) -> Self {
+        let body = xml::get_bucket_encryption_xml(config);
         Self::new(200).xml_body(body)
     }
 
@@ -1374,6 +1388,7 @@ mod tests {
             public_write: false,
             public_access_block: None,
             ownership_controls: None,
+            encryption: BucketEncryptionConfig::default(),
         };
         let resp = S3Response::head_bucket(&info);
         assert_eq!(resp.status_code, 200);
@@ -1393,6 +1408,7 @@ mod tests {
             public_write: false,
             public_access_block: None,
             ownership_controls: None,
+            encryption: BucketEncryptionConfig::default(),
         }];
         let owner_canonical_id = CanonicalUserId::from_principal("owner");
         let resp = S3Response::list_buckets(&buckets, "owner", &owner_canonical_id);

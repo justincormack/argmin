@@ -739,6 +739,9 @@ impl PgStore {
                 .map(SerializedTagSet::from),
             public_access_block: row.get(13)?,
             ownership_controls: row.get(14)?,
+            encryption: BucketEncryptionConfig {
+                sse_c_blocked: row.get::<_, i64>(15)? != 0,
+            },
         })
     }
 
@@ -1168,7 +1171,7 @@ impl PgMetadataStore for PgStore {
     fn head_bucket_raw(&self, name: &str) -> Result<BucketInfo, MetadataError> {
         self.conn
             .query_row(
-                "SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, public_read, public_write, write_reservations_blocked, active_write_reservations, cors_config, tags, public_access_block, ownership_controls \
+                "SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, public_read, public_write, write_reservations_blocked, active_write_reservations, cors_config, tags, public_access_block, ownership_controls, sse_c_blocked \
                  FROM buckets WHERE name = ?1",
                 params![name],
                 Self::row_to_bucket_info,
@@ -1194,7 +1197,7 @@ impl PgMetadataStore for PgStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, public_read, public_write, write_reservations_blocked, active_write_reservations, cors_config, tags, public_access_block, ownership_controls \
+                "SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, public_read, public_write, write_reservations_blocked, active_write_reservations, cors_config, tags, public_access_block, ownership_controls, sse_c_blocked \
                  FROM buckets WHERE owner_principal = ?1 AND state = ?2 ORDER BY name ASC",
             )
             .map_err(|e| MetadataError::Db {
@@ -1632,6 +1635,50 @@ impl PgMetadataStore for PgStore {
             });
         }
         Ok(())
+    }
+
+    fn put_bucket_encryption(
+        &self,
+        name: &str,
+        config: BucketEncryptionConfig,
+    ) -> Result<(), MetadataError> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE buckets SET sse_c_blocked = ?1 WHERE name = ?2",
+                params![i32::from(config.sse_c_blocked), name],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "put bucket encryption",
+                source: e,
+            })?;
+        if updated == 0 {
+            return Err(MetadataError::BucketNotFound {
+                name: BucketName::from(name),
+            });
+        }
+        Ok(())
+    }
+
+    fn get_bucket_encryption(&self, name: &str) -> Result<BucketEncryptionConfig, MetadataError> {
+        self.conn
+            .query_row(
+                "SELECT sse_c_blocked FROM buckets WHERE name = ?1",
+                params![name],
+                |row| {
+                    Ok(BucketEncryptionConfig {
+                        sse_c_blocked: row.get::<_, i64>(0)? != 0,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| MetadataError::Db {
+                context: "get bucket encryption",
+                source: e,
+            })?
+            .ok_or(MetadataError::BucketNotFound {
+                name: BucketName::from(name),
+            })
     }
 
     fn put_object_meta(&self, req: &PutObjectReq) -> Result<(), MetadataError> {

@@ -1097,6 +1097,8 @@ pub struct BucketInfo {
     pub public_access_block: Option<String>,
     /// Ownership controls value (None = not set).
     pub ownership_controls: Option<String>,
+    /// Bucket encryption configuration subset currently modeled by storage.
+    pub encryption: BucketEncryptionConfig,
 }
 
 /// Authoritative in-memory subset of bucket metadata used on hot object paths.
@@ -1112,6 +1114,16 @@ pub struct BucketFastPathInfo {
     pub public_write: bool,
     pub public_access_block: Option<String>,
     pub ownership_controls: Option<String>,
+    pub encryption: BucketEncryptionConfig,
+}
+
+/// Bucket encryption configuration subset currently implemented by Argmin.
+///
+/// AWS now exposes bucket-level blocked encryption types. For the current
+/// implementation scope, the only relevant gate is whether `SSE-C` is blocked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BucketEncryptionConfig {
+    pub sse_c_blocked: bool,
 }
 
 impl From<BucketInfo> for BucketFastPathInfo {
@@ -1127,6 +1139,7 @@ impl From<BucketInfo> for BucketFastPathInfo {
             public_write: info.public_write,
             public_access_block: info.public_access_block,
             ownership_controls: info.ownership_controls,
+            encryption: info.encryption,
         }
     }
 }
@@ -1144,6 +1157,7 @@ impl From<&BucketInfo> for BucketFastPathInfo {
             public_write: info.public_write,
             public_access_block: info.public_access_block.clone(),
             ownership_controls: info.ownership_controls.clone(),
+            encryption: info.encryption,
         }
     }
 }

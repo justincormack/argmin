@@ -19,6 +19,8 @@ pub enum S3Operation {
     ListObjectVersions { bucket: String },
     PutBucketVersioning { bucket: String },
     GetBucketVersioning { bucket: String },
+    PutBucketEncryption { bucket: String },
+    GetBucketEncryption { bucket: String },
     PutBucketCors { bucket: String },
     GetBucketCors { bucket: String },
     DeleteBucketCors { bucket: String },
@@ -190,6 +192,11 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
                 bucket: bucket.to_string(),
             })
         }
+        ("PUT", None) if has_query_key(query, "encryption") => {
+            Ok(S3Operation::PutBucketEncryption {
+                bucket: bucket.to_string(),
+            })
+        }
         ("PUT", None) if has_query_key(query, "cors") => Ok(S3Operation::PutBucketCors {
             bucket: bucket.to_string(),
         }),
@@ -282,6 +289,12 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
             // Check for ?versioning → GetBucketVersioning
             if has_query_key(query, "versioning") {
                 return Ok(S3Operation::GetBucketVersioning {
+                    bucket: bucket.to_string(),
+                });
+            }
+            // Check for ?encryption → GetBucketEncryption
+            if has_query_key(query, "encryption") {
+                return Ok(S3Operation::GetBucketEncryption {
                     bucket: bucket.to_string(),
                 });
             }
@@ -724,6 +737,26 @@ mod tests {
     }
 
     #[test]
+    fn put_bucket_encryption() {
+        assert_eq!(
+            route("PUT", "/mybucket", "encryption").unwrap(),
+            S3Operation::PutBucketEncryption {
+                bucket: "mybucket".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn get_bucket_encryption() {
+        assert_eq!(
+            route("GET", "/mybucket", "encryption").unwrap(),
+            S3Operation::GetBucketEncryption {
+                bucket: "mybucket".to_string()
+            }
+        );
+    }
+
+    #[test]
     fn put_bucket_cors() {
         assert_eq!(
             route("PUT", "/mybucket", "cors").unwrap(),
@@ -781,6 +814,16 @@ mod tests {
         assert_eq!(
             route("PUT", "/mybucket", "versioning").unwrap(),
             S3Operation::PutBucketVersioning {
+                bucket: "mybucket".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn put_bucket_encryption_takes_priority_over_create() {
+        assert_eq!(
+            route("PUT", "/mybucket", "encryption").unwrap(),
+            S3Operation::PutBucketEncryption {
                 bucket: "mybucket".to_string()
             }
         );

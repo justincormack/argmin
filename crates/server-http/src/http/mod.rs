@@ -1245,6 +1245,20 @@ impl HttpFrontend {
                 let state = self.coordinator.get_bucket_versioning(&bucket, requester)?;
                 Ok(S3Response::get_bucket_versioning(state))
             }
+            S3Operation::PutBucketEncryption { bucket } => {
+                let config = xml::parse_bucket_encryption_xml(&req.body)?;
+                let requester =
+                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                self.coordinator
+                    .put_bucket_encryption(&bucket, config, requester)?;
+                Ok(S3Response::put_bucket_encryption())
+            }
+            S3Operation::GetBucketEncryption { bucket } => {
+                let requester =
+                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                let config = self.coordinator.get_bucket_encryption(&bucket, requester)?;
+                Ok(S3Response::get_bucket_encryption(config))
+            }
             S3Operation::PostObject { .. } => {
                 // POST Object is handled by the streaming path in serve.rs.
                 // If it reaches dispatch_routed, something is wrong.

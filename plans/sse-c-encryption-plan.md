@@ -360,13 +360,29 @@ coverage.
 Add bucket encryption policy support for SSE-C blocking/unblocking, matching the
 AWS model that is rolling out during April 2026.
 
-This likely means:
+This means:
 
 1. add bucket encryption configuration storage
 2. model blocked encryption types (`NONE | SSE-C`)
 3. reject SSE-C write requests with `403 AccessDenied` when blocked
 
 This is related but should be kept separate from object crypto internals.
+
+Current Phase 3 status:
+
+1. `PutBucketEncryption` implemented for the relevant SSE-S3-shaped bucket
+   encryption configuration with `BlockedEncryptionTypes` support for
+   `NONE | SSE-C`.
+2. `GetBucketEncryption` implemented and returns the bucket encryption
+   configuration used for SSE-C gating.
+3. SSE-C writes are rejected with `403 AccessDenied` when the bucket blocks
+   SSE-C.
+4. Existing SSE-C reads remain allowed after a later bucket-level block.
+5. Focused AWS-backed tests cover the implemented bucket encryption surface.
+
+Phase 3 is complete for the currently intended SSE-C bucket-gating scope. The
+remaining future bucket-encryption work is broader `SSE-S3` / KMS policy
+support, not additional SSE-C gating plumbing.
 
 ## Request Handling Design
 
@@ -524,6 +540,8 @@ This work should include direct AWS verification for:
 3. required headers
 4. response headers
 5. multipart header rules
+6. bucket encryption request/response shape for the implemented SSE-C block /
+   unblock subset
 
 ## Suggested Implementation Order
 
@@ -538,6 +556,13 @@ This work should include direct AWS verification for:
 8. Unignore `GetObjectAttributes` SSE-C test and implement attributes path.
 9. Implement copy paths.
 10. Add bucket-level SSE-C blocking support.
+
+The ordered SSE-C implementation work above is now complete. Remaining follow-up
+work is:
+
+1. enforce HTTPS-only SSE-C requests
+2. extend bucket encryption support beyond the SSE-C block/unblock subset
+3. keep validating exact AWS behavior for edge-case error mappings
 
 ## Open Questions To Resolve Early
 

@@ -11,6 +11,7 @@ use quick_xml::{escape::unescape, events::Event, Reader};
 #[cfg(test)]
 use s3_types::VersionId;
 use s3_types::{BucketVersioningState, CanonicalUserId};
+use storage::BucketEncryptionConfig;
 
 use super::response::format_version_id;
 
@@ -701,6 +702,278 @@ pub fn get_bucket_versioning_xml(state: BucketVersioningState) -> String {
 
     xml.push_str("</VersioningConfiguration>");
     xml
+}
+
+/// Parse a `PutBucketEncryption` XML request body.
+///
+/// This currently supports the SSE-C bucket blocking subset:
+/// - default encryption may be omitted or set to SSE-S3 (`AES256`)
+/// - `BlockedEncryptionTypes` may contain `SSE-C` or `NONE`
+pub fn parse_bucket_encryption_xml(data: &[u8]) -> Result<BucketEncryptionConfig, ServerError> {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum State {
+        Start,
+        InRoot,
+        InRule,
+        InApplyDefault,
+        InSseAlgorithm,
+        InKmsMasterKeyId,
+        InBucketKeyEnabled,
+        InBlockedTypes,
+        InEncryptionType,
+        Done,
+    }
+
+    fn malformed_bucket_encryption_xml(reason: &str) -> ServerError {
+        ServerError::MalformedXML {
+            reason: reason.to_string(),
+        }
+    }
+
+    fn decode_bucket_encryption_text(bytes: &[u8]) -> Result<String, ServerError> {
+        decode_xml_text(
+            bytes,
+            "invalid UTF-8 in bucket encryption XML body",
+            "invalid XML entity in bucket encryption XML body",
+        )
+    }
+
+    let mut reader = Reader::from_reader(data);
+    let mut buf = Vec::new();
+    let mut state = State::Start;
+    let mut current_text = String::new();
+    let mut rule_seen = false;
+    let mut apply_default_seen = false;
+    let mut sse_algorithm: Option<String> = None;
+    let mut bucket_key_enabled = false;
+    let mut encryption_types: Vec<String> = Vec::new();
+    let mut kms_master_key_seen = false;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => match (state, e.name().as_ref()) {
+                (State::Start, b"ServerSideEncryptionConfiguration") => state = State::InRoot,
+                (State::InRoot, b"Rule") => {
+                    if rule_seen {
+                        return Err(malformed_bucket_encryption_xml(
+                            "multiple Rule elements are not supported",
+                        ));
+                    }
+                    rule_seen = true;
+                    state = State::InRule;
+                }
+                (State::InRule, b"ApplyServerSideEncryptionByDefault") => {
+                    current_text.clear();
+                    apply_default_seen = true;
+                    state = State::InApplyDefault;
+                }
+                (State::InRule, b"BucketKeyEnabled") => {
+                    current_text.clear();
+                    state = State::InBucketKeyEnabled;
+                }
+                (State::InRule, b"BlockedEncryptionTypes") => {
+                    state = State::InBlockedTypes;
+                }
+                (State::InApplyDefault, b"SSEAlgorithm") => {
+                    current_text.clear();
+                    state = State::InSseAlgorithm;
+                }
+                (State::InApplyDefault, b"KMSMasterKeyID") => {
+                    current_text.clear();
+                    kms_master_key_seen = true;
+                    state = State::InKmsMasterKeyId;
+                }
+                (State::InBlockedTypes, b"EncryptionType") => {
+                    current_text.clear();
+                    state = State::InEncryptionType;
+                }
+                _ => {
+                    return Err(malformed_bucket_encryption_xml(
+                        "unexpected element in bucket encryption XML",
+                    ));
+                }
+            },
+            Ok(Event::Empty(e)) => match (state, e.name().as_ref()) {
+                (State::Start, b"ServerSideEncryptionConfiguration") => state = State::Done,
+                (State::InRoot, b"Rule") => {
+                    if rule_seen {
+                        return Err(malformed_bucket_encryption_xml(
+                            "multiple Rule elements are not supported",
+                        ));
+                    }
+                    rule_seen = true;
+                }
+                (State::InRule, b"ApplyServerSideEncryptionByDefault") => {
+                    apply_default_seen = true;
+                }
+                (State::InRule, b"BucketKeyEnabled") => {}
+                (State::InRule, b"BlockedEncryptionTypes") => {}
+                (State::InApplyDefault, b"SSEAlgorithm") => sse_algorithm = Some(String::new()),
+                (State::InApplyDefault, b"KMSMasterKeyID") => {
+                    kms_master_key_seen = true;
+                }
+                (State::InBlockedTypes, b"EncryptionType") => {
+                    encryption_types.push(String::new());
+                }
+                _ => {
+                    return Err(malformed_bucket_encryption_xml(
+                        "unexpected empty element in bucket encryption XML",
+                    ));
+                }
+            },
+            Ok(Event::End(e)) => match (state, e.name().as_ref()) {
+                (State::InRoot, b"ServerSideEncryptionConfiguration") => state = State::Done,
+                (State::InRule, b"Rule") => state = State::InRoot,
+                (State::InApplyDefault, b"ApplyServerSideEncryptionByDefault") => {
+                    state = State::InRule;
+                }
+                (State::InSseAlgorithm, b"SSEAlgorithm") => {
+                    sse_algorithm = Some(std::mem::take(&mut current_text));
+                    state = State::InApplyDefault;
+                }
+                (State::InKmsMasterKeyId, b"KMSMasterKeyID") => {
+                    current_text.clear();
+                    state = State::InApplyDefault;
+                }
+                (State::InBucketKeyEnabled, b"BucketKeyEnabled") => {
+                    bucket_key_enabled = current_text.trim().eq_ignore_ascii_case("true");
+                    current_text.clear();
+                    state = State::InRule;
+                }
+                (State::InBlockedTypes, b"BlockedEncryptionTypes") => state = State::InRule,
+                (State::InEncryptionType, b"EncryptionType") => {
+                    encryption_types.push(std::mem::take(&mut current_text));
+                    state = State::InBlockedTypes;
+                }
+                _ => {
+                    return Err(malformed_bucket_encryption_xml(
+                        "unexpected closing element in bucket encryption XML",
+                    ));
+                }
+            },
+            Ok(Event::Text(t)) => {
+                let text = decode_bucket_encryption_text(t.as_ref())?;
+                match state {
+                    State::InSseAlgorithm
+                    | State::InKmsMasterKeyId
+                    | State::InBucketKeyEnabled
+                    | State::InEncryptionType => current_text.push_str(&text),
+                    _ if text.trim().is_empty() => {}
+                    _ => {
+                        return Err(malformed_bucket_encryption_xml(
+                            "unexpected text in bucket encryption XML",
+                        ));
+                    }
+                }
+            }
+            Ok(Event::CData(t)) => {
+                let text = std::str::from_utf8(t.as_ref()).map_err(|_| {
+                    malformed_bucket_encryption_xml("invalid UTF-8 in bucket encryption XML body")
+                })?;
+                match state {
+                    State::InSseAlgorithm
+                    | State::InKmsMasterKeyId
+                    | State::InBucketKeyEnabled
+                    | State::InEncryptionType => current_text.push_str(text),
+                    _ if text.trim().is_empty() => {}
+                    _ => {
+                        return Err(malformed_bucket_encryption_xml(
+                            "unexpected CDATA in bucket encryption XML",
+                        ));
+                    }
+                }
+            }
+            Ok(Event::Comment(_) | Event::Decl(_) | Event::PI(_) | Event::DocType(_)) => {}
+            Ok(Event::Eof) => {
+                if state != State::Done {
+                    return Err(match state {
+                        State::Start => malformed_bucket_encryption_xml(
+                            "missing ServerSideEncryptionConfiguration element",
+                        ),
+                        _ => malformed_bucket_encryption_xml(
+                            "unexpected end of bucket encryption XML",
+                        ),
+                    });
+                }
+                break;
+            }
+            Err(_) => {
+                return Err(malformed_bucket_encryption_xml(
+                    "malformed bucket encryption XML",
+                ));
+            }
+        }
+        buf.clear();
+    }
+
+    if bucket_key_enabled {
+        return Err(ServerError::NotImplemented {
+            feature: "BucketKeyEnabled=true".to_string(),
+        });
+    }
+    if kms_master_key_seen {
+        return Err(ServerError::NotImplemented {
+            feature: "KMS bucket encryption configuration".to_string(),
+        });
+    }
+    if apply_default_seen {
+        match sse_algorithm.as_deref().map(str::trim) {
+            Some("AES256") => {}
+            Some(other) => {
+                return Err(ServerError::NotImplemented {
+                    feature: format!("bucket encryption algorithm {other}"),
+                });
+            }
+            None => {
+                return Err(malformed_bucket_encryption_xml(
+                    "missing SSEAlgorithm element in ApplyServerSideEncryptionByDefault",
+                ));
+            }
+        }
+    }
+
+    let encryption_types: Vec<&str> = encryption_types
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .collect();
+
+    let sse_c_blocked = match encryption_types.as_slice() {
+        [] | ["NONE"] => false,
+        ["SSE-C"] => true,
+        [other] => {
+            return Err(ServerError::InvalidArgument {
+                reason: format!("unsupported blocked encryption type: {other}"),
+            });
+        }
+        _ => {
+            return Err(ServerError::InvalidArgument {
+                reason: "unsupported blocked encryption types configuration".to_string(),
+            });
+        }
+    };
+
+    Ok(BucketEncryptionConfig { sse_c_blocked })
+}
+
+/// Format a `GetBucketEncryption` XML response.
+#[must_use]
+pub fn get_bucket_encryption_xml(config: BucketEncryptionConfig) -> String {
+    let encryption_type = if config.sse_c_blocked {
+        "SSE-C"
+    } else {
+        "NONE"
+    };
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <ServerSideEncryptionConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <Rule>\
+         <ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault>\
+         <BlockedEncryptionTypes><EncryptionType>{}</EncryptionType></BlockedEncryptionTypes>\
+         </Rule>\
+         </ServerSideEncryptionConfiguration>",
+        encryption_type
+    )
 }
 
 /// Format a `ListVersionsResult` XML response.
@@ -2496,6 +2769,7 @@ mod tests {
             public_write: false,
             public_access_block: None,
             ownership_controls: None,
+            encryption: BucketEncryptionConfig::default(),
         }];
         let owner_canonical_id = CanonicalUserId::from_principal("owner");
         let xml = list_buckets_xml(&buckets, "owner", &owner_canonical_id);
@@ -3014,6 +3288,88 @@ mod tests {
     fn get_bucket_versioning_suspended() {
         let xml = get_bucket_versioning_xml(BucketVersioningState::Suspended);
         assert!(xml.contains("<Status>Suspended</Status>"));
+    }
+
+    #[test]
+    fn parse_bucket_encryption_sse_c_blocked() {
+        let xml = br#"
+            <ServerSideEncryptionConfiguration>
+              <Rule>
+                <ApplyServerSideEncryptionByDefault>
+                  <SSEAlgorithm>AES256</SSEAlgorithm>
+                </ApplyServerSideEncryptionByDefault>
+                <BlockedEncryptionTypes>
+                  <EncryptionType>SSE-C</EncryptionType>
+                </BlockedEncryptionTypes>
+              </Rule>
+            </ServerSideEncryptionConfiguration>
+        "#;
+        let config = parse_bucket_encryption_xml(xml).unwrap();
+        assert!(config.sse_c_blocked);
+    }
+
+    #[test]
+    fn parse_bucket_encryption_none_unblocks_sse_c() {
+        let xml = br#"
+            <ServerSideEncryptionConfiguration>
+              <Rule>
+                <BlockedEncryptionTypes>
+                  <EncryptionType>NONE</EncryptionType>
+                </BlockedEncryptionTypes>
+              </Rule>
+            </ServerSideEncryptionConfiguration>
+        "#;
+        let config = parse_bucket_encryption_xml(xml).unwrap();
+        assert!(!config.sse_c_blocked);
+    }
+
+    #[test]
+    fn parse_bucket_encryption_rejects_unsupported_algorithm() {
+        let xml = br#"
+            <ServerSideEncryptionConfiguration>
+              <Rule>
+                <ApplyServerSideEncryptionByDefault>
+                  <SSEAlgorithm>aws:kms</SSEAlgorithm>
+                </ApplyServerSideEncryptionByDefault>
+              </Rule>
+            </ServerSideEncryptionConfiguration>
+        "#;
+        assert!(matches!(
+            parse_bucket_encryption_xml(xml),
+            Err(ServerError::NotImplemented { .. })
+        ));
+    }
+
+    #[test]
+    fn parse_bucket_encryption_rejects_unsupported_blocked_type() {
+        let xml = br#"
+            <ServerSideEncryptionConfiguration>
+              <Rule>
+                <BlockedEncryptionTypes>
+                  <EncryptionType>aws:kms</EncryptionType>
+                </BlockedEncryptionTypes>
+              </Rule>
+            </ServerSideEncryptionConfiguration>
+        "#;
+        assert!(matches!(
+            parse_bucket_encryption_xml(xml),
+            Err(ServerError::InvalidArgument { .. })
+        ));
+    }
+
+    #[test]
+    fn bucket_encryption_xml_round_trip() {
+        let blocked = BucketEncryptionConfig {
+            sse_c_blocked: true,
+        };
+        let xml = get_bucket_encryption_xml(blocked);
+        let parsed = parse_bucket_encryption_xml(xml.as_bytes()).unwrap();
+        assert_eq!(parsed, blocked);
+
+        let unblocked_xml = get_bucket_encryption_xml(BucketEncryptionConfig {
+            sse_c_blocked: false,
+        });
+        assert!(unblocked_xml.contains("<EncryptionType>NONE</EncryptionType>"));
     }
 
     // ── CORS XML ─────────────────────────────────────────────────────

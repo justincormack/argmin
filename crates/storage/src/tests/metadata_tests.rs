@@ -571,6 +571,28 @@ fn file_bucket_metadata_config_roundtrip() {
     store.delete_bucket_ownership_controls("bucket").unwrap();
     assert_eq!(store.get_bucket_ownership_controls("bucket").unwrap(), None);
 
+    store
+        .put_bucket_encryption(
+            "bucket",
+            BucketEncryptionConfig {
+                sse_c_blocked: true,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        store.get_bucket_encryption("bucket").unwrap(),
+        BucketEncryptionConfig {
+            sse_c_blocked: true,
+        }
+    );
+    assert!(
+        store
+            .head_bucket("bucket")
+            .unwrap()
+            .encryption
+            .sse_c_blocked
+    );
+
     store.put_bucket_acl("bucket", true, false).unwrap();
     assert!(store.head_bucket("bucket").unwrap().public_read);
     store.put_bucket_acl("bucket", false, false).unwrap();
@@ -588,6 +610,19 @@ fn file_bucket_metadata_config_on_nonexistent_bucket() {
     ));
 
     let err = store.get_bucket_tags("nope").unwrap_err();
+    assert!(matches!(
+        err,
+        crate::error::MetadataError::BucketNotFound { .. }
+    ));
+
+    let err = store
+        .put_bucket_encryption(
+            "nope",
+            BucketEncryptionConfig {
+                sse_c_blocked: true,
+            },
+        )
+        .unwrap_err();
     assert!(matches!(
         err,
         crate::error::MetadataError::BucketNotFound { .. }

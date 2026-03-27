@@ -14,10 +14,10 @@ use storage::traits::{PgMetadataStore, ShardStore};
 #[cfg(test)]
 use storage::SimplePayloadReclaimRecord;
 use storage::{
-    BucketFastPathInfo, BucketInfo, BucketName, BucketState, CommitMultipartReq,
-    CommitStreamPutReq, CreateMultipartUploadReq, CreateStreamUploadReq, EcShape, GenerationId,
-    ListMultipartUploadsReq, ListObjectVersionsReq, ListObjectsReq, ListPartsReq,
-    MultipartPartRecord, MultipartPartSegmentRecord, MultipartReclaimPartRecord,
+    BucketEncryptionConfig, BucketFastPathInfo, BucketInfo, BucketName, BucketState,
+    CommitMultipartReq, CommitStreamPutReq, CreateMultipartUploadReq, CreateStreamUploadReq,
+    EcShape, GenerationId, ListMultipartUploadsReq, ListObjectVersionsReq, ListObjectsReq,
+    ListPartsReq, MultipartPartRecord, MultipartPartSegmentRecord, MultipartReclaimPartRecord,
     MultipartReclaimPartSegmentRecord, MultipartReclaimRecord, MultipartUploadRecord,
     ObjectEncryption, ObjectKey, ObjectLayout, ObjectPartRecord, ObjectSegmentRecord,
     ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord, PutDeleteMarkerReq,
@@ -159,6 +159,7 @@ pub struct BucketSummary {
     pub versioning: BucketVersioningState,
     pub public_access_block: Option<String>,
     pub ownership_controls: Option<String>,
+    pub encryption: BucketEncryptionConfig,
 }
 
 /// Result of a GetBucketAcl operation.
@@ -2517,6 +2518,13 @@ impl Coordinator {
         bucket.public_write && !Self::ignores_public_acls(bucket.public_access_block.as_deref())
     }
 
+    fn ensure_sse_c_allowed(bucket: &BucketSummary, uses_sse_c: bool) -> Result<(), ServerError> {
+        if uses_sse_c && bucket.encryption.sse_c_blocked {
+            return Err(ServerError::AccessDenied);
+        }
+        Ok(())
+    }
+
     fn requester_principal_required(requester: Requester<'_>) -> Result<&str, ServerError> {
         requester.principal_opt().ok_or(ServerError::AccessDenied)
     }
@@ -2679,6 +2687,7 @@ impl Coordinator {
             versioning: info.versioning,
             public_access_block: info.public_access_block,
             ownership_controls: info.ownership_controls,
+            encryption: info.encryption,
         }
     }
 
@@ -2693,6 +2702,7 @@ impl Coordinator {
             versioning: info.versioning,
             public_access_block: info.public_access_block,
             ownership_controls: info.ownership_controls,
+            encryption: info.encryption,
         }
     }
 
@@ -3096,6 +3106,49 @@ impl Coordinator {
         );
         let info = self.authorize_bucket_read_requester(requester, name)?;
         Ok(info.versioning)
+    }
+
+    pub fn put_bucket_encryption(
+        &self,
+        name: &str,
+        config: BucketEncryptionConfig,
+        requester: Requester<'_>,
+    ) -> Result<(), ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::put_bucket_encryption",
+            "bucket={} sse_c_blocked={}",
+            name,
+            config.sse_c_blocked
+        );
+        let _bucket_info = self.authorize_bucket_admin_requester(requester, name)?;
+        let bucket_pg = self.get_bucket_pg(name)?;
+        bucket_pg
+            .put_bucket_encryption(name, config)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })?;
+        self.storage_node
+            .update_bucket_fast_path_if_present(name, |info| info.encryption = config);
+        Ok(())
+    }
+
+    pub fn get_bucket_encryption(
+        &self,
+        name: &str,
+        requester: Requester<'_>,
+    ) -> Result<BucketEncryptionConfig, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::get_bucket_encryption",
+            "bucket={}",
+            name
+        );
+        let info = self.authorize_bucket_admin_requester(requester, name)?;
+        Ok(info.encryption)
     }
 
     pub fn put_bucket_cors(
@@ -3850,6 +3903,7 @@ impl Coordinator {
             ) {
                 return Err(ServerError::AccessDenied);
             }
+            Self::ensure_sse_c_allowed(&bucket_info, write_encryption.is_some())?;
             if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_deref())
                 && !matches!(
                     req.acl,
@@ -4019,6 +4073,10 @@ impl Coordinator {
             ) {
                 return Err(ServerError::AccessDenied);
             }
+            Self::ensure_sse_c_allowed(
+                &bucket_info,
+                matches!(req.encryption, ObjectEncryption::SseCustomer(_)),
+            )?;
             if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_deref())
                 && !matches!(
                     req.acl,
@@ -4086,7 +4144,7 @@ impl Coordinator {
             });
         }
 
-        let _bucket_info = self.authorize_object_write_requester(req.requester, bucket)?;
+        let bucket_info = self.authorize_object_write_requester(req.requester, bucket)?;
 
         // Lock metadata PG and validate upload exists.
         let meta_pg_id = self.object_pg_id(bucket, key);
@@ -4103,6 +4161,10 @@ impl Coordinator {
                 upload_id: upload_id.to_string(),
             });
         }
+        Self::ensure_sse_c_allowed(
+            &bucket_info,
+            matches!(upload.encryption, ObjectEncryption::SseCustomer(_)),
+        )?;
         let sse_customer =
             self.prepare_existing_sse_customer_write_context(&upload.encryption, req.sse_customer)?;
 
@@ -7124,6 +7186,7 @@ impl Coordinator {
             ) {
                 return Err(ServerError::AccessDenied);
             }
+            Self::ensure_sse_c_allowed(&bucket_info, req.sse_customer.is_some())?;
 
             // Generate 16 random bytes → 32-char hex upload ID.
             let rng = ring::rand::SystemRandom::new();
@@ -7468,6 +7531,10 @@ impl Coordinator {
                     upload_id: upload_id.to_string(),
                 });
             }
+            Self::ensure_sse_c_allowed(
+                &bucket_info,
+                matches!(upload.encryption, ObjectEncryption::SseCustomer(_)),
+            )?;
             let multipart_sse_write =
                 self.prepare_existing_sse_customer_write_context(&upload.encryption, req.sse_customer)?;
 
@@ -13670,6 +13737,223 @@ mod tests {
                 BucketVersioningState::Enabled,
                 Requester::principal("other-user"),
             )
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn bucket_encryption_default_unblocked() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let config = coord
+            .get_bucket_encryption("bucket", TEST_REQUESTER)
+            .unwrap();
+        assert!(!config.sse_c_blocked);
+    }
+
+    #[test]
+    fn bucket_encryption_block_and_unblock() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        coord
+            .put_bucket_encryption(
+                "bucket",
+                BucketEncryptionConfig {
+                    sse_c_blocked: true,
+                },
+                TEST_REQUESTER,
+            )
+            .unwrap();
+        assert!(
+            coord
+                .get_bucket_encryption("bucket", TEST_REQUESTER)
+                .unwrap()
+                .sse_c_blocked
+        );
+
+        coord
+            .put_bucket_encryption(
+                "bucket",
+                BucketEncryptionConfig {
+                    sse_c_blocked: false,
+                },
+                TEST_REQUESTER,
+            )
+            .unwrap();
+        assert!(
+            !coord
+                .get_bucket_encryption("bucket", TEST_REQUESTER)
+                .unwrap()
+                .sse_c_blocked
+        );
+    }
+
+    #[test]
+    fn put_bucket_encryption_rejects_non_owner_requester() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+
+        let err = coord
+            .put_bucket_encryption(
+                "bucket",
+                BucketEncryptionConfig {
+                    sse_c_blocked: true,
+                },
+                Requester::principal("other-user"),
+            )
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn sse_c_put_object_rejected_when_bucket_blocks_sse_c() {
+        let dir = test_util::tempdir();
+        let coord = setup_coordinator_with_sse_c(dir.path());
+        coord.create_bucket("bucket").unwrap();
+        coord
+            .put_bucket_encryption(
+                "bucket",
+                BucketEncryptionConfig {
+                    sse_c_blocked: true,
+                },
+                TEST_REQUESTER,
+            )
+            .unwrap();
+
+        let sse_customer = test_sse_customer_request();
+        let err = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: Some(&sse_customer),
+                bucket: "bucket",
+                key: "key",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn unencrypted_put_object_allowed_when_bucket_blocks_sse_c() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+        coord
+            .put_bucket_encryption(
+                "bucket",
+                BucketEncryptionConfig {
+                    sse_c_blocked: true,
+                },
+                TEST_REQUESTER,
+            )
+            .unwrap();
+
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "key",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn sse_c_stream_put_rejected_when_bucket_blocks_sse_c() {
+        let dir = test_util::tempdir();
+        let coord = setup_coordinator_with_sse_c(dir.path());
+        coord.create_bucket("bucket").unwrap();
+        coord
+            .put_bucket_encryption(
+                "bucket",
+                BucketEncryptionConfig {
+                    sse_c_blocked: true,
+                },
+                TEST_REQUESTER,
+            )
+            .unwrap();
+
+        let sse_customer = test_sse_customer_request();
+        let encryption = coord
+            .prepare_sse_customer_write_context(Some(&sse_customer))
+            .unwrap()
+            .unwrap()
+            .encryption()
+            .clone();
+
+        let err = coord
+            .begin_stream_put(&BeginStreamPutRequest {
+                bucket: "bucket",
+                key: "key",
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
+                encryption,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn sse_c_upload_part_rejected_when_bucket_blocks_sse_c() {
+        let dir = test_util::tempdir();
+        let coord = setup_coordinator_with_sse_c(dir.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let sse_customer = test_sse_customer_request();
+        let upload = coord
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                checksum: None,
+                requester: TEST_REQUESTER,
+                sse_customer: Some(&sse_customer),
+            })
+            .unwrap();
+
+        coord
+            .put_bucket_encryption(
+                "bucket",
+                BucketEncryptionConfig {
+                    sse_c_blocked: true,
+                },
+                TEST_REQUESTER,
+            )
+            .unwrap();
+
+        let err = coord
+            .begin_stream_part(&BeginStreamPartRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload.upload_id,
+                part_number: 1,
+                requester: TEST_REQUESTER,
+                sse_customer: Some(&sse_customer),
+            })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
     }
