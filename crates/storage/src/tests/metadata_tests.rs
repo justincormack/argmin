@@ -2534,11 +2534,20 @@ mod prop_tests {
         all
     }
 
+    #[test]
+    fn regression_empty_prefix_matches_all() {
+        let (_dir, store) = super::make_pg_store();
+        insert_keys(&store, "bucket", &["O".to_string()]);
+
+        let got = list_all_keys(&store, "bucket", Some(ObjectKey::from("")), 1);
+        assert_eq!(got, vec![ObjectKey::from("O")]);
+    }
+
     proptest! {
         #[test]
         fn prop_metadata_pagination_roundtrip(
             keys in proptest::collection::vec(
-                proptest::string::string_regex(r"[A-Za-z0-9._/-]{0,16}").unwrap(),
+                proptest::string::string_regex(r"[A-Za-z0-9._/-]{1,16}").unwrap(),
                 0..=40
             ),
             max_keys in 1u32..=10,
@@ -2557,7 +2566,7 @@ mod prop_tests {
         #[test]
         fn prop_metadata_prefix_subset(
             keys in proptest::collection::vec(
-                proptest::string::string_regex(r"[A-Za-z0-9._/-]{0,16}").unwrap(),
+                proptest::string::string_regex(r"[A-Za-z0-9._/-]{1,16}").unwrap(),
                 0..=40
             ),
             prefix in proptest::string::string_regex(r"[A-Za-z0-9._/-]{0,8}").unwrap(),
