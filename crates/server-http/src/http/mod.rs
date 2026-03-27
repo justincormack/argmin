@@ -37,6 +37,7 @@ use conditional::{
     copy_source_condition_from_headers, delete_condition_from_headers, read_condition_from_headers,
     write_condition_from_headers,
 };
+use md5_legacy::Digest;
 use request::S3Request;
 use response::S3Response;
 use router::{route, S3Operation};
@@ -830,6 +831,7 @@ impl HttpFrontend {
                     Ok(S3Response::copy_object(&result))
                 } else {
                     // Normal PutObject — use streaming upload path directly.
+                    validate_content_md5(req)?;
                     validate_checksum_headers(req, true)?;
                     let inline_tags_xml = if let Some(tagging_header) = req.header("x-amz-tagging")
                     {
@@ -1179,6 +1181,7 @@ impl HttpFrontend {
                 ))
             }
             S3Operation::DeleteObjects { bucket } => {
+                require_content_md5(req)?;
                 let (xml_entries, quiet) = xml::parse_delete_objects_xml(&req.body)?;
                 let cond = delete_condition_from_headers(req)?;
                 let requester =
@@ -1496,6 +1499,7 @@ impl HttpFrontend {
                     ))
                 } else {
                     // Normal UploadPart — use streaming upload path directly.
+                    validate_content_md5(req)?;
                     let claimed_checksum = extract_checksum_header(req)?;
                     let requester =
                         crate::coordinator::Requester::from_principal(auth.principal.as_deref());
@@ -2353,6 +2357,7 @@ impl HttpFrontend {
         );
         let auth = self.authenticate_with_payload_check(req, false)?;
 
+        let content_md5 = ContentMd5Claim::from_request(req)?;
         validate_checksum_headers(req, false)?;
 
         // Parse inline tags before starting the session.
@@ -2418,6 +2423,7 @@ impl HttpFrontend {
             cond,
             inline_tags_xml,
             checksum: StreamingPutChecksumContract {
+                content_md5,
                 response_headers: ChecksumResponseHeaders(checksum_response),
             },
             streaming_signing: auth.streaming,
@@ -2591,6 +2597,7 @@ impl HttpFrontend {
         );
         let auth = self.authenticate_with_payload_check(req, false)?;
 
+        let content_md5 = ContentMd5Claim::from_request(req)?;
         let claimed_checksum = extract_checksum_header(req)?;
 
         let mut checksum_response: Vec<(String, String)> = Vec::new();
@@ -2622,6 +2629,7 @@ impl HttpFrontend {
                 part_number,
             },
             checksum: StreamingPartChecksumContract {
+                content_md5,
                 upload_checksum_algorithm: begin.checksum_algorithm,
                 claim: claimed_checksum,
                 response_headers: ChecksumResponseHeaders(checksum_response),
@@ -2784,11 +2792,13 @@ pub struct ChecksumResponseHeaders(pub Vec<(String, String)>);
 
 /// Checksum contract for streaming `PutObject`.
 pub struct StreamingPutChecksumContract {
+    pub content_md5: Option<ContentMd5Claim>,
     pub response_headers: ChecksumResponseHeaders,
 }
 
 /// Checksum contract for streaming `UploadPart`.
 pub struct StreamingPartChecksumContract {
+    pub content_md5: Option<ContentMd5Claim>,
     pub upload_checksum_algorithm: Option<ChecksumAlgorithm>,
     pub claim: Option<ChecksumClaim>,
     pub response_headers: ChecksumResponseHeaders,
@@ -2896,6 +2906,55 @@ const CHECKSUM_HEADERS: &[(&str, &str)] = &[
     ("CRC32C", "x-amz-checksum-crc32c"),
     ("SHA1", "x-amz-checksum-sha1"),
 ];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContentMd5Claim([u8; 16]);
+
+impl ContentMd5Claim {
+    fn from_request(req: &S3Request) -> Result<Option<Self>, ServerError> {
+        use base64::Engine;
+
+        if header_count(req, "content-md5") > 1 {
+            return Err(ServerError::InvalidDigest);
+        }
+        let Some(header) = req.header("content-md5") else {
+            return Ok(None);
+        };
+
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(header)
+            .map_err(|_| ServerError::InvalidDigest)?;
+        let bytes: [u8; 16] = decoded.try_into().map_err(|_| ServerError::InvalidDigest)?;
+        Ok(Some(Self(bytes)))
+    }
+
+    fn verify(self, actual: &[u8; 16]) -> Result<(), ServerError> {
+        if self.0 == *actual {
+            Ok(())
+        } else {
+            Err(ServerError::BadDigest)
+        }
+    }
+}
+
+fn validate_content_md5(req: &S3Request) -> Result<(), ServerError> {
+    let Some(claim) = ContentMd5Claim::from_request(req)? else {
+        return Ok(());
+    };
+    let actual = md5_legacy::Md5::digest(&req.body);
+    let mut actual_bytes = [0u8; 16];
+    actual_bytes.copy_from_slice(actual.as_ref());
+    claim.verify(&actual_bytes)
+}
+
+fn require_content_md5(req: &S3Request) -> Result<(), ServerError> {
+    if req.header("content-md5").is_none() {
+        return Err(ServerError::InvalidRequest {
+            reason: "Content-MD5 HTTP header is required for DeleteObjects".to_string(),
+        });
+    }
+    validate_content_md5(req)
+}
 
 /// Map a checksum header name (e.g. `x-amz-checksum-crc32`) to its
 /// `ChecksumAlgorithm`. Returns `None` for unrecognized headers.
@@ -3213,6 +3272,13 @@ mod tests {
         request::header_map_from_owned(headers)
     }
 
+    fn content_md5_value(body: &[u8]) -> String {
+        use base64::Engine;
+
+        let digest = md5_legacy::Md5::digest(body);
+        base64::engine::general_purpose::STANDARD.encode(&digest[..])
+    }
+
     // ── UploadPart validation ────────────────────────────────────────
 
     #[test]
@@ -3251,6 +3317,118 @@ mod tests {
         match fe.dispatch_routed(&req, &test_auth(), op) {
             Err(ServerError::InvalidArgument { .. }) => {}
             Err(e) => panic!("expected InvalidArgument, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn put_object_invalid_content_md5_rejected() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+
+        let req = new_req(
+            http::Method::PUT,
+            "",
+            "",
+            vec![("Content-MD5".to_string(), "not-base64".to_string())],
+            b"hello world".to_vec(),
+        );
+        let op = S3Operation::PutObject {
+            bucket: "mybucket".to_string(),
+            key: "mykey".to_string(),
+        };
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::InvalidDigest) => {}
+            Err(e) => panic!("expected InvalidDigest, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn put_object_bad_content_md5_rejected() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+
+        let req = new_req(
+            http::Method::PUT,
+            "",
+            "",
+            vec![(
+                "Content-MD5".to_string(),
+                "AAAAAAAAAAAAAAAAAAAAAA==".to_string(),
+            )],
+            b"hello world".to_vec(),
+        );
+        let op = S3Operation::PutObject {
+            bucket: "mybucket".to_string(),
+            key: "mykey".to_string(),
+        };
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::BadDigest) => {}
+            Err(e) => panic!("expected BadDigest, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn upload_part_invalid_content_md5_rejected() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+        let upload_id = create_upload_with_checksum(&fe, "mybucket", "mykey", None);
+
+        let req = new_req(
+            http::Method::PUT,
+            "",
+            &format!("partNumber=1&uploadId={upload_id}"),
+            vec![("Content-MD5".to_string(), "not-base64".to_string())],
+            b"part data".to_vec(),
+        );
+        let op = S3Operation::UploadPart {
+            bucket: "mybucket".to_string(),
+            key: "mykey".to_string(),
+        };
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::InvalidDigest) => {}
+            Err(e) => panic!("expected InvalidDigest, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn upload_part_bad_content_md5_rejected() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+        let upload_id = create_upload_with_checksum(&fe, "mybucket", "mykey", None);
+
+        let req = new_req(
+            http::Method::PUT,
+            "",
+            &format!("partNumber=1&uploadId={upload_id}"),
+            vec![(
+                "Content-MD5".to_string(),
+                "AAAAAAAAAAAAAAAAAAAAAA==".to_string(),
+            )],
+            b"part data".to_vec(),
+        );
+        let op = S3Operation::UploadPart {
+            bucket: "mybucket".to_string(),
+            key: "mykey".to_string(),
+        };
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::BadDigest) => {}
+            Err(e) => panic!("expected BadDigest, got {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
     }
@@ -4736,7 +4914,7 @@ mod tests {
             http::Method::POST,
             "/mybucket",
             "delete",
-            vec![],
+            vec![("Content-MD5".to_string(), content_md5_value(xml))],
             xml.to_vec(),
         );
         let op = S3Operation::DeleteObjects {
@@ -4765,7 +4943,7 @@ mod tests {
             http::Method::POST,
             "/mybucket",
             "delete",
-            vec![],
+            vec![("Content-MD5".to_string(), content_md5_value(xml))],
             xml.to_vec(),
         );
         let op = S3Operation::DeleteObjects {
@@ -4775,6 +4953,96 @@ mod tests {
         match fe.dispatch_routed(&req, &test_auth(), op) {
             Ok(_) => {}
             Err(e) => panic!("expected Ok, got {e:?}"),
+        }
+    }
+
+    #[test]
+    fn delete_objects_missing_content_md5_rejected() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+
+        let xml = br#"<?xml version="1.0"?>
+<Delete>
+  <Object><Key>key1</Key></Object>
+</Delete>"#;
+        let req = new_req(
+            http::Method::POST,
+            "/mybucket",
+            "delete",
+            vec![],
+            xml.to_vec(),
+        );
+        let op = S3Operation::DeleteObjects {
+            bucket: "mybucket".to_string(),
+        };
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::InvalidRequest { .. }) => {}
+            Err(e) => panic!("expected InvalidRequest, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn delete_objects_invalid_content_md5_rejected() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+
+        let xml = br#"<?xml version="1.0"?>
+<Delete>
+  <Object><Key>key1</Key></Object>
+</Delete>"#;
+        let req = new_req(
+            http::Method::POST,
+            "/mybucket",
+            "delete",
+            vec![("Content-MD5".to_string(), "not-base64".to_string())],
+            xml.to_vec(),
+        );
+        let op = S3Operation::DeleteObjects {
+            bucket: "mybucket".to_string(),
+        };
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::InvalidDigest) => {}
+            Err(e) => panic!("expected InvalidDigest, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn delete_objects_bad_content_md5_rejected() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+
+        let xml = br#"<?xml version="1.0"?>
+<Delete>
+  <Object><Key>key1</Key></Object>
+</Delete>"#;
+        let req = new_req(
+            http::Method::POST,
+            "/mybucket",
+            "delete",
+            vec![(
+                "Content-MD5".to_string(),
+                "AAAAAAAAAAAAAAAAAAAAAA==".to_string(),
+            )],
+            xml.to_vec(),
+        );
+        let op = S3Operation::DeleteObjects {
+            bucket: "mybucket".to_string(),
+        };
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::BadDigest) => {}
+            Err(e) => panic!("expected BadDigest, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
         }
     }
 

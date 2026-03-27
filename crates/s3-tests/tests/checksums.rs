@@ -3,7 +3,9 @@ use aws_sdk_s3::types::{
     ChecksumAlgorithm, ChecksumMode, ChecksumType, CompletedMultipartUpload, CompletedPart,
     ObjectAttributes,
 };
+use ring::hmac;
 use s3_tests::{assert_s3_err_code, err_status, unique_bucket, CTX};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
@@ -22,6 +24,168 @@ async fn cleanup(bucket: &str, keys: &[&str]) {
     client.delete_bucket().bucket(bucket).send().await.unwrap();
 }
 
+fn assert_error_code(body: &str, code: &str) {
+    let expected = format!("<Code>{}</Code>", code);
+    assert!(
+        body.contains(&expected),
+        "expected {expected} in body: {body}",
+    );
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    let d = ring::digest::digest(&ring::digest::SHA256, data);
+    d.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
+    let k = hmac::Key::new(hmac::HMAC_SHA256, key);
+    hmac::sign(&k, data).as_ref().to_vec()
+}
+
+fn format_amz_date(epoch_secs: u64) -> String {
+    let days = epoch_secs / 86400;
+    let tod = epoch_secs % 86400;
+    let (y, m, d) = days_to_date(days as i64);
+    format!(
+        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+        y,
+        m,
+        d,
+        tod / 3600,
+        (tod % 3600) / 60,
+        tod % 60,
+    )
+}
+
+fn days_to_date(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+fn normalize_query(raw: &str) -> String {
+    if raw.is_empty() {
+        return String::new();
+    }
+    let mut pairs: Vec<(String, String)> = raw
+        .split('&')
+        .filter(|s| !s.is_empty())
+        .map(|pair| {
+            let mut parts = pair.splitn(2, '=');
+            let key = parts.next().unwrap_or("").to_string();
+            let val = parts.next().unwrap_or("").to_string();
+            (key, val)
+        })
+        .collect();
+    pairs.sort();
+    pairs
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+fn send_signed_post(url_str: &str, body: &[u8], extra_headers: &[(&str, &str)]) -> (u16, String) {
+    let agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .new_agent();
+    let parsed = url::Url::parse(url_str).expect("parse URL");
+    let path = parsed.path();
+    let query = normalize_query(parsed.query().unwrap_or(""));
+
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let dt = format_amz_date(secs);
+    let date_stamp = &dt[..8];
+
+    let access_key = CTX.access_key();
+    let secret_key = CTX.secret_key();
+    let region = CTX.region();
+    let service = "s3";
+
+    let host = parsed
+        .host_str()
+        .map(|h| {
+            if let Some(port) = parsed.port() {
+                format!("{h}:{port}")
+            } else {
+                h.to_string()
+            }
+        })
+        .unwrap();
+
+    let payload_hash = sha256_hex(body);
+
+    let mut header_map: Vec<(String, String)> = vec![
+        ("host".to_string(), host),
+        ("x-amz-content-sha256".to_string(), payload_hash.clone()),
+        ("x-amz-date".to_string(), dt.clone()),
+    ];
+    for &(k, v) in extra_headers {
+        header_map.push((k.to_lowercase(), v.to_string()));
+    }
+    header_map.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let signed_headers = header_map
+        .iter()
+        .map(|(k, _)| k.as_str())
+        .collect::<Vec<_>>()
+        .join(";");
+    let canonical_headers: String = header_map
+        .iter()
+        .map(|(k, v)| format!("{k}:{v}\n"))
+        .collect();
+    let canonical_request =
+        format!("POST\n{path}\n{query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
+
+    let cr_hash = sha256_hex(canonical_request.as_bytes());
+    let scope = format!("{date_stamp}/{region}/{service}/aws4_request");
+    let string_to_sign = format!("AWS4-HMAC-SHA256\n{dt}\n{scope}\n{cr_hash}");
+
+    let k_date = hmac_sha256(
+        format!("AWS4{secret_key}").as_bytes(),
+        date_stamp.as_bytes(),
+    );
+    let k_region = hmac_sha256(&k_date, region.as_bytes());
+    let k_service = hmac_sha256(&k_region, service.as_bytes());
+    let k_signing = hmac_sha256(&k_service, b"aws4_request");
+    let signature: String = hmac_sha256(&k_signing, string_to_sign.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+
+    let auth_header = format!(
+        "AWS4-HMAC-SHA256 Credential={access_key}/{scope}, \
+         SignedHeaders={signed_headers}, Signature={signature}"
+    );
+
+    let mut request = agent
+        .post(url_str)
+        .header("Authorization", &auth_header)
+        .header("x-amz-date", &dt)
+        .header("x-amz-content-sha256", &payload_hash);
+
+    for &(k, v) in extra_headers {
+        request = request.header(k, v);
+    }
+
+    let mut resp = request.send(body).expect("transport error");
+    let status = resp.status().as_u16();
+    let body_text = resp.body_mut().read_to_string().unwrap_or_default();
+    (status, body_text)
+}
+
 /// 1024 bytes of 'A'.
 fn body_1k() -> Vec<u8> {
     vec![b'A'; 1024]
@@ -35,6 +199,9 @@ const SHA256_1K_A: &str = "arcu6553sHVAiX4MjW0j7I7vD4w6R+Gz9Ok0Q9lTa+0=";
 
 /// CRC-64/NVME of 1024 × 'A', base64-encoded.
 const CRC64NVME_1K_A: &str = "Qeh8oXvGiSo=";
+
+/// MD5 of 1024 × 'A', base64-encoded.
+const MD5_1K_A: &str = "1HsSe8LeLWh93ILaw1TEFQ==";
 
 // ── test_object_checksum_sha256 ─────────────────────────────────────
 
@@ -99,6 +266,75 @@ fn test_object_checksum_sha256() {
     });
 }
 
+#[test]
+fn test_object_content_md5() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "myobj";
+
+        let resp = client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from(body_1k()))
+            .content_md5(MD5_1K_A)
+            .send()
+            .await
+            .unwrap();
+        assert!(!resp.e_tag().unwrap_or_default().is_empty());
+
+        let result = client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from(body_1k()))
+            .content_md5("AAAAAAAAAAAAAAAAAAAAAA==")
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "BadDigest");
+
+        let result = client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from(body_1k()))
+            .content_md5("bad")
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "InvalidDigest");
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_delete_objects_content_md5_required() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "delete-md5-required";
+
+        CTX.client()
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from(body_1k()))
+            .send()
+            .await
+            .unwrap();
+
+        let url = format!("{}/{}?delete", CTX.endpoint(), bucket);
+        let body = format!("<Delete><Object><Key>{key}</Key></Object></Delete>");
+        let (status, body_text) = send_signed_post(&url, body.as_bytes(), &[]);
+        assert_eq!(status, 400, "body: {body_text}");
+        assert_error_code(&body_text, "InvalidRequest");
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
 // ── test_object_checksum_crc32 ──────────────────────────────────────
 
 /// CRC-32 of 1024 × 'A', base64-encoded.
@@ -146,6 +382,101 @@ fn test_object_checksum_crc32() {
             .send()
             .await;
         assert_eq!(err_status(&result), 400);
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_upload_part_content_md5() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "multipart-md5";
+        let body = body_1k();
+
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+
+        let part = client
+            .upload_part()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .part_number(1)
+            .body(ByteStream::from(body.clone()))
+            .content_md5(MD5_1K_A)
+            .send()
+            .await
+            .unwrap();
+        let part_etag = part.e_tag().unwrap().to_string();
+
+        let completed = CompletedMultipartUpload::builder()
+            .parts(
+                CompletedPart::builder()
+                    .part_number(1)
+                    .e_tag(part_etag)
+                    .build(),
+            )
+            .build();
+        client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .multipart_upload(completed)
+            .send()
+            .await
+            .unwrap();
+
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key("multipart-md5-bad")
+            .send()
+            .await
+            .unwrap();
+        let bad_upload_id = create.upload_id().unwrap().to_string();
+
+        let result = client
+            .upload_part()
+            .bucket(&bucket)
+            .key("multipart-md5-bad")
+            .upload_id(&bad_upload_id)
+            .part_number(1)
+            .body(ByteStream::from(body.clone()))
+            .content_md5("AAAAAAAAAAAAAAAAAAAAAA==")
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "BadDigest");
+
+        let result = client
+            .upload_part()
+            .bucket(&bucket)
+            .key("multipart-md5-bad")
+            .upload_id(&bad_upload_id)
+            .part_number(1)
+            .body(ByteStream::from(body))
+            .content_md5("bad")
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "InvalidDigest");
+
+        let _ = client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key("multipart-md5-bad")
+            .upload_id(&bad_upload_id)
+            .send()
+            .await;
 
         cleanup(&bucket, &[key]).await;
     });

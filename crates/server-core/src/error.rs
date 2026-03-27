@@ -72,6 +72,9 @@ pub enum ServerError {
     #[error("bad digest")]
     BadDigest,
 
+    #[error("invalid digest")]
+    InvalidDigest,
+
     #[error("invalid chunk size: only the last chunk may be smaller than {min_size} bytes (chunk {chunk} was {chunk_size} bytes)")]
     InvalidChunkSize {
         chunk: usize,
@@ -202,6 +205,7 @@ impl ServerError {
             Self::InvalidRange { .. } => "InvalidRange",
             Self::SlowDown => "SlowDown",
             Self::BadDigest => "BadDigest",
+            Self::InvalidDigest => "InvalidDigest",
             Self::InvalidChunkSize { .. } => "InvalidChunkSizeError",
             Self::NoSuchCorsConfiguration { .. } => "NoSuchCORSConfiguration",
             Self::NoSuchTagSet { .. } => "NoSuchTagSet",
@@ -258,7 +262,8 @@ impl ServerError {
             | Self::InvalidArgument { .. }
             | Self::InvalidURI { .. }
             | Self::InvalidBucketName { .. }
-            | Self::BadDigest => 400,
+            | Self::BadDigest
+            | Self::InvalidDigest => 400,
             Self::InvalidChunkSize { .. } => 403,
             Self::NoSuchCorsConfiguration { .. } => 404,
             Self::NoSuchTagSet { .. } => 404,

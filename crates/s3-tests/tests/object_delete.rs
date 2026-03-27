@@ -3,7 +3,8 @@ use aws_sdk_s3::types::{
     BucketVersioningStatus, Delete, ObjectIdentifier, VersioningConfiguration,
 };
 use s3_tests::{
-    create_objects, create_objects_with_keys, delete_all_and_bucket, err_status, unique_bucket, CTX,
+    create_objects, create_objects_with_keys, delete_all_and_bucket, delete_objects_with_md5,
+    err_status, unique_bucket, CTX,
 };
 
 // ── Local helpers ───────────────────────────────────────────────────
@@ -41,10 +42,7 @@ fn test_multi_object_delete() {
 
         let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
         let delete = make_delete_request(&key_refs, false);
-        let resp = client
-            .delete_objects()
-            .bucket(&bucket)
-            .delete(delete)
+        let resp = delete_objects_with_md5(client, &bucket, delete)
             .send()
             .await
             .unwrap();
@@ -68,10 +66,7 @@ fn test_multi_objectv2_delete() {
 
         let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
         let delete = make_delete_request(&key_refs, false);
-        client
-            .delete_objects()
-            .bucket(&bucket)
-            .delete(delete)
+        delete_objects_with_md5(client, &bucket, delete)
             .send()
             .await
             .unwrap();
@@ -98,10 +93,7 @@ fn test_multi_object_delete_quiet() {
 
         let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
         let delete = make_delete_request(&key_refs, true);
-        let resp = client
-            .delete_objects()
-            .bucket(&bucket)
-            .delete(delete)
+        let resp = delete_objects_with_md5(client, &bucket, delete)
             .send()
             .await
             .unwrap();
@@ -131,10 +123,7 @@ fn test_multi_object_delete_large() {
 
         let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
         let delete = make_delete_request(&key_refs, false);
-        let resp = client
-            .delete_objects()
-            .bucket(&bucket)
-            .delete(delete)
+        let resp = delete_objects_with_md5(client, &bucket, delete)
             .send()
             .await
             .unwrap();
@@ -163,10 +152,7 @@ fn test_multi_object_delete_nonexistent_keys() {
 
         // Delete keys that were never created — should succeed (idempotent)
         let delete = make_delete_request(&["nokey1", "nokey2", "nokey3"], false);
-        let resp = client
-            .delete_objects()
-            .bucket(&bucket)
-            .delete(delete)
+        let resp = delete_objects_with_md5(client, &bucket, delete)
             .send()
             .await
             .unwrap();
@@ -186,10 +172,7 @@ fn test_multi_object_delete_mixed() {
 
         // Delete mix of existing and nonexistent keys
         let delete = make_delete_request(&["existing1", "nonexistent", "existing2"], false);
-        let resp = client
-            .delete_objects()
-            .bucket(&bucket)
-            .delete(delete)
+        let resp = delete_objects_with_md5(client, &bucket, delete)
             .send()
             .await
             .unwrap();
@@ -222,10 +205,7 @@ fn test_multi_object_delete_special_keys() {
 
         let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
         let delete = make_delete_request(&key_refs, false);
-        let resp = client
-            .delete_objects()
-            .bucket(&bucket)
-            .delete(delete)
+        let resp = delete_objects_with_md5(client, &bucket, delete)
             .send()
             .await
             .unwrap();
@@ -253,10 +233,7 @@ fn test_multi_object_delete_single() {
 
         // Delete just one key via multi-delete API
         let delete = make_delete_request(&["only"], false);
-        let resp = client
-            .delete_objects()
-            .bucket(&bucket)
-            .delete(delete)
+        let resp = delete_objects_with_md5(client, &bucket, delete)
             .send()
             .await
             .unwrap();
@@ -284,10 +261,7 @@ fn test_multi_object_delete_verify_response() {
         let (bucket, _keys) = create_objects_with_keys(client, &["alpha", "beta", "gamma"]).await;
 
         let delete = make_delete_request(&["alpha", "beta", "gamma"], false);
-        let resp = client
-            .delete_objects()
-            .bucket(&bucket)
-            .delete(delete)
+        let resp = delete_objects_with_md5(client, &bucket, delete)
             .send()
             .await
             .unwrap();
@@ -318,10 +292,7 @@ fn test_multi_object_delete_key_limit() {
         let key_refs: Vec<&str> = key_strs.iter().map(|s| s.as_str()).collect();
         let delete = make_delete_request(&key_refs, false);
 
-        let result = client
-            .delete_objects()
-            .bucket(&bucket)
-            .delete(delete)
+        let result = delete_objects_with_md5(client, &bucket, delete)
             .send()
             .await;
         assert_eq!(err_status(&result), 400);
@@ -356,10 +327,7 @@ fn test_multi_object_delete_nonexistent_bucket() {
         let bucket = unique_bucket();
 
         let delete = make_delete_request(&["key1", "key2"], false);
-        let result = client
-            .delete_objects()
-            .bucket(&bucket)
-            .delete(delete)
+        let result = delete_objects_with_md5(client, &bucket, delete)
             .send()
             .await;
         assert!(result.is_err());
@@ -378,10 +346,7 @@ fn test_multi_objectv2_delete_key_limit() {
         let key_refs: Vec<&str> = key_strs.iter().map(|s| s.as_str()).collect();
         let delete = make_delete_request(&key_refs, false);
 
-        let result = client
-            .delete_objects()
-            .bucket(&bucket)
-            .delete(delete)
+        let result = delete_objects_with_md5(client, &bucket, delete)
             .send()
             .await;
         assert_eq!(err_status(&result), 400);
@@ -515,10 +480,7 @@ fn test_versioning_multi_object_delete() {
             .quiet(false)
             .build()
             .unwrap();
-        let resp = client
-            .delete_objects()
-            .bucket(&bucket)
-            .delete(delete)
+        let resp = delete_objects_with_md5(client, &bucket, delete)
             .send()
             .await
             .unwrap();
@@ -558,10 +520,7 @@ fn test_versioning_multi_object_delete() {
             .quiet(false)
             .build()
             .unwrap();
-        let resp2 = client
-            .delete_objects()
-            .bucket(&bucket)
-            .delete(delete2)
+        let resp2 = delete_objects_with_md5(client, &bucket, delete2)
             .send()
             .await
             .unwrap();
@@ -613,10 +572,7 @@ fn test_versioning_multi_object_delete_with_marker() {
             .quiet(false)
             .build()
             .unwrap();
-        let resp = client
-            .delete_objects()
-            .bucket(&bucket)
-            .delete(delete)
+        let resp = delete_objects_with_md5(client, &bucket, delete)
             .send()
             .await
             .unwrap();
@@ -673,10 +629,7 @@ fn test_versioning_multi_object_delete_marker_create() {
             .quiet(false)
             .build()
             .unwrap();
-        let resp = client
-            .delete_objects()
-            .bucket(&bucket)
-            .delete(delete)
+        let resp = delete_objects_with_md5(client, &bucket, delete)
             .send()
             .await
             .unwrap();
@@ -732,10 +685,7 @@ fn test_versioning_multi_object_delete_nonexistent_creates_marker() {
             .quiet(false)
             .build()
             .unwrap();
-        let resp = client
-            .delete_objects()
-            .bucket(&bucket)
-            .delete(delete)
+        let resp = delete_objects_with_md5(client, &bucket, delete)
             .send()
             .await
             .unwrap();

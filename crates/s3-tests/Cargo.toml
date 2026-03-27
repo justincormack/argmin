@@ -29,6 +29,7 @@ test-util = { path = "../test-util" }
 # POST Object tests (raw HTTP, SigV4 signing)
 ureq = "3"
 base64 = "0.22"
+md5_legacy = { package = "md-5", version = "0.10" }
 serde_json = "1"
 ring = "0.17"
 url = "2.5.8"

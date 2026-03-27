@@ -213,6 +213,13 @@ fn crc32_b64(data: &[u8]) -> String {
     )
 }
 
+fn md5_b64(data: &[u8]) -> String {
+    use md5_legacy::Digest;
+
+    let digest = md5_legacy::Md5::digest(data);
+    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &digest[..])
+}
+
 /// Convenience: send signed PUT.
 fn signed_put(url: &str, body: &[u8], extra: &[(&str, &str)]) -> (u16, String) {
     send_signed("PUT", url, body, extra)
@@ -226,11 +233,13 @@ fn signed_put_with_checksum(url: &str, body: &[u8], extra: &[(&str, &str)]) -> (
     send_signed("PUT", url, body, &headers)
 }
 
-/// Convenience: send signed POST with CRC32 checksum.
+/// Convenience: send signed POST with checksums required by DeleteObjects.
 fn signed_post_with_checksum(url: &str, body: &[u8], extra: &[(&str, &str)]) -> (u16, String) {
     let cksum = crc32_b64(body);
+    let md5 = md5_b64(body);
     let mut headers: Vec<(&str, &str)> = extra.to_vec();
     headers.push(("x-amz-checksum-crc32", &cksum));
+    headers.push(("content-md5", &md5));
     send_signed("POST", url, body, &headers)
 }
 

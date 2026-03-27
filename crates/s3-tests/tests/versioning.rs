@@ -2,7 +2,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     BucketVersioningStatus, Delete, ObjectIdentifier, VersioningConfiguration,
 };
-use s3_tests::{cleanup_versioned_bucket, err_status, unique_bucket, CTX};
+use s3_tests::{cleanup_versioned_bucket, delete_objects_with_md5, err_status, unique_bucket, CTX};
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
@@ -1010,18 +1010,17 @@ fn test_versioning_multi_object_delete() {
                     .unwrap()
             })
             .collect();
-        client
-            .delete_objects()
-            .bucket(&bucket)
-            .delete(
-                Delete::builder()
-                    .set_objects(Some(objects.clone()))
-                    .build()
-                    .unwrap(),
-            )
-            .send()
-            .await
-            .unwrap();
+        delete_objects_with_md5(
+            client,
+            &bucket,
+            Delete::builder()
+                .set_objects(Some(objects.clone()))
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
 
         let resp = client
             .list_object_versions()
@@ -1032,18 +1031,17 @@ fn test_versioning_multi_object_delete() {
         assert!(resp.versions().is_empty());
 
         // Deleting again should succeed (idempotent)
-        client
-            .delete_objects()
-            .bucket(&bucket)
-            .delete(
-                Delete::builder()
-                    .set_objects(Some(objects))
-                    .build()
-                    .unwrap(),
-            )
-            .send()
-            .await
-            .unwrap();
+        delete_objects_with_md5(
+            client,
+            &bucket,
+            Delete::builder()
+                .set_objects(Some(objects))
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
 
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
@@ -1083,18 +1081,17 @@ fn test_versioning_multi_object_delete_with_marker() {
                     .unwrap()
             })
             .collect();
-        client
-            .delete_objects()
-            .bucket(&bucket)
-            .delete(
-                Delete::builder()
-                    .set_objects(Some(objects.clone()))
-                    .build()
-                    .unwrap(),
-            )
-            .send()
-            .await
-            .unwrap();
+        delete_objects_with_md5(
+            client,
+            &bucket,
+            Delete::builder()
+                .set_objects(Some(objects.clone()))
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
 
         let resp = client
             .list_object_versions()
@@ -1106,18 +1103,17 @@ fn test_versioning_multi_object_delete_with_marker() {
         assert!(resp.delete_markers().is_empty());
 
         // Idempotent re-delete
-        client
-            .delete_objects()
-            .bucket(&bucket)
-            .delete(
-                Delete::builder()
-                    .set_objects(Some(objects))
-                    .build()
-                    .unwrap(),
-            )
-            .send()
-            .await
-            .unwrap();
+        delete_objects_with_md5(
+            client,
+            &bucket,
+            Delete::builder()
+                .set_objects(Some(objects))
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
 
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
@@ -1132,18 +1128,17 @@ fn test_versioning_multi_object_delete_with_marker_create() {
 
         // Use delete_objects to create a delete marker on a nonexistent key
         let objects = vec![ObjectIdentifier::builder().key(key).build().unwrap()];
-        let resp = client
-            .delete_objects()
-            .bucket(&bucket)
-            .delete(
-                Delete::builder()
-                    .set_objects(Some(objects))
-                    .build()
-                    .unwrap(),
-            )
-            .send()
-            .await
-            .unwrap();
+        let resp = delete_objects_with_md5(
+            client,
+            &bucket,
+            Delete::builder()
+                .set_objects(Some(objects))
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
 
         assert_eq!(resp.deleted().len(), 1);
         assert!(resp.deleted()[0].delete_marker().unwrap_or(false));
@@ -1327,18 +1322,17 @@ fn test_versioning_concurrent_multi_object_delete() {
             })
             .collect();
 
-        let resp = client
-            .delete_objects()
-            .bucket(&bucket)
-            .delete(
-                Delete::builder()
-                    .set_objects(Some(objects))
-                    .build()
-                    .unwrap(),
-            )
-            .send()
-            .await
-            .unwrap();
+        let resp = delete_objects_with_md5(
+            client,
+            &bucket,
+            Delete::builder()
+                .set_objects(Some(objects))
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
         assert_eq!(resp.deleted().len(), num_objects * num_versions);
 
         let resp = client

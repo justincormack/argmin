@@ -1,8 +1,14 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
 
+use aws_sdk_s3::client::customize::CustomizableOperation;
+use aws_sdk_s3::operation::delete_objects::builders::DeleteObjectsFluentBuilder;
+use aws_sdk_s3::operation::delete_objects::{DeleteObjectsError, DeleteObjectsOutput};
 use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::Delete;
 use aws_sdk_s3::Client;
+use base64::Engine;
+use md5_legacy::Digest;
 
 static BUCKET_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -232,6 +238,29 @@ pub async fn delete_all_and_bucket(client: &Client, bucket: &str, keys: &[String
         .expect("delete bucket");
 }
 
+/// Build a DeleteObjects request that sets the required Content-MD5 header from
+/// the serialized XML body before signing.
+pub fn delete_objects_with_md5(
+    client: &Client,
+    bucket: &str,
+    delete: Delete,
+) -> CustomizableOperation<DeleteObjectsOutput, DeleteObjectsError, DeleteObjectsFluentBuilder> {
+    client
+        .delete_objects()
+        .bucket(bucket)
+        .delete(delete)
+        .customize()
+        .mutate_request(|req| {
+            let body = req
+                .body()
+                .bytes()
+                .expect("DeleteObjects body must be in-memory");
+            let digest = md5_legacy::Md5::digest(body);
+            let content_md5 = base64::engine::general_purpose::STANDARD.encode(&digest[..]);
+            req.headers_mut().insert("content-md5", content_md5);
+        })
+}
+
 /// Delete all object versions and delete markers in a bucket, then delete the bucket.
 ///
 /// This is needed for versioned buckets on AWS where simple delete_object creates
@@ -275,10 +304,7 @@ pub async fn cleanup_versioned_bucket(client: &Client, bucket: &str) {
             .quiet(true)
             .build()
             .unwrap();
-        client
-            .delete_objects()
-            .bucket(bucket)
-            .delete(delete)
+        delete_objects_with_md5(client, bucket, delete)
             .send()
             .await
             .expect("delete objects");

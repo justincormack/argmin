@@ -12,6 +12,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::Request;
 use hyper_util::rt::{TokioIo, TokioTimer};
+use md5_legacy::Digest;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 
@@ -1154,6 +1155,7 @@ async fn handle_streaming_put(
     let mut payload_sha256_hasher = claimed_payload_sha256
         .as_ref()
         .map(|_| ring::digest::Context::new(&ring::digest::SHA256));
+    let mut content_md5_hasher = ctx.checksum.content_md5.map(|_| md5_legacy::Md5::new());
 
     // 2. Stream body frames, accumulating into internal segment-sized buffers.
     let ctx = Arc::new(ctx);
@@ -1188,6 +1190,7 @@ async fn handle_streaming_put(
                         let mut ingest = StreamingPutIngestState {
                             hasher: &mut hasher,
                             payload_sha256_hasher: &mut payload_sha256_hasher,
+                            content_md5_hasher: &mut content_md5_hasher,
                             trailing_hasher: &mut trailing_hasher,
                             total_size: &mut total_size,
                             buf: &mut buf,
@@ -1205,6 +1208,7 @@ async fn handle_streaming_put(
                         let mut ingest = StreamingPutIngestState {
                             hasher: &mut hasher,
                             payload_sha256_hasher: &mut payload_sha256_hasher,
+                            content_md5_hasher: &mut content_md5_hasher,
                             trailing_hasher: &mut trailing_hasher,
                             total_size: &mut total_size,
                             buf: &mut buf,
@@ -1295,6 +1299,16 @@ async fn handle_streaming_put(
                 client_hash: claimed.clone(),
                 server_hash: actual,
             });
+        }
+    }
+
+    if let (Some(claim), Some(hasher)) = (ctx.checksum.content_md5, content_md5_hasher.take()) {
+        let actual = hasher.finalize();
+        let mut actual_bytes = [0u8; 16];
+        actual_bytes.copy_from_slice(actual.as_ref());
+        if let Err(err) = claim.verify(&actual_bytes) {
+            abort_streaming(&state, &ctx, session_id.clone()).await;
+            return error_response(&err);
         }
     }
 
@@ -1481,6 +1495,7 @@ async fn abort_streaming(
 struct StreamingPutIngestState<'a> {
     hasher: &'a mut checksum::crc64::Hasher,
     payload_sha256_hasher: &'a mut Option<ring::digest::Context>,
+    content_md5_hasher: &'a mut Option<md5_legacy::Md5>,
     trailing_hasher: &'a mut Option<TrailingChecksumHasher>,
     total_size: &'a mut u64,
     buf: &'a mut PooledSegmentBuffer,
@@ -1664,6 +1679,9 @@ async fn ingest_streaming_put_payload(
     if let Some(h) = ingest.payload_sha256_hasher.as_mut() {
         h.update(payload);
     }
+    if let Some(h) = ingest.content_md5_hasher.as_mut() {
+        h.update(payload);
+    }
     if let Some(th) = ingest.trailing_hasher.as_mut() {
         th.update(payload);
     }
@@ -1785,6 +1803,7 @@ async fn handle_streaming_part(
     let mut payload_sha256_hasher = claimed_payload_sha256
         .as_ref()
         .map(|_| ring::digest::Context::new(&ring::digest::SHA256));
+    let mut content_md5_hasher = ctx.checksum.content_md5.map(|_| md5_legacy::Md5::new());
     // 2. Stream body frames, accumulating into internal segment-sized buffers.
     let ctx = Arc::new(ctx);
     let mut hasher = checksum::crc64::Hasher::new();
@@ -1817,6 +1836,7 @@ async fn handle_streaming_part(
                         let mut ingest = StreamingPartIngestState {
                             hasher: &mut hasher,
                             payload_sha256_hasher: &mut payload_sha256_hasher,
+                            content_md5_hasher: &mut content_md5_hasher,
                             trailing_hasher: &mut trailing_hasher,
                             total_size: &mut total_size,
                             buf: &mut buf,
@@ -1833,6 +1853,7 @@ async fn handle_streaming_part(
                         let mut ingest = StreamingPartIngestState {
                             hasher: &mut hasher,
                             payload_sha256_hasher: &mut payload_sha256_hasher,
+                            content_md5_hasher: &mut content_md5_hasher,
                             trailing_hasher: &mut trailing_hasher,
                             total_size: &mut total_size,
                             buf: &mut buf,
@@ -1924,6 +1945,16 @@ async fn handle_streaming_part(
                 client_hash: claimed.clone(),
                 server_hash: actual,
             });
+        }
+    }
+
+    if let (Some(claim), Some(hasher)) = (ctx.checksum.content_md5, content_md5_hasher.take()) {
+        let actual = hasher.finalize();
+        let mut actual_bytes = [0u8; 16];
+        actual_bytes.copy_from_slice(actual.as_ref());
+        if let Err(err) = claim.verify(&actual_bytes) {
+            abort_streaming_part_ctx(&state, &ctx).await;
+            return error_response(&err);
         }
     }
 
@@ -2148,6 +2179,7 @@ async fn abort_streaming_part_ctx(
 struct StreamingPartIngestState<'a> {
     hasher: &'a mut checksum::crc64::Hasher,
     payload_sha256_hasher: &'a mut Option<ring::digest::Context>,
+    content_md5_hasher: &'a mut Option<md5_legacy::Md5>,
     trailing_hasher: &'a mut Option<TrailingChecksumHasher>,
     total_size: &'a mut u64,
     buf: &'a mut PooledSegmentBuffer,
@@ -2177,6 +2209,9 @@ async fn ingest_streaming_part_payload(
     let accounting_start = Instant::now();
     ingest.hasher.update(payload);
     if let Some(h) = ingest.payload_sha256_hasher.as_mut() {
+        h.update(payload);
+    }
+    if let Some(h) = ingest.content_md5_hasher.as_mut() {
         h.update(payload);
     }
     if let Some(th) = ingest.trailing_hasher.as_mut() {
