@@ -735,7 +735,6 @@ impl HttpFrontend {
             }
             S3Operation::PutObject { bucket, key } => {
                 if let Some(copy_source) = req.header("x-amz-copy-source") {
-                    ensure_sse_customer_not_requested(req, "SSE-C CopyObject")?;
                     // CopyObject path
                     let (src_bucket, src_key, src_version_id_str) =
                         request::parse_copy_source(copy_source)?;
@@ -750,6 +749,8 @@ impl HttpFrontend {
                     };
                     let requester =
                         crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                    let source_sse_customer = parse_sse_customer_copy_source_request(req)?;
+                    let dst_sse_customer = parse_sse_customer_request(req)?;
                     let acl = parse_put_object_acl(req.header("x-amz-acl"));
                     let src_cond = copy_source_condition_from_headers(req);
                     let dst_cond = write_condition_from_headers(req)?;
@@ -782,15 +783,6 @@ impl HttpFrontend {
                         }
                         _ => MetadataDirective::Copy,
                     };
-                    // Copy-to-self without REPLACE is invalid (AWS returns 400)
-                    if matches!(directive, MetadataDirective::Copy)
-                        && src_bucket == bucket
-                        && src_key == key
-                    {
-                        return Err(ServerError::InvalidRequest {
-                            reason: "This copy request is illegal because it is trying to copy an object to itself without changing the object's metadata, storage class, website redirect location or encryption attributes.".to_string(),
-                        });
-                    }
                     // Parse inline tags before writing so invalid tags don't leave orphan objects
                     let replace_tags_xml = if req
                         .header("x-amz-tagging-directive")
@@ -831,6 +823,8 @@ impl HttpFrontend {
                         tagging,
                         requester,
                         acl,
+                        source_sse_customer: source_sse_customer.as_ref(),
+                        dst_sse_customer: dst_sse_customer.as_ref(),
                     })?;
                     Ok(S3Response::copy_object(&result))
                 } else {
@@ -1494,7 +1488,6 @@ impl HttpFrontend {
                     })?;
 
                 if let Some(copy_source) = req.header("x-amz-copy-source") {
-                    ensure_sse_customer_not_requested(req, "SSE-C UploadPartCopy")?;
                     // UploadPartCopy path
                     let (src_bucket, src_key, src_version_id_str) =
                         request::parse_copy_source(copy_source)?;
@@ -1509,6 +1502,8 @@ impl HttpFrontend {
                     };
                     let requester =
                         crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                    let source_sse_customer = parse_sse_customer_copy_source_request(req)?;
+                    let sse_customer = parse_sse_customer_request(req)?;
                     let src_cond = copy_source_condition_from_headers(req);
                     let copy_source_range =
                         if let Some(range_header) = req.header("x-amz-copy-source-range") {
@@ -1529,10 +1524,13 @@ impl HttpFrontend {
                         part_number,
                         copy_source_range,
                         requester,
+                        source_sse_customer: source_sse_customer.as_ref(),
+                        sse_customer: sse_customer.as_ref(),
                     })?;
                     Ok(S3Response::upload_part_copy(
                         &result.etag,
                         result.last_modified,
+                        result.sse_customer.as_ref(),
                     ))
                 } else {
                     // Normal UploadPart — use streaming upload path directly.
@@ -3039,13 +3037,18 @@ fn ensure_sse_customer_not_requested(req: &S3Request, feature: &str) -> Result<(
     Ok(())
 }
 
-fn parse_sse_customer_request(req: &S3Request) -> Result<Option<SseCustomerRequest>, ServerError> {
+fn parse_sse_customer_request_with_names(
+    req: &S3Request,
+    algorithm_header: &str,
+    customer_key_header: &str,
+    customer_key_md5_header: &str,
+) -> Result<Option<SseCustomerRequest>, ServerError> {
     use base64::Engine;
 
     for header in [
-        SSE_C_ALGORITHM_HEADER,
-        SSE_C_KEY_HEADER,
-        SSE_C_KEY_MD5_HEADER,
+        algorithm_header,
+        customer_key_header,
+        customer_key_md5_header,
     ] {
         if header_count(req, header) > 1 {
             return Err(ServerError::InvalidRequest {
@@ -3054,9 +3057,9 @@ fn parse_sse_customer_request(req: &S3Request) -> Result<Option<SseCustomerReque
         }
     }
 
-    let algorithm = req.header(SSE_C_ALGORITHM_HEADER);
-    let customer_key = req.header(SSE_C_KEY_HEADER);
-    let customer_key_md5 = req.header(SSE_C_KEY_MD5_HEADER);
+    let algorithm = req.header(algorithm_header);
+    let customer_key = req.header(customer_key_header);
+    let customer_key_md5 = req.header(customer_key_md5_header);
 
     if algorithm.is_none() && customer_key.is_none() && customer_key_md5.is_none() {
         return Ok(None);
@@ -3106,6 +3109,26 @@ fn parse_sse_customer_request(req: &S3Request) -> Result<Option<SseCustomerReque
         customer_key_bytes,
         base64::engine::general_purpose::STANDARD.encode(actual_md5_bytes),
     )))
+}
+
+fn parse_sse_customer_request(req: &S3Request) -> Result<Option<SseCustomerRequest>, ServerError> {
+    parse_sse_customer_request_with_names(
+        req,
+        SSE_C_ALGORITHM_HEADER,
+        SSE_C_KEY_HEADER,
+        SSE_C_KEY_MD5_HEADER,
+    )
+}
+
+fn parse_sse_customer_copy_source_request(
+    req: &S3Request,
+) -> Result<Option<SseCustomerRequest>, ServerError> {
+    parse_sse_customer_request_with_names(
+        req,
+        SSE_C_COPY_SOURCE_ALGORITHM_HEADER,
+        SSE_C_COPY_SOURCE_KEY_HEADER,
+        SSE_C_COPY_SOURCE_KEY_MD5_HEADER,
+    )
 }
 
 fn apply_sse_customer_write_response_headers(

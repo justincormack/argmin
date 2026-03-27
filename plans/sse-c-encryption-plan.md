@@ -295,6 +295,8 @@ Current discovery from AWS-backed `s3-tests`:
    not surface a parsed S3 error code on that `HEAD` failure path.
 2. plain SSE-C `CompleteMultipartUpload` succeeds without repeating the SSE-C
    headers in the non-checksum case, so we must not over-constrain that path.
+3. `CopyObject` and `UploadPartCopy` from an SSE-C source fail with
+   `400 InvalidRequest` when the copy-source SSE-C header triad is missing.
 
 ## Phase 1: Core happy path
 
@@ -337,6 +339,16 @@ Implement once Phase 1 is stable:
 
 `GetObjectAttributes` is already part of the implemented happy-path slice and
 should stay covered in [`object_attributes.rs`](/home/justin/src/github.com/justincormack/argmin/crates/s3-tests/tests/object_attributes.rs).
+
+Current Phase 2 status:
+
+1. `CopyObject` implemented, including SSE-C source reads and SSE-C destination
+   writes.
+2. `UploadPartCopy` implemented, including SSE-C source reads and SSE-C
+   multipart-destination writes.
+3. `POST Object` SSE-C still deferred.
+4. presigned SSE-C requests still need explicit coverage and any fixes that
+   fall out of that coverage.
 
 ## Phase 3: Bucket-level gating
 

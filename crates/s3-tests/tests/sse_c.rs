@@ -23,6 +23,41 @@ macro_rules! with_sse_c_headers {
     }};
 }
 
+macro_rules! with_sse_c_copy_headers {
+    ($op:expr, $src_key_b64:expr, $src_key_md5_b64:expr, $dst_key_b64:expr, $dst_key_md5_b64:expr) => {{
+        $op.customize().mutate_request({
+            let src_key_b64 = $src_key_b64.clone();
+            let src_key_md5_b64 = $src_key_md5_b64.clone();
+            let dst_key_b64 = $dst_key_b64.clone();
+            let dst_key_md5_b64 = $dst_key_md5_b64.clone();
+            move |req| {
+                req.headers_mut()
+                    .insert("x-amz-server-side-encryption-customer-algorithm", "AES256");
+                req.headers_mut().insert(
+                    "x-amz-server-side-encryption-customer-key",
+                    dst_key_b64.clone(),
+                );
+                req.headers_mut().insert(
+                    "x-amz-server-side-encryption-customer-key-md5",
+                    dst_key_md5_b64.clone(),
+                );
+                req.headers_mut().insert(
+                    "x-amz-copy-source-server-side-encryption-customer-algorithm",
+                    "AES256",
+                );
+                req.headers_mut().insert(
+                    "x-amz-copy-source-server-side-encryption-customer-key",
+                    src_key_b64.clone(),
+                );
+                req.headers_mut().insert(
+                    "x-amz-copy-source-server-side-encryption-customer-key-md5",
+                    src_key_md5_b64.clone(),
+                );
+            }
+        })
+    }};
+}
+
 async fn cleanup(bucket: &str, key: &str) {
     let client = CTX.client();
     let _ = client.delete_object().bucket(bucket).key(key).send().await;
@@ -331,5 +366,308 @@ fn test_sse_c_upload_part_requires_headers() {
         assert_s3_err_code(&result, "InvalidRequest");
 
         cleanup_multipart(&bucket, "obj", &upload_id).await;
+    });
+}
+
+#[test]
+fn test_sse_c_copy_object_round_trip() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let src_key = test_sse_c_key();
+        let (src_key_b64, src_key_md5_b64) = sse_c_header_values(&src_key);
+        let dst_key = [7u8; 32];
+        let (dst_key_b64, dst_key_md5_b64) = sse_c_header_values(&dst_key);
+        let body = b"hello sse-c copy".to_vec();
+
+        with_sse_c_headers!(
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key("src")
+                .body(ByteStream::from(body.clone())),
+            src_key_b64,
+            src_key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+
+        with_sse_c_copy_headers!(
+            client
+                .copy_object()
+                .bucket(&bucket)
+                .key("dst")
+                .copy_source(format!("{}/src", bucket)),
+            src_key_b64,
+            src_key_md5_b64,
+            dst_key_b64,
+            dst_key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+
+        let head = with_sse_c_headers!(
+            client.head_object().bucket(&bucket).key("dst"),
+            dst_key_b64,
+            dst_key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(head.content_length(), Some(body.len() as i64));
+
+        let get = with_sse_c_headers!(
+            client.get_object().bucket(&bucket).key("dst"),
+            dst_key_b64,
+            dst_key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(
+            get.body.collect().await.unwrap().into_bytes().as_ref(),
+            body.as_slice()
+        );
+
+        let client = CTX.client();
+        let _ = client
+            .delete_object()
+            .bucket(&bucket)
+            .key("src")
+            .send()
+            .await;
+        let _ = client
+            .delete_object()
+            .bucket(&bucket)
+            .key("dst")
+            .send()
+            .await;
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_sse_c_copy_object_requires_source_headers() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let key = test_sse_c_key();
+        let (key_b64, key_md5_b64) = sse_c_header_values(&key);
+
+        with_sse_c_headers!(
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key("src")
+                .body(ByteStream::from_static(b"secret-copy")),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+
+        let result = client
+            .copy_object()
+            .bucket(&bucket)
+            .key("dst")
+            .copy_source(format!("{}/src", bucket))
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "InvalidRequest");
+
+        let client = CTX.client();
+        let _ = client
+            .delete_object()
+            .bucket(&bucket)
+            .key("src")
+            .send()
+            .await;
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_sse_c_upload_part_copy_round_trip() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let src_key = test_sse_c_key();
+        let (src_key_b64, src_key_md5_b64) = sse_c_header_values(&src_key);
+        let dst_key = [9u8; 32];
+        let (dst_key_b64, dst_key_md5_b64) = sse_c_header_values(&dst_key);
+        let body = b"hello multipart copy sse-c".to_vec();
+
+        with_sse_c_headers!(
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key("src")
+                .body(ByteStream::from(body.clone())),
+            src_key_b64,
+            src_key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+
+        let create = with_sse_c_headers!(
+            client.create_multipart_upload().bucket(&bucket).key("dst"),
+            dst_key_b64,
+            dst_key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+
+        let part = with_sse_c_copy_headers!(
+            client
+                .upload_part_copy()
+                .bucket(&bucket)
+                .key("dst")
+                .upload_id(&upload_id)
+                .part_number(1)
+                .copy_source(format!("{}/src", bucket)),
+            src_key_b64,
+            src_key_md5_b64,
+            dst_key_b64,
+            dst_key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+        let etag = part
+            .copy_part_result()
+            .unwrap()
+            .e_tag()
+            .unwrap()
+            .to_string();
+
+        client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key("dst")
+            .upload_id(&upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(CompletedPart::builder().e_tag(etag).part_number(1).build())
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let get = with_sse_c_headers!(
+            client.get_object().bucket(&bucket).key("dst"),
+            dst_key_b64,
+            dst_key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(
+            get.body.collect().await.unwrap().into_bytes().as_ref(),
+            body.as_slice()
+        );
+
+        let client = CTX.client();
+        let _ = client
+            .delete_object()
+            .bucket(&bucket)
+            .key("src")
+            .send()
+            .await;
+        let _ = client
+            .delete_object()
+            .bucket(&bucket)
+            .key("dst")
+            .send()
+            .await;
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_sse_c_upload_part_copy_requires_source_headers() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let src_key = test_sse_c_key();
+        let (src_key_b64, src_key_md5_b64) = sse_c_header_values(&src_key);
+        let dst_key = [9u8; 32];
+        let (dst_key_b64, dst_key_md5_b64) = sse_c_header_values(&dst_key);
+
+        with_sse_c_headers!(
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key("src")
+                .body(ByteStream::from_static(b"secret-copy-part")),
+            src_key_b64,
+            src_key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+
+        let create = with_sse_c_headers!(
+            client.create_multipart_upload().bucket(&bucket).key("dst"),
+            dst_key_b64,
+            dst_key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+
+        let result = with_sse_c_headers!(
+            client
+                .upload_part_copy()
+                .bucket(&bucket)
+                .key("dst")
+                .upload_id(&upload_id)
+                .part_number(1)
+                .copy_source(format!("{}/src", bucket)),
+            dst_key_b64,
+            dst_key_md5_b64
+        )
+        .send()
+        .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "InvalidRequest");
+
+        let client = CTX.client();
+        let _ = client
+            .delete_object()
+            .bucket(&bucket)
+            .key("src")
+            .send()
+            .await;
+        let _ = client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key("dst")
+            .upload_id(&upload_id)
+            .send()
+            .await;
+        let _ = client
+            .delete_object()
+            .bucket(&bucket)
+            .key("dst")
+            .send()
+            .await;
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
 }

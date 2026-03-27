@@ -1061,6 +1061,8 @@ pub struct CopyObjectRequest<'a> {
     pub tagging: TaggingDirective<'a>,
     pub requester: Requester<'a>,
     pub acl: PutObjectAcl<'a>,
+    pub source_sse_customer: Option<&'a SseCustomerRequest>,
+    pub dst_sse_customer: Option<&'a SseCustomerRequest>,
 }
 
 /// Parsed UploadPartCopy request from the HTTP layer.
@@ -1073,6 +1075,8 @@ pub struct UploadPartCopyRequest<'a> {
     pub part_number: u32,
     pub copy_source_range: Option<(u64, u64)>,
     pub requester: Requester<'a>,
+    pub source_sse_customer: Option<&'a SseCustomerRequest>,
+    pub sse_customer: Option<&'a SseCustomerRequest>,
 }
 
 /// Request for a PutObject operation.
@@ -1449,6 +1453,7 @@ pub struct CopyObjectResult {
     pub etag: String,
     pub last_modified: u64,
     pub version_id: VersionId,
+    pub sse_customer: Option<SseCustomerResponseHeaders>,
 }
 
 /// Object entry for listing.
@@ -1537,6 +1542,7 @@ pub struct UploadPartResult {
 pub struct UploadPartCopyResult {
     pub etag: String,
     pub last_modified: u64,
+    pub sse_customer: Option<SseCustomerResponseHeaders>,
 }
 
 /// Result of a CreateMultipartUpload operation.
@@ -4938,6 +4944,12 @@ impl Coordinator {
         let directive = &req.directive;
         let requester = req.requester;
         let acl = req.acl;
+        let source_sse_customer = req.source_sse_customer;
+        let dst_write_sse_customer =
+            self.prepare_sse_customer_write_context(req.dst_sse_customer)?;
+        let dst_response_sse_customer = dst_write_sse_customer
+            .as_ref()
+            .map(|ctx| ctx.request().response_headers());
 
         let dst_bucket_info = self.authorize_object_write_requester(requester, dst_bucket)?;
 
@@ -4980,6 +4992,27 @@ impl Coordinator {
 
             let src_etag = src_record.etag.format();
             check_copy_source_conditions(src_cond, &src_etag, src_record.last_modified)?;
+            let _src_sse_customer =
+                self.prepare_sse_customer_read_access(&src_record.encryption, source_sse_customer)?;
+
+            let same_key_same_bucket = src_bucket == dst_bucket && src_key == dst_key;
+            let encryption_attrs_unchanged = match (&src_record.encryption, req.dst_sse_customer) {
+                (ObjectEncryption::None, None) => true,
+                (ObjectEncryption::None, Some(_)) => false,
+                (ObjectEncryption::SseCustomer(_), None) => false,
+                (ObjectEncryption::SseCustomer(_), Some(dst_request)) => source_sse_customer
+                    .is_some_and(|src_request| {
+                        src_request.customer_key() == dst_request.customer_key()
+                    }),
+            };
+            if matches!(directive, MetadataDirective::Copy)
+                && same_key_same_bucket
+                && encryption_attrs_unchanged
+            {
+                return Err(ServerError::InvalidRequest {
+                    reason: "This copy request is illegal because it is trying to copy an object to itself without changing the object's metadata, storage class, website redirect location or encryption attributes.".to_string(),
+                });
+            }
 
             if src_record.size > MAX_OBJECT_SIZE {
                 return Err(ServerError::ObjectTooLarge {
@@ -5011,7 +5044,7 @@ impl Coordinator {
                         src_record.generation_id,
                         obj_parts,
                         src_record.size as usize,
-                        None,
+                        source_sse_customer.cloned(),
                     );
                     drop(pgs);
                     #[cfg(test)]
@@ -5047,7 +5080,7 @@ impl Coordinator {
                             bucket: src_bucket,
                             key: src_key,
                             generation_id: src_record.generation_id,
-                            sse_customer_request: None,
+                            sse_customer_request: source_sse_customer.cloned(),
                         },
                         segment_payloads_from_object_segments(
                             segments,
@@ -5095,7 +5128,10 @@ impl Coordinator {
             key: dst_key,
             requester,
             acl,
-            encryption: ObjectEncryption::None,
+            encryption: dst_write_sse_customer
+                .as_ref()
+                .map(|ctx| ctx.encryption().clone())
+                .unwrap_or_default(),
         })?;
         let not_found = |e: ServerError| match e {
             ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
@@ -5122,12 +5158,17 @@ impl Coordinator {
                 if let Some(checksum) = replacement_checksum.as_mut() {
                     checksum.update(&chunk);
                 }
+                let storage_chunk = if let Some(sse_customer) = dst_write_sse_customer.as_ref() {
+                    sse_customer.encrypt_segment(segment_index, &chunk)?
+                } else {
+                    chunk.to_vec()
+                };
                 self.append_stream_segment(
                     dst_bucket,
                     dst_key,
                     &session_id,
                     segment_index,
-                    &chunk,
+                    &storage_chunk,
                 )?;
                 segment_index =
                     segment_index
@@ -5168,6 +5209,7 @@ impl Coordinator {
                 etag: put_result.etag,
                 last_modified: dst_stored.last_modified(),
                 version_id: put_result.version_id,
+                sse_customer: dst_response_sse_customer,
             })
         })();
         if copy_result.is_err() {
@@ -7025,6 +7067,7 @@ impl Coordinator {
         let src_cond = req.source.condition;
         let copy_source_range = req.copy_source_range;
         let requester = req.requester;
+        let source_sse_customer = req.source_sse_customer;
 
         let _dst_bucket_info = self.authorize_object_write_requester(requester, dst_bucket)?;
         let _src_bucket_info = self.authorize_bucket_read_requester(requester, src_bucket)?;
@@ -7063,6 +7106,8 @@ impl Coordinator {
 
             let src_etag = src_record.etag.format();
             check_copy_source_conditions(src_cond, &src_etag, src_record.last_modified)?;
+            let _src_sse_customer =
+                self.prepare_sse_customer_read_access(&src_record.encryption, source_sse_customer)?;
 
             let source_size = src_record.size;
 
@@ -7111,7 +7156,7 @@ impl Coordinator {
                     src_record.generation_id,
                     obj_parts,
                     (read_start as usize, read_end as usize),
-                    None,
+                    source_sse_customer.cloned(),
                 );
                 drop(pgs);
                 #[cfg(test)]
@@ -7130,7 +7175,7 @@ impl Coordinator {
                         bucket: src_bucket,
                         key: src_key,
                         generation_id: src_record.generation_id,
-                        sse_customer_request: None,
+                        sse_customer_request: source_sse_customer.cloned(),
                     },
                     segment_payloads_from_object_segments(segments, src_record.encryption.clone()),
                     read_start as usize,
@@ -7148,9 +7193,13 @@ impl Coordinator {
             upload_id,
             part_number,
             requester,
-            sse_customer: None,
+            sse_customer: req.sse_customer,
         })?;
         let session_id = &session.session_id;
+        let sse_customer_headers = session
+            .sse_customer
+            .as_ref()
+            .map(|ctx| ctx.request().response_headers());
         let result = (|| {
             let mut crc64 = checksum::crc64::Hasher::new();
             let mut total_size = 0u64;
@@ -7172,7 +7221,18 @@ impl Coordinator {
                 if let Some(checksum) = computed_checksum.as_mut() {
                     checksum.update(&chunk);
                 }
-                self.append_stream_segment(dst_bucket, dst_key, session_id, segment_index, &chunk)?;
+                let storage_chunk = if let Some(sse_customer) = session.sse_customer.as_ref() {
+                    sse_customer.encrypt_segment(segment_index, &chunk)?
+                } else {
+                    chunk.to_vec()
+                };
+                self.append_stream_segment(
+                    dst_bucket,
+                    dst_key,
+                    session_id,
+                    segment_index,
+                    &storage_chunk,
+                )?;
                 segment_index =
                     segment_index
                         .checked_add(1)
@@ -7215,6 +7275,7 @@ impl Coordinator {
         Ok(UploadPartCopyResult {
             etag: inner.etag,
             last_modified,
+            sse_customer: sse_customer_headers,
         })
     }
 
@@ -12338,6 +12399,8 @@ mod tests {
                 tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
+                source_sse_customer: None,
+                dst_sse_customer: None,
             })
             .unwrap();
         assert!(!result.etag.is_empty());
@@ -12397,6 +12460,8 @@ mod tests {
                 tagging: TaggingDirective::Copy,
                 requester: Requester::principal("owner-b"),
                 acl: NO_PUT_OBJECT_ACL,
+                source_sse_customer: None,
+                dst_sse_customer: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -12445,6 +12510,8 @@ mod tests {
                 tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
                 acl: PutObjectAcl::Other("public-read"),
+                source_sse_customer: None,
+                dst_sse_customer: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessControlListNotSupported));
@@ -12491,6 +12558,8 @@ mod tests {
                 tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
+                source_sse_customer: None,
+                dst_sse_customer: None,
             })
             .unwrap();
 
@@ -12554,6 +12623,8 @@ mod tests {
                 tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
+                source_sse_customer: None,
+                dst_sse_customer: None,
             })
             .unwrap();
 
@@ -12617,6 +12688,8 @@ mod tests {
                 tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
+                source_sse_customer: None,
+                dst_sse_customer: None,
             })
             .unwrap();
 
@@ -12673,6 +12746,8 @@ mod tests {
                 tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
+                source_sse_customer: None,
+                dst_sse_customer: None,
             })
             .unwrap();
 
@@ -12730,6 +12805,8 @@ mod tests {
                 tagging: TaggingDirective::Replace(Some(dst_tags)),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
+                source_sse_customer: None,
+                dst_sse_customer: None,
             })
             .unwrap();
 
@@ -12791,6 +12868,8 @@ mod tests {
                 tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
+                source_sse_customer: None,
+                dst_sse_customer: None,
             })
             .unwrap();
 
@@ -12854,6 +12933,8 @@ mod tests {
                 tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
+                source_sse_customer: None,
+                dst_sse_customer: None,
             })
             .unwrap();
 
@@ -12912,6 +12993,8 @@ mod tests {
                 tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
+                source_sse_customer: None,
+                dst_sse_customer: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
@@ -12953,6 +13036,8 @@ mod tests {
                 tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
+                source_sse_customer: None,
+                dst_sse_customer: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
@@ -12998,6 +13083,8 @@ mod tests {
                 tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
+                source_sse_customer: None,
+                dst_sse_customer: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::PreconditionFailed));
@@ -13056,6 +13143,8 @@ mod tests {
                 tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
+                source_sse_customer: None,
+                dst_sse_customer: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::PreconditionFailed));
@@ -13114,6 +13203,8 @@ mod tests {
                 tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
+                source_sse_customer: None,
+                dst_sse_customer: None,
             })
             .unwrap();
         assert!(!result.etag.is_empty());
@@ -13170,6 +13261,8 @@ mod tests {
                 tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
+                source_sse_customer: None,
+                dst_sse_customer: None,
             })
             .unwrap();
 
@@ -13674,6 +13767,8 @@ mod tests {
                     tagging: TaggingDirective::Copy,
                     requester: TEST_REQUESTER,
                     acl: NO_PUT_OBJECT_ACL,
+                    source_sse_customer: None,
+                    dst_sse_customer: None,
                 })
             });
 
@@ -13806,6 +13901,8 @@ mod tests {
                     part_number: 1,
                     copy_source_range: None,
                     requester: TEST_REQUESTER,
+                    source_sse_customer: None,
+                    sse_customer: None,
                 })
             });
 
@@ -14247,6 +14344,8 @@ mod tests {
                 part_number: 1,
                 copy_source_range: None,
                 requester: TEST_REQUESTER,
+                source_sse_customer: None,
+                sse_customer: None,
             })
         });
         sync.snapshot_reached.wait();
@@ -14314,6 +14413,8 @@ mod tests {
                 tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
+                source_sse_customer: None,
+                dst_sse_customer: None,
             })
         });
         sync.snapshot_reached.wait();
@@ -17158,6 +17259,8 @@ mod tests {
                 tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
+                source_sse_customer: None,
+                dst_sse_customer: None,
             })
             .unwrap();
 
@@ -17431,6 +17534,8 @@ mod tests {
                 tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
+                source_sse_customer: None,
+                dst_sse_customer: None,
             })
             .unwrap();
 
@@ -18715,6 +18820,8 @@ mod tests {
                 tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL,
+                source_sse_customer: None,
+                dst_sse_customer: None,
             })
             .unwrap();
 
@@ -19238,6 +19345,8 @@ mod tests {
                 part_number: 1,
                 copy_source_range: None,
                 requester: TEST_REQUESTER,
+                source_sse_customer: None,
+                sse_customer: None,
             })
             .unwrap();
         assert!(!result.etag.is_empty());
@@ -19304,6 +19413,8 @@ mod tests {
                 part_number: 1,
                 copy_source_range: None,
                 requester: TEST_REQUESTER,
+                source_sse_customer: None,
+                sse_customer: None,
             })
             .unwrap();
 
@@ -19410,6 +19521,8 @@ mod tests {
                 part_number: 1,
                 copy_source_range: None,
                 requester: Requester::principal("other-user"),
+                source_sse_customer: None,
+                sse_customer: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));

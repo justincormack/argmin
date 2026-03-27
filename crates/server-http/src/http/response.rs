@@ -167,7 +167,7 @@ impl S3Response {
             let vid = format_version_id(result.version_id);
             resp.headers.push(("x-amz-version-id".to_string(), vid));
         }
-        resp
+        resp.apply_sse_customer_headers(result.sse_customer.as_ref())
     }
 
     /// Build a response for a successful `GetObject`.
@@ -792,9 +792,15 @@ impl S3Response {
 
     /// Build a response for `UploadPartCopy` (200 OK, XML body with `CopyPartResult`).
     #[must_use]
-    pub fn upload_part_copy(etag: &str, last_modified: u64) -> Self {
+    pub fn upload_part_copy(
+        etag: &str,
+        last_modified: u64,
+        sse_customer: Option<&SseCustomerResponseHeaders>,
+    ) -> Self {
         let body = xml::copy_part_result_xml(etag, last_modified);
-        Self::new(200).xml_body(body)
+        Self::new(200)
+            .xml_body(body)
+            .apply_sse_customer_headers(sse_customer)
     }
 
     /// Build a response for `CompleteMultipartUpload` (200 OK, XML body).
