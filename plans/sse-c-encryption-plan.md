@@ -346,9 +346,14 @@ Current Phase 2 status:
    writes.
 2. `UploadPartCopy` implemented, including SSE-C source reads and SSE-C
    multipart-destination writes.
-3. `POST Object` SSE-C still deferred.
-4. presigned SSE-C requests still need explicit coverage and any fixes that
-   fall out of that coverage.
+3. `POST Object` implemented with SSE-C form-field parsing and encrypted
+   streaming writes.
+4. presigned SSE-C requests are covered for `PUT`, `GET`, and `HEAD`, including
+   signed-header enforcement.
+
+Phase 2 is complete. Remaining SSE-C follow-up work is tracked under the later
+checksum-metadata and bucket-policy phases rather than under request-path
+coverage.
 
 ## Phase 3: Bucket-level gating
 

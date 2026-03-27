@@ -1,7 +1,9 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ring::hmac;
-use s3_tests::{unique_bucket, CTX};
+use s3_tests::{
+    assert_s3_err_code, err_status, sse_c_header_values, test_sse_c_key, unique_bucket, CTX,
+};
 
 /// Create a bucket, returning its name.
 async fn setup_bucket() -> String {
@@ -294,6 +296,127 @@ fn test_post_object_authenticated_request() {
             .send()
             .await
             .unwrap();
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_post_object_sse_c_round_trip() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "post-sse-c";
+        let file_data = b"hello from POST with SSE-C";
+        let customer_key = test_sse_c_key();
+        let (key_b64, key_md5_b64) = sse_c_header_values(&customer_key);
+
+        let mut fields = sigv4_fields(
+            &bucket,
+            key,
+            &[
+                serde_json::json!({"x-amz-server-side-encryption-customer-algorithm": "AES256"}),
+                serde_json::json!({"x-amz-server-side-encryption-customer-key": &key_b64}),
+                serde_json::json!({"x-amz-server-side-encryption-customer-key-md5": &key_md5_b64}),
+            ],
+        );
+        fields.push((
+            "x-amz-server-side-encryption-customer-algorithm".to_string(),
+            "AES256".to_string(),
+        ));
+        fields.push((
+            "x-amz-server-side-encryption-customer-key".to_string(),
+            key_b64.clone(),
+        ));
+        fields.push((
+            "x-amz-server-side-encryption-customer-key-md5".to_string(),
+            key_md5_b64.clone(),
+        ));
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+
+        let (status, body) = post_object(&bucket, &field_refs, file_data, "test.txt");
+        assert_eq!(status, 204, "expected 204, got {} body={}", status, body);
+
+        let head = client
+            .head_object()
+            .bucket(&bucket)
+            .key(key)
+            .sse_customer_algorithm("AES256")
+            .sse_customer_key(key_b64.clone())
+            .sse_customer_key_md5(key_md5_b64.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(head.content_length(), Some(file_data.len() as i64));
+        assert_eq!(head.sse_customer_algorithm(), Some("AES256"));
+        assert_eq!(head.sse_customer_key_md5(), Some(key_md5_b64.as_str()));
+
+        let get = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .sse_customer_algorithm("AES256")
+            .sse_customer_key(key_b64.clone())
+            .sse_customer_key_md5(key_md5_b64.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(get.sse_customer_algorithm(), Some("AES256"));
+        assert_eq!(get.sse_customer_key_md5(), Some(key_md5_b64.as_str()));
+        let data = get.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], file_data);
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_post_object_sse_c_requires_complete_form_fields() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "post-sse-c-missing-md5";
+        let customer_key = test_sse_c_key();
+        let (key_b64, _) = sse_c_header_values(&customer_key);
+
+        let mut fields = sigv4_fields(
+            &bucket,
+            key,
+            &[
+                serde_json::json!({"x-amz-server-side-encryption-customer-algorithm": "AES256"}),
+                serde_json::json!({"x-amz-server-side-encryption-customer-key": &key_b64}),
+            ],
+        );
+        fields.push((
+            "x-amz-server-side-encryption-customer-algorithm".to_string(),
+            "AES256".to_string(),
+        ));
+        fields.push((
+            "x-amz-server-side-encryption-customer-key".to_string(),
+            key_b64.clone(),
+        ));
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+
+        let (status, body) = post_object(&bucket, &field_refs, b"secret", "test.txt");
+        assert_eq!(status, 400, "expected 400, got {} body={}", status, body);
+        assert_error_code(&body, "InvalidArgument");
+
+        let get_result = client.get_object().bucket(&bucket).key(key).send().await;
+        assert_eq!(err_status(&get_result), 404);
+        assert_s3_err_code(&get_result, "NoSuchKey");
+
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
 }

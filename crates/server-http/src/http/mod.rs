@@ -1237,7 +1237,6 @@ impl HttpFrontend {
                 Ok(S3Response::get_bucket_versioning(state))
             }
             S3Operation::PostObject { .. } => {
-                ensure_sse_customer_not_requested(req, "SSE-C POST Object")?;
                 // POST Object is handled by the streaming path in serve.rs.
                 // If it reaches dispatch_routed, something is wrong.
                 Err(ServerError::InvalidRequest {
@@ -2075,7 +2074,6 @@ impl HttpFrontend {
             bucket,
             file_name.is_some()
         );
-        ensure_sse_customer_not_requested(req, "SSE-C POST Object")?;
         let header_auth = self.authenticate_with_payload_check(req, false)?;
 
         let field = |name: &str| -> Option<&str> {
@@ -2179,6 +2177,10 @@ impl HttpFrontend {
         } else {
             None
         };
+        let sse_customer_request = parse_sse_customer_form_fields(form_fields)?;
+        let sse_customer = self
+            .coordinator
+            .prepare_sse_customer_write_context(sse_customer_request.as_ref())?;
 
         let requester =
             crate::coordinator::Requester::from_principal(effective_auth.principal.as_deref());
@@ -2188,7 +2190,11 @@ impl HttpFrontend {
             key: &key,
             requester,
             acl,
-            encryption: storage::ObjectEncryption::None,
+            encryption: sse_customer
+                .as_ref()
+                .map_or(storage::ObjectEncryption::None, |ctx| {
+                    ctx.encryption().clone()
+                }),
         })?;
 
         let success_status = field("success_action_status")
@@ -2209,6 +2215,7 @@ impl HttpFrontend {
             checksum_sha256_b64: field("x-amz-checksum-sha256")
                 .map(std::string::ToString::to_string),
             tags_xml,
+            sse_customer,
         })
     }
 
@@ -2296,12 +2303,19 @@ impl HttpFrontend {
                 cond: &crate::conditional::WriteCondition::default(),
             })?;
 
-        Ok(S3Response::post_object(
+        let mut resp = S3Response::post_object(
             &result,
             &ctx.binding.bucket,
             &ctx.binding.key,
             ctx.success_status,
-        ))
+        );
+        apply_sse_customer_write_response_headers(
+            &mut resp,
+            ctx.sse_customer
+                .as_ref()
+                .map(SseCustomerWriteContext::request),
+        );
+        Ok(resp)
     }
 
     /// Append a segment to a streaming POST session.
@@ -2321,12 +2335,17 @@ impl HttpFrontend {
             segment_index,
             data.len()
         );
+        let data = if let Some(sse_customer) = ctx.sse_customer.as_ref() {
+            sse_customer.encrypt_segment(segment_index, data)?
+        } else {
+            data.to_vec()
+        };
         self.coordinator.append_stream_segment(
             &ctx.binding.bucket,
             &ctx.binding.key,
             &ctx.binding.session_id,
             segment_index,
-            data,
+            &data,
         )
     }
 
@@ -2930,6 +2949,7 @@ pub struct StreamingPostContext {
     pub policy_b64: Option<String>,
     pub checksum_sha256_b64: Option<String>,
     pub tags_xml: Option<String>,
+    pub sse_customer: Option<SseCustomerWriteContext>,
 }
 
 /// Context for an in-progress streaming `UploadPart`.
@@ -3016,27 +3036,6 @@ const SSE_C_COPY_SOURCE_KEY_HEADER: &str = "x-amz-copy-source-server-side-encryp
 const SSE_C_COPY_SOURCE_KEY_MD5_HEADER: &str =
     "x-amz-copy-source-server-side-encryption-customer-key-md5";
 
-fn any_sse_customer_headers(req: &S3Request) -> bool {
-    req.header(SSE_C_ALGORITHM_HEADER).is_some()
-        || req.header(SSE_C_KEY_HEADER).is_some()
-        || req.header(SSE_C_KEY_MD5_HEADER).is_some()
-}
-
-fn any_sse_customer_copy_source_headers(req: &S3Request) -> bool {
-    req.header(SSE_C_COPY_SOURCE_ALGORITHM_HEADER).is_some()
-        || req.header(SSE_C_COPY_SOURCE_KEY_HEADER).is_some()
-        || req.header(SSE_C_COPY_SOURCE_KEY_MD5_HEADER).is_some()
-}
-
-fn ensure_sse_customer_not_requested(req: &S3Request, feature: &str) -> Result<(), ServerError> {
-    if any_sse_customer_headers(req) || any_sse_customer_copy_source_headers(req) {
-        return Err(ServerError::NotImplemented {
-            feature: feature.to_string(),
-        });
-    }
-    Ok(())
-}
-
 fn parse_sse_customer_request_with_names(
     req: &S3Request,
     algorithm_header: &str,
@@ -3061,15 +3060,10 @@ fn parse_sse_customer_request_with_names(
     let customer_key = req.header(customer_key_header);
     let customer_key_md5 = req.header(customer_key_md5_header);
 
-    if algorithm.is_none() && customer_key.is_none() && customer_key_md5.is_none() {
-        return Ok(None);
-    }
-    let (Some(algorithm), Some(customer_key), Some(customer_key_md5)) =
-        (algorithm, customer_key, customer_key_md5)
+    let Some((algorithm, customer_key, customer_key_md5)) =
+        require_complete_sse_customer_fields(algorithm, customer_key, customer_key_md5)?
     else {
-        return Err(ServerError::InvalidRequest {
-            reason: "all SSE-C headers must be provided together".to_string(),
-        });
+        return Ok(None);
     };
     if !algorithm.eq_ignore_ascii_case(SSE_CUSTOMER_ALGORITHM) {
         return Err(ServerError::InvalidArgument {
@@ -3120,6 +3114,77 @@ fn parse_sse_customer_request(req: &S3Request) -> Result<Option<SseCustomerReque
     )
 }
 
+fn parse_form_field_once<'a>(
+    form_fields: &'a [(String, String)],
+    name: &str,
+) -> Result<Option<&'a str>, ServerError> {
+    let mut matches = form_fields
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_str());
+    let first = matches.next();
+    if matches.next().is_some() {
+        return Err(ServerError::InvalidRequest {
+            reason: format!("duplicate form field: {name}"),
+        });
+    }
+    Ok(first)
+}
+
+fn parse_sse_customer_form_fields(
+    form_fields: &[(String, String)],
+) -> Result<Option<SseCustomerRequest>, ServerError> {
+    use base64::Engine;
+
+    let algorithm = parse_form_field_once(form_fields, SSE_C_ALGORITHM_HEADER)?;
+    let customer_key = parse_form_field_once(form_fields, SSE_C_KEY_HEADER)?;
+    let customer_key_md5 = parse_form_field_once(form_fields, SSE_C_KEY_MD5_HEADER)?;
+
+    let Some((algorithm, customer_key, customer_key_md5)) =
+        require_complete_sse_customer_fields(algorithm, customer_key, customer_key_md5)?
+    else {
+        return Ok(None);
+    };
+    if !algorithm.eq_ignore_ascii_case(SSE_CUSTOMER_ALGORITHM) {
+        return Err(ServerError::InvalidArgument {
+            reason: format!(
+                "unsupported SSE-C algorithm {algorithm}; expected {SSE_CUSTOMER_ALGORITHM}"
+            ),
+        });
+    }
+
+    let decoded_key = base64::engine::general_purpose::STANDARD
+        .decode(customer_key)
+        .map_err(|_| ServerError::InvalidArgument {
+            reason: "invalid base64 in SSE-C key".to_string(),
+        })?;
+    let customer_key_bytes: [u8; SSE_C_CUSTOMER_KEY_LEN] =
+        decoded_key
+            .try_into()
+            .map_err(|_| ServerError::InvalidArgument {
+                reason: format!("SSE-C key must decode to exactly {SSE_C_CUSTOMER_KEY_LEN} bytes"),
+            })?;
+
+    let decoded_md5 = base64::engine::general_purpose::STANDARD
+        .decode(customer_key_md5)
+        .map_err(|_| ServerError::InvalidDigest)?;
+    let claimed_md5: [u8; 16] = decoded_md5
+        .try_into()
+        .map_err(|_| ServerError::InvalidDigest)?;
+
+    let actual_md5 = md5_legacy::Md5::digest(customer_key_bytes);
+    let mut actual_md5_bytes = [0u8; 16];
+    actual_md5_bytes.copy_from_slice(actual_md5.as_ref());
+    if claimed_md5 != actual_md5_bytes {
+        return Err(ServerError::BadDigest);
+    }
+
+    Ok(Some(SseCustomerRequest::new(
+        customer_key_bytes,
+        base64::engine::general_purpose::STANDARD.encode(actual_md5_bytes),
+    )))
+}
+
 fn parse_sse_customer_copy_source_request(
     req: &S3Request,
 ) -> Result<Option<SseCustomerRequest>, ServerError> {
@@ -3129,6 +3194,42 @@ fn parse_sse_customer_copy_source_request(
         SSE_C_COPY_SOURCE_KEY_HEADER,
         SSE_C_COPY_SOURCE_KEY_MD5_HEADER,
     )
+}
+
+fn require_complete_sse_customer_fields<'a>(
+    algorithm: Option<&'a str>,
+    customer_key: Option<&'a str>,
+    customer_key_md5: Option<&'a str>,
+) -> Result<Option<(&'a str, &'a str, &'a str)>, ServerError> {
+    if algorithm.is_none() && customer_key.is_none() && customer_key_md5.is_none() {
+        return Ok(None);
+    }
+    if algorithm.is_none() {
+        return Err(ServerError::InvalidArgument {
+            reason:
+                "Requests specifying Server Side Encryption with Customer provided keys must provide a valid encryption algorithm."
+                    .to_string(),
+        });
+    }
+    if customer_key.is_none() {
+        return Err(ServerError::InvalidArgument {
+            reason:
+                "Requests specifying Server Side Encryption with Customer provided keys must provide an appropriate secret key."
+                    .to_string(),
+        });
+    }
+    if customer_key_md5.is_none() {
+        return Err(ServerError::InvalidArgument {
+            reason:
+                "Requests specifying Server Side Encryption with Customer provided keys must provide the client calculated MD5 of the secret key."
+                    .to_string(),
+        });
+    }
+    Ok(Some((
+        algorithm.expect("checked above"),
+        customer_key.expect("checked above"),
+        customer_key_md5.expect("checked above"),
+    )))
 }
 
 fn apply_sse_customer_write_response_headers(

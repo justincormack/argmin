@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;
 use ring::{digest, hmac};
-use s3_tests::{unique_bucket, CTX};
+use s3_tests::{sse_c_header_values, test_sse_c_key, unique_bucket, CTX};
 
 /// Create a bucket, returning its name.
 async fn setup_bucket() -> String {
@@ -19,6 +19,16 @@ fn agent() -> ureq::Agent {
         .http_status_as_error(false)
         .build()
         .new_agent()
+}
+
+macro_rules! with_presigned_headers {
+    ($req:expr, $presigned:expr) => {{
+        let mut req = $req;
+        for (name, value) in $presigned.headers() {
+            req = req.header(name, value);
+        }
+        req
+    }};
 }
 
 // ── Manual presigned-URL helpers (for signed-payload tests) ─────────────
@@ -269,6 +279,60 @@ fn test_presigned_put_object() {
 }
 
 #[test]
+fn test_presigned_sse_c_put_object() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let body = b"presigned sse-c put content";
+        let customer_key = test_sse_c_key();
+        let (key_b64, key_md5_b64) = sse_c_header_values(&customer_key);
+
+        let presign_config = PresigningConfig::expires_in(Duration::from_secs(900)).unwrap();
+        let presigned = client
+            .put_object()
+            .bucket(&bucket)
+            .key("uploaded-sse-c")
+            .sse_customer_algorithm("AES256")
+            .sse_customer_key(key_b64.clone())
+            .sse_customer_key_md5(key_md5_b64.clone())
+            .presigned(presign_config)
+            .await
+            .unwrap();
+
+        let mut resp = with_presigned_headers!(agent().put(presigned.uri()), presigned)
+            .send(&body[..])
+            .expect("transport error");
+        assert_eq!(resp.status().as_u16(), 200);
+        let alg = resp
+            .headers()
+            .get("x-amz-server-side-encryption-customer-algorithm")
+            .map(|v| v.to_str().unwrap().to_string());
+        let key_md5 = resp
+            .headers()
+            .get("x-amz-server-side-encryption-customer-key-md5")
+            .map(|v| v.to_str().unwrap().to_string());
+        let _ = resp.body_mut().read_to_string();
+        assert_eq!(alg.as_deref(), Some("AES256"));
+        assert_eq!(key_md5.as_deref(), Some(key_md5_b64.as_str()));
+
+        let get_resp = client
+            .get_object()
+            .bucket(&bucket)
+            .key("uploaded-sse-c")
+            .sse_customer_algorithm("AES256")
+            .sse_customer_key(key_b64.clone())
+            .sse_customer_key_md5(key_md5_b64.clone())
+            .send()
+            .await
+            .unwrap();
+        let data = get_resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], body);
+
+        cleanup(&bucket, &["uploaded-sse-c"]).await;
+    });
+}
+
+#[test]
 fn test_presigned_put_object_signed_payload() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -434,6 +498,156 @@ fn test_presigned_head_object() {
         assert_eq!(status, 200);
 
         cleanup(&bucket, &["obj"]).await;
+    });
+}
+
+#[test]
+fn test_presigned_sse_c_get_object() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let body = b"presigned get sse-c content";
+        let customer_key = test_sse_c_key();
+        let (key_b64, key_md5_b64) = sse_c_header_values(&customer_key);
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("obj-sse-c")
+            .sse_customer_algorithm("AES256")
+            .sse_customer_key(key_b64.clone())
+            .sse_customer_key_md5(key_md5_b64.clone())
+            .body(ByteStream::from_static(body))
+            .send()
+            .await
+            .unwrap();
+
+        let presign_config = PresigningConfig::expires_in(Duration::from_secs(900)).unwrap();
+        let presigned = client
+            .get_object()
+            .bucket(&bucket)
+            .key("obj-sse-c")
+            .sse_customer_algorithm("AES256")
+            .sse_customer_key(key_b64.clone())
+            .sse_customer_key_md5(key_md5_b64.clone())
+            .presigned(presign_config)
+            .await
+            .unwrap();
+
+        let mut resp = with_presigned_headers!(agent().get(presigned.uri()), presigned)
+            .call()
+            .expect("transport error");
+        assert_eq!(resp.status().as_u16(), 200);
+        let alg = resp
+            .headers()
+            .get("x-amz-server-side-encryption-customer-algorithm")
+            .map(|v| v.to_str().unwrap().to_string());
+        let key_md5 = resp
+            .headers()
+            .get("x-amz-server-side-encryption-customer-key-md5")
+            .map(|v| v.to_str().unwrap().to_string());
+        let data = resp.body_mut().read_to_vec().unwrap();
+        assert_eq!(alg.as_deref(), Some("AES256"));
+        assert_eq!(key_md5.as_deref(), Some(key_md5_b64.as_str()));
+        assert_eq!(&data[..], body);
+
+        cleanup(&bucket, &["obj-sse-c"]).await;
+    });
+}
+
+#[test]
+fn test_presigned_sse_c_get_requires_signed_headers() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let customer_key = test_sse_c_key();
+        let (key_b64, key_md5_b64) = sse_c_header_values(&customer_key);
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("obj-sse-c-missing-headers")
+            .sse_customer_algorithm("AES256")
+            .sse_customer_key(key_b64.clone())
+            .sse_customer_key_md5(key_md5_b64.clone())
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+
+        let presign_config = PresigningConfig::expires_in(Duration::from_secs(900)).unwrap();
+        let presigned = client
+            .get_object()
+            .bucket(&bucket)
+            .key("obj-sse-c-missing-headers")
+            .sse_customer_algorithm("AES256")
+            .sse_customer_key(key_b64.clone())
+            .sse_customer_key_md5(key_md5_b64.clone())
+            .presigned(presign_config)
+            .await
+            .unwrap();
+
+        let mut resp = agent()
+            .get(presigned.uri())
+            .call()
+            .expect("transport error");
+        let status = resp.status().as_u16();
+        let _ = resp.body_mut().read_to_string();
+        assert_eq!(status, 403, "expected 403, got {}", status);
+
+        cleanup(&bucket, &["obj-sse-c-missing-headers"]).await;
+    });
+}
+
+#[test]
+fn test_presigned_sse_c_head_object() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let customer_key = test_sse_c_key();
+        let (key_b64, key_md5_b64) = sse_c_header_values(&customer_key);
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("obj-head-sse-c")
+            .sse_customer_algorithm("AES256")
+            .sse_customer_key(key_b64.clone())
+            .sse_customer_key_md5(key_md5_b64.clone())
+            .body(ByteStream::from_static(b"head test"))
+            .send()
+            .await
+            .unwrap();
+
+        let presign_config = PresigningConfig::expires_in(Duration::from_secs(900)).unwrap();
+        let presigned = client
+            .head_object()
+            .bucket(&bucket)
+            .key("obj-head-sse-c")
+            .sse_customer_algorithm("AES256")
+            .sse_customer_key(key_b64.clone())
+            .sse_customer_key_md5(key_md5_b64.clone())
+            .presigned(presign_config)
+            .await
+            .unwrap();
+
+        let mut resp = with_presigned_headers!(agent().head(presigned.uri()), presigned)
+            .call()
+            .expect("transport error");
+        assert_eq!(resp.status().as_u16(), 200);
+        let alg = resp
+            .headers()
+            .get("x-amz-server-side-encryption-customer-algorithm")
+            .map(|v| v.to_str().unwrap().to_string());
+        let key_md5 = resp
+            .headers()
+            .get("x-amz-server-side-encryption-customer-key-md5")
+            .map(|v| v.to_str().unwrap().to_string());
+        let _ = resp.body_mut().read_to_string();
+        assert_eq!(alg.as_deref(), Some("AES256"));
+        assert_eq!(key_md5.as_deref(), Some(key_md5_b64.as_str()));
+
+        cleanup(&bucket, &["obj-head-sse-c"]).await;
     });
 }
 
