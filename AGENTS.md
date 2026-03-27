@@ -3,6 +3,9 @@
 We are building a server that much exactly match AWS S3 behaviour at all times. Do not work around this, always
 fix non conforming behaviour.
 
+This is a high quality codebase. If changes to add new features or fix issues are extensive we will do these
+rather than finding shortcuts that are less maintainable long term.
+
 ## Repository structure
 
 The guides/ folder has guides about specific technical or other issues and coding guidelines. These include
