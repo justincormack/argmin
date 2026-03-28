@@ -14,6 +14,14 @@ fn assert_canonical_owner_id(id: &str) {
     );
 }
 
+fn assert_error_code(body: &str, code: &str) {
+    let expected = format!("<Code>{code}</Code>");
+    assert!(
+        body.contains(&expected),
+        "expected {expected} in body, got {body}"
+    );
+}
+
 /// Build an agent that returns all HTTP responses (including 4xx/5xx) as Ok.
 fn agent() -> ureq::Agent {
     s3_tests::test_agent()
@@ -428,12 +436,74 @@ fn test_get_public_access_block_requires_owner() {
     });
 }
 
-// ── Ignored tests (not yet implemented) ──────────────────────────────
+// ── Remaining policy-related gaps ────────────────────────────────────
 
 #[test]
-#[ignore = "not implemented: per-object ACLs"]
 fn test_block_public_object_canned_acls() {
-    s3_tests::run(async {});
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client
+            .create_bucket()
+            .bucket(&bucket)
+            .object_ownership(ObjectOwnership::BucketOwnerPreferred)
+            .send()
+            .await
+            .unwrap();
+
+        let pab = aws_sdk_s3::types::PublicAccessBlockConfiguration::builder()
+            .block_public_acls(true)
+            .ignore_public_acls(false)
+            .block_public_policy(false)
+            .restrict_public_buckets(false)
+            .build();
+        client
+            .put_public_access_block()
+            .bucket(&bucket)
+            .public_access_block_configuration(pab)
+            .send()
+            .await
+            .unwrap();
+
+        for (key, acl) in [
+            ("foo1", "public-read"),
+            ("foo2", "public-read-write"),
+            ("foo3", "authenticated-read"),
+        ] {
+            let url = format!("{}/{bucket}/{key}", CTX.endpoint());
+            let response = send_signed_put_response(&url, b"", &[("x-amz-acl", acl)]);
+            assert_eq!(
+                response.status, 403,
+                "expected 403 for PutObject with x-amz-acl={acl} when BlockPublicAcls is set, got {}",
+                response.status,
+            );
+            assert_error_code(&response.body, "AccessDenied");
+        }
+
+        let private_url = format!("{}/{bucket}/foo4", CTX.endpoint());
+        let private_status = send_signed_put(&private_url, b"", &[("x-amz-acl", "private")]);
+        assert_eq!(
+            private_status, 200,
+            "expected 200 for PutObject with x-amz-acl=private when BlockPublicAcls is set, got {private_status}",
+        );
+        let head = client
+            .head_object()
+            .bucket(&bucket)
+            .key("foo4")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(head.content_length(), Some(0));
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key("foo4")
+            .send()
+            .await
+            .unwrap();
+        cleanup(&bucket).await;
+    });
 }
 
 #[test]
@@ -462,7 +532,20 @@ fn test_get_public_block_deny_bucket_policy() {
 
 // ── Helper: send a signed PUT request via raw HTTP ───────────────────
 
+struct RawPutResponse {
+    status: u16,
+    body: String,
+}
+
 fn send_signed_put(url_str: &str, body: &[u8], extra_headers: &[(&str, &str)]) -> u16 {
+    send_signed_put_response(url_str, body, extra_headers).status
+}
+
+fn send_signed_put_response(
+    url_str: &str,
+    body: &[u8],
+    extra_headers: &[(&str, &str)],
+) -> RawPutResponse {
     use std::time::SystemTime;
 
     let a = agent();
@@ -550,8 +633,11 @@ fn send_signed_put(url_str: &str, body: &[u8], extra_headers: &[(&str, &str)]) -
         request = request.header(*k, *v);
     }
 
-    let resp = request.send(body).expect("transport error");
-    resp.status().as_u16()
+    let mut resp = request.send(body).expect("transport error");
+    RawPutResponse {
+        status: resp.status().as_u16(),
+        body: resp.body_mut().read_to_string().unwrap_or_default(),
+    }
 }
 
 fn sha256_hex(data: &[u8]) -> String {

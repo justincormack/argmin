@@ -36,11 +36,11 @@ The current implementation now supports a substantial ACL subset:
   small-body and promoted streaming paths
 - CopyObject canned destination ACLs, multipart initiation canned ACL
   persistence, and presigned PUT ACL handling are implemented
+- bucket-level public access block now rejects public object ACL attempts under
+  `BlockPublicAcls` and suppresses public object ACL effects under
+  `IgnorePublicAcls`
 - unsupported states such as object `WRITE` grants and `AuthenticatedUsers`
   enforcement are rejected rather than silently persisted
-
-Remaining ignored test tied directly to the ACL gap:
-- block-public-object-canned-acls
 
 ## Goals
 
@@ -241,7 +241,7 @@ Deliver:
 - public object ACL effects suppressed under `IgnorePublicAcls`
 
 Success criteria:
-- block-public-object-canned-acls test can be unignored
+- object public-access-block ACL tests pass without `--ignored`
 
 ## Test Plan
 
@@ -252,7 +252,7 @@ Targeted integration tests:
 - `cargo test -p s3-tests --test copy_object test_object_copy_canned_acl`
 - `cargo test -p s3-tests --test multipart test_multipart_upload_canned_acl_persists_to_completed_object`
 - `cargo test -p s3-tests --test presigned test_object_presigned_put_object_with_acl`
-- `cargo test -p s3-tests --test public_access_block test_block_public_object_canned_acls -- --ignored`
+- `cargo test -p s3-tests --test public_access_block test_block_public_object_canned_acls`
 - `cargo test -p s3-tests --test versioning test_versioned_object_acl`
 - `cargo test -p s3-tests --test versioning test_versioned_object_acl_no_version_specified`
 
