@@ -38,6 +38,7 @@ The server is configured via environment variables:
 |---|---|---|
 | `ARGMIN_ACCESS_KEY_ID` | *(required)* | S3 access key |
 | `ARGMIN_SECRET_ACCESS_KEY` | *(required)* | S3 secret key |
+| `ARGMIN_SSE_C_VALIDATOR_KEY` | *(unset)* | Base64-encoded 32-byte SSE-C validator secret; required to use SSE-C |
 | `ARGMIN_LISTEN_ADDR` | `127.0.0.1:9000` | Listen address |
 | `ARGMIN_TLS_CERT_PATH` | *(unset)* | PEM certificate path for direct HTTPS |
 | `ARGMIN_TLS_KEY_PATH` | *(unset)* | PEM private key path for direct HTTPS |
@@ -57,6 +58,15 @@ The server is configured via environment variables:
 If both `ARGMIN_TLS_CERT_PATH` and `ARGMIN_TLS_KEY_PATH` are set, the server
 accepts direct HTTPS on `ARGMIN_LISTEN_ADDR`. Both variables must be set
 together.
+
+`ARGMIN_SSE_C_VALIDATOR_KEY` has no built-in default. If it is unset, SSE-C
+requests are rejected. This is intentional; we do not want a shared implicit
+validator secret. For now it is configured directly via environment variable.
+Once secret storage exists for the broader encryption work (`SSE-S3` / KMS),
+this should move there as well.
+
+If you set `ARGMIN_SSE_C_VALIDATOR_KEY`, keep it stable for the lifetime of
+existing SSE-C objects. It is a base64-encoded 32-byte secret.
 
 Start the server:
 
@@ -85,6 +95,12 @@ ARGMIN_SECRET_ACCESS_KEY=useasecuresecretkey \
 ARGMIN_TLS_CERT_PATH=/path/to/cert.pem \
 ARGMIN_TLS_KEY_PATH=/path/to/key.pem \
   ./target/release/argmin-s3
+```
+
+If you want to enable SSE-C, set a stable validator secret as well:
+
+```bash
+ARGMIN_SSE_C_VALIDATOR_KEY='<base64-encoded-32-byte-secret>'
 ```
 
 ## Usage with AWS CLI
