@@ -47,7 +47,9 @@ pub enum S3Operation {
     AbortMultipartUpload { bucket: String, key: String },
     ListMultipartUploads { bucket: String },
     ListParts { bucket: String, key: String },
+    PutBucketPolicy { bucket: String },
     GetBucketPolicy { bucket: String },
+    DeleteBucketPolicy { bucket: String },
     OptionsRequest { bucket: String, key: Option<String> },
 }
 
@@ -218,6 +220,9 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
                 bucket: bucket.to_string(),
             })
         }
+        ("PUT", None) if has_query_key(query, "policy") => Ok(S3Operation::PutBucketPolicy {
+            bucket: bucket.to_string(),
+        }),
         ("PUT", None) => Ok(S3Operation::CreateBucket {
             bucket: bucket.to_string(),
         }),
@@ -239,6 +244,9 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
                 bucket: bucket.to_string(),
             })
         }
+        ("DELETE", None) if has_query_key(query, "policy") => Ok(S3Operation::DeleteBucketPolicy {
+            bucket: bucket.to_string(),
+        }),
         ("DELETE", None) => Ok(S3Operation::DeleteBucket {
             bucket: bucket.to_string(),
         }),
@@ -914,6 +922,36 @@ mod tests {
         assert_eq!(
             route("DELETE", "/mybucket", "ownershipControls").unwrap(),
             S3Operation::DeleteBucketOwnershipControls {
+                bucket: "mybucket".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn put_bucket_policy() {
+        assert_eq!(
+            route("PUT", "/mybucket", "policy").unwrap(),
+            S3Operation::PutBucketPolicy {
+                bucket: "mybucket".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn get_bucket_policy() {
+        assert_eq!(
+            route("GET", "/mybucket", "policy").unwrap(),
+            S3Operation::GetBucketPolicy {
+                bucket: "mybucket".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn delete_bucket_policy() {
+        assert_eq!(
+            route("DELETE", "/mybucket", "policy").unwrap(),
+            S3Operation::DeleteBucketPolicy {
                 bucket: "mybucket".to_string()
             }
         );

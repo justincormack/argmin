@@ -1681,9 +1681,49 @@ impl HttpFrontend {
                     )?;
                 Ok(S3Response::delete_bucket_ownership_controls())
             }
+            S3Operation::PutBucketPolicy { bucket } => {
+                let policy =
+                    std::str::from_utf8(&req.body).map_err(|_| ServerError::InvalidArgument {
+                        reason: "invalid UTF-8 in bucket policy JSON body".to_string(),
+                    })?;
+                let requester = Self::requester_from_auth(auth);
+                self.coordinator.put_bucket_policy_for_request(
+                    &crate::coordinator::PutBucketConfigRequest {
+                        bucket: crate::coordinator::BucketRequest {
+                            name: &bucket,
+                            requester,
+                            expected_bucket_owner,
+                        },
+                        config: policy,
+                    },
+                )?;
+                Ok(S3Response::put_bucket_policy())
+            }
             S3Operation::GetBucketPolicy { bucket } => {
-                // We don't support bucket policies; always return NoSuchBucketPolicy.
-                Err(ServerError::NoSuchBucketPolicy { bucket })
+                let requester = Self::requester_from_auth(auth);
+                match self.coordinator.get_bucket_policy_for_request(
+                    &crate::coordinator::BucketRequest {
+                        name: &bucket,
+                        requester,
+                        expected_bucket_owner,
+                    },
+                )? {
+                    Some(policy) => Ok(S3Response::get_bucket_policy(&policy)),
+                    None => Err(ServerError::NoSuchBucketPolicy {
+                        bucket: bucket.clone(),
+                    }),
+                }
+            }
+            S3Operation::DeleteBucketPolicy { bucket } => {
+                let requester = Self::requester_from_auth(auth);
+                self.coordinator.delete_bucket_policy_for_request(
+                    &crate::coordinator::BucketRequest {
+                        name: &bucket,
+                        requester,
+                        expected_bucket_owner,
+                    },
+                )?;
+                Ok(S3Response::delete_bucket_policy())
             }
             S3Operation::GetBucketAcl { bucket } => {
                 let requester = Self::requester_from_auth(auth);
@@ -4475,6 +4515,105 @@ mod tests {
             .unwrap();
         let body = String::from_utf8(resp.body).unwrap();
         assert!(body.contains(canonical_id.as_str()));
+    }
+
+    #[test]
+    fn bucket_policy_put_get_delete_round_trip() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+
+        let policy = "{\"Version\":\"2012-10-17\",\"Statement\":[]}";
+        let put_req = new_req(
+            http::Method::PUT,
+            "/",
+            "policy",
+            vec![],
+            policy.as_bytes().to_vec(),
+        );
+        let put_resp = fe
+            .dispatch_routed(
+                &put_req,
+                &test_auth(),
+                S3Operation::PutBucketPolicy {
+                    bucket: "mybucket".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(put_resp.status_code, 204);
+
+        let get_req = new_req(http::Method::GET, "/", "policy", vec![], vec![]);
+        let get_resp = fe
+            .dispatch_routed(
+                &get_req,
+                &test_auth(),
+                S3Operation::GetBucketPolicy {
+                    bucket: "mybucket".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(get_resp.status_code, 200);
+        assert_eq!(String::from_utf8(get_resp.body).unwrap(), policy);
+        assert!(get_resp
+            .headers
+            .iter()
+            .any(|(name, value)| { name == "Content-Type" && value == "application/json" }));
+
+        let delete_req = new_req(http::Method::DELETE, "/", "policy", vec![], vec![]);
+        let delete_resp = fe
+            .dispatch_routed(
+                &delete_req,
+                &test_auth(),
+                S3Operation::DeleteBucketPolicy {
+                    bucket: "mybucket".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(delete_resp.status_code, 204);
+
+        match fe.dispatch_routed(
+            &get_req,
+            &test_auth(),
+            S3Operation::GetBucketPolicy {
+                bucket: "mybucket".to_string(),
+            },
+        ) {
+            Err(ServerError::NoSuchBucketPolicy { bucket }) => assert_eq!(bucket, "mybucket"),
+            Err(e) => panic!("expected NoSuchBucketPolicy, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn put_bucket_policy_rejects_invalid_utf8() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+
+        let put_req = new_req(
+            http::Method::PUT,
+            "/",
+            "policy",
+            vec![],
+            vec![0xff, 0xfe, 0xfd],
+        );
+        match fe.dispatch_routed(
+            &put_req,
+            &test_auth(),
+            S3Operation::PutBucketPolicy {
+                bucket: "mybucket".to_string(),
+            },
+        ) {
+            Err(ServerError::InvalidArgument { reason }) => {
+                assert!(reason.contains("bucket policy JSON body"));
+            }
+            Err(e) => panic!("expected InvalidArgument, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
     }
 
     #[test]

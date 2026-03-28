@@ -4188,6 +4188,40 @@ impl Coordinator {
         )
     }
 
+    pub fn put_bucket_policy_for_request(
+        &self,
+        req: &PutBucketConfigRequest<'_>,
+    ) -> Result<(), ServerError> {
+        self.put_bucket_policy_with_expected_bucket_owner(
+            req.bucket.name,
+            req.config,
+            req.bucket.requester.clone(),
+            req.bucket.expected_bucket_owner(),
+        )
+    }
+
+    pub fn get_bucket_policy_for_request(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<Option<String>, ServerError> {
+        self.get_bucket_policy_with_expected_bucket_owner(
+            req.name,
+            req.requester.clone(),
+            req.expected_bucket_owner(),
+        )
+    }
+
+    pub fn delete_bucket_policy_for_request(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<(), ServerError> {
+        self.delete_bucket_policy_with_expected_bucket_owner(
+            req.name,
+            req.requester.clone(),
+            req.expected_bucket_owner(),
+        )
+    }
+
     pub fn put_bucket_public_access_block_for_request(
         &self,
         req: &PutBucketConfigRequest<'_>,
@@ -4619,6 +4653,106 @@ impl Coordinator {
             },
             other => ServerError::Metadata(other),
         })
+    }
+
+    pub fn put_bucket_policy(
+        &self,
+        name: &str,
+        policy: &str,
+        requester: Requester,
+    ) -> Result<(), ServerError> {
+        self.put_bucket_policy_with_expected_bucket_owner(name, policy, requester, None)
+    }
+
+    pub fn put_bucket_policy_with_expected_bucket_owner(
+        &self,
+        name: &str,
+        policy: &str,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<(), ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::put_bucket_policy",
+            "bucket={} bytes={}",
+            name,
+            policy.len()
+        );
+        let _bucket_info =
+            self.authorize_bucket_admin_requester(&requester, name, expected_bucket_owner)?;
+        let bucket_pg = self.get_bucket_pg(name)?;
+        bucket_pg
+            .put_bucket_policy(name, policy)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })?;
+        Ok(())
+    }
+
+    pub fn get_bucket_policy(
+        &self,
+        name: &str,
+        requester: Requester,
+    ) -> Result<Option<String>, ServerError> {
+        self.get_bucket_policy_with_expected_bucket_owner(name, requester, None)
+    }
+
+    pub fn get_bucket_policy_with_expected_bucket_owner(
+        &self,
+        name: &str,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<Option<String>, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::get_bucket_policy",
+            "bucket={}",
+            name
+        );
+        let _bucket_info =
+            self.authorize_bucket_admin_requester(&requester, name, expected_bucket_owner)?;
+        let bucket_pg = self.get_bucket_pg(name)?;
+        bucket_pg.get_bucket_policy(name).map_err(|e| match e {
+            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                name: name.to_string(),
+            },
+            other => ServerError::Metadata(other),
+        })
+    }
+
+    pub fn delete_bucket_policy(
+        &self,
+        name: &str,
+        requester: Requester,
+    ) -> Result<(), ServerError> {
+        self.delete_bucket_policy_with_expected_bucket_owner(name, requester, None)
+    }
+
+    pub fn delete_bucket_policy_with_expected_bucket_owner(
+        &self,
+        name: &str,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<(), ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::delete_bucket_policy",
+            "bucket={}",
+            name
+        );
+        let _bucket_info =
+            self.authorize_bucket_admin_requester(&requester, name, expected_bucket_owner)?;
+        let bucket_pg = self.get_bucket_pg(name)?;
+        bucket_pg.delete_bucket_policy(name).map_err(|e| match e {
+            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                name: name.to_string(),
+            },
+            other => ServerError::Metadata(other),
+        })?;
+        Ok(())
     }
 
     // ── Public access block ───────────────────────────────────────────
@@ -10726,6 +10860,47 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(controls.contains("<ObjectOwnership>ObjectWriter</ObjectOwnership>"));
+    }
+
+    #[test]
+    fn bucket_policy_round_trips() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+
+        coord
+            .create_bucket_for_requester(&CreateBucketRequest {
+                name: "bucket",
+                requester: Requester::principal("owner-a"),
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+            })
+            .unwrap();
+
+        let policy = "{\"Version\":\"2012-10-17\",\"Statement\":[]}";
+        coord
+            .put_bucket_policy("bucket", policy, Requester::principal("owner-a"))
+            .unwrap();
+
+        assert_eq!(
+            coord
+                .get_bucket_policy("bucket", Requester::principal("owner-a"))
+                .unwrap(),
+            Some(policy.to_string())
+        );
+
+        coord
+            .delete_bucket_policy("bucket", Requester::principal("owner-a"))
+            .unwrap();
+        coord
+            .delete_bucket_policy("bucket", Requester::principal("owner-a"))
+            .unwrap();
+
+        assert_eq!(
+            coord
+                .get_bucket_policy("bucket", Requester::principal("owner-a"))
+                .unwrap(),
+            None
+        );
     }
 
     #[test]

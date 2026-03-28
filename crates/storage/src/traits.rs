@@ -119,6 +119,15 @@ pub trait PgMetadataStore {
     /// Delete a bucket's public access block configuration. Idempotent.
     fn delete_bucket_public_access_block(&self, name: &str) -> Result<(), MetadataError>;
 
+    /// Store a bucket policy document (original JSON string).
+    fn put_bucket_policy(&self, name: &str, policy: &str) -> Result<(), MetadataError>;
+
+    /// Retrieve a bucket's policy document. Returns None if not set.
+    fn get_bucket_policy(&self, name: &str) -> Result<Option<String>, MetadataError>;
+
+    /// Delete a bucket's policy document. Idempotent.
+    fn delete_bucket_policy(&self, name: &str) -> Result<(), MetadataError>;
+
     /// Update a bucket's public ACL flags.
     fn put_bucket_acl(
         &self,

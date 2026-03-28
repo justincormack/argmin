@@ -136,6 +136,16 @@ impl S3Response {
         self
     }
 
+    fn json_body(mut self, json: String) -> Self {
+        self.body = json.into_bytes();
+        self.stream = None;
+        self.headers
+            .push(("Content-Type".to_string(), "application/json".to_string()));
+        self.headers
+            .push(("Content-Length".to_string(), self.body.len().to_string()));
+        self
+    }
+
     fn streaming_body(mut self, body: ReadHandle, content_length: u64) -> Self {
         self.headers
             .push(("Content-Length".to_string(), content_length.to_string()));
@@ -691,6 +701,24 @@ impl S3Response {
     /// Build a response for `DeleteBucketOwnershipControls` (204 No Content).
     #[must_use]
     pub fn delete_bucket_ownership_controls() -> Self {
+        Self::new(204)
+    }
+
+    /// Build a response for `PutBucketPolicy` (204 No Content).
+    #[must_use]
+    pub fn put_bucket_policy() -> Self {
+        Self::new(204)
+    }
+
+    /// Build a response for `GetBucketPolicy` (200 OK, JSON body).
+    #[must_use]
+    pub fn get_bucket_policy(policy: &str) -> Self {
+        Self::new(200).json_body(policy.to_string())
+    }
+
+    /// Build a response for `DeleteBucketPolicy` (204 No Content).
+    #[must_use]
+    pub fn delete_bucket_policy() -> Self {
         Self::new(204)
     }
 

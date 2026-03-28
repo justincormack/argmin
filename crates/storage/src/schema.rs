@@ -323,6 +323,7 @@ CREATE TABLE IF NOT EXISTS buckets (
     tags             TEXT,
     public_access_block TEXT,
     ownership_controls TEXT,
+    bucket_policy    TEXT,
     sse_c_blocked    INTEGER NOT NULL DEFAULT 0 CHECK (sse_c_blocked IN (0, 1))
 )";
 
@@ -369,6 +370,7 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     migrate_owner_identity_columns(conn)?;
     migrate_acl_grant_columns(conn)?;
     migrate_bucket_write_reservation_columns(conn)?;
+    migrate_bucket_policy_columns(conn)?;
     migrate_multipart_upload_tag_columns(conn)?;
     Ok(())
 }
@@ -430,6 +432,21 @@ fn migrate_checksum_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
     )?;
 
     Ok(())
+}
+
+/// Add bucket policy storage to bucket metadata.
+///
+/// Idempotent — silently ignores "duplicate column name" errors.
+fn migrate_bucket_policy_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
+    match conn.execute("ALTER TABLE buckets ADD COLUMN bucket_policy TEXT", []) {
+        Ok(_) => Ok(()),
+        Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
+            if msg.contains("duplicate column name") =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 fn migrate_segment_crc_columns(conn: &Connection) -> Result<(), rusqlite::Error> {

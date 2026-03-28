@@ -733,8 +733,9 @@ impl PgStore {
                 .map(SerializedTagSet::from),
             public_access_block: row.get(14)?,
             ownership_controls: row.get(15)?,
+            bucket_policy: row.get(16)?,
             encryption: BucketEncryptionConfig {
-                sse_c_blocked: row.get::<_, i64>(16)? != 0,
+                sse_c_blocked: row.get::<_, i64>(17)? != 0,
             },
         })
     }
@@ -1261,7 +1262,7 @@ impl PgMetadataStore for PgStore {
     fn head_bucket_raw(&self, name: &str) -> Result<BucketInfo, MetadataError> {
         self.conn
             .query_row(
-                "SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, write_reservations_blocked, active_write_reservations, cors_config, tags, public_access_block, ownership_controls, sse_c_blocked \
+                "SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, write_reservations_blocked, active_write_reservations, cors_config, tags, public_access_block, ownership_controls, bucket_policy, sse_c_blocked \
                  FROM buckets WHERE name = ?1",
                 params![name],
                 Self::row_to_bucket_info,
@@ -1287,7 +1288,7 @@ impl PgMetadataStore for PgStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, write_reservations_blocked, active_write_reservations, cors_config, tags, public_access_block, ownership_controls, sse_c_blocked \
+                "SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, write_reservations_blocked, active_write_reservations, cors_config, tags, public_access_block, ownership_controls, bucket_policy, sse_c_blocked \
                  FROM buckets WHERE owner_principal = ?1 AND state = ?2 ORDER BY name ASC",
             )
             .map_err(|e| MetadataError::Db {
@@ -1638,6 +1639,61 @@ impl PgMetadataStore for PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "delete bucket public access block",
+                source: e,
+            })?;
+        if updated == 0 {
+            return Err(MetadataError::BucketNotFound {
+                name: BucketName::from(name),
+            });
+        }
+        Ok(())
+    }
+
+    fn put_bucket_policy(&self, name: &str, policy: &str) -> Result<(), MetadataError> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE buckets SET bucket_policy = ?1 WHERE name = ?2",
+                params![policy, name],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "put bucket policy",
+                source: e,
+            })?;
+        if updated == 0 {
+            return Err(MetadataError::BucketNotFound {
+                name: BucketName::from(name),
+            });
+        }
+        Ok(())
+    }
+
+    fn get_bucket_policy(&self, name: &str) -> Result<Option<String>, MetadataError> {
+        self.conn
+            .query_row(
+                "SELECT bucket_policy FROM buckets WHERE name = ?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| MetadataError::Db {
+                context: "get bucket policy",
+                source: e,
+            })?
+            .ok_or(MetadataError::BucketNotFound {
+                name: BucketName::from(name),
+            })
+    }
+
+    fn delete_bucket_policy(&self, name: &str) -> Result<(), MetadataError> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE buckets SET bucket_policy = NULL WHERE name = ?1",
+                params![name],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "delete bucket policy",
                 source: e,
             })?;
         if updated == 0 {

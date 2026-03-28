@@ -26,14 +26,24 @@ Dependencies:
 ## Current State
 
 Current implementation status:
-- the router recognizes `GET ?policy`
-- the HTTP handler always returns `NoSuchBucketPolicy`
-- there is no bucket policy storage in the schema
+- bucket metadata now stores raw bucket policy JSON in `buckets.bucket_policy`
+- storage exposes `put/get/delete_bucket_policy`
+- the router and HTTP handler support `PUT ?policy`, `GET ?policy`, and
+  `DELETE ?policy`
+- `PUT ?policy` requires a UTF-8 body and stores the provided JSON string
+  without parsing or validation
+- `GET ?policy` returns the stored policy JSON, or `NoSuchBucketPolicy` when
+  no policy is configured
+- `DELETE ?policy` removes the stored policy
+- bucket policy administration is wired through bucket-admin authorization
 - the public access block XML parser already supports `BlockPublicPolicy` and
   `RestrictPublicBuckets`
-- the core does not yet evaluate either of those flags against stored policy
+- there is no typed bucket policy parser, public-policy classifier, or
+  request-time policy evaluation yet
+- raw policy is intentionally not stored in bucket fast-path metadata
 
-Ignored tests tied directly to this gap:
+Remaining ignored tests tied directly to the unimplemented policy-evaluation
+gap:
 - block public policy
 - block public policy with principal
 - restrict public buckets
@@ -67,8 +77,8 @@ Support:
 
 Requirements:
 - owner-only policy administration unless AWS says otherwise
-- stored policy returned byte-for-byte or canonically normalized in a way that
-  still matches AWS-compatible expectations for the covered tests
+- stored policy returned as JSON in an AWS-compatible way; do not rely on
+  whitespace or key-order round-tripping across AWS
 - correct `NoSuchBucketPolicy` behavior when not configured
 
 ### Evaluation Model
@@ -196,15 +206,26 @@ Requirements:
 
 ### Phase 1: Bucket Policy Storage And APIs
 
+Status:
+- completed
+
 Deliver:
 - schema support
 - `PutBucketPolicy`
 - `GetBucketPolicy`
 - `DeleteBucketPolicy`
+- owner-authorized administration path
+- `NoSuchBucketPolicy` mapping for unset `GET`
+- storage/core/http/integration coverage for the surface contract
 
 Success criteria:
 - policy documents can be stored, retrieved, and removed without affecting
   request authorization yet
+
+Notes:
+- the raw JSON policy is stored durably in `BucketInfo`
+- the raw policy is not propagated into `BucketFastPathInfo`
+- this phase does not parse, validate, classify, or evaluate bucket policies
 
 ### Phase 2: Typed Policy Parser And Public Classifier
 

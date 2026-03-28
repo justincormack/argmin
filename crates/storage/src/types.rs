@@ -1150,6 +1150,8 @@ pub struct BucketInfo {
     pub public_access_block: Option<String>,
     /// Ownership controls value (None = not set).
     pub ownership_controls: Option<String>,
+    /// Original bucket policy JSON document (None = no policy).
+    pub bucket_policy: Option<String>,
     /// Bucket encryption configuration subset currently modeled by storage.
     pub encryption: BucketEncryptionConfig,
 }

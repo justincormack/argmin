@@ -605,6 +605,20 @@ fn file_bucket_metadata_config_roundtrip() {
     );
 
     store
+        .put_bucket_policy("bucket", "{\"Version\":\"2012-10-17\"}")
+        .unwrap();
+    assert_eq!(
+        store.get_bucket_policy("bucket").unwrap(),
+        Some("{\"Version\":\"2012-10-17\"}".to_string())
+    );
+    assert_eq!(
+        store.head_bucket("bucket").unwrap().bucket_policy,
+        Some("{\"Version\":\"2012-10-17\"}".to_string())
+    );
+    store.delete_bucket_policy("bucket").unwrap();
+    assert_eq!(store.get_bucket_policy("bucket").unwrap(), None);
+
+    store
         .put_bucket_ownership_controls("bucket", "<OwnershipControls/>")
         .unwrap();
     assert_eq!(
@@ -657,6 +671,18 @@ fn file_bucket_metadata_config_on_nonexistent_bucket() {
     ));
 
     let err = store.get_bucket_tags("nope").unwrap_err();
+    assert!(matches!(
+        err,
+        crate::error::MetadataError::BucketNotFound { .. }
+    ));
+
+    let err = store.get_bucket_policy("nope").unwrap_err();
+    assert!(matches!(
+        err,
+        crate::error::MetadataError::BucketNotFound { .. }
+    ));
+
+    let err = store.delete_bucket_policy("nope").unwrap_err();
     assert!(matches!(
         err,
         crate::error::MetadataError::BucketNotFound { .. }
