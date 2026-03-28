@@ -231,6 +231,28 @@ pub async fn create_public_write_bucket(client: &Client) -> String {
         .await
         .expect("set public-read-write ACL");
 
+    // Issue one read-back pass after the control-plane writes. This is not a
+    // convergence loop; it just gives AWS a moment to settle before tests make
+    // anonymous data-plane requests against the bucket.
+    client
+        .get_public_access_block()
+        .bucket(&bucket)
+        .send()
+        .await
+        .expect("read public access block");
+    client
+        .get_bucket_ownership_controls()
+        .bucket(&bucket)
+        .send()
+        .await
+        .expect("read ownership controls");
+    client
+        .get_bucket_acl()
+        .bucket(&bucket)
+        .send()
+        .await
+        .expect("read bucket ACL");
+
     bucket
 }
 

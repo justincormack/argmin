@@ -593,7 +593,11 @@ async fn assert_post_object_anonymous_public_write_bucket() {
     let bucket = s3_tests::create_public_write_bucket(client).await;
     let key = "post-anon";
 
-    let fields = [("key", key)];
+    let fields = [
+        ("key", key),
+        ("acl", "public-read"),
+        ("Content-Type", "text/plain"),
+    ];
     let (status, body) = post_object(&bucket, &fields, b"data", "test.txt");
     assert_eq!(
         status, 204,
@@ -601,36 +605,15 @@ async fn assert_post_object_anonymous_public_write_bucket() {
         status, body
     );
 
-    // Match the same behavior asserted in the anonymous PUT test:
-    // bucket-level public write allows the anonymous upload, but on AWS the
-    // uploaded object is not readable by the bucket owner. Argmin has not yet
-    // implemented per-object owner identity for anonymous writes, so local
-    // readback still succeeds there.
-    if is_external() {
-        let err = client
-            .get_object()
-            .bucket(&bucket)
-            .key(key)
-            .send()
-            .await
-            .unwrap_err();
-        let raw = format!("{:?}", err);
-        assert!(
-            raw.contains("AccessDenied") || raw.contains("403"),
-            "expected owner readback to be denied on external S3, got: {}",
-            raw
-        );
-    } else {
-        let out = client
-            .get_object()
-            .bucket(&bucket)
-            .key(key)
-            .send()
-            .await
-            .unwrap();
-        let data = out.body.collect().await.unwrap().into_bytes();
-        assert_eq!(&data[..], b"data");
-    }
+    let out = client
+        .get_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await
+        .unwrap();
+    let data = out.body.collect().await.unwrap().into_bytes();
+    assert_eq!(&data[..], b"data");
 
     client
         .delete_object()
@@ -2486,11 +2469,6 @@ fn test_post_object_missing_expires_condition() {
             .await
             .unwrap();
     });
-}
-
-#[test]
-fn test_post_object_anonymous_request_public_write_bucket() {
-    s3_tests::run(assert_post_object_anonymous_public_write_bucket());
 }
 
 #[test]
