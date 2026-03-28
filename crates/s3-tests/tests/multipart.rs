@@ -4,10 +4,15 @@
 //! CreateMultipartUpload, UploadPart, CompleteMultipartUpload,
 //! AbortMultipartUpload, ListMultipartUploads, ListParts.
 
+use std::collections::BTreeMap;
+
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::CompletedMultipartUpload;
 use aws_sdk_s3::types::CompletedPart;
-use s3_tests::{assert_s3_err_code, copy_source_with_version, err_status, unique_bucket, CTX};
+use s3_tests::{
+    assert_s3_err_code, copy_source_with_version, create_public_write_bucket,
+    ensure_distinct_s3_owners_or_skip, err_status, unique_bucket, CTX,
+};
 
 const PART_SIZE: usize = 5 * 1024 * 1024; // 5 MB minimum part size
 
@@ -16,6 +21,24 @@ async fn setup_bucket() -> String {
     let bucket = unique_bucket();
     client.create_bucket().bucket(&bucket).send().await.unwrap();
     bucket
+}
+
+async fn canonical_owner_id(client: &aws_sdk_s3::Client) -> String {
+    let bucket = unique_bucket();
+    client.create_bucket().bucket(&bucket).send().await.unwrap();
+    let owner_id = client
+        .get_bucket_acl()
+        .bucket(&bucket)
+        .send()
+        .await
+        .unwrap()
+        .owner()
+        .expect("expected owner in GetBucketAcl")
+        .id()
+        .expect("expected owner ID in GetBucketAcl")
+        .to_string();
+    client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    owner_id
 }
 
 async fn cleanup(bucket: &str, keys: &[&str]) {
@@ -57,6 +80,10 @@ async fn cleanup(bucket: &str, keys: &[&str]) {
     }
 
     client.delete_bucket().bucket(bucket).send().await.unwrap();
+}
+
+fn anon_agent() -> ureq::Agent {
+    s3_tests::test_agent()
 }
 
 /// Helper: create multipart upload, upload parts, complete, return (etag, version_id).
@@ -2437,7 +2464,218 @@ fn test_upload_part_copy_percent_encoded_key() {
 // ── Multi-user (not implemented) ────────────────────────────────────
 
 #[test]
-#[ignore = "not implemented: multi-user"]
 fn test_list_multipart_upload_owner() {
-    s3_tests::run(async {});
+    s3_tests::run(async {
+        let client = CTX.client();
+        if !CTX.has_alt_client() {
+            eprintln!(
+                "skipping test_list_multipart_upload_owner: alternate credentials are not configured"
+            );
+            return;
+        }
+        let alt_client = CTX.alt_client();
+        if !ensure_distinct_s3_owners_or_skip(
+            client,
+            alt_client,
+            "test_list_multipart_upload_owner",
+        )
+        .await
+        {
+            return;
+        }
+
+        let bucket = create_public_write_bucket(client).await;
+        let owner_id = client
+            .get_bucket_acl()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap()
+            .owner()
+            .expect("expected bucket owner in GetBucketAcl")
+            .id()
+            .expect("expected bucket owner ID in GetBucketAcl")
+            .to_string();
+        let alt_owner_id = canonical_owner_id(alt_client).await;
+
+        let upload1 = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key("multipart1")
+            .send()
+            .await
+            .unwrap();
+        let upload1_id = upload1.upload_id().unwrap().to_string();
+        let upload2 = alt_client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key("multipart2")
+            .send()
+            .await
+            .unwrap();
+        let upload2_id = upload2.upload_id().unwrap().to_string();
+
+        let mut views = Vec::new();
+        for lister in [client, alt_client] {
+            let resp = lister
+                .list_multipart_uploads()
+                .bucket(&bucket)
+                .send()
+                .await
+                .unwrap();
+
+            let uploads: BTreeMap<_, _> = resp
+                .uploads()
+                .iter()
+                .map(|upload| {
+                    let owner = upload.owner().expect("upload should have owner");
+                    let initiator = upload.initiator().expect("upload should have initiator");
+                    (
+                        upload.key().expect("upload should have key").to_string(),
+                        (
+                            upload
+                                .upload_id()
+                                .expect("upload should have upload ID")
+                                .to_string(),
+                            owner.id().expect("owner should have ID").to_string(),
+                            initiator
+                                .id()
+                                .expect("initiator should have ID")
+                                .to_string(),
+                        ),
+                    )
+                })
+                .collect();
+
+            assert_eq!(uploads.len(), 2);
+            views.push(uploads);
+        }
+
+        assert_eq!(views[0], views[1]);
+
+        let multipart1 = views[0].get("multipart1").expect("expected multipart1");
+        assert_eq!(multipart1.0, upload1_id);
+        assert_eq!(multipart1.1, owner_id);
+        assert!(!multipart1.2.is_empty());
+
+        let multipart2 = views[0].get("multipart2").expect("expected multipart2");
+        assert_eq!(multipart2.0, upload2_id);
+        assert_eq!(multipart2.1, alt_owner_id);
+        assert!(!multipart2.2.is_empty());
+
+        assert_ne!(
+            multipart1.2, multipart2.2,
+            "initiator IDs should distinguish the two upload creators"
+        );
+
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key("multipart1")
+            .upload_id(&upload1_id)
+            .send()
+            .await
+            .unwrap();
+        alt_client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key("multipart2")
+            .upload_id(&upload2_id)
+            .send()
+            .await
+            .unwrap();
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_anon_create_multipart_upload_public_write_bucket_fail() {
+    s3_tests::run(async {
+        let bucket = create_public_write_bucket(CTX.client()).await;
+        let url = format!("{}/{}/anon-multipart?uploads", CTX.endpoint(), bucket);
+        let mut resp = anon_agent()
+            .post(&url)
+            .send(b"" as &[u8])
+            .expect("transport error");
+        let status = resp.status().as_u16();
+        let body = resp.body_mut().read_to_string().unwrap_or_default();
+        assert_eq!(
+            status, 403,
+            "expected 403 for anonymous CreateMultipartUpload on public-read-write bucket, got {} body={}",
+            status, body
+        );
+        assert!(
+            body.contains("<Code>AccessDenied</Code>"),
+            "expected AccessDenied in body: {body}"
+        );
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_multipart_initiator_cannot_continue_after_bucket_acl_change() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        if !CTX.has_alt_client() {
+            eprintln!(
+                "skipping test_multipart_initiator_cannot_continue_after_bucket_acl_change: alternate credentials are not configured"
+            );
+            return;
+        }
+        let alt_client = CTX.alt_client();
+        if !ensure_distinct_s3_owners_or_skip(
+            client,
+            alt_client,
+            "test_multipart_initiator_cannot_continue_after_bucket_acl_change",
+        )
+        .await
+        {
+            return;
+        }
+
+        let bucket = create_public_write_bucket(client).await;
+        let key = "multipart-acl-change";
+
+        let create = alt_client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+
+        client
+            .put_bucket_acl()
+            .bucket(&bucket)
+            .acl(aws_sdk_s3::types::BucketCannedAcl::Private)
+            .send()
+            .await
+            .unwrap();
+
+        let upload_part = alt_client
+            .upload_part()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .part_number(1)
+            .body(ByteStream::from(vec![b'x'; 1024]))
+            .send()
+            .await;
+        assert_eq!(err_status(&upload_part), 403);
+        assert_s3_err_code(&upload_part, "AccessDenied");
+
+        alt_client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .unwrap();
+
+        cleanup(&bucket, &[]).await;
+    });
 }

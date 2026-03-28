@@ -640,6 +640,40 @@ impl HttpFrontend {
         (owner_display_name, grants)
     }
 
+    fn render_multipart_uploads(
+        &self,
+        result: crate::coordinator::ListMultipartUploadsResult,
+    ) -> xml::RenderedListMultipartUploadsResult {
+        let uploads = result
+            .uploads
+            .into_iter()
+            .map(|upload| {
+                let owner = xml::RenderedCanonicalUser {
+                    canonical_id: upload.owner.canonical_id.clone(),
+                };
+                let initiator_identity = upload.initiator.unwrap_or_else(|| upload.owner.clone());
+                let initiator = xml::RenderedCanonicalUser {
+                    canonical_id: initiator_identity.canonical_id.clone(),
+                };
+                xml::RenderedMultipartUploadEntry {
+                    key: upload.key,
+                    upload_id: upload.upload_id,
+                    initiated: upload.initiated,
+                    owner,
+                    initiator,
+                    checksum_algorithm: upload.checksum_algorithm,
+                    checksum_type: upload.checksum_type,
+                }
+            })
+            .collect();
+        xml::RenderedListMultipartUploadsResult {
+            uploads,
+            is_truncated: result.is_truncated,
+            next_key_marker: result.next_key_marker,
+            next_upload_id_marker: result.next_upload_id_marker,
+        }
+    }
+
     fn dispatch_routed(
         &self,
         req: &S3Request,
@@ -1775,13 +1809,14 @@ impl HttpFrontend {
                         requester,
                     },
                 )?;
+                let rendered = self.render_multipart_uploads(result);
                 Ok(S3Response::list_multipart_uploads(
                     &bucket,
                     prefix.as_deref(),
                     key_marker.as_deref(),
                     upload_id_marker.as_deref(),
                     max_uploads,
-                    &result,
+                    &rendered,
                 ))
             }
             S3Operation::ListParts { bucket, key } => {

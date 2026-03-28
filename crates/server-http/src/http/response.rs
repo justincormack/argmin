@@ -3,8 +3,8 @@
 use crate::coordinator::{
     BucketSummary, CopyObjectResult, DeleteObjectResult, DeleteObjectsResult, GetBucketAclResult,
     GetObjectAclResult, GetObjectPartResult, GetObjectRangeResult, GetObjectResult,
-    HeadObjectPartResult, HeadObjectResult, ListMultipartUploadsResult, ListObjectVersionsResult,
-    ListObjectsResult, ListPartsResult, PutObjectResult, ReadHandle,
+    HeadObjectPartResult, HeadObjectResult, ListObjectVersionsResult, ListObjectsResult,
+    ListPartsResult, PutObjectResult, ReadHandle,
 };
 use crate::error::ServerError;
 use auth::canonical::uri_encode;
@@ -855,7 +855,7 @@ impl S3Response {
         key_marker: Option<&str>,
         upload_id_marker: Option<&str>,
         max_uploads: u32,
-        result: &ListMultipartUploadsResult,
+        result: &xml::RenderedListMultipartUploadsResult,
     ) -> Self {
         let body = xml::list_multipart_uploads_xml(
             bucket,

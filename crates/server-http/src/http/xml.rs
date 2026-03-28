@@ -1,8 +1,7 @@
 /// Hand-formatted XML for S3 responses with lightweight request XML parsing.
 use crate::coordinator::{
     BucketAcl, BucketSummary, ChecksumClaim, CompletePart, DeleteError, DeletedObject,
-    ListMultipartUploadsResult, ListObjectVersionsResult, ListObjectsResult, ListPartsResult,
-    ObjectPartsInfo,
+    ListObjectVersionsResult, ListObjectsResult, ListPartsResult, ObjectPartsInfo,
 };
 use crate::error::ServerError;
 use auth::canonical::uri_encode_path;
@@ -104,6 +103,40 @@ pub struct RenderedAclGrant {
     pub grantee: AclGrantee,
     pub permission: AclPermission,
     pub display_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedCanonicalUser {
+    pub canonical_id: CanonicalUserId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedMultipartUploadEntry {
+    pub key: String,
+    pub upload_id: String,
+    pub initiated: u64,
+    pub owner: RenderedCanonicalUser,
+    pub initiator: RenderedCanonicalUser,
+    pub checksum_algorithm: Option<ChecksumAlgorithm>,
+    pub checksum_type: Option<checksum::ChecksumType>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedListMultipartUploadsResult {
+    pub uploads: Vec<RenderedMultipartUploadEntry>,
+    pub is_truncated: bool,
+    pub next_key_marker: Option<String>,
+    pub next_upload_id_marker: Option<String>,
+}
+
+fn append_canonical_owner_xml(xml: &mut String, element: &str, owner: &RenderedCanonicalUser) {
+    xml.push('<');
+    xml.push_str(element);
+    xml.push_str("><ID>");
+    xml.push_str(&xml_escape(owner.canonical_id.as_str()));
+    xml.push_str("</ID></");
+    xml.push_str(element);
+    xml.push('>');
 }
 
 /// Format a `GetBucketAcl`/`GetObjectAcl` XML response.
@@ -2610,7 +2643,7 @@ pub fn list_multipart_uploads_xml(
     key_marker: Option<&str>,
     upload_id_marker: Option<&str>,
     max_uploads: u32,
-    result: &ListMultipartUploadsResult,
+    result: &RenderedListMultipartUploadsResult,
 ) -> String {
     let mut xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -2654,16 +2687,32 @@ pub fn list_multipart_uploads_xml(
         ));
     }
     for upload in &result.uploads {
+        xml.push_str("<Upload>");
+        if let Some(algo) = upload.checksum_algorithm {
+            xml.push_str(&format!(
+                "<ChecksumAlgorithm>{}</ChecksumAlgorithm>",
+                algo.as_str()
+            ));
+        }
+        if let Some(checksum_type) = upload.checksum_type {
+            xml.push_str(&format!(
+                "<ChecksumType>{}</ChecksumType>",
+                checksum_type.as_str()
+            ));
+        }
         xml.push_str(&format!(
-            "<Upload>\
-             <Key>{}</Key>\
-             <UploadId>{}</UploadId>\
-             <Initiated>{}</Initiated>\
-             </Upload>",
-            xml_escape(&upload.key),
-            xml_escape(&upload.upload_id),
-            format_timestamp(upload.initiated),
+            "<Initiated>{}</Initiated>",
+            format_timestamp(upload.initiated)
         ));
+        append_canonical_owner_xml(&mut xml, "Initiator", &upload.initiator);
+        xml.push_str(&format!("<Key>{}</Key>", xml_escape(&upload.key)));
+        append_canonical_owner_xml(&mut xml, "Owner", &upload.owner);
+        xml.push_str("<StorageClass>STANDARD</StorageClass>");
+        xml.push_str(&format!(
+            "<UploadId>{}</UploadId>",
+            xml_escape(&upload.upload_id)
+        ));
+        xml.push_str("</Upload>");
     }
     xml.push_str("</ListMultipartUploadsResult>");
     xml
@@ -4424,7 +4473,7 @@ mod tests {
 
     #[test]
     fn list_multipart_uploads_xml_empty() {
-        let result = ListMultipartUploadsResult {
+        let result = RenderedListMultipartUploadsResult {
             uploads: vec![],
             is_truncated: false,
             next_key_marker: None,
@@ -4444,18 +4493,33 @@ mod tests {
 
     #[test]
     fn list_multipart_uploads_xml_with_entries() {
-        use crate::coordinator::MultipartUploadEntry;
-        let result = ListMultipartUploadsResult {
+        let result = RenderedListMultipartUploadsResult {
             uploads: vec![
-                MultipartUploadEntry {
+                RenderedMultipartUploadEntry {
                     key: "file1.txt".to_string(),
                     upload_id: "id1".to_string(),
                     initiated: 1700000000000,
+                    owner: RenderedCanonicalUser {
+                        canonical_id: CanonicalUserId::from_principal("owner-1"),
+                    },
+                    initiator: RenderedCanonicalUser {
+                        canonical_id: CanonicalUserId::from_principal("owner-1"),
+                    },
+                    checksum_algorithm: None,
+                    checksum_type: None,
                 },
-                MultipartUploadEntry {
+                RenderedMultipartUploadEntry {
                     key: "file2.txt".to_string(),
                     upload_id: "id2".to_string(),
                     initiated: 1700000001000,
+                    owner: RenderedCanonicalUser {
+                        canonical_id: CanonicalUserId::from_principal("owner-2"),
+                    },
+                    initiator: RenderedCanonicalUser {
+                        canonical_id: CanonicalUserId::from_principal("writer-2"),
+                    },
+                    checksum_algorithm: Some(ChecksumAlgorithm::Sha256),
+                    checksum_type: Some(checksum::ChecksumType::Composite),
                 },
             ],
             is_truncated: false,
@@ -4469,16 +4533,29 @@ mod tests {
         assert!(xml.contains("<Key>file2.txt</Key>"));
         assert!(xml.contains("<UploadId>id2</UploadId>"));
         assert!(xml.contains("<Initiated>"));
+        assert!(xml.contains("<Owner><ID>"));
+        assert!(xml.contains("<Initiator><ID>"));
+        assert!(xml.contains("<StorageClass>STANDARD</StorageClass>"));
+        assert!(xml.contains("<ChecksumAlgorithm>SHA256</ChecksumAlgorithm>"));
+        assert!(xml.contains("<ChecksumType>COMPOSITE</ChecksumType>"));
+        assert!(!xml.contains("<DisplayName>"));
     }
 
     #[test]
     fn list_multipart_uploads_xml_truncated() {
-        use crate::coordinator::MultipartUploadEntry;
-        let result = ListMultipartUploadsResult {
-            uploads: vec![MultipartUploadEntry {
+        let result = RenderedListMultipartUploadsResult {
+            uploads: vec![RenderedMultipartUploadEntry {
                 key: "key1".to_string(),
                 upload_id: "uid1".to_string(),
                 initiated: 0,
+                owner: RenderedCanonicalUser {
+                    canonical_id: CanonicalUserId::from_principal("owner-1"),
+                },
+                initiator: RenderedCanonicalUser {
+                    canonical_id: CanonicalUserId::from_principal("owner-1"),
+                },
+                checksum_algorithm: None,
+                checksum_type: None,
             }],
             is_truncated: true,
             next_key_marker: Some("key1".to_string()),
@@ -4502,12 +4579,19 @@ mod tests {
 
     #[test]
     fn list_multipart_uploads_xml_escapes_keys() {
-        use crate::coordinator::MultipartUploadEntry;
-        let result = ListMultipartUploadsResult {
-            uploads: vec![MultipartUploadEntry {
+        let result = RenderedListMultipartUploadsResult {
+            uploads: vec![RenderedMultipartUploadEntry {
                 key: "key&<>".to_string(),
                 upload_id: "id\"'".to_string(),
                 initiated: 0,
+                owner: RenderedCanonicalUser {
+                    canonical_id: CanonicalUserId::from_principal("owner&<>"),
+                },
+                initiator: RenderedCanonicalUser {
+                    canonical_id: CanonicalUserId::from_principal("owner&<>"),
+                },
+                checksum_algorithm: None,
+                checksum_type: None,
             }],
             is_truncated: false,
             next_key_marker: None,
@@ -4516,6 +4600,8 @@ mod tests {
         let xml = list_multipart_uploads_xml("mybucket", None, None, None, 1000, &result);
         assert!(xml.contains("<Key>key&amp;&lt;&gt;</Key>"));
         assert!(xml.contains("<UploadId>id&quot;&apos;</UploadId>"));
+        assert!(xml.contains("<Owner><ID>"));
+        assert!(!xml.contains("<DisplayName>"));
     }
 
     // ── ListParts XML tests ──────────────────────────────────────────

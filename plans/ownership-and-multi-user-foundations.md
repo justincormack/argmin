@@ -273,16 +273,29 @@ Success criteria:
 
 ### Phase 4: Multipart Owner And Initiator Surfaces
 
-Status: next.
+Status: complete for the currently targeted multipart ownership cases. The
+multipart list surface now reports stored owner and initiator identity in an
+AWS-compatible shape using multipart owner and initiator IDs without relying
+on `DisplayName`, and multipart list/abort/list parts authorization now uses
+stored upload identities where AWS exposes upload-scoped defaults. Multipart
+write and complete paths still re-check the current bucket/object write
+authorization, using stored upload identities only to prevent unrelated
+principals from continuing an existing upload. Anonymous callers are rejected
+at `CreateMultipartUpload`, matching AWS. The multipart owner test is
+unignored, and a regression now covers the AWS-visible case where an initiator
+loses `UploadPart` access after the bucket ACL is tightened.
 
 Deliver:
 - list multipart uploads result includes correct owner/initiator semantics
-- multipart ownership checks use stored upload owner identity
+- multipart ownership checks use stored upload identity where AWS grants
+  upload-scoped defaults without bypassing current write authorization
 
 Success criteria:
 - multipart owner test can be unignored
 
 ### Phase 5: Tenant Compatibility Cleanup
+
+Status: next.
 
 Deliver:
 - presigned tests that require account isolation use the shared identity model

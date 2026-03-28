@@ -1204,6 +1204,20 @@ impl Requester {
         self.account().map(AccountIdentity::canonical_user_id)
     }
 
+    #[must_use]
+    pub fn is_anonymous(&self) -> bool {
+        self.account.is_none() && {
+            #[cfg(test)]
+            {
+                !self.is_system
+            }
+            #[cfg(not(test))]
+            {
+                true
+            }
+        }
+    }
+
     #[cfg(test)]
     #[must_use]
     const fn system() -> Self {
@@ -1698,6 +1712,10 @@ pub struct MultipartUploadEntry {
     pub key: String,
     pub upload_id: String,
     pub initiated: u64,
+    pub owner: OwnerIdentity,
+    pub initiator: Option<OwnerIdentity>,
+    pub checksum_algorithm: Option<ChecksumAlgorithm>,
+    pub checksum_type: Option<ChecksumType>,
 }
 
 /// Result of a ListMultipartUploads operation.
@@ -2687,6 +2705,43 @@ impl Coordinator {
             || object.acl_grants().is_some_and(|grants| {
                 Self::requester_has_acl_permission(requester, grants, AclPermission::WriteAcp)
             })
+    }
+
+    fn requester_matches_owner_identity(requester: &Requester, owner: &OwnerIdentity) -> bool {
+        #[cfg(test)]
+        if requester.is_system {
+            return true;
+        }
+
+        requester.account().is_some_and(|account| {
+            account.canonical_user_id() == &owner.canonical_id
+                || account.principal() == owner.principal
+        })
+    }
+
+    fn requester_can_manage_multipart_upload(
+        requester: &Requester,
+        bucket: &BucketSummary,
+        upload: &MultipartUploadRecord,
+    ) -> bool {
+        Self::requester_can_bucket_admin(requester, &bucket.owner_principal)
+            || Self::requester_matches_owner_identity(requester, &upload.owner)
+            || upload.initiator.as_ref().is_some_and(|initiator| {
+                Self::requester_matches_owner_identity(requester, initiator)
+            })
+    }
+
+    fn requester_can_write_multipart_upload(
+        requester: &Requester,
+        bucket: &BucketSummary,
+        upload: &MultipartUploadRecord,
+    ) -> bool {
+        Self::requester_can_object_write(
+            requester,
+            &bucket.owner_principal,
+            &bucket.acl_grants,
+            Self::effective_public_write(bucket),
+        ) && Self::requester_can_manage_multipart_upload(requester, bucket, upload)
     }
 
     fn requester_can_manage_object_tags(
@@ -4749,7 +4804,7 @@ impl Coordinator {
             });
         }
 
-        let bucket_info = self.authorize_object_write_requester(&req.requester, bucket)?;
+        let bucket_info = self.active_bucket_summary(bucket)?;
 
         // Lock metadata PG and validate upload exists.
         let meta_pg_id = self.object_pg_id(bucket, key);
@@ -4765,6 +4820,9 @@ impl Coordinator {
             return Err(ServerError::NoSuchUpload {
                 upload_id: upload_id.to_string(),
             });
+        }
+        if !Self::requester_can_write_multipart_upload(&req.requester, &bucket_info, &upload) {
+            return Err(ServerError::AccessDenied);
         }
         Self::ensure_sse_c_allowed(
             &bucket_info,
@@ -7807,6 +7865,9 @@ impl Coordinator {
         let bucket = req.bucket;
         let key = req.key;
         self.with_bucket_write_reservation(bucket, |bucket_info| {
+            if req.requester.is_anonymous() {
+                return Err(ServerError::AccessDenied);
+            }
             if !Self::requester_can_object_write(
                 &req.requester,
                 &bucket_info.owner_principal,
@@ -8130,15 +8191,24 @@ impl Coordinator {
         let parts = req.parts;
         let claimed_checksum = req.claimed_checksum;
         self.with_bucket_write_reservation(bucket, |bucket_info| {
-            if !Self::requester_can_object_write(
-                &req.requester,
-                &bucket_info.owner_principal,
-                &bucket_info.acl_grants,
-                Self::effective_public_write(&bucket_info),
-            ) {
+            let meta_pg_id = self.object_pg_id(bucket, key);
+            let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
+
+            let upload = meta_pg.get_multipart_upload(upload_id)?;
+            if upload.bucket != bucket || upload.key != key {
+                return Err(ServerError::NoSuchUpload {
+                    upload_id: upload_id.to_string(),
+                });
+            }
+            if upload.state != UploadState::InProgress {
+                return Err(ServerError::NoSuchUpload {
+                    upload_id: upload_id.to_string(),
+                });
+            }
+            if !Self::requester_can_write_multipart_upload(&req.requester, &bucket_info, &upload)
+            {
                 return Err(ServerError::AccessDenied);
             }
-
             if parts.is_empty() {
                 return Err(ServerError::InvalidRequest {
                     reason: "part list must not be empty".to_string(),
@@ -8156,21 +8226,6 @@ impl Coordinator {
                 if window[0].part_number >= window[1].part_number {
                     return Err(ServerError::InvalidPartOrder);
                 }
-            }
-
-            let meta_pg_id = self.object_pg_id(bucket, key);
-            let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
-
-            let upload = meta_pg.get_multipart_upload(upload_id)?;
-            if upload.bucket != bucket || upload.key != key {
-                return Err(ServerError::NoSuchUpload {
-                    upload_id: upload_id.to_string(),
-                });
-            }
-            if upload.state != UploadState::InProgress {
-                return Err(ServerError::NoSuchUpload {
-                    upload_id: upload_id.to_string(),
-                });
             }
             Self::ensure_sse_c_allowed(
                 &bucket_info,
@@ -8548,7 +8603,7 @@ impl Coordinator {
         let bucket = req.bucket;
         let key = req.key;
         let upload_id = req.upload_id;
-        let _bucket_info = self.authorize_object_write_requester(&req.requester, bucket)?;
+        let bucket_info = self.active_bucket_summary(bucket)?;
         // 1. Lock meta PG and validate upload.
         let meta_pg_id = self.object_pg_id(bucket, key);
         let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
@@ -8558,6 +8613,9 @@ impl Coordinator {
             return Err(ServerError::NoSuchUpload {
                 upload_id: upload_id.to_string(),
             });
+        }
+        if !Self::requester_can_manage_multipart_upload(&req.requester, &bucket_info, &upload) {
+            return Err(ServerError::AccessDenied);
         }
 
         // 2. Transition to Aborting. Allow already-Aborting for idempotence.
@@ -8652,7 +8710,7 @@ impl Coordinator {
         let upload_id = req.upload_id;
         let part_number_marker = req.part_number_marker;
         let max_parts = req.max_parts;
-        let _bucket_info = self.authorize_bucket_read_requester(&req.requester, bucket)?;
+        let bucket_info = self.active_bucket_summary(bucket)?;
         // 1. Lock meta PG and validate upload.
         let meta_pg_id = self.object_pg_id(bucket, key);
         let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
@@ -8667,6 +8725,9 @@ impl Coordinator {
             return Err(ServerError::NoSuchUpload {
                 upload_id: upload_id.to_string(),
             });
+        }
+        if !Self::requester_can_manage_multipart_upload(&req.requester, &bucket_info, &upload) {
+            return Err(ServerError::AccessDenied);
         }
 
         // 2. Delegate to storage layer.
@@ -8792,6 +8853,10 @@ impl Coordinator {
                 key: u.key.to_string(),
                 upload_id: u.upload_id.to_string(),
                 initiated: u.initiated_at,
+                owner: u.owner,
+                initiator: u.initiator,
+                checksum_algorithm: u.checksum.map(MultipartChecksumConfig::algorithm),
+                checksum_type: u.checksum.map(MultipartChecksumConfig::checksum_type),
             })
             .collect();
 
@@ -16982,6 +17047,340 @@ mod tests {
         assert_eq!(result.uploads[1].key, "beta");
         assert_eq!(result.uploads[1].upload_id, r2.upload_id);
         assert!(!result.is_truncated);
+    }
+
+    #[test]
+    fn list_multipart_uploads_reports_stored_owner_and_initiator() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let bucket_owner = AccountIdentity::new(
+            "owner-a",
+            CanonicalUserId::from_principal("bucket-owner-canonical"),
+            "Bucket Owner",
+        );
+        let writer = AccountIdentity::new(
+            "writer-a",
+            CanonicalUserId::from_principal("writer-canonical"),
+            "Writer",
+        );
+
+        coord
+            .create_bucket_for_requester(&CreateBucketRequest {
+                name: "bucket",
+                requester: Requester::authenticated(bucket_owner.clone()),
+                acl: BucketAcl::Private,
+                ownership: BucketObjectOwnership::ObjectWriter,
+            })
+            .unwrap();
+        coord
+            .put_bucket_canned_acl(
+                "bucket",
+                BucketAcl::PublicReadWrite,
+                Requester::authenticated(bucket_owner.clone()),
+            )
+            .unwrap();
+        coord
+            .put_bucket_ownership_controls(
+                "bucket",
+                "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerPreferred</ObjectOwnership></Rule></OwnershipControls>",
+                Requester::authenticated(bucket_owner.clone()),
+            )
+            .unwrap();
+
+        let upload = coord
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                checksum: None,
+                requester: Requester::authenticated(writer.clone()),
+                acl: PutObjectAcl::BucketOwnerFullControl,
+                sse_customer: None,
+            })
+            .unwrap();
+
+        let result = coord
+            .list_multipart_uploads(&ListMultipartUploadsRequest {
+                bucket: "bucket",
+                prefix: None,
+                key_marker: None,
+                upload_id_marker: None,
+                max_uploads: 1000,
+                requester: Requester::authenticated(writer.clone()),
+            })
+            .unwrap();
+        assert_eq!(result.uploads.len(), 1);
+        assert_eq!(result.uploads[0].upload_id, upload.upload_id);
+        assert_eq!(
+            result.uploads[0].owner,
+            OwnerIdentity::new(
+                bucket_owner.principal().to_string(),
+                bucket_owner.canonical_user_id().clone(),
+            )
+        );
+        assert_eq!(
+            result.uploads[0].initiator,
+            Some(OwnerIdentity::new(
+                writer.principal().to_string(),
+                writer.canonical_user_id().clone(),
+            ))
+        );
+    }
+
+    #[test]
+    fn multipart_operations_reject_non_initiator_on_public_write_bucket() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let bucket_owner = AccountIdentity::new(
+            "owner-a",
+            CanonicalUserId::from_principal("bucket-owner-canonical"),
+            "Bucket Owner",
+        );
+        let writer = AccountIdentity::new(
+            "writer-a",
+            CanonicalUserId::from_principal("writer-canonical"),
+            "Writer",
+        );
+        let other = AccountIdentity::new(
+            "other-a",
+            CanonicalUserId::from_principal("other-canonical"),
+            "Other",
+        );
+        let owner_requester = Requester::authenticated(bucket_owner.clone());
+        let writer_requester = Requester::authenticated(writer.clone());
+        let other_requester = Requester::authenticated(other);
+
+        coord
+            .create_bucket_for_requester(&CreateBucketRequest {
+                name: "bucket",
+                requester: owner_requester.clone(),
+                acl: BucketAcl::Private,
+                ownership: BucketObjectOwnership::ObjectWriter,
+            })
+            .unwrap();
+        coord
+            .put_bucket_canned_acl("bucket", BucketAcl::PublicReadWrite, owner_requester)
+            .unwrap();
+
+        let upload = coord
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                checksum: None,
+                requester: writer_requester.clone(),
+                acl: NO_PUT_OBJECT_ACL,
+                sse_customer: None,
+            })
+            .unwrap();
+
+        let err = test_helpers::upload_part(
+            &coord,
+            &UploadPartRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload.upload_id,
+                part_number: 1,
+                data: b"not-allowed",
+                claimed_checksum: None,
+                requester: other_requester.clone(),
+                sse_customer: None,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+
+        let uploaded = test_helpers::upload_part(
+            &coord,
+            &UploadPartRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload.upload_id,
+                part_number: 1,
+                data: b"allowed",
+                claimed_checksum: None,
+                requester: writer_requester.clone(),
+                sse_customer: None,
+            },
+        )
+        .unwrap();
+
+        let err = coord
+            .list_parts(&ListPartsRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload.upload_id,
+                part_number_marker: None,
+                max_parts: 100,
+                requester: other_requester.clone(),
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+
+        let parts = coord
+            .list_parts(&ListPartsRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload.upload_id,
+                part_number_marker: None,
+                max_parts: 100,
+                requester: writer_requester.clone(),
+            })
+            .unwrap();
+        assert_eq!(parts.parts.len(), 1);
+        assert_eq!(parts.parts[0].etag, uploaded.etag);
+
+        let err = coord
+            .abort_multipart_upload(&AbortMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload.upload_id,
+                requester: other_requester,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn create_multipart_upload_rejects_anonymous_on_public_write_bucket() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let owner_canonical_id = CanonicalUserId::from_principal("owner-a");
+        coord
+            .create_bucket_for_owner_with_acl("owner-a", &owner_canonical_id, "bucket", false, true)
+            .unwrap();
+
+        let err = coord
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                checksum: None,
+                requester: Requester::anonymous(),
+                acl: NO_PUT_OBJECT_ACL,
+                sse_customer: None,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn multipart_initiator_cannot_continue_after_bucket_acl_becomes_private() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let bucket_owner = AccountIdentity::new(
+            "owner-a",
+            CanonicalUserId::from_principal("bucket-owner-canonical"),
+            "Bucket Owner",
+        );
+        let writer = AccountIdentity::new(
+            "writer-a",
+            CanonicalUserId::from_principal("writer-canonical"),
+            "Writer",
+        );
+        let owner_requester = Requester::authenticated(bucket_owner.clone());
+        let writer_requester = Requester::authenticated(writer.clone());
+
+        coord
+            .create_bucket_for_requester(&CreateBucketRequest {
+                name: "bucket",
+                requester: owner_requester.clone(),
+                acl: BucketAcl::Private,
+                ownership: BucketObjectOwnership::ObjectWriter,
+            })
+            .unwrap();
+        coord
+            .put_bucket_canned_acl(
+                "bucket",
+                BucketAcl::PublicReadWrite,
+                owner_requester.clone(),
+            )
+            .unwrap();
+        coord
+            .put_bucket_ownership_controls(
+                "bucket",
+                "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerPreferred</ObjectOwnership></Rule></OwnershipControls>",
+                owner_requester.clone(),
+            )
+            .unwrap();
+
+        let upload = coord
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                checksum: None,
+                requester: writer_requester.clone(),
+                acl: PutObjectAcl::BucketOwnerFullControl,
+                sse_customer: None,
+            })
+            .unwrap();
+
+        coord
+            .put_bucket_canned_acl("bucket", BucketAcl::Private, owner_requester.clone())
+            .unwrap();
+
+        let completed = coord
+            .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload.upload_id,
+                parts: &[CompletePart {
+                    part_number: 1,
+                    etag: "\"etag\"".to_string(),
+                    checksum: None,
+                }],
+                claimed_checksum: None,
+                requester: writer_requester.clone(),
+                sse_customer: None,
+            })
+            .unwrap_err();
+        assert!(matches!(completed, ServerError::AccessDenied));
+
+        let upload_part = test_helpers::upload_part(
+            &coord,
+            &UploadPartRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload.upload_id,
+                part_number: 1,
+                data: b"denied-after-acl-change",
+                claimed_checksum: None,
+                requester: writer_requester.clone(),
+                sse_customer: None,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(upload_part, ServerError::AccessDenied));
+
+        let list_parts = coord
+            .list_parts(&ListPartsRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload.upload_id,
+                part_number_marker: None,
+                max_parts: 100,
+                requester: writer_requester.clone(),
+            })
+            .unwrap();
+        assert!(list_parts.parts.is_empty());
+
+        coord
+            .abort_multipart_upload(&AbortMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload.upload_id,
+                requester: writer_requester,
+            })
+            .unwrap();
     }
 
     #[test]
