@@ -44,10 +44,8 @@ The current code already has:
 The current code does not yet have:
 - complete object-level authorization decisions across grant-based ACL and
   policy cases
-- XML and API surfaces that consistently render stored object and multipart
-  owner identity where AWS expects it
 - tenant/account modeling beyond synthetically derived account identity on
-  configured credentials
+  configured credentials or a separate durable account registry
 
 Important current shortcuts:
 - write authorization still compares the requester primarily to the bucket
@@ -55,13 +53,20 @@ Important current shortcuts:
 - object ACL handling now covers the XML/canned ACL grant cases needed for the
   current ignored copy/versioning tests, but header-grant parsing and the wider
   ACL matrix remain later work
-- multipart list and future ACL/XML owner surfaces do not yet consistently use
-  the stored owner and initiator identity
+- future non-multipart ACL/XML owner surfaces outside the targeted ownership
+  tests still remain later work
 
 ## Current Status
 
-Phases 1 through 3 are complete for the scoped success criteria in this plan.
-Phase 4 multipart owner and initiator surfaces are the next active slice.
+Phases 1 through 5 are complete for the scoped success criteria in this plan.
+The ownership foundations work covered here is done.
+
+Remaining follow-up work is outside this plan:
+- broader ACL/header-grant coverage belongs to `plans/object-and-bucket-acls.md`
+- bucket-policy behavior belongs to `plans/bucket-policies.md`
+- the still-ignored multi-user bucket-create test in
+  `crates/s3-tests/tests/bucket_crud.rs` is a narrower follow-up than the
+  ownership substrate completed here
 
 Completed in Phase 1:
 - shared `AccountIdentity` type added for auth and request handling
@@ -86,13 +91,30 @@ Completed in Phase 2:
 - storage read paths now return stored owner identity for live objects, delete
   markers, and multipart uploads without inference
 
-Still open after Phase 3:
-- the server config and local test harness still synthesize account identity
-  directly from configured access keys and fixture principals
-- the broader ACL/header-grant matrix remains later work beyond the current
-  object-owner foundation
-- XML and API surfaces still need later phases to render stored owner identity
-  for object and multipart responses where AWS expects it
+Completed in Phase 3:
+- private-object read, head, range, attributes, tagging, and copy-source
+  authorization now consult stored object owner identity instead of only bucket
+  read access
+- the targeted cross-owner copy and versioned object ACL cases are covered
+  without falling back to bucket-level shortcuts
+- minimal persisted object public-read/public-read-write state is now used to
+  preserve AWS-compatible anonymous object reads where needed
+
+Completed in Phase 4:
+- multipart list responses now render stored owner and initiator IDs in the
+  AWS-compatible shape used by `ListMultipartUploads`
+- multipart list/abort/list-parts authorization uses stored upload identity
+  where AWS exposes upload-scoped defaults
+- multipart write and complete paths still re-check current write
+  authorization, matching AWS when bucket ACLs change after initiation
+- anonymous callers are rejected at `CreateMultipartUpload`, matching AWS
+
+Completed in Phase 5:
+- the remaining presigned account-isolation tests now use the shared
+  alternate-account harness rather than a separate tenant abstraction
+- presigned PUT with `x-amz-acl` and the raw `X-Amz-Expires` not-expired GET
+  case are both covered for primary and alternate accounts
+- no separate tenant namespace was needed for the covered presigned behaviors
 
 ## Target Behavior
 
@@ -295,7 +317,12 @@ Success criteria:
 
 ### Phase 5: Tenant Compatibility Cleanup
 
-Status: next.
+Status: complete. The remaining presigned tests that had been marked
+"multi-tenant" now run through the shared alternate-account harness rather
+than assuming a separate tenant abstraction. Presigned object PUT with
+`x-amz-acl` is covered for both the primary and alternate accounts, and the
+raw `X-Amz-Expires` not-expired presigned GET case is likewise covered for
+both. No separate tenant namespace was required for these behaviors.
 
 Deliver:
 - presigned tests that require account isolation use the shared identity model
@@ -304,12 +331,14 @@ Deliver:
 
 ## Test Plan
 
-Targeted integration tests:
-- `cargo test -p s3-tests --test bucket_crud test_bucket_create_exists_nonowner -- --ignored`
+Historical targeted integration tests for this plan:
 - `cargo test -p s3-tests --test copy_object test_object_copy_not_owned_bucket -- --exact`
-- `cargo test -p s3-tests --test multipart test_list_multipart_upload_owner -- --ignored`
-- `cargo test -p s3-tests --test presigned test_object_presigned_put_object_with_acl_tenant -- --ignored`
-- `cargo test -p s3-tests --test presigned test_object_raw_get_x_amz_expires_not_expired_tenant -- --ignored`
+- `cargo test -p s3-tests --test multipart test_list_multipart_upload_owner -- --exact`
+- `cargo test -p s3-tests --test presigned test_object_presigned_put_object_with_acl_tenant -- --exact`
+- `cargo test -p s3-tests --test presigned test_object_raw_get_x_amz_expires_not_expired_tenant -- --exact`
+
+Related remaining follow-up outside this plan:
+- `cargo test -p s3-tests --test bucket_crud test_bucket_create_exists_nonowner -- --ignored`
 
 Regression coverage to keep green while working:
 - `cargo test -p s3-tests --test ownership`

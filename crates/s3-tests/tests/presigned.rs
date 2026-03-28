@@ -4,7 +4,8 @@ use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;
 use ring::{digest, hmac};
 use s3_tests::{
-    build_client_with_ca, build_test_agent, sse_c_header_values, test_sse_c_key, unique_bucket,
+    build_client_with_ca, build_test_agent, create_public_bucket,
+    ensure_distinct_s3_owners_or_skip, sse_c_header_values, test_sse_c_key, unique_bucket,
     TestServer, CTX,
 };
 
@@ -171,12 +172,15 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
 }
 
 /// Cleanup helper.
-async fn cleanup(bucket: &str, keys: &[&str]) {
-    let client = CTX.client();
+async fn cleanup_with_client(client: &aws_sdk_s3::Client, bucket: &str, keys: &[&str]) {
     for key in keys {
         let _ = client.delete_object().bucket(bucket).key(*key).send().await;
     }
     client.delete_bucket().bucket(bucket).send().await.unwrap();
+}
+
+async fn cleanup(bucket: &str, keys: &[&str]) {
+    cleanup_with_client(CTX.client(), bucket, keys).await;
 }
 
 // ── Presigned GET ───────────────────────────────────────────────────────
@@ -284,6 +288,68 @@ fn test_presigned_put_object() {
 
         cleanup(&bucket, &["uploaded"]).await;
     });
+}
+
+async fn assert_presigned_put_object_with_acl(client: &aws_sdk_s3::Client) {
+    use aws_sdk_s3::types::{ObjectOwnership, OwnershipControls, OwnershipControlsRule};
+
+    let bucket = unique_bucket();
+    client.create_bucket().bucket(&bucket).send().await.unwrap();
+    let ownership = OwnershipControls::builder()
+        .rules(
+            OwnershipControlsRule::builder()
+                .object_ownership(ObjectOwnership::BucketOwnerPreferred)
+                .build()
+                .unwrap(),
+        )
+        .build()
+        .unwrap();
+    client
+        .put_bucket_ownership_controls()
+        .bucket(&bucket)
+        .ownership_controls(ownership)
+        .send()
+        .await
+        .unwrap();
+    let body = b"hello world";
+
+    let presign_config = PresigningConfig::expires_in(Duration::from_secs(900)).unwrap();
+    let presigned = client
+        .put_object()
+        .bucket(&bucket)
+        .key("foo")
+        .acl(aws_sdk_s3::types::ObjectCannedAcl::Private)
+        .presigned(presign_config.clone())
+        .await
+        .unwrap();
+
+    let mut resp = with_presigned_headers!(agent().put(presigned.uri()), presigned)
+        .send(&body[..])
+        .expect("transport error");
+    let status = resp.status().as_u16();
+    let response_body = resp.body_mut().read_to_string().unwrap_or_default();
+    assert_eq!(
+        status, 200,
+        "expected 200 for presigned PUT with x-amz-acl, got {} body={}",
+        status, response_body
+    );
+
+    let get_presigned = client
+        .get_object()
+        .bucket(&bucket)
+        .key("foo")
+        .presigned(presign_config)
+        .await
+        .unwrap();
+    let mut get_resp = agent()
+        .get(get_presigned.uri())
+        .call()
+        .expect("transport error");
+    assert_eq!(get_resp.status().as_u16(), 200);
+    let data = get_resp.body_mut().read_to_vec().unwrap();
+    assert_eq!(&data[..], body);
+
+    cleanup_with_client(client, &bucket, &["foo"]).await;
 }
 
 #[test]
@@ -1045,37 +1111,7 @@ fn test_presigned_get_response_content_type() {
 #[test]
 fn test_object_raw_get_x_amz_expires_not_expired() {
     s3_tests::run(async {
-        let client = CTX.client();
-        let bucket = setup_bucket().await;
-
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("obj")
-            .body(ByteStream::from_static(b"data"))
-            .send()
-            .await
-            .unwrap();
-
-        // Generate a presigned URL with a valid, non-expired duration
-        let presign_config = PresigningConfig::expires_in(Duration::from_secs(600)).unwrap();
-        let presigned = client
-            .get_object()
-            .bucket(&bucket)
-            .key("obj")
-            .presigned(presign_config)
-            .await
-            .unwrap();
-
-        let mut resp = agent()
-            .get(presigned.uri())
-            .call()
-            .expect("transport error");
-        assert_eq!(resp.status().as_u16(), 200);
-        let data = resp.body_mut().read_to_vec().unwrap();
-        assert_eq!(&data[..], b"data");
-
-        cleanup(&bucket, &["obj"]).await;
+        assert_object_raw_get_x_amz_expires_not_expired(CTX.client()).await;
     });
 }
 
@@ -1242,19 +1278,92 @@ fn test_object_raw_put_authenticated_expired() {
 // ── ACL / Tenant presigned (not implemented) ───────────────────────────
 
 #[test]
-#[ignore = "not implemented: ACL on presigned PUT"]
 fn test_object_presigned_put_object_with_acl() {
-    s3_tests::run(async {});
+    s3_tests::run(async {
+        assert_presigned_put_object_with_acl(CTX.client()).await;
+    });
 }
 
 #[test]
-#[ignore = "not implemented: multi-tenant"]
 fn test_object_presigned_put_object_with_acl_tenant() {
-    s3_tests::run(async {});
+    s3_tests::run(async {
+        if !CTX.has_alt_client() {
+            eprintln!(
+                "skipping test_object_presigned_put_object_with_acl_tenant: alternate credentials are not configured"
+            );
+            return;
+        }
+        if !ensure_distinct_s3_owners_or_skip(
+            CTX.client(),
+            CTX.alt_client(),
+            "test_object_presigned_put_object_with_acl_tenant",
+        )
+        .await
+        {
+            return;
+        }
+        assert_presigned_put_object_with_acl(CTX.alt_client()).await;
+    });
+}
+
+async fn assert_object_raw_get_x_amz_expires_not_expired(client: &aws_sdk_s3::Client) {
+    let bucket = create_public_bucket(client).await;
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key("obj")
+        .acl(aws_sdk_s3::types::ObjectCannedAcl::PublicRead)
+        .body(ByteStream::from_static(b"data"))
+        .send()
+        .await
+        .unwrap();
+
+    let presign_config = PresigningConfig::expires_in(Duration::from_secs(600)).unwrap();
+    let presigned = client
+        .get_object()
+        .bucket(&bucket)
+        .key("obj")
+        .presigned(presign_config)
+        .await
+        .unwrap();
+
+    let mut options_resp = agent()
+        .options(presigned.uri())
+        .call()
+        .expect("transport error");
+    let options_status = options_resp.status().as_u16();
+    let _ = options_resp.body_mut().read_to_string();
+    assert_eq!(options_status, 400);
+
+    let mut get_resp = agent()
+        .get(presigned.uri())
+        .call()
+        .expect("transport error");
+    assert_eq!(get_resp.status().as_u16(), 200);
+    let data = get_resp.body_mut().read_to_vec().unwrap();
+    assert_eq!(&data[..], b"data");
+
+    cleanup_with_client(client, &bucket, &["obj"]).await;
 }
 
 #[test]
-#[ignore = "not implemented: multi-tenant"]
 fn test_object_raw_get_x_amz_expires_not_expired_tenant() {
-    s3_tests::run(async {});
+    s3_tests::run(async {
+        if !CTX.has_alt_client() {
+            eprintln!(
+                "skipping test_object_raw_get_x_amz_expires_not_expired_tenant: alternate credentials are not configured"
+            );
+            return;
+        }
+        if !ensure_distinct_s3_owners_or_skip(
+            CTX.client(),
+            CTX.alt_client(),
+            "test_object_raw_get_x_amz_expires_not_expired_tenant",
+        )
+        .await
+        {
+            return;
+        }
+        assert_object_raw_get_x_amz_expires_not_expired(CTX.alt_client()).await;
+    });
 }
