@@ -73,7 +73,7 @@ pub fn authenticate_post_sigv4(
     Ok(AuthContext {
         mode: AuthMode::HeaderSigV4,
         access_key_id: Some(access_key_id.to_string()),
-        principal: Some(record.principal.clone()),
+        account: Some(record.account.clone()),
         request_epoch_secs: None,
         streaming: None,
     })
@@ -327,6 +327,7 @@ fn is_leap(year: u64) -> bool {
 mod tests {
     use super::*;
     use crate::credential::SecretKey;
+    use s3_types::AccountIdentity;
 
     fn test_store() -> CredentialStore {
         let mut store = CredentialStore::new();
@@ -997,7 +998,7 @@ mod tests {
         store.add_record(crate::credential::CredentialRecord {
             access_key_id: "AKID".to_string(),
             secret_key: SecretKey::new("secret".to_string()),
-            principal: "p".to_string(),
+            account: AccountIdentity::from_principal("p"),
             session_token: None,
             expires_at_epoch_secs: None,
             enabled: false,

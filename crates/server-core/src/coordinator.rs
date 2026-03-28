@@ -9,7 +9,7 @@ use checksum::{
     ChecksumAlgorithm, ChecksumBytes, ChecksumType, MultipartChecksumConfig, RawChecksum,
 };
 use ec::{EcConfig, ErasureCodec};
-use s3_types::{BucketVersioningState, CanonicalUserId, VersionId};
+use s3_types::{AccountIdentity, BucketVersioningState, CanonicalUserId, VersionId};
 use storage::traits::{PgMetadataStore, ShardStore};
 #[cfg(test)]
 use storage::SimplePayloadReclaimRecord;
@@ -1070,7 +1070,7 @@ pub struct CopyObjectRequest<'a> {
     pub dst_condition: &'a WriteCondition,
     pub directive: MetadataDirective<'a>,
     pub tagging: TaggingDirective<'a>,
-    pub requester: Requester<'a>,
+    pub requester: Requester,
     pub acl: PutObjectAcl<'a>,
     pub source_sse_customer: Option<&'a SseCustomerRequest>,
     pub dst_sse_customer: Option<&'a SseCustomerRequest>,
@@ -1085,7 +1085,7 @@ pub struct UploadPartCopyRequest<'a> {
     pub upload_id: &'a str,
     pub part_number: u32,
     pub copy_source_range: Option<(u64, u64)>,
-    pub requester: Requester<'a>,
+    pub requester: Requester,
     pub source_sse_customer: Option<&'a SseCustomerRequest>,
     pub sse_customer: Option<&'a SseCustomerRequest>,
 }
@@ -1100,7 +1100,7 @@ pub struct PutObjectRequest<'a> {
     pub system_metadata: &'a SystemMetadata,
     pub tags: Option<&'a str>,
     pub cond: &'a WriteCondition,
-    pub requester: Requester<'a>,
+    pub requester: Requester,
     pub acl: PutObjectAcl<'a>,
     pub sse_customer: Option<&'a SseCustomerRequest>,
 }
@@ -1127,51 +1127,75 @@ struct PutCommitRequest<'a> {
 }
 
 /// Authenticated requester context needed by core-side authorization.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Requester<'a> {
-    principal: Option<&'a str>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Requester {
+    account: Option<AccountIdentity>,
     #[cfg(test)]
     is_system: bool,
 }
 
-impl<'a> Requester<'a> {
+impl Requester {
     #[must_use]
     pub const fn anonymous() -> Self {
         Self {
-            principal: None,
+            account: None,
             #[cfg(test)]
             is_system: false,
         }
     }
 
     #[must_use]
-    pub const fn principal(principal: &'a str) -> Self {
+    pub fn authenticated(account: AccountIdentity) -> Self {
         Self {
-            principal: Some(principal),
+            account: Some(account),
             #[cfg(test)]
             is_system: false,
         }
     }
 
     #[must_use]
-    pub const fn from_principal(principal: Option<&'a str>) -> Self {
+    pub fn principal(principal: &str) -> Self {
+        Self::authenticated(AccountIdentity::from_principal(principal))
+    }
+
+    #[must_use]
+    pub fn from_account(account: Option<&AccountIdentity>) -> Self {
         Self {
-            principal,
+            account: account.cloned(),
             #[cfg(test)]
             is_system: false,
         }
     }
 
     #[must_use]
-    pub const fn principal_opt(self) -> Option<&'a str> {
-        self.principal
+    pub fn from_principal(principal: Option<&str>) -> Self {
+        Self {
+            account: principal.map(AccountIdentity::from_principal),
+            #[cfg(test)]
+            is_system: false,
+        }
+    }
+
+    #[must_use]
+    pub fn account(&self) -> Option<&AccountIdentity> {
+        self.account.as_ref()
+    }
+
+    #[must_use]
+    pub fn principal_opt(&self) -> Option<&str> {
+        self.account().map(AccountIdentity::principal)
+    }
+
+    #[must_use]
+    pub fn canonical_user_id(&self) -> Option<&CanonicalUserId> {
+        self.account().map(AccountIdentity::canonical_user_id)
     }
 
     #[cfg(test)]
     #[must_use]
     const fn system() -> Self {
         Self {
-            principal: None,
+            account: None,
             is_system: true,
         }
     }
@@ -1219,7 +1243,7 @@ impl BucketObjectOwnership {
 #[derive(Debug)]
 pub struct CreateBucketRequest<'a> {
     pub name: &'a str,
-    pub requester: Requester<'a>,
+    pub requester: Requester,
     pub acl: BucketAcl,
     pub ownership: BucketObjectOwnership,
 }
@@ -1232,8 +1256,8 @@ enum BucketCreateOutcome {
 
 /// Request for a ListBuckets operation.
 #[derive(Debug)]
-pub struct ListBucketsRequest<'a> {
-    pub requester: Requester<'a>,
+pub struct ListBucketsRequest {
+    pub requester: Requester,
 }
 
 /// Request for a GetObject or HeadObject operation.
@@ -1243,7 +1267,7 @@ pub struct GetObjectRequest<'a> {
     pub key: &'a str,
     pub version_id: Option<VersionId>,
     pub cond: &'a ReadCondition,
-    pub requester: Requester<'a>,
+    pub requester: Requester,
     pub sse_customer: Option<&'a SseCustomerRequest>,
 }
 
@@ -1251,7 +1275,7 @@ pub struct GetObjectRequest<'a> {
 #[derive(Debug)]
 pub struct HeadBucketRequest<'a> {
     pub bucket: &'a str,
-    pub requester: Requester<'a>,
+    pub requester: Requester,
 }
 
 /// Request for a GetObjectPart or HeadObjectPart operation.
@@ -1262,7 +1286,7 @@ pub struct GetObjectPartRequest<'a> {
     pub version_id: Option<VersionId>,
     pub part_number: u32,
     pub cond: &'a ReadCondition,
-    pub requester: Requester<'a>,
+    pub requester: Requester,
     pub sse_customer: Option<&'a SseCustomerRequest>,
 }
 
@@ -1274,7 +1298,7 @@ pub struct GetObjectRangeRequest<'a> {
     pub version_id: Option<VersionId>,
     pub range: ByteRange,
     pub cond: &'a ReadCondition,
-    pub requester: Requester<'a>,
+    pub requester: Requester,
     pub sse_customer: Option<&'a SseCustomerRequest>,
 }
 
@@ -1285,7 +1309,7 @@ pub struct DeleteObjectRequest<'a> {
     pub key: &'a str,
     pub version_id: Option<VersionId>,
     pub cond: &'a DeleteCondition,
-    pub requester: Requester<'a>,
+    pub requester: Requester,
 }
 
 /// Request for a ListObjectsV2 operation.
@@ -1296,7 +1320,7 @@ pub struct ListObjectsV2Request<'a> {
     pub delimiter: Option<&'a str>,
     pub continuation_token: Option<&'a str>,
     pub max_keys: u32,
-    pub requester: Requester<'a>,
+    pub requester: Requester,
 }
 
 /// Request for a ListObjectVersions operation.
@@ -1307,7 +1331,7 @@ pub struct ListObjectVersionsRequest<'a> {
     pub key_marker: Option<&'a str>,
     pub version_id_marker: Option<VersionId>,
     pub max_keys: u32,
-    pub requester: Requester<'a>,
+    pub requester: Requester,
 }
 
 /// Request for a ListParts operation.
@@ -1318,7 +1342,7 @@ pub struct ListPartsRequest<'a> {
     pub upload_id: &'a str,
     pub part_number_marker: Option<u32>,
     pub max_parts: u32,
-    pub requester: Requester<'a>,
+    pub requester: Requester,
 }
 
 /// Request for a ListMultipartUploads operation.
@@ -1329,7 +1353,7 @@ pub struct ListMultipartUploadsRequest<'a> {
     pub key_marker: Option<&'a str>,
     pub upload_id_marker: Option<&'a str>,
     pub max_uploads: u32,
-    pub requester: Requester<'a>,
+    pub requester: Requester,
 }
 
 /// A single entry in a batch-delete request, with an already-parsed version ID.
@@ -1345,14 +1369,14 @@ pub struct DeleteObjectsRequest<'a> {
     pub bucket: &'a str,
     pub entries: &'a [DeleteEntry<'a>],
     pub cond: &'a DeleteCondition,
-    pub requester: Requester<'a>,
+    pub requester: Requester,
 }
 
 /// Request for a DeleteBucket operation.
 #[derive(Debug)]
 pub struct DeleteBucketRequest<'a> {
     pub name: &'a str,
-    pub requester: Requester<'a>,
+    pub requester: Requester,
 }
 
 /// Request for an AbortMultipartUpload operation.
@@ -1361,7 +1385,7 @@ pub struct AbortMultipartUploadRequest<'a> {
     pub bucket: &'a str,
     pub key: &'a str,
     pub upload_id: &'a str,
-    pub requester: Requester<'a>,
+    pub requester: Requester,
 }
 
 /// Request for a CreateMultipartUpload operation.
@@ -1373,7 +1397,7 @@ pub struct CreateMultipartUploadRequest<'a> {
     pub system_metadata: &'a SystemMetadata,
     pub tags: Option<&'a str>,
     pub checksum: Option<MultipartChecksumConfig>,
-    pub requester: Requester<'a>,
+    pub requester: Requester,
     pub sse_customer: Option<&'a SseCustomerRequest>,
 }
 
@@ -1387,7 +1411,7 @@ pub struct UploadPartRequest<'a> {
     pub part_number: u32,
     pub data: &'a [u8],
     pub claimed_checksum: Option<&'a ChecksumClaim>,
-    pub requester: Requester<'a>,
+    pub requester: Requester,
     pub sse_customer: Option<&'a SseCustomerRequest>,
 }
 
@@ -1401,7 +1425,7 @@ pub struct GetObjectAttributesRequest<'a> {
     pub want_parts: bool,
     pub part_number_marker: Option<u32>,
     pub max_parts: u32,
-    pub requester: Requester<'a>,
+    pub requester: Requester,
     pub sse_customer: Option<&'a SseCustomerRequest>,
 }
 
@@ -1413,7 +1437,7 @@ pub struct CompleteMultipartUploadRequest<'a> {
     pub upload_id: &'a str,
     pub parts: &'a [CompletePart],
     pub claimed_checksum: Option<&'a EncodedChecksumClaim>,
-    pub requester: Requester<'a>,
+    pub requester: Requester,
     pub sse_customer: Option<&'a SseCustomerRequest>,
 }
 
@@ -1422,7 +1446,7 @@ pub struct CompleteMultipartUploadRequest<'a> {
 pub struct BeginStreamPutRequest<'a> {
     pub bucket: &'a str,
     pub key: &'a str,
-    pub requester: Requester<'a>,
+    pub requester: Requester,
     pub acl: PutObjectAcl<'a>,
     pub encryption: ObjectEncryption,
 }
@@ -1434,7 +1458,7 @@ pub struct BeginStreamPartRequest<'a> {
     pub key: &'a str,
     pub upload_id: &'a str,
     pub part_number: u32,
-    pub requester: Requester<'a>,
+    pub requester: Requester,
     pub sse_customer: Option<&'a SseCustomerRequest>,
 }
 
@@ -2485,7 +2509,7 @@ impl MultipartReader {
 }
 
 impl Coordinator {
-    fn requester_can_bucket_admin(requester: Requester<'_>, owner_principal: &str) -> bool {
+    fn requester_can_bucket_admin(requester: &Requester, owner_principal: &str) -> bool {
         #[cfg(test)]
         if requester.is_system {
             return true;
@@ -2495,7 +2519,7 @@ impl Coordinator {
     }
 
     fn requester_can_object_write(
-        requester: Requester<'_>,
+        requester: &Requester,
         owner_principal: &str,
         public_write: bool,
     ) -> bool {
@@ -2508,7 +2532,7 @@ impl Coordinator {
     }
 
     fn requester_can_read_bucket(
-        requester: Requester<'_>,
+        requester: &Requester,
         owner_principal: &str,
         public_read: bool,
     ) -> bool {
@@ -2551,7 +2575,7 @@ impl Coordinator {
         Ok(())
     }
 
-    fn requester_principal_required(requester: Requester<'_>) -> Result<&str, ServerError> {
+    fn requester_principal_required(requester: &Requester) -> Result<&str, ServerError> {
         requester.principal_opt().ok_or(ServerError::AccessDenied)
     }
 
@@ -2571,7 +2595,7 @@ impl Coordinator {
 
     fn authorize_bucket_read_requester(
         &self,
-        requester: Requester<'_>,
+        requester: &Requester,
         bucket: &str,
     ) -> Result<BucketSummary, ServerError> {
         let info = self.active_bucket_summary(bucket)?;
@@ -2588,7 +2612,7 @@ impl Coordinator {
 
     fn authorize_bucket_admin_requester(
         &self,
-        requester: Requester<'_>,
+        requester: &Requester,
         bucket: &str,
     ) -> Result<BucketSummary, ServerError> {
         let info = self.active_bucket_summary(bucket)?;
@@ -2601,7 +2625,7 @@ impl Coordinator {
 
     fn authorize_object_write_requester(
         &self,
-        requester: Requester<'_>,
+        requester: &Requester,
         bucket: &str,
     ) -> Result<BucketSummary, ServerError> {
         let info = self.active_bucket_summary(bucket)?;
@@ -2879,7 +2903,7 @@ impl Coordinator {
             "bucket={}",
             req.name
         );
-        let owner_principal = Self::requester_principal_required(req.requester)?;
+        let owner_account = req.requester.account().ok_or(ServerError::AccessDenied)?;
         let (public_read, public_write) = match req.acl {
             BucketAcl::Private => (false, false),
             BucketAcl::PublicRead => (true, false),
@@ -2898,7 +2922,8 @@ impl Coordinator {
         }
 
         let create_outcome = self.create_bucket_for_owner_with_acl(
-            owner_principal,
+            owner_account.principal(),
+            owner_account.canonical_user_id(),
             req.name,
             public_read,
             public_write,
@@ -2907,7 +2932,7 @@ impl Coordinator {
             BucketCreateOutcome::Created => self.put_bucket_ownership_controls(
                 req.name,
                 &Self::ownership_controls_xml(req.ownership),
-                Requester::principal(owner_principal),
+                req.requester.clone(),
             ),
             BucketCreateOutcome::AlreadyOwned => Ok(()),
         }
@@ -2919,24 +2944,31 @@ impl Coordinator {
         name: &str,
         public_read: bool,
     ) -> Result<(), ServerError> {
-        self.create_bucket_for_owner_with_acl(owner_principal, name, public_read, false)?;
+        let owner_canonical_id = CanonicalUserId::from_principal(owner_principal);
+        self.create_bucket_for_owner_with_acl(
+            owner_principal,
+            &owner_canonical_id,
+            name,
+            public_read,
+            false,
+        )?;
         Ok(())
     }
 
     fn create_bucket_for_owner_with_acl(
         &self,
         owner_principal: &str,
+        owner_canonical_id: &CanonicalUserId,
         name: &str,
         public_read: bool,
         public_write: bool,
     ) -> Result<BucketCreateOutcome, ServerError> {
         let _bucket_guard = self.storage_node.lock_bucket(name);
         let bucket_pg = self.get_bucket_pg(name)?;
-        let owner_canonical_id = CanonicalUserId::from_principal(owner_principal);
         match bucket_pg.create_bucket(
             name,
             owner_principal,
-            &owner_canonical_id,
+            owner_canonical_id,
             public_read,
             public_write,
         ) {
@@ -2963,6 +2995,7 @@ impl Coordinator {
                 })?;
                 if existing.state == BucketState::Active
                     && existing.owner_principal == owner_principal
+                    && existing.owner_canonical_id == *owner_canonical_id
                 {
                     Ok(BucketCreateOutcome::AlreadyOwned)
                 } else {
@@ -2981,7 +3014,7 @@ impl Coordinator {
             req.name
         );
         let name = req.name;
-        let _bucket_info = self.authorize_bucket_admin_requester(req.requester, name)?;
+        let _bucket_info = self.authorize_bucket_admin_requester(&req.requester, name)?;
         self.begin_bucket_write_drain(name)?;
 
         let mut marked_deleting = false;
@@ -3056,7 +3089,7 @@ impl Coordinator {
             "bucket={}",
             req.bucket
         );
-        self.authorize_bucket_read_requester(req.requester, req.bucket)
+        self.authorize_bucket_read_requester(&req.requester, req.bucket)
     }
 
     pub fn list_buckets(&self) -> Result<Vec<BucketSummary>, ServerError> {
@@ -3065,10 +3098,10 @@ impl Coordinator {
 
     pub fn list_buckets_for_requester(
         &self,
-        req: &ListBucketsRequest<'_>,
+        req: &ListBucketsRequest,
     ) -> Result<Vec<BucketSummary>, ServerError> {
         observability::trace_scope!(TRACE_TARGET, "Coordinator::list_buckets_for_requester");
-        self.list_buckets_for_owner(Self::requester_principal_required(req.requester)?)
+        self.list_buckets_for_owner(Self::requester_principal_required(&req.requester)?)
     }
 
     pub fn list_buckets_for_owner(
@@ -3090,7 +3123,7 @@ impl Coordinator {
         &self,
         name: &str,
         state: BucketVersioningState,
-        requester: Requester<'_>,
+        requester: Requester,
     ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
@@ -3099,7 +3132,7 @@ impl Coordinator {
             name,
             state
         );
-        let _bucket_info = self.authorize_bucket_admin_requester(requester, name)?;
+        let _bucket_info = self.authorize_bucket_admin_requester(&requester, name)?;
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg
             .put_bucket_versioning(name, state)
@@ -3122,7 +3155,7 @@ impl Coordinator {
     pub fn get_bucket_versioning(
         &self,
         name: &str,
-        requester: Requester<'_>,
+        requester: Requester,
     ) -> Result<BucketVersioningState, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
@@ -3130,7 +3163,7 @@ impl Coordinator {
             "bucket={}",
             name
         );
-        let info = self.authorize_bucket_read_requester(requester, name)?;
+        let info = self.authorize_bucket_read_requester(&requester, name)?;
         Ok(info.versioning)
     }
 
@@ -3138,7 +3171,7 @@ impl Coordinator {
         &self,
         name: &str,
         config: BucketEncryptionConfig,
-        requester: Requester<'_>,
+        requester: Requester,
     ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
@@ -3147,7 +3180,7 @@ impl Coordinator {
             name,
             config.sse_c_blocked
         );
-        let _bucket_info = self.authorize_bucket_admin_requester(requester, name)?;
+        let _bucket_info = self.authorize_bucket_admin_requester(&requester, name)?;
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg
             .put_bucket_encryption(name, config)
@@ -3165,7 +3198,7 @@ impl Coordinator {
     pub fn get_bucket_encryption(
         &self,
         name: &str,
-        requester: Requester<'_>,
+        requester: Requester,
     ) -> Result<BucketEncryptionConfig, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
@@ -3173,7 +3206,7 @@ impl Coordinator {
             "bucket={}",
             name
         );
-        let info = self.authorize_bucket_admin_requester(requester, name)?;
+        let info = self.authorize_bucket_admin_requester(&requester, name)?;
         Ok(info.encryption)
     }
 
@@ -3181,7 +3214,7 @@ impl Coordinator {
         &self,
         name: &str,
         config: &str,
-        requester: Requester<'_>,
+        requester: Requester,
     ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
@@ -3190,7 +3223,7 @@ impl Coordinator {
             name,
             config.len()
         );
-        let _bucket_info = self.authorize_bucket_admin_requester(requester, name)?;
+        let _bucket_info = self.authorize_bucket_admin_requester(&requester, name)?;
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg
             .put_bucket_cors(name, config)
@@ -3221,7 +3254,7 @@ impl Coordinator {
     pub fn get_bucket_cors(
         &self,
         name: &str,
-        requester: Requester<'_>,
+        requester: Requester,
     ) -> Result<Option<String>, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
@@ -3229,22 +3262,18 @@ impl Coordinator {
             "bucket={}",
             name
         );
-        let _bucket_info = self.authorize_bucket_read_requester(requester, name)?;
+        let _bucket_info = self.authorize_bucket_read_requester(&requester, name)?;
         self.get_bucket_cors_unchecked(name)
     }
 
-    pub fn delete_bucket_cors(
-        &self,
-        name: &str,
-        requester: Requester<'_>,
-    ) -> Result<(), ServerError> {
+    pub fn delete_bucket_cors(&self, name: &str, requester: Requester) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::delete_bucket_cors",
             "bucket={}",
             name
         );
-        let _bucket_info = self.authorize_bucket_admin_requester(requester, name)?;
+        let _bucket_info = self.authorize_bucket_admin_requester(&requester, name)?;
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg.delete_bucket_cors(name).map_err(|e| match e {
             storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
@@ -3260,7 +3289,7 @@ impl Coordinator {
         &self,
         name: &str,
         tags: &str,
-        requester: Requester<'_>,
+        requester: Requester,
     ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
@@ -3269,7 +3298,7 @@ impl Coordinator {
             name,
             tags.len()
         );
-        let _bucket_info = self.authorize_bucket_admin_requester(requester, name)?;
+        let _bucket_info = self.authorize_bucket_admin_requester(&requester, name)?;
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg.put_bucket_tags(name, tags).map_err(|e| match e {
             storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
@@ -3282,7 +3311,7 @@ impl Coordinator {
     pub fn get_bucket_tags(
         &self,
         name: &str,
-        requester: Requester<'_>,
+        requester: Requester,
     ) -> Result<Option<String>, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
@@ -3290,7 +3319,7 @@ impl Coordinator {
             "bucket={}",
             name
         );
-        let _bucket_info = self.authorize_bucket_read_requester(requester, name)?;
+        let _bucket_info = self.authorize_bucket_read_requester(&requester, name)?;
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg.get_bucket_tags(name).map_err(|e| match e {
             storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
@@ -3300,18 +3329,14 @@ impl Coordinator {
         })
     }
 
-    pub fn delete_bucket_tags(
-        &self,
-        name: &str,
-        requester: Requester<'_>,
-    ) -> Result<(), ServerError> {
+    pub fn delete_bucket_tags(&self, name: &str, requester: Requester) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::delete_bucket_tags",
             "bucket={}",
             name
         );
-        let _bucket_info = self.authorize_bucket_admin_requester(requester, name)?;
+        let _bucket_info = self.authorize_bucket_admin_requester(&requester, name)?;
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg.delete_bucket_tags(name).map_err(|e| match e {
             storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
@@ -3327,7 +3352,7 @@ impl Coordinator {
         &self,
         name: &str,
         config: &str,
-        requester: Requester<'_>,
+        requester: Requester,
     ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
@@ -3336,7 +3361,7 @@ impl Coordinator {
             name,
             config.len()
         );
-        let _bucket_info = self.authorize_bucket_admin_requester(requester, name)?;
+        let _bucket_info = self.authorize_bucket_admin_requester(&requester, name)?;
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg
             .put_bucket_public_access_block(name, config)
@@ -3357,7 +3382,7 @@ impl Coordinator {
     pub fn get_bucket_public_access_block(
         &self,
         name: &str,
-        requester: Requester<'_>,
+        requester: Requester,
     ) -> Result<Option<String>, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
@@ -3365,7 +3390,7 @@ impl Coordinator {
             "bucket={}",
             name
         );
-        let _bucket_info = self.authorize_bucket_admin_requester(requester, name)?;
+        let _bucket_info = self.authorize_bucket_admin_requester(&requester, name)?;
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg
             .get_bucket_public_access_block(name)
@@ -3380,7 +3405,7 @@ impl Coordinator {
     pub fn delete_bucket_public_access_block(
         &self,
         name: &str,
-        requester: Requester<'_>,
+        requester: Requester,
     ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
@@ -3388,7 +3413,7 @@ impl Coordinator {
             "bucket={}",
             name
         );
-        let _bucket_info = self.authorize_bucket_admin_requester(requester, name)?;
+        let _bucket_info = self.authorize_bucket_admin_requester(&requester, name)?;
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg
             .delete_bucket_public_access_block(name)
@@ -3409,7 +3434,7 @@ impl Coordinator {
         &self,
         name: &str,
         acl: BucketAcl,
-        requester: Requester<'_>,
+        requester: Requester,
     ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
@@ -3418,8 +3443,8 @@ impl Coordinator {
             name,
             acl
         );
-        let _bucket_info = self.authorize_bucket_admin_requester(requester, name)?;
-        let ownership_controls = self.get_bucket_ownership_controls(name, requester)?;
+        let _bucket_info = self.authorize_bucket_admin_requester(&requester, name)?;
+        let ownership_controls = self.get_bucket_ownership_controls(name, requester.clone())?;
         if Self::is_bucket_owner_enforced(ownership_controls.as_deref()) {
             return Err(ServerError::AccessControlListNotSupported);
         }
@@ -3461,7 +3486,7 @@ impl Coordinator {
     pub fn get_bucket_acl(
         &self,
         name: &str,
-        requester: Requester<'_>,
+        requester: Requester,
     ) -> Result<GetBucketAclResult, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
@@ -3469,7 +3494,7 @@ impl Coordinator {
             "bucket={}",
             name
         );
-        let bucket = self.authorize_bucket_admin_requester(requester, name)?;
+        let bucket = self.authorize_bucket_admin_requester(&requester, name)?;
         let acl = if bucket.public_write {
             BucketAcl::PublicReadWrite
         } else if bucket.public_read {
@@ -3490,7 +3515,7 @@ impl Coordinator {
         &self,
         name: &str,
         config: &str,
-        requester: Requester<'_>,
+        requester: Requester,
     ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
@@ -3499,7 +3524,7 @@ impl Coordinator {
             name,
             config.len()
         );
-        let bucket_info = self.authorize_bucket_admin_requester(requester, name)?;
+        let bucket_info = self.authorize_bucket_admin_requester(&requester, name)?;
         if Self::is_bucket_owner_enforced(Some(config))
             && (bucket_info.public_read || bucket_info.public_write)
         {
@@ -3525,7 +3550,7 @@ impl Coordinator {
     pub fn get_bucket_ownership_controls(
         &self,
         name: &str,
-        requester: Requester<'_>,
+        requester: Requester,
     ) -> Result<Option<String>, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
@@ -3533,7 +3558,7 @@ impl Coordinator {
             "bucket={}",
             name
         );
-        let _bucket_info = self.authorize_bucket_admin_requester(requester, name)?;
+        let _bucket_info = self.authorize_bucket_admin_requester(&requester, name)?;
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg
             .get_bucket_ownership_controls(name)
@@ -3548,7 +3573,7 @@ impl Coordinator {
     pub fn delete_bucket_ownership_controls(
         &self,
         name: &str,
-        requester: Requester<'_>,
+        requester: Requester,
     ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
@@ -3556,7 +3581,7 @@ impl Coordinator {
             "bucket={}",
             name
         );
-        let _bucket_info = self.authorize_bucket_admin_requester(requester, name)?;
+        let _bucket_info = self.authorize_bucket_admin_requester(&requester, name)?;
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg
             .delete_bucket_ownership_controls(name)
@@ -3579,7 +3604,7 @@ impl Coordinator {
         key: &str,
         version_id: Option<VersionId>,
         tags: &str,
-        requester: Requester<'_>,
+        requester: Requester,
     ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
@@ -3589,7 +3614,7 @@ impl Coordinator {
             key,
             tags.len()
         );
-        let _bucket_info = self.authorize_object_write_requester(requester, bucket)?;
+        let _bucket_info = self.authorize_object_write_requester(&requester, bucket)?;
         let pg_id = self.object_pg_id(bucket, key);
         let pg = self.storage_node.get_pg(pg_id)?;
         let stored = match version_id {
@@ -3622,7 +3647,7 @@ impl Coordinator {
         bucket: &str,
         key: &str,
         version_id: Option<VersionId>,
-        requester: Requester<'_>,
+        requester: Requester,
     ) -> Result<Option<String>, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
@@ -3631,7 +3656,7 @@ impl Coordinator {
             bucket,
             key
         );
-        let _bucket_info = self.authorize_bucket_read_requester(requester, bucket)?;
+        let _bucket_info = self.authorize_bucket_read_requester(&requester, bucket)?;
         let pg_id = self.object_pg_id(bucket, key);
         let pg = self.storage_node.get_pg(pg_id)?;
         let stored = match version_id {
@@ -3664,7 +3689,7 @@ impl Coordinator {
         bucket: &str,
         key: &str,
         version_id: Option<VersionId>,
-        requester: Requester<'_>,
+        requester: Requester,
     ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
@@ -3673,7 +3698,7 @@ impl Coordinator {
             bucket,
             key
         );
-        let _bucket_info = self.authorize_object_write_requester(requester, bucket)?;
+        let _bucket_info = self.authorize_object_write_requester(&requester, bucket)?;
         let pg_id = self.object_pg_id(bucket, key);
         let pg = self.storage_node.get_pg(pg_id)?;
         let stored = match version_id {
@@ -3893,7 +3918,7 @@ impl Coordinator {
             let session_id = self.begin_stream_put(&BeginStreamPutRequest {
                 bucket: req.bucket,
                 key: req.key,
-                requester: req.requester,
+                requester: req.requester.clone(),
                 acl: req.acl,
                 encryption: write_encryption
                     .as_ref()
@@ -3936,7 +3961,7 @@ impl Coordinator {
 
         self.with_bucket_write_reservation(req.bucket, |bucket_info| {
             if !Self::requester_can_object_write(
-                req.requester,
+                &req.requester,
                 &bucket_info.owner_principal,
                 Self::effective_public_write(&bucket_info),
             ) {
@@ -4106,7 +4131,7 @@ impl Coordinator {
         let key = req.key;
         self.with_bucket_write_reservation(bucket, |bucket_info| {
             if !Self::requester_can_object_write(
-                req.requester,
+                &req.requester,
                 &bucket_info.owner_principal,
                 Self::effective_public_write(&bucket_info),
             ) {
@@ -4183,7 +4208,7 @@ impl Coordinator {
             });
         }
 
-        let bucket_info = self.authorize_object_write_requester(req.requester, bucket)?;
+        let bucket_info = self.authorize_object_write_requester(&req.requester, bucket)?;
 
         // Lock metadata PG and validate upload exists.
         let meta_pg_id = self.object_pg_id(bucket, key);
@@ -5083,7 +5108,7 @@ impl Coordinator {
         let src_cond = req.source.condition;
         let dst_cond = req.dst_condition;
         let directive = &req.directive;
-        let requester = req.requester;
+        let requester = &req.requester;
         let acl = req.acl;
         let source_sse_customer = req.source_sse_customer;
         let dst_write_sse_customer =
@@ -5280,7 +5305,7 @@ impl Coordinator {
         let session_id = self.begin_stream_put(&BeginStreamPutRequest {
             bucket: dst_bucket,
             key: dst_key,
-            requester,
+            requester: requester.clone(),
             acl,
             encryption: dst_write_sse_customer
                 .as_ref()
@@ -5843,7 +5868,7 @@ impl Coordinator {
         let key = req.key;
         let version_id = req.version_id;
         let cond = req.cond;
-        let requester = req.requester;
+        let requester = &req.requester;
         let _bucket_info = self.authorize_bucket_read_requester(requester, bucket)?;
         let LockedReadObject {
             record: stored,
@@ -5983,7 +6008,7 @@ impl Coordinator {
         let version_id = req.version_id;
         let part_number = req.part_number;
         let cond = req.cond;
-        let requester = req.requester;
+        let requester = &req.requester;
         let _bucket_info = self.authorize_bucket_read_requester(requester, bucket)?;
         let LockedReadObject {
             record: stored,
@@ -6162,7 +6187,7 @@ impl Coordinator {
         let version_id = req.version_id;
         let part_number = req.part_number;
         let cond = req.cond;
-        let requester = req.requester;
+        let requester = &req.requester;
         let _bucket_info = self.authorize_bucket_read_requester(requester, bucket)?;
         let LockedReadObject {
             record: stored,
@@ -6278,7 +6303,7 @@ impl Coordinator {
         let key = req.key;
         let version_id = req.version_id;
         let cond = req.cond;
-        let requester = req.requester;
+        let requester = &req.requester;
         let _bucket_info = self.authorize_bucket_read_requester(requester, bucket)?;
         let LockedReadObject { record: stored, .. } =
             self.lock_object_pgs_for_read(bucket, key, version_id)?;
@@ -6341,7 +6366,7 @@ impl Coordinator {
         let want_parts = req.want_parts;
         let part_number_marker = req.part_number_marker;
         let max_parts = req.max_parts;
-        let requester = req.requester;
+        let requester = &req.requester;
         let _bucket_info = self.authorize_bucket_read_requester(requester, bucket)?;
         let LockedReadObject {
             record: stored,
@@ -6474,7 +6499,7 @@ impl Coordinator {
         let version_id = req.version_id;
         let range = req.range;
         let cond = req.cond;
-        let requester = req.requester;
+        let requester = &req.requester;
         let _bucket_info = self.authorize_bucket_read_requester(requester, bucket)?;
         let LockedReadObject {
             record: stored,
@@ -6643,7 +6668,7 @@ impl Coordinator {
         let key = req.key;
         let request_version_id = req.version_id;
         let cond = req.cond;
-        let requester = req.requester;
+        let requester = &req.requester;
         let bucket_info = self.authorize_object_write_requester(requester, bucket)?;
 
         match (bucket_info.versioning, request_version_id) {
@@ -6905,7 +6930,7 @@ impl Coordinator {
         let delimiter = req.delimiter;
         let continuation_token = req.continuation_token;
         let max_keys = req.max_keys;
-        let bucket_info = self.authorize_bucket_read_requester(req.requester, bucket)?;
+        let bucket_info = self.authorize_bucket_read_requester(&req.requester, bucket)?;
 
         // MaxKeys=0 is valid per S3 spec: return empty result
         if max_keys == 0 {
@@ -7073,7 +7098,7 @@ impl Coordinator {
         let key_marker = req.key_marker;
         let version_id_marker = req.version_id_marker;
         let max_keys = req.max_keys;
-        let bucket_info = self.authorize_bucket_read_requester(req.requester, bucket)?;
+        let bucket_info = self.authorize_bucket_read_requester(&req.requester, bucket)?;
 
         if max_keys == 0 {
             return Ok(ListObjectVersionsResult {
@@ -7175,7 +7200,7 @@ impl Coordinator {
         let bucket = req.bucket;
         let entries = req.entries;
         let cond = req.cond;
-        let requester = req.requester;
+        let requester = &req.requester;
         let _bucket_info = self.authorize_bucket_admin_requester(requester, bucket)?;
 
         let mut deleted = Vec::new();
@@ -7187,7 +7212,7 @@ impl Coordinator {
                 key: entry.key,
                 version_id: entry.version_id,
                 cond,
-                requester,
+                requester: requester.clone(),
             }) {
                 Ok(result) => {
                     deleted.push(DeletedObject {
@@ -7230,7 +7255,7 @@ impl Coordinator {
         let key = req.key;
         self.with_bucket_write_reservation(bucket, |bucket_info| {
             if !Self::requester_can_object_write(
-                req.requester,
+                &req.requester,
                 &bucket_info.owner_principal,
                 Self::effective_public_write(&bucket_info),
             ) {
@@ -7303,7 +7328,7 @@ impl Coordinator {
         let part_number = req.part_number;
         let src_cond = req.source.condition;
         let copy_source_range = req.copy_source_range;
-        let requester = req.requester;
+        let requester = &req.requester;
         let source_sse_customer = req.source_sse_customer;
 
         let _dst_bucket_info = self.authorize_object_write_requester(requester, dst_bucket)?;
@@ -7429,7 +7454,7 @@ impl Coordinator {
             key: dst_key,
             upload_id,
             part_number,
-            requester,
+            requester: requester.clone(),
             sse_customer: req.sse_customer,
         })?;
         let session_id = &session.session_id;
@@ -7541,7 +7566,7 @@ impl Coordinator {
         let claimed_checksum = req.claimed_checksum;
         self.with_bucket_write_reservation(bucket, |bucket_info| {
             if !Self::requester_can_object_write(
-                req.requester,
+                &req.requester,
                 &bucket_info.owner_principal,
                 Self::effective_public_write(&bucket_info),
             ) {
@@ -7954,7 +7979,7 @@ impl Coordinator {
         let bucket = req.bucket;
         let key = req.key;
         let upload_id = req.upload_id;
-        let _bucket_info = self.authorize_object_write_requester(req.requester, bucket)?;
+        let _bucket_info = self.authorize_object_write_requester(&req.requester, bucket)?;
         // 1. Lock meta PG and validate upload.
         let meta_pg_id = self.object_pg_id(bucket, key);
         let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
@@ -8058,7 +8083,7 @@ impl Coordinator {
         let upload_id = req.upload_id;
         let part_number_marker = req.part_number_marker;
         let max_parts = req.max_parts;
-        let _bucket_info = self.authorize_bucket_read_requester(req.requester, bucket)?;
+        let _bucket_info = self.authorize_bucket_read_requester(&req.requester, bucket)?;
         // 1. Lock meta PG and validate upload.
         let meta_pg_id = self.object_pg_id(bucket, key);
         let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
@@ -8134,7 +8159,7 @@ impl Coordinator {
         let key_marker = req.key_marker;
         let upload_id_marker = req.upload_id_marker;
         let max_uploads = req.max_uploads;
-        let _bucket_info = self.authorize_bucket_read_requester(req.requester, bucket)?;
+        let _bucket_info = self.authorize_bucket_read_requester(&req.requester, bucket)?;
 
         if max_uploads == 0 {
             return Ok(ListMultipartUploadsResult {
@@ -8332,7 +8357,7 @@ pub mod test_helpers {
             key: req.key,
             upload_id: req.upload_id,
             part_number: req.part_number,
-            requester: req.requester,
+            requester: req.requester.clone(),
             sse_customer: req.sse_customer,
         })?;
         let session_id = &session.session_id;
@@ -8392,7 +8417,7 @@ mod tests {
     };
     const NO_WRITE: &WriteCondition = &WriteCondition::None;
     const NO_DELETE: &DeleteCondition = &DeleteCondition::None;
-    const TEST_REQUESTER: Requester<'static> = Requester::system();
+    const TEST_REQUESTER: Requester = Requester::system();
     const NO_PUT_OBJECT_ACL: PutObjectAcl<'static> = PutObjectAcl::None;
 
     fn read_all_body(mut body: ReadHandle) -> Result<Vec<u8>, ServerError> {
@@ -8773,6 +8798,27 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(controls.contains("<ObjectOwnership>ObjectWriter</ObjectOwnership>"));
+    }
+
+    #[test]
+    fn create_bucket_for_requester_persists_explicit_owner_canonical_id() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let owner_canonical_id = CanonicalUserId::from_principal("custom-account-id");
+        let owner = AccountIdentity::new("owner-a", owner_canonical_id.clone(), "Owner A");
+
+        coord
+            .create_bucket_for_requester(&CreateBucketRequest {
+                name: "bucket",
+                requester: Requester::authenticated(owner),
+                acl: BucketAcl::Private,
+                ownership: BucketObjectOwnership::ObjectWriter,
+            })
+            .unwrap();
+
+        let bucket = coord.head_bucket("bucket").unwrap();
+        assert_eq!(bucket.owner_principal, "owner-a");
+        assert_eq!(bucket.owner_canonical_id, owner_canonical_id);
     }
 
     #[test]

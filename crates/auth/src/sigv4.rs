@@ -632,7 +632,7 @@ mod tests {
         store.add_record(crate::credential::CredentialRecord {
             access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
             secret_key: SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
-            principal: "u1".to_string(),
+            account: s3_types::AccountIdentity::from_principal("u1"),
             session_token: None,
             expires_at_epoch_secs: None,
             enabled: false,

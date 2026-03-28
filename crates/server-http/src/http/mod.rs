@@ -589,6 +589,16 @@ impl HttpFrontend {
         }
     }
 
+    fn requester_from_auth(auth: &AuthContext) -> crate::coordinator::Requester {
+        crate::coordinator::Requester::from_account(auth.account.as_ref())
+    }
+
+    fn authenticated_account(
+        auth: &AuthContext,
+    ) -> Result<&s3_types::AccountIdentity, ServerError> {
+        auth.account.as_ref().ok_or(ServerError::AccessDenied)
+    }
+
     fn dispatch_routed(
         &self,
         req: &S3Request,
@@ -602,29 +612,26 @@ impl HttpFrontend {
             req.method.as_str(),
             req.path(),
             operation,
-            auth.principal
+            auth.principal()
         );
         // Dispatch to coordinator
         match operation {
             S3Operation::ListBuckets => {
-                let requester =
-                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
-                let owner_principal = auth.principal.as_deref().ok_or(ServerError::AccessDenied)?;
+                let requester = Self::requester_from_auth(auth);
+                let owner_account = Self::authenticated_account(auth)?;
                 let buckets = self.coordinator.list_buckets_for_requester(
                     &crate::coordinator::ListBucketsRequest { requester },
                 )?;
-                let owner_canonical_id = s3_types::CanonicalUserId::from_principal(owner_principal);
                 Ok(S3Response::list_buckets(
                     &buckets,
-                    owner_principal,
-                    &owner_canonical_id,
+                    owner_account.display_name(),
+                    owner_account.canonical_user_id(),
                 ))
             }
             S3Operation::CreateBucket { bucket } => {
                 let acl = parse_bucket_acl(req)?;
                 let ownership = parse_bucket_ownership(req.header("x-amz-object-ownership"))?;
-                let requester =
-                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                let requester = Self::requester_from_auth(auth);
                 self.coordinator.create_bucket_for_requester(
                     &crate::coordinator::CreateBucketRequest {
                         name: &bucket,
@@ -636,8 +643,7 @@ impl HttpFrontend {
                 Ok(S3Response::create_bucket(&bucket))
             }
             S3Operation::DeleteBucket { bucket } => {
-                let requester =
-                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                let requester = Self::requester_from_auth(auth);
                 self.coordinator
                     .delete_bucket(&crate::coordinator::DeleteBucketRequest {
                         name: &bucket,
@@ -646,8 +652,7 @@ impl HttpFrontend {
                 Ok(S3Response::delete_bucket())
             }
             S3Operation::HeadBucket { bucket } => {
-                let requester =
-                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                let requester = Self::requester_from_auth(auth);
                 let info = self.coordinator.head_bucket_for_requester(
                     &crate::coordinator::HeadBucketRequest {
                         bucket: &bucket,
@@ -668,8 +673,7 @@ impl HttpFrontend {
                     });
                 }
                 let max_keys: u32 = parse_max_keys(req.query_param_lossy("max-keys"))?;
-                let requester =
-                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                let requester = Self::requester_from_auth(auth);
 
                 let result = self.coordinator.list_objects_v2(
                     &crate::coordinator::ListObjectsV2Request {
@@ -720,8 +724,7 @@ impl HttpFrontend {
                     .or(start_after_raw.as_deref())
                     .filter(|v| !v.is_empty());
                 let max_keys: u32 = parse_max_keys(req.query_param_lossy("max-keys"))?;
-                let requester =
-                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                let requester = Self::requester_from_auth(auth);
 
                 let result = self.coordinator.list_objects_v2(
                     &crate::coordinator::ListObjectsV2Request {
@@ -759,8 +762,7 @@ impl HttpFrontend {
                             }
                         })?)),
                     };
-                    let requester =
-                        crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                    let requester = Self::requester_from_auth(auth);
                     let source_sse_customer = parse_sse_customer_copy_source_request(req)?;
                     let dst_sse_customer = parse_sse_customer_request(req)?;
                     let acl = parse_put_object_acl(req.header("x-amz-acl"));
@@ -860,8 +862,7 @@ impl HttpFrontend {
                     let (metadata_blob, system_metadata) =
                         parse_request_metadata(req.header_iter())?;
                     let cond = write_condition_from_headers(req)?;
-                    let requester =
-                        crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                    let requester = Self::requester_from_auth(auth);
                     let acl = parse_put_object_acl(req.header("x-amz-acl"));
                     let result =
                         self.coordinator
@@ -891,8 +892,7 @@ impl HttpFrontend {
                 let sse_customer = parse_sse_customer_request(req)?;
                 let cond = read_condition_from_headers(req);
                 let vid = parse_version_id(req)?;
-                let requester =
-                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                let requester = Self::requester_from_auth(auth);
                 let trace = current_trace_context();
                 // partNumber takes precedence over Range header (AWS behavior)
                 if let Some(pn_str) = req.query_param_lossy("partNumber") {
@@ -1033,8 +1033,7 @@ impl HttpFrontend {
             S3Operation::DeleteObject { bucket, key } => {
                 let cond = delete_condition_from_headers(req)?;
                 let vid = parse_version_id(req)?;
-                let requester =
-                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                let requester = Self::requester_from_auth(auth);
                 let result =
                     self.coordinator
                         .delete_object(&crate::coordinator::DeleteObjectRequest {
@@ -1050,8 +1049,7 @@ impl HttpFrontend {
                 let sse_customer = parse_sse_customer_request(req)?;
                 let cond = read_condition_from_headers(req);
                 let vid = parse_version_id(req)?;
-                let requester =
-                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                let requester = Self::requester_from_auth(auth);
                 let trace = current_trace_context();
                 if let Some(pn_str) = req.query_param_lossy("partNumber") {
                     let part_number: u32 =
@@ -1168,8 +1166,7 @@ impl HttpFrontend {
 
                 let cond = read_condition_from_headers(req);
                 let vid = parse_version_id(req)?;
-                let requester_ctx =
-                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                let requester_ctx = Self::requester_from_auth(auth);
                 let result = self.coordinator.get_object_attributes(
                     &crate::coordinator::GetObjectAttributesRequest {
                         bucket: &bucket,
@@ -1205,8 +1202,7 @@ impl HttpFrontend {
                 require_content_md5(req)?;
                 let (xml_entries, quiet) = xml::parse_delete_objects_xml(&req.body)?;
                 let cond = delete_condition_from_headers(req)?;
-                let requester =
-                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                let requester = Self::requester_from_auth(auth);
                 let entries: Vec<crate::coordinator::DeleteEntry> = xml_entries
                     .iter()
                     .map(|e| {
@@ -1233,29 +1229,25 @@ impl HttpFrontend {
             }
             S3Operation::PutBucketVersioning { bucket } => {
                 let versioning_state = xml::parse_versioning_config_xml(&req.body)?;
-                let requester =
-                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                let requester = Self::requester_from_auth(auth);
                 self.coordinator
                     .put_bucket_versioning(&bucket, versioning_state, requester)?;
                 Ok(S3Response::put_bucket_versioning())
             }
             S3Operation::GetBucketVersioning { bucket } => {
-                let requester =
-                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                let requester = Self::requester_from_auth(auth);
                 let state = self.coordinator.get_bucket_versioning(&bucket, requester)?;
                 Ok(S3Response::get_bucket_versioning(state))
             }
             S3Operation::PutBucketEncryption { bucket } => {
                 let config = xml::parse_bucket_encryption_xml(&req.body)?;
-                let requester =
-                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                let requester = Self::requester_from_auth(auth);
                 self.coordinator
                     .put_bucket_encryption(&bucket, config, requester)?;
                 Ok(S3Response::put_bucket_encryption())
             }
             S3Operation::GetBucketEncryption { bucket } => {
-                let requester =
-                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                let requester = Self::requester_from_auth(auth);
                 let config = self.coordinator.get_bucket_encryption(&bucket, requester)?;
                 Ok(S3Response::get_bucket_encryption(config))
             }
@@ -1269,15 +1261,13 @@ impl HttpFrontend {
             S3Operation::PutBucketCors { bucket } => {
                 let config = xml::parse_cors_config_xml(&req.body)?;
                 let config_xml = xml::get_cors_config_xml(&config);
-                let requester =
-                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                let requester = Self::requester_from_auth(auth);
                 self.coordinator
                     .put_bucket_cors(&bucket, &config_xml, requester)?;
                 Ok(S3Response::put_bucket_cors())
             }
             S3Operation::GetBucketCors { bucket } => {
-                let requester =
-                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                let requester = Self::requester_from_auth(auth);
                 match self.coordinator.get_bucket_cors(&bucket, requester)? {
                     Some(config_xml) => Ok(S3Response::get_bucket_cors(&config_xml)),
                     None => Err(ServerError::NoSuchCorsConfiguration {
@@ -1286,23 +1276,20 @@ impl HttpFrontend {
                 }
             }
             S3Operation::DeleteBucketCors { bucket } => {
-                let requester =
-                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                let requester = Self::requester_from_auth(auth);
                 self.coordinator.delete_bucket_cors(&bucket, requester)?;
                 Ok(S3Response::delete_bucket_cors())
             }
             S3Operation::PutBucketTagging { bucket } => {
                 let tags = xml::parse_tagging_xml(&req.body, 50)?;
                 let tags_xml = xml::get_tagging_xml(&tags);
-                let requester =
-                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                let requester = Self::requester_from_auth(auth);
                 self.coordinator
                     .put_bucket_tags(&bucket, &tags_xml, requester)?;
                 Ok(S3Response::put_bucket_tagging())
             }
             S3Operation::GetBucketTagging { bucket } => {
-                let requester =
-                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                let requester = Self::requester_from_auth(auth);
                 match self.coordinator.get_bucket_tags(&bucket, requester)? {
                     Some(tags_xml) => Ok(S3Response::get_bucket_tagging(&tags_xml)),
                     None => Err(ServerError::NoSuchTagSet {
@@ -1311,8 +1298,7 @@ impl HttpFrontend {
                 }
             }
             S3Operation::DeleteBucketTagging { bucket } => {
-                let requester =
-                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                let requester = Self::requester_from_auth(auth);
                 self.coordinator.delete_bucket_tags(&bucket, requester)?;
                 Ok(S3Response::delete_bucket_tagging())
             }
@@ -1320,16 +1306,14 @@ impl HttpFrontend {
                 let vid = parse_version_id(req)?;
                 let tags = xml::parse_tagging_xml(&req.body, 10)?;
                 let tags_xml = xml::get_tagging_xml(&tags);
-                let requester =
-                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                let requester = Self::requester_from_auth(auth);
                 self.coordinator
                     .put_object_tags(&bucket, &key, vid, &tags_xml, requester)?;
                 Ok(S3Response::put_object_tagging())
             }
             S3Operation::GetObjectTagging { bucket, key } => {
                 let vid = parse_version_id(req)?;
-                let requester =
-                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                let requester = Self::requester_from_auth(auth);
                 if let Some(tags_xml) = self
                     .coordinator
                     .get_object_tags(&bucket, &key, vid, requester)?
@@ -1343,8 +1327,7 @@ impl HttpFrontend {
             }
             S3Operation::DeleteObjectTagging { bucket, key } => {
                 let vid = parse_version_id(req)?;
-                let requester =
-                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                let requester = Self::requester_from_auth(auth);
                 self.coordinator
                     .delete_object_tags(&bucket, &key, vid, requester)?;
                 Ok(S3Response::delete_object_tagging())
@@ -1352,15 +1335,13 @@ impl HttpFrontend {
             S3Operation::PutBucketPublicAccessBlock { bucket } => {
                 let config = xml::parse_public_access_block_xml(&req.body)?;
                 let config_xml = xml::get_public_access_block_xml(&config);
-                let requester =
-                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                let requester = Self::requester_from_auth(auth);
                 self.coordinator
                     .put_bucket_public_access_block(&bucket, &config_xml, requester)?;
                 Ok(S3Response::put_bucket_public_access_block())
             }
             S3Operation::GetBucketPublicAccessBlock { bucket } => {
-                let requester =
-                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                let requester = Self::requester_from_auth(auth);
                 match self
                     .coordinator
                     .get_bucket_public_access_block(&bucket, requester)?
@@ -1372,8 +1353,7 @@ impl HttpFrontend {
                 }
             }
             S3Operation::DeleteBucketPublicAccessBlock { bucket } => {
-                let requester =
-                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                let requester = Self::requester_from_auth(auth);
                 self.coordinator
                     .delete_bucket_public_access_block(&bucket, requester)?;
                 Ok(S3Response::delete_bucket_public_access_block())
@@ -1381,15 +1361,13 @@ impl HttpFrontend {
             S3Operation::PutBucketOwnershipControls { bucket } => {
                 let value = xml::parse_ownership_controls_xml(&req.body)?;
                 let config_xml = xml::get_ownership_controls_xml(&value);
-                let requester =
-                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                let requester = Self::requester_from_auth(auth);
                 self.coordinator
                     .put_bucket_ownership_controls(&bucket, &config_xml, requester)?;
                 Ok(S3Response::put_bucket_ownership_controls())
             }
             S3Operation::GetBucketOwnershipControls { bucket } => {
-                let requester =
-                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                let requester = Self::requester_from_auth(auth);
                 match self
                     .coordinator
                     .get_bucket_ownership_controls(&bucket, requester)?
@@ -1401,8 +1379,7 @@ impl HttpFrontend {
                 }
             }
             S3Operation::DeleteBucketOwnershipControls { bucket } => {
-                let requester =
-                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                let requester = Self::requester_from_auth(auth);
                 self.coordinator
                     .delete_bucket_ownership_controls(&bucket, requester)?;
                 Ok(S3Response::delete_bucket_ownership_controls())
@@ -1412,15 +1389,13 @@ impl HttpFrontend {
                 Err(ServerError::NoSuchBucketPolicy { bucket })
             }
             S3Operation::GetBucketAcl { bucket } => {
-                let requester =
-                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                let requester = Self::requester_from_auth(auth);
                 let result = self.coordinator.get_bucket_acl(&bucket, requester)?;
                 Ok(S3Response::get_bucket_acl(&result))
             }
             S3Operation::PutBucketAcl { bucket } => {
                 let acl = parse_bucket_acl(req)?;
-                let requester =
-                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                let requester = Self::requester_from_auth(auth);
                 self.coordinator.put_bucket_acl(&bucket, acl, requester)?;
                 Ok(S3Response::put_bucket_acl())
             }
@@ -1470,8 +1445,7 @@ impl HttpFrontend {
                 } else {
                     None
                 };
-                let requester =
-                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                let requester = Self::requester_from_auth(auth);
 
                 let result = self.coordinator.create_multipart_upload(
                     &crate::coordinator::CreateMultipartUploadRequest {
@@ -1523,8 +1497,7 @@ impl HttpFrontend {
                             }
                         })?)),
                     };
-                    let requester =
-                        crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                    let requester = Self::requester_from_auth(auth);
                     let source_sse_customer = parse_sse_customer_copy_source_request(req)?;
                     let sse_customer = parse_sse_customer_request(req)?;
                     let src_cond = copy_source_condition_from_headers(req);
@@ -1560,8 +1533,7 @@ impl HttpFrontend {
                     validate_content_md5(req)?;
                     let claimed_checksum = extract_checksum_header(req)?;
                     let sse_customer_request = parse_sse_customer_request(req)?;
-                    let requester =
-                        crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                    let requester = Self::requester_from_auth(auth);
                     let session = self.coordinator.begin_stream_part(
                         &crate::coordinator::BeginStreamPartRequest {
                             bucket: &bucket,
@@ -1643,8 +1615,7 @@ impl HttpFrontend {
                 // so we cannot decode them as plain base64.
                 let claimed_checksum = extract_encoded_checksum_header(req)?;
                 let sse_customer = parse_sse_customer_request(req)?;
-                let requester =
-                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                let requester = Self::requester_from_auth(auth);
                 let result = self.coordinator.complete_multipart_upload(
                     &crate::coordinator::CompleteMultipartUploadRequest {
                         bucket: &bucket,
@@ -1672,8 +1643,7 @@ impl HttpFrontend {
                         reason: "missing uploadId query parameter".to_string(),
                     }
                 })?;
-                let requester =
-                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                let requester = Self::requester_from_auth(auth);
                 self.coordinator.abort_multipart_upload(
                     &crate::coordinator::AbortMultipartUploadRequest {
                         bucket: &bucket,
@@ -1694,8 +1664,7 @@ impl HttpFrontend {
                         reason: "invalid max-uploads".to_string(),
                     })?,
                 };
-                let requester =
-                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                let requester = Self::requester_from_auth(auth);
                 let result = self.coordinator.list_multipart_uploads(
                     &crate::coordinator::ListMultipartUploadsRequest {
                         bucket: &bucket,
@@ -1735,8 +1704,7 @@ impl HttpFrontend {
                         reason: "invalid max-parts".to_string(),
                     })?,
                 };
-                let requester =
-                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                let requester = Self::requester_from_auth(auth);
                 let result =
                     self.coordinator
                         .list_parts(&crate::coordinator::ListPartsRequest {
@@ -1776,8 +1744,7 @@ impl HttpFrontend {
                     .query_param_lossy("max-keys")
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(1000);
-                let requester =
-                    crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                let requester = Self::requester_from_auth(auth);
 
                 let result = self.coordinator.list_object_versions(
                     &crate::coordinator::ListObjectVersionsRequest {
@@ -1851,13 +1818,7 @@ impl HttpFrontend {
 
         let auth = match auth_result {
             Ok(auth) => auth,
-            Err(auth::AuthError::MissingAuth) => AuthContext {
-                mode: AuthMode::Anonymous,
-                access_key_id: None,
-                principal: None,
-                request_epoch_secs: None,
-                streaming: None,
-            },
+            Err(auth::AuthError::MissingAuth) => AuthContext::anonymous(),
             // Missing x-amz-date when declared as signed → AccessDenied
             // AWS: "AWS authentication requires a valid Date or x-amz-date header"
             Err(auth::AuthError::MissingSignedHeader { header }) if header == "x-amz-date" => {
@@ -2138,13 +2099,7 @@ impl HttpFrontend {
             )
             .map_err(ServerError::Auth)?
         } else {
-            AuthContext {
-                mode: AuthMode::Anonymous,
-                access_key_id: None,
-                principal: None,
-                request_epoch_secs: None,
-                streaming: None,
-            }
+            AuthContext::anonymous()
         };
 
         // Resolve object key (with ${filename} substitution).
@@ -2207,8 +2162,7 @@ impl HttpFrontend {
             .coordinator
             .prepare_sse_customer_write_context(sse_customer_request.as_ref())?;
 
-        let requester =
-            crate::coordinator::Requester::from_principal(effective_auth.principal.as_deref());
+        let requester = Self::requester_from_auth(effective_auth);
         let acl = parse_put_object_acl(field("acl"));
         let session_id = self.coordinator.begin_stream_put(&BeginStreamPutRequest {
             bucket,
@@ -2534,7 +2488,7 @@ impl HttpFrontend {
             trace: current_trace_context(),
             bucket: bucket.to_string(),
             key: key.to_string(),
-            requester_principal: auth.principal,
+            requester: Self::requester_from_auth(&auth),
             acl_header: req.header("x-amz-acl").map(str::to_string),
             metadata_blob,
             system_metadata,
@@ -2566,9 +2520,7 @@ impl HttpFrontend {
         self.coordinator.begin_stream_put(&BeginStreamPutRequest {
             bucket: &ctx.bucket,
             key: &ctx.key,
-            requester: crate::coordinator::Requester::from_principal(
-                ctx.requester_principal.as_deref(),
-            ),
+            requester: ctx.requester.clone(),
             acl: parse_put_object_acl(ctx.acl_header.as_deref()),
             encryption: ctx
                 .sse_customer
@@ -2639,9 +2591,7 @@ impl HttpFrontend {
                 system_metadata: &system_metadata,
                 tags: ctx.inline_tags_xml.as_deref(),
                 cond: &ctx.cond,
-                requester: crate::coordinator::Requester::from_principal(
-                    ctx.requester_principal.as_deref(),
-                ),
+                requester: ctx.requester.clone(),
                 acl: parse_put_object_acl(ctx.acl_header.as_deref()),
                 sse_customer: ctx
                     .sse_customer
@@ -2765,7 +2715,7 @@ impl HttpFrontend {
                 key,
                 upload_id,
                 part_number,
-                requester: crate::coordinator::Requester::from_principal(auth.principal.as_deref()),
+                requester: Self::requester_from_auth(&auth),
                 sse_customer: sse_customer_request.as_ref(),
             })?;
 
@@ -2977,7 +2927,7 @@ pub struct StreamingPutContext {
     pub trace: observability::TraceContext,
     pub bucket: String,
     pub key: String,
-    pub requester_principal: Option<String>,
+    pub requester: crate::coordinator::Requester,
     pub acl_header: Option<String>,
     pub metadata_blob: crate::metadata_blob::MetadataBlob,
     pub system_metadata: SystemMetadata,
@@ -3657,10 +3607,45 @@ mod tests {
         auth::AuthContext {
             mode: auth::AuthMode::HeaderSigV4,
             access_key_id: Some("AKID".to_string()),
-            principal: Some("testuser".to_string()),
+            account: Some(auth::AccountIdentity::from_principal("testuser")),
             request_epoch_secs: Some(0),
             streaming: None,
         }
+    }
+
+    #[test]
+    fn list_buckets_uses_account_display_name_and_explicit_canonical_id() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        let owner_canonical_id = s3_types::CanonicalUserId::from_principal("custom-account-id");
+        let account = auth::AccountIdentity::new("testuser", owner_canonical_id.clone(), "User A");
+
+        fe.coordinator
+            .create_bucket_for_requester(&crate::coordinator::CreateBucketRequest {
+                name: "mybucket",
+                requester: crate::coordinator::Requester::authenticated(account.clone()),
+                acl: crate::coordinator::BucketAcl::Private,
+                ownership: crate::coordinator::BucketObjectOwnership::ObjectWriter,
+            })
+            .unwrap();
+
+        let bucket = fe.coordinator.head_bucket("mybucket").unwrap();
+        assert_eq!(bucket.owner_canonical_id, owner_canonical_id);
+
+        let auth = auth::AuthContext {
+            mode: auth::AuthMode::HeaderSigV4,
+            access_key_id: Some("AKID".to_string()),
+            account: Some(account),
+            request_epoch_secs: Some(0),
+            streaming: None,
+        };
+        let resp = fe
+            .dispatch_routed(&make_req(""), &auth, S3Operation::ListBuckets)
+            .unwrap();
+        let body = String::from_utf8(resp.body).unwrap();
+        assert!(body.contains(owner_canonical_id.as_str()));
+        assert!(body.contains("<DisplayName>User A</DisplayName>"));
+        assert!(!body.contains("<DisplayName>testuser</DisplayName>"));
     }
 
     fn make_req(query: &str) -> S3Request {
@@ -5216,7 +5201,7 @@ mod tests {
         let auth = auth::AuthContext {
             mode: auth::AuthMode::HeaderSigV4,
             access_key_id: Some("AKID".to_string()),
-            principal: Some("testuser".to_string()),
+            account: Some(auth::AccountIdentity::from_principal("testuser")),
             request_epoch_secs: Some(0),
             streaming: None, // missing!
         };

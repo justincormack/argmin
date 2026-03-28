@@ -506,10 +506,10 @@ impl S3Response {
     #[must_use]
     pub fn list_buckets(
         buckets: &[BucketSummary],
-        owner_principal: &str,
+        owner_display_name: &str,
         owner_canonical_id: &CanonicalUserId,
     ) -> Self {
-        let body = xml::list_buckets_xml(buckets, owner_principal, owner_canonical_id);
+        let body = xml::list_buckets_xml(buckets, owner_display_name, owner_canonical_id);
         Self::new(200).xml_body(body)
     }
 
@@ -1524,7 +1524,7 @@ mod tests {
             encryption: BucketEncryptionConfig::default(),
         }];
         let owner_canonical_id = CanonicalUserId::from_principal("owner");
-        let resp = S3Response::list_buckets(&buckets, "owner", &owner_canonical_id);
+        let resp = S3Response::list_buckets(&buckets, "Owner A", &owner_canonical_id);
         assert_eq!(resp.status_code, 200);
         assert_eq!(find_header(&resp, "Content-Type"), Some("application/xml"));
         let body = String::from_utf8(resp.body).unwrap();
@@ -1532,6 +1532,7 @@ mod tests {
         assert!(body.contains("test-bucket"));
         assert!(body.contains("ListAllMyBucketsResult"));
         assert!(body.contains(owner_canonical_id.as_str()));
+        assert!(body.contains("<DisplayName>Owner A</DisplayName>"));
     }
 
     // ── list_objects_v2 ───────────────────────────────────────────────

@@ -127,9 +127,65 @@ impl std::fmt::Display for CanonicalUserId {
     }
 }
 
+/// Durable authenticated account identity shared across auth and server layers.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AccountIdentity {
+    principal: String,
+    canonical_user_id: CanonicalUserId,
+    display_name: String,
+}
+
+impl AccountIdentity {
+    /// Construct an account identity from explicit durable fields.
+    #[must_use]
+    pub fn new(
+        principal: impl Into<String>,
+        canonical_user_id: CanonicalUserId,
+        display_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            principal: principal.into(),
+            canonical_user_id,
+            display_name: display_name.into(),
+        }
+    }
+
+    /// Construct an account identity by deriving a canonical ID from the principal.
+    #[must_use]
+    pub fn from_principal(principal: impl Into<String>) -> Self {
+        let principal = principal.into();
+        let canonical_user_id = CanonicalUserId::from_principal(&principal);
+        Self {
+            display_name: principal.clone(),
+            principal,
+            canonical_user_id,
+        }
+    }
+
+    /// Stable principal name for authorization and XML owner display fields.
+    #[must_use]
+    pub fn principal(&self) -> &str {
+        &self.principal
+    }
+
+    /// Stable canonical owner ID for XML owner identity fields.
+    #[must_use]
+    pub fn canonical_user_id(&self) -> &CanonicalUserId {
+        &self.canonical_user_id
+    }
+
+    /// Display name used in XML surfaces that expose account identity.
+    #[must_use]
+    pub fn display_name(&self) -> &str {
+        &self.display_name
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{BucketVersioningState, CanonicalUserId, VersionId, CANONICAL_USER_ID_LEN};
+    use super::{
+        AccountIdentity, BucketVersioningState, CanonicalUserId, VersionId, CANONICAL_USER_ID_LEN,
+    };
 
     #[test]
     fn bucket_versioning_state_from_u8_round_trip() {
@@ -182,5 +238,25 @@ mod tests {
         assert_eq!(CanonicalUserId::new(&good).unwrap().as_str(), good.as_str());
         assert!(CanonicalUserId::new("short").is_none());
         assert!(CanonicalUserId::new(&"z".repeat(CANONICAL_USER_ID_LEN)).is_none());
+    }
+
+    #[test]
+    fn account_identity_from_principal_derives_canonical_id() {
+        let account = AccountIdentity::from_principal("owner-a");
+        assert_eq!(account.principal(), "owner-a");
+        assert_eq!(account.display_name(), "owner-a");
+        assert_eq!(
+            account.canonical_user_id(),
+            &CanonicalUserId::from_principal("owner-a")
+        );
+    }
+
+    #[test]
+    fn account_identity_new_uses_explicit_fields() {
+        let canonical = CanonicalUserId::from_principal("owner-a");
+        let account = AccountIdentity::new("owner-a", canonical.clone(), "Owner A");
+        assert_eq!(account.principal(), "owner-a");
+        assert_eq!(account.display_name(), "Owner A");
+        assert_eq!(account.canonical_user_id(), &canonical);
     }
 }

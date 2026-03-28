@@ -71,7 +71,7 @@ pub fn header_not_implemented_xml(header: &str, resource: &str, request_id: &str
 #[must_use]
 pub fn list_buckets_xml(
     buckets: &[BucketSummary],
-    owner_principal: &str,
+    owner_display_name: &str,
     owner_canonical_id: &CanonicalUserId,
 ) -> String {
     let mut xml = String::from(
@@ -81,7 +81,7 @@ pub fn list_buckets_xml(
     );
     xml.push_str(&xml_escape(owner_canonical_id.as_str()));
     xml.push_str("</ID><DisplayName>");
-    xml.push_str(&xml_escape(owner_principal));
+    xml.push_str(&xml_escape(owner_display_name));
     xml.push_str("</DisplayName></Owner><Buckets>");
 
     for bucket in buckets {
@@ -2741,8 +2741,11 @@ mod tests {
 
     const NO_WRITE: &WriteCondition = &WriteCondition::None;
     const NO_DELETE: &DeleteCondition = &DeleteCondition::None;
-    const TEST_REQUESTER: Requester<'static> = Requester::principal("default-owner");
     const NO_PUT_OBJECT_ACL: PutObjectAcl<'static> = PutObjectAcl::None;
+
+    fn test_requester() -> Requester {
+        Requester::principal("default-owner")
+    }
 
     #[test]
     fn error_xml_format() {
@@ -2772,11 +2775,11 @@ mod tests {
             encryption: BucketEncryptionConfig::default(),
         }];
         let owner_canonical_id = CanonicalUserId::from_principal("owner");
-        let xml = list_buckets_xml(&buckets, "owner", &owner_canonical_id);
+        let xml = list_buckets_xml(&buckets, "Owner A", &owner_canonical_id);
         assert!(xml.contains("<Name>test-bucket</Name>"));
         assert!(xml.contains("ListAllMyBucketsResult"));
         assert!(xml.contains(&format!("<ID>{}</ID>", owner_canonical_id.as_str())));
-        assert!(xml.contains("<DisplayName>owner</DisplayName>"));
+        assert!(xml.contains("<DisplayName>Owner A</DisplayName>"));
     }
 
     #[test]
@@ -4653,7 +4656,7 @@ mod tests {
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: TEST_REQUESTER,
+                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL,
             },
         )
@@ -4669,7 +4672,7 @@ mod tests {
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: TEST_REQUESTER,
+                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL,
             },
         )
@@ -4685,7 +4688,7 @@ mod tests {
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: TEST_REQUESTER,
+                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL,
             },
         )
@@ -4698,7 +4701,7 @@ mod tests {
                 key_marker: None,
                 version_id_marker: None,
                 max_keys: 1000,
-                requester: TEST_REQUESTER,
+                requester: test_requester(),
             })
             .unwrap();
         assert_eq!(versions_result.versions.len(), 3);
@@ -4719,7 +4722,7 @@ mod tests {
                 delimiter: None,
                 continuation_token: None,
                 max_keys: 1000,
-                requester: TEST_REQUESTER,
+                requester: test_requester(),
             })
             .unwrap();
         assert_eq!(list_result.objects.len(), 3);
@@ -4746,7 +4749,7 @@ mod tests {
                 bucket: "test-bucket",
                 entries: &entries,
                 cond: NO_DELETE,
-                requester: TEST_REQUESTER,
+                requester: test_requester(),
             })
             .unwrap();
         assert_eq!(delete_result.deleted.len(), 3);
@@ -4759,14 +4762,14 @@ mod tests {
                 delimiter: None,
                 continuation_token: None,
                 max_keys: 1000,
-                requester: TEST_REQUESTER,
+                requester: test_requester(),
             })
             .unwrap();
         assert!(list_after.objects.is_empty());
         coord
             .delete_bucket(&crate::coordinator::DeleteBucketRequest {
                 name: "test-bucket",
-                requester: TEST_REQUESTER,
+                requester: test_requester(),
             })
             .unwrap();
     }
@@ -4790,7 +4793,7 @@ mod tests {
                     system_metadata: &SystemMetadata::EMPTY,
                     tags: None,
                     cond: NO_WRITE,
-                    requester: TEST_REQUESTER,
+                    requester: test_requester(),
                     acl: NO_PUT_OBJECT_ACL,
                 },
             )
@@ -4804,7 +4807,7 @@ mod tests {
                 delimiter: None,
                 continuation_token: None,
                 max_keys: 2,
-                requester: TEST_REQUESTER,
+                requester: test_requester(),
             })
             .unwrap();
         assert_eq!(page1.objects.len(), 2);
@@ -4818,7 +4821,7 @@ mod tests {
                 delimiter: None,
                 continuation_token: Some(&token),
                 max_keys: 2,
-                requester: TEST_REQUESTER,
+                requester: test_requester(),
             })
             .unwrap();
         assert_eq!(page2.objects.len(), 2);
@@ -4831,7 +4834,7 @@ mod tests {
                 delimiter: None,
                 continuation_token: Some(&token2),
                 max_keys: 2,
-                requester: TEST_REQUESTER,
+                requester: test_requester(),
             })
             .unwrap();
         assert_eq!(page3.objects.len(), 1);
@@ -4868,7 +4871,7 @@ mod tests {
                 bucket: "bucket",
                 entries: &entries,
                 cond: NO_DELETE,
-                requester: TEST_REQUESTER,
+                requester: test_requester(),
             })
             .unwrap();
         assert_eq!(delete_result.deleted.len(), 5);
@@ -4882,7 +4885,7 @@ mod tests {
         coord
             .delete_bucket(&crate::coordinator::DeleteBucketRequest {
                 name: "bucket",
-                requester: TEST_REQUESTER,
+                requester: test_requester(),
             })
             .unwrap();
     }

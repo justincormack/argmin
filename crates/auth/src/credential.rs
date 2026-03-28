@@ -1,6 +1,8 @@
 /// Credential storage for SigV4 authentication.
 use std::collections::HashMap;
 
+use s3_types::AccountIdentity;
+
 /// A secret access key. Deliberately does not implement Debug to avoid leaking secrets.
 /// Field is private — use [`SecretKey::as_str()`] to access the value.
 pub struct SecretKey(String);
@@ -21,7 +23,7 @@ impl SecretKey {
 pub struct CredentialRecord {
     pub access_key_id: String,
     pub secret_key: SecretKey,
-    pub principal: String,
+    pub account: AccountIdentity,
     pub session_token: Option<String>,
     pub expires_at_epoch_secs: Option<u64>,
     pub enabled: bool,
@@ -53,11 +55,11 @@ impl CredentialStore {
     ///
     /// Principal defaults to the access key ID, with no session token or expiry.
     pub fn add(&mut self, access_key_id: String, secret_key: SecretKey) {
-        let principal = access_key_id.clone();
+        let account = AccountIdentity::from_principal(access_key_id.clone());
         self.add_record(CredentialRecord {
             access_key_id,
             secret_key,
-            principal,
+            account,
             session_token: None,
             expires_at_epoch_secs: None,
             enabled: true,
@@ -97,7 +99,7 @@ mod tests {
         store.add("AKID".into(), SecretKey::new("secret123".into()));
         let record = store.get_record("AKID").unwrap();
         assert_eq!(record.secret_key.as_str(), "secret123");
-        assert_eq!(record.principal, "AKID");
+        assert_eq!(record.account.principal(), "AKID");
         assert!(record.enabled);
     }
 
@@ -116,13 +118,18 @@ mod tests {
         store.add_record(CredentialRecord {
             access_key_id: "AKID".into(),
             secret_key: SecretKey::new("secret".into()),
-            principal: "user-123".into(),
+            account: AccountIdentity::new(
+                "user-123",
+                s3_types::CanonicalUserId::from_principal("user-123"),
+                "User 123",
+            ),
             session_token: Some("token".into()),
             expires_at_epoch_secs: Some(1234),
             enabled: true,
         });
         let record = store.get_record("AKID").unwrap();
-        assert_eq!(record.principal, "user-123");
+        assert_eq!(record.account.principal(), "user-123");
+        assert_eq!(record.account.display_name(), "User 123");
         assert_eq!(record.session_token.as_deref(), Some("token"));
         assert_eq!(record.expires_at_epoch_secs, Some(1234));
     }

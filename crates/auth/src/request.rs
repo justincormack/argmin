@@ -2,6 +2,7 @@
 use std::borrow::Cow;
 
 use ring::hmac;
+use s3_types::AccountIdentity;
 
 use crate::canonical::{
     canonical_headers, canonical_query_string, canonical_request, parse_amz_date, sha256_hex,
@@ -52,10 +53,28 @@ pub struct StreamingSigningContext {
 pub struct AuthContext {
     pub mode: AuthMode,
     pub access_key_id: Option<String>,
-    pub principal: Option<String>,
+    pub account: Option<AccountIdentity>,
     pub request_epoch_secs: Option<u64>,
     /// Present when the request uses STREAMING-AWS4-HMAC-SHA256-* content hash.
     pub streaming: Option<StreamingSigningContext>,
+}
+
+impl AuthContext {
+    #[must_use]
+    pub const fn anonymous() -> Self {
+        Self {
+            mode: AuthMode::Anonymous,
+            access_key_id: None,
+            account: None,
+            request_epoch_secs: None,
+            streaming: None,
+        }
+    }
+
+    #[must_use]
+    pub fn principal(&self) -> Option<&str> {
+        self.account.as_ref().map(AccountIdentity::principal)
+    }
 }
 
 /// Borrowed access to lowercased request headers.
@@ -286,7 +305,7 @@ fn authenticate_header<H: HeaderSource + ?Sized>(
     Ok(AuthContext {
         mode: AuthMode::HeaderSigV4,
         access_key_id: Some(credential.access_key_id),
-        principal: Some(record.principal.clone()),
+        account: Some(record.account.clone()),
         request_epoch_secs,
         streaming,
     })
@@ -447,7 +466,7 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
     Ok(AuthContext {
         mode: AuthMode::PresignedSigV4,
         access_key_id: Some(credential.access_key_id.to_owned()),
-        principal: Some(record.principal.clone()),
+        account: Some(record.account.clone()),
         request_epoch_secs: Some(request_epoch),
         streaming: None,
     })
@@ -608,6 +627,11 @@ fn header_value<'a, H: HeaderSource + ?Sized>(headers: &'a H, name: &str) -> Opt
 mod tests {
     use super::*;
     use crate::credential::{CredentialRecord, SecretKey};
+    use s3_types::AccountIdentity;
+
+    fn account(principal: &str) -> AccountIdentity {
+        AccountIdentity::from_principal(principal)
+    }
 
     fn example_store() -> CredentialStore {
         let mut store = CredentialStore::new();
@@ -642,7 +666,7 @@ mod tests {
         .unwrap();
         assert_eq!(ctx.mode, AuthMode::HeaderSigV4);
         assert_eq!(ctx.access_key_id.as_deref(), Some("AKIAIOSFODNN7EXAMPLE"));
-        assert_eq!(ctx.principal.as_deref(), Some("AKIAIOSFODNN7EXAMPLE"));
+        assert_eq!(ctx.principal(), Some("AKIAIOSFODNN7EXAMPLE"));
         assert_eq!(ctx.request_epoch_secs, Some(1_369_353_600));
     }
 
@@ -867,7 +891,7 @@ mod tests {
         store.add_record(CredentialRecord {
             access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
             secret_key: SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
-            principal: "u1".to_string(),
+            account: account("u1"),
             session_token: Some("expected".to_string()),
             expires_at_epoch_secs: None,
             enabled: true,
@@ -901,7 +925,7 @@ mod tests {
         store.add_record(CredentialRecord {
             access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
             secret_key: SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
-            principal: "u1".to_string(),
+            account: account("u1"),
             session_token: None,
             expires_at_epoch_secs: Some(5),
             enabled: true,
@@ -1312,7 +1336,7 @@ mod tests {
         store.add_record(CredentialRecord {
             access_key_id: "AKID".to_string(),
             secret_key: SecretKey::new("secret".to_string()),
-            principal: "p".to_string(),
+            account: account("p"),
             session_token: None,
             expires_at_epoch_secs: None,
             enabled: false,
@@ -1363,7 +1387,7 @@ mod tests {
         let record = CredentialRecord {
             access_key_id: "AKID".to_string(),
             secret_key: SecretKey::new("s".to_string()),
-            principal: "p".to_string(),
+            account: account("p"),
             session_token: Some("tok123".to_string()),
             expires_at_epoch_secs: None,
             enabled: true,
@@ -1376,7 +1400,7 @@ mod tests {
         let record = CredentialRecord {
             access_key_id: "AKID".to_string(),
             secret_key: SecretKey::new("s".to_string()),
-            principal: "p".to_string(),
+            account: account("p"),
             session_token: Some("expected".to_string()),
             expires_at_epoch_secs: None,
             enabled: true,
@@ -1390,7 +1414,7 @@ mod tests {
         let record = CredentialRecord {
             access_key_id: "AKID".to_string(),
             secret_key: SecretKey::new("s".to_string()),
-            principal: "p".to_string(),
+            account: account("p"),
             session_token: Some("expected".to_string()),
             expires_at_epoch_secs: None,
             enabled: true,
@@ -1404,7 +1428,7 @@ mod tests {
         let record = CredentialRecord {
             access_key_id: "AKID".to_string(),
             secret_key: SecretKey::new("s".to_string()),
-            principal: "p".to_string(),
+            account: account("p"),
             session_token: None,
             expires_at_epoch_secs: Some(5),
             enabled: true,
@@ -1418,7 +1442,7 @@ mod tests {
         let record = CredentialRecord {
             access_key_id: "AKID".to_string(),
             secret_key: SecretKey::new("s".to_string()),
-            principal: "p".to_string(),
+            account: account("p"),
             session_token: None,
             expires_at_epoch_secs: None,
             enabled: true,
@@ -1431,7 +1455,7 @@ mod tests {
         let record = CredentialRecord {
             access_key_id: "AKID".to_string(),
             secret_key: SecretKey::new("s".to_string()),
-            principal: "p".to_string(),
+            account: account("p"),
             session_token: None,
             expires_at_epoch_secs: Some(100),
             enabled: true,
@@ -1677,7 +1701,7 @@ mod tests {
         store.add_record(CredentialRecord {
             access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
             secret_key: SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
-            principal: "u1".to_string(),
+            account: account("u1"),
             session_token: Some("session-token-123".to_string()),
             expires_at_epoch_secs: None,
             enabled: true,
@@ -1733,7 +1757,7 @@ mod tests {
         store.add_record(CredentialRecord {
             access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
             secret_key: SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
-            principal: "u1".to_string(),
+            account: account("u1"),
             session_token: Some("expected-token".to_string()),
             expires_at_epoch_secs: None,
             enabled: true,
@@ -1763,7 +1787,7 @@ mod tests {
         store.add_record(CredentialRecord {
             access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
             secret_key: SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
-            principal: "u1".to_string(),
+            account: account("u1"),
             session_token: None,
             expires_at_epoch_secs: Some(100),
             enabled: true,

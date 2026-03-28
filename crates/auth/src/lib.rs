@@ -21,6 +21,8 @@ pub mod post;
 pub mod request;
 pub mod sigv4;
 
+pub use s3_types::AccountIdentity;
+
 use subtle::ConstantTimeEq;
 
 pub(crate) const MAX_ACCESS_KEY_ID_LEN: usize = 128;

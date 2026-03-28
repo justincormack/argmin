@@ -49,6 +49,7 @@ dependencies = [
  "observability",
  "proptest",
  "ring",
+ "s3-types",
  "serde_json",
  "subtle",
  "thiserror",

@@ -33,7 +33,7 @@ This plan should land before:
 ## Current State
 
 The current code already has:
-- authenticated principals propagated into `server-core`
+- authenticated account identity propagated into `server-core`
 - durable bucket owner principal and canonical ID
 - alternate test credentials in `crates/s3-tests`
 - limited ownership-controls support at the bucket level
@@ -43,15 +43,36 @@ The current code does not yet have:
 - durable owner identity on delete markers
 - durable canonical owner identity on multipart uploads
 - object-level authorization decisions distinct from bucket-level authorization
-- tenant/account modeling beyond a principal string on a credential record
+- tenant/account modeling beyond synthetically derived account identity on
+  configured credentials
 
 Important current shortcuts:
-- `Requester` only carries `Option<&str>` principal state
 - read and write authorization compares the requester only to the bucket owner
   plus bucket public flags
 - object GET and HEAD authorize only at bucket scope before reading the object
 - multipart uploads store only an optional `owner_principal`, and current create
   paths populate it from the bucket owner rather than the requester
+
+## Current Status
+
+Phase 1 is now in progress.
+
+Completed in the first implementation slice:
+- shared `AccountIdentity` type added for auth and request handling
+- credential records now resolve access keys to typed account identity rather
+  than a bare principal string
+- `AuthContext` now carries account identity, including canonical user ID,
+  across header auth, presigned auth, and POST auth
+- `Requester` now models anonymous versus authenticated account callers instead
+  of only `Option<&str>` principal state
+- HTTP request dispatch now constructs coordinator requesters from the typed
+  auth context
+
+Still open in Phase 1:
+- the server config and local test harness still synthesize account identity
+  directly from configured access keys and fixture principals
+- storage and object ownership paths still need later phases to persist and
+  consume the new identity model durably
 
 ## Target Behavior
 
@@ -180,6 +201,9 @@ with the production auth path.
 ## Implementation Phases
 
 ### Phase 1: Durable Account Identity
+
+Status: in progress. Typed account identity now flows through auth, HTTP, and
+core requester handling.
 
 Deliver:
 - typed account identity in auth and request handling
