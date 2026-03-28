@@ -60,8 +60,8 @@ Important current shortcuts:
 
 ## Current Status
 
-Phase 1 is complete. Phase 2 durable persistence is also in place in storage
-and coordinator paths.
+Phases 1 through 3 are complete for the scoped success criteria in this plan.
+Phase 4 multipart owner and initiator surfaces are the next active slice.
 
 Completed in Phase 1:
 - shared `AccountIdentity` type added for auth and request handling
@@ -86,11 +86,11 @@ Completed in Phase 2:
 - storage read paths now return stored owner identity for live objects, delete
   markers, and multipart uploads without inference
 
-Still open after Phase 2:
+Still open after Phase 3:
 - the server config and local test harness still synthesize account identity
   directly from configured access keys and fixture principals
-- object-scoped authorization is still incomplete on write-side cleanup edges
-  and ACL-grant cases
+- the broader ACL/header-grant matrix remains later work beyond the current
+  object-owner foundation
 - XML and API surfaces still need later phases to render stored owner identity
   for object and multipart responses where AWS expects it
 
@@ -251,14 +251,14 @@ Success criteria:
 
 ### Phase 3: Object-Scoped Authorization
 
-Status: in progress. Private-object read, head, range, attributes, tagging,
-and copy-source authorization now consult stored object owner identity instead
-of only bucket read access. This phase also persists the minimal object
-`public-read`/`public-read-write` bit needed to preserve AWS-compatible
-anonymous read behavior once bucket-level read shortcuts are removed. The
-grant-based bucket/object ACL behavior needed for the ignored cross-owner copy
-and versioned object ACL tests is now in place, but the broader ACL/header
-matrix still remains later work.
+Status: complete for the currently targeted ownership cases. Private-object
+read, head, range, attributes, tagging, and copy-source authorization now
+consult stored object owner identity instead of only bucket read access. This
+phase also persists the minimal object `public-read`/`public-read-write` bit
+needed to preserve AWS-compatible anonymous read behavior once bucket-level
+read shortcuts are removed. The grant-based bucket/object ACL behavior needed
+for the ignored cross-owner copy and versioned object ACL tests is now in
+place, while the broader ACL/header matrix remains later work.
 
 Deliver:
 - object read and object metadata APIs authorize against object ownership rules
@@ -272,6 +272,8 @@ Success criteria:
   bucket-level shortcuts
 
 ### Phase 4: Multipart Owner And Initiator Surfaces
+
+Status: next.
 
 Deliver:
 - list multipart uploads result includes correct owner/initiator semantics
