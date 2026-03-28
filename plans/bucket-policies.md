@@ -19,9 +19,9 @@ Out of scope:
 - a generic external policy engine dependency without prior approval
 
 Dependencies:
-- `plans/ownership-and-multi-user-foundations.md`
-- `plans/object-and-bucket-acls.md` for the tests that involve `GetObjectAcl`
-  or ACL-conditioned policy behavior
+- `plans/completed/ownership-and-multi-user-foundations.md`
+- `plans/completed/object-and-bucket-acls.md` for the tests that involve
+  `GetObjectAcl` or ACL-conditioned policy behavior
 
 ## Current State
 

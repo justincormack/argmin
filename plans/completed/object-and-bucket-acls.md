@@ -20,8 +20,8 @@ Out of scope:
 - account-level public access block
 
 Dependency:
-- this plan assumes `plans/ownership-and-multi-user-foundations.md` has landed
-  first
+- this plan assumed `plans/completed/ownership-and-multi-user-foundations.md`
+  had landed first
 
 ## Current State
 
@@ -41,6 +41,19 @@ The current implementation now supports a substantial ACL subset:
   `IgnorePublicAcls`
 - unsupported states such as object `WRITE` grants and `AuthenticatedUsers`
   enforcement are rejected rather than silently persisted
+
+## Current Status
+
+Phases 1 through 5 are complete for the scoped ACL behavior in this plan. The
+object and bucket ACL surface covered here is implemented and exercised by live
+integration tests.
+
+Remaining follow-up work is outside this plan:
+- bucket-policy evaluation belongs to `plans/bucket-policies.md`
+- account-level public access block remains out of scope
+- `AuthenticatedUsers` parsing and serialization exist, but those grants are
+  still rejected on write because enforcement semantics remain a separate
+  follow-up
 
 ## Goals
 
@@ -192,6 +205,8 @@ Do not leave copy and presigned ACL behavior as separate special cases.
 
 ### Phase 1: Typed ACL Representation
 
+Status: complete.
+
 Deliver:
 - internal ACL types
 - XML and header normalization into typed ACLs
@@ -202,6 +217,8 @@ Success criteria:
   behavior yet
 
 ### Phase 2: Bucket ACL Completion
+
+Status: complete.
 
 Deliver:
 - create-bucket ACL normalization onto the structured bucket ACL model
@@ -215,6 +232,8 @@ Success criteria:
 
 ### Phase 3: Direct PutObject ACL Header Grants
 
+Status: complete.
+
 Deliver:
 - direct `PutObject` `x-amz-grant-*` normalization
 - grant persistence on initial object writes for both small-body and streaming PUT paths
@@ -227,6 +246,8 @@ Success criteria:
 
 ### Phase 4: Canned ACLs On Write Paths
 
+Status: complete.
+
 Deliver:
 - end-to-end integration coverage for multipart initiation ACL persistence
 - AWS validation for the CopyObject, multipart, and presigned canned ACL paths
@@ -235,6 +256,8 @@ Success criteria:
 - copy canned ACL, multipart canned ACL, and presigned PUT ACL tests pass
 
 ### Phase 5: Public Access Block Integration
+
+Status: complete.
 
 Deliver:
 - public object ACL attempts rejected under `BlockPublicAcls`
@@ -265,22 +288,23 @@ Regression coverage:
 - `cargo test -p s3-tests --test versioning`
 
 AWS validation:
-- compare canned ACL, header grant, and per-version ACL behavior against AWS
-  before finalizing the permission matrix
+- targeted ownership-default and object ACL compatibility runs have been
+  checked against AWS; broader ACL matrix comparison remains ongoing
 
-## Open Decisions
+## Resolved Decisions
 
 1. Storage layout
-- whether bucket and object ACLs should live in typed serialized blobs or in
-  normalized child tables
+- bucket, object, and multipart ACLs live in typed serialized `acl_grants`
+  columns, with derived public projections stored alongside them
 
 2. Fast-path projections
-- whether to retain `public_read` and `public_write` as derived bucket metadata
-  projections for hot paths, or remove them once ACL evaluation exists
+- `public_read` and `public_write` remain as derived metadata projections for
+  hot authorization paths, with structured ACL grants as the source of truth
 
 3. Authenticated users group
-- whether to implement `AuthenticatedUsers` fully in the first ACL cut or only
-  the portions exercised by the current compatibility tests
+- boundary parsing and serialization support `AuthenticatedUsers`, but write
+  paths currently reject those grants until enforcement semantics are added in
+  a separate follow-up
 
 ## Recommended Defaults
 

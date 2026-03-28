@@ -27,7 +27,7 @@ core authorization model is still bucket-centric, so adding ACL or policy
 checks first would force another authz rewrite later.
 
 This plan should land before:
-- `plans/object-and-bucket-acls.md`
+- `plans/completed/object-and-bucket-acls.md`
 - `plans/bucket-policies.md`
 
 ## Current State
@@ -62,7 +62,7 @@ Phases 1 through 5 are complete for the scoped success criteria in this plan.
 The ownership foundations work covered here is done.
 
 Remaining follow-up work is outside this plan:
-- broader ACL/header-grant coverage belongs to `plans/object-and-bucket-acls.md`
+- broader ACL/header-grant coverage belongs to `plans/completed/object-and-bucket-acls.md`
 - bucket-policy behavior belongs to `plans/bucket-policies.md`
 
 Completed in Phase 1:
