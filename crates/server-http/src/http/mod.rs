@@ -955,7 +955,7 @@ impl HttpFrontend {
                         parse_request_metadata(req.header_iter())?;
                     let cond = write_condition_from_headers(req)?;
                     let requester = Self::requester_from_auth(auth);
-                    let acl = parse_put_object_acl(req.header("x-amz-acl"));
+                    let acl = parse_put_object_write_acl(req)?;
                     let result =
                         self.coordinator
                             .put_object(&crate::coordinator::PutObjectRequest {
@@ -2532,7 +2532,7 @@ impl HttpFrontend {
             bucket,
             key: &key,
             requester: requester.clone(),
-            acl,
+            acl: acl.into(),
             encryption: sse_customer
                 .as_ref()
                 .map_or(storage::ObjectEncryption::None, |ctx| {
@@ -2656,7 +2656,7 @@ impl HttpFrontend {
                 tags: ctx.tags_xml.as_deref(),
                 cond: &crate::conditional::WriteCondition::default(),
                 requester: ctx.requester.clone(),
-                acl: parse_put_object_acl(ctx.acl_header.as_deref()),
+                acl: parse_put_object_acl(ctx.acl_header.as_deref()).into(),
             })?;
 
         let mut resp = S3Response::post_object(
@@ -2844,6 +2844,12 @@ impl HttpFrontend {
             system_metadata.strip_aws_chunked_content_encoding();
         }
         let cond = write_condition_from_headers(req)?;
+        let acl_grants = parse_acl_grants_headers(req)?;
+        if req.header("x-amz-acl").is_some() && acl_grants.is_some() {
+            return Err(ServerError::InvalidArgument {
+                reason: "x-amz-acl cannot be combined with x-amz-grant-* headers".to_string(),
+            });
+        }
 
         // Collect checksum response headers to echo back in the response.
         let mut checksum_response: Vec<(String, String)> = Vec::new();
@@ -2860,6 +2866,7 @@ impl HttpFrontend {
             requester: Self::requester_from_auth(&auth),
             expected_bucket_owner: expected_bucket_owner(req).map(str::to_string),
             acl_header: req.header("x-amz-acl").map(str::to_string),
+            acl_grants,
             metadata_blob,
             system_metadata,
             cond,
@@ -2891,7 +2898,10 @@ impl HttpFrontend {
             bucket: &ctx.bucket,
             key: &ctx.key,
             requester: ctx.requester.clone(),
-            acl: parse_put_object_acl(ctx.acl_header.as_deref()),
+            acl: put_object_write_acl_from_components(
+                ctx.acl_header.as_deref(),
+                ctx.acl_grants.as_ref(),
+            ),
             encryption: ctx
                 .sse_customer
                 .as_ref()
@@ -2963,7 +2973,10 @@ impl HttpFrontend {
                 tags: ctx.inline_tags_xml.as_deref(),
                 cond: &ctx.cond,
                 requester: ctx.requester.clone(),
-                acl: parse_put_object_acl(ctx.acl_header.as_deref()),
+                acl: put_object_write_acl_from_components(
+                    ctx.acl_header.as_deref(),
+                    ctx.acl_grants.as_ref(),
+                ),
                 sse_customer: ctx
                     .sse_customer
                     .as_ref()
@@ -3022,7 +3035,10 @@ impl HttpFrontend {
                 tags: ctx.inline_tags_xml.as_deref(),
                 cond: &ctx.cond,
                 requester: ctx.requester.clone(),
-                acl: parse_put_object_acl(ctx.acl_header.as_deref()),
+                acl: put_object_write_acl_from_components(
+                    ctx.acl_header.as_deref(),
+                    ctx.acl_grants.as_ref(),
+                ),
             })?;
 
         let mut resp = S3Response::put_object(&result);
@@ -3305,6 +3321,7 @@ pub struct StreamingPutContext {
     pub requester: crate::coordinator::Requester,
     pub expected_bucket_owner: Option<String>,
     pub acl_header: Option<String>,
+    pub acl_grants: Option<s3_types::AclGrants>,
     pub metadata_blob: crate::metadata_blob::MetadataBlob,
     pub system_metadata: SystemMetadata,
     pub cond: crate::conditional::WriteCondition,
@@ -4096,6 +4113,33 @@ fn parse_acl_grants(req: &S3Request) -> Result<s3_types::AclGrants, ServerError>
     })
 }
 
+fn put_object_write_acl_from_components<'a>(
+    acl_header: Option<&'a str>,
+    acl_grants: Option<&s3_types::AclGrants>,
+) -> crate::coordinator::PutObjectWriteAcl<'a> {
+    match (acl_header, acl_grants) {
+        (Some(header), None) => parse_put_object_acl(Some(header)).into(),
+        (None, Some(grants)) => crate::coordinator::PutObjectWriteAcl::Grants(grants.clone()),
+        (None, None) => crate::coordinator::PutObjectWriteAcl::None,
+        (Some(_), Some(_)) => unreachable!("validated before constructing object write ACL"),
+    }
+}
+
+fn parse_put_object_write_acl(
+    req: &S3Request,
+) -> Result<crate::coordinator::PutObjectWriteAcl<'_>, ServerError> {
+    let acl_grants = parse_acl_grants_headers(req)?;
+    if req.header("x-amz-acl").is_some() && acl_grants.is_some() {
+        return Err(ServerError::InvalidArgument {
+            reason: "x-amz-acl cannot be combined with x-amz-grant-* headers".to_string(),
+        });
+    }
+    Ok(put_object_write_acl_from_components(
+        req.header("x-amz-acl"),
+        acl_grants.as_ref(),
+    ))
+}
+
 fn parse_bucket_ownership(
     value: Option<&str>,
 ) -> Result<crate::coordinator::BucketObjectOwnership, ServerError> {
@@ -4351,6 +4395,31 @@ mod tests {
     }
 
     #[test]
+    fn parse_put_object_write_acl_rejects_acl_and_grants_together() {
+        let canonical_id = s3_types::CanonicalUserId::from_principal("grantee-a");
+        let req = new_req(
+            http::Method::PUT,
+            "/",
+            "",
+            vec![
+                ("x-amz-acl".to_string(), "private".to_string()),
+                (
+                    "x-amz-grant-read".to_string(),
+                    format!("id=\"{}\"", canonical_id.as_str()),
+                ),
+            ],
+            b"data".to_vec(),
+        );
+
+        match parse_put_object_write_acl(&req) {
+            Err(ServerError::InvalidArgument { reason }) => {
+                assert!(reason.contains("cannot be combined"));
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_acl_grants_rejects_malformed_header_value() {
         let req = new_req(
             http::Method::PUT,
@@ -4401,6 +4470,55 @@ mod tests {
                 &test_auth(),
                 S3Operation::GetBucketAcl {
                     bucket: "mybucket".to_string(),
+                },
+            )
+            .unwrap();
+        let body = String::from_utf8(resp.body).unwrap();
+        assert!(body.contains(canonical_id.as_str()));
+    }
+
+    #[test]
+    fn put_object_accepts_header_grants_and_renders_them() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_requester(&crate::coordinator::CreateBucketRequest {
+                name: "mybucket",
+                requester: crate::coordinator::Requester::principal("testuser"),
+                acl: crate::coordinator::CreateBucketAcl::DefaultPrivate,
+                ownership: crate::coordinator::BucketObjectOwnership::ObjectWriter,
+            })
+            .unwrap();
+        let canonical_id = s3_types::CanonicalUserId::from_principal("grantee-a");
+
+        let put_req = new_req(
+            http::Method::PUT,
+            "/",
+            "",
+            vec![(
+                "x-amz-grant-read-acp".to_string(),
+                format!("id=\"{}\"", canonical_id.as_str()),
+            )],
+            b"data".to_vec(),
+        );
+        fe.dispatch_routed(
+            &put_req,
+            &test_auth(),
+            S3Operation::PutObject {
+                bucket: "mybucket".to_string(),
+                key: "mykey".to_string(),
+            },
+        )
+        .unwrap();
+
+        let get_req = new_req(http::Method::GET, "/", "acl", vec![], vec![]);
+        let resp = fe
+            .dispatch_routed(
+                &get_req,
+                &test_auth(),
+                S3Operation::GetObjectAcl {
+                    bucket: "mybucket".to_string(),
+                    key: "mykey".to_string(),
                 },
             )
             .unwrap();
@@ -4463,7 +4581,7 @@ mod tests {
                 tags: None,
                 cond: &crate::conditional::WriteCondition::default(),
                 requester: crate::coordinator::Requester::principal("testuser"),
-                acl: crate::coordinator::PutObjectAcl::None,
+                acl: crate::coordinator::PutObjectAcl::None.into(),
                 sse_customer: None,
                 expected_bucket_owner: None,
             })

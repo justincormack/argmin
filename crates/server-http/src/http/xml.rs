@@ -4979,7 +4979,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: test_requester(),
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 expected_bucket_owner: None,
             },
         )
@@ -4996,7 +4996,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: test_requester(),
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 expected_bucket_owner: None,
             },
         )
@@ -5013,7 +5013,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: test_requester(),
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 expected_bucket_owner: None,
             },
         )
@@ -5124,7 +5124,7 @@ mod tests {
                     tags: None,
                     cond: NO_WRITE,
                     requester: test_requester(),
-                    acl: NO_PUT_OBJECT_ACL,
+                    acl: NO_PUT_OBJECT_ACL.into(),
                     expected_bucket_owner: None,
                 },
             )

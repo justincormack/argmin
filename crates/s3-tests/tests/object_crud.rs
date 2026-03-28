@@ -1,6 +1,13 @@
 use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::{
+    AccessControlPolicy, Grant, Grantee, ObjectOwnership, Owner, OwnershipControls,
+    OwnershipControlsRule, Permission, Type,
+};
+use aws_sdk_s3::Client;
 use ring::{digest, hmac};
-use s3_tests::{assert_s3_err_code, err_status, unique_bucket, CTX};
+use s3_tests::{
+    assert_s3_err_code, ensure_distinct_s3_owners_or_skip, err_status, unique_bucket, CTX,
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Create a bucket, returning its name. Tests are responsible for cleanup.
@@ -9,6 +16,199 @@ async fn setup_bucket() -> String {
     let bucket = unique_bucket();
     client.create_bucket().bucket(&bucket).send().await.unwrap();
     bucket
+}
+
+async fn set_object_writer_ownership(bucket: &str) {
+    let rule = OwnershipControlsRule::builder()
+        .object_ownership(ObjectOwnership::ObjectWriter)
+        .build()
+        .unwrap();
+    let controls = OwnershipControls::builder().rules(rule).build().unwrap();
+    CTX.client()
+        .put_bucket_ownership_controls()
+        .bucket(bucket)
+        .ownership_controls(controls)
+        .send()
+        .await
+        .unwrap();
+}
+
+async fn canonical_owner_id(client: &Client) -> String {
+    let bucket = unique_bucket();
+    client.create_bucket().bucket(&bucket).send().await.unwrap();
+    let owner_id = client
+        .get_bucket_acl()
+        .bucket(&bucket)
+        .send()
+        .await
+        .unwrap()
+        .owner()
+        .and_then(|owner| owner.id())
+        .expect("expected owner ID in GetBucketAcl")
+        .to_string();
+    client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    owner_id
+}
+
+fn canonical_user_grant(canonical_user_id: &str, permission: Permission) -> Grant {
+    Grant::builder()
+        .grantee(
+            Grantee::builder()
+                .id(canonical_user_id)
+                .r#type(Type::CanonicalUser)
+                .build()
+                .expect("canonical grantee"),
+        )
+        .permission(permission)
+        .build()
+}
+
+fn access_control_policy(owner_id: &str, grants: Vec<Grant>) -> AccessControlPolicy {
+    AccessControlPolicy::builder()
+        .owner(Owner::builder().id(owner_id).build())
+        .set_grants(Some(grants))
+        .build()
+}
+
+fn has_grant(
+    grants: &[Grant],
+    permission: Permission,
+    canonical_user_id: Option<&str>,
+    uri: Option<&str>,
+) -> bool {
+    grants.iter().any(|grant| {
+        grant.permission() == Some(&permission)
+            && grant
+                .grantee()
+                .is_some_and(|grantee| grantee.id() == canonical_user_id && grantee.uri() == uri)
+    })
+}
+
+async fn run_object_header_acl_grants_case(test_name: &str, key: &str, body: Vec<u8>) {
+    let client = CTX.client();
+    let alt_client = CTX.alt_client();
+    if !ensure_distinct_s3_owners_or_skip(client, alt_client, test_name).await {
+        return;
+    }
+
+    let bucket = setup_bucket().await;
+    set_object_writer_ownership(&bucket).await;
+    let alt_owner_id = canonical_owner_id(alt_client).await;
+
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from(body.clone()))
+        .customize()
+        .mutate_request({
+            let alt_owner_id = alt_owner_id.clone();
+            move |req| {
+                req.headers_mut().insert(
+                    "x-amz-grant-read",
+                    format!("id=\"{}\"", alt_owner_id.clone()),
+                );
+                req.headers_mut().insert(
+                    "x-amz-grant-read-acp",
+                    format!("id=\"{}\"", alt_owner_id.clone()),
+                );
+                req.headers_mut().insert(
+                    "x-amz-grant-write-acp",
+                    format!("id=\"{}\"", alt_owner_id.clone()),
+                );
+                req.headers_mut().insert(
+                    "x-amz-grant-full-control",
+                    format!("id=\"{}\"", alt_owner_id.clone()),
+                );
+            }
+        })
+        .send()
+        .await
+        .unwrap();
+
+    let acl = client
+        .get_object_acl()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await
+        .unwrap();
+    let grants = acl.grants();
+    assert!(has_grant(
+        grants,
+        Permission::Read,
+        Some(&alt_owner_id),
+        None
+    ));
+    assert!(has_grant(
+        grants,
+        Permission::ReadAcp,
+        Some(&alt_owner_id),
+        None
+    ));
+    assert!(has_grant(
+        grants,
+        Permission::WriteAcp,
+        Some(&alt_owner_id),
+        None
+    ));
+    assert!(has_grant(
+        grants,
+        Permission::FullControl,
+        Some(&alt_owner_id),
+        None
+    ));
+
+    let owner_id = acl
+        .owner()
+        .and_then(|owner| owner.id())
+        .expect("expected owner ID in GetObjectAcl")
+        .to_string();
+
+    let read = alt_client
+        .get_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await
+        .unwrap();
+    let read_body = read.body.collect().await.unwrap().into_bytes();
+    assert_eq!(&read_body[..], body.as_slice());
+
+    alt_client
+        .get_object_acl()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await
+        .unwrap();
+
+    alt_client
+        .put_object_acl()
+        .bucket(&bucket)
+        .key(key)
+        .access_control_policy(access_control_policy(
+            &owner_id,
+            vec![
+                canonical_user_grant(&owner_id, Permission::FullControl),
+                canonical_user_grant(&alt_owner_id, Permission::Read),
+                canonical_user_grant(&alt_owner_id, Permission::ReadAcp),
+                canonical_user_grant(&alt_owner_id, Permission::WriteAcp),
+                canonical_user_grant(&alt_owner_id, Permission::FullControl),
+            ],
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    client
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await
+        .unwrap();
+    client.delete_bucket().bucket(&bucket).send().await.unwrap();
 }
 
 fn primary_account_id_or_skip(test_name: &str) -> Option<String> {
@@ -1506,10 +1706,39 @@ fn test_object_content_encoding_aws_chunked() {
     });
 }
 
-// ── Not implemented ─────────────────────────────────────────────────
+#[test]
+fn test_object_header_acl_grants() {
+    if !CTX.has_alt_client() {
+        eprintln!(
+            "skipping test_object_header_acl_grants: alternate credentials are not configured"
+        );
+        return;
+    }
+    s3_tests::run(async {
+        run_object_header_acl_grants_case(
+            "test_object_header_acl_grants",
+            "testobj",
+            b"header-acl".to_vec(),
+        )
+        .await;
+    });
+}
 
 #[test]
-#[ignore = "not implemented: ACL grants"]
-fn test_object_header_acl_grants() {
-    s3_tests::run(async {});
+fn test_object_header_acl_grants_streaming_put() {
+    if !CTX.has_alt_client() {
+        eprintln!(
+            "skipping test_object_header_acl_grants_streaming_put: alternate credentials are not configured"
+        );
+        return;
+    }
+    s3_tests::run(async {
+        let body = vec![0x5Au8; server_core::coordinator::INTERNAL_SEGMENT_SIZE + 1];
+        run_object_header_acl_grants_case(
+            "test_object_header_acl_grants_streaming_put",
+            "streaming-testobj",
+            body,
+        )
+        .await;
+    });
 }

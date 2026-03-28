@@ -25,22 +25,22 @@ Dependency:
 
 ## Current State
 
-The current implementation supports only a reduced ACL subset:
-- bucket ACLs are stored as `public_read` and `public_write` booleans
-- `GetBucketAcl` renders a synthetic ACL document from those booleans
-- `PutBucketAcl` only accepts canned values mapped onto those booleans
-- object writes parse only `private` and `bucket-owner-full-control` as special
-  cases
-- object ACLs are not stored durably at all
-- object ACL APIs are not implemented
+The current implementation now supports a substantial ACL subset:
+- bucket ACLs are stored as structured grants and rendered from stored ACL state
+- `CreateBucket`, `GetBucketAcl`, and `PutBucketAcl` accept structured ACL
+  inputs, including header grants
+- object ACLs are stored durably per version
+- `GetObjectAcl` and `PutObjectAcl` are implemented, including version-aware
+  reads and writes
+- direct `PutObject` supports canned ACLs and `x-amz-grant-*` headers on both
+  small-body and promoted streaming paths
+- CopyObject canned destination ACLs and presigned PUT ACL handling are
+  implemented
+- unsupported states such as object `WRITE` grants and `AuthenticatedUsers`
+  enforcement are rejected rather than silently persisted
 
-Ignored tests tied directly to this gap:
-- bucket header ACL grants
-- object header ACL grants
-- object copy canned ACL
-- object presigned PUT with ACL
+Remaining ignored test tied directly to the ACL gap:
 - block-public-object-canned-acls
-- versioned object ACL tests
 
 ## Goals
 
@@ -104,6 +104,9 @@ Ownership-controls behavior must remain correct:
 - `BucketOwnerEnforced` continues to reject ACL usage where AWS rejects it
 - `BucketOwnerPreferred` and `ObjectWriter` determine owner and ACL defaults
   coherently
+- ACL-focused compatibility tests must explicitly create or convert buckets to
+  `ObjectWriter` or `BucketOwnerPreferred`, because fresh AWS buckets default to
+  `BucketOwnerEnforced`
 - `bucket-owner-full-control` must work across direct PUT, POST object, COPY,
   and presigned PUT
 
@@ -210,21 +213,21 @@ Success criteria:
 - current bucket ACL tests continue to pass
 - header grant bucket ACL test can be unignored
 
-### Phase 3: Object ACL APIs And Storage
+### Phase 3: Direct PutObject ACL Header Grants
 
 Deliver:
-- object ACL persistence per version
-- `GetObjectAcl`
-- `PutObjectAcl`
-- version-aware ACL reads and writes
+- direct `PutObject` `x-amz-grant-*` normalization
+- grant persistence on initial object writes for both small-body and streaming PUT paths
+- AWS-compatible rejection of mixed canned and grant ACL inputs
+- object-grant validation aligned with current enforcement rules
 
 Success criteria:
-- object ACL tests and versioned object ACL tests can be unignored
+- object header ACL grant test can be unignored
+- existing object ACL and versioned object ACL coverage continues to pass
 
 ### Phase 4: Canned ACLs On Write Paths
 
 Deliver:
-- direct PUT canned ACLs
 - CopyObject destination ACLs
 - multipart initiation ACL persistence
 - presigned PUT ACL handling
@@ -245,12 +248,13 @@ Success criteria:
 
 Targeted integration tests:
 - `cargo test -p s3-tests --test bucket_crud test_bucket_header_acl_grants`
-- `cargo test -p s3-tests --test object_crud test_object_header_acl_grants -- --ignored`
-- `cargo test -p s3-tests --test copy_object test_object_copy_canned_acl -- --ignored`
-- `cargo test -p s3-tests --test presigned test_object_presigned_put_object_with_acl -- --ignored`
+- `cargo test -p s3-tests --test object_crud test_object_header_acl_grants`
+- `cargo test -p s3-tests --test object_crud test_object_header_acl_grants_streaming_put`
+- `cargo test -p s3-tests --test copy_object test_object_copy_canned_acl`
+- `cargo test -p s3-tests --test presigned test_object_presigned_put_object_with_acl`
 - `cargo test -p s3-tests --test public_access_block test_block_public_object_canned_acls -- --ignored`
-- `cargo test -p s3-tests --test versioning test_versioned_object_acl -- --ignored`
-- `cargo test -p s3-tests --test versioning test_versioned_object_acl_no_version_specified -- --ignored`
+- `cargo test -p s3-tests --test versioning test_versioned_object_acl`
+- `cargo test -p s3-tests --test versioning test_versioned_object_acl_no_version_specified`
 
 Regression coverage:
 - `cargo test -p s3-tests --test ownership`

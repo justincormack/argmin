@@ -1120,7 +1120,7 @@ pub struct PutObjectRequest<'a> {
     pub tags: Option<&'a str>,
     pub cond: &'a WriteCondition,
     pub requester: Requester,
-    pub acl: PutObjectAcl<'a>,
+    pub acl: PutObjectWriteAcl<'a>,
     pub sse_customer: Option<&'a SseCustomerRequest>,
     #[cfg(not(test))]
     pub expected_bucket_owner: Option<&'a str>,
@@ -1264,6 +1264,24 @@ impl PutObjectAcl<'_> {
             self,
             Self::None | Self::Private | Self::BucketOwnerFullControl
         )
+    }
+}
+
+/// Parsed ACL input relevant to direct PutObject authorization rules.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum PutObjectWriteAcl<'a> {
+    #[default]
+    None,
+    Canned(PutObjectAcl<'a>),
+    Grants(AclGrants),
+}
+
+impl<'a> From<PutObjectAcl<'a>> for PutObjectWriteAcl<'a> {
+    fn from(value: PutObjectAcl<'a>) -> Self {
+        match value {
+            PutObjectAcl::None => Self::None,
+            other => Self::Canned(other),
+        }
     }
 }
 
@@ -1636,7 +1654,7 @@ pub struct BeginStreamPutRequest<'a> {
     pub bucket: &'a str,
     pub key: &'a str,
     pub requester: Requester,
-    pub acl: PutObjectAcl<'a>,
+    pub acl: PutObjectWriteAcl<'a>,
     pub encryption: ObjectEncryption,
     #[cfg(not(test))]
     pub expected_bucket_owner: Option<&'a str>,
@@ -1708,7 +1726,7 @@ impl<'a> BeginStreamPutRequest<'a> {
         bucket: &'a str,
         key: &'a str,
         requester: Requester,
-        acl: PutObjectAcl<'a>,
+        acl: impl Into<PutObjectWriteAcl<'a>>,
         encryption: ObjectEncryption,
         _expected_bucket_owner: Option<&'a str>,
     ) -> Self {
@@ -1716,7 +1734,7 @@ impl<'a> BeginStreamPutRequest<'a> {
             bucket,
             key,
             requester,
-            acl,
+            acl: acl.into(),
             encryption,
             #[cfg(not(test))]
             expected_bucket_owner: _expected_bucket_owner,
@@ -1782,7 +1800,7 @@ pub struct FinalizeStreamPutRequest<'a> {
     pub tags: Option<&'a str>,
     pub cond: &'a WriteCondition,
     pub requester: Requester,
-    pub acl: PutObjectAcl<'a>,
+    pub acl: PutObjectWriteAcl<'a>,
 }
 
 /// Parsed request for finalizing a streaming UploadPart.
@@ -3170,6 +3188,18 @@ impl Coordinator {
             .unwrap_or_else(|| Self::bucket_owner_identity(bucket))
     }
 
+    fn effective_put_object_owner(
+        bucket: &BucketSummary,
+        requester: &Requester,
+        acl: &PutObjectWriteAcl<'_>,
+    ) -> OwnerIdentity {
+        let canned = match acl {
+            PutObjectWriteAcl::None | PutObjectWriteAcl::Grants(_) => PutObjectAcl::None,
+            PutObjectWriteAcl::Canned(acl) => *acl,
+        };
+        Self::effective_object_owner(bucket, requester, canned)
+    }
+
     fn ensure_put_object_acl_supported(
         bucket: &BucketSummary,
         acl: PutObjectAcl<'_>,
@@ -3213,6 +3243,31 @@ impl Coordinator {
         Ok(())
     }
 
+    fn ensure_put_object_write_acl_supported(
+        bucket: &BucketSummary,
+        acl: &PutObjectWriteAcl<'_>,
+    ) -> Result<(), ServerError> {
+        match acl {
+            PutObjectWriteAcl::None => {
+                Self::ensure_put_object_acl_supported(bucket, PutObjectAcl::None)
+            }
+            PutObjectWriteAcl::Canned(acl) => Self::ensure_put_object_acl_supported(bucket, *acl),
+            PutObjectWriteAcl::Grants(acl_grants) => {
+                if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_deref()) {
+                    return Err(ServerError::AccessControlListNotSupported);
+                }
+                Self::ensure_supported_object_acl_grants(acl_grants)?;
+                if Self::blocks_public_acls(bucket.public_access_block.as_deref())
+                    && (Self::acl_grants_public_read(acl_grants)
+                        || Self::acl_grants_public_write(acl_grants))
+                {
+                    return Err(ServerError::AccessDenied);
+                }
+                Ok(())
+            }
+        }
+    }
+
     fn object_acl_grants_for_write(
         bucket: &BucketSummary,
         owner: &OwnerIdentity,
@@ -3247,6 +3302,29 @@ impl Coordinator {
             | PutObjectAcl::Invalid(_) => {}
         }
         AclGrants::new(grants)
+    }
+
+    fn object_acl_grants_for_put_object(
+        bucket: &BucketSummary,
+        owner: &OwnerIdentity,
+        acl: &PutObjectWriteAcl<'_>,
+    ) -> AclGrants {
+        match acl {
+            PutObjectWriteAcl::None => {
+                Self::object_acl_grants_for_write(bucket, owner, PutObjectAcl::None)
+            }
+            PutObjectWriteAcl::Canned(acl) => {
+                Self::object_acl_grants_for_write(bucket, owner, *acl)
+            }
+            PutObjectWriteAcl::Grants(acl_grants) => {
+                let mut grants: Vec<AclGrant> = acl_grants.iter().cloned().collect();
+                grants.push(AclGrant::new(
+                    AclGrantee::CanonicalUser(owner.canonical_id.clone()),
+                    AclPermission::FullControl,
+                ));
+                AclGrants::new(grants)
+            }
+        }
     }
 
     fn ensure_supported_bucket_acl_grants(acl_grants: &AclGrants) -> Result<(), ServerError> {
@@ -5497,7 +5575,7 @@ impl Coordinator {
                     req.bucket,
                     req.key,
                     req.requester.clone(),
-                    req.acl,
+                    req.acl.clone(),
                     write_encryption
                         .as_ref()
                         .map(|ctx| ctx.encryption().clone())
@@ -5533,7 +5611,7 @@ impl Coordinator {
                     tags: req.tags,
                     cond: req.cond,
                     requester: req.requester.clone(),
-                    acl: req.acl,
+                    acl: req.acl.clone(),
                 })
             })();
             if result.is_err() {
@@ -5553,7 +5631,7 @@ impl Coordinator {
                 return Err(ServerError::AccessDenied);
             }
             Self::ensure_sse_c_allowed(&bucket_info, write_encryption.is_some())?;
-            Self::ensure_put_object_acl_supported(&bucket_info, req.acl)?;
+            Self::ensure_put_object_write_acl_supported(&bucket_info, &req.acl)?;
 
             let transient_segment_id = {
                 let rng = ring::rand::SystemRandom::new();
@@ -5628,8 +5706,8 @@ impl Coordinator {
                     return Err(err);
                 }
             };
-            let owner = Self::effective_object_owner(&bucket_info, &req.requester, req.acl);
-            let acl_grants = Self::object_acl_grants_for_write(&bucket_info, &owner, req.acl);
+            let owner = Self::effective_put_object_owner(&bucket_info, &req.requester, &req.acl);
+            let acl_grants = Self::object_acl_grants_for_put_object(&bucket_info, &owner, &req.acl);
 
             let segment_record = ObjectSegmentRecord {
                 bucket: BucketName::from(req.bucket),
@@ -5732,7 +5810,7 @@ impl Coordinator {
                 &bucket_info,
                 matches!(req.encryption, ObjectEncryption::SseCustomer(_)),
             )?;
-            Self::ensure_put_object_acl_supported(&bucket_info, req.acl)?;
+            Self::ensure_put_object_write_acl_supported(&bucket_info, &req.acl)?;
 
             let rng = ring::rand::SystemRandom::new();
             let mut id_bytes = [0u8; 16];
@@ -6231,7 +6309,7 @@ impl Coordinator {
             ) {
                 return Err(ServerError::AccessDenied);
             }
-            Self::ensure_put_object_acl_supported(&bucket_info, req.acl)?;
+            Self::ensure_put_object_write_acl_supported(&bucket_info, &req.acl)?;
 
             let meta_pg_id = self.object_pg_id(bucket, key);
             let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
@@ -6267,8 +6345,8 @@ impl Coordinator {
                     cond,
                 },
             )?;
-            let owner = Self::effective_object_owner(&bucket_info, &req.requester, req.acl);
-            let acl_grants = Self::object_acl_grants_for_write(&bucket_info, &owner, req.acl);
+            let owner = Self::effective_put_object_owner(&bucket_info, &req.requester, &req.acl);
+            let acl_grants = Self::object_acl_grants_for_put_object(&bucket_info, &owner, &req.acl);
 
             let staging_segments = meta_guard
                 .list_stream_segments(session_id)
@@ -7002,7 +7080,7 @@ impl Coordinator {
                 tags: tags.as_deref(),
                 cond: dst_cond,
                 requester: requester.clone(),
-                acl,
+                acl: acl.into(),
             })?;
 
             let dst_meta_pg = self
@@ -10237,6 +10315,7 @@ pub mod test_helpers {
 }
 
 #[cfg(test)]
+#[allow(clippy::useless_conversion)]
 mod tests {
     use super::test_helpers;
     use super::*;
@@ -10355,7 +10434,7 @@ mod tests {
             bucket,
             key,
             requester: TEST_REQUESTER,
-            acl: NO_PUT_OBJECT_ACL,
+            acl: NO_PUT_OBJECT_ACL.into(),
             encryption: ObjectEncryption::None,
         })
     }
@@ -10697,7 +10776,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: requester.clone(),
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -10744,7 +10823,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: requester.clone(),
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -10799,7 +10878,7 @@ mod tests {
                 tags: None,
                 checksum: None,
                 requester: requester.clone(),
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -10905,7 +10984,7 @@ mod tests {
                 tags: None,
                 checksum: None,
                 requester: Requester::authenticated(writer.clone()),
-                acl: PutObjectAcl::BucketOwnerFullControl,
+                acl: PutObjectAcl::BucketOwnerFullControl.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -11114,7 +11193,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: writer_requester,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -11200,7 +11279,7 @@ mod tests {
                 tags: None,
                 checksum: None,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -11237,7 +11316,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -11266,7 +11345,7 @@ mod tests {
                 tags: Some(tags_xml),
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -11320,7 +11399,7 @@ mod tests {
                     tags: None,
                     cond: NO_WRITE,
                     requester: TEST_REQUESTER,
-                    acl: NO_PUT_OBJECT_ACL,
+                    acl: NO_PUT_OBJECT_ACL.into(),
                 },
             );
             tx.send(res).unwrap();
@@ -11368,7 +11447,7 @@ mod tests {
                 tags: None,
                 checksum: None,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             });
             tx.send(res).unwrap();
@@ -11438,7 +11517,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -11500,7 +11579,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -11574,7 +11653,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -11715,7 +11794,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -11762,7 +11841,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -11804,7 +11883,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -11841,7 +11920,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -11857,7 +11936,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -11893,7 +11972,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -11930,7 +12009,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -11975,7 +12054,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -12042,7 +12121,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -12058,7 +12137,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -12074,7 +12153,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -12114,7 +12193,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -12130,7 +12209,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -12146,7 +12225,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -12182,7 +12261,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -12198,7 +12277,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -12214,7 +12293,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -12230,7 +12309,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -12269,7 +12348,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -12420,7 +12499,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -12461,7 +12540,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -12500,7 +12579,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -12556,7 +12635,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -12598,7 +12677,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -12642,7 +12721,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -12681,7 +12760,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -12724,7 +12803,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -12764,7 +12843,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -12820,7 +12899,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -12875,7 +12954,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap_err();
@@ -12919,7 +12998,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -12967,7 +13046,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -12983,7 +13062,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -12999,7 +13078,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -13015,7 +13094,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -13031,7 +13110,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -13094,7 +13173,7 @@ mod tests {
                     tags: None,
                     cond: NO_WRITE,
                     requester: TEST_REQUESTER,
-                    acl: NO_PUT_OBJECT_ACL,
+                    acl: NO_PUT_OBJECT_ACL.into(),
                 },
             )
             .unwrap();
@@ -13133,7 +13212,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap_err();
@@ -13169,7 +13248,7 @@ mod tests {
                     tags: None,
                     cond: NO_WRITE,
                     requester: TEST_REQUESTER,
-                    acl: NO_PUT_OBJECT_ACL,
+                    acl: NO_PUT_OBJECT_ACL.into(),
                 },
             )
             .unwrap();
@@ -13211,7 +13290,7 @@ mod tests {
                     tags: None,
                     cond: NO_WRITE,
                     requester: TEST_REQUESTER,
-                    acl: NO_PUT_OBJECT_ACL,
+                    acl: NO_PUT_OBJECT_ACL.into(),
                 },
             )
             .unwrap();
@@ -13281,7 +13360,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -13297,7 +13376,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -13313,7 +13392,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -13329,7 +13408,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -13372,7 +13451,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -13410,7 +13489,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -13449,7 +13528,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -13505,7 +13584,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -13521,7 +13600,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -13624,7 +13703,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -13735,7 +13814,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -13776,7 +13855,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -13816,7 +13895,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -13854,7 +13933,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -13892,7 +13971,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -13938,7 +14017,7 @@ mod tests {
                 tags: None,
                 cond: &cond,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -13962,7 +14041,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -13980,7 +14059,7 @@ mod tests {
                 tags: None,
                 cond: &cond,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap_err();
@@ -14005,7 +14084,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -14022,7 +14101,7 @@ mod tests {
                 tags: None,
                 cond: &cond,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -14059,7 +14138,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -14076,7 +14155,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -14094,7 +14173,7 @@ mod tests {
                 tags: None,
                 cond: &cond,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap_err();
@@ -14119,7 +14198,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: Requester::principal("other-user"),
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap_err();
@@ -14151,7 +14230,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: PutObjectAcl::PublicRead,
+                acl: PutObjectAcl::PublicRead.into(),
             },
         )
         .unwrap_err();
@@ -14240,7 +14319,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
-                acl: PutObjectAcl::PublicRead,
+                acl: PutObjectAcl::PublicRead.into(),
             },
         )
         .unwrap_err();
@@ -14267,7 +14346,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
-                acl: PutObjectAcl::BucketOwnerRead,
+                acl: PutObjectAcl::BucketOwnerRead.into(),
             },
         )
         .unwrap_err();
@@ -14298,11 +14377,191 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
-                acl: PutObjectAcl::Invalid("definitely-not-a-real-acl"),
+                acl: PutObjectAcl::Invalid("definitely-not-a-real-acl").into(),
             },
         )
         .unwrap_err();
         assert!(matches!(err, ServerError::InvalidArgument { .. }));
+    }
+
+    #[test]
+    fn put_object_persists_explicit_acl_grants_on_write() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let owner = AccountIdentity::new(
+            "owner-a",
+            CanonicalUserId::from_principal("owner-write-grants-canonical"),
+            "Owner A",
+        );
+        let grantee = AccountIdentity::new(
+            "grantee-a",
+            CanonicalUserId::from_principal("grantee-write-grants-canonical"),
+            "Grantee A",
+        );
+        let owner_requester = Requester::authenticated(owner.clone());
+        let grantee_requester = Requester::authenticated(grantee.clone());
+
+        coord
+            .create_bucket_for_requester(&CreateBucketRequest {
+                name: "bucket",
+                requester: owner_requester.clone(),
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+            })
+            .unwrap();
+
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "key",
+                data: b"granted-read",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                requester: owner_requester.clone(),
+                acl: PutObjectWriteAcl::Grants(AclGrants::new(vec![
+                    AclGrant::new(
+                        AclGrantee::CanonicalUser(grantee.canonical_user_id().clone()),
+                        AclPermission::Read,
+                    ),
+                    AclGrant::new(
+                        AclGrantee::CanonicalUser(grantee.canonical_user_id().clone()),
+                        AclPermission::ReadAcp,
+                    ),
+                ])),
+            },
+        )
+        .unwrap();
+
+        let object = coord
+            .get_object(&GetObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: NO_READ,
+                requester: grantee_requester.clone(),
+            })
+            .unwrap();
+        assert_eq!(object.body.read_all().unwrap(), b"granted-read");
+
+        let acl = coord
+            .get_object_acl("bucket", "key", None, grantee_requester)
+            .unwrap();
+        assert!(grants_contain(
+            &acl.acl_grants,
+            &AclGrantee::CanonicalUser(grantee.canonical_user_id().clone()),
+            AclPermission::Read,
+        ));
+        assert!(grants_contain(
+            &acl.acl_grants,
+            &AclGrantee::CanonicalUser(grantee.canonical_user_id().clone()),
+            AclPermission::ReadAcp,
+        ));
+        assert!(grants_contain(
+            &acl.acl_grants,
+            &AclGrantee::CanonicalUser(owner.canonical_user_id().clone()),
+            AclPermission::FullControl,
+        ));
+    }
+
+    #[test]
+    fn put_object_rejects_write_acl_grants_on_write() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let owner = AccountIdentity::new(
+            "owner-a",
+            CanonicalUserId::from_principal("owner-write-grant-invalid-canonical"),
+            "Owner A",
+        );
+        let grantee = AccountIdentity::new(
+            "grantee-a",
+            CanonicalUserId::from_principal("grantee-write-grant-invalid-canonical"),
+            "Grantee A",
+        );
+        let owner_requester = Requester::authenticated(owner);
+
+        coord
+            .create_bucket_for_requester(&CreateBucketRequest {
+                name: "bucket",
+                requester: owner_requester.clone(),
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+            })
+            .unwrap();
+
+        let err = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "key",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                requester: owner_requester,
+                acl: PutObjectWriteAcl::Grants(AclGrants::new(vec![AclGrant::new(
+                    AclGrantee::CanonicalUser(grantee.canonical_user_id().clone()),
+                    AclPermission::Write,
+                )])),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ServerError::InvalidArgument { reason } if reason.contains("WRITE grants"))
+        );
+    }
+
+    #[test]
+    fn put_object_rejects_acl_grants_on_bucket_owner_enforced_bucket() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let owner = AccountIdentity::new(
+            "owner-a",
+            CanonicalUserId::from_principal("owner-boe-grants-canonical"),
+            "Owner A",
+        );
+        let grantee = AccountIdentity::new(
+            "grantee-a",
+            CanonicalUserId::from_principal("grantee-boe-grants-canonical"),
+            "Grantee A",
+        );
+        let owner_requester = Requester::authenticated(owner);
+
+        coord
+            .create_bucket_for_requester(&CreateBucketRequest {
+                name: "bucket",
+                requester: owner_requester.clone(),
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::BucketOwnerEnforced,
+            })
+            .unwrap();
+
+        let err = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "key",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                requester: owner_requester,
+                acl: PutObjectWriteAcl::Grants(AclGrants::new(vec![AclGrant::new(
+                    AclGrantee::CanonicalUser(grantee.canonical_user_id().clone()),
+                    AclPermission::Read,
+                )])),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ServerError::AccessControlListNotSupported));
     }
 
     #[test]
@@ -14324,7 +14583,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -14396,7 +14655,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -14434,7 +14693,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -14472,7 +14731,7 @@ mod tests {
                 tags: Some(tags_xml),
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
-                acl: PutObjectAcl::PublicRead,
+                acl: PutObjectAcl::PublicRead.into(),
             },
         )
         .unwrap();
@@ -14505,7 +14764,7 @@ mod tests {
                 tags: Some(tags_xml),
                 cond: NO_WRITE,
                 requester: Requester::principal("writer-a"),
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -14537,7 +14796,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -14596,7 +14855,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -14634,7 +14893,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: Requester::principal("writer-a"),
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -14672,7 +14931,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: Requester::principal("writer-a"),
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -14709,7 +14968,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
-                acl: PutObjectAcl::PublicRead,
+                acl: PutObjectAcl::PublicRead.into(),
             },
         )
         .unwrap();
@@ -14746,7 +15005,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
-                acl: PutObjectAcl::PublicRead,
+                acl: PutObjectAcl::PublicRead.into(),
             },
         )
         .unwrap();
@@ -14864,7 +15123,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -14916,7 +15175,7 @@ mod tests {
                 tags: None,
                 checksum: None,
                 requester: Requester::principal("other-user"),
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap_err();
@@ -14940,7 +15199,7 @@ mod tests {
                 tags: None,
                 checksum: None,
                 requester: Requester::principal("owner-a"),
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -14986,7 +15245,7 @@ mod tests {
                 tags: None,
                 checksum: None,
                 requester: TEST_REQUESTER,
-                acl: PutObjectAcl::PublicRead,
+                acl: PutObjectAcl::PublicRead.into(),
                 sse_customer: None,
             })
             .unwrap_err();
@@ -15010,7 +15269,7 @@ mod tests {
                 tags: None,
                 checksum: None,
                 requester: Requester::principal("owner-a"),
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -15046,7 +15305,7 @@ mod tests {
                 tags: None,
                 checksum: None,
                 requester: Requester::principal("owner-a"),
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -15075,7 +15334,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 requester: Requester::principal("other-user"),
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 encryption: ObjectEncryption::None,
             })
             .unwrap_err();
@@ -15099,7 +15358,7 @@ mod tests {
                 tags: None,
                 checksum: None,
                 requester: Requester::principal("owner-a"),
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -15137,7 +15396,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 requester: Requester::principal("owner-a"),
-                acl: PutObjectAcl::PublicRead,
+                acl: PutObjectAcl::PublicRead.into(),
                 encryption: ObjectEncryption::None,
             })
             .unwrap_err();
@@ -15162,7 +15421,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -15200,7 +15459,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -15240,7 +15499,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -15279,7 +15538,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -15318,7 +15577,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -15361,7 +15620,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -15397,7 +15656,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -15413,7 +15672,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -15462,7 +15721,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -15507,7 +15766,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -15526,7 +15785,7 @@ mod tests {
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
             })
@@ -15569,7 +15828,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -15588,7 +15847,7 @@ mod tests {
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
                 requester: Requester::principal("owner-b"),
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
             })
@@ -15617,7 +15876,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: Requester::principal("writer-a"),
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -15636,7 +15895,7 @@ mod tests {
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
                 requester: Requester::principal("owner-a"),
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
             })
@@ -15681,7 +15940,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: owner_requester.clone(),
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -15722,7 +15981,7 @@ mod tests {
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
                 requester: writer_requester.clone(),
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
             })
@@ -15779,7 +16038,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -15798,7 +16057,7 @@ mod tests {
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
-                acl: PutObjectAcl::PublicRead,
+                acl: PutObjectAcl::PublicRead.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
             })
@@ -15825,7 +16084,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -15851,7 +16110,7 @@ mod tests {
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
                 requester: Requester::principal("owner-a"),
-                acl: PutObjectAcl::PublicRead,
+                acl: PutObjectAcl::PublicRead.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
             })
@@ -15883,7 +16142,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -15902,7 +16161,7 @@ mod tests {
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
             })
@@ -15946,7 +16205,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -15972,7 +16231,7 @@ mod tests {
                 },
                 tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
             })
@@ -16016,7 +16275,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -16042,7 +16301,7 @@ mod tests {
                 },
                 tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
             })
@@ -16082,7 +16341,7 @@ mod tests {
                 tags: Some(tags_xml),
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -16101,7 +16360,7 @@ mod tests {
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
             })
@@ -16142,7 +16401,7 @@ mod tests {
                 tags: Some(src_tags),
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -16161,7 +16420,7 @@ mod tests {
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Replace(Some(dst_tags)),
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
             })
@@ -16200,7 +16459,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -16228,7 +16487,7 @@ mod tests {
                 },
                 tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
             })
@@ -16271,7 +16530,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -16297,7 +16556,7 @@ mod tests {
                 },
                 tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
             })
@@ -16356,7 +16615,7 @@ mod tests {
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
             })
@@ -16381,7 +16640,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -16400,7 +16659,7 @@ mod tests {
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
             })
@@ -16425,7 +16684,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -16448,7 +16707,7 @@ mod tests {
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
             })
@@ -16474,7 +16733,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -16490,7 +16749,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -16510,7 +16769,7 @@ mod tests {
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
             })
@@ -16536,7 +16795,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -16552,7 +16811,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -16572,7 +16831,7 @@ mod tests {
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
             })
@@ -16614,7 +16873,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -16633,7 +16892,7 @@ mod tests {
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
             })
@@ -16732,7 +16991,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: requester.clone(),
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -16748,7 +17007,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: requester.clone(),
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -16816,7 +17075,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: requester.clone(),
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -16832,7 +17091,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: requester.clone(),
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -17051,7 +17310,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap_err();
@@ -17085,7 +17344,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -17119,7 +17378,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 encryption,
             })
             .unwrap_err();
@@ -17142,7 +17401,7 @@ mod tests {
                 tags: None,
                 checksum: None,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: Some(&sse_customer),
             })
             .unwrap();
@@ -17188,7 +17447,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -17213,7 +17472,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -17248,7 +17507,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -17313,7 +17572,7 @@ mod tests {
                         tags: None,
                         cond: NO_WRITE,
                         requester: TEST_REQUESTER,
-                        acl: NO_PUT_OBJECT_ACL,
+                        acl: NO_PUT_OBJECT_ACL.into(),
                     },
                 )
             });
@@ -17331,7 +17590,7 @@ mod tests {
                         tags: None,
                         cond: NO_WRITE,
                         requester: TEST_REQUESTER,
-                        acl: NO_PUT_OBJECT_ACL,
+                        acl: NO_PUT_OBJECT_ACL.into(),
                     },
                 )
             });
@@ -17382,7 +17641,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -17412,7 +17671,7 @@ mod tests {
                         tags: None,
                         cond: NO_WRITE,
                         requester: TEST_REQUESTER,
-                        acl: NO_PUT_OBJECT_ACL,
+                        acl: NO_PUT_OBJECT_ACL.into(),
                     },
                 )
             });
@@ -17483,7 +17742,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -17515,7 +17774,7 @@ mod tests {
                         tags: None,
                         cond: NO_WRITE,
                         requester: TEST_REQUESTER,
-                        acl: NO_PUT_OBJECT_ACL,
+                        acl: NO_PUT_OBJECT_ACL.into(),
                     },
                 )
             });
@@ -17534,7 +17793,7 @@ mod tests {
                     directive: MetadataDirective::Copy,
                     tagging: TaggingDirective::Copy,
                     requester: TEST_REQUESTER,
-                    acl: NO_PUT_OBJECT_ACL,
+                    acl: NO_PUT_OBJECT_ACL.into(),
                     source_sse_customer: None,
                     dst_sse_customer: None,
                 })
@@ -17608,7 +17867,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -17627,7 +17886,7 @@ mod tests {
                     tags: None,
                     checksum: None,
                     requester: TEST_REQUESTER,
-                    acl: NO_PUT_OBJECT_ACL,
+                    acl: NO_PUT_OBJECT_ACL.into(),
                     sse_customer: None,
                 })
                 .unwrap();
@@ -17654,7 +17913,7 @@ mod tests {
                         tags: None,
                         cond: NO_WRITE,
                         requester: TEST_REQUESTER,
-                        acl: NO_PUT_OBJECT_ACL,
+                        acl: NO_PUT_OBJECT_ACL.into(),
                     },
                 )
             });
@@ -17759,7 +18018,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -17788,7 +18047,7 @@ mod tests {
                         tags: None,
                         cond: NO_WRITE,
                         requester: TEST_REQUESTER,
-                        acl: NO_PUT_OBJECT_ACL,
+                        acl: NO_PUT_OBJECT_ACL.into(),
                     },
                 )
             });
@@ -18022,7 +18281,7 @@ mod tests {
                 tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             })
             .unwrap();
         assert_object_maps_meta_pg_gt_shard_pg(&admin, "race-bucket", &key);
@@ -18098,7 +18357,7 @@ mod tests {
                 tags: None,
                 checksum: None,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -18191,7 +18450,7 @@ mod tests {
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
             })
@@ -18250,7 +18509,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -18286,7 +18545,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -18313,7 +18572,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -18327,7 +18586,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -18350,7 +18609,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap_err();
@@ -18394,7 +18653,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -18408,7 +18667,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -18480,7 +18739,7 @@ mod tests {
                 tags: None,
                 checksum: None,
                 requester: Requester::authenticated(writer.clone()),
-                acl: PutObjectAcl::BucketOwnerFullControl,
+                acl: PutObjectAcl::BucketOwnerFullControl.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -18557,7 +18816,7 @@ mod tests {
                 tags: None,
                 checksum: None,
                 requester: writer_requester.clone(),
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -18647,7 +18906,7 @@ mod tests {
                 tags: None,
                 checksum: None,
                 requester: Requester::anonymous(),
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap_err();
@@ -18703,7 +18962,7 @@ mod tests {
                 tags: None,
                 checksum: None,
                 requester: writer_requester.clone(),
-                acl: PutObjectAcl::BucketOwnerFullControl,
+                acl: PutObjectAcl::BucketOwnerFullControl.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -18785,7 +19044,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -18799,7 +19058,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -18846,7 +19105,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -18860,7 +19119,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -18874,7 +19133,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -18930,7 +19189,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -18944,7 +19203,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -18958,7 +19217,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -18994,7 +19253,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -19053,7 +19312,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -19091,7 +19350,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -19170,7 +19429,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -19273,7 +19532,7 @@ mod tests {
                     checksum: None,
 
                     requester: TEST_REQUESTER,
-                    acl: NO_PUT_OBJECT_ACL,
+                    acl: NO_PUT_OBJECT_ACL.into(),
                     sse_customer: None,
                 })
                 .unwrap();
@@ -19345,7 +19604,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -19406,7 +19665,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -19473,7 +19732,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -19513,7 +19772,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -19577,7 +19836,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -19662,7 +19921,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -19710,7 +19969,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -19771,7 +20030,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -19831,7 +20090,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -19920,7 +20179,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -20217,7 +20476,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -20567,7 +20826,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -20617,7 +20876,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -20706,7 +20965,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -20880,7 +21139,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -20940,7 +21199,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -21009,7 +21268,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -21069,7 +21328,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -21124,7 +21383,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -21181,7 +21440,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -21449,7 +21708,7 @@ mod tests {
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
             })
@@ -21606,7 +21865,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -21661,7 +21920,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -21726,7 +21985,7 @@ mod tests {
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
             })
@@ -21815,7 +22074,7 @@ mod tests {
                 tags: None,
                 checksum: Some(MultipartChecksumConfig::new(algo, ctype).unwrap()),
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -22228,7 +22487,7 @@ mod tests {
                 tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             })
             .unwrap();
 
@@ -22278,7 +22537,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -22351,7 +22610,7 @@ mod tests {
                 tags: None,
                 checksum: None,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: Some(&sse_customer),
             })
             .unwrap();
@@ -22420,7 +22679,7 @@ mod tests {
                 tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             })
             .unwrap();
 
@@ -22465,7 +22724,7 @@ mod tests {
                 tags: Some(tags_xml),
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             })
             .unwrap();
         assert_eq!(result.version_id, VersionId::Null);
@@ -22535,7 +22794,7 @@ mod tests {
                 tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             })
             .unwrap();
 
@@ -22578,7 +22837,7 @@ mod tests {
                 tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             })
             .unwrap_err();
         assert!(
@@ -22637,7 +22896,7 @@ mod tests {
                 tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             })
             .unwrap_err();
         assert!(
@@ -22678,7 +22937,7 @@ mod tests {
                 tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -22705,7 +22964,7 @@ mod tests {
                 tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             })
             .unwrap();
         assert_eq!(result.etag, format_etag(crc));
@@ -22743,7 +23002,7 @@ mod tests {
                 tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -22769,7 +23028,7 @@ mod tests {
                 tags: None,
                 cond: &cond,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             })
             .unwrap();
 
@@ -22793,7 +23052,7 @@ mod tests {
                 tags: None,
                 cond: &bad_cond,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             })
             .unwrap_err();
         assert!(
@@ -22837,7 +23096,7 @@ mod tests {
                 tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             })
             .unwrap();
         assert_eq!(result.etag, format_etag(crc));
@@ -22912,7 +23171,7 @@ mod tests {
                 tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             })
             .unwrap();
 
@@ -22977,7 +23236,7 @@ mod tests {
                 tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             })
             .unwrap();
 
@@ -23052,7 +23311,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             })
             .unwrap();
 
@@ -23115,7 +23374,7 @@ mod tests {
                 tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             })
             .unwrap();
 
@@ -23201,7 +23460,7 @@ mod tests {
                 tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             })
             .unwrap();
 
@@ -23220,7 +23479,7 @@ mod tests {
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
             })
@@ -23269,7 +23528,7 @@ mod tests {
                 tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -23315,7 +23574,7 @@ mod tests {
                 tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -23349,7 +23608,7 @@ mod tests {
                 tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -23401,7 +23660,7 @@ mod tests {
                 tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -23426,7 +23685,7 @@ mod tests {
                 tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -23467,7 +23726,7 @@ mod tests {
                 tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             })
             .unwrap();
 
@@ -23510,7 +23769,7 @@ mod tests {
                 tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             })
             .unwrap();
 
@@ -23555,7 +23814,7 @@ mod tests {
                 tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             })
             .unwrap();
 
@@ -23585,7 +23844,7 @@ mod tests {
                 tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -23629,7 +23888,7 @@ mod tests {
                 tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             })
             .unwrap();
 
@@ -23682,7 +23941,7 @@ mod tests {
                 tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             })
             .unwrap();
 
@@ -23743,7 +24002,7 @@ mod tests {
                 tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             })
             .unwrap();
 
@@ -23758,7 +24017,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -23818,7 +24077,7 @@ mod tests {
                 tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             })
             .unwrap();
 
@@ -23833,7 +24092,7 @@ mod tests {
                     MultipartChecksumConfig::new(ChecksumAlgorithm::Crc32c, None).unwrap(),
                 ),
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -23929,7 +24188,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -23943,7 +24202,7 @@ mod tests {
                 tags: None,
                 checksum: None,
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -24005,7 +24264,7 @@ mod tests {
                 tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             })
             .unwrap();
     }
@@ -24037,7 +24296,7 @@ mod tests {
                 tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             })
             .unwrap_err();
         assert!(
@@ -24112,7 +24371,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -24171,7 +24430,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -24232,7 +24491,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -24275,7 +24534,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -24289,7 +24548,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -24418,7 +24677,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
             })
             .unwrap();
@@ -24570,7 +24829,7 @@ mod tests {
                 tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             })
             .unwrap();
 
@@ -24661,7 +24920,7 @@ mod tests {
                 tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             })
             .unwrap();
 
@@ -24725,7 +24984,7 @@ mod tests {
                 tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -24810,7 +25069,7 @@ mod tests {
                 tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             })
             .unwrap();
 
@@ -24838,7 +25097,7 @@ mod tests {
                 tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
@@ -24882,7 +25141,7 @@ mod tests {
                 tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             })
             .unwrap();
 
@@ -24904,7 +25163,7 @@ mod tests {
                 tags: None,
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
-                acl: NO_PUT_OBJECT_ACL,
+                acl: NO_PUT_OBJECT_ACL.into(),
             })
             .unwrap();
 
