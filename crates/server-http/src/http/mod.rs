@@ -636,7 +636,9 @@ impl HttpFrontend {
                         .credentials
                         .find_account_by_canonical_user_id(id)
                         .map(|account| account.display_name().to_string()),
-                    s3_types::AclGrantee::AllUsers => None,
+                    s3_types::AclGrantee::AllUsers | s3_types::AclGrantee::AuthenticatedUsers => {
+                        None
+                    }
                 };
                 xml::RenderedAclGrant {
                     grantee: grant.grantee().clone(),
@@ -1554,6 +1556,12 @@ impl HttpFrontend {
                             reason: "x-amz-acl cannot be combined with ACL XML body".to_string(),
                         });
                     }
+                    if has_acl_grant_headers(req) {
+                        return Err(ServerError::InvalidArgument {
+                            reason: "x-amz-acl cannot be combined with x-amz-grant-* headers"
+                                .to_string(),
+                        });
+                    }
                     let acl = parse_put_object_acl(req.header("x-amz-acl"));
                     self.coordinator.put_object_canned_acl_for_request(
                         &crate::coordinator::PutObjectCannedAclRequest {
@@ -1703,6 +1711,12 @@ impl HttpFrontend {
                     if !req.body.is_empty() {
                         return Err(ServerError::InvalidArgument {
                             reason: "x-amz-acl cannot be combined with ACL XML body".to_string(),
+                        });
+                    }
+                    if has_acl_grant_headers(req) {
+                        return Err(ServerError::InvalidArgument {
+                            reason: "x-amz-acl cannot be combined with x-amz-grant-* headers"
+                                .to_string(),
                         });
                     }
                     let acl = parse_create_bucket_acl(req)?;
@@ -3911,13 +3925,131 @@ fn parse_create_bucket_acl(req: &S3Request) -> Result<crate::coordinator::Bucket
     }
 }
 
-fn parse_acl_grants(req: &S3Request) -> Result<s3_types::AclGrants, ServerError> {
-    if req.body.is_empty() {
+const ACL_GRANT_HEADERS: [(&str, s3_types::AclPermission); 5] = [
+    ("x-amz-grant-read", s3_types::AclPermission::Read),
+    ("x-amz-grant-write", s3_types::AclPermission::Write),
+    ("x-amz-grant-read-acp", s3_types::AclPermission::ReadAcp),
+    ("x-amz-grant-write-acp", s3_types::AclPermission::WriteAcp),
+    (
+        "x-amz-grant-full-control",
+        s3_types::AclPermission::FullControl,
+    ),
+];
+
+fn has_acl_grant_headers(req: &S3Request) -> bool {
+    ACL_GRANT_HEADERS
+        .iter()
+        .any(|(name, _)| req.header_count(name) > 0)
+}
+
+fn parse_acl_grant_header_value(
+    value: &str,
+    permission: s3_types::AclPermission,
+) -> Result<Vec<s3_types::AclGrant>, ServerError> {
+    let mut grants = Vec::new();
+    let mut remaining = value.trim();
+    if remaining.is_empty() {
         return Err(ServerError::InvalidArgument {
-            reason: "missing ACL XML body".to_string(),
+            reason: "empty ACL grant header value".to_string(),
         });
     }
-    xml::parse_acl_xml(&req.body)
+
+    while !remaining.is_empty() {
+        let (grantee_kind, rest) =
+            remaining
+                .split_once('=')
+                .ok_or_else(|| ServerError::InvalidArgument {
+                    reason: format!("invalid ACL grant header entry: {remaining}"),
+                })?;
+        let grantee_kind = grantee_kind.trim();
+        let rest = rest.trim_start();
+        let quoted = rest
+            .strip_prefix('"')
+            .ok_or_else(|| ServerError::InvalidArgument {
+                reason: format!("invalid ACL grant header entry: {remaining}"),
+            })?;
+        let quote_end = quoted
+            .find('"')
+            .ok_or_else(|| ServerError::InvalidArgument {
+                reason: format!("invalid ACL grant header entry: {remaining}"),
+            })?;
+        let grantee_value = &quoted[..quote_end];
+        let grantee = match grantee_kind {
+            "id" => s3_types::AclGrantee::CanonicalUser(
+                s3_types::CanonicalUserId::new(grantee_value).ok_or_else(|| {
+                    ServerError::InvalidArgument {
+                        reason: "invalid canonical user ID in ACL grant header".to_string(),
+                    }
+                })?,
+            ),
+            "uri" => s3_types::AclGrantee::parse_group_uri(grantee_value).ok_or_else(|| {
+                ServerError::InvalidArgument {
+                    reason: format!("unsupported ACL group URI: {grantee_value}"),
+                }
+            })?,
+            other => {
+                return Err(ServerError::InvalidArgument {
+                    reason: format!("unsupported ACL grant header grantee: {other}"),
+                });
+            }
+        };
+        grants.push(s3_types::AclGrant::new(grantee, permission));
+
+        remaining = quoted[quote_end + 1..].trim_start();
+        if remaining.is_empty() {
+            break;
+        }
+        remaining = remaining
+            .strip_prefix(',')
+            .ok_or_else(|| ServerError::InvalidArgument {
+                reason: format!("invalid ACL grant header entry: {remaining}"),
+            })?;
+        remaining = remaining.trim_start();
+        if remaining.is_empty() {
+            return Err(ServerError::InvalidArgument {
+                reason: format!("invalid ACL grant header entry: {value}"),
+            });
+        }
+    }
+
+    Ok(grants)
+}
+
+fn parse_acl_grants_headers(req: &S3Request) -> Result<Option<s3_types::AclGrants>, ServerError> {
+    if !has_acl_grant_headers(req) {
+        return Ok(None);
+    }
+
+    let mut grants = Vec::new();
+    for (header_name, permission) in ACL_GRANT_HEADERS {
+        for raw_value in req.headers.get_all(header_name).iter() {
+            let value = std::str::from_utf8(raw_value.as_bytes()).map_err(|_| {
+                ServerError::InvalidArgument {
+                    reason: format!("invalid UTF-8 in ACL grant header {header_name}"),
+                }
+            })?;
+            grants.extend(parse_acl_grant_header_value(value, permission)?);
+        }
+    }
+    Ok(Some(s3_types::AclGrants::new(grants)))
+}
+
+fn parse_acl_grants(req: &S3Request) -> Result<s3_types::AclGrants, ServerError> {
+    let header_grants = parse_acl_grants_headers(req)?;
+    if !req.body.is_empty() {
+        if header_grants.is_some() {
+            return Err(ServerError::InvalidArgument {
+                reason: "ACL XML body cannot be combined with x-amz-grant-* headers".to_string(),
+            });
+        }
+        return xml::parse_acl_xml(&req.body);
+    }
+    if let Some(grants) = header_grants {
+        return Ok(grants);
+    }
+    Err(ServerError::InvalidArgument {
+        reason: "missing ACL XML body".to_string(),
+    })
 }
 
 fn parse_bucket_ownership(
@@ -4036,6 +4168,217 @@ mod tests {
 
     fn test_headers(headers: Vec<(String, String)>) -> http::HeaderMap {
         request::header_map_from_owned(headers)
+    }
+
+    #[test]
+    fn parse_acl_grants_accepts_supported_header_grantees() {
+        let canonical_id = s3_types::CanonicalUserId::from_principal("grantee-a");
+        let req = new_req(
+            http::Method::PUT,
+            "/",
+            "",
+            vec![
+                (
+                    "x-amz-grant-read".to_string(),
+                    format!(
+                        "id=\"{}\", uri=\"{}\"",
+                        canonical_id.as_str(),
+                        s3_types::AclGrantee::all_users_uri()
+                    ),
+                ),
+                (
+                    "x-amz-grant-full-control".to_string(),
+                    format!("id=\"{}\"", canonical_id.as_str()),
+                ),
+            ],
+            vec![],
+        );
+
+        let grants = parse_acl_grants(&req).unwrap();
+        assert_eq!(
+            grants,
+            s3_types::AclGrants::new(vec![
+                s3_types::AclGrant::new(
+                    s3_types::AclGrantee::CanonicalUser(canonical_id.clone()),
+                    s3_types::AclPermission::Read,
+                ),
+                s3_types::AclGrant::new(
+                    s3_types::AclGrantee::AllUsers,
+                    s3_types::AclPermission::Read,
+                ),
+                s3_types::AclGrant::new(
+                    s3_types::AclGrantee::CanonicalUser(canonical_id),
+                    s3_types::AclPermission::FullControl,
+                ),
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_acl_grants_rejects_body_and_headers_together() {
+        let req = new_req(
+            http::Method::PUT,
+            "/",
+            "",
+            vec![(
+                "x-amz-grant-read".to_string(),
+                format!("uri=\"{}\"", s3_types::AclGrantee::all_users_uri()),
+            )],
+            b"<AccessControlPolicy/>".to_vec(),
+        );
+
+        match parse_acl_grants(&req) {
+            Err(ServerError::InvalidArgument { reason }) => {
+                assert!(reason.contains("cannot be combined"));
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_acl_grants_rejects_malformed_header_value() {
+        let req = new_req(
+            http::Method::PUT,
+            "/",
+            "",
+            vec![("x-amz-grant-read".to_string(), "id=no-quotes".to_string())],
+            vec![],
+        );
+
+        match parse_acl_grants(&req) {
+            Err(ServerError::InvalidArgument { .. }) => {}
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn put_bucket_acl_accepts_header_grants_and_renders_them() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+        let canonical_id = s3_types::CanonicalUserId::from_principal("grantee-a");
+
+        let put_req = new_req(
+            http::Method::PUT,
+            "/",
+            "acl",
+            vec![(
+                "x-amz-grant-read-acp".to_string(),
+                format!("id=\"{}\"", canonical_id.as_str()),
+            )],
+            vec![],
+        );
+        fe.dispatch_routed(
+            &put_req,
+            &test_auth(),
+            S3Operation::PutBucketAcl {
+                bucket: "mybucket".to_string(),
+            },
+        )
+        .unwrap();
+
+        let get_req = new_req(http::Method::GET, "/", "acl", vec![], vec![]);
+        let resp = fe
+            .dispatch_routed(
+                &get_req,
+                &test_auth(),
+                S3Operation::GetBucketAcl {
+                    bucket: "mybucket".to_string(),
+                },
+            )
+            .unwrap();
+        let body = String::from_utf8(resp.body).unwrap();
+        assert!(body.contains(canonical_id.as_str()));
+    }
+
+    #[test]
+    fn put_bucket_acl_rejects_authenticated_users_header_grant() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+
+        let put_req = new_req(
+            http::Method::PUT,
+            "/",
+            "acl",
+            vec![(
+                "x-amz-grant-read".to_string(),
+                format!(
+                    "uri=\"{}\"",
+                    s3_types::AclGrantee::authenticated_users_uri()
+                ),
+            )],
+            vec![],
+        );
+        match fe.dispatch_routed(
+            &put_req,
+            &test_auth(),
+            S3Operation::PutBucketAcl {
+                bucket: "mybucket".to_string(),
+            },
+        ) {
+            Err(ServerError::NotImplemented { feature }) => {
+                assert!(feature.contains("AuthenticatedUsers"));
+            }
+            Err(e) => panic!("expected NotImplemented, got {e:?}"),
+            Ok(_) => panic!("expected NotImplemented, got Ok"),
+        }
+    }
+
+    #[test]
+    fn put_object_acl_rejects_write_header_grant() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+        let metadata = crate::metadata_blob::MetadataBlob::default();
+        let system_metadata = server_core::system_metadata::SystemMetadata::default();
+        fe.coordinator
+            .put_object(&crate::coordinator::PutObjectRequest {
+                bucket: "mybucket",
+                key: "mykey",
+                data: b"data",
+                metadata: &metadata,
+                system_metadata: &system_metadata,
+                tags: None,
+                cond: &crate::conditional::WriteCondition::default(),
+                requester: crate::coordinator::Requester::principal("testuser"),
+                acl: crate::coordinator::PutObjectAcl::None,
+                sse_customer: None,
+                expected_bucket_owner: None,
+            })
+            .unwrap();
+
+        let canonical_id = s3_types::CanonicalUserId::from_principal("grantee-a");
+        let put_req = new_req(
+            http::Method::PUT,
+            "/",
+            "acl",
+            vec![(
+                "x-amz-grant-write".to_string(),
+                format!("id=\"{}\"", canonical_id.as_str()),
+            )],
+            vec![],
+        );
+        match fe.dispatch_routed(
+            &put_req,
+            &test_auth(),
+            S3Operation::PutObjectAcl {
+                bucket: "mybucket".to_string(),
+                key: "mykey".to_string(),
+            },
+        ) {
+            Err(ServerError::InvalidArgument { reason }) => {
+                assert!(reason.contains("WRITE grants"));
+            }
+            Err(e) => panic!("expected InvalidArgument, got {e:?}"),
+            Ok(_) => panic!("expected InvalidArgument, got Ok"),
+        }
     }
 
     fn content_md5_value(body: &[u8]) -> String {

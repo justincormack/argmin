@@ -3222,6 +3222,33 @@ impl Coordinator {
         AclGrants::new(grants)
     }
 
+    fn ensure_supported_bucket_acl_grants(acl_grants: &AclGrants) -> Result<(), ServerError> {
+        for grant in acl_grants.iter() {
+            if matches!(grant.grantee(), AclGrantee::AuthenticatedUsers) {
+                return Err(ServerError::NotImplemented {
+                    feature: "AuthenticatedUsers ACL grants".to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_supported_object_acl_grants(acl_grants: &AclGrants) -> Result<(), ServerError> {
+        for grant in acl_grants.iter() {
+            if grant.permission() == AclPermission::Write {
+                return Err(ServerError::InvalidArgument {
+                    reason: "object ACLs do not support WRITE grants".to_string(),
+                });
+            }
+            if matches!(grant.grantee(), AclGrantee::AuthenticatedUsers) {
+                return Err(ServerError::NotImplemented {
+                    feature: "AuthenticatedUsers ACL grants".to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     fn normalize_bucket_acl_grants(bucket: &BucketSummary, acl_grants: AclGrants) -> AclGrants {
         let mut grants: Vec<AclGrant> = acl_grants.iter().cloned().collect();
         grants.push(AclGrant::new(
@@ -4622,6 +4649,7 @@ impl Coordinator {
         if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_deref()) {
             return Err(ServerError::AccessControlListNotSupported);
         }
+        Self::ensure_supported_bucket_acl_grants(&acl_grants)?;
         let acl_grants = Self::normalize_bucket_acl_grants(&bucket_info, acl_grants);
         let public_read = Self::acl_grants_public_read(&acl_grants);
         let public_write = Self::acl_grants_public_write(&acl_grants);
@@ -4788,6 +4816,7 @@ impl Coordinator {
             record: stored,
             pgs,
         } = locked;
+        Self::ensure_supported_object_acl_grants(&acl_grants)?;
         Self::persist_locked_object_acl(bucket, key, &bucket_info, &stored, pgs.meta(), acl_grants)
     }
 

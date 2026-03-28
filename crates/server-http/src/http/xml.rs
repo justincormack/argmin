@@ -192,7 +192,11 @@ pub fn bucket_acl_xml(
                 display_name: None,
             });
         }
-        BucketAcl::AuthenticatedRead => {}
+        BucketAcl::AuthenticatedRead => grants.push(RenderedAclGrant {
+            grantee: AclGrantee::AuthenticatedUsers,
+            permission: AclPermission::Read,
+            display_name: None,
+        }),
     }
     acl_xml(owner_display_name, owner_canonical_id, &grants)
 }
@@ -212,9 +216,14 @@ fn append_rendered_acl_grant(xml: &mut String, grant: &RenderedAclGrant) {
                 xml.push_str("</DisplayName>");
             }
         }
-        AclGrantee::AllUsers => {
+        AclGrantee::AllUsers | AclGrantee::AuthenticatedUsers => {
             xml.push_str("Group\"><URI>");
-            xml.push_str(AclGrantee::all_users_uri());
+            xml.push_str(
+                grant
+                    .grantee
+                    .group_uri()
+                    .expect("group grantees always have a URI"),
+            );
             xml.push_str("</URI>");
         }
     }
@@ -3037,6 +3046,34 @@ mod tests {
         assert!(xml.contains(&format!("<Owner><ID>{}</ID>", owner_canonical_id.as_str())));
         assert!(xml.contains("<DisplayName>owner</DisplayName>"));
         assert!(xml.contains("CanonicalUser"));
+    }
+
+    #[test]
+    fn bucket_acl_xml_renders_authenticated_users_group() {
+        let owner_canonical_id = CanonicalUserId::from_principal("owner");
+        let xml = bucket_acl_xml("owner", &owner_canonical_id, BucketAcl::AuthenticatedRead);
+        assert!(xml.contains(AclGrantee::authenticated_users_uri()));
+        assert!(xml.contains("<Permission>READ</Permission>"));
+    }
+
+    #[test]
+    fn parse_acl_xml_accepts_authenticated_users_group() {
+        let grants = parse_acl_xml(
+            format!(
+                "<AccessControlPolicy><AccessControlList>\
+                 <Grant><Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"Group\">\
+                 <URI>{}</URI></Grantee><Permission>READ</Permission></Grant>\
+                 </AccessControlList></AccessControlPolicy>",
+                AclGrantee::authenticated_users_uri()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+
+        assert!(grants.iter().any(|grant| {
+            grant.grantee() == &AclGrantee::AuthenticatedUsers
+                && grant.permission() == AclPermission::Read
+        }));
     }
 
     #[test]

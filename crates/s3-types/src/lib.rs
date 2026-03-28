@@ -226,10 +226,12 @@ impl AclPermission {
 pub enum AclGrantee {
     CanonicalUser(CanonicalUserId),
     AllUsers,
+    AuthenticatedUsers,
 }
 
 impl AclGrantee {
     const ALL_USERS_TOKEN: &'static str = "all_users";
+    const AUTHENTICATED_USERS_TOKEN: &'static str = "authenticated_users";
 
     #[must_use]
     pub const fn all_users_uri() -> &'static str {
@@ -237,11 +239,25 @@ impl AclGrantee {
     }
 
     #[must_use]
+    pub const fn authenticated_users_uri() -> &'static str {
+        "http://acs.amazonaws.com/groups/global/AuthenticatedUsers"
+    }
+
+    #[must_use]
+    pub const fn group_uri(&self) -> Option<&'static str> {
+        match self {
+            Self::CanonicalUser(_) => None,
+            Self::AllUsers => Some(Self::all_users_uri()),
+            Self::AuthenticatedUsers => Some(Self::authenticated_users_uri()),
+        }
+    }
+
+    #[must_use]
     pub fn parse_group_uri(uri: &str) -> Option<Self> {
-        if uri == Self::all_users_uri() {
-            Some(Self::AllUsers)
-        } else {
-            None
+        match uri {
+            uri if uri == Self::all_users_uri() => Some(Self::AllUsers),
+            uri if uri == Self::authenticated_users_uri() => Some(Self::AuthenticatedUsers),
+            _ => None,
         }
     }
 
@@ -249,6 +265,7 @@ impl AclGrantee {
         match self {
             Self::CanonicalUser(id) => ("cu", id.as_str()),
             Self::AllUsers => ("group", Self::ALL_USERS_TOKEN),
+            Self::AuthenticatedUsers => ("group", Self::AUTHENTICATED_USERS_TOKEN),
         }
     }
 }
@@ -356,6 +373,9 @@ impl AclGrants {
                     })?)
                 }
                 "group" if value == AclGrantee::ALL_USERS_TOKEN => AclGrantee::AllUsers,
+                "group" if value == AclGrantee::AUTHENTICATED_USERS_TOKEN => {
+                    AclGrantee::AuthenticatedUsers
+                }
                 _ => return Err(format!("invalid ACL grantee on line {}", idx + 1)),
             };
             let permission = AclPermission::parse(permission_raw).ok_or_else(|| {
@@ -453,6 +473,7 @@ mod tests {
         let alt = CanonicalUserId::from_principal("alt");
         let grants = AclGrants::new(vec![
             AclGrant::new(AclGrantee::AllUsers, AclPermission::Read),
+            AclGrant::new(AclGrantee::AuthenticatedUsers, AclPermission::ReadAcp),
             AclGrant::new(
                 AclGrantee::CanonicalUser(alt.clone()),
                 AclPermission::FullControl,
@@ -464,6 +485,10 @@ mod tests {
         assert_eq!(parsed, grants);
         assert!(parsed.allows_all_users(AclPermission::Read));
         assert!(parsed.allows_canonical_user(&alt, AclPermission::WriteAcp));
+        assert!(parsed
+            .iter()
+            .any(|grant| grant.grantee() == &AclGrantee::AuthenticatedUsers
+                && grant.permission() == AclPermission::ReadAcp));
     }
 
     #[test]
