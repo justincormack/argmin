@@ -64,9 +64,6 @@ The ownership foundations work covered here is done.
 Remaining follow-up work is outside this plan:
 - broader ACL/header-grant coverage belongs to `plans/object-and-bucket-acls.md`
 - bucket-policy behavior belongs to `plans/bucket-policies.md`
-- the still-ignored multi-user bucket-create test in
-  `crates/s3-tests/tests/bucket_crud.rs` is a narrower follow-up than the
-  ownership substrate completed here
 
 Completed in Phase 1:
 - shared `AccountIdentity` type added for auth and request handling
@@ -338,7 +335,6 @@ Historical targeted integration tests for this plan:
 - `cargo test -p s3-tests --test presigned test_object_raw_get_x_amz_expires_not_expired_tenant -- --exact`
 
 Related remaining follow-up outside this plan:
-- `cargo test -p s3-tests --test bucket_crud test_bucket_create_exists_nonowner -- --ignored`
 
 Regression coverage to keep green while working:
 - `cargo test -p s3-tests --test ownership`
