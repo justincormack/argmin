@@ -34,8 +34,8 @@ The current implementation now supports a substantial ACL subset:
   reads and writes
 - direct `PutObject` supports canned ACLs and `x-amz-grant-*` headers on both
   small-body and promoted streaming paths
-- CopyObject canned destination ACLs and presigned PUT ACL handling are
-  implemented
+- CopyObject canned destination ACLs, multipart initiation canned ACL
+  persistence, and presigned PUT ACL handling are implemented
 - unsupported states such as object `WRITE` grants and `AuthenticatedUsers`
   enforcement are rejected rather than silently persisted
 
@@ -228,12 +228,11 @@ Success criteria:
 ### Phase 4: Canned ACLs On Write Paths
 
 Deliver:
-- CopyObject destination ACLs
-- multipart initiation ACL persistence
-- presigned PUT ACL handling
+- end-to-end integration coverage for multipart initiation ACL persistence
+- AWS validation for the CopyObject, multipart, and presigned canned ACL paths
 
 Success criteria:
-- copy canned ACL and presigned PUT ACL tests can be unignored
+- copy canned ACL, multipart canned ACL, and presigned PUT ACL tests pass
 
 ### Phase 5: Public Access Block Integration
 
@@ -251,6 +250,7 @@ Targeted integration tests:
 - `cargo test -p s3-tests --test object_crud test_object_header_acl_grants`
 - `cargo test -p s3-tests --test object_crud test_object_header_acl_grants_streaming_put`
 - `cargo test -p s3-tests --test copy_object test_object_copy_canned_acl`
+- `cargo test -p s3-tests --test multipart test_multipart_upload_canned_acl_persists_to_completed_object`
 - `cargo test -p s3-tests --test presigned test_object_presigned_put_object_with_acl`
 - `cargo test -p s3-tests --test public_access_block test_block_public_object_canned_acls -- --ignored`
 - `cargo test -p s3-tests --test versioning test_versioned_object_acl`

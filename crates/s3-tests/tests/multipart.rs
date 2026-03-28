@@ -7,8 +7,10 @@
 use std::collections::BTreeMap;
 
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::CompletedMultipartUpload;
-use aws_sdk_s3::types::CompletedPart;
+use aws_sdk_s3::types::{
+    CompletedMultipartUpload, CompletedPart, ObjectCannedAcl, ObjectOwnership, Permission,
+    PublicAccessBlockConfiguration,
+};
 use s3_tests::{
     assert_s3_err_code, copy_source_with_version, create_public_write_bucket,
     ensure_distinct_s3_owners_or_skip, err_status, unique_bucket, CTX,
@@ -21,6 +23,40 @@ async fn setup_bucket() -> String {
     let bucket = unique_bucket();
     client.create_bucket().bucket(&bucket).send().await.unwrap();
     bucket
+}
+
+async fn set_object_writer_ownership(bucket: &str) {
+    let rule = aws_sdk_s3::types::OwnershipControlsRule::builder()
+        .object_ownership(ObjectOwnership::ObjectWriter)
+        .build()
+        .unwrap();
+    let controls = aws_sdk_s3::types::OwnershipControls::builder()
+        .rules(rule)
+        .build()
+        .unwrap();
+    CTX.client()
+        .put_bucket_ownership_controls()
+        .bucket(bucket)
+        .ownership_controls(controls)
+        .send()
+        .await
+        .unwrap();
+}
+
+async fn disable_bucket_public_access_block(bucket: &str) {
+    let config = PublicAccessBlockConfiguration::builder()
+        .block_public_acls(false)
+        .ignore_public_acls(false)
+        .block_public_policy(false)
+        .restrict_public_buckets(false)
+        .build();
+    CTX.client()
+        .put_public_access_block()
+        .bucket(bucket)
+        .public_access_block_configuration(config)
+        .send()
+        .await
+        .unwrap();
 }
 
 async fn canonical_owner_id(client: &aws_sdk_s3::Client) -> String {
@@ -88,15 +124,22 @@ fn anon_agent() -> ureq::Agent {
 
 /// Helper: create multipart upload, upload parts, complete, return (etag, version_id).
 async fn do_multipart_upload(bucket: &str, key: &str, parts_data: &[Vec<u8>]) -> String {
+    do_multipart_upload_with_acl(bucket, key, parts_data, None).await
+}
+
+async fn do_multipart_upload_with_acl(
+    bucket: &str,
+    key: &str,
+    parts_data: &[Vec<u8>],
+    acl: Option<ObjectCannedAcl>,
+) -> String {
     let client = CTX.client();
 
-    let create = client
-        .create_multipart_upload()
-        .bucket(bucket)
-        .key(key)
-        .send()
-        .await
-        .unwrap();
+    let mut create_req = client.create_multipart_upload().bucket(bucket).key(key);
+    if let Some(acl) = acl {
+        create_req = create_req.acl(acl);
+    }
+    let create = create_req.send().await.unwrap();
     let upload_id = create.upload_id().unwrap();
 
     let mut completed_parts = Vec::new();
@@ -134,6 +177,13 @@ async fn do_multipart_upload(bucket: &str, key: &str, parts_data: &[Vec<u8>]) ->
         .await
         .unwrap();
     complete.e_tag().unwrap().to_string()
+}
+
+fn has_grant(grants: &[aws_sdk_s3::types::Grant], permission: Permission, uri: &str) -> bool {
+    grants.iter().any(|grant| {
+        grant.permission() == Some(&permission)
+            && grant.grantee().and_then(|grantee| grantee.uri()) == Some(uri)
+    })
 }
 
 // ── Basic lifecycle ─────────────────────────────────────────────────
@@ -188,6 +238,56 @@ fn test_multipart_upload_single_part() {
             .unwrap();
         let data = resp.body.collect().await.unwrap().into_bytes();
         assert_eq!(&data[..], &part[..]);
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_multipart_upload_canned_acl_persists_to_completed_object() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "multipart-public-read";
+        let body = vec![b'x'; 1024];
+
+        set_object_writer_ownership(&bucket).await;
+        disable_bucket_public_access_block(&bucket).await;
+
+        do_multipart_upload_with_acl(
+            &bucket,
+            key,
+            std::slice::from_ref(&body),
+            Some(ObjectCannedAcl::PublicRead),
+        )
+        .await;
+
+        let acl = client
+            .get_object_acl()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            has_grant(
+                acl.grants(),
+                Permission::Read,
+                "http://acs.amazonaws.com/groups/global/AllUsers",
+            ),
+            "expected READ grant for AllUsers, got {:?}",
+            acl.grants()
+        );
+
+        let get_url = format!("{}/{bucket}/{key}", CTX.endpoint());
+        let mut resp = anon_agent().get(&get_url).call().expect("transport error");
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "expected anonymous GET for multipart public-read object"
+        );
+        let data = resp.body_mut().read_to_vec().unwrap();
+        assert_eq!(&data[..], body.as_slice());
 
         cleanup(&bucket, &[key]).await;
     });
