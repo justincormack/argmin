@@ -68,6 +68,15 @@ this should move there as well.
 If you set `ARGMIN_SSE_C_VALIDATOR_KEY`, keep it stable for the lifetime of
 existing SSE-C objects. It is a base64-encoded 32-byte secret.
 
+For an existing data directory, treat these settings as stable:
+
+- `ARGMIN_PG_COUNT` is part of placement. Changing it without migration will
+  route buckets and objects to different PGs.
+- `ARGMIN_SSE_C_VALIDATOR_KEY` must remain stable for existing SSE-C objects.
+- `ARGMIN_EC_K` and `ARGMIN_EC_M` are stored per object, but reconfiguration is
+  not currently a supported operational workflow, so they should also be
+  treated as cluster-creation settings for now.
+
 Start the server:
 
 ```bash
