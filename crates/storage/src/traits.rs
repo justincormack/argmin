@@ -42,6 +42,7 @@ pub trait PgMetadataStore {
         name: &str,
         owner_principal: &str,
         owner_canonical_id: &CanonicalUserId,
+        acl_grants: &AclGrants,
         public_read: bool,
         public_write: bool,
     ) -> Result<(), MetadataError>;
@@ -122,6 +123,7 @@ pub trait PgMetadataStore {
     fn put_bucket_acl(
         &self,
         name: &str,
+        acl_grants: &AclGrants,
         public_read: bool,
         public_write: bool,
     ) -> Result<(), MetadataError>;
@@ -164,6 +166,16 @@ pub trait PgMetadataStore {
         key: &str,
         version_id: VersionId,
     ) -> Result<StoredObject, MetadataError>;
+
+    /// Update the ACL grants for a specific live object version.
+    fn put_object_acl(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: VersionId,
+        acl_grants: &AclGrants,
+        public_read: bool,
+    ) -> Result<(), MetadataError>;
 
     /// Delete all versions of an object's metadata.
     fn delete_object_meta(&self, bucket: &str, key: &str) -> Result<(), MetadataError>;

@@ -75,6 +75,17 @@ impl CredentialStore {
     pub fn get_record(&self, access_key_id: &str) -> Option<&CredentialRecord> {
         self.keys.get(access_key_id)
     }
+
+    /// Look up an account by canonical user ID.
+    pub fn find_account_by_canonical_user_id(
+        &self,
+        canonical_user_id: &s3_types::CanonicalUserId,
+    ) -> Option<&AccountIdentity> {
+        self.keys
+            .values()
+            .find(|record| record.account.canonical_user_id() == canonical_user_id)
+            .map(|record| &record.account)
+    }
 }
 
 impl Default for CredentialStore {

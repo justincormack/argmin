@@ -10,7 +10,9 @@ use checksum::ChecksumAlgorithm;
 use quick_xml::{escape::unescape, events::Event, Reader};
 #[cfg(test)]
 use s3_types::VersionId;
-use s3_types::{BucketVersioningState, CanonicalUserId};
+use s3_types::{
+    AclGrant, AclGrantee, AclGrants, AclPermission, BucketVersioningState, CanonicalUserId,
+};
 use storage::BucketEncryptionConfig;
 
 use super::response::format_version_id;
@@ -97,11 +99,19 @@ pub fn list_buckets_xml(
 }
 
 /// Format a `GetBucketAcl` XML response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedAclGrant {
+    pub grantee: AclGrantee,
+    pub permission: AclPermission,
+    pub display_name: Option<String>,
+}
+
+/// Format a `GetBucketAcl`/`GetObjectAcl` XML response.
 #[must_use]
-pub fn bucket_acl_xml(
-    owner_principal: &str,
+pub fn acl_xml(
+    owner_display_name: &str,
     owner_canonical_id: &CanonicalUserId,
-    acl: BucketAcl,
+    grants: &[RenderedAclGrant],
 ) -> String {
     let mut xml = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -110,46 +120,234 @@ pub fn bucket_acl_xml(
     );
     xml.push_str(&xml_escape(owner_canonical_id.as_str()));
     xml.push_str("</ID><DisplayName>");
-    xml.push_str(&xml_escape(owner_principal));
+    xml.push_str(&xml_escape(owner_display_name));
     xml.push_str("</DisplayName></Owner><AccessControlList>");
-    append_canonical_user_grant(
-        &mut xml,
-        owner_principal,
-        owner_canonical_id,
-        "FULL_CONTROL",
-    );
-    match acl {
-        BucketAcl::Private => {}
-        BucketAcl::PublicRead => append_all_users_grant(&mut xml, "READ"),
-        BucketAcl::PublicReadWrite => {
-            append_all_users_grant(&mut xml, "READ");
-            append_all_users_grant(&mut xml, "WRITE");
-        }
-        BucketAcl::AuthenticatedRead => {}
+    for grant in grants {
+        append_rendered_acl_grant(&mut xml, grant);
     }
     xml.push_str("</AccessControlList></AccessControlPolicy>");
     xml
 }
 
-fn append_canonical_user_grant(
-    xml: &mut String,
-    owner_principal: &str,
+#[must_use]
+pub fn bucket_acl_xml(
+    owner_display_name: &str,
     owner_canonical_id: &CanonicalUserId,
-    permission: &str,
-) {
-    xml.push_str("<Grant><Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"CanonicalUser\"><ID>");
-    xml.push_str(&xml_escape(owner_canonical_id.as_str()));
-    xml.push_str("</ID><DisplayName>");
-    xml.push_str(&xml_escape(owner_principal));
-    xml.push_str("</DisplayName></Grantee><Permission>");
-    xml.push_str(permission);
+    acl: BucketAcl,
+) -> String {
+    let mut grants = vec![RenderedAclGrant {
+        grantee: AclGrantee::CanonicalUser(owner_canonical_id.clone()),
+        permission: AclPermission::FullControl,
+        display_name: Some(owner_display_name.to_string()),
+    }];
+    match acl {
+        BucketAcl::Private => {}
+        BucketAcl::PublicRead => grants.push(RenderedAclGrant {
+            grantee: AclGrantee::AllUsers,
+            permission: AclPermission::Read,
+            display_name: None,
+        }),
+        BucketAcl::PublicReadWrite => {
+            grants.push(RenderedAclGrant {
+                grantee: AclGrantee::AllUsers,
+                permission: AclPermission::Read,
+                display_name: None,
+            });
+            grants.push(RenderedAclGrant {
+                grantee: AclGrantee::AllUsers,
+                permission: AclPermission::Write,
+                display_name: None,
+            });
+        }
+        BucketAcl::AuthenticatedRead => {}
+    }
+    acl_xml(owner_display_name, owner_canonical_id, &grants)
+}
+
+fn append_rendered_acl_grant(xml: &mut String, grant: &RenderedAclGrant) {
+    xml.push_str(
+        "<Grant><Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"",
+    );
+    match &grant.grantee {
+        AclGrantee::CanonicalUser(id) => {
+            xml.push_str("CanonicalUser\"><ID>");
+            xml.push_str(&xml_escape(id.as_str()));
+            xml.push_str("</ID>");
+            if let Some(display_name) = &grant.display_name {
+                xml.push_str("<DisplayName>");
+                xml.push_str(&xml_escape(display_name));
+                xml.push_str("</DisplayName>");
+            }
+        }
+        AclGrantee::AllUsers => {
+            xml.push_str("Group\"><URI>");
+            xml.push_str(AclGrantee::all_users_uri());
+            xml.push_str("</URI>");
+        }
+    }
+    xml.push_str("</Grantee><Permission>");
+    xml.push_str(grant.permission.as_str());
     xml.push_str("</Permission></Grant>");
 }
 
-fn append_all_users_grant(xml: &mut String, permission: &str) {
-    xml.push_str("<Grant><Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"Group\"><URI>http://acs.amazonaws.com/groups/global/AllUsers</URI></Grantee><Permission>");
-    xml.push_str(permission);
-    xml.push_str("</Permission></Grant>");
+pub fn parse_acl_xml(data: &[u8]) -> Result<AclGrants, ServerError> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum TextField {
+        Permission,
+        GranteeId,
+        GranteeUri,
+    }
+
+    let mut reader = Reader::from_reader(data);
+    reader.config_mut().trim_text(true);
+
+    let mut buf = Vec::new();
+    let mut grants = Vec::new();
+    let mut current_grantee_type: Option<String> = None;
+    let mut current_grantee: Option<AclGrantee> = None;
+    let mut current_permission: Option<AclPermission> = None;
+    let mut current_text_field: Option<TextField> = None;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => match e.local_name().as_ref() {
+                b"Grantee" => {
+                    current_grantee_type = None;
+                    current_grantee = None;
+                    for attr in e.attributes() {
+                        let attr = attr.map_err(|_| ServerError::InvalidArgument {
+                            reason: "invalid ACL XML attributes".to_string(),
+                        })?;
+                        if attr.key.as_ref().ends_with(b"type") {
+                            current_grantee_type = Some(
+                                attr.decode_and_unescape_value(reader.decoder())
+                                    .map_err(|_| ServerError::InvalidArgument {
+                                        reason: "invalid ACL grantee type".to_string(),
+                                    })?
+                                    .into_owned(),
+                            );
+                        }
+                    }
+                }
+                b"ID" => current_text_field = Some(TextField::GranteeId),
+                b"URI" => current_text_field = Some(TextField::GranteeUri),
+                b"Permission" => current_text_field = Some(TextField::Permission),
+                _ => {}
+            },
+            Ok(Event::Empty(e)) if e.local_name().as_ref() == b"Grantee" => {
+                current_grantee_type = None;
+                current_grantee = None;
+                for attr in e.attributes() {
+                    let attr = attr.map_err(|_| ServerError::InvalidArgument {
+                        reason: "invalid ACL XML attributes".to_string(),
+                    })?;
+                    if attr.key.as_ref().ends_with(b"type") {
+                        current_grantee_type = Some(
+                            attr.decode_and_unescape_value(reader.decoder())
+                                .map_err(|_| ServerError::InvalidArgument {
+                                    reason: "invalid ACL grantee type".to_string(),
+                                })?
+                                .into_owned(),
+                        );
+                    }
+                }
+            }
+            Ok(Event::Text(e)) => {
+                let Some(field) = current_text_field else {
+                    buf.clear();
+                    continue;
+                };
+                let text = decode_xml_text(
+                    e.as_ref(),
+                    "invalid UTF-8 in ACL XML",
+                    "invalid escaped text in ACL XML",
+                )?;
+                match field {
+                    TextField::Permission => {
+                        current_permission =
+                            Some(AclPermission::parse(text.trim()).ok_or_else(|| {
+                                ServerError::InvalidArgument {
+                                    reason: format!("unsupported ACL permission: {}", text.trim()),
+                                }
+                            })?);
+                    }
+                    TextField::GranteeId => {
+                        let grantee_type = current_grantee_type.as_deref().ok_or_else(|| {
+                            ServerError::InvalidArgument {
+                                reason: "missing ACL grantee type".to_string(),
+                            }
+                        })?;
+                        if grantee_type != "CanonicalUser" {
+                            return Err(ServerError::InvalidArgument {
+                                reason: format!("unsupported ACL grantee type: {grantee_type}"),
+                            });
+                        }
+                        current_grantee = Some(AclGrantee::CanonicalUser(
+                            CanonicalUserId::new(text.trim()).ok_or_else(|| {
+                                ServerError::InvalidArgument {
+                                    reason: "invalid canonical user ID in ACL XML".to_string(),
+                                }
+                            })?,
+                        ));
+                    }
+                    TextField::GranteeUri => {
+                        let grantee_type = current_grantee_type.as_deref().ok_or_else(|| {
+                            ServerError::InvalidArgument {
+                                reason: "missing ACL grantee type".to_string(),
+                            }
+                        })?;
+                        if grantee_type != "Group" {
+                            return Err(ServerError::InvalidArgument {
+                                reason: format!("unsupported ACL grantee type: {grantee_type}"),
+                            });
+                        }
+                        current_grantee =
+                            Some(AclGrantee::parse_group_uri(text.trim()).ok_or_else(|| {
+                                ServerError::InvalidArgument {
+                                    reason: format!("unsupported ACL group URI: {}", text.trim()),
+                                }
+                            })?);
+                    }
+                }
+            }
+            Ok(Event::End(e)) => match e.local_name().as_ref() {
+                b"ID" | b"URI" | b"Permission" => {
+                    current_text_field = None;
+                }
+                b"Grant" => {
+                    let grantee =
+                        current_grantee
+                            .take()
+                            .ok_or_else(|| ServerError::InvalidArgument {
+                                reason: "missing ACL grantee".to_string(),
+                            })?;
+                    let permission =
+                        current_permission
+                            .take()
+                            .ok_or_else(|| ServerError::InvalidArgument {
+                                reason: "missing ACL permission".to_string(),
+                            })?;
+                    grants.push(AclGrant::new(grantee, permission));
+                }
+                _ => {}
+            },
+            Ok(Event::Eof) => break,
+            Ok(Event::Decl(_))
+            | Ok(Event::DocType(_))
+            | Ok(Event::Comment(_))
+            | Ok(Event::CData(_))
+            | Ok(Event::PI(_))
+            | Ok(Event::Empty(_)) => {}
+            Err(_) => {
+                return Err(ServerError::InvalidArgument {
+                    reason: "malformed ACL XML".to_string(),
+                });
+            }
+        }
+        buf.clear();
+    }
+
+    Ok(AclGrants::new(grants))
 }
 
 /// Format a `ListBucketResult` (`ListObjectsV2`) XML response.
@@ -2767,6 +2965,7 @@ mod tests {
             owner_principal: "owner".to_string(),
             owner_canonical_id: CanonicalUserId::from_principal("owner"),
             created_at: 1685000000000,
+            acl_grants: s3_types::AclGrants::default(),
             versioning: BucketVersioningState::Disabled,
             public_read: false,
             public_write: false,

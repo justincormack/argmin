@@ -599,6 +599,47 @@ impl HttpFrontend {
         auth.account.as_ref().ok_or(ServerError::AccessDenied)
     }
 
+    fn acl_owner_display_name(
+        &self,
+        owner_principal: &str,
+        owner_canonical_id: &s3_types::CanonicalUserId,
+    ) -> String {
+        self.credentials
+            .find_account_by_canonical_user_id(owner_canonical_id)
+            .map(|account| account.display_name().to_string())
+            .unwrap_or_else(|| owner_principal.to_string())
+    }
+
+    fn render_acl_grants(
+        &self,
+        owner_principal: &str,
+        owner_canonical_id: &s3_types::CanonicalUserId,
+        acl_grants: &s3_types::AclGrants,
+    ) -> (String, Vec<xml::RenderedAclGrant>) {
+        let owner_display_name = self.acl_owner_display_name(owner_principal, owner_canonical_id);
+        let grants = acl_grants
+            .iter()
+            .map(|grant| {
+                let display_name = match grant.grantee() {
+                    s3_types::AclGrantee::CanonicalUser(id) if id == owner_canonical_id => {
+                        Some(owner_display_name.clone())
+                    }
+                    s3_types::AclGrantee::CanonicalUser(id) => self
+                        .credentials
+                        .find_account_by_canonical_user_id(id)
+                        .map(|account| account.display_name().to_string()),
+                    s3_types::AclGrantee::AllUsers => None,
+                };
+                xml::RenderedAclGrant {
+                    grantee: grant.grantee().clone(),
+                    permission: grant.permission(),
+                    display_name,
+                }
+            })
+            .collect();
+        (owner_display_name, grants)
+    }
+
     fn dispatch_routed(
         &self,
         req: &S3Request,
@@ -629,7 +670,7 @@ impl HttpFrontend {
                 ))
             }
             S3Operation::CreateBucket { bucket } => {
-                let acl = parse_bucket_acl(req)?;
+                let acl = parse_create_bucket_acl(req)?;
                 let ownership = parse_bucket_ownership(req.header("x-amz-object-ownership"))?;
                 let requester = Self::requester_from_auth(auth);
                 self.coordinator.create_bucket_for_requester(
@@ -1332,6 +1373,42 @@ impl HttpFrontend {
                     .delete_object_tags(&bucket, &key, vid, requester)?;
                 Ok(S3Response::delete_object_tagging())
             }
+            S3Operation::GetObjectAcl { bucket, key } => {
+                let version_id = parse_version_id(req)?;
+                let requester = Self::requester_from_auth(auth);
+                let result = self
+                    .coordinator
+                    .get_object_acl(&bucket, &key, version_id, requester)?;
+                let (owner_display_name, grants) = self.render_acl_grants(
+                    &result.owner_principal,
+                    &result.owner_canonical_id,
+                    &result.acl_grants,
+                );
+                Ok(S3Response::get_object_acl(
+                    &result,
+                    &owner_display_name,
+                    &grants,
+                ))
+            }
+            S3Operation::PutObjectAcl { bucket, key } => {
+                let version_id = parse_version_id(req)?;
+                let requester = Self::requester_from_auth(auth);
+                let result_version_id = if req.header("x-amz-acl").is_some() {
+                    if !req.body.is_empty() {
+                        return Err(ServerError::InvalidArgument {
+                            reason: "x-amz-acl cannot be combined with ACL XML body".to_string(),
+                        });
+                    }
+                    let acl = parse_put_object_acl(req.header("x-amz-acl"));
+                    self.coordinator
+                        .put_object_canned_acl(&bucket, &key, version_id, acl, requester)?
+                } else {
+                    let acl_grants = parse_acl_grants(req)?;
+                    self.coordinator
+                        .put_object_acl(&bucket, &key, version_id, acl_grants, requester)?
+                };
+                Ok(S3Response::put_object_acl(result_version_id))
+            }
             S3Operation::PutBucketPublicAccessBlock { bucket } => {
                 let config = xml::parse_public_access_block_xml(&req.body)?;
                 let config_xml = xml::get_public_access_block_xml(&config);
@@ -1391,12 +1468,33 @@ impl HttpFrontend {
             S3Operation::GetBucketAcl { bucket } => {
                 let requester = Self::requester_from_auth(auth);
                 let result = self.coordinator.get_bucket_acl(&bucket, requester)?;
-                Ok(S3Response::get_bucket_acl(&result))
+                let (owner_display_name, grants) = self.render_acl_grants(
+                    &result.owner_principal,
+                    &result.owner_canonical_id,
+                    &result.acl_grants,
+                );
+                Ok(S3Response::get_bucket_acl(
+                    &result,
+                    &owner_display_name,
+                    &grants,
+                ))
             }
             S3Operation::PutBucketAcl { bucket } => {
-                let acl = parse_bucket_acl(req)?;
                 let requester = Self::requester_from_auth(auth);
-                self.coordinator.put_bucket_acl(&bucket, acl, requester)?;
+                if req.header("x-amz-acl").is_some() {
+                    if !req.body.is_empty() {
+                        return Err(ServerError::InvalidArgument {
+                            reason: "x-amz-acl cannot be combined with ACL XML body".to_string(),
+                        });
+                    }
+                    let acl = parse_create_bucket_acl(req)?;
+                    self.coordinator
+                        .put_bucket_canned_acl(&bucket, acl, requester)?;
+                } else {
+                    let acl_grants = parse_acl_grants(req)?;
+                    self.coordinator
+                        .put_bucket_acl(&bucket, acl_grants, requester)?;
+                }
                 Ok(S3Response::put_bucket_acl())
             }
             S3Operation::CreateMultipartUpload { bucket, key } => {
@@ -3551,7 +3649,7 @@ fn add_tagging_count_header(resp: &mut S3Response, tags_xml: &str) -> Result<(),
     Ok(())
 }
 
-fn parse_bucket_acl(req: &S3Request) -> Result<crate::coordinator::BucketAcl, ServerError> {
+fn parse_create_bucket_acl(req: &S3Request) -> Result<crate::coordinator::BucketAcl, ServerError> {
     match req.header("x-amz-acl") {
         None | Some("private") => Ok(crate::coordinator::BucketAcl::Private),
         Some("public-read") => Ok(crate::coordinator::BucketAcl::PublicRead),
@@ -3561,6 +3659,15 @@ fn parse_bucket_acl(req: &S3Request) -> Result<crate::coordinator::BucketAcl, Se
             reason: format!("unsupported x-amz-acl value: {other}"),
         }),
     }
+}
+
+fn parse_acl_grants(req: &S3Request) -> Result<s3_types::AclGrants, ServerError> {
+    if req.body.is_empty() {
+        return Err(ServerError::InvalidArgument {
+            reason: "missing ACL XML body".to_string(),
+        });
+    }
+    xml::parse_acl_xml(&req.body)
 }
 
 fn parse_bucket_ownership(

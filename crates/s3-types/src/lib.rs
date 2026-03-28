@@ -84,7 +84,7 @@ impl std::fmt::Display for VersionId {
 }
 
 /// Canonical S3 owner ID used in XML owner fields.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CanonicalUserId(String);
 
 impl CanonicalUserId {
@@ -181,10 +181,198 @@ impl AccountIdentity {
     }
 }
 
+/// Stored ACL permission used on bucket and object ACL surfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum AclPermission {
+    Read,
+    Write,
+    ReadAcp,
+    WriteAcp,
+    FullControl,
+}
+
+impl AclPermission {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "READ",
+            Self::Write => "WRITE",
+            Self::ReadAcp => "READ_ACP",
+            Self::WriteAcp => "WRITE_ACP",
+            Self::FullControl => "FULL_CONTROL",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "READ" => Some(Self::Read),
+            "WRITE" => Some(Self::Write),
+            "READ_ACP" => Some(Self::ReadAcp),
+            "WRITE_ACP" => Some(Self::WriteAcp),
+            "FULL_CONTROL" => Some(Self::FullControl),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn implies(self, requested: Self) -> bool {
+        matches!(self, Self::FullControl) || self == requested
+    }
+}
+
+/// Supported ACL grantees for the currently modeled ACL surface.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum AclGrantee {
+    CanonicalUser(CanonicalUserId),
+    AllUsers,
+}
+
+impl AclGrantee {
+    const ALL_USERS_TOKEN: &'static str = "all_users";
+
+    #[must_use]
+    pub const fn all_users_uri() -> &'static str {
+        "http://acs.amazonaws.com/groups/global/AllUsers"
+    }
+
+    #[must_use]
+    pub fn parse_group_uri(uri: &str) -> Option<Self> {
+        if uri == Self::all_users_uri() {
+            Some(Self::AllUsers)
+        } else {
+            None
+        }
+    }
+
+    fn serialize_tag(&self) -> (&'static str, &str) {
+        match self {
+            Self::CanonicalUser(id) => ("cu", id.as_str()),
+            Self::AllUsers => ("group", Self::ALL_USERS_TOKEN),
+        }
+    }
+}
+
+/// A single ACL grant.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AclGrant {
+    grantee: AclGrantee,
+    permission: AclPermission,
+}
+
+impl AclGrant {
+    #[must_use]
+    pub fn new(grantee: AclGrantee, permission: AclPermission) -> Self {
+        Self {
+            grantee,
+            permission,
+        }
+    }
+
+    #[must_use]
+    pub fn grantee(&self) -> &AclGrantee {
+        &self.grantee
+    }
+
+    #[must_use]
+    pub const fn permission(&self) -> AclPermission {
+        self.permission
+    }
+}
+
+/// Canonical stored ACL grants for a bucket or object.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct AclGrants(Vec<AclGrant>);
+
+impl AclGrants {
+    #[must_use]
+    pub fn new(mut grants: Vec<AclGrant>) -> Self {
+        grants.sort();
+        grants.dedup();
+        Self(grants)
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &AclGrant> {
+        self.0.iter()
+    }
+
+    #[must_use]
+    pub fn allows_canonical_user(
+        &self,
+        canonical_user_id: &CanonicalUserId,
+        permission: AclPermission,
+    ) -> bool {
+        self.0.iter().any(|grant| {
+            matches!(grant.grantee(), AclGrantee::CanonicalUser(id) if id == canonical_user_id)
+                && grant.permission().implies(permission)
+        })
+    }
+
+    #[must_use]
+    pub fn allows_all_users(&self, permission: AclPermission) -> bool {
+        self.0.iter().any(|grant| {
+            matches!(grant.grantee(), AclGrantee::AllUsers)
+                && grant.permission().implies(permission)
+        })
+    }
+
+    #[must_use]
+    pub fn serialized(&self) -> String {
+        let mut out = String::new();
+        for grant in &self.0 {
+            let (kind, value) = grant.grantee().serialize_tag();
+            let _ = writeln!(out, "{kind}:{value}:{}", grant.permission().as_str());
+        }
+        out
+    }
+
+    pub fn parse(serialized: &str) -> Result<Self, String> {
+        if serialized.is_empty() {
+            return Ok(Self::default());
+        }
+
+        let mut grants = Vec::new();
+        for (idx, line) in serialized.lines().enumerate() {
+            let mut parts = line.splitn(3, ':');
+            let kind = parts
+                .next()
+                .ok_or_else(|| format!("missing ACL grant kind on line {}", idx + 1))?;
+            let value = parts
+                .next()
+                .ok_or_else(|| format!("missing ACL grant value on line {}", idx + 1))?;
+            let permission_raw = parts
+                .next()
+                .ok_or_else(|| format!("missing ACL grant permission on line {}", idx + 1))?;
+
+            let grantee = match kind {
+                "cu" => {
+                    AclGrantee::CanonicalUser(CanonicalUserId::new(value).ok_or_else(|| {
+                        format!("invalid canonical user id in ACL grant on line {}", idx + 1)
+                    })?)
+                }
+                "group" if value == AclGrantee::ALL_USERS_TOKEN => AclGrantee::AllUsers,
+                _ => return Err(format!("invalid ACL grantee on line {}", idx + 1)),
+            };
+            let permission = AclPermission::parse(permission_raw).ok_or_else(|| {
+                format!("invalid ACL permission in ACL grant on line {}", idx + 1)
+            })?;
+            grants.push(AclGrant::new(grantee, permission));
+        }
+
+        Ok(Self::new(grants))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        AccountIdentity, BucketVersioningState, CanonicalUserId, VersionId, CANONICAL_USER_ID_LEN,
+        AccountIdentity, AclGrant, AclGrantee, AclGrants, AclPermission, BucketVersioningState,
+        CanonicalUserId, VersionId, CANONICAL_USER_ID_LEN,
     };
 
     #[test]
@@ -258,5 +446,31 @@ mod tests {
         assert_eq!(account.principal(), "owner-a");
         assert_eq!(account.display_name(), "Owner A");
         assert_eq!(account.canonical_user_id(), &canonical);
+    }
+
+    #[test]
+    fn acl_grants_round_trip_and_normalize() {
+        let alt = CanonicalUserId::from_principal("alt");
+        let grants = AclGrants::new(vec![
+            AclGrant::new(AclGrantee::AllUsers, AclPermission::Read),
+            AclGrant::new(
+                AclGrantee::CanonicalUser(alt.clone()),
+                AclPermission::FullControl,
+            ),
+            AclGrant::new(AclGrantee::AllUsers, AclPermission::Read),
+        ]);
+        let serialized = grants.serialized();
+        let parsed = AclGrants::parse(&serialized).unwrap();
+        assert_eq!(parsed, grants);
+        assert!(parsed.allows_all_users(AclPermission::Read));
+        assert!(parsed.allows_canonical_user(&alt, AclPermission::WriteAcp));
+    }
+
+    #[test]
+    fn acl_permission_parse_and_implication() {
+        assert_eq!(AclPermission::parse("READ"), Some(AclPermission::Read));
+        assert_eq!(AclPermission::parse("bogus"), None);
+        assert!(AclPermission::FullControl.implies(AclPermission::ReadAcp));
+        assert!(!AclPermission::Read.implies(AclPermission::Write));
     }
 }

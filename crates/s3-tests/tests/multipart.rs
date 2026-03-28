@@ -7,7 +7,7 @@
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::CompletedMultipartUpload;
 use aws_sdk_s3::types::CompletedPart;
-use s3_tests::{assert_s3_err_code, err_status, unique_bucket, CTX};
+use s3_tests::{assert_s3_err_code, copy_source_with_version, err_status, unique_bucket, CTX};
 
 const PART_SIZE: usize = 5 * 1024 * 1024; // 5 MB minimum part size
 
@@ -2046,7 +2046,7 @@ fn test_multipart_copy_versioned() {
             .key(dst_key)
             .upload_id(upload_id)
             .part_number(1)
-            .copy_source(format!("{}/{}?versionId={}", bucket, src_key, v1_id))
+            .copy_source(copy_source_with_version(&bucket, src_key, &v1_id))
             .send()
             .await
             .unwrap();
@@ -2216,10 +2216,7 @@ fn test_multipart_copy_delete_marker_version_id() {
             .key(dst_key)
             .upload_id(upload_id)
             .part_number(1)
-            .copy_source(format!(
-                "{}/{}?versionId={}",
-                bucket, src_key, dm_version_id
-            ))
+            .copy_source(copy_source_with_version(&bucket, src_key, dm_version_id))
             .send()
             .await;
         assert!(result.is_err());

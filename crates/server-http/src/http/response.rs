@@ -2,9 +2,9 @@
 
 use crate::coordinator::{
     BucketSummary, CopyObjectResult, DeleteObjectResult, DeleteObjectsResult, GetBucketAclResult,
-    GetObjectPartResult, GetObjectRangeResult, GetObjectResult, HeadObjectPartResult,
-    HeadObjectResult, ListMultipartUploadsResult, ListObjectVersionsResult, ListObjectsResult,
-    ListPartsResult, PutObjectResult, ReadHandle,
+    GetObjectAclResult, GetObjectPartResult, GetObjectRangeResult, GetObjectResult,
+    HeadObjectPartResult, HeadObjectResult, ListMultipartUploadsResult, ListObjectVersionsResult,
+    ListObjectsResult, ListPartsResult, PutObjectResult, ReadHandle,
 };
 use crate::error::ServerError;
 use auth::canonical::uri_encode;
@@ -719,12 +719,44 @@ impl S3Response {
 
     /// Build a response for `GetBucketAcl`.
     #[must_use]
-    pub fn get_bucket_acl(result: &GetBucketAclResult) -> Self {
-        Self::new(200).xml_body(xml::bucket_acl_xml(
-            &result.owner_principal,
+    pub fn get_bucket_acl(
+        result: &GetBucketAclResult,
+        owner_display_name: &str,
+        grants: &[xml::RenderedAclGrant],
+    ) -> Self {
+        Self::new(200).xml_body(xml::acl_xml(
+            owner_display_name,
             &result.owner_canonical_id,
-            result.acl,
+            grants,
         ))
+    }
+
+    /// Build a response for `PutObjectAcl` (200 OK, optional version header).
+    #[must_use]
+    pub fn put_object_acl(version_id: VersionId) -> Self {
+        let mut resp = Self::new(200);
+        if version_id.is_versioned() {
+            resp = resp.header("x-amz-version-id", &format_version_id(version_id));
+        }
+        resp
+    }
+
+    /// Build a response for `GetObjectAcl`.
+    #[must_use]
+    pub fn get_object_acl(
+        result: &GetObjectAclResult,
+        owner_display_name: &str,
+        grants: &[xml::RenderedAclGrant],
+    ) -> Self {
+        let mut resp = Self::new(200).xml_body(xml::acl_xml(
+            owner_display_name,
+            &result.owner_canonical_id,
+            grants,
+        ));
+        if result.version_id.is_versioned() {
+            resp = resp.header("x-amz-version-id", &format_version_id(result.version_id));
+        }
+        resp
     }
 
     /// Build a response for `CreateMultipartUpload` (200 OK, XML body).
@@ -1033,9 +1065,10 @@ fn date_to_days(year: i64, month: u32, day: u32) -> i64 {
 mod tests {
     use super::*;
     use crate::coordinator::{
-        BucketAcl, GetObjectResult, HeadObjectResult, ListEntry, ListObjectsResult, PutObjectResult,
+        GetObjectResult, HeadObjectResult, ListEntry, ListObjectsResult, PutObjectResult,
     };
     use crate::metadata_blob::MetadataBlob;
+    use s3_types::{AclGrant, AclGrantee, AclGrants, AclPermission};
 
     fn system_metadata(headers: &[(&str, &str)]) -> SystemMetadata {
         SystemMetadata::from_pairs(headers)
@@ -1496,6 +1529,7 @@ mod tests {
             owner_principal: "owner".into(),
             owner_canonical_id: CanonicalUserId::from_principal("owner"),
             created_at: 0,
+            acl_grants: AclGrants::default(),
             versioning: BucketVersioningState::Disabled,
             public_read: false,
             public_write: false,
@@ -1516,6 +1550,7 @@ mod tests {
             owner_principal: "owner".into(),
             owner_canonical_id: CanonicalUserId::from_principal("owner"),
             created_at: 1000,
+            acl_grants: AclGrants::default(),
             versioning: BucketVersioningState::Disabled,
             public_read: false,
             public_write: false,
@@ -1605,9 +1640,27 @@ mod tests {
         let result = GetBucketAclResult {
             owner_principal: "owner".into(),
             owner_canonical_id: owner_canonical_id.clone(),
-            acl: BucketAcl::PublicRead,
+            acl_grants: AclGrants::new(vec![
+                AclGrant::new(
+                    AclGrantee::CanonicalUser(owner_canonical_id.clone()),
+                    AclPermission::FullControl,
+                ),
+                AclGrant::new(AclGrantee::AllUsers, AclPermission::Read),
+            ]),
         };
-        let resp = S3Response::get_bucket_acl(&result);
+        let grants = vec![
+            xml::RenderedAclGrant {
+                grantee: AclGrantee::CanonicalUser(owner_canonical_id.clone()),
+                permission: AclPermission::FullControl,
+                display_name: Some("owner".to_string()),
+            },
+            xml::RenderedAclGrant {
+                grantee: AclGrantee::AllUsers,
+                permission: AclPermission::Read,
+                display_name: None,
+            },
+        ];
+        let resp = S3Response::get_bucket_acl(&result, "owner", &grants);
         assert_eq!(resp.status_code, 200);
         let body = String::from_utf8(resp.body).unwrap();
         assert!(body.contains(owner_canonical_id.as_str()));

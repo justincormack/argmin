@@ -30,6 +30,8 @@ pub enum S3Operation {
     PutObjectTagging { bucket: String, key: String },
     GetObjectTagging { bucket: String, key: String },
     DeleteObjectTagging { bucket: String, key: String },
+    PutObjectAcl { bucket: String, key: String },
+    GetObjectAcl { bucket: String, key: String },
     PutBucketPublicAccessBlock { bucket: String },
     GetBucketPublicAccessBlock { bucket: String },
     DeleteBucketPublicAccessBlock { bucket: String },
@@ -340,12 +342,20 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
                 key,
             })
         }
+        ("PUT", Some(key)) if has_query_key(query, "acl") => Ok(S3Operation::PutObjectAcl {
+            bucket: bucket.to_string(),
+            key,
+        }),
         ("GET", Some(key)) if has_query_key(query, "tagging") => {
             Ok(S3Operation::GetObjectTagging {
                 bucket: bucket.to_string(),
                 key,
             })
         }
+        ("GET", Some(key)) if has_query_key(query, "acl") => Ok(S3Operation::GetObjectAcl {
+            bucket: bucket.to_string(),
+            key,
+        }),
         ("DELETE", Some(key)) if has_query_key(query, "tagging") => {
             Ok(S3Operation::DeleteObjectTagging {
                 bucket: bucket.to_string(),

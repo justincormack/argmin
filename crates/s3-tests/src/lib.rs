@@ -2,8 +2,8 @@ pub mod helpers;
 pub mod server;
 
 pub use helpers::{
-    assert_s3_err_code, bucket_prefix, cleanup_versioned_bucket, create_objects,
-    create_objects_with_keys, create_public_bucket, create_public_write_bucket,
+    assert_s3_err_code, bucket_prefix, cleanup_versioned_bucket, copy_source_with_version,
+    create_objects, create_objects_with_keys, create_public_bucket, create_public_write_bucket,
     delete_all_and_bucket, delete_objects_with_md5, ensure_distinct_s3_owners_or_skip, err_status,
     sse_c_header_values, test_sse_c_key, unique_bucket,
 };

@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS objects (
     encryption_state BLOB,
     owner_principal TEXT NOT NULL CHECK (length(owner_principal) BETWEEN 1 AND 256),
     owner_canonical_id TEXT NOT NULL CHECK (length(owner_canonical_id) = 64),
+    acl_grants TEXT NOT NULL DEFAULT '',
     public_read INTEGER NOT NULL DEFAULT 0 CHECK (public_read IN (0, 1)),
     CHECK (status IN (0, 1)),
     CHECK (etag_kind IN (0, 1)),
@@ -75,6 +76,7 @@ CREATE TABLE IF NOT EXISTS multipart_uploads (
     initiator_canonical_id TEXT CHECK (
         initiator_canonical_id IS NULL OR length(initiator_canonical_id) = 64
     ),
+    acl_grants TEXT NOT NULL DEFAULT '',
     public_read INTEGER NOT NULL DEFAULT 0 CHECK (public_read IN (0, 1))
 )";
 
@@ -312,6 +314,7 @@ CREATE TABLE IF NOT EXISTS buckets (
     region           INTEGER NOT NULL DEFAULT 0,
     state            INTEGER NOT NULL DEFAULT 0 CHECK (state IN (0, 1)),
     versioning       INTEGER NOT NULL DEFAULT 0 CHECK (versioning IN (0, 1, 2)),
+    acl_grants       TEXT NOT NULL DEFAULT '',
     public_read      INTEGER NOT NULL DEFAULT 0 CHECK (public_read IN (0, 1)),
     public_write     INTEGER NOT NULL DEFAULT 0 CHECK (public_write IN (0, 1)),
     write_reservations_blocked INTEGER NOT NULL DEFAULT 0 CHECK (write_reservations_blocked IN (0, 1)),
@@ -364,6 +367,7 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     migrate_checksum_columns(conn)?;
     migrate_segment_crc_columns(conn)?;
     migrate_owner_identity_columns(conn)?;
+    migrate_acl_grant_columns(conn)?;
     migrate_bucket_write_reservation_columns(conn)?;
     migrate_multipart_upload_tag_columns(conn)?;
     Ok(())
@@ -455,6 +459,28 @@ fn migrate_multipart_upload_tag_columns(conn: &Connection) -> Result<(), rusqlit
             if msg.contains("duplicate column name") => {}
         Err(e) => return Err(e),
     }
+    Ok(())
+}
+
+fn migrate_acl_grant_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
+    add_column_if_missing(
+        conn,
+        "buckets",
+        "acl_grants",
+        "ALTER TABLE buckets ADD COLUMN acl_grants TEXT NOT NULL DEFAULT ''",
+    )?;
+    add_column_if_missing(
+        conn,
+        "objects",
+        "acl_grants",
+        "ALTER TABLE objects ADD COLUMN acl_grants TEXT NOT NULL DEFAULT ''",
+    )?;
+    add_column_if_missing(
+        conn,
+        "multipart_uploads",
+        "acl_grants",
+        "ALTER TABLE multipart_uploads ADD COLUMN acl_grants TEXT NOT NULL DEFAULT ''",
+    )?;
     Ok(())
 }
 

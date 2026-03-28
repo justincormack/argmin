@@ -302,6 +302,16 @@ pub fn delete_objects_with_md5(
         })
 }
 
+/// Build an `x-amz-copy-source` value for a specific object version.
+///
+/// `source_key` should already be URL-encoded if it contains reserved path
+/// characters. The `version_id` query component is always percent-encoded.
+pub fn copy_source_with_version(bucket: &str, source_key: &str, version_id: &str) -> String {
+    let encoded_version_id: String =
+        url::form_urlencoded::byte_serialize(version_id.as_bytes()).collect();
+    format!("{bucket}/{source_key}?versionId={encoded_version_id}")
+}
+
 /// Delete all object versions and delete markers in a bucket, then delete the bucket.
 ///
 /// This is needed for versioned buckets on AWS where simple delete_object creates

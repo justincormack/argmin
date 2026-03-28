@@ -6,7 +6,7 @@ pub use checksum::{
     ChecksumAlgorithm, ChecksumBytes, ChecksumType, InvalidChecksumConfig, MultipartChecksumConfig,
     RawChecksum,
 };
-pub use s3_types::{BucketVersioningState, CanonicalUserId, VersionId};
+pub use s3_types::{AclGrants, BucketVersioningState, CanonicalUserId, VersionId};
 
 /// Internal immutable payload generation identifier.
 ///
@@ -917,6 +917,13 @@ impl StoredObject {
         }
     }
 
+    pub fn acl_grants(&self) -> Option<&AclGrants> {
+        match self {
+            Self::Live(r) => Some(&r.acl_grants),
+            Self::DeleteMarker(_) => None,
+        }
+    }
+
     pub fn is_delete_marker(&self) -> bool {
         matches!(self, Self::DeleteMarker(_))
     }
@@ -969,6 +976,7 @@ pub struct LiveObjectRecord {
     pub key: ObjectKey,
     pub version_id: VersionId,
     pub owner: OwnerIdentity,
+    pub acl_grants: AclGrants,
     pub public_read: bool,
     pub generation_id: GenerationId,
     pub size: u64,
@@ -1129,6 +1137,7 @@ pub struct BucketInfo {
     pub region: u16,
     pub state: BucketState,
     pub versioning: BucketVersioningState,
+    pub acl_grants: AclGrants,
     pub public_read: bool,
     pub public_write: bool,
     pub write_reservations_blocked: bool,
@@ -1154,6 +1163,7 @@ pub struct BucketFastPathInfo {
     pub created_at: u64,
     pub state: BucketState,
     pub versioning: BucketVersioningState,
+    pub acl_grants: AclGrants,
     pub public_read: bool,
     pub public_write: bool,
     pub public_access_block: Option<String>,
@@ -1179,6 +1189,7 @@ impl From<BucketInfo> for BucketFastPathInfo {
             created_at: info.created_at,
             state: info.state,
             versioning: info.versioning,
+            acl_grants: info.acl_grants,
             public_read: info.public_read,
             public_write: info.public_write,
             public_access_block: info.public_access_block,
@@ -1197,6 +1208,7 @@ impl From<&BucketInfo> for BucketFastPathInfo {
             created_at: info.created_at,
             state: info.state,
             versioning: info.versioning,
+            acl_grants: info.acl_grants.clone(),
             public_read: info.public_read,
             public_write: info.public_write,
             public_access_block: info.public_access_block.clone(),
@@ -1224,6 +1236,7 @@ pub struct PutLiveObjectReq {
     pub key: ObjectKey,
     pub version_id: VersionId,
     pub owner: OwnerIdentity,
+    pub acl_grants: AclGrants,
     pub public_read: bool,
     pub generation_id: GenerationId,
     pub size: u64,
@@ -1286,6 +1299,7 @@ pub struct CommitMultipartReq {
     pub key: ObjectKey,
     pub version_id: VersionId,
     pub owner: OwnerIdentity,
+    pub acl_grants: AclGrants,
     pub public_read: bool,
     pub generation_id: GenerationId,
     pub size: u64,
@@ -1311,6 +1325,7 @@ pub struct CommitStreamPutReq {
     pub key: ObjectKey,
     pub version_id: VersionId,
     pub owner: OwnerIdentity,
+    pub acl_grants: AclGrants,
     pub public_read: bool,
     pub generation_id: GenerationId,
     pub size: u64,
@@ -1397,6 +1412,7 @@ pub struct MultipartUploadRecord {
     pub system_metadata_blob: SerializedSystemMetadataBlob,
     pub initiator: Option<OwnerIdentity>,
     pub owner: OwnerIdentity,
+    pub acl_grants: AclGrants,
     pub public_read: bool,
     /// Validated checksum configuration for this upload.
     pub checksum: Option<MultipartChecksumConfig>,
@@ -1461,6 +1477,7 @@ pub struct CreateMultipartUploadReq {
     pub system_metadata_blob: SerializedSystemMetadataBlob,
     pub initiator: Option<OwnerIdentity>,
     pub owner: OwnerIdentity,
+    pub acl_grants: AclGrants,
     pub public_read: bool,
     pub checksum: Option<MultipartChecksumConfig>,
     pub encryption: ObjectEncryption,

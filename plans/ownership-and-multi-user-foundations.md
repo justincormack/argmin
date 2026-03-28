@@ -52,8 +52,9 @@ The current code does not yet have:
 Important current shortcuts:
 - write authorization still compares the requester primarily to the bucket
   owner plus bucket public-write flags
-- object ACL handling only covers the minimal stored public-read/public-read-write
-  behavior needed for current tests; grant-based ACLs remain later work
+- object ACL handling now covers the XML/canned ACL grant cases needed for the
+  current ignored copy/versioning tests, but header-grant parsing and the wider
+  ACL matrix remain later work
 - multipart list and future ACL/XML owner surfaces do not yet consistently use
   the stored owner and initiator identity
 
@@ -254,8 +255,10 @@ Status: in progress. Private-object read, head, range, attributes, tagging,
 and copy-source authorization now consult stored object owner identity instead
 of only bucket read access. This phase also persists the minimal object
 `public-read`/`public-read-write` bit needed to preserve AWS-compatible
-anonymous read behavior once bucket-level read shortcuts are removed. Full
-grant-based object ACL semantics remain for later ACL work.
+anonymous read behavior once bucket-level read shortcuts are removed. The
+grant-based bucket/object ACL behavior needed for the ignored cross-owner copy
+and versioned object ACL tests is now in place, but the broader ACL/header
+matrix still remains later work.
 
 Deliver:
 - object read and object metadata APIs authorize against object ownership rules
@@ -264,8 +267,9 @@ Deliver:
 
 Success criteria:
 - multi-user private-object read and copy authorization tests can be unignored
-- ACL-grant cases stay explicitly tracked for later ACL work rather than
-  relying on bucket-level shortcuts
+- versioned object ACL tests can be unignored
+- remaining ACL-grant gaps stay explicitly tracked rather than relying on
+  bucket-level shortcuts
 
 ### Phase 4: Multipart Owner And Initiator Surfaces
 
@@ -291,9 +295,6 @@ Targeted integration tests:
 - `cargo test -p s3-tests --test multipart test_list_multipart_upload_owner -- --ignored`
 - `cargo test -p s3-tests --test presigned test_object_presigned_put_object_with_acl_tenant -- --ignored`
 - `cargo test -p s3-tests --test presigned test_object_raw_get_x_amz_expires_not_expired_tenant -- --ignored`
-
-Still blocked on later ACL work:
-- `cargo test -p s3-tests --test copy_object test_object_copy_not_owned_object_bucket -- --ignored`
 
 Regression coverage to keep green while working:
 - `cargo test -p s3-tests --test ownership`
