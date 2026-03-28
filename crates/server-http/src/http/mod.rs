@@ -1446,6 +1446,7 @@ impl HttpFrontend {
                     None
                 };
                 let requester = Self::requester_from_auth(auth);
+                let acl = parse_put_object_acl(req.header("x-amz-acl"));
 
                 let result = self.coordinator.create_multipart_upload(
                     &crate::coordinator::CreateMultipartUploadRequest {
@@ -1456,6 +1457,7 @@ impl HttpFrontend {
                         tags: inline_tags_xml.as_deref(),
                         checksum,
                         requester,
+                        acl,
                         sse_customer: sse_customer.as_ref(),
                     },
                 )?;
@@ -2167,7 +2169,7 @@ impl HttpFrontend {
         let session_id = self.coordinator.begin_stream_put(&BeginStreamPutRequest {
             bucket,
             key: &key,
-            requester,
+            requester: requester.clone(),
             acl,
             encryption: sse_customer
                 .as_ref()
@@ -2191,6 +2193,8 @@ impl HttpFrontend {
                 bucket: bucket.to_string(),
                 key,
             },
+            requester,
+            acl_header: field("acl").map(std::string::ToString::to_string),
             metadata_blob,
             system_metadata,
             success_status,
@@ -2288,6 +2292,8 @@ impl HttpFrontend {
                 sse_customer: ctx.sse_customer.as_ref(),
                 tags: ctx.tags_xml.as_deref(),
                 cond: &crate::conditional::WriteCondition::default(),
+                requester: ctx.requester.clone(),
+                acl: parse_put_object_acl(ctx.acl_header.as_deref()),
             })?;
 
         let mut resp = S3Response::post_object(
@@ -2649,6 +2655,8 @@ impl HttpFrontend {
                 sse_customer: ctx.sse_customer.as_ref(),
                 tags: ctx.inline_tags_xml.as_deref(),
                 cond: &ctx.cond,
+                requester: ctx.requester.clone(),
+                acl: parse_put_object_acl(ctx.acl_header.as_deref()),
             })?;
 
         let mut resp = S3Response::put_object(&result);
@@ -2943,6 +2951,8 @@ pub struct StreamingPutContext {
 pub struct StreamingPostContext {
     pub trace: observability::TraceContext,
     pub binding: StreamObjectBinding,
+    pub requester: crate::coordinator::Requester,
+    pub acl_header: Option<String>,
     pub metadata_blob: crate::metadata_blob::MetadataBlob,
     pub system_metadata: SystemMetadata,
     pub success_status: u16,
@@ -4296,6 +4306,39 @@ mod tests {
     }
 
     // ── CreateMultipartUpload checksum validation ───────────────────
+
+    #[test]
+    fn create_multipart_rejects_acl_on_bucket_owner_enforced_bucket() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+        fe.coordinator
+            .put_bucket_ownership_controls(
+                "mybucket",
+                "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
+                crate::coordinator::Requester::principal("testuser"),
+            )
+            .unwrap();
+
+        let req = new_req(
+            http::Method::GET,
+            "",
+            "uploads",
+            vec![("x-amz-acl".to_string(), "public-read".to_string())],
+            vec![],
+        );
+        let op = S3Operation::CreateMultipartUpload {
+            bucket: "mybucket".to_string(),
+            key: "k".to_string(),
+        };
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::AccessControlListNotSupported) => {}
+            Err(e) => panic!("expected AccessControlListNotSupported, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
 
     #[test]
     fn create_multipart_invalid_checksum_algorithm() {

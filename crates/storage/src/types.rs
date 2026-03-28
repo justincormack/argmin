@@ -903,6 +903,13 @@ impl StoredObject {
         }
     }
 
+    pub fn owner(&self) -> &OwnerIdentity {
+        match self {
+            Self::Live(r) => &r.owner,
+            Self::DeleteMarker(r) => &r.owner,
+        }
+    }
+
     pub fn is_delete_marker(&self) -> bool {
         matches!(self, Self::DeleteMarker(_))
     }
@@ -922,12 +929,39 @@ impl StoredObject {
     }
 }
 
+/// Durable owner identity stored on object and multipart metadata rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerIdentity {
+    pub principal: String,
+    pub canonical_id: CanonicalUserId,
+}
+
+impl OwnerIdentity {
+    #[must_use]
+    pub fn new(principal: impl Into<String>, canonical_id: CanonicalUserId) -> Self {
+        Self {
+            principal: principal.into(),
+            canonical_id,
+        }
+    }
+
+    #[must_use]
+    pub fn from_principal(principal: impl Into<String>) -> Self {
+        let principal = principal.into();
+        Self {
+            canonical_id: CanonicalUserId::from_principal(&principal),
+            principal,
+        }
+    }
+}
+
 /// A live object record (not a delete marker).
 #[derive(Debug, Clone)]
 pub struct LiveObjectRecord {
     pub bucket: BucketName,
     pub key: ObjectKey,
     pub version_id: VersionId,
+    pub owner: OwnerIdentity,
     pub generation_id: GenerationId,
     pub size: u64,
     pub etag: ObjectEtag,
@@ -951,6 +985,7 @@ pub struct DeleteMarkerRecord {
     pub bucket: BucketName,
     pub key: ObjectKey,
     pub version_id: VersionId,
+    pub owner: OwnerIdentity,
     /// Last modified timestamp (unix milliseconds).
     pub last_modified: u64,
 }
@@ -1180,6 +1215,7 @@ pub struct PutLiveObjectReq {
     pub bucket: BucketName,
     pub key: ObjectKey,
     pub version_id: VersionId,
+    pub owner: OwnerIdentity,
     pub generation_id: GenerationId,
     pub size: u64,
     pub etag: ObjectEtag,
@@ -1224,6 +1260,7 @@ pub struct PutDeleteMarkerReq {
     pub bucket: BucketName,
     pub key: ObjectKey,
     pub version_id: VersionId,
+    pub owner: OwnerIdentity,
 }
 
 /// Request to finalize a multipart upload into a live object.
@@ -1239,6 +1276,7 @@ pub struct CommitMultipartReq {
     pub bucket: BucketName,
     pub key: ObjectKey,
     pub version_id: VersionId,
+    pub owner: OwnerIdentity,
     pub generation_id: GenerationId,
     pub size: u64,
     /// Composite CRC64-NVME bytes (CRC of concatenated per-part CRC64s).
@@ -1262,6 +1300,7 @@ pub struct CommitStreamPutReq {
     pub bucket: BucketName,
     pub key: ObjectKey,
     pub version_id: VersionId,
+    pub owner: OwnerIdentity,
     pub generation_id: GenerationId,
     pub size: u64,
     /// CRC64-NVME of the object data.
@@ -1345,7 +1384,8 @@ pub struct MultipartUploadRecord {
     pub metadata_blob: SerializedMetadataBlob,
     /// Serialized system metadata headers.
     pub system_metadata_blob: SerializedSystemMetadataBlob,
-    pub owner_principal: Option<String>,
+    pub initiator: Option<OwnerIdentity>,
+    pub owner: OwnerIdentity,
     /// Validated checksum configuration for this upload.
     pub checksum: Option<MultipartChecksumConfig>,
     pub encryption: ObjectEncryption,
@@ -1407,7 +1447,8 @@ pub struct CreateMultipartUploadReq {
     pub tags: Option<SerializedTagSet>,
     pub metadata_blob: SerializedMetadataBlob,
     pub system_metadata_blob: SerializedSystemMetadataBlob,
-    pub owner_principal: Option<String>,
+    pub initiator: Option<OwnerIdentity>,
+    pub owner: OwnerIdentity,
     pub checksum: Option<MultipartChecksumConfig>,
     pub encryption: ObjectEncryption,
 }

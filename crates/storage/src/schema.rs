@@ -34,6 +34,8 @@ CREATE TABLE IF NOT EXISTS objects (
     system_metadata_blob BLOB,
     encryption_type INTEGER NOT NULL DEFAULT 0,
     encryption_state BLOB,
+    owner_principal TEXT NOT NULL CHECK (length(owner_principal) BETWEEN 1 AND 256),
+    owner_canonical_id TEXT NOT NULL CHECK (length(owner_canonical_id) = 64),
     CHECK (status IN (0, 1)),
     CHECK (etag_kind IN (0, 1)),
     CHECK (data_layout IN (0, 1)),
@@ -62,10 +64,16 @@ CREATE TABLE IF NOT EXISTS multipart_uploads (
     tags             TEXT,
     metadata_blob    BLOB NOT NULL,
     system_metadata_blob BLOB NOT NULL,
-    owner_principal  TEXT CHECK (owner_principal IS NULL OR length(owner_principal) BETWEEN 1 AND 256)
-    ,
+    owner_principal  TEXT NOT NULL CHECK (length(owner_principal) BETWEEN 1 AND 256),
     encryption_type  INTEGER NOT NULL DEFAULT 0 CHECK (encryption_type IN (0, 1)),
-    encryption_state BLOB
+    encryption_state BLOB,
+    owner_canonical_id TEXT NOT NULL CHECK (length(owner_canonical_id) = 64),
+    initiator_principal TEXT CHECK (
+        initiator_principal IS NULL OR length(initiator_principal) BETWEEN 1 AND 256
+    ),
+    initiator_canonical_id TEXT CHECK (
+        initiator_canonical_id IS NULL OR length(initiator_canonical_id) = 64
+    )
 )";
 
 /// Index for listing multipart uploads by bucket/key.
@@ -448,40 +456,187 @@ fn migrate_multipart_upload_tag_columns(conn: &Connection) -> Result<(), rusqlit
     Ok(())
 }
 
-fn migrate_owner_identity_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
-    let has_owner_canonical_id = {
-        let mut stmt = conn.prepare("PRAGMA table_info(buckets)")?;
-        let cols = stmt.query_map([], |row| row.get::<_, String>(1))?;
-        let mut found = false;
-        for col in cols {
-            if col? == "owner_canonical_id" {
-                found = true;
-                break;
-            }
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, rusqlite::Error> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let cols = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for col in cols {
+        if col? == column {
+            return Ok(true);
         }
-        found
-    };
+    }
+    Ok(false)
+}
 
-    if !has_owner_canonical_id {
-        conn.execute("ALTER TABLE buckets ADD COLUMN owner_canonical_id TEXT", [])?;
-        let mut stmt = conn.prepare("SELECT name, owner_principal FROM buckets")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        let mut updates = Vec::new();
-        for row in rows {
-            let (name, owner_principal) = row?;
-            updates.push((
-                name,
-                s3_types::CanonicalUserId::from_principal(&owner_principal).into_string(),
-            ));
-        }
-        for (name, owner_canonical_id) in updates {
-            conn.execute(
-                "UPDATE buckets SET owner_canonical_id = ?1 WHERE name = ?2",
-                [&owner_canonical_id, &name],
-            )?;
-        }
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    sql: &str,
+) -> Result<(), rusqlite::Error> {
+    if !table_has_column(conn, table, column)? {
+        conn.execute(sql, [])?;
+    }
+    Ok(())
+}
+
+fn migrate_owner_identity_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
+    add_column_if_missing(
+        conn,
+        "buckets",
+        "owner_canonical_id",
+        "ALTER TABLE buckets ADD COLUMN owner_canonical_id TEXT",
+    )?;
+
+    let mut stmt = conn.prepare(
+        "SELECT name, owner_principal FROM buckets \
+         WHERE owner_canonical_id IS NULL OR owner_canonical_id = ''",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut bucket_updates = Vec::new();
+    for row in rows {
+        let (name, owner_principal) = row?;
+        bucket_updates.push((
+            name,
+            s3_types::CanonicalUserId::from_principal(&owner_principal).into_string(),
+        ));
+    }
+    for (name, owner_canonical_id) in bucket_updates {
+        conn.execute(
+            "UPDATE buckets SET owner_canonical_id = ?1 WHERE name = ?2",
+            [&owner_canonical_id, &name],
+        )?;
+    }
+
+    add_column_if_missing(
+        conn,
+        "objects",
+        "owner_principal",
+        "ALTER TABLE objects ADD COLUMN owner_principal TEXT",
+    )?;
+    add_column_if_missing(
+        conn,
+        "objects",
+        "owner_canonical_id",
+        "ALTER TABLE objects ADD COLUMN owner_canonical_id TEXT",
+    )?;
+
+    let mut stmt = conn.prepare(
+        "SELECT o.bucket, o.key, o.version_id, b.owner_principal, b.owner_canonical_id \
+         FROM objects o \
+         INNER JOIN buckets b ON b.name = o.bucket \
+         WHERE o.owner_principal IS NULL OR o.owner_principal = '' \
+            OR o.owner_canonical_id IS NULL OR o.owner_canonical_id = ''",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+        ))
+    })?;
+    let mut object_updates = Vec::new();
+    for row in rows {
+        object_updates.push(row?);
+    }
+    for (bucket, key, version_id, owner_principal, owner_canonical_id) in object_updates {
+        conn.execute(
+            "UPDATE objects SET owner_principal = ?1, owner_canonical_id = ?2 \
+             WHERE bucket = ?3 AND key = ?4 AND version_id = ?5",
+            (
+                &owner_principal,
+                &owner_canonical_id,
+                &bucket,
+                &key,
+                version_id,
+            ),
+        )?;
+    }
+
+    add_column_if_missing(
+        conn,
+        "multipart_uploads",
+        "owner_canonical_id",
+        "ALTER TABLE multipart_uploads ADD COLUMN owner_canonical_id TEXT",
+    )?;
+    add_column_if_missing(
+        conn,
+        "multipart_uploads",
+        "initiator_principal",
+        "ALTER TABLE multipart_uploads ADD COLUMN initiator_principal TEXT",
+    )?;
+    add_column_if_missing(
+        conn,
+        "multipart_uploads",
+        "initiator_canonical_id",
+        "ALTER TABLE multipart_uploads ADD COLUMN initiator_canonical_id TEXT",
+    )?;
+
+    let mut stmt = conn.prepare(
+        "SELECT m.upload_id, m.owner_principal, m.owner_canonical_id, \
+                m.initiator_principal, m.initiator_canonical_id, b.owner_principal \
+         FROM multipart_uploads m \
+         LEFT JOIN buckets b ON b.name = m.bucket \
+         WHERE m.owner_canonical_id IS NULL OR m.owner_canonical_id = '' \
+            OR (m.initiator_principal IS NOT NULL AND \
+                (m.initiator_canonical_id IS NULL OR m.initiator_canonical_id = '')) \
+            OR (m.initiator_principal IS NULL AND m.owner_principal IS NOT NULL)",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<String>>(4)?,
+            row.get::<_, Option<String>>(5)?,
+        ))
+    })?;
+    let mut multipart_updates = Vec::new();
+    for row in rows {
+        multipart_updates.push(row?);
+    }
+    for (
+        upload_id,
+        owner_principal,
+        owner_canonical_id,
+        initiator_principal,
+        initiator_canonical_id,
+        bucket_owner_principal,
+    ) in multipart_updates
+    {
+        let effective_owner_principal =
+            owner_principal.or(bucket_owner_principal).ok_or_else(|| {
+                rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(format!(
+                    "multipart upload {upload_id} is missing both stored and bucket owner identity"
+                ))))
+            })?;
+        let effective_owner_canonical_id = owner_canonical_id.unwrap_or_else(|| {
+            s3_types::CanonicalUserId::from_principal(&effective_owner_principal).into_string()
+        });
+        let effective_initiator_principal =
+            initiator_principal.or_else(|| Some(effective_owner_principal.clone()));
+        let effective_initiator_canonical_id = effective_initiator_principal.as_ref().map(|name| {
+            initiator_canonical_id
+                .unwrap_or_else(|| s3_types::CanonicalUserId::from_principal(name).into_string())
+        });
+
+        conn.execute(
+            "UPDATE multipart_uploads \
+             SET owner_principal = ?1, owner_canonical_id = ?2, \
+                 initiator_principal = ?3, initiator_canonical_id = ?4 \
+             WHERE upload_id = ?5",
+            (
+                &effective_owner_principal,
+                &effective_owner_canonical_id,
+                effective_initiator_principal.as_deref(),
+                effective_initiator_canonical_id.as_deref(),
+                &upload_id,
+            ),
+        )?;
     }
 
     Ok(())

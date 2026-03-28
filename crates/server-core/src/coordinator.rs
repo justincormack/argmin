@@ -20,8 +20,8 @@ use storage::{
     ListPartsReq, MultipartPartRecord, MultipartPartSegmentRecord, MultipartReclaimPartRecord,
     MultipartReclaimPartSegmentRecord, MultipartReclaimRecord, MultipartUploadRecord,
     ObjectEncryption, ObjectKey, ObjectLayout, ObjectPartRecord, ObjectSegmentRecord,
-    ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord, PutDeleteMarkerReq,
-    PutLiveObjectReq, PutObjectReq, ReclaimWorkItem, SerializedMetadataBlob,
+    ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord, OwnerIdentity,
+    PutDeleteMarkerReq, PutLiveObjectReq, PutObjectReq, ReclaimWorkItem, SerializedMetadataBlob,
     SerializedSystemMetadataBlob, SerializedTagSet, SessionId, ShardKey, SharedStorageNode,
     StoredObject, StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadState,
     StreamUploadTarget, UploadId, UploadState,
@@ -1398,6 +1398,7 @@ pub struct CreateMultipartUploadRequest<'a> {
     pub tags: Option<&'a str>,
     pub checksum: Option<MultipartChecksumConfig>,
     pub requester: Requester,
+    pub acl: PutObjectAcl<'a>,
     pub sse_customer: Option<&'a SseCustomerRequest>,
 }
 
@@ -1475,6 +1476,8 @@ pub struct FinalizeStreamPutRequest<'a> {
     pub sse_customer: Option<&'a SseCustomerWriteContext>,
     pub tags: Option<&'a str>,
     pub cond: &'a WriteCondition,
+    pub requester: Requester,
+    pub acl: PutObjectAcl<'a>,
 }
 
 /// Parsed request for finalizing a streaming UploadPart.
@@ -2551,6 +2554,12 @@ impl Coordinator {
         })
     }
 
+    fn is_bucket_owner_preferred(config_xml: Option<&str>) -> bool {
+        config_xml.is_some_and(|xml| {
+            xml.contains("<ObjectOwnership>BucketOwnerPreferred</ObjectOwnership>")
+        })
+    }
+
     // Public-access-block XML is stored in canonical form by the HTTP layer.
     fn ignores_public_acls(config_xml: Option<&str>) -> bool {
         config_xml.is_some_and(|xml| xml.contains("<IgnorePublicAcls>true</IgnorePublicAcls>"))
@@ -2577,6 +2586,54 @@ impl Coordinator {
 
     fn requester_principal_required(requester: &Requester) -> Result<&str, ServerError> {
         requester.principal_opt().ok_or(ServerError::AccessDenied)
+    }
+
+    fn bucket_owner_identity(bucket: &BucketSummary) -> OwnerIdentity {
+        OwnerIdentity::new(
+            bucket.owner_principal.clone(),
+            bucket.owner_canonical_id.clone(),
+        )
+    }
+
+    fn requester_owner_identity(requester: &Requester) -> Option<OwnerIdentity> {
+        requester.account().map(|account| {
+            OwnerIdentity::new(
+                account.principal().to_string(),
+                account.canonical_user_id().clone(),
+            )
+        })
+    }
+
+    fn effective_object_owner(
+        bucket: &BucketSummary,
+        requester: &Requester,
+        acl: PutObjectAcl<'_>,
+    ) -> OwnerIdentity {
+        if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_deref())
+            || (Self::is_bucket_owner_preferred(bucket.ownership_controls.as_deref())
+                && matches!(acl, PutObjectAcl::BucketOwnerFullControl))
+        {
+            return Self::bucket_owner_identity(bucket);
+        }
+
+        Self::requester_owner_identity(requester)
+            .unwrap_or_else(|| Self::bucket_owner_identity(bucket))
+    }
+
+    fn ensure_put_object_acl_supported(
+        bucket: &BucketSummary,
+        acl: PutObjectAcl<'_>,
+    ) -> Result<(), ServerError> {
+        if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_deref())
+            && !matches!(
+                acl,
+                PutObjectAcl::None | PutObjectAcl::Private | PutObjectAcl::BucketOwnerFullControl
+            )
+        {
+            return Err(ServerError::AccessControlListNotSupported);
+        }
+
+        Ok(())
     }
 
     fn ownership_controls_xml(ownership: BucketObjectOwnership) -> String {
@@ -3951,6 +4008,8 @@ impl Coordinator {
                     sse_customer: write_encryption.as_ref(),
                     tags: req.tags,
                     cond: req.cond,
+                    requester: req.requester.clone(),
+                    acl: req.acl,
                 })
             })();
             if result.is_err() {
@@ -3968,16 +4027,7 @@ impl Coordinator {
                 return Err(ServerError::AccessDenied);
             }
             Self::ensure_sse_c_allowed(&bucket_info, write_encryption.is_some())?;
-            if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_deref())
-                && !matches!(
-                    req.acl,
-                    PutObjectAcl::None
-                        | PutObjectAcl::Private
-                        | PutObjectAcl::BucketOwnerFullControl
-                )
-            {
-                return Err(ServerError::AccessControlListNotSupported);
-            }
+            Self::ensure_put_object_acl_supported(&bucket_info, req.acl)?;
 
             let transient_segment_id = {
                 let rng = ring::rand::SystemRandom::new();
@@ -4052,6 +4102,7 @@ impl Coordinator {
                     return Err(err);
                 }
             };
+            let owner = Self::effective_object_owner(&bucket_info, &req.requester, req.acl);
 
             let segment_record = ObjectSegmentRecord {
                 bucket: BucketName::from(req.bucket),
@@ -4070,6 +4121,7 @@ impl Coordinator {
                 bucket: BucketName::from(req.bucket),
                 key: ObjectKey::from(req.key),
                 version_id: prepared.version_id,
+                owner,
                 generation_id: prepared.generation_id,
                 size: req.data.len() as u64,
                 etag: storage::ObjectEtag::single_part(checksum::crc64::checksum(req.data)),
@@ -4141,16 +4193,7 @@ impl Coordinator {
                 &bucket_info,
                 matches!(req.encryption, ObjectEncryption::SseCustomer(_)),
             )?;
-            if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_deref())
-                && !matches!(
-                    req.acl,
-                    PutObjectAcl::None
-                        | PutObjectAcl::Private
-                        | PutObjectAcl::BucketOwnerFullControl
-                )
-            {
-                return Err(ServerError::AccessControlListNotSupported);
-            }
+            Self::ensure_put_object_acl_supported(&bucket_info, req.acl)?;
 
             let rng = ring::rand::SystemRandom::new();
             let mut id_bytes = [0u8; 16];
@@ -4629,6 +4672,15 @@ impl Coordinator {
         let tags = req.tags;
         let cond = req.cond;
         self.with_bucket_write_reservation(bucket, |bucket_info| {
+            if !Self::requester_can_object_write(
+                &req.requester,
+                &bucket_info.owner_principal,
+                Self::effective_public_write(&bucket_info),
+            ) {
+                return Err(ServerError::AccessDenied);
+            }
+            Self::ensure_put_object_acl_supported(&bucket_info, req.acl)?;
+
             let meta_pg_id = self.object_pg_id(bucket, key);
             let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
 
@@ -4663,6 +4715,7 @@ impl Coordinator {
                     cond,
                 },
             )?;
+            let owner = Self::effective_object_owner(&bucket_info, &req.requester, req.acl);
 
             let staging_segments = meta_guard
                 .list_stream_segments(session_id)
@@ -4699,6 +4752,7 @@ impl Coordinator {
                         bucket: BucketName::from(bucket),
                         key: ObjectKey::from(key),
                         version_id: prepared.version_id,
+                        owner,
                         generation_id: prepared.generation_id,
                         size: total_size,
                         etag_crc64: crc64,
@@ -5377,6 +5431,8 @@ impl Coordinator {
                 sse_customer: dst_write_sse_customer.as_ref(),
                 tags: tags.as_deref(),
                 cond: dst_cond,
+                requester: requester.clone(),
+                acl,
             })?;
 
             let dst_meta_pg = self
@@ -6903,6 +6959,11 @@ impl Coordinator {
                     bucket: BucketName::from(bucket),
                     key: ObjectKey::from(key),
                     version_id: marker_vid,
+                    owner: Self::effective_object_owner(
+                        &bucket_info,
+                        &req.requester,
+                        PutObjectAcl::None,
+                    ),
                 }))?;
 
                 Ok(DeleteObjectResult {
@@ -7284,6 +7345,9 @@ impl Coordinator {
                 .as_ref()
                 .map(|ctx| ctx.encryption().clone())
                 .unwrap_or_default();
+            Self::ensure_put_object_acl_supported(&bucket_info, req.acl)?;
+            let initiator = Self::requester_owner_identity(&req.requester);
+            let owner = Self::effective_object_owner(&bucket_info, &req.requester, req.acl);
 
             let meta_pg_id = self.object_pg_id(bucket, key);
             let pg = self.storage_node.get_pg(meta_pg_id)?;
@@ -7294,7 +7358,8 @@ impl Coordinator {
                 tags: req.tags.map(SerializedTagSet::from),
                 metadata_blob: SerializedMetadataBlob::from(metadata_blob),
                 system_metadata_blob: SerializedSystemMetadataBlob::from(system_metadata_blob),
-                owner_principal: Some(bucket_info.owner_principal),
+                initiator,
+                owner,
                 checksum: req.checksum,
                 encryption,
             })?;
@@ -7877,6 +7942,7 @@ impl Coordinator {
                 bucket: BucketName::from(bucket),
                 key: ObjectKey::from(key),
                 version_id,
+                owner: upload.owner.clone(),
                 generation_id,
                 size: total_size,
                 etag_crc64,
@@ -8822,6 +8888,267 @@ mod tests {
     }
 
     #[test]
+    fn put_object_persists_explicit_object_owner_identity() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let owner_canonical_id = CanonicalUserId::from_principal("custom-object-owner");
+        let owner = AccountIdentity::new("owner-a", owner_canonical_id.clone(), "Owner A");
+        let requester = Requester::authenticated(owner.clone());
+
+        coord
+            .create_bucket_for_requester(&CreateBucketRequest {
+                name: "bucket",
+                requester: requester.clone(),
+                acl: BucketAcl::Private,
+                ownership: BucketObjectOwnership::ObjectWriter,
+            })
+            .unwrap();
+
+        coord
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"hello",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                requester: requester.clone(),
+                acl: NO_PUT_OBJECT_ACL,
+                sse_customer: None,
+            })
+            .unwrap();
+
+        let meta_pg = coord
+            .storage_node
+            .get_pg(coord.object_pg_id("bucket", "key"))
+            .unwrap();
+        let live = meta_pg
+            .get_object_meta("bucket", "key")
+            .unwrap()
+            .into_live()
+            .expect("expected live object");
+        assert_eq!(live.owner.principal, owner.principal());
+        assert_eq!(live.owner.canonical_id, owner_canonical_id);
+    }
+
+    #[test]
+    fn delete_marker_persists_explicit_owner_identity() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let owner_canonical_id = CanonicalUserId::from_principal("custom-delete-owner");
+        let owner = AccountIdentity::new("owner-a", owner_canonical_id.clone(), "Owner A");
+        let requester = Requester::authenticated(owner.clone());
+
+        coord
+            .create_bucket_for_requester(&CreateBucketRequest {
+                name: "bucket",
+                requester: requester.clone(),
+                acl: BucketAcl::Private,
+                ownership: BucketObjectOwnership::ObjectWriter,
+            })
+            .unwrap();
+        coord
+            .put_bucket_versioning("bucket", BucketVersioningState::Enabled, requester.clone())
+            .unwrap();
+        coord
+            .put_object(&PutObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                data: b"hello",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                requester: requester.clone(),
+                acl: NO_PUT_OBJECT_ACL,
+                sse_customer: None,
+            })
+            .unwrap();
+
+        coord
+            .delete_object(&DeleteObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: NO_DELETE,
+                requester,
+            })
+            .unwrap();
+
+        let meta_pg = coord
+            .storage_node
+            .get_pg(coord.object_pg_id("bucket", "key"))
+            .unwrap();
+        let marker = match meta_pg.get_object_meta("bucket", "key").unwrap() {
+            StoredObject::DeleteMarker(marker) => marker,
+            other => panic!("expected delete marker, got {other:?}"),
+        };
+        assert_eq!(marker.owner.principal, owner.principal());
+        assert_eq!(marker.owner.canonical_id, owner_canonical_id);
+    }
+
+    #[test]
+    fn multipart_upload_and_complete_persist_explicit_owner_identity() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let owner_canonical_id = CanonicalUserId::from_principal("custom-mpu-owner");
+        let owner = AccountIdentity::new("owner-a", owner_canonical_id.clone(), "Owner A");
+        let requester = Requester::authenticated(owner.clone());
+        let expected_owner =
+            OwnerIdentity::new(owner.principal().to_string(), owner_canonical_id.clone());
+
+        coord
+            .create_bucket_for_requester(&CreateBucketRequest {
+                name: "bucket",
+                requester: requester.clone(),
+                acl: BucketAcl::Private,
+                ownership: BucketObjectOwnership::ObjectWriter,
+            })
+            .unwrap();
+
+        let upload = coord
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                checksum: None,
+                requester: requester.clone(),
+                acl: NO_PUT_OBJECT_ACL,
+                sse_customer: None,
+            })
+            .unwrap();
+
+        let meta_pg = coord
+            .storage_node
+            .get_pg(coord.object_pg_id("bucket", "key"))
+            .unwrap();
+        let upload_record = meta_pg.get_multipart_upload(&upload.upload_id).unwrap();
+        assert_eq!(upload_record.initiator, Some(expected_owner.clone()));
+        assert_eq!(upload_record.owner, expected_owner);
+        drop(meta_pg);
+
+        test_helpers::upload_part(
+            &coord,
+            &UploadPartRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload.upload_id,
+                part_number: 1,
+                data: b"multipart-data",
+                claimed_checksum: None,
+                requester: requester.clone(),
+                sse_customer: None,
+            },
+        )
+        .unwrap();
+
+        coord
+            .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                upload_id: &upload.upload_id,
+                parts: &[CompletePart {
+                    part_number: 1,
+                    etag: format_etag(checksum::crc64::checksum(b"multipart-data")),
+                    checksum: None,
+                }],
+                claimed_checksum: None,
+                requester,
+                sse_customer: None,
+            })
+            .unwrap();
+
+        let meta_pg = coord
+            .storage_node
+            .get_pg(coord.object_pg_id("bucket", "key"))
+            .unwrap();
+        let live = meta_pg
+            .get_object_meta("bucket", "key")
+            .unwrap()
+            .into_live()
+            .expect("expected completed object");
+        assert_eq!(live.owner.principal, owner.principal());
+        assert_eq!(live.owner.canonical_id, owner_canonical_id);
+    }
+
+    #[test]
+    fn create_multipart_upload_bucket_owner_preferred_promotes_bucket_owner_with_full_control_acl()
+    {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let bucket_owner = AccountIdentity::new(
+            "owner-a",
+            CanonicalUserId::from_principal("bucket-owner-canonical"),
+            "Bucket Owner",
+        );
+        let writer = AccountIdentity::new(
+            "writer-a",
+            CanonicalUserId::from_principal("writer-canonical"),
+            "Writer",
+        );
+
+        coord
+            .create_bucket_for_requester(&CreateBucketRequest {
+                name: "bucket",
+                requester: Requester::authenticated(bucket_owner.clone()),
+                acl: BucketAcl::Private,
+                ownership: BucketObjectOwnership::ObjectWriter,
+            })
+            .unwrap();
+        coord
+            .put_bucket_acl(
+                "bucket",
+                BucketAcl::PublicReadWrite,
+                Requester::authenticated(bucket_owner.clone()),
+            )
+            .unwrap();
+        coord
+            .put_bucket_ownership_controls(
+                "bucket",
+                "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerPreferred</ObjectOwnership></Rule></OwnershipControls>",
+                Requester::authenticated(bucket_owner.clone()),
+            )
+            .unwrap();
+
+        let upload = coord
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                checksum: None,
+                requester: Requester::authenticated(writer.clone()),
+                acl: PutObjectAcl::BucketOwnerFullControl,
+                sse_customer: None,
+            })
+            .unwrap();
+
+        let meta_pg = coord
+            .storage_node
+            .get_pg(coord.object_pg_id("bucket", "key"))
+            .unwrap();
+        let upload_record = meta_pg.get_multipart_upload(&upload.upload_id).unwrap();
+        assert_eq!(
+            upload_record.initiator,
+            Some(OwnerIdentity::new(
+                writer.principal().to_string(),
+                writer.canonical_user_id().clone(),
+            ))
+        );
+        assert_eq!(
+            upload_record.owner,
+            OwnerIdentity::new(
+                bucket_owner.principal().to_string(),
+                bucket_owner.canonical_user_id().clone(),
+            )
+        );
+    }
+
+    #[test]
     fn create_bucket_for_requester_idempotent_create_does_not_overwrite_ownership_controls() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
@@ -8950,8 +9277,8 @@ mod tests {
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
-
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -9119,6 +9446,7 @@ mod tests {
                 tags: None,
                 checksum: None,
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             });
             tx.send(res).unwrap();
@@ -11374,6 +11702,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -12221,6 +12550,7 @@ mod tests {
                 tags: None,
                 checksum: None,
                 requester: Requester::principal("other-user"),
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap_err();
@@ -12244,6 +12574,7 @@ mod tests {
                 tags: None,
                 checksum: None,
                 requester: Requester::principal("owner-a"),
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -12266,6 +12597,37 @@ mod tests {
     }
 
     #[test]
+    fn create_multipart_upload_rejects_acl_on_bucket_owner_enforced_bucket() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        coord
+            .put_bucket_ownership_controls(
+                "bucket",
+                "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
+                Requester::principal("owner-a"),
+            )
+            .unwrap();
+
+        let err = coord
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                bucket: "bucket",
+                key: "key",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                checksum: None,
+                requester: TEST_REQUESTER,
+                acl: PutObjectAcl::Other("public-read"),
+                sse_customer: None,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessControlListNotSupported));
+    }
+
+    #[test]
     fn complete_multipart_upload_rejects_non_owner_requester() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
@@ -12282,6 +12644,7 @@ mod tests {
                 tags: None,
                 checksum: None,
                 requester: Requester::principal("owner-a"),
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -12317,6 +12680,7 @@ mod tests {
                 tags: None,
                 checksum: None,
                 requester: Requester::principal("owner-a"),
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -12369,6 +12733,7 @@ mod tests {
                 tags: None,
                 checksum: None,
                 requester: Requester::principal("owner-a"),
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -14031,6 +14396,7 @@ mod tests {
                 tags: None,
                 checksum: None,
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: Some(&sse_customer),
             })
             .unwrap();
@@ -14515,6 +14881,7 @@ mod tests {
                     tags: None,
                     checksum: None,
                     requester: TEST_REQUESTER,
+                    acl: NO_PUT_OBJECT_ACL,
                     sse_customer: None,
                 })
                 .unwrap();
@@ -14908,6 +15275,8 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
         assert_object_maps_meta_pg_gt_shard_pg(&admin, "race-bucket", &key);
@@ -14982,8 +15351,8 @@ mod tests {
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
-
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -15171,6 +15540,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -15197,6 +15567,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -15210,6 +15581,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -15232,6 +15604,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap_err();
@@ -15275,6 +15648,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -15288,6 +15662,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -15330,6 +15705,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -15343,6 +15719,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -15389,6 +15766,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -15402,6 +15780,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -15415,6 +15794,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -15470,6 +15850,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -15483,6 +15864,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -15496,6 +15878,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -15531,6 +15914,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -15589,6 +15973,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -15626,6 +16011,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -15807,6 +16193,7 @@ mod tests {
                     checksum: None,
 
                     requester: TEST_REQUESTER,
+                    acl: NO_PUT_OBJECT_ACL,
                     sse_customer: None,
                 })
                 .unwrap();
@@ -15878,6 +16265,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -15938,6 +16326,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -16004,6 +16393,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -16043,6 +16433,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -16106,6 +16497,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -16190,6 +16582,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -16237,6 +16630,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -16297,6 +16691,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -16356,6 +16751,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -16444,6 +16840,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -16740,6 +17137,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -17089,6 +17487,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -17138,6 +17537,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -17226,6 +17626,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -17399,6 +17800,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -17458,6 +17860,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -17526,6 +17929,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -17585,6 +17989,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -17639,6 +18044,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -17695,6 +18101,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -18327,8 +18734,8 @@ mod tests {
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: Some(MultipartChecksumConfig::new(algo, ctype).unwrap()),
-
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -18740,6 +19147,8 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -18862,6 +19271,7 @@ mod tests {
                 tags: None,
                 checksum: None,
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: Some(&sse_customer),
             })
             .unwrap();
@@ -18929,6 +19339,8 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -18972,6 +19384,8 @@ mod tests {
                 sse_customer: None,
                 tags: Some(tags_xml),
                 cond: &WriteCondition::default(),
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
         assert_eq!(result.version_id, VersionId::Null);
@@ -19040,6 +19454,8 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -19081,6 +19497,8 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap_err();
         assert!(
@@ -19138,6 +19556,8 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap_err();
         assert!(
@@ -19204,6 +19624,8 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
         assert_eq!(result.etag, format_etag(crc));
@@ -19266,6 +19688,8 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &cond,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -19288,6 +19712,8 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &bad_cond,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap_err();
         assert!(
@@ -19330,6 +19756,8 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
         assert_eq!(result.etag, format_etag(crc));
@@ -19403,6 +19831,8 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -19466,6 +19896,8 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -19539,6 +19971,8 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -19600,6 +20034,8 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -19684,6 +20120,8 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -19948,6 +20386,8 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -19989,6 +20429,8 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -20032,6 +20474,8 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -20104,6 +20548,8 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -20155,6 +20601,8 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -20214,6 +20662,8 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -20228,6 +20678,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -20286,6 +20737,8 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -20300,6 +20753,7 @@ mod tests {
                     MultipartChecksumConfig::new(ChecksumAlgorithm::Crc32c, None).unwrap(),
                 ),
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -20408,8 +20862,8 @@ mod tests {
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
-
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -20470,6 +20924,8 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
     }
@@ -20500,6 +20956,8 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap_err();
         assert!(
@@ -20574,6 +21032,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -20632,6 +21091,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -20692,6 +21152,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -20734,6 +21195,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -20747,6 +21209,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -20875,6 +21338,7 @@ mod tests {
                 checksum: None,
 
                 requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
                 sse_customer: None,
             })
             .unwrap();
@@ -21025,6 +21489,8 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -21114,6 +21580,8 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -21201,6 +21669,7 @@ mod tests {
                         bucket: live.bucket.clone(),
                         key: live.key.clone(),
                         version_id: live.version_id,
+                        owner: live.owner.clone(),
                         generation_id: live.generation_id,
                         size: live.size,
                         etag: live.etag,
@@ -21258,6 +21727,8 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -21328,6 +21799,8 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 
@@ -21348,6 +21821,8 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL,
             })
             .unwrap();
 

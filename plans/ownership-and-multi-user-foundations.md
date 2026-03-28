@@ -35,29 +35,32 @@ This plan should land before:
 The current code already has:
 - authenticated account identity propagated into `server-core`
 - durable bucket owner principal and canonical ID
+- durable object owner principal and canonical ID on live object rows and
+  delete markers
+- durable multipart effective owner identity plus optional initiator identity
 - alternate test credentials in `crates/s3-tests`
 - limited ownership-controls support at the bucket level
 
 The current code does not yet have:
-- durable owner identity on object rows
-- durable owner identity on delete markers
-- durable canonical owner identity on multipart uploads
 - object-level authorization decisions distinct from bucket-level authorization
+- XML and API surfaces that consistently render stored object and multipart
+  owner identity where AWS expects it
 - tenant/account modeling beyond synthetically derived account identity on
   configured credentials
 
 Important current shortcuts:
-- read and write authorization compares the requester only to the bucket owner
-  plus bucket public flags
+- read and write authorization still compare the requester primarily to the
+  bucket owner plus bucket public flags
 - object GET and HEAD authorize only at bucket scope before reading the object
-- multipart uploads store only an optional `owner_principal`, and current create
-  paths populate it from the bucket owner rather than the requester
+- multipart list and future ACL/XML owner surfaces do not yet consistently use
+  the stored owner and initiator identity
 
 ## Current Status
 
-Phase 1 is now in progress.
+Phase 1 is complete. Phase 2 durable persistence is also in place in storage
+and coordinator paths.
 
-Completed in the first implementation slice:
+Completed in Phase 1:
 - shared `AccountIdentity` type added for auth and request handling
 - credential records now resolve access keys to typed account identity rather
   than a bare principal string
@@ -68,11 +71,24 @@ Completed in the first implementation slice:
 - HTTP request dispatch now constructs coordinator requesters from the typed
   auth context
 
-Still open in Phase 1:
+Completed in Phase 2:
+- live object rows and delete markers now persist owner principal and canonical
+  ID explicitly
+- multipart upload rows now persist effective owner identity plus optional
+  initiator identity explicitly
+- coordinator write paths compute effective object ownership from the requester
+  and bucket ownership-controls rules
+- multipart completion reuses stored upload owner identity rather than
+  re-deriving it from the bucket
+- storage read paths now return stored owner identity for live objects, delete
+  markers, and multipart uploads without inference
+
+Still open after Phase 2:
 - the server config and local test harness still synthesize account identity
   directly from configured access keys and fixture principals
-- storage and object ownership paths still need later phases to persist and
-  consume the new identity model durably
+- object-scoped authorization is still bucket-centric
+- XML and API surfaces still need later phases to render stored owner identity
+  for object and multipart responses where AWS expects it
 
 ## Target Behavior
 
@@ -202,8 +218,8 @@ with the production auth path.
 
 ### Phase 1: Durable Account Identity
 
-Status: in progress. Typed account identity now flows through auth, HTTP, and
-core requester handling.
+Status: complete. Typed account identity now flows through auth, HTTP, and core
+requester handling.
 
 Deliver:
 - typed account identity in auth and request handling
@@ -215,6 +231,10 @@ Success criteria:
 - no call sites depend on raw principal strings alone for future ownership work
 
 ### Phase 2: Durable Object And Multipart Ownership
+
+Status: complete in storage and coordinator paths. Explicit owner identity is
+now stored and read back for live objects, delete markers, and multipart
+uploads.
 
 Deliver:
 - schema changes for object and multipart owner identity
@@ -272,20 +292,16 @@ AWS validation:
 - rerun a narrowed ownership subset against AWS before finalizing object-owner
   semantics for public-write and cross-account behavior
 
-## Open Decisions
+## Open Decision
 
 1. Account identity source
 - whether to introduce a small durable local account registry now, or keep the
   source in the credential store while still exposing a stable typed identity
 
-2. Delete marker ownership
-- whether to store delete-marker owner identity in the same row shape as live
-  objects or in a dedicated ownership sub-structure
-
-3. Multipart upload initiator vs owner
-- whether to model these as separate required fields immediately, or land
-  effective owner first and add initiator in the same schema change shortly
-  after
+Resolved in implementation:
+- delete-marker owner identity is stored in the same row shape as live objects
+- multipart uploads store effective owner and initiator as separate durable
+  fields
 
 ## Recommended Defaults
 

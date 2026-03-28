@@ -2,6 +2,10 @@ use crate::traits::{PgMetadataStore, ShardStore, StorageNode};
 use crate::types::*;
 use std::num::NonZeroU64;
 
+fn test_owner() -> OwnerIdentity {
+    OwnerIdentity::from_principal("owner")
+}
+
 /// Integration test: write shard data + object metadata, read both back.
 #[test]
 fn shard_and_metadata_roundtrip() {
@@ -21,6 +25,7 @@ fn shard_and_metadata_roundtrip() {
         bucket: "test-bucket".into(),
         key: "my/object.txt".into(),
         version_id: VersionId::Null,
+        owner: test_owner(),
         generation_id: GenerationId::MIN,
         size: shard_data.len() as u64,
         etag: ObjectEtag::single_part(ack.crc64),
@@ -44,6 +49,7 @@ fn shard_and_metadata_roundtrip() {
     let live = obj.as_live().unwrap();
     assert_eq!(live.size, shard_data.len() as u64);
     assert_eq!(live.etag, ObjectEtag::single_part(ack.crc64));
+    assert_eq!(live.owner, test_owner());
 }
 
 /// Integration test: LocalStorageNode with multiple PGs.
@@ -122,6 +128,7 @@ fn full_lifecycle() {
         bucket: "my-bucket".into(),
         key: "greeting.txt".into(),
         version_id: VersionId::Null,
+        owner: test_owner(),
         generation_id: GenerationId::MIN,
         size: data.len() as u64,
         etag: ObjectEtag::single_part(ack.crc64),
@@ -175,6 +182,7 @@ fn pg_store_persistence() {
                 bucket: "b".into(),
                 key: "k".into(),
                 version_id: VersionId::Null,
+                owner: test_owner(),
                 generation_id: GenerationId::MIN,
                 size: data.len() as u64,
                 etag: ObjectEtag::SinglePart([1, 0, 0, 0, 0, 0, 0, 0]),
@@ -229,7 +237,9 @@ fn multipart_upload_lifecycle() {
             tags: None,
             metadata_blob: vec![].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
-            owner_principal: Some("owner".into()),
+            initiator: Some(test_owner()),
+
+            owner: test_owner(),
             checksum: None,
             encryption: ObjectEncryption::None,
         })
@@ -297,6 +307,7 @@ fn multipart_upload_lifecycle() {
         bucket: "b".into(),
         key: "k".into(),
         version_id: VersionId::Null,
+        owner: test_owner(),
         generation_id: GenerationId::MIN,
         size: total_size,
         etag_crc64: [0xCC, 0, 0, 0, 0, 0, 0, 0],
@@ -467,6 +478,7 @@ fn streaming_put_object_lifecycle() {
                 bucket: "b".into(),
                 key: "k".into(),
                 version_id: VersionId::Null,
+                owner: test_owner(),
                 generation_id: GenerationId::MIN,
                 size: total_size,
                 etag_crc64: 0xDEAD,
@@ -523,7 +535,9 @@ fn streaming_upload_part_lifecycle() {
             tags: None,
             metadata_blob: vec![].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
-            owner_principal: None,
+            initiator: None,
+
+            owner: test_owner(),
             checksum: None,
             encryption: ObjectEncryption::None,
         })
@@ -665,6 +679,7 @@ fn versioned_object_lifecycle() {
                 bucket: "b".into(),
                 key: "k".into(),
                 version_id: vid,
+                owner: test_owner(),
                 generation_id: GenerationId::MIN,
                 ec: EcShape { k: 4, m: 2 },
                 size: data.len() as u64,
@@ -756,6 +771,7 @@ fn object_overwrite_with_reclaim() {
             bucket: "b".into(),
             key: "k".into(),
             version_id: VersionId::Null,
+            owner: test_owner(),
             generation_id: gen1,
             ec: EcShape { k: 4, m: 2 },
             size: 10,
@@ -789,6 +805,7 @@ fn object_overwrite_with_reclaim() {
             bucket: "b".into(),
             key: "k".into(),
             version_id: VersionId::Null,
+            owner: test_owner(),
             generation_id: gen2,
             ec: EcShape { k: 4, m: 2 },
             size: 10,
@@ -862,6 +879,7 @@ fn bucket_deletion_lifecycle() {
             bucket: "doomed".into(),
             key: "file.txt".into(),
             version_id: VersionId::Null,
+            owner: test_owner(),
             generation_id: GenerationId::MIN,
             ec: EcShape { k: 4, m: 2 },
             size: 5,
@@ -930,7 +948,9 @@ fn multipart_abort_cleanup() {
             tags: None,
             metadata_blob: vec![].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
-            owner_principal: None,
+            initiator: None,
+
+            owner: test_owner(),
             checksum: None,
             encryption: ObjectEncryption::None,
         })
@@ -1043,6 +1063,7 @@ fn object_tags_through_overwrite_and_versioned_delete() {
             bucket: "b".into(),
             key: "k".into(),
             version_id: VersionId::Null,
+            owner: test_owner(),
             generation_id: GenerationId::MIN,
             ec: EcShape { k: 4, m: 2 },
             size: 10,
@@ -1064,6 +1085,7 @@ fn object_tags_through_overwrite_and_versioned_delete() {
             bucket: "b".into(),
             key: "k".into(),
             version_id: VersionId::Null,
+            owner: test_owner(),
             generation_id: GenerationId::new(2).unwrap(),
             ec: EcShape { k: 4, m: 2 },
             size: 20,
@@ -1093,6 +1115,7 @@ fn object_tags_through_overwrite_and_versioned_delete() {
                 bucket: "b".into(),
                 key: "tagged".into(),
                 version_id: vid,
+                owner: test_owner(),
                 generation_id: GenerationId::MIN,
                 ec: EcShape { k: 4, m: 2 },
                 size: 5,
@@ -1186,7 +1209,9 @@ fn persistence_complex_state_through_reopen() {
                 tags: None,
                 metadata_blob: vec![].into(),
                 system_metadata_blob: SerializedSystemMetadataBlob::default(),
-                owner_principal: Some("owner".into()),
+                initiator: Some(test_owner()),
+
+                owner: test_owner(),
                 checksum: None,
                 encryption: ObjectEncryption::None,
             })
