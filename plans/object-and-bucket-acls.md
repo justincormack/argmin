@@ -1,0 +1,287 @@
+# Object And Bucket ACLs
+
+## Scope
+
+This plan covers completion of the S3 ACL surface after the ownership and
+multi-user foundations are in place.
+
+In scope:
+- bucket ACLs beyond the current boolean public flags
+- object ACLs, including per-version ACLs
+- canned ACLs on PUT, POST, COPY, multipart initiation, and presigned PUT
+- header grant parsing via `x-amz-grant-*`
+- `GetObjectAcl` and `PutObjectAcl`
+- interaction with bucket ownership controls
+- interaction with bucket-level public access block for ACL-related behavior
+
+Out of scope:
+- bucket policy evaluation
+- IAM policy language
+- account-level public access block
+
+Dependency:
+- this plan assumes `plans/ownership-and-multi-user-foundations.md` has landed
+  first
+
+## Current State
+
+The current implementation supports only a reduced ACL subset:
+- bucket ACLs are stored as `public_read` and `public_write` booleans
+- `GetBucketAcl` renders a synthetic ACL document from those booleans
+- `PutBucketAcl` only accepts canned values mapped onto those booleans
+- object writes parse only `private` and `bucket-owner-full-control` as special
+  cases
+- object ACLs are not stored durably at all
+- object ACL APIs are not implemented
+
+Ignored tests tied directly to this gap:
+- bucket header ACL grants
+- object header ACL grants
+- object copy canned ACL
+- object presigned PUT with ACL
+- block-public-object-canned-acls
+- versioned object ACL tests
+
+## Goals
+
+Implement a maintainable ACL model that matches AWS semantics for the covered
+feature set rather than continuing to special-case public and private behavior.
+
+The resulting design should make these states explicit:
+- owner grants
+- canonical-user grants
+- group grants
+- per-version object ACLs
+- ownership-controls restrictions
+- public-access-block overrides of public ACL effects
+
+## Target Behavior
+
+### Bucket ACLs
+
+Bucket ACLs should become a durable structured document rather than a pair of
+booleans.
+
+Requirements:
+- preserve current public-read and public-read-write behavior
+- support header grants and XML ACL documents
+- render `GetBucketAcl` from stored grants, not a synthetic reconstruction
+- derive fast-path public flags from the structured ACL where useful, but do not
+  treat those flags as the source of truth
+
+### Object ACLs
+
+Object ACLs must be first-class and version-specific.
+
+Requirements:
+- each committed live object version stores its own ACL
+- each version remains readable through `GetObjectAcl` even after newer versions
+  exist
+- requests without `versionId` operate on the current version's ACL, matching
+  AWS semantics
+
+### Canned ACLs And Header Grants
+
+Support the request forms AWS uses for the targeted test set:
+- `x-amz-acl`
+- `acl` form field for POST object
+- `x-amz-grant-read`
+- `x-amz-grant-write`
+- `x-amz-grant-read-acp`
+- `x-amz-grant-write-acp`
+- `x-amz-grant-full-control`
+
+Coverage requirements:
+- direct PUT object
+- POST object / form upload ACL handling
+- CopyObject destination ACL
+- multipart initiation where ACL is part of the upload state
+- presigned PUT where ACL headers are signed and enforced
+
+### Ownership Controls
+
+Ownership-controls behavior must remain correct:
+- `BucketOwnerEnforced` continues to reject ACL usage where AWS rejects it
+- `BucketOwnerPreferred` and `ObjectWriter` determine owner and ACL defaults
+  coherently
+- `bucket-owner-full-control` must work across direct PUT, POST object, COPY,
+  and presigned PUT
+
+### Public Access Block Interaction
+
+The bucket-level public access block already parses:
+- `BlockPublicAcls`
+- `IgnorePublicAcls`
+
+ACL behavior must respect those settings for both bucket and object ACLs:
+- `BlockPublicAcls` rejects new public ACL attempts
+- `IgnorePublicAcls` keeps stored ACLs but removes their public effect during
+  authorization
+
+## Design Changes
+
+### 1. Internal ACL Model
+
+Introduce typed ACL structures in core and storage:
+- owner identity
+- grants
+- grantee type
+- permission set
+
+Recommended grantee support:
+- canonical user
+- `AllUsers`
+- `AuthenticatedUsers`
+
+Avoid representing ACL state as free-form XML or ad hoc booleans in core logic.
+XML should remain a boundary format, not the internal source of truth.
+
+### 2. Storage
+
+Bucket metadata:
+- replace boolean-only ACL storage with a durable structured ACL column or
+  normalized ACL tables
+- keep derived public-read/public-write fast-path projections only if they are
+  maintained from the structured ACL deterministically
+
+Object metadata:
+- add object ACL storage keyed by `(bucket, key, version_id)`
+- ensure writes, copies, and version deletes cannot orphan ACL state
+
+Multipart upload state:
+- persist the ACL requested at initiation so complete and abort flows retain the
+  correct semantics
+
+### 3. HTTP Surface
+
+Add or complete:
+- `GET ?acl` and `PUT ?acl` for object paths
+- ACL XML parsing and rendering
+- `x-amz-grant-*` parsing
+- canned ACL parsing for bucket and object APIs
+
+The HTTP layer should normalize request forms into typed ACL structures before
+handing them to `server-core`.
+
+### 4. Authorization Engine
+
+Extend authorization to evaluate ACL permissions explicitly:
+- object read
+- object write
+- read ACP
+- write ACP
+- bucket read/write where bucket ACLs apply
+
+This should be separate from bucket-policy evaluation so later policy work can
+compose cleanly on top.
+
+### 5. Copy And Presigned Paths
+
+ACL handling must be consistent across:
+- direct PUT
+- CopyObject
+- UploadPartCopy where relevant state is inherited or rejected
+- presigned PUT with signed ACL headers
+
+Do not leave copy and presigned ACL behavior as separate special cases.
+
+## Implementation Phases
+
+### Phase 1: Typed ACL Representation
+
+Deliver:
+- internal ACL types
+- XML and header normalization into typed ACLs
+- permission and grantee enums that make illegal states hard to represent
+
+Success criteria:
+- bucket ACL paths can operate on the typed model without changing external
+  behavior yet
+
+### Phase 2: Bucket ACL Storage Migration
+
+Deliver:
+- structured bucket ACL storage
+- deterministic projection of current public flags from stored bucket ACL
+- `GetBucketAcl` and `PutBucketAcl` powered by the structured ACL
+
+Success criteria:
+- current bucket ACL tests continue to pass
+- header grant bucket ACL test can be unignored
+
+### Phase 3: Object ACL APIs And Storage
+
+Deliver:
+- object ACL persistence per version
+- `GetObjectAcl`
+- `PutObjectAcl`
+- version-aware ACL reads and writes
+
+Success criteria:
+- object ACL tests and versioned object ACL tests can be unignored
+
+### Phase 4: Canned ACLs On Write Paths
+
+Deliver:
+- direct PUT canned ACLs
+- CopyObject destination ACLs
+- multipart initiation ACL persistence
+- presigned PUT ACL handling
+
+Success criteria:
+- copy canned ACL and presigned PUT ACL tests can be unignored
+
+### Phase 5: Public Access Block Integration
+
+Deliver:
+- public object ACL attempts rejected under `BlockPublicAcls`
+- public object ACL effects suppressed under `IgnorePublicAcls`
+
+Success criteria:
+- block-public-object-canned-acls test can be unignored
+
+## Test Plan
+
+Targeted integration tests:
+- `cargo test -p s3-tests --test bucket_crud test_bucket_header_acl_grants -- --ignored`
+- `cargo test -p s3-tests --test object_crud test_object_header_acl_grants -- --ignored`
+- `cargo test -p s3-tests --test copy_object test_object_copy_canned_acl -- --ignored`
+- `cargo test -p s3-tests --test presigned test_object_presigned_put_object_with_acl -- --ignored`
+- `cargo test -p s3-tests --test public_access_block test_block_public_object_canned_acls -- --ignored`
+- `cargo test -p s3-tests --test versioning test_versioned_object_acl -- --ignored`
+- `cargo test -p s3-tests --test versioning test_versioned_object_acl_no_version_specified -- --ignored`
+
+Regression coverage:
+- `cargo test -p s3-tests --test ownership`
+- `cargo test -p s3-tests --test public_access_block`
+- `cargo test -p s3-tests --test copy_object`
+- `cargo test -p s3-tests --test post_object`
+- `cargo test -p s3-tests --test presigned`
+- `cargo test -p s3-tests --test versioning`
+
+AWS validation:
+- compare canned ACL, header grant, and per-version ACL behavior against AWS
+  before finalizing the permission matrix
+
+## Open Decisions
+
+1. Storage layout
+- whether bucket and object ACLs should live in typed serialized blobs or in
+  normalized child tables
+
+2. Fast-path projections
+- whether to retain `public_read` and `public_write` as derived bucket metadata
+  projections for hot paths, or remove them once ACL evaluation exists
+
+3. Authenticated users group
+- whether to implement `AuthenticatedUsers` fully in the first ACL cut or only
+  the portions exercised by the current compatibility tests
+
+## Recommended Defaults
+
+- adopt a typed internal ACL model and keep XML as a boundary format only
+- make structured ACL state the source of truth for bucket ACLs, with public
+  flags derived from it if still needed
+- store object ACLs per version, not per key
+- keep ACL evaluation as a separate layer from bucket-policy evaluation so the
+  later policy work can compose rather than replace it
