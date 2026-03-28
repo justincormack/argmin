@@ -187,6 +187,32 @@ fn test_object_copy_same_bucket() {
 }
 
 #[test]
+fn test_object_copy_wrong_expected_source_bucket_owner() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        put_object(&bucket, "foo123bar", b"foo").await;
+
+        let result = CTX
+            .client()
+            .copy_object()
+            .bucket(&bucket)
+            .key("bar321foo")
+            .copy_source(format!("{}/foo123bar", bucket))
+            .customize()
+            .mutate_request(|req| {
+                req.headers_mut()
+                    .insert("x-amz-source-expected-bucket-owner", "000000000000");
+            })
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 403);
+        assert_s3_err_code(&result, "AccessDenied");
+
+        cleanup(&bucket, &["foo123bar"]).await;
+    });
+}
+
+#[test]
 fn test_object_copy_verify_contenttype() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;

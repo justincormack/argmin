@@ -1072,6 +1072,8 @@ pub struct CopySource<'a> {
     pub key: &'a str,
     pub version_id: Option<VersionId>,
     pub condition: &'a ReadCondition,
+    #[cfg(not(test))]
+    pub expected_bucket_owner: Option<&'a str>,
 }
 
 /// Parsed CopyObject request from the HTTP layer.
@@ -1087,6 +1089,8 @@ pub struct CopyObjectRequest<'a> {
     pub acl: PutObjectAcl<'a>,
     pub source_sse_customer: Option<&'a SseCustomerRequest>,
     pub dst_sse_customer: Option<&'a SseCustomerRequest>,
+    #[cfg(not(test))]
+    pub expected_bucket_owner: Option<&'a str>,
 }
 
 /// Parsed UploadPartCopy request from the HTTP layer.
@@ -1101,6 +1105,8 @@ pub struct UploadPartCopyRequest<'a> {
     pub requester: Requester,
     pub source_sse_customer: Option<&'a SseCustomerRequest>,
     pub sse_customer: Option<&'a SseCustomerRequest>,
+    #[cfg(not(test))]
+    pub expected_bucket_owner: Option<&'a str>,
 }
 
 /// Request for a PutObject operation.
@@ -1116,6 +1122,8 @@ pub struct PutObjectRequest<'a> {
     pub requester: Requester,
     pub acl: PutObjectAcl<'a>,
     pub sse_customer: Option<&'a SseCustomerRequest>,
+    #[cfg(not(test))]
+    pub expected_bucket_owner: Option<&'a str>,
 }
 
 struct PreparedPutCommit {
@@ -1317,6 +1325,82 @@ pub struct ListBucketsRequest {
     pub requester: Requester,
 }
 
+/// Request for a bucket-scoped operation.
+#[derive(Debug)]
+pub struct BucketRequest<'a> {
+    pub name: &'a str,
+    pub requester: Requester,
+    #[cfg(not(test))]
+    pub expected_bucket_owner: Option<&'a str>,
+}
+
+/// Request for a bucket-scoped string configuration operation.
+#[derive(Debug)]
+pub struct PutBucketConfigRequest<'a> {
+    pub bucket: BucketRequest<'a>,
+    pub config: &'a str,
+}
+
+/// Request for a PutBucketVersioning operation.
+#[derive(Debug)]
+pub struct PutBucketVersioningRequest<'a> {
+    pub bucket: BucketRequest<'a>,
+    pub state: BucketVersioningState,
+}
+
+/// Request for a PutBucketEncryption operation.
+#[derive(Debug)]
+pub struct PutBucketEncryptionRequest<'a> {
+    pub bucket: BucketRequest<'a>,
+    pub config: BucketEncryptionConfig,
+}
+
+/// Request for a PutBucketAcl operation.
+#[derive(Debug)]
+pub struct PutBucketAclRequest<'a> {
+    pub bucket: BucketRequest<'a>,
+    pub acl_grants: AclGrants,
+}
+
+/// Request for a PutBucket canned ACL operation.
+#[derive(Debug)]
+pub struct PutBucketCannedAclRequest<'a> {
+    pub bucket: BucketRequest<'a>,
+    pub acl: BucketAcl,
+}
+
+/// Request for an object or object-version-scoped operation.
+#[derive(Debug)]
+pub struct ObjectVersionRequest<'a> {
+    pub bucket: &'a str,
+    pub key: &'a str,
+    pub version_id: Option<VersionId>,
+    pub requester: Requester,
+    #[cfg(not(test))]
+    pub expected_bucket_owner: Option<&'a str>,
+}
+
+/// Request for a PutObjectTagging operation.
+#[derive(Debug)]
+pub struct PutObjectTagsRequest<'a> {
+    pub object: ObjectVersionRequest<'a>,
+    pub tags: &'a str,
+}
+
+/// Request for a PutObjectAcl operation.
+#[derive(Debug)]
+pub struct PutObjectAclRequest<'a> {
+    pub object: ObjectVersionRequest<'a>,
+    pub acl_grants: AclGrants,
+}
+
+/// Request for a PutObject canned ACL operation.
+#[derive(Debug)]
+pub struct PutObjectCannedAclRequest<'a> {
+    pub object: ObjectVersionRequest<'a>,
+    pub acl: PutObjectAcl<'a>,
+}
+
 /// Request for a GetObject or HeadObject operation.
 #[derive(Debug)]
 pub struct GetObjectRequest<'a> {
@@ -1326,6 +1410,8 @@ pub struct GetObjectRequest<'a> {
     pub cond: &'a ReadCondition,
     pub requester: Requester,
     pub sse_customer: Option<&'a SseCustomerRequest>,
+    #[cfg(not(test))]
+    pub expected_bucket_owner: Option<&'a str>,
 }
 
 /// Request for a HeadBucket operation.
@@ -1333,6 +1419,8 @@ pub struct GetObjectRequest<'a> {
 pub struct HeadBucketRequest<'a> {
     pub bucket: &'a str,
     pub requester: Requester,
+    #[cfg(not(test))]
+    pub expected_bucket_owner: Option<&'a str>,
 }
 
 /// Request for a GetObjectPart or HeadObjectPart operation.
@@ -1345,6 +1433,8 @@ pub struct GetObjectPartRequest<'a> {
     pub cond: &'a ReadCondition,
     pub requester: Requester,
     pub sse_customer: Option<&'a SseCustomerRequest>,
+    #[cfg(not(test))]
+    pub expected_bucket_owner: Option<&'a str>,
 }
 
 /// Request for a GetObjectRange operation.
@@ -1357,6 +1447,8 @@ pub struct GetObjectRangeRequest<'a> {
     pub cond: &'a ReadCondition,
     pub requester: Requester,
     pub sse_customer: Option<&'a SseCustomerRequest>,
+    #[cfg(not(test))]
+    pub expected_bucket_owner: Option<&'a str>,
 }
 
 /// Request for a DeleteObject operation.
@@ -1367,6 +1459,8 @@ pub struct DeleteObjectRequest<'a> {
     pub version_id: Option<VersionId>,
     pub cond: &'a DeleteCondition,
     pub requester: Requester,
+    #[cfg(not(test))]
+    pub expected_bucket_owner: Option<&'a str>,
 }
 
 /// Request for a ListObjectsV2 operation.
@@ -1378,6 +1472,8 @@ pub struct ListObjectsV2Request<'a> {
     pub continuation_token: Option<&'a str>,
     pub max_keys: u32,
     pub requester: Requester,
+    #[cfg(not(test))]
+    pub expected_bucket_owner: Option<&'a str>,
 }
 
 /// Request for a ListObjectVersions operation.
@@ -1389,6 +1485,8 @@ pub struct ListObjectVersionsRequest<'a> {
     pub version_id_marker: Option<VersionId>,
     pub max_keys: u32,
     pub requester: Requester,
+    #[cfg(not(test))]
+    pub expected_bucket_owner: Option<&'a str>,
 }
 
 /// Request for a ListParts operation.
@@ -1400,6 +1498,8 @@ pub struct ListPartsRequest<'a> {
     pub part_number_marker: Option<u32>,
     pub max_parts: u32,
     pub requester: Requester,
+    #[cfg(not(test))]
+    pub expected_bucket_owner: Option<&'a str>,
 }
 
 /// Request for a ListMultipartUploads operation.
@@ -1411,6 +1511,8 @@ pub struct ListMultipartUploadsRequest<'a> {
     pub upload_id_marker: Option<&'a str>,
     pub max_uploads: u32,
     pub requester: Requester,
+    #[cfg(not(test))]
+    pub expected_bucket_owner: Option<&'a str>,
 }
 
 /// A single entry in a batch-delete request, with an already-parsed version ID.
@@ -1427,6 +1529,8 @@ pub struct DeleteObjectsRequest<'a> {
     pub entries: &'a [DeleteEntry<'a>],
     pub cond: &'a DeleteCondition,
     pub requester: Requester,
+    #[cfg(not(test))]
+    pub expected_bucket_owner: Option<&'a str>,
 }
 
 /// Request for a DeleteBucket operation.
@@ -1434,6 +1538,8 @@ pub struct DeleteObjectsRequest<'a> {
 pub struct DeleteBucketRequest<'a> {
     pub name: &'a str,
     pub requester: Requester,
+    #[cfg(not(test))]
+    pub expected_bucket_owner: Option<&'a str>,
 }
 
 /// Request for an AbortMultipartUpload operation.
@@ -1443,6 +1549,8 @@ pub struct AbortMultipartUploadRequest<'a> {
     pub key: &'a str,
     pub upload_id: &'a str,
     pub requester: Requester,
+    #[cfg(not(test))]
+    pub expected_bucket_owner: Option<&'a str>,
 }
 
 /// Request for a CreateMultipartUpload operation.
@@ -1457,6 +1565,8 @@ pub struct CreateMultipartUploadRequest<'a> {
     pub requester: Requester,
     pub acl: PutObjectAcl<'a>,
     pub sse_customer: Option<&'a SseCustomerRequest>,
+    #[cfg(not(test))]
+    pub expected_bucket_owner: Option<&'a str>,
 }
 
 /// Request for an UploadPart operation (test-only convenience wrapper).
@@ -1471,6 +1581,8 @@ pub struct UploadPartRequest<'a> {
     pub claimed_checksum: Option<&'a ChecksumClaim>,
     pub requester: Requester,
     pub sse_customer: Option<&'a SseCustomerRequest>,
+    #[cfg(not(test))]
+    pub expected_bucket_owner: Option<&'a str>,
 }
 
 /// Request for a GetObjectAttributes operation.
@@ -1485,6 +1597,8 @@ pub struct GetObjectAttributesRequest<'a> {
     pub max_parts: u32,
     pub requester: Requester,
     pub sse_customer: Option<&'a SseCustomerRequest>,
+    #[cfg(not(test))]
+    pub expected_bucket_owner: Option<&'a str>,
 }
 
 /// Request for a CompleteMultipartUpload operation.
@@ -1497,6 +1611,8 @@ pub struct CompleteMultipartUploadRequest<'a> {
     pub claimed_checksum: Option<&'a EncodedChecksumClaim>,
     pub requester: Requester,
     pub sse_customer: Option<&'a SseCustomerRequest>,
+    #[cfg(not(test))]
+    pub expected_bucket_owner: Option<&'a str>,
 }
 
 /// Request for beginning a streaming PutObject session.
@@ -1507,6 +1623,8 @@ pub struct BeginStreamPutRequest<'a> {
     pub requester: Requester,
     pub acl: PutObjectAcl<'a>,
     pub encryption: ObjectEncryption,
+    #[cfg(not(test))]
+    pub expected_bucket_owner: Option<&'a str>,
 }
 
 /// Request for beginning a streaming UploadPart session.
@@ -1518,6 +1636,121 @@ pub struct BeginStreamPartRequest<'a> {
     pub part_number: u32,
     pub requester: Requester,
     pub sse_customer: Option<&'a SseCustomerRequest>,
+    #[cfg(not(test))]
+    pub expected_bucket_owner: Option<&'a str>,
+}
+
+macro_rules! impl_expected_bucket_owner_accessor {
+    ($($name:ident),+ $(,)?) => {
+        $(
+            impl<'a> $name<'a> {
+                fn expected_bucket_owner(&self) -> Option<&str> {
+                    #[cfg(test)]
+                    {
+                        None
+                    }
+                    #[cfg(not(test))]
+                    {
+                        self.expected_bucket_owner
+                    }
+                }
+            }
+        )+
+    };
+}
+
+impl_expected_bucket_owner_accessor!(
+    CopySource,
+    CopyObjectRequest,
+    UploadPartCopyRequest,
+    PutObjectRequest,
+    BucketRequest,
+    ObjectVersionRequest,
+    GetObjectRequest,
+    HeadBucketRequest,
+    GetObjectPartRequest,
+    GetObjectRangeRequest,
+    DeleteObjectRequest,
+    ListObjectsV2Request,
+    ListObjectVersionsRequest,
+    ListPartsRequest,
+    ListMultipartUploadsRequest,
+    DeleteObjectsRequest,
+    DeleteBucketRequest,
+    AbortMultipartUploadRequest,
+    CreateMultipartUploadRequest,
+    GetObjectAttributesRequest,
+    CompleteMultipartUploadRequest,
+    BeginStreamPutRequest,
+    BeginStreamPartRequest,
+);
+
+#[cfg(any(test, feature = "test-utils"))]
+impl_expected_bucket_owner_accessor!(UploadPartRequest);
+
+impl<'a> BeginStreamPutRequest<'a> {
+    fn new(
+        bucket: &'a str,
+        key: &'a str,
+        requester: Requester,
+        acl: PutObjectAcl<'a>,
+        encryption: ObjectEncryption,
+        _expected_bucket_owner: Option<&'a str>,
+    ) -> Self {
+        Self {
+            bucket,
+            key,
+            requester,
+            acl,
+            encryption,
+            #[cfg(not(test))]
+            expected_bucket_owner: _expected_bucket_owner,
+        }
+    }
+}
+
+impl<'a> BeginStreamPartRequest<'a> {
+    fn new(
+        bucket: &'a str,
+        key: &'a str,
+        upload_id: &'a str,
+        part_number: u32,
+        requester: Requester,
+        sse_customer: Option<&'a SseCustomerRequest>,
+        _expected_bucket_owner: Option<&'a str>,
+    ) -> Self {
+        Self {
+            bucket,
+            key,
+            upload_id,
+            part_number,
+            requester,
+            sse_customer,
+            #[cfg(not(test))]
+            expected_bucket_owner: _expected_bucket_owner,
+        }
+    }
+}
+
+impl<'a> DeleteObjectRequest<'a> {
+    fn new(
+        bucket: &'a str,
+        key: &'a str,
+        version_id: Option<VersionId>,
+        cond: &'a DeleteCondition,
+        requester: Requester,
+        _expected_bucket_owner: Option<&'a str>,
+    ) -> Self {
+        Self {
+            bucket,
+            key,
+            version_id,
+            cond,
+            requester,
+            #[cfg(not(test))]
+            expected_bucket_owner: _expected_bucket_owner,
+        }
+    }
 }
 
 /// Parsed request for finalizing a streaming PutObject.
@@ -2795,6 +3028,16 @@ impl Coordinator {
         Ok(())
     }
 
+    fn ensure_expected_bucket_owner(
+        bucket: &BucketSummary,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<(), ServerError> {
+        if expected_bucket_owner.is_some_and(|expected| expected != bucket.owner_principal) {
+            return Err(ServerError::AccessDenied);
+        }
+        Ok(())
+    }
+
     fn requester_principal_required(requester: &Requester) -> Result<&str, ServerError> {
         requester.principal_opt().ok_or(ServerError::AccessDenied)
     }
@@ -3014,8 +3257,10 @@ impl Coordinator {
         bucket: &str,
         key: &str,
         version_id: Option<VersionId>,
+        expected_bucket_owner: Option<&str>,
     ) -> Result<LockedReadObject<'a>, ServerError> {
         let bucket_info = self.active_bucket_summary(bucket)?;
+        Self::ensure_expected_bucket_owner(&bucket_info, expected_bucket_owner)?;
         let can_discover_missing =
             Self::requester_can_bucket_admin(requester, &bucket_info.owner_principal);
         let locked = match self.lock_object_pgs_for_read(bucket, key, version_id) {
@@ -3042,8 +3287,10 @@ impl Coordinator {
         key: &str,
         version_id: Option<VersionId>,
         require_write: bool,
+        expected_bucket_owner: Option<&str>,
     ) -> Result<(BucketSummary, LockedReadObject<'a>), ServerError> {
         let bucket_info = self.active_bucket_summary(bucket)?;
+        Self::ensure_expected_bucket_owner(&bucket_info, expected_bucket_owner)?;
         let can_discover_missing =
             Self::requester_can_bucket_admin(requester, &bucket_info.owner_principal);
         let locked = match self.lock_object_pgs_for_read(bucket, key, version_id) {
@@ -3085,8 +3332,10 @@ impl Coordinator {
         &self,
         requester: &Requester,
         bucket: &str,
+        expected_bucket_owner: Option<&str>,
     ) -> Result<BucketSummary, ServerError> {
         let info = self.active_bucket_summary(bucket)?;
+        Self::ensure_expected_bucket_owner(&info, expected_bucket_owner)?;
         if Self::requester_can_read_bucket(
             requester,
             &info.owner_principal,
@@ -3103,8 +3352,10 @@ impl Coordinator {
         &self,
         requester: &Requester,
         bucket: &str,
+        expected_bucket_owner: Option<&str>,
     ) -> Result<BucketSummary, ServerError> {
         let info = self.active_bucket_summary(bucket)?;
+        Self::ensure_expected_bucket_owner(&info, expected_bucket_owner)?;
         if Self::requester_can_bucket_admin(requester, &info.owner_principal) {
             Ok(info)
         } else {
@@ -3116,8 +3367,10 @@ impl Coordinator {
         &self,
         requester: &Requester,
         bucket: &str,
+        expected_bucket_owner: Option<&str>,
     ) -> Result<BucketSummary, ServerError> {
         let info = self.active_bucket_summary(bucket)?;
+        Self::ensure_expected_bucket_owner(&info, expected_bucket_owner)?;
         if Self::requester_can_object_write(
             requester,
             &info.owner_principal,
@@ -3136,8 +3389,10 @@ impl Coordinator {
         bucket: &str,
         key: &str,
         version_id: Option<VersionId>,
+        expected_bucket_owner: Option<&str>,
     ) -> Result<LockedReadObject<'a>, ServerError> {
         let bucket_info = self.active_bucket_summary(bucket)?;
+        Self::ensure_expected_bucket_owner(&bucket_info, expected_bucket_owner)?;
         let can_read_bucket = Self::requester_can_read_bucket(
             requester,
             &bucket_info.owner_principal,
@@ -3298,6 +3553,16 @@ impl Coordinator {
         })?;
         self.storage_node.upsert_bucket_fast_path((&info).into());
         Ok(Self::bucket_summary(info))
+    }
+
+    fn active_bucket_summary_with_expected_owner(
+        &self,
+        name: &str,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<BucketSummary, ServerError> {
+        let bucket = self.active_bucket_summary(name)?;
+        Self::ensure_expected_bucket_owner(&bucket, expected_bucket_owner)?;
+        Ok(bucket)
     }
 
     /// Create a new coordinator.
@@ -3533,6 +3798,14 @@ impl Coordinator {
     }
 
     pub fn delete_bucket(&self, req: &DeleteBucketRequest<'_>) -> Result<(), ServerError> {
+        self.delete_bucket_with_expected_bucket_owner(req, req.expected_bucket_owner())
+    }
+
+    pub fn delete_bucket_with_expected_bucket_owner(
+        &self,
+        req: &DeleteBucketRequest<'_>,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::delete_bucket",
@@ -3540,7 +3813,8 @@ impl Coordinator {
             req.name
         );
         let name = req.name;
-        let _bucket_info = self.authorize_bucket_admin_requester(&req.requester, name)?;
+        let _bucket_info =
+            self.authorize_bucket_admin_requester(&req.requester, name, expected_bucket_owner)?;
         self.begin_bucket_write_drain(name)?;
 
         let mut marked_deleting = false;
@@ -3609,13 +3883,21 @@ impl Coordinator {
         &self,
         req: &HeadBucketRequest<'_>,
     ) -> Result<BucketSummary, ServerError> {
+        self.head_bucket_for_requester_with_expected_bucket_owner(req, req.expected_bucket_owner())
+    }
+
+    pub fn head_bucket_for_requester_with_expected_bucket_owner(
+        &self,
+        req: &HeadBucketRequest<'_>,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<BucketSummary, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::head_bucket_for_requester",
             "bucket={}",
             req.bucket
         );
-        self.authorize_bucket_read_requester(&req.requester, req.bucket)
+        self.authorize_bucket_read_requester(&req.requester, req.bucket, expected_bucket_owner)
     }
 
     pub fn list_buckets(&self) -> Result<Vec<BucketSummary>, ServerError> {
@@ -3645,11 +3927,238 @@ impl Coordinator {
         Ok(out)
     }
 
+    pub fn put_bucket_versioning_for_request(
+        &self,
+        req: &PutBucketVersioningRequest<'_>,
+    ) -> Result<(), ServerError> {
+        self.put_bucket_versioning_with_expected_bucket_owner(
+            req.bucket.name,
+            req.state,
+            req.bucket.requester.clone(),
+            req.bucket.expected_bucket_owner(),
+        )
+    }
+
+    pub fn get_bucket_versioning_for_request(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<BucketVersioningState, ServerError> {
+        self.get_bucket_versioning_with_expected_bucket_owner(
+            req.name,
+            req.requester.clone(),
+            req.expected_bucket_owner(),
+        )
+    }
+
+    pub fn put_bucket_encryption_for_request(
+        &self,
+        req: &PutBucketEncryptionRequest<'_>,
+    ) -> Result<(), ServerError> {
+        self.put_bucket_encryption_with_expected_bucket_owner(
+            req.bucket.name,
+            req.config,
+            req.bucket.requester.clone(),
+            req.bucket.expected_bucket_owner(),
+        )
+    }
+
+    pub fn get_bucket_encryption_for_request(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<BucketEncryptionConfig, ServerError> {
+        self.get_bucket_encryption_with_expected_bucket_owner(
+            req.name,
+            req.requester.clone(),
+            req.expected_bucket_owner(),
+        )
+    }
+
+    pub fn put_bucket_cors_for_request(
+        &self,
+        req: &PutBucketConfigRequest<'_>,
+    ) -> Result<(), ServerError> {
+        self.put_bucket_cors_with_expected_bucket_owner(
+            req.bucket.name,
+            req.config,
+            req.bucket.requester.clone(),
+            req.bucket.expected_bucket_owner(),
+        )
+    }
+
+    pub fn get_bucket_cors_for_request(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<Option<String>, ServerError> {
+        self.get_bucket_cors_with_expected_bucket_owner(
+            req.name,
+            req.requester.clone(),
+            req.expected_bucket_owner(),
+        )
+    }
+
+    pub fn delete_bucket_cors_for_request(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<(), ServerError> {
+        self.delete_bucket_cors_with_expected_bucket_owner(
+            req.name,
+            req.requester.clone(),
+            req.expected_bucket_owner(),
+        )
+    }
+
+    pub fn put_bucket_tags_for_request(
+        &self,
+        req: &PutBucketConfigRequest<'_>,
+    ) -> Result<(), ServerError> {
+        self.put_bucket_tags_with_expected_bucket_owner(
+            req.bucket.name,
+            req.config,
+            req.bucket.requester.clone(),
+            req.bucket.expected_bucket_owner(),
+        )
+    }
+
+    pub fn get_bucket_tags_for_request(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<Option<String>, ServerError> {
+        self.get_bucket_tags_with_expected_bucket_owner(
+            req.name,
+            req.requester.clone(),
+            req.expected_bucket_owner(),
+        )
+    }
+
+    pub fn delete_bucket_tags_for_request(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<(), ServerError> {
+        self.delete_bucket_tags_with_expected_bucket_owner(
+            req.name,
+            req.requester.clone(),
+            req.expected_bucket_owner(),
+        )
+    }
+
+    pub fn put_bucket_public_access_block_for_request(
+        &self,
+        req: &PutBucketConfigRequest<'_>,
+    ) -> Result<(), ServerError> {
+        self.put_bucket_public_access_block_with_expected_bucket_owner(
+            req.bucket.name,
+            req.config,
+            req.bucket.requester.clone(),
+            req.bucket.expected_bucket_owner(),
+        )
+    }
+
+    pub fn get_bucket_public_access_block_for_request(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<Option<String>, ServerError> {
+        self.get_bucket_public_access_block_with_expected_bucket_owner(
+            req.name,
+            req.requester.clone(),
+            req.expected_bucket_owner(),
+        )
+    }
+
+    pub fn delete_bucket_public_access_block_for_request(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<(), ServerError> {
+        self.delete_bucket_public_access_block_with_expected_bucket_owner(
+            req.name,
+            req.requester.clone(),
+            req.expected_bucket_owner(),
+        )
+    }
+
+    pub fn put_bucket_ownership_controls_for_request(
+        &self,
+        req: &PutBucketConfigRequest<'_>,
+    ) -> Result<(), ServerError> {
+        self.put_bucket_ownership_controls_with_expected_bucket_owner(
+            req.bucket.name,
+            req.config,
+            req.bucket.requester.clone(),
+            req.bucket.expected_bucket_owner(),
+        )
+    }
+
+    pub fn get_bucket_ownership_controls_for_request(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<Option<String>, ServerError> {
+        self.get_bucket_ownership_controls_with_expected_bucket_owner(
+            req.name,
+            req.requester.clone(),
+            req.expected_bucket_owner(),
+        )
+    }
+
+    pub fn delete_bucket_ownership_controls_for_request(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<(), ServerError> {
+        self.delete_bucket_ownership_controls_with_expected_bucket_owner(
+            req.name,
+            req.requester.clone(),
+            req.expected_bucket_owner(),
+        )
+    }
+
+    pub fn get_bucket_acl_for_request(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<GetBucketAclResult, ServerError> {
+        self.get_bucket_acl_with_expected_bucket_owner(
+            req.name,
+            req.requester.clone(),
+            req.expected_bucket_owner(),
+        )
+    }
+
+    pub fn put_bucket_acl_for_request(
+        &self,
+        req: &PutBucketAclRequest<'_>,
+    ) -> Result<(), ServerError> {
+        self.put_bucket_acl_with_expected_bucket_owner(
+            req.bucket.name,
+            req.acl_grants.clone(),
+            req.bucket.requester.clone(),
+            req.bucket.expected_bucket_owner(),
+        )
+    }
+
+    pub fn put_bucket_canned_acl_for_request(
+        &self,
+        req: &PutBucketCannedAclRequest<'_>,
+    ) -> Result<(), ServerError> {
+        self.put_bucket_canned_acl_with_expected_bucket_owner(
+            req.bucket.name,
+            req.acl,
+            req.bucket.requester.clone(),
+            req.bucket.expected_bucket_owner(),
+        )
+    }
+
     pub fn put_bucket_versioning(
         &self,
         name: &str,
         state: BucketVersioningState,
         requester: Requester,
+    ) -> Result<(), ServerError> {
+        self.put_bucket_versioning_with_expected_bucket_owner(name, state, requester, None)
+    }
+
+    pub fn put_bucket_versioning_with_expected_bucket_owner(
+        &self,
+        name: &str,
+        state: BucketVersioningState,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
     ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
@@ -3658,7 +4167,8 @@ impl Coordinator {
             name,
             state
         );
-        let _bucket_info = self.authorize_bucket_admin_requester(&requester, name)?;
+        let _bucket_info =
+            self.authorize_bucket_admin_requester(&requester, name, expected_bucket_owner)?;
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg
             .put_bucket_versioning(name, state)
@@ -3683,13 +4193,22 @@ impl Coordinator {
         name: &str,
         requester: Requester,
     ) -> Result<BucketVersioningState, ServerError> {
+        self.get_bucket_versioning_with_expected_bucket_owner(name, requester, None)
+    }
+
+    pub fn get_bucket_versioning_with_expected_bucket_owner(
+        &self,
+        name: &str,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<BucketVersioningState, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_bucket_versioning",
             "bucket={}",
             name
         );
-        let info = self.authorize_bucket_read_requester(&requester, name)?;
+        let info = self.authorize_bucket_read_requester(&requester, name, expected_bucket_owner)?;
         Ok(info.versioning)
     }
 
@@ -3699,6 +4218,16 @@ impl Coordinator {
         config: BucketEncryptionConfig,
         requester: Requester,
     ) -> Result<(), ServerError> {
+        self.put_bucket_encryption_with_expected_bucket_owner(name, config, requester, None)
+    }
+
+    pub fn put_bucket_encryption_with_expected_bucket_owner(
+        &self,
+        name: &str,
+        config: BucketEncryptionConfig,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_bucket_encryption",
@@ -3706,7 +4235,8 @@ impl Coordinator {
             name,
             config.sse_c_blocked
         );
-        let _bucket_info = self.authorize_bucket_admin_requester(&requester, name)?;
+        let _bucket_info =
+            self.authorize_bucket_admin_requester(&requester, name, expected_bucket_owner)?;
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg
             .put_bucket_encryption(name, config)
@@ -3726,13 +4256,23 @@ impl Coordinator {
         name: &str,
         requester: Requester,
     ) -> Result<BucketEncryptionConfig, ServerError> {
+        self.get_bucket_encryption_with_expected_bucket_owner(name, requester, None)
+    }
+
+    pub fn get_bucket_encryption_with_expected_bucket_owner(
+        &self,
+        name: &str,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<BucketEncryptionConfig, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_bucket_encryption",
             "bucket={}",
             name
         );
-        let info = self.authorize_bucket_admin_requester(&requester, name)?;
+        let info =
+            self.authorize_bucket_admin_requester(&requester, name, expected_bucket_owner)?;
         Ok(info.encryption)
     }
 
@@ -3742,6 +4282,16 @@ impl Coordinator {
         config: &str,
         requester: Requester,
     ) -> Result<(), ServerError> {
+        self.put_bucket_cors_with_expected_bucket_owner(name, config, requester, None)
+    }
+
+    pub fn put_bucket_cors_with_expected_bucket_owner(
+        &self,
+        name: &str,
+        config: &str,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_bucket_cors",
@@ -3749,7 +4299,8 @@ impl Coordinator {
             name,
             config.len()
         );
-        let _bucket_info = self.authorize_bucket_admin_requester(&requester, name)?;
+        let _bucket_info =
+            self.authorize_bucket_admin_requester(&requester, name, expected_bucket_owner)?;
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg
             .put_bucket_cors(name, config)
@@ -3782,24 +4333,44 @@ impl Coordinator {
         name: &str,
         requester: Requester,
     ) -> Result<Option<String>, ServerError> {
+        self.get_bucket_cors_with_expected_bucket_owner(name, requester, None)
+    }
+
+    pub fn get_bucket_cors_with_expected_bucket_owner(
+        &self,
+        name: &str,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<Option<String>, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_bucket_cors",
             "bucket={}",
             name
         );
-        let _bucket_info = self.authorize_bucket_read_requester(&requester, name)?;
+        let _bucket_info =
+            self.authorize_bucket_read_requester(&requester, name, expected_bucket_owner)?;
         self.get_bucket_cors_unchecked(name)
     }
 
     pub fn delete_bucket_cors(&self, name: &str, requester: Requester) -> Result<(), ServerError> {
+        self.delete_bucket_cors_with_expected_bucket_owner(name, requester, None)
+    }
+
+    pub fn delete_bucket_cors_with_expected_bucket_owner(
+        &self,
+        name: &str,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::delete_bucket_cors",
             "bucket={}",
             name
         );
-        let _bucket_info = self.authorize_bucket_admin_requester(&requester, name)?;
+        let _bucket_info =
+            self.authorize_bucket_admin_requester(&requester, name, expected_bucket_owner)?;
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg.delete_bucket_cors(name).map_err(|e| match e {
             storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
@@ -3817,6 +4388,16 @@ impl Coordinator {
         tags: &str,
         requester: Requester,
     ) -> Result<(), ServerError> {
+        self.put_bucket_tags_with_expected_bucket_owner(name, tags, requester, None)
+    }
+
+    pub fn put_bucket_tags_with_expected_bucket_owner(
+        &self,
+        name: &str,
+        tags: &str,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_bucket_tags",
@@ -3824,7 +4405,8 @@ impl Coordinator {
             name,
             tags.len()
         );
-        let _bucket_info = self.authorize_bucket_admin_requester(&requester, name)?;
+        let _bucket_info =
+            self.authorize_bucket_admin_requester(&requester, name, expected_bucket_owner)?;
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg.put_bucket_tags(name, tags).map_err(|e| match e {
             storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
@@ -3839,13 +4421,23 @@ impl Coordinator {
         name: &str,
         requester: Requester,
     ) -> Result<Option<String>, ServerError> {
+        self.get_bucket_tags_with_expected_bucket_owner(name, requester, None)
+    }
+
+    pub fn get_bucket_tags_with_expected_bucket_owner(
+        &self,
+        name: &str,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<Option<String>, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_bucket_tags",
             "bucket={}",
             name
         );
-        let _bucket_info = self.authorize_bucket_read_requester(&requester, name)?;
+        let _bucket_info =
+            self.authorize_bucket_read_requester(&requester, name, expected_bucket_owner)?;
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg.get_bucket_tags(name).map_err(|e| match e {
             storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
@@ -3856,13 +4448,23 @@ impl Coordinator {
     }
 
     pub fn delete_bucket_tags(&self, name: &str, requester: Requester) -> Result<(), ServerError> {
+        self.delete_bucket_tags_with_expected_bucket_owner(name, requester, None)
+    }
+
+    pub fn delete_bucket_tags_with_expected_bucket_owner(
+        &self,
+        name: &str,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::delete_bucket_tags",
             "bucket={}",
             name
         );
-        let _bucket_info = self.authorize_bucket_admin_requester(&requester, name)?;
+        let _bucket_info =
+            self.authorize_bucket_admin_requester(&requester, name, expected_bucket_owner)?;
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg.delete_bucket_tags(name).map_err(|e| match e {
             storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
@@ -3880,6 +4482,18 @@ impl Coordinator {
         config: &str,
         requester: Requester,
     ) -> Result<(), ServerError> {
+        self.put_bucket_public_access_block_with_expected_bucket_owner(
+            name, config, requester, None,
+        )
+    }
+
+    pub fn put_bucket_public_access_block_with_expected_bucket_owner(
+        &self,
+        name: &str,
+        config: &str,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_bucket_public_access_block",
@@ -3887,7 +4501,8 @@ impl Coordinator {
             name,
             config.len()
         );
-        let _bucket_info = self.authorize_bucket_admin_requester(&requester, name)?;
+        let _bucket_info =
+            self.authorize_bucket_admin_requester(&requester, name, expected_bucket_owner)?;
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg
             .put_bucket_public_access_block(name, config)
@@ -3910,13 +4525,23 @@ impl Coordinator {
         name: &str,
         requester: Requester,
     ) -> Result<Option<String>, ServerError> {
+        self.get_bucket_public_access_block_with_expected_bucket_owner(name, requester, None)
+    }
+
+    pub fn get_bucket_public_access_block_with_expected_bucket_owner(
+        &self,
+        name: &str,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<Option<String>, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_bucket_public_access_block",
             "bucket={}",
             name
         );
-        let _bucket_info = self.authorize_bucket_admin_requester(&requester, name)?;
+        let _bucket_info =
+            self.authorize_bucket_admin_requester(&requester, name, expected_bucket_owner)?;
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg
             .get_bucket_public_access_block(name)
@@ -3933,13 +4558,23 @@ impl Coordinator {
         name: &str,
         requester: Requester,
     ) -> Result<(), ServerError> {
+        self.delete_bucket_public_access_block_with_expected_bucket_owner(name, requester, None)
+    }
+
+    pub fn delete_bucket_public_access_block_with_expected_bucket_owner(
+        &self,
+        name: &str,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::delete_bucket_public_access_block",
             "bucket={}",
             name
         );
-        let _bucket_info = self.authorize_bucket_admin_requester(&requester, name)?;
+        let _bucket_info =
+            self.authorize_bucket_admin_requester(&requester, name, expected_bucket_owner)?;
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg
             .delete_bucket_public_access_block(name)
@@ -3962,6 +4597,16 @@ impl Coordinator {
         acl_grants: AclGrants,
         requester: Requester,
     ) -> Result<(), ServerError> {
+        self.put_bucket_acl_with_expected_bucket_owner(name, acl_grants, requester, None)
+    }
+
+    pub fn put_bucket_acl_with_expected_bucket_owner(
+        &self,
+        name: &str,
+        acl_grants: AclGrants,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_bucket_acl",
@@ -3969,7 +4614,8 @@ impl Coordinator {
             name,
             acl_grants.iter().count()
         );
-        let bucket_info = self.active_bucket_summary(name)?;
+        let bucket_info =
+            self.active_bucket_summary_with_expected_owner(name, expected_bucket_owner)?;
         if !Self::requester_can_write_bucket_acl(&requester, &bucket_info) {
             return Err(ServerError::AccessDenied);
         }
@@ -4008,14 +4654,29 @@ impl Coordinator {
         acl: BucketAcl,
         requester: Requester,
     ) -> Result<(), ServerError> {
-        let bucket = self.active_bucket_summary(name)?;
+        self.put_bucket_canned_acl_with_expected_bucket_owner(name, acl, requester, None)
+    }
+
+    pub fn put_bucket_canned_acl_with_expected_bucket_owner(
+        &self,
+        name: &str,
+        acl: BucketAcl,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<(), ServerError> {
+        let bucket = self.active_bucket_summary_with_expected_owner(name, expected_bucket_owner)?;
         if !Self::requester_can_write_bucket_acl(&requester, &bucket) {
             return Err(ServerError::AccessDenied);
         }
         Self::ensure_put_bucket_acl_supported(&bucket, acl)?;
         let grants =
             Self::bucket_acl_grants_from_canned(&Self::bucket_owner_identity(&bucket), acl)?;
-        self.put_bucket_acl(name, grants, requester)
+        self.put_bucket_acl_with_expected_bucket_owner(
+            name,
+            grants,
+            requester,
+            expected_bucket_owner,
+        )
     }
 
     pub fn get_bucket_acl(
@@ -4023,13 +4684,22 @@ impl Coordinator {
         name: &str,
         requester: Requester,
     ) -> Result<GetBucketAclResult, ServerError> {
+        self.get_bucket_acl_with_expected_bucket_owner(name, requester, None)
+    }
+
+    pub fn get_bucket_acl_with_expected_bucket_owner(
+        &self,
+        name: &str,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<GetBucketAclResult, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_bucket_acl",
             "bucket={}",
             name
         );
-        let bucket = self.active_bucket_summary(name)?;
+        let bucket = self.active_bucket_summary_with_expected_owner(name, expected_bucket_owner)?;
         if !Self::requester_can_read_bucket_acl(&requester, &bucket) {
             return Err(ServerError::AccessDenied);
         }
@@ -4080,6 +4750,20 @@ impl Coordinator {
         acl_grants: AclGrants,
         requester: Requester,
     ) -> Result<VersionId, ServerError> {
+        self.put_object_acl_with_expected_bucket_owner(
+            bucket, key, version_id, acl_grants, requester, None,
+        )
+    }
+
+    pub fn put_object_acl_with_expected_bucket_owner(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<VersionId>,
+        acl_grants: AclGrants,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<VersionId, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_object_acl",
@@ -4089,8 +4773,14 @@ impl Coordinator {
             version_id,
             acl_grants.iter().count()
         );
-        let (bucket_info, locked) =
-            self.lock_object_for_authorized_acl(&requester, bucket, key, version_id, true)?;
+        let (bucket_info, locked) = self.lock_object_for_authorized_acl(
+            &requester,
+            bucket,
+            key,
+            version_id,
+            true,
+            expected_bucket_owner,
+        )?;
         if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_deref()) {
             return Err(ServerError::AccessControlListNotSupported);
         }
@@ -4109,8 +4799,28 @@ impl Coordinator {
         acl: PutObjectAcl<'_>,
         requester: Requester,
     ) -> Result<VersionId, ServerError> {
-        let (bucket_info, locked) =
-            self.lock_object_for_authorized_acl(&requester, bucket, key, version_id, true)?;
+        self.put_object_canned_acl_with_expected_bucket_owner(
+            bucket, key, version_id, acl, requester, None,
+        )
+    }
+
+    pub fn put_object_canned_acl_with_expected_bucket_owner(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<VersionId>,
+        acl: PutObjectAcl<'_>,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<VersionId, ServerError> {
+        let (bucket_info, locked) = self.lock_object_for_authorized_acl(
+            &requester,
+            bucket,
+            key,
+            version_id,
+            true,
+            expected_bucket_owner,
+        )?;
         if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_deref()) {
             return Err(ServerError::AccessControlListNotSupported);
         }
@@ -4139,6 +4849,17 @@ impl Coordinator {
         version_id: Option<VersionId>,
         requester: Requester,
     ) -> Result<GetObjectAclResult, ServerError> {
+        self.get_object_acl_with_expected_bucket_owner(bucket, key, version_id, requester, None)
+    }
+
+    pub fn get_object_acl_with_expected_bucket_owner(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<VersionId>,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<GetObjectAclResult, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_object_acl",
@@ -4147,8 +4868,14 @@ impl Coordinator {
             key,
             version_id
         );
-        let (_bucket_info, locked) =
-            self.lock_object_for_authorized_acl(&requester, bucket, key, version_id, false)?;
+        let (_bucket_info, locked) = self.lock_object_for_authorized_acl(
+            &requester,
+            bucket,
+            key,
+            version_id,
+            false,
+            expected_bucket_owner,
+        )?;
         let LockedReadObject { record: stored, .. } = locked;
         let live = stored.as_live().ok_or(ServerError::MethodNotAllowed)?;
         Ok(GetObjectAclResult {
@@ -4167,6 +4894,16 @@ impl Coordinator {
         config: &str,
         requester: Requester,
     ) -> Result<(), ServerError> {
+        self.put_bucket_ownership_controls_with_expected_bucket_owner(name, config, requester, None)
+    }
+
+    pub fn put_bucket_ownership_controls_with_expected_bucket_owner(
+        &self,
+        name: &str,
+        config: &str,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_bucket_ownership_controls",
@@ -4174,7 +4911,8 @@ impl Coordinator {
             name,
             config.len()
         );
-        let bucket_info = self.authorize_bucket_admin_requester(&requester, name)?;
+        let bucket_info =
+            self.authorize_bucket_admin_requester(&requester, name, expected_bucket_owner)?;
         if Self::is_bucket_owner_enforced(Some(config))
             && !Self::acl_grants_owner_full_control_only(
                 &bucket_info.owner_canonical_id,
@@ -4205,13 +4943,23 @@ impl Coordinator {
         name: &str,
         requester: Requester,
     ) -> Result<Option<String>, ServerError> {
+        self.get_bucket_ownership_controls_with_expected_bucket_owner(name, requester, None)
+    }
+
+    pub fn get_bucket_ownership_controls_with_expected_bucket_owner(
+        &self,
+        name: &str,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<Option<String>, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_bucket_ownership_controls",
             "bucket={}",
             name
         );
-        let _bucket_info = self.authorize_bucket_admin_requester(&requester, name)?;
+        let _bucket_info =
+            self.authorize_bucket_admin_requester(&requester, name, expected_bucket_owner)?;
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg
             .get_bucket_ownership_controls(name)
@@ -4228,13 +4976,23 @@ impl Coordinator {
         name: &str,
         requester: Requester,
     ) -> Result<(), ServerError> {
+        self.delete_bucket_ownership_controls_with_expected_bucket_owner(name, requester, None)
+    }
+
+    pub fn delete_bucket_ownership_controls_with_expected_bucket_owner(
+        &self,
+        name: &str,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::delete_bucket_ownership_controls",
             "bucket={}",
             name
         );
-        let _bucket_info = self.authorize_bucket_admin_requester(&requester, name)?;
+        let _bucket_info =
+            self.authorize_bucket_admin_requester(&requester, name, expected_bucket_owner)?;
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg
             .delete_bucket_ownership_controls(name)
@@ -4251,6 +5009,87 @@ impl Coordinator {
 
     // ── Object tagging ──────────────────────────────────────────────
 
+    pub fn put_object_tags_for_request(
+        &self,
+        req: &PutObjectTagsRequest<'_>,
+    ) -> Result<(), ServerError> {
+        self.put_object_tags_with_expected_bucket_owner(
+            req.object.bucket,
+            req.object.key,
+            req.object.version_id,
+            req.tags,
+            req.object.requester.clone(),
+            req.object.expected_bucket_owner(),
+        )
+    }
+
+    pub fn get_object_tags_for_request(
+        &self,
+        req: &ObjectVersionRequest<'_>,
+    ) -> Result<Option<String>, ServerError> {
+        self.get_object_tags_with_expected_bucket_owner(
+            req.bucket,
+            req.key,
+            req.version_id,
+            req.requester.clone(),
+            req.expected_bucket_owner(),
+        )
+    }
+
+    pub fn delete_object_tags_for_request(
+        &self,
+        req: &ObjectVersionRequest<'_>,
+    ) -> Result<(), ServerError> {
+        self.delete_object_tags_with_expected_bucket_owner(
+            req.bucket,
+            req.key,
+            req.version_id,
+            req.requester.clone(),
+            req.expected_bucket_owner(),
+        )
+    }
+
+    pub fn get_object_acl_for_request(
+        &self,
+        req: &ObjectVersionRequest<'_>,
+    ) -> Result<GetObjectAclResult, ServerError> {
+        self.get_object_acl_with_expected_bucket_owner(
+            req.bucket,
+            req.key,
+            req.version_id,
+            req.requester.clone(),
+            req.expected_bucket_owner(),
+        )
+    }
+
+    pub fn put_object_acl_for_request(
+        &self,
+        req: &PutObjectAclRequest<'_>,
+    ) -> Result<VersionId, ServerError> {
+        self.put_object_acl_with_expected_bucket_owner(
+            req.object.bucket,
+            req.object.key,
+            req.object.version_id,
+            req.acl_grants.clone(),
+            req.object.requester.clone(),
+            req.object.expected_bucket_owner(),
+        )
+    }
+
+    pub fn put_object_canned_acl_for_request(
+        &self,
+        req: &PutObjectCannedAclRequest<'_>,
+    ) -> Result<VersionId, ServerError> {
+        self.put_object_canned_acl_with_expected_bucket_owner(
+            req.object.bucket,
+            req.object.key,
+            req.object.version_id,
+            req.acl,
+            req.object.requester.clone(),
+            req.object.expected_bucket_owner(),
+        )
+    }
+
     pub fn put_object_tags(
         &self,
         bucket: &str,
@@ -4258,6 +5097,20 @@ impl Coordinator {
         version_id: Option<VersionId>,
         tags: &str,
         requester: Requester,
+    ) -> Result<(), ServerError> {
+        self.put_object_tags_with_expected_bucket_owner(
+            bucket, key, version_id, tags, requester, None,
+        )
+    }
+
+    pub fn put_object_tags_with_expected_bucket_owner(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<VersionId>,
+        tags: &str,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
     ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
@@ -4270,7 +5123,13 @@ impl Coordinator {
         let LockedReadObject {
             record: stored,
             pgs,
-        } = self.lock_object_for_authorized_tagging(&requester, bucket, key, version_id)?;
+        } = self.lock_object_for_authorized_tagging(
+            &requester,
+            bucket,
+            key,
+            version_id,
+            expected_bucket_owner,
+        )?;
         if stored.is_delete_marker() {
             return Err(ServerError::MethodNotAllowed);
         }
@@ -4286,6 +5145,17 @@ impl Coordinator {
         version_id: Option<VersionId>,
         requester: Requester,
     ) -> Result<Option<String>, ServerError> {
+        self.get_object_tags_with_expected_bucket_owner(bucket, key, version_id, requester, None)
+    }
+
+    pub fn get_object_tags_with_expected_bucket_owner(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<VersionId>,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<Option<String>, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_object_tags",
@@ -4296,7 +5166,13 @@ impl Coordinator {
         let LockedReadObject {
             record: stored,
             pgs,
-        } = self.lock_object_for_authorized_tagging(&requester, bucket, key, version_id)?;
+        } = self.lock_object_for_authorized_tagging(
+            &requester,
+            bucket,
+            key,
+            version_id,
+            expected_bucket_owner,
+        )?;
         if stored.is_delete_marker() {
             return Err(ServerError::MethodNotAllowed);
         }
@@ -4312,6 +5188,17 @@ impl Coordinator {
         version_id: Option<VersionId>,
         requester: Requester,
     ) -> Result<(), ServerError> {
+        self.delete_object_tags_with_expected_bucket_owner(bucket, key, version_id, requester, None)
+    }
+
+    pub fn delete_object_tags_with_expected_bucket_owner(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<VersionId>,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::delete_object_tags",
@@ -4322,7 +5209,13 @@ impl Coordinator {
         let LockedReadObject {
             record: stored,
             pgs,
-        } = self.lock_object_for_authorized_tagging(&requester, bucket, key, version_id)?;
+        } = self.lock_object_for_authorized_tagging(
+            &requester,
+            bucket,
+            key,
+            version_id,
+            expected_bucket_owner,
+        )?;
         if stored.is_delete_marker() {
             return Err(ServerError::MethodNotAllowed);
         }
@@ -4509,6 +5402,14 @@ impl Coordinator {
 
     /// Put an object, using a direct single-segment commit when possible.
     pub fn put_object(&self, req: &PutObjectRequest<'_>) -> Result<PutObjectResult, ServerError> {
+        self.put_object_with_expected_bucket_owner(req, req.expected_bucket_owner())
+    }
+
+    pub fn put_object_with_expected_bucket_owner(
+        &self,
+        req: &PutObjectRequest<'_>,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<PutObjectResult, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_object",
@@ -4520,16 +5421,20 @@ impl Coordinator {
         let write_encryption = self.prepare_sse_customer_write_context(req.sse_customer)?;
 
         if req.data.len() > INTERNAL_SEGMENT_SIZE {
-            let session_id = self.begin_stream_put(&BeginStreamPutRequest {
-                bucket: req.bucket,
-                key: req.key,
-                requester: req.requester.clone(),
-                acl: req.acl,
-                encryption: write_encryption
-                    .as_ref()
-                    .map(|ctx| ctx.encryption().clone())
-                    .unwrap_or_default(),
-            })?;
+            let session_id = self.begin_stream_put_with_expected_bucket_owner(
+                &BeginStreamPutRequest::new(
+                    req.bucket,
+                    req.key,
+                    req.requester.clone(),
+                    req.acl,
+                    write_encryption
+                        .as_ref()
+                        .map(|ctx| ctx.encryption().clone())
+                        .unwrap_or_default(),
+                    expected_bucket_owner,
+                ),
+                expected_bucket_owner,
+            )?;
             let result = (|| {
                 for (idx, chunk) in req.data.chunks(INTERNAL_SEGMENT_SIZE).enumerate() {
                     let chunk_storage = if let Some(ctx) = &write_encryption {
@@ -4567,6 +5472,7 @@ impl Coordinator {
         }
 
         self.with_bucket_write_reservation(req.bucket, |bucket_info| {
+            Self::ensure_expected_bucket_owner(&bucket_info, expected_bucket_owner)?;
             if !Self::requester_can_object_write(
                 &req.requester,
                 &bucket_info.owner_principal,
@@ -4724,6 +5630,14 @@ impl Coordinator {
     /// feeds segments via `append_stream_segment` and commits via
     /// `finalize_stream_put`.
     pub fn begin_stream_put(&self, req: &BeginStreamPutRequest<'_>) -> Result<String, ServerError> {
+        self.begin_stream_put_with_expected_bucket_owner(req, req.expected_bucket_owner())
+    }
+
+    pub fn begin_stream_put_with_expected_bucket_owner(
+        &self,
+        req: &BeginStreamPutRequest<'_>,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<String, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::begin_stream_put",
@@ -4734,6 +5648,7 @@ impl Coordinator {
         let bucket = req.bucket;
         let key = req.key;
         self.with_bucket_write_reservation(bucket, |bucket_info| {
+            Self::ensure_expected_bucket_owner(&bucket_info, expected_bucket_owner)?;
             if !Self::requester_can_object_write(
                 &req.requester,
                 &bucket_info.owner_principal,
@@ -4783,6 +5698,14 @@ impl Coordinator {
         &self,
         req: &BeginStreamPartRequest<'_>,
     ) -> Result<BeginStreamPartResult, ServerError> {
+        self.begin_stream_part_with_expected_bucket_owner(req, req.expected_bucket_owner())
+    }
+
+    pub fn begin_stream_part_with_expected_bucket_owner(
+        &self,
+        req: &BeginStreamPartRequest<'_>,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<BeginStreamPartResult, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::begin_stream_part",
@@ -4804,7 +5727,8 @@ impl Coordinator {
             });
         }
 
-        let bucket_info = self.active_bucket_summary(bucket)?;
+        let bucket_info =
+            self.active_bucket_summary_with_expected_owner(bucket, expected_bucket_owner)?;
 
         // Lock metadata PG and validate upload exists.
         let meta_pg_id = self.object_pg_id(bucket, key);
@@ -5705,6 +6629,19 @@ impl Coordinator {
     /// and metadata directive (COPY preserves source metadata, REPLACE
     /// uses new headers).
     pub fn copy_object(&self, req: &CopyObjectRequest) -> Result<CopyObjectResult, ServerError> {
+        self.copy_object_with_expected_bucket_owners(
+            req,
+            req.expected_bucket_owner(),
+            req.source.expected_bucket_owner(),
+        )
+    }
+
+    pub fn copy_object_with_expected_bucket_owners(
+        &self,
+        req: &CopyObjectRequest,
+        expected_dst_bucket_owner: Option<&str>,
+        expected_source_bucket_owner: Option<&str>,
+    ) -> Result<CopyObjectResult, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::copy_object",
@@ -5731,7 +6668,11 @@ impl Coordinator {
             .as_ref()
             .map(|ctx| ctx.request().response_headers());
 
-        let dst_bucket_info = self.authorize_object_write_requester(requester, dst_bucket)?;
+        let dst_bucket_info = self.authorize_object_write_requester(
+            requester,
+            dst_bucket,
+            expected_dst_bucket_owner,
+        )?;
 
         Self::ensure_put_object_acl_supported(&dst_bucket_info, acl)?;
 
@@ -5745,6 +6686,7 @@ impl Coordinator {
                 src_bucket,
                 src_key,
                 src_version_id,
+                expected_source_bucket_owner,
             )?;
 
             // Reject delete markers — they are not copyable objects.
@@ -5912,16 +6854,17 @@ impl Coordinator {
             } => Some(StreamingChecksumAccumulator::new(*algo)),
             _ => None,
         };
-        let session_id = self.begin_stream_put(&BeginStreamPutRequest {
-            bucket: dst_bucket,
-            key: dst_key,
-            requester: requester.clone(),
+        let session_id = self.begin_stream_put(&BeginStreamPutRequest::new(
+            dst_bucket,
+            dst_key,
+            requester.clone(),
             acl,
-            encryption: dst_write_sse_customer
+            dst_write_sse_customer
                 .as_ref()
                 .map(|ctx| ctx.encryption().clone())
                 .unwrap_or_default(),
-        })?;
+            expected_dst_bucket_owner,
+        ))?;
         let not_found = |e: ServerError| match e {
             ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
                 bucket: src_bucket.to_string(),
@@ -6468,6 +7411,14 @@ impl Coordinator {
 
     /// Get an object from storage.
     pub fn get_object(&self, req: &GetObjectRequest) -> Result<GetObjectResult, ServerError> {
+        self.get_object_with_expected_bucket_owner(req, req.expected_bucket_owner())
+    }
+
+    pub fn get_object_with_expected_bucket_owner(
+        &self,
+        req: &GetObjectRequest,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<GetObjectResult, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_object",
@@ -6484,7 +7435,13 @@ impl Coordinator {
         let LockedReadObject {
             record: stored,
             pgs,
-        } = self.lock_object_for_authorized_read(requester, bucket, key, version_id)?;
+        } = self.lock_object_for_authorized_read(
+            requester,
+            bucket,
+            key,
+            version_id,
+            expected_bucket_owner,
+        )?;
 
         // If latest version is a delete marker, return 404 with x-amz-delete-marker
         let record = match stored {
@@ -6605,6 +7562,14 @@ impl Coordinator {
         &self,
         req: &GetObjectPartRequest,
     ) -> Result<GetObjectPartResult, ServerError> {
+        self.get_object_part_with_expected_bucket_owner(req, req.expected_bucket_owner())
+    }
+
+    pub fn get_object_part_with_expected_bucket_owner(
+        &self,
+        req: &GetObjectPartRequest,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<GetObjectPartResult, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_object_part",
@@ -6623,7 +7588,13 @@ impl Coordinator {
         let LockedReadObject {
             record: stored,
             pgs,
-        } = self.lock_object_for_authorized_read(requester, bucket, key, version_id)?;
+        } = self.lock_object_for_authorized_read(
+            requester,
+            bucket,
+            key,
+            version_id,
+            expected_bucket_owner,
+        )?;
 
         let record = match stored {
             StoredObject::Live(r) => r,
@@ -6783,6 +7754,14 @@ impl Coordinator {
         &self,
         req: &GetObjectPartRequest,
     ) -> Result<HeadObjectPartResult, ServerError> {
+        self.head_object_part_with_expected_bucket_owner(req, req.expected_bucket_owner())
+    }
+
+    pub fn head_object_part_with_expected_bucket_owner(
+        &self,
+        req: &GetObjectPartRequest,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<HeadObjectPartResult, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::head_object_part",
@@ -6801,7 +7780,13 @@ impl Coordinator {
         let LockedReadObject {
             record: stored,
             pgs,
-        } = self.lock_object_for_authorized_read(requester, bucket, key, version_id)?;
+        } = self.lock_object_for_authorized_read(
+            requester,
+            bucket,
+            key,
+            version_id,
+            expected_bucket_owner,
+        )?;
 
         let record = match stored {
             StoredObject::Live(r) => r,
@@ -6900,6 +7885,14 @@ impl Coordinator {
     ///
     /// Metadata is always read from the DB row (no shard read needed).
     pub fn head_object(&self, req: &GetObjectRequest) -> Result<HeadObjectResult, ServerError> {
+        self.head_object_with_expected_bucket_owner(req, req.expected_bucket_owner())
+    }
+
+    pub fn head_object_with_expected_bucket_owner(
+        &self,
+        req: &GetObjectRequest,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<HeadObjectResult, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::head_object",
@@ -6913,8 +7906,13 @@ impl Coordinator {
         let version_id = req.version_id;
         let cond = req.cond;
         let requester = &req.requester;
-        let LockedReadObject { record: stored, .. } =
-            self.lock_object_for_authorized_read(requester, bucket, key, version_id)?;
+        let LockedReadObject { record: stored, .. } = self.lock_object_for_authorized_read(
+            requester,
+            bucket,
+            key,
+            version_id,
+            expected_bucket_owner,
+        )?;
 
         // If latest version is a delete marker, return 404 with x-amz-delete-marker
         let record = match stored {
@@ -6958,6 +7956,14 @@ impl Coordinator {
         &self,
         req: &GetObjectAttributesRequest,
     ) -> Result<GetObjectAttributesResult, ServerError> {
+        self.get_object_attributes_with_expected_bucket_owner(req, req.expected_bucket_owner())
+    }
+
+    pub fn get_object_attributes_with_expected_bucket_owner(
+        &self,
+        req: &GetObjectAttributesRequest,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<GetObjectAttributesResult, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_object_attributes",
@@ -6978,7 +7984,13 @@ impl Coordinator {
         let LockedReadObject {
             record: stored,
             pgs,
-        } = self.lock_object_for_authorized_read(requester, bucket, key, version_id)?;
+        } = self.lock_object_for_authorized_read(
+            requester,
+            bucket,
+            key,
+            version_id,
+            expected_bucket_owner,
+        )?;
 
         let record = match stored {
             StoredObject::Live(r) => r,
@@ -7092,6 +8104,14 @@ impl Coordinator {
         &self,
         req: &GetObjectRangeRequest,
     ) -> Result<GetObjectRangeResult, ServerError> {
+        self.get_object_range_with_expected_bucket_owner(req, req.expected_bucket_owner())
+    }
+
+    pub fn get_object_range_with_expected_bucket_owner(
+        &self,
+        req: &GetObjectRangeRequest,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<GetObjectRangeResult, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_object_range",
@@ -7110,7 +8130,13 @@ impl Coordinator {
         let LockedReadObject {
             record: stored,
             pgs,
-        } = self.lock_object_for_authorized_read(requester, bucket, key, version_id)?;
+        } = self.lock_object_for_authorized_read(
+            requester,
+            bucket,
+            key,
+            version_id,
+            expected_bucket_owner,
+        )?;
 
         // If latest version is a delete marker, return 404 with x-amz-delete-marker
         let record = match stored {
@@ -7262,6 +8288,14 @@ impl Coordinator {
         &self,
         req: &DeleteObjectRequest,
     ) -> Result<DeleteObjectResult, ServerError> {
+        self.delete_object_with_expected_bucket_owner(req, req.expected_bucket_owner())
+    }
+
+    pub fn delete_object_with_expected_bucket_owner(
+        &self,
+        req: &DeleteObjectRequest,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<DeleteObjectResult, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::delete_object",
@@ -7275,7 +8309,8 @@ impl Coordinator {
         let request_version_id = req.version_id;
         let cond = req.cond;
         let requester = &req.requester;
-        let bucket_info = self.authorize_object_write_requester(requester, bucket)?;
+        let bucket_info =
+            self.authorize_object_write_requester(requester, bucket, expected_bucket_owner)?;
 
         match (bucket_info.versioning, request_version_id) {
             // Unversioned bucket: physical delete (current behavior)
@@ -7529,6 +8564,14 @@ impl Coordinator {
         &self,
         req: &ListObjectsV2Request,
     ) -> Result<ListObjectsResult, ServerError> {
+        self.list_objects_v2_with_expected_bucket_owner(req, req.expected_bucket_owner())
+    }
+
+    pub fn list_objects_v2_with_expected_bucket_owner(
+        &self,
+        req: &ListObjectsV2Request,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<ListObjectsResult, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::list_objects_v2",
@@ -7541,7 +8584,8 @@ impl Coordinator {
         let delimiter = req.delimiter;
         let continuation_token = req.continuation_token;
         let max_keys = req.max_keys;
-        let bucket_info = self.authorize_bucket_read_requester(&req.requester, bucket)?;
+        let bucket_info =
+            self.authorize_bucket_read_requester(&req.requester, bucket, expected_bucket_owner)?;
 
         // MaxKeys=0 is valid per S3 spec: return empty result
         if max_keys == 0 {
@@ -7697,6 +8741,14 @@ impl Coordinator {
         &self,
         req: &ListObjectVersionsRequest,
     ) -> Result<ListObjectVersionsResult, ServerError> {
+        self.list_object_versions_with_expected_bucket_owner(req, req.expected_bucket_owner())
+    }
+
+    pub fn list_object_versions_with_expected_bucket_owner(
+        &self,
+        req: &ListObjectVersionsRequest,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<ListObjectVersionsResult, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::list_object_versions",
@@ -7709,7 +8761,8 @@ impl Coordinator {
         let key_marker = req.key_marker;
         let version_id_marker = req.version_id_marker;
         let max_keys = req.max_keys;
-        let bucket_info = self.authorize_bucket_read_requester(&req.requester, bucket)?;
+        let bucket_info =
+            self.authorize_bucket_read_requester(&req.requester, bucket, expected_bucket_owner)?;
 
         if max_keys == 0 {
             return Ok(ListObjectVersionsResult {
@@ -7801,6 +8854,14 @@ impl Coordinator {
         &self,
         req: &DeleteObjectsRequest,
     ) -> Result<DeleteObjectsResult, ServerError> {
+        self.delete_objects_with_expected_bucket_owner(req, req.expected_bucket_owner())
+    }
+
+    pub fn delete_objects_with_expected_bucket_owner(
+        &self,
+        req: &DeleteObjectsRequest,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<DeleteObjectsResult, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::delete_objects",
@@ -7812,19 +8873,24 @@ impl Coordinator {
         let entries = req.entries;
         let cond = req.cond;
         let requester = &req.requester;
-        let _bucket_info = self.authorize_bucket_admin_requester(requester, bucket)?;
+        let _bucket_info =
+            self.authorize_bucket_admin_requester(requester, bucket, expected_bucket_owner)?;
 
         let mut deleted = Vec::new();
         let mut errors = Vec::new();
 
         for entry in entries {
-            match self.delete_object(&DeleteObjectRequest {
-                bucket,
-                key: entry.key,
-                version_id: entry.version_id,
-                cond,
-                requester: requester.clone(),
-            }) {
+            match self.delete_object_with_expected_bucket_owner(
+                &DeleteObjectRequest::new(
+                    bucket,
+                    entry.key,
+                    entry.version_id,
+                    cond,
+                    requester.clone(),
+                    expected_bucket_owner,
+                ),
+                expected_bucket_owner,
+            ) {
                 Ok(result) => {
                     deleted.push(DeletedObject {
                         key: entry.key.to_string(),
@@ -7855,6 +8921,14 @@ impl Coordinator {
         &self,
         req: &CreateMultipartUploadRequest,
     ) -> Result<CreateMultipartUploadResult, ServerError> {
+        self.create_multipart_upload_with_expected_bucket_owner(req, req.expected_bucket_owner())
+    }
+
+    pub fn create_multipart_upload_with_expected_bucket_owner(
+        &self,
+        req: &CreateMultipartUploadRequest,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<CreateMultipartUploadResult, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::create_multipart_upload",
@@ -7865,6 +8939,7 @@ impl Coordinator {
         let bucket = req.bucket;
         let key = req.key;
         self.with_bucket_write_reservation(bucket, |bucket_info| {
+            Self::ensure_expected_bucket_owner(&bucket_info, expected_bucket_owner)?;
             if req.requester.is_anonymous() {
                 return Err(ServerError::AccessDenied);
             }
@@ -7931,6 +9006,19 @@ impl Coordinator {
         &self,
         req: &UploadPartCopyRequest,
     ) -> Result<UploadPartCopyResult, ServerError> {
+        self.upload_part_copy_with_expected_bucket_owners(
+            req,
+            req.expected_bucket_owner(),
+            req.source.expected_bucket_owner(),
+        )
+    }
+
+    pub fn upload_part_copy_with_expected_bucket_owners(
+        &self,
+        req: &UploadPartCopyRequest,
+        expected_dst_bucket_owner: Option<&str>,
+        expected_source_bucket_owner: Option<&str>,
+    ) -> Result<UploadPartCopyResult, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::upload_part_copy",
@@ -7954,7 +9042,11 @@ impl Coordinator {
         let requester = &req.requester;
         let source_sse_customer = req.source_sse_customer;
 
-        let _dst_bucket_info = self.authorize_object_write_requester(requester, dst_bucket)?;
+        let _dst_bucket_info = self.authorize_object_write_requester(
+            requester,
+            dst_bucket,
+            expected_dst_bucket_owner,
+        )?;
         let not_found = |e: ServerError| match e {
             ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
                 bucket: src_bucket.to_string(),
@@ -7973,6 +9065,7 @@ impl Coordinator {
                 src_bucket,
                 src_key,
                 src_version_id,
+                expected_source_bucket_owner,
             )?;
 
             // Reject delete markers — they are not copyable objects.
@@ -8075,14 +9168,18 @@ impl Coordinator {
         }; // source locks dropped here
 
         // Phase 2: Stream into the destination multipart part session.
-        let session = self.begin_stream_part(&BeginStreamPartRequest {
-            bucket: dst_bucket,
-            key: dst_key,
-            upload_id,
-            part_number,
-            requester: requester.clone(),
-            sse_customer: req.sse_customer,
-        })?;
+        let session = self.begin_stream_part_with_expected_bucket_owner(
+            &BeginStreamPartRequest::new(
+                dst_bucket,
+                dst_key,
+                upload_id,
+                part_number,
+                requester.clone(),
+                req.sse_customer,
+                expected_dst_bucket_owner,
+            ),
+            expected_dst_bucket_owner,
+        )?;
         let session_id = &session.session_id;
         let sse_customer_headers = session
             .sse_customer
@@ -8176,6 +9273,14 @@ impl Coordinator {
         &self,
         req: &CompleteMultipartUploadRequest,
     ) -> Result<CompleteMultipartUploadResult, ServerError> {
+        self.complete_multipart_upload_with_expected_bucket_owner(req, req.expected_bucket_owner())
+    }
+
+    pub fn complete_multipart_upload_with_expected_bucket_owner(
+        &self,
+        req: &CompleteMultipartUploadRequest,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<CompleteMultipartUploadResult, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::complete_multipart_upload",
@@ -8191,6 +9296,7 @@ impl Coordinator {
         let parts = req.parts;
         let claimed_checksum = req.claimed_checksum;
         self.with_bucket_write_reservation(bucket, |bucket_info| {
+            Self::ensure_expected_bucket_owner(&bucket_info, expected_bucket_owner)?;
             let meta_pg_id = self.object_pg_id(bucket, key);
             let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
 
@@ -8592,6 +9698,14 @@ impl Coordinator {
         &self,
         req: &AbortMultipartUploadRequest,
     ) -> Result<(), ServerError> {
+        self.abort_multipart_upload_with_expected_bucket_owner(req, req.expected_bucket_owner())
+    }
+
+    pub fn abort_multipart_upload_with_expected_bucket_owner(
+        &self,
+        req: &AbortMultipartUploadRequest,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::abort_multipart_upload",
@@ -8603,7 +9717,8 @@ impl Coordinator {
         let bucket = req.bucket;
         let key = req.key;
         let upload_id = req.upload_id;
-        let bucket_info = self.active_bucket_summary(bucket)?;
+        let bucket_info =
+            self.active_bucket_summary_with_expected_owner(bucket, expected_bucket_owner)?;
         // 1. Lock meta PG and validate upload.
         let meta_pg_id = self.object_pg_id(bucket, key);
         let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
@@ -8696,6 +9811,14 @@ impl Coordinator {
 
     /// List parts of an in-progress multipart upload.
     pub fn list_parts(&self, req: &ListPartsRequest) -> Result<ListPartsResult, ServerError> {
+        self.list_parts_with_expected_bucket_owner(req, req.expected_bucket_owner())
+    }
+
+    pub fn list_parts_with_expected_bucket_owner(
+        &self,
+        req: &ListPartsRequest,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<ListPartsResult, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::list_parts",
@@ -8710,7 +9833,8 @@ impl Coordinator {
         let upload_id = req.upload_id;
         let part_number_marker = req.part_number_marker;
         let max_parts = req.max_parts;
-        let bucket_info = self.active_bucket_summary(bucket)?;
+        let bucket_info =
+            self.active_bucket_summary_with_expected_owner(bucket, expected_bucket_owner)?;
         // 1. Lock meta PG and validate upload.
         let meta_pg_id = self.object_pg_id(bucket, key);
         let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
@@ -8777,6 +9901,14 @@ impl Coordinator {
         &self,
         req: &ListMultipartUploadsRequest,
     ) -> Result<ListMultipartUploadsResult, ServerError> {
+        self.list_multipart_uploads_with_expected_bucket_owner(req, req.expected_bucket_owner())
+    }
+
+    pub fn list_multipart_uploads_with_expected_bucket_owner(
+        &self,
+        req: &ListMultipartUploadsRequest,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<ListMultipartUploadsResult, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::list_multipart_uploads",
@@ -8789,7 +9921,8 @@ impl Coordinator {
         let key_marker = req.key_marker;
         let upload_id_marker = req.upload_id_marker;
         let max_uploads = req.max_uploads;
-        let _bucket_info = self.authorize_bucket_read_requester(&req.requester, bucket)?;
+        let _bucket_info =
+            self.authorize_bucket_read_requester(&req.requester, bucket, expected_bucket_owner)?;
 
         if max_uploads == 0 {
             return Ok(ListMultipartUploadsResult {
@@ -8986,14 +10119,15 @@ pub mod test_helpers {
         coord: &Coordinator,
         req: &UploadPartRequest<'_>,
     ) -> Result<UploadPartResult, ServerError> {
-        let session = coord.begin_stream_part(&BeginStreamPartRequest {
-            bucket: req.bucket,
-            key: req.key,
-            upload_id: req.upload_id,
-            part_number: req.part_number,
-            requester: req.requester.clone(),
-            sse_customer: req.sse_customer,
-        })?;
+        let session = coord.begin_stream_part(&BeginStreamPartRequest::new(
+            req.bucket,
+            req.key,
+            req.upload_id,
+            req.part_number,
+            req.requester.clone(),
+            req.sse_customer,
+            req.expected_bucket_owner(),
+        ))?;
         let session_id = &session.session_id;
         let result = (|| {
             for (idx, chunk) in req.data.chunks(INTERNAL_SEGMENT_SIZE).enumerate() {
@@ -13440,6 +14574,46 @@ mod tests {
                 bucket: "bucket",
                 requester: Requester::principal("other-user"),
             })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn head_bucket_allows_matching_expected_bucket_owner() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("111122223333", "bucket", false)
+            .unwrap();
+
+        let info = coord
+            .head_bucket_for_requester_with_expected_bucket_owner(
+                &HeadBucketRequest {
+                    bucket: "bucket",
+                    requester: Requester::principal("111122223333"),
+                },
+                Some("111122223333"),
+            )
+            .unwrap();
+        assert_eq!(info.name, "bucket");
+    }
+
+    #[test]
+    fn head_bucket_rejects_mismatched_expected_bucket_owner() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("111122223333", "bucket", false)
+            .unwrap();
+
+        let err = coord
+            .head_bucket_for_requester_with_expected_bucket_owner(
+                &HeadBucketRequest {
+                    bucket: "bucket",
+                    requester: Requester::principal("111122223333"),
+                },
+                Some("999988887777"),
+            )
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
     }

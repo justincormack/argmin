@@ -1,6 +1,6 @@
 use aws_sdk_s3::primitives::ByteStream;
 use ring::{digest, hmac};
-use s3_tests::{err_status, unique_bucket, CTX};
+use s3_tests::{assert_s3_err_code, err_status, unique_bucket, CTX};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Create a bucket, returning its name. Tests are responsible for cleanup.
@@ -9,6 +9,16 @@ async fn setup_bucket() -> String {
     let bucket = unique_bucket();
     client.create_bucket().bucket(&bucket).send().await.unwrap();
     bucket
+}
+
+fn primary_account_id_or_skip(test_name: &str) -> Option<String> {
+    match CTX.account_id() {
+        Some(account_id) => Some(account_id.to_string()),
+        None => {
+            eprintln!("skipping {test_name}: S3_TEST_ACCOUNT_ID is not configured");
+            None
+        }
+    }
 }
 
 fn agent() -> ureq::Agent {
@@ -152,6 +162,95 @@ fn test_object_write_file() {
             .unwrap();
         let data = resp.body.collect().await.unwrap().into_bytes();
         assert_eq!(&data[..], body);
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key("testobj")
+            .send()
+            .await
+            .unwrap();
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_get_object_expected_bucket_owner() {
+    s3_tests::run(async {
+        let Some(account_id) = primary_account_id_or_skip("test_get_object_expected_bucket_owner")
+        else {
+            return;
+        };
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let body = b"hello expected owner";
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("testobj")
+            .body(ByteStream::from_static(body))
+            .send()
+            .await
+            .unwrap();
+
+        let resp = client
+            .get_object()
+            .bucket(&bucket)
+            .key("testobj")
+            .customize()
+            .mutate_request({
+                let account_id = account_id.clone();
+                move |req| {
+                    req.headers_mut()
+                        .insert("x-amz-expected-bucket-owner", account_id.clone());
+                }
+            })
+            .send()
+            .await
+            .unwrap();
+        let data = resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], body);
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key("testobj")
+            .send()
+            .await
+            .unwrap();
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_get_object_wrong_expected_bucket_owner() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("testobj")
+            .body(ByteStream::from_static(b"hello expected owner"))
+            .send()
+            .await
+            .unwrap();
+
+        let result = client
+            .get_object()
+            .bucket(&bucket)
+            .key("testobj")
+            .customize()
+            .mutate_request(|req| {
+                req.headers_mut()
+                    .insert("x-amz-expected-bucket-owner", "000000000000");
+            })
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 403);
+        assert_s3_err_code(&result, "AccessDenied");
 
         client
             .delete_object()

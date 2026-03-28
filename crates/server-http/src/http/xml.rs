@@ -4943,6 +4943,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL,
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -4959,6 +4960,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL,
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -4975,6 +4977,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL,
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -4987,6 +4990,7 @@ mod tests {
                 version_id_marker: None,
                 max_keys: 1000,
                 requester: test_requester(),
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(versions_result.versions.len(), 3);
@@ -5008,6 +5012,7 @@ mod tests {
                 continuation_token: None,
                 max_keys: 1000,
                 requester: test_requester(),
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(list_result.objects.len(), 3);
@@ -5035,6 +5040,7 @@ mod tests {
                 entries: &entries,
                 cond: NO_DELETE,
                 requester: test_requester(),
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(delete_result.deleted.len(), 3);
@@ -5048,6 +5054,7 @@ mod tests {
                 continuation_token: None,
                 max_keys: 1000,
                 requester: test_requester(),
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(list_after.objects.is_empty());
@@ -5055,6 +5062,7 @@ mod tests {
             .delete_bucket(&crate::coordinator::DeleteBucketRequest {
                 name: "test-bucket",
                 requester: test_requester(),
+                expected_bucket_owner: None,
             })
             .unwrap();
     }
@@ -5080,6 +5088,7 @@ mod tests {
                     cond: NO_WRITE,
                     requester: test_requester(),
                     acl: NO_PUT_OBJECT_ACL,
+                    expected_bucket_owner: None,
                 },
             )
             .unwrap();
@@ -5093,6 +5102,7 @@ mod tests {
                 continuation_token: None,
                 max_keys: 2,
                 requester: test_requester(),
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(page1.objects.len(), 2);
@@ -5107,6 +5117,7 @@ mod tests {
                 continuation_token: Some(&token),
                 max_keys: 2,
                 requester: test_requester(),
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(page2.objects.len(), 2);
@@ -5120,6 +5131,7 @@ mod tests {
                 continuation_token: Some(&token2),
                 max_keys: 2,
                 requester: test_requester(),
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(page3.objects.len(), 1);
@@ -5157,6 +5169,7 @@ mod tests {
                 entries: &entries,
                 cond: NO_DELETE,
                 requester: test_requester(),
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(delete_result.deleted.len(), 5);
@@ -5171,6 +5184,7 @@ mod tests {
             .delete_bucket(&crate::coordinator::DeleteBucketRequest {
                 name: "bucket",
                 requester: test_requester(),
+                expected_bucket_owner: None,
             })
             .unwrap();
     }

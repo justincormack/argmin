@@ -5,11 +5,12 @@ use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 
-use auth::{CredentialStore, SecretKey};
+use auth::{AccountIdentity, CredentialRecord, CredentialStore, SecretKey};
 use ec::EcConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use server_core::coordinator::Coordinator;
 use server_core::sse::SseCustomerValidatorConfig;
+use storage::CanonicalUserId;
 use storage::SharedStorageNode;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
@@ -115,10 +116,19 @@ async fn main() {
             }
         };
         let mut credentials = CredentialStore::new();
-        credentials.add(
-            config.access_key_id.clone(),
-            SecretKey::new(config.secret_access_key.clone()),
+        let account = AccountIdentity::new(
+            config.account_id.clone(),
+            CanonicalUserId::from_principal(&config.account_id),
+            config.account_id.clone(),
         );
+        credentials.add_record(CredentialRecord {
+            access_key_id: config.access_key_id.clone(),
+            secret_key: SecretKey::new(config.secret_access_key.clone()),
+            account,
+            session_token: None,
+            expires_at_epoch_secs: None,
+            enabled: true,
+        });
         frontends.push(HttpFrontend {
             coordinator,
             credentials,

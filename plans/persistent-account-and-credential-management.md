@@ -81,3 +81,6 @@ At a minimum, the finished design needs to answer:
 
 Intro only for now. The implementation phases, schema shape, APIs, and test
 strategy should be filled in once we decide the intended operational model.
+Concrete account modelling should also be defined here when implementation
+starts, including the durable representation of accounts, their identity
+fields, and how those records relate to credential records.

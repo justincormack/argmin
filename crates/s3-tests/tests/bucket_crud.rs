@@ -40,6 +40,16 @@ async fn recreate_bucket_after_delete(client: &aws_sdk_s3::Client, bucket: &str)
     }
 }
 
+fn primary_account_id_or_skip(test_name: &str) -> Option<String> {
+    match CTX.account_id() {
+        Some(account_id) => Some(account_id.to_string()),
+        None => {
+            eprintln!("skipping {test_name}: S3_TEST_ACCOUNT_ID is not configured");
+            None
+        }
+    }
+}
+
 // ── CreateBucket ─────────────────────────────────────────────────────
 
 #[test]
@@ -201,6 +211,58 @@ fn test_bucket_head() {
         client.create_bucket().bucket(&bucket).send().await.unwrap();
 
         client.head_bucket().bucket(&bucket).send().await.unwrap();
+
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_bucket_head_expected_owner() {
+    s3_tests::run(async {
+        let Some(account_id) = primary_account_id_or_skip("test_bucket_head_expected_owner") else {
+            return;
+        };
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        client
+            .head_bucket()
+            .bucket(&bucket)
+            .customize()
+            .mutate_request({
+                let account_id = account_id.clone();
+                move |req| {
+                    req.headers_mut()
+                        .insert("x-amz-expected-bucket-owner", account_id.clone());
+                }
+            })
+            .send()
+            .await
+            .unwrap();
+
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_bucket_head_wrong_expected_owner() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let result = client
+            .head_bucket()
+            .bucket(&bucket)
+            .customize()
+            .mutate_request(|req| {
+                req.headers_mut()
+                    .insert("x-amz-expected-bucket-owner", "000000000000");
+            })
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 403);
 
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });

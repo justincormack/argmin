@@ -9,6 +9,7 @@ pub(crate) struct ServerConfig {
     pub(crate) pg_count: u32,
     pub(crate) ec_k: u8,
     pub(crate) ec_m: u8,
+    pub(crate) account_id: String,
     pub(crate) access_key_id: String,
     pub(crate) secret_access_key: String,
     pub(crate) sse_c_validator_key_b64: Option<String>,
@@ -22,7 +23,8 @@ pub(crate) struct ServerConfig {
 impl ServerConfig {
     /// Load configuration from environment variables.
     ///
-    /// Required: `ARGMIN_ACCESS_KEY_ID`, `ARGMIN_SECRET_ACCESS_KEY`
+    /// Required: `ARGMIN_ACCOUNT_ID`, `ARGMIN_ACCESS_KEY_ID`,
+    /// `ARGMIN_SECRET_ACCESS_KEY`
     /// Optional (with defaults):
     ///   `ARGMIN_LISTEN_ADDR` (127.0.0.1:9000)
     ///   `ARGMIN_TLS_CERT_PATH` / `ARGMIN_TLS_KEY_PATH` (unset)
@@ -42,6 +44,11 @@ impl ServerConfig {
     /// Build configuration from an arbitrary key-lookup function.
     /// Used by `from_env` (with `std::env::var`) and directly by tests.
     fn from_lookup<F: Fn(&str) -> Option<String>>(get: F) -> Result<Self, String> {
+        let account_id =
+            get("ARGMIN_ACCOUNT_ID").ok_or_else(|| "ARGMIN_ACCOUNT_ID is required".to_string())?;
+        if account_id.len() != 12 || !account_id.bytes().all(|b| b.is_ascii_digit()) {
+            return Err("ARGMIN_ACCOUNT_ID must be a 12-digit AWS account ID".to_string());
+        }
         let access_key_id = get("ARGMIN_ACCESS_KEY_ID")
             .ok_or_else(|| "ARGMIN_ACCESS_KEY_ID is required".to_string())?;
         let secret_access_key = get("ARGMIN_SECRET_ACCESS_KEY")
@@ -119,6 +126,7 @@ impl ServerConfig {
             pg_count,
             ec_k,
             ec_m,
+            account_id,
             access_key_id,
             secret_access_key,
             sse_c_validator_key_b64,
@@ -145,8 +153,19 @@ mod tests {
         }
     }
 
+    fn make_required_env<'a>(
+        overrides: &'a [(&'a str, &'a str)],
+    ) -> impl Fn(&str) -> Option<String> + 'a {
+        let mut values = required_only();
+        for (key, value) in overrides {
+            values.insert(key, value);
+        }
+        move |key| values.get(key).map(std::string::ToString::to_string)
+    }
+
     fn required_only() -> HashMap<&'static str, &'static str> {
         let mut m = HashMap::new();
+        m.insert("ARGMIN_ACCOUNT_ID", "111122223333");
         m.insert("ARGMIN_ACCESS_KEY_ID", "AKID");
         m.insert("ARGMIN_SECRET_ACCESS_KEY", "SECRET");
         m
@@ -158,16 +177,43 @@ mod tests {
 
     #[test]
     fn missing_access_key_id() {
-        let err =
-            ServerConfig::from_lookup(make_env(&[("ARGMIN_SECRET_ACCESS_KEY", "s")])).unwrap_err();
+        let err = ServerConfig::from_lookup(make_env(&[
+            ("ARGMIN_ACCOUNT_ID", "111122223333"),
+            ("ARGMIN_SECRET_ACCESS_KEY", "s"),
+        ]))
+        .unwrap_err();
         assert!(err.contains("ARGMIN_ACCESS_KEY_ID"));
     }
 
     #[test]
     fn missing_secret_access_key() {
-        let err =
-            ServerConfig::from_lookup(make_env(&[("ARGMIN_ACCESS_KEY_ID", "a")])).unwrap_err();
+        let err = ServerConfig::from_lookup(make_env(&[
+            ("ARGMIN_ACCOUNT_ID", "111122223333"),
+            ("ARGMIN_ACCESS_KEY_ID", "a"),
+        ]))
+        .unwrap_err();
         assert!(err.contains("ARGMIN_SECRET_ACCESS_KEY"));
+    }
+
+    #[test]
+    fn missing_account_id() {
+        let err = ServerConfig::from_lookup(make_env(&[
+            ("ARGMIN_ACCESS_KEY_ID", "a"),
+            ("ARGMIN_SECRET_ACCESS_KEY", "s"),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("ARGMIN_ACCOUNT_ID"));
+    }
+
+    #[test]
+    fn invalid_account_id() {
+        let err = ServerConfig::from_lookup(make_env(&[
+            ("ARGMIN_ACCOUNT_ID", "not-an-account"),
+            ("ARGMIN_ACCESS_KEY_ID", "a"),
+            ("ARGMIN_SECRET_ACCESS_KEY", "s"),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("12-digit AWS account ID"));
     }
 
     #[test]
@@ -181,6 +227,7 @@ mod tests {
         assert_eq!(cfg.pg_count, 16);
         assert_eq!(cfg.ec_k, 4);
         assert_eq!(cfg.ec_m, 2);
+        assert_eq!(cfg.account_id, "111122223333");
         assert_eq!(cfg.region, "us-east-1");
         assert_eq!(cfg.workers, 4);
         assert_eq!(cfg.max_connections, 512);
@@ -197,6 +244,7 @@ mod tests {
     #[test]
     fn custom_values() {
         let cfg = ServerConfig::from_lookup(make_env(&[
+            ("ARGMIN_ACCOUNT_ID", "444455556666"),
             ("ARGMIN_ACCESS_KEY_ID", "mykey"),
             ("ARGMIN_SECRET_ACCESS_KEY", "mysecret"),
             ("ARGMIN_SSE_C_VALIDATOR_KEY", "Zm9v"),
@@ -217,6 +265,7 @@ mod tests {
         assert_eq!(cfg.pg_count, 32);
         assert_eq!(cfg.ec_k, 8);
         assert_eq!(cfg.ec_m, 4);
+        assert_eq!(cfg.account_id, "444455556666");
         assert_eq!(cfg.region, "eu-west-1");
         assert_eq!(cfg.workers, 4); // not overridden, uses default
         assert_eq!(cfg.max_inflight_requests, 32); // not overridden, uses default
@@ -231,166 +280,118 @@ mod tests {
 
     #[test]
     fn custom_workers() {
-        let cfg = ServerConfig::from_lookup(make_env(&[
-            ("ARGMIN_ACCESS_KEY_ID", "a"),
-            ("ARGMIN_SECRET_ACCESS_KEY", "s"),
-            ("ARGMIN_WORKERS", "8"),
-        ]))
-        .unwrap();
+        let cfg = ServerConfig::from_lookup(make_required_env(&[("ARGMIN_WORKERS", "8")])).unwrap();
         assert_eq!(cfg.workers, 8);
     }
 
     #[test]
     fn workers_zero() {
-        let err = ServerConfig::from_lookup(make_env(&[
-            ("ARGMIN_ACCESS_KEY_ID", "a"),
-            ("ARGMIN_SECRET_ACCESS_KEY", "s"),
-            ("ARGMIN_WORKERS", "0"),
-        ]))
-        .unwrap_err();
+        let err =
+            ServerConfig::from_lookup(make_required_env(&[("ARGMIN_WORKERS", "0")])).unwrap_err();
         assert!(err.contains("ARGMIN_WORKERS must be > 0"));
     }
 
     #[test]
     fn invalid_workers() {
-        let err = ServerConfig::from_lookup(make_env(&[
-            ("ARGMIN_ACCESS_KEY_ID", "a"),
-            ("ARGMIN_SECRET_ACCESS_KEY", "s"),
-            ("ARGMIN_WORKERS", "abc"),
-        ]))
-        .unwrap_err();
+        let err =
+            ServerConfig::from_lookup(make_required_env(&[("ARGMIN_WORKERS", "abc")])).unwrap_err();
         assert!(err.contains("ARGMIN_WORKERS"));
     }
 
     #[test]
     fn invalid_pg_count_non_integer() {
-        let err = ServerConfig::from_lookup(make_env(&[
-            ("ARGMIN_ACCESS_KEY_ID", "a"),
-            ("ARGMIN_SECRET_ACCESS_KEY", "s"),
-            ("ARGMIN_PG_COUNT", "abc"),
-        ]))
-        .unwrap_err();
+        let err = ServerConfig::from_lookup(make_required_env(&[("ARGMIN_PG_COUNT", "abc")]))
+            .unwrap_err();
         assert!(err.contains("ARGMIN_PG_COUNT"));
     }
 
     #[test]
     fn pg_count_zero() {
-        let err = ServerConfig::from_lookup(make_env(&[
-            ("ARGMIN_ACCESS_KEY_ID", "a"),
-            ("ARGMIN_SECRET_ACCESS_KEY", "s"),
-            ("ARGMIN_PG_COUNT", "0"),
-        ]))
-        .unwrap_err();
+        let err =
+            ServerConfig::from_lookup(make_required_env(&[("ARGMIN_PG_COUNT", "0")])).unwrap_err();
         assert!(err.contains("ARGMIN_PG_COUNT must be > 0"));
     }
 
     #[test]
     fn invalid_ec_k() {
-        let err = ServerConfig::from_lookup(make_env(&[
-            ("ARGMIN_ACCESS_KEY_ID", "a"),
-            ("ARGMIN_SECRET_ACCESS_KEY", "s"),
-            ("ARGMIN_EC_K", "not_a_number"),
-        ]))
-        .unwrap_err();
+        let err = ServerConfig::from_lookup(make_required_env(&[("ARGMIN_EC_K", "not_a_number")]))
+            .unwrap_err();
         assert!(err.contains("ARGMIN_EC_K"));
     }
 
     #[test]
     fn invalid_ec_m() {
-        let err = ServerConfig::from_lookup(make_env(&[
-            ("ARGMIN_ACCESS_KEY_ID", "a"),
-            ("ARGMIN_SECRET_ACCESS_KEY", "s"),
-            ("ARGMIN_EC_M", "xyz"),
-        ]))
-        .unwrap_err();
+        let err =
+            ServerConfig::from_lookup(make_required_env(&[("ARGMIN_EC_M", "xyz")])).unwrap_err();
         assert!(err.contains("ARGMIN_EC_M"));
     }
 
     #[test]
     fn custom_max_connections() {
-        let cfg = ServerConfig::from_lookup(make_env(&[
-            ("ARGMIN_ACCESS_KEY_ID", "a"),
-            ("ARGMIN_SECRET_ACCESS_KEY", "s"),
-            ("ARGMIN_MAX_CONNECTIONS", "1024"),
-        ]))
-        .unwrap();
+        let cfg =
+            ServerConfig::from_lookup(make_required_env(&[("ARGMIN_MAX_CONNECTIONS", "1024")]))
+                .unwrap();
         assert_eq!(cfg.max_connections, 1024);
     }
 
     #[test]
     fn max_connections_zero() {
-        let err = ServerConfig::from_lookup(make_env(&[
-            ("ARGMIN_ACCESS_KEY_ID", "a"),
-            ("ARGMIN_SECRET_ACCESS_KEY", "s"),
-            ("ARGMIN_MAX_CONNECTIONS", "0"),
-        ]))
-        .unwrap_err();
+        let err = ServerConfig::from_lookup(make_required_env(&[("ARGMIN_MAX_CONNECTIONS", "0")]))
+            .unwrap_err();
         assert!(err.contains("ARGMIN_MAX_CONNECTIONS must be > 0"));
     }
 
     #[test]
     fn invalid_max_connections() {
-        let err = ServerConfig::from_lookup(make_env(&[
-            ("ARGMIN_ACCESS_KEY_ID", "a"),
-            ("ARGMIN_SECRET_ACCESS_KEY", "s"),
-            ("ARGMIN_MAX_CONNECTIONS", "not_a_number"),
-        ]))
+        let err = ServerConfig::from_lookup(make_required_env(&[(
+            "ARGMIN_MAX_CONNECTIONS",
+            "not_a_number",
+        )]))
         .unwrap_err();
         assert!(err.contains("ARGMIN_MAX_CONNECTIONS"));
     }
 
     #[test]
     fn custom_max_inflight_requests() {
-        let cfg = ServerConfig::from_lookup(make_env(&[
-            ("ARGMIN_ACCESS_KEY_ID", "a"),
-            ("ARGMIN_SECRET_ACCESS_KEY", "s"),
-            ("ARGMIN_MAX_INFLIGHT_REQUESTS", "64"),
-        ]))
-        .unwrap();
+        let cfg =
+            ServerConfig::from_lookup(make_required_env(&[("ARGMIN_MAX_INFLIGHT_REQUESTS", "64")]))
+                .unwrap();
         assert_eq!(cfg.max_inflight_requests, 64);
     }
 
     #[test]
     fn max_inflight_requests_zero() {
-        let err = ServerConfig::from_lookup(make_env(&[
-            ("ARGMIN_ACCESS_KEY_ID", "a"),
-            ("ARGMIN_SECRET_ACCESS_KEY", "s"),
-            ("ARGMIN_MAX_INFLIGHT_REQUESTS", "0"),
-        ]))
-        .unwrap_err();
+        let err =
+            ServerConfig::from_lookup(make_required_env(&[("ARGMIN_MAX_INFLIGHT_REQUESTS", "0")]))
+                .unwrap_err();
         assert!(err.contains("ARGMIN_MAX_INFLIGHT_REQUESTS must be > 0"));
     }
 
     #[test]
     fn invalid_max_inflight_requests() {
-        let err = ServerConfig::from_lookup(make_env(&[
-            ("ARGMIN_ACCESS_KEY_ID", "a"),
-            ("ARGMIN_SECRET_ACCESS_KEY", "s"),
-            ("ARGMIN_MAX_INFLIGHT_REQUESTS", "not_a_number"),
-        ]))
+        let err = ServerConfig::from_lookup(make_required_env(&[(
+            "ARGMIN_MAX_INFLIGHT_REQUESTS",
+            "not_a_number",
+        )]))
         .unwrap_err();
         assert!(err.contains("ARGMIN_MAX_INFLIGHT_REQUESTS"));
     }
 
     #[test]
     fn custom_stream_read_chunk_size() {
-        let cfg = ServerConfig::from_lookup(make_env(&[
-            ("ARGMIN_ACCESS_KEY_ID", "a"),
-            ("ARGMIN_SECRET_ACCESS_KEY", "s"),
-            ("ARGMIN_STREAM_READ_CHUNK_SIZE", "8388608"),
-        ]))
+        let cfg = ServerConfig::from_lookup(make_required_env(&[(
+            "ARGMIN_STREAM_READ_CHUNK_SIZE",
+            "8388608",
+        )]))
         .unwrap();
         assert_eq!(cfg.stream_read_chunk_size, 8 * 1024 * 1024);
     }
 
     #[test]
     fn stream_read_chunk_size_zero() {
-        let err = ServerConfig::from_lookup(make_env(&[
-            ("ARGMIN_ACCESS_KEY_ID", "a"),
-            ("ARGMIN_SECRET_ACCESS_KEY", "s"),
-            ("ARGMIN_STREAM_READ_CHUNK_SIZE", "0"),
-        ]))
-        .unwrap_err();
+        let err =
+            ServerConfig::from_lookup(make_required_env(&[("ARGMIN_STREAM_READ_CHUNK_SIZE", "0")]))
+                .unwrap_err();
         assert!(err.contains("ARGMIN_STREAM_READ_CHUNK_SIZE must be > 0"));
     }
 }

@@ -1,6 +1,7 @@
 use aws_sdk_s3::types::EncodingType;
 use s3_tests::{
-    create_objects, create_objects_with_keys, delete_all_and_bucket, err_status, unique_bucket, CTX,
+    assert_s3_err_code, create_objects, create_objects_with_keys, delete_all_and_bucket,
+    err_status, unique_bucket, CTX,
 };
 
 fn assert_canonical_owner_id(id: &str) {
@@ -14,6 +15,16 @@ fn assert_canonical_owner_id(id: &str) {
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
         "expected lowercase hex canonical owner ID, got {id}"
     );
+}
+
+fn primary_account_id_or_skip(test_name: &str) -> Option<String> {
+    match CTX.account_id() {
+        Some(account_id) => Some(account_id.to_string()),
+        None => {
+            eprintln!("skipping {test_name}: S3_TEST_ACCOUNT_ID is not configured");
+            None
+        }
+    }
 }
 
 // ── Test data sets ──────────────────────────────────────────────────
@@ -53,6 +64,61 @@ fn test_bucket_list_empty() {
         assert!(resp.contents().is_empty());
 
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_bucket_list_v2_expected_bucket_owner() {
+    s3_tests::run(async {
+        let Some(account_id) =
+            primary_account_id_or_skip("test_bucket_list_v2_expected_bucket_owner")
+        else {
+            return;
+        };
+        let client = CTX.client();
+        let (bucket, keys) = create_objects_with_keys(client, &["foo", "bar"]).await;
+
+        let resp = client
+            .list_objects_v2()
+            .bucket(&bucket)
+            .customize()
+            .mutate_request({
+                let account_id = account_id.clone();
+                move |req| {
+                    req.headers_mut()
+                        .insert("x-amz-expected-bucket-owner", account_id.clone());
+                }
+            })
+            .send()
+            .await
+            .unwrap();
+        let result_keys = get_keys(resp.contents());
+        assert_eq!(result_keys, vec!["bar", "foo"]);
+
+        delete_all_and_bucket(client, &bucket, &keys).await;
+    });
+}
+
+#[test]
+fn test_bucket_list_v2_wrong_expected_bucket_owner() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let (bucket, keys) = create_objects_with_keys(client, &["foo", "bar"]).await;
+
+        let result = client
+            .list_objects_v2()
+            .bucket(&bucket)
+            .customize()
+            .mutate_request(|req| {
+                req.headers_mut()
+                    .insert("x-amz-expected-bucket-owner", "000000000000");
+            })
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 403);
+        assert_s3_err_code(&result, "AccessDenied");
+
+        delete_all_and_bucket(client, &bucket, &keys).await;
     });
 }
 

@@ -3,14 +3,18 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use auth::AccountIdentity;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use storage::CanonicalUserId;
 
 /// Well-known test credentials.
+pub const TEST_ACCOUNT_ID: &str = "111122223333";
 pub const TEST_ACCESS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
 pub const TEST_SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
 pub const TEST_REGION: &str = "us-east-1";
 
 /// Alternate test credentials (non-owner user).
+pub const ALT_ACCOUNT_ID: &str = "444455556666";
 pub const ALT_ACCESS_KEY: &str = "AKIAI44QH8DHBEXAMPLE";
 pub const ALT_SECRET_KEY: &str = "je7MtGbClwBF/2Zp9Utk/h3yCo8nvbEXAMPLEKEY";
 pub const TEST_SSE_C_VALIDATOR_KEY_B64: &str = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
@@ -123,14 +127,30 @@ impl TestServer {
                 .expect("create coordinator");
 
                 let mut credentials = auth::CredentialStore::default();
-                credentials.add(
-                    TEST_ACCESS_KEY.to_string(),
-                    auth::SecretKey::new(TEST_SECRET_KEY.to_string()),
-                );
-                credentials.add(
-                    ALT_ACCESS_KEY.to_string(),
-                    auth::SecretKey::new(ALT_SECRET_KEY.to_string()),
-                );
+                credentials.add_record(auth::CredentialRecord {
+                    access_key_id: TEST_ACCESS_KEY.to_string(),
+                    secret_key: auth::SecretKey::new(TEST_SECRET_KEY.to_string()),
+                    account: AccountIdentity::new(
+                        TEST_ACCOUNT_ID,
+                        CanonicalUserId::from_principal(TEST_ACCOUNT_ID),
+                        "test-account",
+                    ),
+                    session_token: None,
+                    expires_at_epoch_secs: None,
+                    enabled: true,
+                });
+                credentials.add_record(auth::CredentialRecord {
+                    access_key_id: ALT_ACCESS_KEY.to_string(),
+                    secret_key: auth::SecretKey::new(ALT_SECRET_KEY.to_string()),
+                    account: AccountIdentity::new(
+                        ALT_ACCOUNT_ID,
+                        CanonicalUserId::from_principal(ALT_ACCOUNT_ID),
+                        "alt-account",
+                    ),
+                    session_token: None,
+                    expires_at_epoch_secs: None,
+                    enabled: true,
+                });
 
                 server_http::http::HttpFrontend {
                     coordinator,

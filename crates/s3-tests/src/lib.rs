@@ -49,6 +49,8 @@ pub struct TestContext {
     endpoint: String,
     access_key: String,
     secret_key: String,
+    account_id: Option<String>,
+    alt_account_id: Option<String>,
     region: String,
     _server: Option<TestServer>,
 }
@@ -79,8 +81,10 @@ impl TestContext {
                 .expect("S3_TEST_ACCESS_KEY required with S3_TEST_ENDPOINT");
             let secret_key = std::env::var("S3_TEST_SECRET_KEY")
                 .expect("S3_TEST_SECRET_KEY required with S3_TEST_ENDPOINT");
+            let account_id = std::env::var("S3_TEST_ACCOUNT_ID").ok();
             let alt_access_key = std::env::var("S3_TEST_ALT_ACCESS_KEY").ok();
             let alt_secret_key = std::env::var("S3_TEST_ALT_SECRET_KEY").ok();
+            let alt_account_id = std::env::var("S3_TEST_ALT_ACCOUNT_ID").ok();
             let region =
                 std::env::var("S3_TEST_REGION").unwrap_or_else(|_| "us-east-1".to_string());
 
@@ -102,6 +106,8 @@ impl TestContext {
                 endpoint,
                 access_key,
                 secret_key,
+                account_id,
+                alt_account_id,
                 region,
                 _server: None,
             }
@@ -131,6 +137,8 @@ impl TestContext {
                 endpoint,
                 access_key: server::TEST_ACCESS_KEY.to_string(),
                 secret_key: server::TEST_SECRET_KEY.to_string(),
+                account_id: Some(server::TEST_ACCOUNT_ID.to_string()),
+                alt_account_id: Some(server::ALT_ACCOUNT_ID.to_string()),
                 region: server::TEST_REGION.to_string(),
                 _server: Some(server),
             }
@@ -168,6 +176,16 @@ S3_TEST_ALT_SECRET_KEY when running against an external endpoint",
     /// The secret access key.
     pub fn secret_key(&self) -> &str {
         &self.secret_key
+    }
+
+    /// The primary test account ID, if configured.
+    pub fn account_id(&self) -> Option<&str> {
+        self.account_id.as_deref()
+    }
+
+    /// The alternate test account ID, if configured.
+    pub fn alt_account_id(&self) -> Option<&str> {
+        self.alt_account_id.as_deref()
     }
 
     /// The region.

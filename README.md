@@ -36,6 +36,7 @@ The server is configured via environment variables:
 
 | Variable | Default | Description |
 |---|---|---|
+| `ARGMIN_ACCOUNT_ID` | *(required)* | 12-digit bucket-owner account ID used for ownership and `x-amz-expected-bucket-owner` checks |
 | `ARGMIN_ACCESS_KEY_ID` | *(required)* | S3 access key |
 | `ARGMIN_SECRET_ACCESS_KEY` | *(required)* | S3 secret key |
 | `ARGMIN_SSE_C_VALIDATOR_KEY` | *(unset)* | Base64-encoded 32-byte SSE-C validator secret; required to use SSE-C |
@@ -80,6 +81,7 @@ For an existing data directory, treat these settings as stable:
 Start the server:
 
 ```bash
+ARGMIN_ACCOUNT_ID=111122223333 \
 ARGMIN_ACCESS_KEY_ID=admin \
 ARGMIN_SECRET_ACCESS_KEY=useasecuresecretkey \
   ./target/release/argmin-s3
@@ -88,6 +90,7 @@ ARGMIN_SECRET_ACCESS_KEY=useasecuresecretkey \
 Enable tracing:
 
 ```bash
+ARGMIN_ACCOUNT_ID=111122223333 \
 ARGMIN_ACCESS_KEY_ID=admin \
 ARGMIN_SECRET_ACCESS_KEY=useasecuresecretkey \
 ARGMIN_TRACE=1 \
@@ -99,6 +102,7 @@ ARGMIN_TRACE_FILE=/tmp/argmin.trace \
 Start the server with direct HTTPS:
 
 ```bash
+ARGMIN_ACCOUNT_ID=111122223333 \
 ARGMIN_ACCESS_KEY_ID=admin \
 ARGMIN_SECRET_ACCESS_KEY=useasecuresecretkey \
 ARGMIN_TLS_CERT_PATH=/path/to/cert.pem \
@@ -192,8 +196,10 @@ eval "$(grep = .env)" && \
 S3_TEST_ENDPOINT=https://s3.us-east-1.amazonaws.com \
 S3_TEST_ACCESS_KEY="$AWS_ACCESS_KEY" \
 S3_TEST_SECRET_KEY="$AWS_SECRET_KEY" \
+S3_TEST_ACCOUNT_ID="$AWS_ACCOUNT_ID" \
 S3_TEST_ALT_ACCESS_KEY="$AWS_ALT_ACCESS_KEY" \
 S3_TEST_ALT_SECRET_KEY="$AWS_ALT_SECRET_KEY" \
+S3_TEST_ALT_ACCOUNT_ID="$AWS_ALT_ACCOUNT_ID" \
 S3_TEST_REGION=us-east-1 \
 S3_TEST_BUCKET_PREFIX=claude-s3- \
 S3_TEST_TIMEOUT_SECS=30 \
@@ -204,6 +210,11 @@ cargo test -p s3-tests --no-fail-fast
 want the multi-user integration cases to run against the external endpoint. If
 they are unset, tests that require a second authenticated user skip
 themselves. If one is set, both must be set.
+
+`S3_TEST_ACCOUNT_ID` and `S3_TEST_ALT_ACCOUNT_ID` are optional. They are only
+needed for tests that must send a matching `x-amz-expected-bucket-owner` or
+`x-amz-source-expected-bucket-owner` value against an external endpoint. Local
+embedded `s3-tests` runs provide these automatically.
 
 For AWS S3, the alternate credentials must belong to a different AWS account
 with a different S3 canonical owner ID. A second IAM user in the same AWS
