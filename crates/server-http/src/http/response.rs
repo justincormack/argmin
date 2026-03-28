@@ -1,4 +1,5 @@
-/// Build HTTP responses for S3 operations.
+//! Build HTTP responses for S3 operations.
+
 use crate::coordinator::{
     BucketSummary, CopyObjectResult, DeleteObjectResult, DeleteObjectsResult, GetBucketAclResult,
     GetObjectPartResult, GetObjectRangeResult, GetObjectResult, HeadObjectPartResult,
@@ -6,6 +7,7 @@ use crate::coordinator::{
     ListPartsResult, PutObjectResult, ReadHandle,
 };
 use crate::error::ServerError;
+use auth::canonical::uri_encode;
 use checksum::{ChecksumAlgorithm, ChecksumType, RawChecksum};
 use s3_types::{BucketVersioningState, CanonicalUserId, VersionId};
 use server_core::sse::{SseCustomerResponseHeaders, SSE_CUSTOMER_ALGORITHM};
@@ -50,6 +52,45 @@ fn rfc2047_encode(value: &str) -> String {
     }
     encoded.push_str("?=");
     encoded
+}
+
+fn success_action_redirect_location(
+    redirect_url: &str,
+    bucket: &str,
+    key: &str,
+    etag: &str,
+) -> Option<String> {
+    let (base, fragment) = redirect_url
+        .split_once('#')
+        .map_or((redirect_url, ""), |(base, fragment)| (base, fragment));
+
+    let mut location =
+        String::with_capacity(redirect_url.len() + bucket.len() + key.len() + etag.len() + 32);
+    location.push_str(base);
+
+    if base.contains('?') {
+        if !base.ends_with('?') && !base.ends_with('&') {
+            location.push('&');
+        }
+    } else {
+        location.push('?');
+    }
+
+    location.push_str("bucket=");
+    location.push_str(&uri_encode(bucket));
+    location.push_str("&key=");
+    location.push_str(&uri_encode(key));
+    location.push_str("&etag=");
+    location.push_str(&uri_encode(etag));
+
+    if !fragment.is_empty() {
+        location.push('#');
+        location.push_str(fragment);
+    }
+
+    http::header::HeaderValue::from_str(&location)
+        .ok()
+        .map(|_| location)
 }
 
 /// An HTTP response to send back.
@@ -177,23 +218,31 @@ impl S3Response {
     /// Build a response for a successful POST Object.
     ///
     /// `success_status`: one of 200, 201, 204 (default).
-    /// For 201, an XML body with bucket/key/etag is returned.
+    /// For 201, an XML body with bucket/key/etag is returned. If
+    /// `success_redirect` is present and valid, return a 303 redirect instead.
     #[must_use]
     pub fn post_object(
         result: &PutObjectResult,
         bucket: &str,
         key: &str,
         success_status: u16,
+        success_redirect: Option<&str>,
     ) -> Self {
-        let status = match success_status {
-            200 | 201 => success_status,
-            _ => 204,
-        };
-        let mut resp = if status == 201 {
-            let body = xml::post_response_xml(bucket, key, &result.etag);
-            Self::new(201).xml_body(body)
+        let mut resp = if let Some(location) = success_redirect.and_then(|redirect_url| {
+            success_action_redirect_location(redirect_url, bucket, key, &result.etag)
+        }) {
+            Self::new(303).header("Location", &location)
         } else {
-            Self::new(status)
+            let status = match success_status {
+                200 | 201 => success_status,
+                _ => 204,
+            };
+            if status == 201 {
+                let body = xml::post_response_xml(bucket, key, &result.etag);
+                Self::new(201).xml_body(body)
+            } else {
+                Self::new(status)
+            }
         };
         resp = resp.header("ETag", &result.etag);
         if result.version_id.is_versioned() {
@@ -1071,6 +1120,70 @@ mod tests {
         assert_eq!(resp.status_code, 200);
         assert_eq!(find_header(&resp, "ETag"), Some("\"abc123\""));
         assert_eq!(find_header(&resp, "x-amz-version-id"), Some("42"));
+    }
+
+    #[test]
+    fn post_object_response_redirects_with_success_query_params() {
+        let result = PutObjectResult {
+            etag: "\"abc123\"".to_string(),
+            version_id: VersionId::Null,
+        };
+        let resp = S3Response::post_object(
+            &result,
+            "my-bucket",
+            "folder/my file.txt",
+            201,
+            Some("https://example.com/success"),
+        );
+        assert_eq!(resp.status_code, 303);
+        assert_eq!(
+            find_header(&resp, "Location"),
+            Some(
+                "https://example.com/success?bucket=my-bucket&key=folder%2Fmy%20file.txt&etag=%22abc123%22"
+            )
+        );
+        assert_eq!(find_header(&resp, "ETag"), Some("\"abc123\""));
+        assert!(resp.body.is_empty());
+    }
+
+    #[test]
+    fn post_object_response_redirect_appends_to_existing_query() {
+        let result = PutObjectResult {
+            etag: "\"abc123\"".to_string(),
+            version_id: VersionId::Null,
+        };
+        let resp = S3Response::post_object(
+            &result,
+            "my-bucket",
+            "my-key",
+            204,
+            Some("https://example.com/success?foo=bar"),
+        );
+        assert_eq!(resp.status_code, 303);
+        assert_eq!(
+            find_header(&resp, "Location"),
+            Some(
+                "https://example.com/success?foo=bar&bucket=my-bucket&key=my-key&etag=%22abc123%22"
+            )
+        );
+    }
+
+    #[test]
+    fn post_object_response_ignores_invalid_redirect() {
+        let result = PutObjectResult {
+            etag: "\"abc123\"".to_string(),
+            version_id: VersionId::Null,
+        };
+        let resp = S3Response::post_object(
+            &result,
+            "my-bucket",
+            "my-key",
+            200,
+            Some("https://example.com/\n"),
+        );
+        assert_eq!(resp.status_code, 200);
+        assert_eq!(find_header(&resp, "Location"), None);
+        assert_eq!(find_header(&resp, "ETag"), Some("\"abc123\""));
     }
 
     // ── get_object ────────────────────────────────────────────────────

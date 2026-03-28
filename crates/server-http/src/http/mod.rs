@@ -2225,6 +2225,10 @@ impl HttpFrontend {
         let success_status = field("success_action_status")
             .and_then(|s| s.parse::<u16>().ok())
             .unwrap_or(204);
+        let success_redirect = field("success_action_redirect")
+            .or_else(|| field("redirect"))
+            .filter(|s| !s.is_empty())
+            .map(std::string::ToString::to_string);
 
         Ok(StreamingPostContext {
             trace: current_trace_context(),
@@ -2236,6 +2240,7 @@ impl HttpFrontend {
             metadata_blob,
             system_metadata,
             success_status,
+            success_redirect,
             form_fields: form_fields.to_vec(),
             policy_b64: field("policy").map(std::string::ToString::to_string),
             checksum_sha256_b64: field("x-amz-checksum-sha256")
@@ -2336,6 +2341,7 @@ impl HttpFrontend {
             &ctx.binding.bucket,
             &ctx.binding.key,
             ctx.success_status,
+            ctx.success_redirect.as_deref(),
         );
         apply_sse_customer_write_response_headers(
             &mut resp,
@@ -2990,6 +2996,7 @@ pub struct StreamingPostContext {
     pub metadata_blob: crate::metadata_blob::MetadataBlob,
     pub system_metadata: SystemMetadata,
     pub success_status: u16,
+    pub success_redirect: Option<String>,
     pub form_fields: Vec<(String, String)>,
     pub policy_b64: Option<String>,
     pub checksum_sha256_b64: Option<String>,

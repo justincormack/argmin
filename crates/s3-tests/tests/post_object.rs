@@ -1975,10 +1975,82 @@ fn test_post_object_missing_content_length_argument() {
 // ── Redirect ────────────────────────────────────────────────────────────
 
 #[test]
-#[ignore]
 fn test_post_object_success_redirect_action() {
-    // success_action_redirect returns 303 with Location header.
-    // Not yet implemented in the server.
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "foo.txt";
+        let redirect_url = format!("{}/{}", CTX.endpoint(), bucket);
+
+        let mut fields = sigv4_fields(
+            &bucket,
+            key,
+            &[
+                serde_json::json!(["eq", "$success_action_redirect", &redirect_url]),
+                serde_json::json!(["starts-with", "$Content-Type", "text/plain"]),
+            ],
+        );
+        fields.push(("success_action_redirect".to_string(), redirect_url.clone()));
+        fields.push(("Content-Type".to_string(), "text/plain".to_string()));
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+
+        let url = format!("{}/{}", CTX.endpoint(), bucket);
+        let (content_type, body) = build_multipart(&field_refs, b"bar", "test.txt");
+        let mut resp = agent()
+            .post(&url)
+            .config()
+            .max_redirects(0)
+            .build()
+            .header("Content-Type", &content_type)
+            .send(&body[..])
+            .expect("HTTP transport error");
+
+        assert_eq!(resp.status().as_u16(), 303);
+        assert_eq!(resp.body_mut().read_to_string().unwrap_or_default(), "");
+
+        let head = client
+            .head_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let etag = head.e_tag().unwrap().trim_matches('"');
+        let location = resp
+            .headers()
+            .get("Location")
+            .and_then(|value| value.to_str().ok())
+            .expect("missing Location header");
+        let expected_location =
+            format!("{redirect_url}?bucket={bucket}&key={key}&etag=%22{etag}%22");
+        assert_eq!(location, expected_location);
+
+        let body = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap()
+            .body
+            .collect()
+            .await
+            .unwrap()
+            .into_bytes();
+        assert_eq!(&body[..], b"bar");
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
 }
 
 // ── Metadata ────────────────────────────────────────────────────────────
