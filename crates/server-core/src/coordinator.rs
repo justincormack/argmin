@@ -1207,8 +1207,33 @@ pub enum PutObjectAcl<'a> {
     #[default]
     None,
     Private,
+    PublicRead,
+    PublicReadWrite,
+    AuthenticatedRead,
+    AwsExecRead,
+    BucketOwnerRead,
     BucketOwnerFullControl,
-    Other(&'a str),
+    Invalid(&'a str),
+}
+
+impl PutObjectAcl<'_> {
+    const fn is_public_read(self) -> bool {
+        matches!(self, Self::PublicRead | Self::PublicReadWrite)
+    }
+
+    const fn is_public(self) -> bool {
+        matches!(
+            self,
+            Self::PublicRead | Self::PublicReadWrite | Self::AuthenticatedRead
+        )
+    }
+
+    const fn is_supported_with_bucket_owner_enforced(self) -> bool {
+        matches!(
+            self,
+            Self::None | Self::Private | Self::BucketOwnerFullControl
+        )
+    }
 }
 
 /// Parsed bucket ACL value relevant to bucket ACL and ownership-control rules.
@@ -2547,6 +2572,35 @@ impl Coordinator {
         requester.principal_opt() == Some(owner_principal) || public_read
     }
 
+    fn requester_can_read_object(
+        requester: &Requester,
+        bucket: &BucketSummary,
+        object: &StoredObject,
+    ) -> bool {
+        #[cfg(test)]
+        if requester.is_system {
+            return true;
+        }
+
+        requester.principal_opt() == Some(object.owner().principal.as_str())
+            || (object.public_read()
+                && !Self::ignores_public_acls(bucket.public_access_block.as_deref()))
+    }
+
+    fn requester_can_manage_object_tags(
+        requester: &Requester,
+        bucket: &BucketSummary,
+        object: &StoredObject,
+    ) -> bool {
+        #[cfg(test)]
+        if requester.is_system {
+            return true;
+        }
+
+        requester.principal_opt() == Some(bucket.owner_principal.as_str())
+            || requester.principal_opt() == Some(object.owner().principal.as_str())
+    }
+
     // Ownership-controls XML is stored in canonical form by the HTTP layer.
     fn is_bucket_owner_enforced(config_xml: Option<&str>) -> bool {
         config_xml.is_some_and(|xml| {
@@ -2625,15 +2679,69 @@ impl Coordinator {
         acl: PutObjectAcl<'_>,
     ) -> Result<(), ServerError> {
         if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_deref())
-            && !matches!(
-                acl,
-                PutObjectAcl::None | PutObjectAcl::Private | PutObjectAcl::BucketOwnerFullControl
-            )
+            && !acl.is_supported_with_bucket_owner_enforced()
         {
             return Err(ServerError::AccessControlListNotSupported);
         }
+        if Self::blocks_public_acls(bucket.public_access_block.as_deref()) && acl.is_public() {
+            return Err(ServerError::AccessDenied);
+        }
+        match acl {
+            PutObjectAcl::AuthenticatedRead => {
+                return Err(ServerError::NotImplemented {
+                    feature: "authenticated-read object ACL".to_string(),
+                });
+            }
+            PutObjectAcl::AwsExecRead => {
+                return Err(ServerError::NotImplemented {
+                    feature: "aws-exec-read object ACL".to_string(),
+                });
+            }
+            PutObjectAcl::BucketOwnerRead => {
+                return Err(ServerError::NotImplemented {
+                    feature: "bucket-owner-read object ACL".to_string(),
+                });
+            }
+            PutObjectAcl::Invalid(value) => {
+                return Err(ServerError::InvalidArgument {
+                    reason: format!("invalid x-amz-acl value: {value}"),
+                });
+            }
+            PutObjectAcl::None
+            | PutObjectAcl::Private
+            | PutObjectAcl::PublicRead
+            | PutObjectAcl::PublicReadWrite
+            | PutObjectAcl::BucketOwnerFullControl => {}
+        }
 
         Ok(())
+    }
+
+    fn lock_object_for_authorized_tagging<'a>(
+        &'a self,
+        requester: &Requester,
+        bucket: &str,
+        key: &str,
+        version_id: Option<VersionId>,
+    ) -> Result<LockedReadObject<'a>, ServerError> {
+        let bucket_info = self.active_bucket_summary(bucket)?;
+        let can_discover_missing =
+            Self::requester_can_bucket_admin(requester, &bucket_info.owner_principal);
+        let locked = match self.lock_object_pgs_for_read(bucket, key, version_id) {
+            Ok(locked) => locked,
+            Err(ServerError::ObjectNotFound { .. } | ServerError::VersionNotFound { .. })
+                if !can_discover_missing =>
+            {
+                return Err(ServerError::AccessDenied);
+            }
+            Err(other) => return Err(other),
+        };
+
+        if Self::requester_can_manage_object_tags(requester, &bucket_info, &locked.record) {
+            Ok(locked)
+        } else {
+            Err(ServerError::AccessDenied)
+        }
     }
 
     fn ownership_controls_xml(ownership: BucketObjectOwnership) -> String {
@@ -2692,6 +2800,36 @@ impl Coordinator {
             Self::effective_public_write(&info),
         ) {
             Ok(info)
+        } else {
+            Err(ServerError::AccessDenied)
+        }
+    }
+
+    fn lock_object_for_authorized_read<'a>(
+        &'a self,
+        requester: &Requester,
+        bucket: &str,
+        key: &str,
+        version_id: Option<VersionId>,
+    ) -> Result<LockedReadObject<'a>, ServerError> {
+        let bucket_info = self.active_bucket_summary(bucket)?;
+        let can_read_bucket = Self::requester_can_read_bucket(
+            requester,
+            &bucket_info.owner_principal,
+            Self::effective_public_read(&bucket_info),
+        );
+        let locked = match self.lock_object_pgs_for_read(bucket, key, version_id) {
+            Ok(locked) => locked,
+            Err(ServerError::ObjectNotFound { .. } | ServerError::VersionNotFound { .. })
+                if !can_read_bucket =>
+            {
+                return Err(ServerError::AccessDenied);
+            }
+            Err(other) => return Err(other),
+        };
+
+        if Self::requester_can_read_object(requester, &bucket_info, &locked.record) {
+            Ok(locked)
         } else {
             Err(ServerError::AccessDenied)
         }
@@ -3671,31 +3809,15 @@ impl Coordinator {
             key,
             tags.len()
         );
-        let _bucket_info = self.authorize_object_write_requester(&requester, bucket)?;
-        let pg_id = self.object_pg_id(bucket, key);
-        let pg = self.storage_node.get_pg(pg_id)?;
-        let stored = match version_id {
-            Some(vid) => pg.get_object_version(bucket, key, vid),
-            None => pg.get_object_meta(bucket, key),
-        }
-        .map_err(|e| match e {
-            storage::MetadataError::ObjectNotFound if version_id.is_some() => {
-                ServerError::VersionNotFound {
-                    bucket: bucket.to_string(),
-                    key: key.to_string(),
-                    version_id: version_id.unwrap().to_string(),
-                }
-            }
-            storage::MetadataError::ObjectNotFound => ServerError::ObjectNotFound {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-            },
-            other => ServerError::Metadata(other),
-        })?;
+        let LockedReadObject {
+            record: stored,
+            pgs,
+        } = self.lock_object_for_authorized_tagging(&requester, bucket, key, version_id)?;
         if stored.is_delete_marker() {
             return Err(ServerError::MethodNotAllowed);
         }
-        pg.put_object_tags(bucket, key, stored.version_id(), tags)
+        pgs.meta()
+            .put_object_tags(bucket, key, stored.version_id(), tags)
             .map_err(ServerError::Metadata)
     }
 
@@ -3713,31 +3835,15 @@ impl Coordinator {
             bucket,
             key
         );
-        let _bucket_info = self.authorize_bucket_read_requester(&requester, bucket)?;
-        let pg_id = self.object_pg_id(bucket, key);
-        let pg = self.storage_node.get_pg(pg_id)?;
-        let stored = match version_id {
-            Some(vid) => pg.get_object_version(bucket, key, vid),
-            None => pg.get_object_meta(bucket, key),
-        }
-        .map_err(|e| match e {
-            storage::MetadataError::ObjectNotFound if version_id.is_some() => {
-                ServerError::VersionNotFound {
-                    bucket: bucket.to_string(),
-                    key: key.to_string(),
-                    version_id: version_id.unwrap().to_string(),
-                }
-            }
-            storage::MetadataError::ObjectNotFound => ServerError::ObjectNotFound {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-            },
-            other => ServerError::Metadata(other),
-        })?;
+        let LockedReadObject {
+            record: stored,
+            pgs,
+        } = self.lock_object_for_authorized_tagging(&requester, bucket, key, version_id)?;
         if stored.is_delete_marker() {
             return Err(ServerError::MethodNotAllowed);
         }
-        pg.get_object_tags(bucket, key, stored.version_id())
+        pgs.meta()
+            .get_object_tags(bucket, key, stored.version_id())
             .map_err(ServerError::Metadata)
     }
 
@@ -3755,31 +3861,15 @@ impl Coordinator {
             bucket,
             key
         );
-        let _bucket_info = self.authorize_object_write_requester(&requester, bucket)?;
-        let pg_id = self.object_pg_id(bucket, key);
-        let pg = self.storage_node.get_pg(pg_id)?;
-        let stored = match version_id {
-            Some(vid) => pg.get_object_version(bucket, key, vid),
-            None => pg.get_object_meta(bucket, key),
-        }
-        .map_err(|e| match e {
-            storage::MetadataError::ObjectNotFound if version_id.is_some() => {
-                ServerError::VersionNotFound {
-                    bucket: bucket.to_string(),
-                    key: key.to_string(),
-                    version_id: version_id.unwrap().to_string(),
-                }
-            }
-            storage::MetadataError::ObjectNotFound => ServerError::ObjectNotFound {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-            },
-            other => ServerError::Metadata(other),
-        })?;
+        let LockedReadObject {
+            record: stored,
+            pgs,
+        } = self.lock_object_for_authorized_tagging(&requester, bucket, key, version_id)?;
         if stored.is_delete_marker() {
             return Err(ServerError::MethodNotAllowed);
         }
-        pg.delete_object_tags(bucket, key, stored.version_id())
+        pgs.meta()
+            .delete_object_tags(bucket, key, stored.version_id())
             .map_err(ServerError::Metadata)
     }
 
@@ -4122,6 +4212,7 @@ impl Coordinator {
                 key: ObjectKey::from(req.key),
                 version_id: prepared.version_id,
                 owner,
+                public_read: req.acl.is_public_read(),
                 generation_id: prepared.generation_id,
                 size: req.data.len() as u64,
                 etag: storage::ObjectEtag::single_part(checksum::crc64::checksum(req.data)),
@@ -4753,6 +4844,7 @@ impl Coordinator {
                         key: ObjectKey::from(key),
                         version_id: prepared.version_id,
                         owner,
+                        public_read: req.acl.is_public_read(),
                         generation_id: prepared.generation_id,
                         size: total_size,
                         etag_crc64: crc64,
@@ -5173,23 +5265,19 @@ impl Coordinator {
 
         let dst_bucket_info = self.authorize_object_write_requester(requester, dst_bucket)?;
 
-        if Self::is_bucket_owner_enforced(dst_bucket_info.ownership_controls.as_deref())
-            && !matches!(
-                acl,
-                PutObjectAcl::None | PutObjectAcl::Private | PutObjectAcl::BucketOwnerFullControl
-            )
-        {
-            return Err(ServerError::AccessControlListNotSupported);
-        }
-
-        let _src_bucket_info = self.authorize_bucket_read_requester(requester, src_bucket)?;
+        Self::ensure_put_object_acl_supported(&dst_bucket_info, acl)?;
 
         // Phase 1: Snapshot source metadata and prepare a read handle.
         let (src_metadata, src_system_metadata, src_tags, mut source_body) = {
             let LockedReadObject {
                 record: src_stored,
                 pgs,
-            } = self.lock_object_pgs_for_read(src_bucket, src_key, src_version_id)?;
+            } = self.lock_object_for_authorized_read(
+                requester,
+                src_bucket,
+                src_key,
+                src_version_id,
+            )?;
 
             // Reject delete markers — they are not copyable objects.
             // AWS returns 400/InvalidRequest when an explicit versionId targets a
@@ -5925,11 +6013,10 @@ impl Coordinator {
         let version_id = req.version_id;
         let cond = req.cond;
         let requester = &req.requester;
-        let _bucket_info = self.authorize_bucket_read_requester(requester, bucket)?;
         let LockedReadObject {
             record: stored,
             pgs,
-        } = self.lock_object_pgs_for_read(bucket, key, version_id)?;
+        } = self.lock_object_for_authorized_read(requester, bucket, key, version_id)?;
 
         // If latest version is a delete marker, return 404 with x-amz-delete-marker
         let record = match stored {
@@ -6065,11 +6152,10 @@ impl Coordinator {
         let part_number = req.part_number;
         let cond = req.cond;
         let requester = &req.requester;
-        let _bucket_info = self.authorize_bucket_read_requester(requester, bucket)?;
         let LockedReadObject {
             record: stored,
             pgs,
-        } = self.lock_object_pgs_for_read(bucket, key, version_id)?;
+        } = self.lock_object_for_authorized_read(requester, bucket, key, version_id)?;
 
         let record = match stored {
             StoredObject::Live(r) => r,
@@ -6244,11 +6330,10 @@ impl Coordinator {
         let part_number = req.part_number;
         let cond = req.cond;
         let requester = &req.requester;
-        let _bucket_info = self.authorize_bucket_read_requester(requester, bucket)?;
         let LockedReadObject {
             record: stored,
             pgs,
-        } = self.lock_object_pgs_for_read(bucket, key, version_id)?;
+        } = self.lock_object_for_authorized_read(requester, bucket, key, version_id)?;
 
         let record = match stored {
             StoredObject::Live(r) => r,
@@ -6360,9 +6445,8 @@ impl Coordinator {
         let version_id = req.version_id;
         let cond = req.cond;
         let requester = &req.requester;
-        let _bucket_info = self.authorize_bucket_read_requester(requester, bucket)?;
         let LockedReadObject { record: stored, .. } =
-            self.lock_object_pgs_for_read(bucket, key, version_id)?;
+            self.lock_object_for_authorized_read(requester, bucket, key, version_id)?;
 
         // If latest version is a delete marker, return 404 with x-amz-delete-marker
         let record = match stored {
@@ -6423,11 +6507,10 @@ impl Coordinator {
         let part_number_marker = req.part_number_marker;
         let max_parts = req.max_parts;
         let requester = &req.requester;
-        let _bucket_info = self.authorize_bucket_read_requester(requester, bucket)?;
         let LockedReadObject {
             record: stored,
             pgs,
-        } = self.lock_object_pgs_for_read(bucket, key, version_id)?;
+        } = self.lock_object_for_authorized_read(requester, bucket, key, version_id)?;
 
         let record = match stored {
             StoredObject::Live(r) => r,
@@ -6556,11 +6639,10 @@ impl Coordinator {
         let range = req.range;
         let cond = req.cond;
         let requester = &req.requester;
-        let _bucket_info = self.authorize_bucket_read_requester(requester, bucket)?;
         let LockedReadObject {
             record: stored,
             pgs,
-        } = self.lock_object_pgs_for_read(bucket, key, version_id)?;
+        } = self.lock_object_for_authorized_read(requester, bucket, key, version_id)?;
 
         // If latest version is a delete marker, return 404 with x-amz-delete-marker
         let record = match stored {
@@ -7348,6 +7430,7 @@ impl Coordinator {
             Self::ensure_put_object_acl_supported(&bucket_info, req.acl)?;
             let initiator = Self::requester_owner_identity(&req.requester);
             let owner = Self::effective_object_owner(&bucket_info, &req.requester, req.acl);
+            let public_read = req.acl.is_public_read();
 
             let meta_pg_id = self.object_pg_id(bucket, key);
             let pg = self.storage_node.get_pg(meta_pg_id)?;
@@ -7360,6 +7443,7 @@ impl Coordinator {
                 system_metadata_blob: SerializedSystemMetadataBlob::from(system_metadata_blob),
                 initiator,
                 owner,
+                public_read,
                 checksum: req.checksum,
                 encryption,
             })?;
@@ -7397,8 +7481,6 @@ impl Coordinator {
         let source_sse_customer = req.source_sse_customer;
 
         let _dst_bucket_info = self.authorize_object_write_requester(requester, dst_bucket)?;
-        let _src_bucket_info = self.authorize_bucket_read_requester(requester, src_bucket)?;
-
         let not_found = |e: ServerError| match e {
             ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
                 bucket: src_bucket.to_string(),
@@ -7412,7 +7494,12 @@ impl Coordinator {
             let LockedReadObject {
                 record: src_stored,
                 pgs,
-            } = self.lock_object_pgs_for_read(src_bucket, src_key, src_version_id)?;
+            } = self.lock_object_for_authorized_read(
+                requester,
+                src_bucket,
+                src_key,
+                src_version_id,
+            )?;
 
             // Reject delete markers — they are not copyable objects.
             let src_record = match src_stored {
@@ -7943,6 +8030,7 @@ impl Coordinator {
                 key: ObjectKey::from(key),
                 version_id,
                 owner: upload.owner.clone(),
+                public_read: upload.public_read,
                 generation_id,
                 size: total_size,
                 etag_crc64,
@@ -12229,7 +12317,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
-                acl: PutObjectAcl::Other("public-read"),
+                acl: PutObjectAcl::PublicRead,
             },
         )
         .unwrap_err();
@@ -12283,6 +12371,98 @@ mod tests {
     }
 
     #[test]
+    fn put_object_rejects_public_acl_when_block_public_acls_enabled() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        coord
+            .put_bucket_public_access_block(
+                "bucket",
+                "<PublicAccessBlockConfiguration><BlockPublicAcls>true</BlockPublicAcls><IgnorePublicAcls>false</IgnorePublicAcls><BlockPublicPolicy>false</BlockPublicPolicy><RestrictPublicBuckets>false</RestrictPublicBuckets></PublicAccessBlockConfiguration>",
+                Requester::principal("owner-a"),
+            )
+            .unwrap();
+
+        let err = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "key",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                requester: Requester::principal("owner-a"),
+                acl: PutObjectAcl::PublicRead,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn put_object_rejects_unimplemented_bucket_owner_read_acl() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+
+        let err = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "key",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                requester: Requester::principal("owner-a"),
+                acl: PutObjectAcl::BucketOwnerRead,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ServerError::NotImplemented { ref feature }
+            if feature == "bucket-owner-read object ACL"
+        ));
+    }
+
+    #[test]
+    fn put_object_rejects_invalid_acl_value() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+
+        let err = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "key",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                requester: Requester::principal("owner-a"),
+                acl: PutObjectAcl::Invalid("definitely-not-a-real-acl"),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ServerError::InvalidArgument { .. }));
+    }
+
+    #[test]
     fn get_object_tags_rejects_non_owner_requester() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
@@ -12310,6 +12490,73 @@ mod tests {
             .get_object_tags("bucket", "key", None, Requester::principal("other-user"))
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn get_object_tags_rejects_public_read_for_anonymous() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        let tags_xml =
+            "<Tagging><TagSet><Tag><Key>env</Key><Value>public</Value></Tag></TagSet></Tagging>";
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "key",
+                data: b"public",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: Some(tags_xml),
+                cond: NO_WRITE,
+                requester: Requester::principal("owner-a"),
+                acl: PutObjectAcl::PublicRead,
+            },
+        )
+        .unwrap();
+
+        let err = coord
+            .get_object_tags("bucket", "key", None, Requester::anonymous())
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn get_object_tags_allows_bucket_owner_for_cross_owned_object() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let owner_canonical_id = CanonicalUserId::from_principal("owner-a");
+        coord
+            .create_bucket_for_owner_with_acl("owner-a", &owner_canonical_id, "bucket", false, true)
+            .unwrap();
+        let tags_xml =
+            "<Tagging><TagSet><Tag><Key>env</Key><Value>writer</Value></Tag></TagSet></Tagging>";
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "key",
+                data: b"writer-owned",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: Some(tags_xml),
+                cond: NO_WRITE,
+                requester: Requester::principal("writer-a"),
+                acl: NO_PUT_OBJECT_ACL,
+            },
+        )
+        .unwrap();
+
+        let tags = coord
+            .get_object_tags("bucket", "key", None, Requester::principal("owner-a"))
+            .unwrap()
+            .expect("expected tag set");
+        assert!(tags.contains("<Key>env</Key>"));
+        assert!(tags.contains("<Value>writer</Value>"));
     }
 
     #[test]
@@ -12409,11 +12656,87 @@ mod tests {
     }
 
     #[test]
+    fn get_object_allows_object_owner_without_bucket_read_access() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let owner_canonical_id = CanonicalUserId::from_principal("owner-a");
+        coord
+            .create_bucket_for_owner_with_acl("owner-a", &owner_canonical_id, "bucket", false, true)
+            .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "key",
+                data: b"writer-owned",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                requester: Requester::principal("writer-a"),
+                acl: NO_PUT_OBJECT_ACL,
+            },
+        )
+        .unwrap();
+
+        let obj = coord
+            .get_object(&GetObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: NO_READ,
+                requester: Requester::principal("writer-a"),
+            })
+            .unwrap();
+        assert_eq!(obj.body.read_all().unwrap(), b"writer-owned");
+    }
+
+    #[test]
+    fn get_object_rejects_bucket_owner_when_private_object_owned_by_other_principal() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let owner_canonical_id = CanonicalUserId::from_principal("owner-a");
+        coord
+            .create_bucket_for_owner_with_acl("owner-a", &owner_canonical_id, "bucket", false, true)
+            .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "key",
+                data: b"writer-owned",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                requester: Requester::principal("writer-a"),
+                acl: NO_PUT_OBJECT_ACL,
+            },
+        )
+        .unwrap();
+
+        let err = coord
+            .get_object(&GetObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: NO_READ,
+                requester: Requester::principal("owner-a"),
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
     fn get_object_allows_public_read_for_anonymous() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord
-            .create_bucket_for_owner("owner-a", "bucket", true)
+            .create_bucket_for_owner("owner-a", "bucket", false)
             .unwrap();
         test_helpers::put_object(
             &coord,
@@ -12427,7 +12750,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
-                acl: NO_PUT_OBJECT_ACL,
+                acl: PutObjectAcl::PublicRead,
             },
         )
         .unwrap();
@@ -12443,6 +12766,50 @@ mod tests {
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), b"public");
+    }
+
+    #[test]
+    fn get_object_ignores_public_read_acl_when_ignore_public_acls_enabled() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "key",
+                data: b"public",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                requester: Requester::principal("owner-a"),
+                acl: PutObjectAcl::PublicRead,
+            },
+        )
+        .unwrap();
+        coord
+            .put_bucket_public_access_block(
+                "bucket",
+                "<PublicAccessBlockConfiguration><BlockPublicAcls>false</BlockPublicAcls><IgnorePublicAcls>true</IgnorePublicAcls><BlockPublicPolicy>false</BlockPublicPolicy><RestrictPublicBuckets>false</RestrictPublicBuckets></PublicAccessBlockConfiguration>",
+                Requester::principal("owner-a"),
+            )
+            .unwrap();
+
+        let err = coord
+            .get_object(&GetObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: NO_READ,
+                requester: Requester::anonymous(),
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
     }
 
     #[test]
@@ -12620,7 +12987,7 @@ mod tests {
                 tags: None,
                 checksum: None,
                 requester: TEST_REQUESTER,
-                acl: PutObjectAcl::Other("public-read"),
+                acl: PutObjectAcl::PublicRead,
                 sse_customer: None,
             })
             .unwrap_err();
@@ -12771,7 +13138,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 requester: Requester::principal("owner-a"),
-                acl: PutObjectAcl::Other("public-read"),
+                acl: PutObjectAcl::PublicRead,
                 encryption: ObjectEncryption::None,
             })
             .unwrap_err();
@@ -13231,6 +13598,54 @@ mod tests {
     }
 
     #[test]
+    fn copy_object_rejects_bucket_owner_copying_private_object_owned_by_other_principal() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let owner_canonical_id = CanonicalUserId::from_principal("owner-a");
+        coord
+            .create_bucket_for_owner_with_acl("owner-a", &owner_canonical_id, "bucket", false, true)
+            .unwrap();
+
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "src",
+                data: b"private",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                requester: Requester::principal("writer-a"),
+                acl: NO_PUT_OBJECT_ACL,
+            },
+        )
+        .unwrap();
+
+        let err = coord
+            .copy_object(&CopyObjectRequest {
+                source: CopySource {
+                    bucket: "bucket",
+                    key: "src",
+                    version_id: None,
+                    condition: NO_READ,
+                },
+                dst_bucket: "bucket",
+                dst_key: "dst",
+                dst_condition: NO_WRITE,
+                directive: MetadataDirective::Copy,
+                tagging: TaggingDirective::Copy,
+                requester: Requester::principal("owner-a"),
+                acl: NO_PUT_OBJECT_ACL,
+                source_sse_customer: None,
+                dst_sse_customer: None,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
     fn copy_object_rejects_acl_on_bucket_owner_enforced_bucket() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
@@ -13273,12 +13688,65 @@ mod tests {
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
                 requester: TEST_REQUESTER,
-                acl: PutObjectAcl::Other("public-read"),
+                acl: PutObjectAcl::PublicRead,
                 source_sse_customer: None,
                 dst_sse_customer: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessControlListNotSupported));
+    }
+
+    #[test]
+    fn copy_object_rejects_public_acl_when_block_public_acls_enabled() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "src",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                requester: Requester::principal("owner-a"),
+                acl: NO_PUT_OBJECT_ACL,
+            },
+        )
+        .unwrap();
+        coord
+            .put_bucket_public_access_block(
+                "bucket",
+                "<PublicAccessBlockConfiguration><BlockPublicAcls>true</BlockPublicAcls><IgnorePublicAcls>false</IgnorePublicAcls><BlockPublicPolicy>false</BlockPublicPolicy><RestrictPublicBuckets>false</RestrictPublicBuckets></PublicAccessBlockConfiguration>",
+                Requester::principal("owner-a"),
+            )
+            .unwrap();
+
+        let err = coord
+            .copy_object(&CopyObjectRequest {
+                source: CopySource {
+                    bucket: "bucket",
+                    key: "src",
+                    version_id: None,
+                    condition: NO_READ,
+                },
+                dst_bucket: "bucket",
+                dst_key: "dst",
+                dst_condition: NO_WRITE,
+                directive: MetadataDirective::Copy,
+                tagging: TaggingDirective::Copy,
+                requester: Requester::principal("owner-a"),
+                acl: PutObjectAcl::PublicRead,
+                source_sse_customer: None,
+                dst_sse_customer: None,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
     }
 
     #[test]
@@ -21670,6 +22138,7 @@ mod tests {
                         key: live.key.clone(),
                         version_id: live.version_id,
                         owner: live.owner.clone(),
+                        public_read: live.public_read,
                         generation_id: live.generation_id,
                         size: live.size,
                         etag: live.etag,

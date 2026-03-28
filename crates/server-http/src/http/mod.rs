@@ -3585,10 +3585,15 @@ fn parse_put_object_acl(value: Option<&str>) -> crate::coordinator::PutObjectAcl
     match value {
         None => crate::coordinator::PutObjectAcl::None,
         Some("private") => crate::coordinator::PutObjectAcl::Private,
+        Some("public-read") => crate::coordinator::PutObjectAcl::PublicRead,
+        Some("public-read-write") => crate::coordinator::PutObjectAcl::PublicReadWrite,
+        Some("authenticated-read") => crate::coordinator::PutObjectAcl::AuthenticatedRead,
+        Some("aws-exec-read") => crate::coordinator::PutObjectAcl::AwsExecRead,
+        Some("bucket-owner-read") => crate::coordinator::PutObjectAcl::BucketOwnerRead,
         Some("bucket-owner-full-control") => {
             crate::coordinator::PutObjectAcl::BucketOwnerFullControl
         }
-        Some(other) => crate::coordinator::PutObjectAcl::Other(other),
+        Some(other) => crate::coordinator::PutObjectAcl::Invalid(other),
     }
 }
 
@@ -3776,6 +3781,35 @@ mod tests {
         match fe.dispatch_routed(&req, &test_auth(), op) {
             Err(ServerError::BadDigest) => {}
             Err(e) => panic!("expected BadDigest, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn put_object_invalid_acl_rejected() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+
+        let req = new_req(
+            http::Method::PUT,
+            "",
+            "",
+            vec![(
+                "x-amz-acl".to_string(),
+                "definitely-not-a-real-acl".to_string(),
+            )],
+            b"hello world".to_vec(),
+        );
+        let op = S3Operation::PutObject {
+            bucket: "mybucket".to_string(),
+            key: "mykey".to_string(),
+        };
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::InvalidArgument { .. }) => {}
+            Err(e) => panic!("expected InvalidArgument, got {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
     }

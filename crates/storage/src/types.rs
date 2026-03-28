@@ -910,6 +910,13 @@ impl StoredObject {
         }
     }
 
+    pub fn public_read(&self) -> bool {
+        match self {
+            Self::Live(r) => r.public_read,
+            Self::DeleteMarker(_) => false,
+        }
+    }
+
     pub fn is_delete_marker(&self) -> bool {
         matches!(self, Self::DeleteMarker(_))
     }
@@ -962,6 +969,7 @@ pub struct LiveObjectRecord {
     pub key: ObjectKey,
     pub version_id: VersionId,
     pub owner: OwnerIdentity,
+    pub public_read: bool,
     pub generation_id: GenerationId,
     pub size: u64,
     pub etag: ObjectEtag,
@@ -1216,6 +1224,7 @@ pub struct PutLiveObjectReq {
     pub key: ObjectKey,
     pub version_id: VersionId,
     pub owner: OwnerIdentity,
+    pub public_read: bool,
     pub generation_id: GenerationId,
     pub size: u64,
     pub etag: ObjectEtag,
@@ -1277,6 +1286,7 @@ pub struct CommitMultipartReq {
     pub key: ObjectKey,
     pub version_id: VersionId,
     pub owner: OwnerIdentity,
+    pub public_read: bool,
     pub generation_id: GenerationId,
     pub size: u64,
     /// Composite CRC64-NVME bytes (CRC of concatenated per-part CRC64s).
@@ -1301,6 +1311,7 @@ pub struct CommitStreamPutReq {
     pub key: ObjectKey,
     pub version_id: VersionId,
     pub owner: OwnerIdentity,
+    pub public_read: bool,
     pub generation_id: GenerationId,
     pub size: u64,
     /// CRC64-NVME of the object data.
@@ -1386,6 +1397,7 @@ pub struct MultipartUploadRecord {
     pub system_metadata_blob: SerializedSystemMetadataBlob,
     pub initiator: Option<OwnerIdentity>,
     pub owner: OwnerIdentity,
+    pub public_read: bool,
     /// Validated checksum configuration for this upload.
     pub checksum: Option<MultipartChecksumConfig>,
     pub encryption: ObjectEncryption,
@@ -1449,6 +1461,7 @@ pub struct CreateMultipartUploadReq {
     pub system_metadata_blob: SerializedSystemMetadataBlob,
     pub initiator: Option<OwnerIdentity>,
     pub owner: OwnerIdentity,
+    pub public_read: bool,
     pub checksum: Option<MultipartChecksumConfig>,
     pub encryption: ObjectEncryption,
 }

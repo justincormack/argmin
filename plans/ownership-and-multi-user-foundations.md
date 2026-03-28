@@ -42,16 +42,18 @@ The current code already has:
 - limited ownership-controls support at the bucket level
 
 The current code does not yet have:
-- object-level authorization decisions distinct from bucket-level authorization
+- complete object-level authorization decisions across grant-based ACL and
+  policy cases
 - XML and API surfaces that consistently render stored object and multipart
   owner identity where AWS expects it
 - tenant/account modeling beyond synthetically derived account identity on
   configured credentials
 
 Important current shortcuts:
-- read and write authorization still compare the requester primarily to the
-  bucket owner plus bucket public flags
-- object GET and HEAD authorize only at bucket scope before reading the object
+- write authorization still compares the requester primarily to the bucket
+  owner plus bucket public-write flags
+- object ACL handling only covers the minimal stored public-read/public-read-write
+  behavior needed for current tests; grant-based ACLs remain later work
 - multipart list and future ACL/XML owner surfaces do not yet consistently use
   the stored owner and initiator identity
 
@@ -86,7 +88,8 @@ Completed in Phase 2:
 Still open after Phase 2:
 - the server config and local test harness still synthesize account identity
   directly from configured access keys and fixture principals
-- object-scoped authorization is still bucket-centric
+- object-scoped authorization is still incomplete on write-side cleanup edges
+  and ACL-grant cases
 - XML and API surfaces still need later phases to render stored owner identity
   for object and multipart responses where AWS expects it
 
@@ -247,13 +250,22 @@ Success criteria:
 
 ### Phase 3: Object-Scoped Authorization
 
+Status: in progress. Private-object read, head, range, attributes, tagging,
+and copy-source authorization now consult stored object owner identity instead
+of only bucket read access. This phase also persists the minimal object
+`public-read`/`public-read-write` bit needed to preserve AWS-compatible
+anonymous read behavior once bucket-level read shortcuts are removed. Full
+grant-based object ACL semantics remain for later ACL work.
+
 Deliver:
 - object read and object metadata APIs authorize against object ownership rules
 - bucket-owner cleanup/delete behavior matches AWS for the currently targeted
   cases
 
 Success criteria:
-- multi-user object-read and copy authorization tests can be unignored
+- multi-user private-object read and copy authorization tests can be unignored
+- ACL-grant cases stay explicitly tracked for later ACL work rather than
+  relying on bucket-level shortcuts
 
 ### Phase 4: Multipart Owner And Initiator Surfaces
 
@@ -275,11 +287,13 @@ Deliver:
 
 Targeted integration tests:
 - `cargo test -p s3-tests --test bucket_crud test_bucket_create_exists_nonowner -- --ignored`
-- `cargo test -p s3-tests --test copy_object test_object_copy_not_owned_bucket -- --ignored`
-- `cargo test -p s3-tests --test copy_object test_object_copy_not_owned_object_bucket -- --ignored`
+- `cargo test -p s3-tests --test copy_object test_object_copy_not_owned_bucket -- --exact`
 - `cargo test -p s3-tests --test multipart test_list_multipart_upload_owner -- --ignored`
 - `cargo test -p s3-tests --test presigned test_object_presigned_put_object_with_acl_tenant -- --ignored`
 - `cargo test -p s3-tests --test presigned test_object_raw_get_x_amz_expires_not_expired_tenant -- --ignored`
+
+Still blocked on later ACL work:
+- `cargo test -p s3-tests --test copy_object test_object_copy_not_owned_object_bucket -- --ignored`
 
 Regression coverage to keep green while working:
 - `cargo test -p s3-tests --test ownership`

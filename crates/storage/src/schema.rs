@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS objects (
     encryption_state BLOB,
     owner_principal TEXT NOT NULL CHECK (length(owner_principal) BETWEEN 1 AND 256),
     owner_canonical_id TEXT NOT NULL CHECK (length(owner_canonical_id) = 64),
+    public_read INTEGER NOT NULL DEFAULT 0 CHECK (public_read IN (0, 1)),
     CHECK (status IN (0, 1)),
     CHECK (etag_kind IN (0, 1)),
     CHECK (data_layout IN (0, 1)),
@@ -48,7 +49,7 @@ CREATE TABLE IF NOT EXISTS objects (
         )) OR
         (status = 1 AND generation_id IS NULL AND data_layout = 0 AND parts_count IS NULL AND tags IS NULL AND metadata_blob IS NULL AND system_metadata_blob IS NULL
          AND size = 0 AND etag = X'' AND etag_kind = 0 AND storage_class = 0 AND ec_k = 0 AND ec_m = 0
-         AND encryption_type = 0 AND encryption_state IS NULL)
+         AND encryption_type = 0 AND encryption_state IS NULL AND public_read = 0)
     ),
     PRIMARY KEY (bucket, key, version_id)
 )";
@@ -73,7 +74,8 @@ CREATE TABLE IF NOT EXISTS multipart_uploads (
     ),
     initiator_canonical_id TEXT CHECK (
         initiator_canonical_id IS NULL OR length(initiator_canonical_id) = 64
-    )
+    ),
+    public_read INTEGER NOT NULL DEFAULT 0 CHECK (public_read IN (0, 1))
 )";
 
 /// Index for listing multipart uploads by bucket/key.
@@ -521,6 +523,12 @@ fn migrate_owner_identity_columns(conn: &Connection) -> Result<(), rusqlite::Err
         "owner_canonical_id",
         "ALTER TABLE objects ADD COLUMN owner_canonical_id TEXT",
     )?;
+    add_column_if_missing(
+        conn,
+        "objects",
+        "public_read",
+        "ALTER TABLE objects ADD COLUMN public_read INTEGER NOT NULL DEFAULT 0 CHECK (public_read IN (0, 1))",
+    )?;
 
     let mut stmt = conn.prepare(
         "SELECT o.bucket, o.key, o.version_id, b.owner_principal, b.owner_canonical_id \
@@ -573,6 +581,12 @@ fn migrate_owner_identity_columns(conn: &Connection) -> Result<(), rusqlite::Err
         "multipart_uploads",
         "initiator_canonical_id",
         "ALTER TABLE multipart_uploads ADD COLUMN initiator_canonical_id TEXT",
+    )?;
+    add_column_if_missing(
+        conn,
+        "multipart_uploads",
+        "public_read",
+        "ALTER TABLE multipart_uploads ADD COLUMN public_read INTEGER NOT NULL DEFAULT 0 CHECK (public_read IN (0, 1))",
     )?;
 
     let mut stmt = conn.prepare(

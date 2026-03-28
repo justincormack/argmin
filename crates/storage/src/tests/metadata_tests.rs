@@ -17,6 +17,7 @@ fn metadata_put_get_delete(store: &dyn PgMetadataStore) {
         key: "test-key".into(),
         version_id: VersionId::Null,
         owner: test_owner(),
+        public_read: false,
         generation_id: GenerationId::MIN,
         ec: EcShape { k: 4, m: 2 },
         size: 1024,
@@ -64,6 +65,7 @@ fn metadata_put_overwrites(store: &dyn PgMetadataStore) {
         key: "k".into(),
         version_id: VersionId::Null,
         owner: test_owner(),
+        public_read: false,
         generation_id: GenerationId::MIN,
         ec: EcShape { k: 4, m: 2 },
         size: 100,
@@ -81,6 +83,7 @@ fn metadata_put_overwrites(store: &dyn PgMetadataStore) {
         key: "k".into(),
         version_id: VersionId::Null,
         owner: test_owner(),
+        public_read: false,
         generation_id: GenerationId::MIN,
         ec: EcShape { k: 4, m: 2 },
         size: 200,
@@ -111,6 +114,7 @@ fn metadata_list_basic(store: &dyn PgMetadataStore) {
             key: format!("obj-{i:02}").into(),
             version_id: VersionId::Null,
             owner: test_owner(),
+            public_read: false,
             generation_id: GenerationId::MIN,
             size: i * 100,
             etag: ObjectEtag::SinglePart([i as u8, 0, 0, 0, 0, 0, 0, 0]),
@@ -148,6 +152,7 @@ fn metadata_list_with_prefix(store: &dyn PgMetadataStore) {
             key: (*key).into(),
             version_id: VersionId::Null,
             owner: test_owner(),
+            public_read: false,
             generation_id: GenerationId::MIN,
             ec: EcShape { k: 4, m: 2 },
             size: 100,
@@ -181,6 +186,7 @@ fn metadata_list_pagination(store: &dyn PgMetadataStore) {
             key: format!("item-{i:02}").into(),
             version_id: VersionId::Null,
             owner: test_owner(),
+            public_read: false,
             generation_id: GenerationId::MIN,
             size: 0,
             etag: ObjectEtag::SinglePart([0; 8]),
@@ -275,6 +281,7 @@ fn metadata_empty_key(store: &dyn PgMetadataStore) {
         key: "".into(),
         version_id: VersionId::Null,
         owner: test_owner(),
+        public_read: false,
         generation_id: GenerationId::MIN,
         ec: EcShape { k: 4, m: 2 },
         size: 0,
@@ -299,6 +306,7 @@ fn metadata_long_key(store: &dyn PgMetadataStore) {
         key: long_key.clone().into(),
         version_id: VersionId::Null,
         owner: test_owner(),
+        public_read: false,
         generation_id: GenerationId::MIN,
         ec: EcShape { k: 4, m: 2 },
         size: 0,
@@ -321,6 +329,7 @@ fn metadata_zero_size_object(store: &dyn PgMetadataStore) {
         key: "empty-obj".into(),
         version_id: VersionId::Null,
         owner: test_owner(),
+        public_read: false,
         generation_id: GenerationId::MIN,
         ec: EcShape { k: 4, m: 2 },
         size: 0,
@@ -664,6 +673,7 @@ fn file_metadata_object_has_inline_legacy_layout() {
             key: "k".into(),
             version_id: VersionId::Null,
             owner: test_owner(),
+            public_read: false,
             generation_id: GenerationId::MIN,
             ec: EcShape { k: 4, m: 2 },
             size: 100,
@@ -693,6 +703,7 @@ fn file_metadata_invalid_data_layout_returns_error() {
             key: "k".into(),
             version_id: VersionId::Null,
             owner: test_owner(),
+            public_read: false,
             generation_id: GenerationId::MIN,
             ec: EcShape { k: 4, m: 2 },
             size: 100,
@@ -740,6 +751,7 @@ fn mpu_create_and_get_upload() {
             initiator: Some(owner_identity("alice")),
 
             owner: owner_identity("alice"),
+            public_read: false,
             checksum: None,
             encryption: ObjectEncryption::None,
         })
@@ -771,6 +783,7 @@ fn mpu_create_upload_with_checksum_fields() {
             initiator: None,
 
             owner: test_owner(),
+            public_read: false,
             checksum: Some(
                 MultipartChecksumConfig::new(
                     ChecksumAlgorithm::Sha256,
@@ -804,6 +817,7 @@ fn mpu_create_upload_with_checksum_fields() {
             initiator: None,
 
             owner: test_owner(),
+            public_read: false,
             checksum: None,
             encryption: ObjectEncryption::None,
         })
@@ -826,6 +840,7 @@ fn mpu_part_checksum_round_trip() {
             initiator: None,
 
             owner: test_owner(),
+            public_read: false,
             checksum: Some(
                 MultipartChecksumConfig::new(
                     ChecksumAlgorithm::Crc32,
@@ -945,6 +960,7 @@ fn mpu_complete_multipart_commit_preserves_checksums() {
             initiator: None,
 
             owner: test_owner(),
+            public_read: false,
             checksum: Some(
                 MultipartChecksumConfig::new(
                     ChecksumAlgorithm::Sha256,
@@ -961,6 +977,7 @@ fn mpu_complete_multipart_commit_preserves_checksums() {
         key: "k".into(),
         version_id: VersionId::Null,
         owner: test_owner(),
+        public_read: false,
         generation_id: GenerationId::MIN,
         size: 6 * 1024 * 1024,
         etag_crc64: [0xCC, 0, 0, 0, 0, 0, 0, 0],
@@ -1045,6 +1062,7 @@ fn mpu_set_upload_state_transition() {
             initiator: None,
 
             owner: test_owner(),
+            public_read: false,
             checksum: None,
             encryption: ObjectEncryption::None,
         })
@@ -1093,6 +1111,7 @@ fn mpu_delete_upload_cascades_parts() {
             initiator: None,
 
             owner: test_owner(),
+            public_read: false,
             checksum: None,
             encryption: ObjectEncryption::None,
         })
@@ -1149,6 +1168,7 @@ fn mpu_upsert_part_and_get() {
             initiator: None,
 
             owner: test_owner(),
+            public_read: false,
             checksum: None,
             encryption: ObjectEncryption::None,
         })
@@ -1219,6 +1239,7 @@ fn mpu_list_parts_pagination() {
             initiator: None,
 
             owner: test_owner(),
+            public_read: false,
             checksum: None,
             encryption: ObjectEncryption::None,
         })
@@ -1301,6 +1322,7 @@ fn mpu_list_uploads_pagination() {
                 initiator: None,
 
                 owner: test_owner(),
+                public_read: false,
                 checksum: None,
                 encryption: ObjectEncryption::None,
             })
@@ -1357,6 +1379,7 @@ fn mpu_list_uploads_with_prefix() {
                 initiator: None,
 
                 owner: test_owner(),
+                public_read: false,
                 checksum: None,
                 encryption: ObjectEncryption::None,
             })
@@ -1393,6 +1416,7 @@ fn mpu_list_uploads_same_key_multiple_upload_ids() {
                 initiator: None,
 
                 owner: test_owner(),
+                public_read: false,
                 checksum: None,
                 encryption: ObjectEncryption::None,
             })
@@ -1447,6 +1471,7 @@ fn mpu_list_uploads_stale_marker_returns_remaining() {
                 initiator: None,
 
                 owner: test_owner(),
+                public_read: false,
                 checksum: None,
                 encryption: ObjectEncryption::None,
             })
@@ -1491,6 +1516,7 @@ fn mpu_corrupted_part_okh_returns_error() {
             initiator: None,
 
             owner: test_owner(),
+            public_read: false,
             checksum: None,
             encryption: ObjectEncryption::None,
         })
@@ -1587,6 +1613,7 @@ fn mpu_get_missing_part_returns_part_not_found() {
             initiator: None,
 
             owner: test_owner(),
+            public_read: false,
             checksum: None,
             encryption: ObjectEncryption::None,
         })
@@ -1619,6 +1646,7 @@ fn mpu_set_upload_state_rejects_in_progress_target() {
             initiator: None,
 
             owner: test_owner(),
+            public_read: false,
             checksum: None,
             encryption: ObjectEncryption::None,
         })
@@ -1933,6 +1961,7 @@ fn create_upload(store: &dyn PgMetadataStore, upload_id: &str) {
             initiator: None,
 
             owner: test_owner(),
+            public_read: false,
             checksum: None,
             encryption: ObjectEncryption::None,
         })
@@ -2580,6 +2609,7 @@ mod prop_tests {
                 key: key.clone().into(),
                 version_id: VersionId::Null,
                 owner: test_owner(),
+                public_read: false,
                 generation_id: GenerationId::MIN,
                 ec: EcShape { k: 4, m: 2 },
                 size: 0,
@@ -2970,6 +3000,7 @@ fn commit_stream_put_atomic() {
         key: "k".into(),
         version_id: VersionId::Null,
         owner: test_owner(),
+        public_read: false,
         generation_id: GenerationId::MIN,
         size: 6_000_000,
         etag_crc64: u64::from_le_bytes([0xAB; 8]),
@@ -3066,6 +3097,7 @@ fn commit_stream_put_overwrite_unversioned() {
                 key: "k".into(),
                 version_id: VersionId::Null,
                 owner: test_owner(),
+                public_read: false,
                 generation_id: GenerationId::MIN,
                 size: 100,
                 etag_crc64: 1u64,
@@ -3109,6 +3141,7 @@ fn commit_stream_put_overwrite_unversioned() {
                 key: "k".into(),
                 version_id: VersionId::Null,
                 owner: test_owner(),
+                public_read: false,
                 generation_id: GenerationId::MIN,
                 size: 200,
                 etag_crc64: 2u64,
@@ -3158,6 +3191,7 @@ fn put_object_with_segments_persists_manifest() {
                 key: "k".into(),
                 version_id: VersionId::Null,
                 owner: test_owner(),
+                public_read: false,
                 generation_id: GenerationId::MIN,
                 size: 6_000_000,
                 etag: ObjectEtag::single_part(1),
@@ -3223,6 +3257,7 @@ fn put_object_with_segments_overwrite_unversioned_replaces_manifest() {
                 key: "k".into(),
                 version_id: VersionId::Null,
                 owner: test_owner(),
+                public_read: false,
                 generation_id: GenerationId::MIN,
                 size: 100,
                 etag: ObjectEtag::single_part(1),
@@ -3256,6 +3291,7 @@ fn put_object_with_segments_overwrite_unversioned_replaces_manifest() {
                 key: "k".into(),
                 version_id: VersionId::Null,
                 owner: test_owner(),
+                public_read: false,
                 generation_id: GenerationId::new(2).unwrap(),
                 size: 200,
                 etag: ObjectEtag::single_part(2),
@@ -3314,6 +3350,7 @@ fn delete_object_segments_cleanup() {
                 key: "k".into(),
                 version_id: VersionId::Null,
                 owner: test_owner(),
+                public_read: false,
                 generation_id: GenerationId::MIN,
                 size: 100,
                 etag_crc64: 1u64,
@@ -3382,6 +3419,7 @@ fn commit_stream_put_rejects_non_in_progress() {
                 key: "k".into(),
                 version_id: VersionId::Null,
                 owner: test_owner(),
+                public_read: false,
                 generation_id: GenerationId::MIN,
                 size: 0,
                 etag_crc64: 0u64,
@@ -3461,6 +3499,7 @@ fn upsert_multipart_part_segments_replaces_prior_segments() {
             initiator: None,
 
             owner: test_owner(),
+            public_read: false,
             checksum: None,
             encryption: ObjectEncryption::None,
         })
@@ -3543,6 +3582,7 @@ fn commit_stream_part_replaces_prior_segments_on_reupload() {
             initiator: None,
 
             owner: test_owner(),
+            public_read: false,
             checksum: None,
             encryption: ObjectEncryption::None,
         })
@@ -3674,6 +3714,7 @@ fn commit_stream_put_rejects_wrong_kind() {
                 key: "k".into(),
                 version_id: VersionId::Null,
                 owner: test_owner(),
+                public_read: false,
                 generation_id: GenerationId::MIN,
                 size: 0,
                 etag_crc64: 0u64,
@@ -3718,6 +3759,7 @@ fn commit_stream_put_rejects_wrong_bucket_key() {
                 key: "k2".into(),
                 version_id: VersionId::Null,
                 owner: test_owner(),
+                public_read: false,
                 generation_id: GenerationId::MIN,
                 size: 0,
                 etag_crc64: 0u64,
@@ -3754,6 +3796,7 @@ fn commit_stream_part_rejects_wrong_upload_id() {
             initiator: None,
 
             owner: test_owner(),
+            public_read: false,
             checksum: None,
             encryption: ObjectEncryption::None,
         })
@@ -3817,6 +3860,7 @@ fn commit_stream_part_zero_segments_clears_prior() {
             initiator: None,
 
             owner: test_owner(),
+            public_read: false,
             checksum: None,
             encryption: ObjectEncryption::None,
         })
@@ -3961,6 +4005,7 @@ fn commit_stream_put_rejects_mismatched_segment_target() {
                 key: "k".into(),
                 version_id: VersionId::Null,
                 owner: test_owner(),
+                public_read: false,
                 generation_id: GenerationId::MIN,
                 size: 100,
                 etag_crc64: 1u64,
@@ -4203,6 +4248,7 @@ fn commit_stream_part_rejects_mismatched_segment_part_number() {
             initiator: None,
 
             owner: test_owner(),
+            public_read: false,
             checksum: None,
             encryption: ObjectEncryption::None,
         })
@@ -4280,6 +4326,7 @@ fn commit_stream_part_rejects_non_staging_segment_version_id() {
             initiator: None,
 
             owner: test_owner(),
+            public_read: false,
             checksum: None,
             encryption: ObjectEncryption::None,
         })
@@ -4401,6 +4448,7 @@ fn get_object_version_null() {
             key: "k".into(),
             version_id: VersionId::Null,
             owner: test_owner(),
+            public_read: false,
             generation_id: GenerationId::MIN,
             ec: EcShape { k: 4, m: 2 },
             size: 100,
@@ -4428,6 +4476,7 @@ fn get_object_version_versioned() {
             key: "k".into(),
             version_id: vid,
             owner: test_owner(),
+            public_read: false,
             generation_id: GenerationId::MIN,
             ec: EcShape { k: 4, m: 2 },
             size: 200,
@@ -4464,6 +4513,7 @@ fn delete_object_version_null() {
             key: "k".into(),
             version_id: VersionId::Null,
             owner: test_owner(),
+            public_read: false,
             generation_id: GenerationId::MIN,
             ec: EcShape { k: 4, m: 2 },
             size: 100,
@@ -4498,6 +4548,7 @@ fn delete_object_version_specific_leaves_others() {
                 key: "k".into(),
                 version_id: vid,
                 owner: test_owner(),
+                public_read: false,
                 generation_id: GenerationId::MIN,
                 ec: EcShape { k: 4, m: 2 },
                 size,
@@ -4536,6 +4587,7 @@ fn list_object_versions_basic() {
                 key: "k".into(),
                 version_id: vid,
                 owner: test_owner(),
+                public_read: false,
                 generation_id: GenerationId::MIN,
                 ec: EcShape { k: 4, m: 2 },
                 size,
@@ -4575,6 +4627,7 @@ fn list_object_versions_pagination() {
                 key: "k".into(),
                 version_id: VersionId::Versioned(NonZeroU64::new(i).unwrap()),
                 owner: test_owner(),
+                public_read: false,
                 generation_id: GenerationId::MIN,
                 ec: EcShape { k: 4, m: 2 },
                 size: i * 100,
@@ -4628,6 +4681,7 @@ fn list_object_versions_with_prefix() {
                 key: key.into(),
                 version_id: VersionId::Null,
                 owner: test_owner(),
+                public_read: false,
                 generation_id: GenerationId::MIN,
                 ec: EcShape { k: 4, m: 2 },
                 size: 10,
@@ -4665,6 +4719,7 @@ fn list_object_versions_includes_delete_markers() {
             key: "k".into(),
             version_id: vid1,
             owner: test_owner(),
+            public_read: false,
             generation_id: GenerationId::MIN,
             ec: EcShape { k: 4, m: 2 },
             size: 100,
@@ -4720,6 +4775,7 @@ fn next_version_id_increments() {
             key: "k".into(),
             version_id: v1,
             owner: test_owner(),
+            public_read: false,
             generation_id: GenerationId::MIN,
             ec: EcShape { k: 4, m: 2 },
             size: 10,
@@ -4758,6 +4814,7 @@ fn object_tags_round_trip() {
             key: "k".into(),
             version_id: VersionId::Null,
             owner: test_owner(),
+            public_read: false,
             generation_id: GenerationId::MIN,
             ec: EcShape { k: 4, m: 2 },
             size: 100,
@@ -4941,6 +4998,7 @@ fn delete_multipart_part_segments_by_upload_id_cleans_up() {
             initiator: None,
 
             owner: test_owner(),
+            public_read: false,
             checksum: None,
             encryption: ObjectEncryption::None,
         })
@@ -5175,6 +5233,7 @@ fn complete_multipart_commit_no_such_upload() {
         key: "k".into(),
         version_id: VersionId::Null,
         owner: test_owner(),
+        public_read: false,
         generation_id: GenerationId::MIN,
         size: 1024,
         etag_crc64: [0; 8],

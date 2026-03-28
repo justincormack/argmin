@@ -185,6 +185,33 @@ or trailing hyphens, no consecutive periods, and not formatted as an IP address.
 cargo test --workspace
 ```
 
+To run `s3-tests` against an external endpoint such as AWS S3:
+
+```bash
+eval "$(grep = .env)" && \
+S3_TEST_ENDPOINT=https://s3.us-east-1.amazonaws.com \
+S3_TEST_ACCESS_KEY="$AWS_ACCESS_KEY" \
+S3_TEST_SECRET_KEY="$AWS_SECRET_KEY" \
+S3_TEST_ALT_ACCESS_KEY="$AWS_ALT_ACCESS_KEY" \
+S3_TEST_ALT_SECRET_KEY="$AWS_ALT_SECRET_KEY" \
+S3_TEST_REGION=us-east-1 \
+S3_TEST_BUCKET_PREFIX=claude-s3- \
+S3_TEST_TIMEOUT_SECS=30 \
+cargo test -p s3-tests --no-fail-fast
+```
+
+`S3_TEST_ALT_ACCESS_KEY` and `S3_TEST_ALT_SECRET_KEY` are optional unless you
+want the multi-user integration cases to run against the external endpoint. If
+they are unset, tests that require a second authenticated user skip
+themselves. If one is set, both must be set.
+
+For AWS S3, the alternate credentials must belong to a different AWS account
+with a different S3 canonical owner ID. A second IAM user in the same AWS
+account is not sufficient for cross-owner ownership and ACL tests, because S3
+ownership is account-scoped rather than IAM-user-scoped. If the alternate
+credentials resolve to the same S3 owner, the cross-owner tests skip
+themselves with an explicit message.
+
 For local `s3-tests`, the embedded test server also supports trace helpers:
 
 | Variable | Description |

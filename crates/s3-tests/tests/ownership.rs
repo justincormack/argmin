@@ -1,5 +1,8 @@
 use aws_sdk_s3::types::{BucketCannedAcl, ObjectCannedAcl, ObjectOwnership};
-use s3_tests::{unique_bucket, CTX};
+use s3_tests::{
+    assert_s3_err_code, create_public_write_bucket, ensure_distinct_s3_owners_or_skip, err_status,
+    unique_bucket, CTX,
+};
 
 /// Build an agent that returns all HTTP responses (including 4xx/5xx) as Ok.
 fn agent() -> ureq::Agent {
@@ -72,6 +75,57 @@ fn test_create_bucket_existing_bucket_does_not_overwrite_ownership_controls() {
         assert_eq!(rules[0].object_ownership, ObjectOwnership::ObjectWriter);
 
         cleanup(&bucket).await;
+    });
+}
+
+#[test]
+fn test_bucket_owner_cannot_get_private_object_written_by_other_user() {
+    if !CTX.has_alt_client() {
+        eprintln!(
+            "skipping test_bucket_owner_cannot_get_private_object_written_by_other_user: alternate credentials are not configured"
+        );
+        return;
+    }
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        if !ensure_distinct_s3_owners_or_skip(
+            client,
+            alt_client,
+            "test_bucket_owner_cannot_get_private_object_written_by_other_user",
+        )
+        .await
+        {
+            return;
+        }
+        let bucket = create_public_write_bucket(client).await;
+
+        alt_client
+            .put_object()
+            .bucket(&bucket)
+            .key("writer-owned")
+            .body(aws_sdk_s3::primitives::ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+
+        let get = client
+            .get_object()
+            .bucket(&bucket)
+            .key("writer-owned")
+            .send()
+            .await;
+        assert_eq!(err_status(&get), 403);
+        assert_s3_err_code(&get, "AccessDenied");
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key("writer-owned")
+            .send()
+            .await
+            .unwrap();
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
 }
 

@@ -4,8 +4,8 @@ pub mod server;
 pub use helpers::{
     assert_s3_err_code, bucket_prefix, cleanup_versioned_bucket, create_objects,
     create_objects_with_keys, create_public_bucket, create_public_write_bucket,
-    delete_all_and_bucket, delete_objects_with_md5, err_status, sse_c_header_values,
-    test_sse_c_key, unique_bucket,
+    delete_all_and_bucket, delete_objects_with_md5, ensure_distinct_s3_owners_or_skip, err_status,
+    sse_c_header_values, test_sse_c_key, unique_bucket,
 };
 pub use server::TestServer;
 
@@ -45,7 +45,7 @@ pub fn run<F: std::future::Future>(f: F) -> F::Output {
 /// `TestServer` on a random port with well-known test credentials.
 pub struct TestContext {
     client: Client,
-    alt_client: Client,
+    alt_client: Option<Client>,
     endpoint: String,
     access_key: String,
     secret_key: String,
@@ -79,16 +79,23 @@ impl TestContext {
                 .expect("S3_TEST_ACCESS_KEY required with S3_TEST_ENDPOINT");
             let secret_key = std::env::var("S3_TEST_SECRET_KEY")
                 .expect("S3_TEST_SECRET_KEY required with S3_TEST_ENDPOINT");
-            let alt_access_key = std::env::var("S3_TEST_ALT_ACCESS_KEY")
-                .unwrap_or_else(|_| server::ALT_ACCESS_KEY.to_string());
-            let alt_secret_key = std::env::var("S3_TEST_ALT_SECRET_KEY")
-                .unwrap_or_else(|_| server::ALT_SECRET_KEY.to_string());
+            let alt_access_key = std::env::var("S3_TEST_ALT_ACCESS_KEY").ok();
+            let alt_secret_key = std::env::var("S3_TEST_ALT_SECRET_KEY").ok();
             let region =
                 std::env::var("S3_TEST_REGION").unwrap_or_else(|_| "us-east-1".to_string());
 
             let client = build_client(&endpoint, &access_key, &secret_key, &region).await;
-            let alt_client =
-                build_client(&endpoint, &alt_access_key, &alt_secret_key, &region).await;
+            let alt_client = match (alt_access_key.as_deref(), alt_secret_key.as_deref()) {
+                (Some(access_key), Some(secret_key)) => {
+                    Some(build_client(&endpoint, access_key, secret_key, &region).await)
+                }
+                (None, None) => None,
+                _ => {
+                    panic!(
+                        "S3_TEST_ALT_ACCESS_KEY and S3_TEST_ALT_SECRET_KEY must either both be set or both be unset"
+                    );
+                }
+            };
             TestContext {
                 client,
                 alt_client,
@@ -120,7 +127,7 @@ impl TestContext {
             .await;
             TestContext {
                 client,
-                alt_client,
+                alt_client: Some(alt_client),
                 endpoint,
                 access_key: server::TEST_ACCESS_KEY.to_string(),
                 secret_key: server::TEST_SECRET_KEY.to_string(),
@@ -137,7 +144,15 @@ impl TestContext {
 
     /// An alternate S3 client (different user, not the bucket owner).
     pub fn alt_client(&self) -> &Client {
-        &self.alt_client
+        self.alt_client.as_ref().expect(
+            "alternate client is unavailable; set S3_TEST_ALT_ACCESS_KEY and \
+S3_TEST_ALT_SECRET_KEY when running against an external endpoint",
+        )
+    }
+
+    /// Whether an alternate authenticated client is configured.
+    pub fn has_alt_client(&self) -> bool {
+        self.alt_client.is_some()
     }
 
     /// The HTTP endpoint URL (e.g. "http://127.0.0.1:12345").

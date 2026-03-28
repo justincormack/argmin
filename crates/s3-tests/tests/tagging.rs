@@ -1,9 +1,12 @@
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
-    BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, Tag, Tagging,
+    BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, ObjectCannedAcl, Tag, Tagging,
     VersioningConfiguration,
 };
-use s3_tests::{assert_s3_err_code, cleanup_versioned_bucket, err_status, unique_bucket, CTX};
+use s3_tests::{
+    assert_s3_err_code, cleanup_versioned_bucket, create_public_bucket, err_status, unique_bucket,
+    CTX,
+};
 
 /// Cleanup helper.
 async fn cleanup(bucket: &str, keys: &[&str]) {
@@ -448,6 +451,45 @@ fn test_put_object_with_tagging_header() {
             .iter()
             .any(|t| t.key() == "foo" && t.value() == "bar"));
         assert!(tag_set.iter().any(|t| t.key() == "bar" && t.value() == ""));
+
+        cleanup(&bucket, &["obj"]).await;
+    });
+}
+
+#[test]
+fn test_public_read_object_does_not_make_get_object_tagging_public() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = create_public_bucket(client).await;
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("obj")
+            .acl(ObjectCannedAcl::PublicRead)
+            .tagging("env=public")
+            .body(ByteStream::from_static(b"hello"))
+            .send()
+            .await
+            .unwrap();
+
+        let url = format!("{}/{}/obj?tagging", CTX.endpoint(), bucket);
+        let mut resp = s3_tests::test_agent()
+            .get(&url)
+            .call()
+            .expect("transport error");
+        assert_eq!(
+            resp.status().as_u16(),
+            403,
+            "expected anonymous GetObjectTagging to be denied for public-read object, got {}",
+            resp.status().as_u16()
+        );
+
+        let body = resp.body_mut().read_to_string().unwrap();
+        assert!(
+            body.contains("AccessDenied"),
+            "expected AccessDenied response body, got {body}"
+        );
 
         cleanup(&bucket, &["obj"]).await;
     });

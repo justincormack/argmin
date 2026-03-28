@@ -24,6 +24,10 @@ pub fn bucket_prefix() -> &'static str {
     &BUCKET_PREFIX
 }
 
+fn is_external_endpoint() -> bool {
+    std::env::var("S3_TEST_ENDPOINT").is_ok()
+}
+
 /// Fixed 32-byte customer key for SSE-C integration tests.
 pub fn test_sse_c_key() -> [u8; 32] {
     TEST_SSE_C_KEY_BYTES
@@ -387,4 +391,80 @@ pub fn err_status<T, E: std::fmt::Debug>(
             .map(|r| r.status().as_u16())
             .unwrap_or_else(|| panic!("error has no raw HTTP response: {:?}", sdk_err)),
     }
+}
+
+/// For external endpoints, verify that two authenticated clients resolve to
+/// distinct S3 canonical owners before running cross-owner tests.
+///
+/// AWS S3 ownership is account-scoped, so two IAM users in the same account do
+/// not behave as distinct object owners. This helper creates one short-lived
+/// probe bucket per client, compares the `GetBucketAcl` owner IDs, and skips
+/// the caller's test when they are the same.
+pub async fn ensure_distinct_s3_owners_or_skip(
+    client: &Client,
+    alt_client: &Client,
+    test_name: &str,
+) -> bool {
+    if !is_external_endpoint() {
+        return true;
+    }
+
+    let primary_bucket = unique_bucket();
+    client
+        .create_bucket()
+        .bucket(&primary_bucket)
+        .send()
+        .await
+        .expect("create primary probe bucket");
+
+    let alt_bucket = unique_bucket();
+    if let Err(err) = alt_client.create_bucket().bucket(&alt_bucket).send().await {
+        client
+            .delete_bucket()
+            .bucket(&primary_bucket)
+            .send()
+            .await
+            .expect("delete primary probe bucket after alternate create failure");
+        panic!("create alternate probe bucket: {err:?}");
+    }
+
+    let primary_acl = client.get_bucket_acl().bucket(&primary_bucket).send().await;
+    let alt_acl = alt_client.get_bucket_acl().bucket(&alt_bucket).send().await;
+
+    client
+        .delete_bucket()
+        .bucket(&primary_bucket)
+        .send()
+        .await
+        .expect("delete primary probe bucket");
+    alt_client
+        .delete_bucket()
+        .bucket(&alt_bucket)
+        .send()
+        .await
+        .expect("delete alternate probe bucket");
+
+    let primary_owner_id = primary_acl
+        .expect("get primary probe bucket ACL")
+        .owner()
+        .expect("expected owner in primary probe GetBucketAcl")
+        .id()
+        .expect("expected owner ID in primary probe GetBucketAcl")
+        .to_string();
+    let alt_owner_id = alt_acl
+        .expect("get alternate probe bucket ACL")
+        .owner()
+        .expect("expected owner in alternate probe GetBucketAcl")
+        .id()
+        .expect("expected owner ID in alternate probe GetBucketAcl")
+        .to_string();
+
+    if primary_owner_id == alt_owner_id {
+        eprintln!(
+            "skipping {test_name}: S3_TEST_ALT_ACCESS_KEY/S3_TEST_ALT_SECRET_KEY resolve to the same S3 canonical owner ID as the primary credentials; use alternate credentials from a different AWS account"
+        );
+        return false;
+    }
+
+    true
 }

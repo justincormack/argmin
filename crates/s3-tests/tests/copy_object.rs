@@ -1,5 +1,8 @@
 use aws_sdk_s3::primitives::ByteStream;
-use s3_tests::{assert_s3_err_code, cleanup_versioned_bucket, err_status, unique_bucket, CTX};
+use s3_tests::{
+    assert_s3_err_code, cleanup_versioned_bucket, ensure_distinct_s3_owners_or_skip, err_status,
+    unique_bucket, CTX,
+};
 
 /// Create a bucket, returning its name.
 async fn setup_bucket() -> String {
@@ -766,12 +769,132 @@ fn test_object_copy_versioning_multipart_upload() {
     });
 }
 
-// ── Multi-user / ACL (not implemented) ──────────────────────────────
+// ── Multi-user / ACL ────────────────────────────────────────────────
 
 #[test]
-#[ignore = "not implemented: multi-user"]
 fn test_object_copy_not_owned_bucket() {
-    s3_tests::run(async {});
+    if !CTX.has_alt_client() {
+        eprintln!(
+            "skipping test_object_copy_not_owned_bucket: alternate credentials are not configured"
+        );
+        return;
+    }
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        if !ensure_distinct_s3_owners_or_skip(
+            client,
+            alt_client,
+            "test_object_copy_not_owned_bucket",
+        )
+        .await
+        {
+            return;
+        }
+        let bucket1 = unique_bucket();
+        let bucket2 = unique_bucket();
+
+        client
+            .create_bucket()
+            .bucket(&bucket1)
+            .send()
+            .await
+            .unwrap();
+        alt_client
+            .create_bucket()
+            .bucket(&bucket2)
+            .send()
+            .await
+            .unwrap();
+
+        client
+            .put_object()
+            .bucket(&bucket1)
+            .key("foo123bar")
+            .body(ByteStream::from_static(b"foo"))
+            .send()
+            .await
+            .unwrap();
+
+        let result = alt_client
+            .copy_object()
+            .bucket(&bucket2)
+            .key("bar321foo")
+            .copy_source(format!("{}/foo123bar", bucket1))
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 403);
+        assert_s3_err_code(&result, "AccessDenied");
+
+        client
+            .delete_object()
+            .bucket(&bucket1)
+            .key("foo123bar")
+            .send()
+            .await
+            .unwrap();
+        client
+            .delete_bucket()
+            .bucket(&bucket1)
+            .send()
+            .await
+            .unwrap();
+        alt_client
+            .delete_bucket()
+            .bucket(&bucket2)
+            .send()
+            .await
+            .unwrap();
+    });
+}
+
+#[test]
+fn test_object_copy_rejects_public_acl_when_block_public_acls_enabled() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        put_object(&bucket, "src", b"data").await;
+
+        let ownership_rule = aws_sdk_s3::types::OwnershipControlsRule::builder()
+            .object_ownership(aws_sdk_s3::types::ObjectOwnership::BucketOwnerPreferred)
+            .build()
+            .unwrap();
+        let ownership = aws_sdk_s3::types::OwnershipControls::builder()
+            .rules(ownership_rule)
+            .build()
+            .unwrap();
+        client
+            .put_bucket_ownership_controls()
+            .bucket(&bucket)
+            .ownership_controls(ownership)
+            .send()
+            .await
+            .unwrap();
+
+        let pab = aws_sdk_s3::types::PublicAccessBlockConfiguration::builder()
+            .block_public_acls(true)
+            .build();
+        client
+            .put_public_access_block()
+            .bucket(&bucket)
+            .public_access_block_configuration(pab)
+            .send()
+            .await
+            .unwrap();
+
+        let result = client
+            .copy_object()
+            .bucket(&bucket)
+            .key("dst")
+            .copy_source(format!("{}/src", bucket))
+            .acl(aws_sdk_s3::types::ObjectCannedAcl::PublicRead)
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 403);
+        assert_s3_err_code(&result, "AccessDenied");
+
+        cleanup(&bucket, &["src"]).await;
+    });
 }
 
 /// CopyObject from a delete-marker source should fail with 404/NoSuchKey.
