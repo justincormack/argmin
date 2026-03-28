@@ -1285,6 +1285,21 @@ impl BucketAcl {
     }
 }
 
+/// Parsed CreateBucket ACL input.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum CreateBucketAcl {
+    #[default]
+    DefaultPrivate,
+    Canned(BucketAcl),
+    Grants(AclGrants),
+}
+
+impl CreateBucketAcl {
+    const fn is_explicit(&self) -> bool {
+        !matches!(self, Self::DefaultPrivate)
+    }
+}
+
 /// Object ownership mode relevant to CreateBucket semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BucketObjectOwnership {
@@ -1309,7 +1324,7 @@ impl BucketObjectOwnership {
 pub struct CreateBucketRequest<'a> {
     pub name: &'a str,
     pub requester: Requester,
-    pub acl: BucketAcl,
+    pub acl: CreateBucketAcl,
     pub ownership: BucketObjectOwnership,
 }
 
@@ -3100,6 +3115,18 @@ impl Coordinator {
         AclGrants::new(grants)
     }
 
+    fn normalize_bucket_acl_grants_for_owner(
+        bucket_owner: &OwnerIdentity,
+        acl_grants: AclGrants,
+    ) -> AclGrants {
+        let mut grants: Vec<AclGrant> = acl_grants.iter().cloned().collect();
+        grants.push(AclGrant::new(
+            AclGrantee::CanonicalUser(bucket_owner.canonical_id.clone()),
+            AclPermission::FullControl,
+        ));
+        AclGrants::new(grants)
+    }
+
     fn ensure_put_bucket_acl_supported(
         bucket: &BucketSummary,
         acl: BucketAcl,
@@ -3719,29 +3746,27 @@ impl Coordinator {
             req.name
         );
         let owner_account = req.requester.account().ok_or(ServerError::AccessDenied)?;
-        let (public_read, public_write) = match req.acl {
-            BucketAcl::Private => (false, false),
-            BucketAcl::PublicRead => (true, false),
-            BucketAcl::PublicReadWrite => (true, true),
-            BucketAcl::AuthenticatedRead => {
-                return Err(ServerError::NotImplemented {
-                    feature: "authenticated-read ACL".to_string(),
-                });
+        if req.ownership == BucketObjectOwnership::BucketOwnerEnforced && req.acl.is_explicit() {
+            return Err(ServerError::InvalidBucketAclWithObjectOwnership);
+        }
+        let owner = OwnerIdentity::new(
+            owner_account.principal(),
+            owner_account.canonical_user_id().clone(),
+        );
+        let acl_grants = match &req.acl {
+            CreateBucketAcl::DefaultPrivate => Self::owner_full_control_grants(&owner),
+            CreateBucketAcl::Canned(acl) => Self::bucket_acl_grants_from_canned(&owner, *acl)?,
+            CreateBucketAcl::Grants(acl_grants) => {
+                Self::ensure_supported_bucket_acl_grants(acl_grants)?;
+                Self::normalize_bucket_acl_grants_for_owner(&owner, acl_grants.clone())
             }
         };
 
-        if req.ownership == BucketObjectOwnership::BucketOwnerEnforced
-            && (public_read || public_write)
-        {
-            return Err(ServerError::InvalidBucketAclWithObjectOwnership);
-        }
-
-        let create_outcome = self.create_bucket_for_owner_with_acl(
+        let create_outcome = self.create_bucket_for_owner_with_acl_grants(
             owner_account.principal(),
             owner_account.canonical_user_id(),
             req.name,
-            public_read,
-            public_write,
+            acl_grants,
         )?;
         match create_outcome {
             BucketCreateOutcome::Created => self.put_bucket_ownership_controls(
@@ -3778,10 +3803,27 @@ impl Coordinator {
         public_read: bool,
         public_write: bool,
     ) -> Result<BucketCreateOutcome, ServerError> {
-        let _bucket_guard = self.storage_node.lock_bucket(name);
-        let bucket_pg = self.get_bucket_pg(name)?;
         let owner = OwnerIdentity::new(owner_principal.to_string(), owner_canonical_id.clone());
         let acl_grants = Self::bucket_acl_grants_from_flags(&owner, public_read, public_write);
+        self.create_bucket_for_owner_with_acl_grants(
+            owner_principal,
+            owner_canonical_id,
+            name,
+            acl_grants,
+        )
+    }
+
+    fn create_bucket_for_owner_with_acl_grants(
+        &self,
+        owner_principal: &str,
+        owner_canonical_id: &CanonicalUserId,
+        name: &str,
+        acl_grants: AclGrants,
+    ) -> Result<BucketCreateOutcome, ServerError> {
+        let _bucket_guard = self.storage_node.lock_bucket(name);
+        let bucket_pg = self.get_bucket_pg(name)?;
+        let public_read = Self::acl_grants_public_read(&acl_grants);
+        let public_write = Self::acl_grants_public_write(&acl_grants);
         match bucket_pg.create_bucket(
             name,
             owner_principal,
@@ -10595,7 +10637,7 @@ mod tests {
             .create_bucket_for_requester(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::principal("owner-a"),
-                acl: BucketAcl::Private,
+                acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
             })
             .unwrap();
@@ -10618,7 +10660,7 @@ mod tests {
             .create_bucket_for_requester(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::authenticated(owner),
-                acl: BucketAcl::Private,
+                acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
             })
             .unwrap();
@@ -10640,7 +10682,7 @@ mod tests {
             .create_bucket_for_requester(&CreateBucketRequest {
                 name: "bucket",
                 requester: requester.clone(),
-                acl: BucketAcl::Private,
+                acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
             })
             .unwrap();
@@ -10685,7 +10727,7 @@ mod tests {
             .create_bucket_for_requester(&CreateBucketRequest {
                 name: "bucket",
                 requester: requester.clone(),
-                acl: BucketAcl::Private,
+                acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
             })
             .unwrap();
@@ -10743,7 +10785,7 @@ mod tests {
             .create_bucket_for_requester(&CreateBucketRequest {
                 name: "bucket",
                 requester: requester.clone(),
-                acl: BucketAcl::Private,
+                acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
             })
             .unwrap();
@@ -10835,7 +10877,7 @@ mod tests {
             .create_bucket_for_requester(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::authenticated(bucket_owner.clone()),
-                acl: BucketAcl::Private,
+                acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
             })
             .unwrap();
@@ -10898,7 +10940,7 @@ mod tests {
             .create_bucket_for_requester(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::principal("owner-a"),
-                acl: BucketAcl::Private,
+                acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
             })
             .unwrap();
@@ -10907,7 +10949,7 @@ mod tests {
             .create_bucket_for_requester(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::principal("owner-a"),
-                acl: BucketAcl::Private,
+                acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::BucketOwnerEnforced,
             })
             .unwrap();
@@ -10929,7 +10971,7 @@ mod tests {
             .create_bucket_for_requester(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::principal("owner-a"),
-                acl: BucketAcl::PublicRead,
+                acl: CreateBucketAcl::Canned(BucketAcl::PublicRead),
                 ownership: BucketObjectOwnership::BucketOwnerEnforced,
             })
             .unwrap_err();
@@ -10937,6 +10979,145 @@ mod tests {
             err,
             ServerError::InvalidBucketAclWithObjectOwnership
         ));
+    }
+
+    #[test]
+    fn create_bucket_for_requester_allows_default_private_with_owner_enforced() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+
+        coord
+            .create_bucket_for_requester(&CreateBucketRequest {
+                name: "bucket",
+                requester: Requester::principal("owner-a"),
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::BucketOwnerEnforced,
+            })
+            .unwrap();
+
+        let controls = coord
+            .get_bucket_ownership_controls("bucket", Requester::principal("owner-a"))
+            .unwrap()
+            .unwrap();
+        assert!(controls.contains("<ObjectOwnership>BucketOwnerEnforced</ObjectOwnership>"));
+    }
+
+    #[test]
+    fn create_bucket_for_requester_rejects_explicit_private_with_owner_enforced() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+
+        let err = coord
+            .create_bucket_for_requester(&CreateBucketRequest {
+                name: "bucket",
+                requester: Requester::principal("owner-a"),
+                acl: CreateBucketAcl::Canned(BucketAcl::Private),
+                ownership: BucketObjectOwnership::BucketOwnerEnforced,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ServerError::InvalidBucketAclWithObjectOwnership
+        ));
+    }
+
+    #[test]
+    fn create_bucket_for_requester_persists_explicit_grants() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let owner = AccountIdentity::new(
+            "owner-a",
+            CanonicalUserId::from_principal("owner-create-grants-canonical"),
+            "Owner A",
+        );
+        let writer = AccountIdentity::new(
+            "writer-a",
+            CanonicalUserId::from_principal("writer-create-grants-canonical"),
+            "Writer A",
+        );
+        let owner_requester = Requester::authenticated(owner.clone());
+        let writer_requester = Requester::authenticated(writer.clone());
+
+        coord
+            .create_bucket_for_requester(&CreateBucketRequest {
+                name: "bucket",
+                requester: owner_requester.clone(),
+                acl: CreateBucketAcl::Grants(AclGrants::new(vec![
+                    AclGrant::new(
+                        AclGrantee::CanonicalUser(writer.canonical_user_id().clone()),
+                        AclPermission::Read,
+                    ),
+                    AclGrant::new(
+                        AclGrantee::CanonicalUser(writer.canonical_user_id().clone()),
+                        AclPermission::Write,
+                    ),
+                    AclGrant::new(
+                        AclGrantee::CanonicalUser(writer.canonical_user_id().clone()),
+                        AclPermission::ReadAcp,
+                    ),
+                    AclGrant::new(
+                        AclGrantee::CanonicalUser(writer.canonical_user_id().clone()),
+                        AclPermission::WriteAcp,
+                    ),
+                    AclGrant::new(
+                        AclGrantee::CanonicalUser(writer.canonical_user_id().clone()),
+                        AclPermission::FullControl,
+                    ),
+                ])),
+                ownership: BucketObjectOwnership::ObjectWriter,
+            })
+            .unwrap();
+
+        let acl = coord
+            .get_bucket_acl("bucket", owner_requester.clone())
+            .unwrap();
+        assert!(grants_contain(
+            &acl.acl_grants,
+            &AclGrantee::CanonicalUser(writer.canonical_user_id().clone()),
+            AclPermission::Read,
+        ));
+        assert!(grants_contain(
+            &acl.acl_grants,
+            &AclGrantee::CanonicalUser(writer.canonical_user_id().clone()),
+            AclPermission::Write,
+        ));
+        assert!(grants_contain(
+            &acl.acl_grants,
+            &AclGrantee::CanonicalUser(writer.canonical_user_id().clone()),
+            AclPermission::ReadAcp,
+        ));
+        assert!(grants_contain(
+            &acl.acl_grants,
+            &AclGrantee::CanonicalUser(writer.canonical_user_id().clone()),
+            AclPermission::WriteAcp,
+        ));
+        assert!(grants_contain(
+            &acl.acl_grants,
+            &AclGrantee::CanonicalUser(writer.canonical_user_id().clone()),
+            AclPermission::FullControl,
+        ));
+        assert!(grants_contain(
+            &acl.acl_grants,
+            &AclGrantee::CanonicalUser(owner.canonical_user_id().clone()),
+            AclPermission::FullControl,
+        ));
+
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "key",
+                data: b"granted-write",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                requester: writer_requester,
+                acl: NO_PUT_OBJECT_ACL,
+            },
+        )
+        .unwrap();
     }
 
     #[test]
@@ -15484,7 +15665,7 @@ mod tests {
             .create_bucket_for_requester(&CreateBucketRequest {
                 name: "bucket",
                 requester: owner_requester.clone(),
-                acl: BucketAcl::Private,
+                acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
             })
             .unwrap();
@@ -16531,7 +16712,7 @@ mod tests {
             .create_bucket_for_requester(&CreateBucketRequest {
                 name: "bucket",
                 requester: requester.clone(),
-                acl: BucketAcl::Private,
+                acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
             })
             .unwrap();
@@ -16615,7 +16796,7 @@ mod tests {
             .create_bucket_for_requester(&CreateBucketRequest {
                 name: "bucket",
                 requester: requester.clone(),
-                acl: BucketAcl::Private,
+                acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
             })
             .unwrap();
@@ -18271,7 +18452,7 @@ mod tests {
             .create_bucket_for_requester(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::authenticated(bucket_owner.clone()),
-                acl: BucketAcl::Private,
+                acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
             })
             .unwrap();
@@ -18359,7 +18540,7 @@ mod tests {
             .create_bucket_for_requester(&CreateBucketRequest {
                 name: "bucket",
                 requester: owner_requester.clone(),
-                acl: BucketAcl::Private,
+                acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
             })
             .unwrap();
@@ -18494,7 +18675,7 @@ mod tests {
             .create_bucket_for_requester(&CreateBucketRequest {
                 name: "bucket",
                 requester: owner_requester.clone(),
-                acl: BucketAcl::Private,
+                acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
             })
             .unwrap();

@@ -198,12 +198,13 @@ Success criteria:
 - bucket ACL paths can operate on the typed model without changing external
   behavior yet
 
-### Phase 2: Bucket ACL Storage Migration
+### Phase 2: Bucket ACL Completion
 
 Deliver:
-- structured bucket ACL storage
+- create-bucket ACL normalization onto the structured bucket ACL model
 - deterministic projection of current public flags from stored bucket ACL
-- `GetBucketAcl` and `PutBucketAcl` powered by the structured ACL
+- `CreateBucket`, `GetBucketAcl`, and `PutBucketAcl` powered by the structured ACL
+- explicit ACL rejection under `BucketOwnerEnforced` where AWS rejects it
 
 Success criteria:
 - current bucket ACL tests continue to pass
@@ -243,7 +244,7 @@ Success criteria:
 ## Test Plan
 
 Targeted integration tests:
-- `cargo test -p s3-tests --test bucket_crud test_bucket_header_acl_grants -- --ignored`
+- `cargo test -p s3-tests --test bucket_crud test_bucket_header_acl_grants`
 - `cargo test -p s3-tests --test object_crud test_object_header_acl_grants -- --ignored`
 - `cargo test -p s3-tests --test copy_object test_object_copy_canned_acl -- --ignored`
 - `cargo test -p s3-tests --test presigned test_object_presigned_put_object_with_acl -- --ignored`

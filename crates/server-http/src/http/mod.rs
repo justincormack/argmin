@@ -1719,7 +1719,13 @@ impl HttpFrontend {
                                 .to_string(),
                         });
                     }
-                    let acl = parse_create_bucket_acl(req)?;
+                    let acl = match parse_create_bucket_acl(req)? {
+                        crate::coordinator::CreateBucketAcl::Canned(acl) => acl,
+                        crate::coordinator::CreateBucketAcl::DefaultPrivate
+                        | crate::coordinator::CreateBucketAcl::Grants(_) => {
+                            unreachable!("x-amz-acl header must parse to a canned ACL")
+                        }
+                    };
                     self.coordinator.put_bucket_canned_acl_for_request(
                         &crate::coordinator::PutBucketCannedAclRequest {
                             bucket: crate::coordinator::BucketRequest {
@@ -3913,15 +3919,32 @@ fn add_tagging_count_header(resp: &mut S3Response, tags_xml: &str) -> Result<(),
     Ok(())
 }
 
-fn parse_create_bucket_acl(req: &S3Request) -> Result<crate::coordinator::BucketAcl, ServerError> {
+fn parse_create_bucket_acl(
+    req: &S3Request,
+) -> Result<crate::coordinator::CreateBucketAcl, ServerError> {
+    let acl_grants = parse_acl_grants_headers_with_options(req, true)?;
     match req.header("x-amz-acl") {
-        None | Some("private") => Ok(crate::coordinator::BucketAcl::Private),
-        Some("public-read") => Ok(crate::coordinator::BucketAcl::PublicRead),
-        Some("public-read-write") => Ok(crate::coordinator::BucketAcl::PublicReadWrite),
-        Some("authenticated-read") => Ok(crate::coordinator::BucketAcl::AuthenticatedRead),
+        Some(_) if acl_grants.is_some() => Err(ServerError::InvalidArgument {
+            reason: "x-amz-acl cannot be combined with x-amz-grant-* headers".to_string(),
+        }),
+        Some("private") => Ok(crate::coordinator::CreateBucketAcl::Canned(
+            crate::coordinator::BucketAcl::Private,
+        )),
+        Some("public-read") => Ok(crate::coordinator::CreateBucketAcl::Canned(
+            crate::coordinator::BucketAcl::PublicRead,
+        )),
+        Some("public-read-write") => Ok(crate::coordinator::CreateBucketAcl::Canned(
+            crate::coordinator::BucketAcl::PublicReadWrite,
+        )),
+        Some("authenticated-read") => Ok(crate::coordinator::CreateBucketAcl::Canned(
+            crate::coordinator::BucketAcl::AuthenticatedRead,
+        )),
         Some(other) => Err(ServerError::InvalidArgument {
             reason: format!("unsupported x-amz-acl value: {other}"),
         }),
+        None => Ok(acl_grants
+            .map(crate::coordinator::CreateBucketAcl::Grants)
+            .unwrap_or_default()),
     }
 }
 
@@ -3945,6 +3968,7 @@ fn has_acl_grant_headers(req: &S3Request) -> bool {
 fn parse_acl_grant_header_value(
     value: &str,
     permission: s3_types::AclPermission,
+    allow_unquoted_values: bool,
 ) -> Result<Vec<s3_types::AclGrant>, ServerError> {
     let mut grants = Vec::new();
     let mut remaining = value.trim();
@@ -3963,17 +3987,26 @@ fn parse_acl_grant_header_value(
                 })?;
         let grantee_kind = grantee_kind.trim();
         let rest = rest.trim_start();
-        let quoted = rest
-            .strip_prefix('"')
-            .ok_or_else(|| ServerError::InvalidArgument {
+        let (grantee_value, next) = if let Some(quoted) = rest.strip_prefix('"') {
+            let quote_end = quoted
+                .find('"')
+                .ok_or_else(|| ServerError::InvalidArgument {
+                    reason: format!("invalid ACL grant header entry: {remaining}"),
+                })?;
+            (&quoted[..quote_end], &quoted[quote_end + 1..])
+        } else if allow_unquoted_values {
+            let value_end = rest.find(',').unwrap_or(rest.len());
+            (rest[..value_end].trim_end(), &rest[value_end..])
+        } else {
+            return Err(ServerError::InvalidArgument {
                 reason: format!("invalid ACL grant header entry: {remaining}"),
-            })?;
-        let quote_end = quoted
-            .find('"')
-            .ok_or_else(|| ServerError::InvalidArgument {
+            });
+        };
+        if grantee_value.is_empty() {
+            return Err(ServerError::InvalidArgument {
                 reason: format!("invalid ACL grant header entry: {remaining}"),
-            })?;
-        let grantee_value = &quoted[..quote_end];
+            });
+        }
         let grantee = match grantee_kind {
             "id" => s3_types::AclGrantee::CanonicalUser(
                 s3_types::CanonicalUserId::new(grantee_value).ok_or_else(|| {
@@ -3995,7 +4028,7 @@ fn parse_acl_grant_header_value(
         };
         grants.push(s3_types::AclGrant::new(grantee, permission));
 
-        remaining = quoted[quote_end + 1..].trim_start();
+        remaining = next.trim_start();
         if remaining.is_empty() {
             break;
         }
@@ -4015,7 +4048,10 @@ fn parse_acl_grant_header_value(
     Ok(grants)
 }
 
-fn parse_acl_grants_headers(req: &S3Request) -> Result<Option<s3_types::AclGrants>, ServerError> {
+fn parse_acl_grants_headers_with_options(
+    req: &S3Request,
+    allow_unquoted_values: bool,
+) -> Result<Option<s3_types::AclGrants>, ServerError> {
     if !has_acl_grant_headers(req) {
         return Ok(None);
     }
@@ -4028,10 +4064,18 @@ fn parse_acl_grants_headers(req: &S3Request) -> Result<Option<s3_types::AclGrant
                     reason: format!("invalid UTF-8 in ACL grant header {header_name}"),
                 }
             })?;
-            grants.extend(parse_acl_grant_header_value(value, permission)?);
+            grants.extend(parse_acl_grant_header_value(
+                value,
+                permission,
+                allow_unquoted_values,
+            )?);
         }
     }
     Ok(Some(s3_types::AclGrants::new(grants)))
+}
+
+fn parse_acl_grants_headers(req: &S3Request) -> Result<Option<s3_types::AclGrants>, ServerError> {
+    parse_acl_grants_headers_with_options(req, false)
 }
 
 fn parse_acl_grants(req: &S3Request) -> Result<s3_types::AclGrants, ServerError> {
@@ -4128,7 +4172,7 @@ mod tests {
             .create_bucket_for_requester(&crate::coordinator::CreateBucketRequest {
                 name: "mybucket",
                 requester: crate::coordinator::Requester::authenticated(account.clone()),
-                acl: crate::coordinator::BucketAcl::Private,
+                acl: crate::coordinator::CreateBucketAcl::DefaultPrivate,
                 ownership: crate::coordinator::BucketObjectOwnership::ObjectWriter,
             })
             .unwrap();
@@ -4236,12 +4280,83 @@ mod tests {
     }
 
     #[test]
+    fn parse_create_bucket_acl_accepts_unquoted_grant_headers() {
+        let canonical_id = s3_types::CanonicalUserId::from_principal("grantee-a");
+        let req = new_req(
+            http::Method::PUT,
+            "/",
+            "",
+            vec![(
+                "x-amz-grant-read".to_string(),
+                format!("id={}", canonical_id.as_str()),
+            )],
+            vec![],
+        );
+
+        let acl = parse_create_bucket_acl(&req).unwrap();
+        assert_eq!(
+            acl,
+            crate::coordinator::CreateBucketAcl::Grants(s3_types::AclGrants::new(vec![
+                s3_types::AclGrant::new(
+                    s3_types::AclGrantee::CanonicalUser(canonical_id),
+                    s3_types::AclPermission::Read,
+                ),
+            ]))
+        );
+    }
+
+    #[test]
+    fn parse_acl_grants_rejects_unquoted_header_value() {
+        let canonical_id = s3_types::CanonicalUserId::from_principal("grantee-a");
+        let req = new_req(
+            http::Method::PUT,
+            "/",
+            "",
+            vec![(
+                "x-amz-grant-read".to_string(),
+                format!("id={}", canonical_id.as_str()),
+            )],
+            vec![],
+        );
+
+        match parse_acl_grants(&req) {
+            Err(ServerError::InvalidArgument { .. }) => {}
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_create_bucket_acl_rejects_acl_and_grants_together() {
+        let canonical_id = s3_types::CanonicalUserId::from_principal("grantee-a");
+        let req = new_req(
+            http::Method::PUT,
+            "/",
+            "",
+            vec![
+                ("x-amz-acl".to_string(), "private".to_string()),
+                (
+                    "x-amz-grant-read".to_string(),
+                    format!("id={}", canonical_id.as_str()),
+                ),
+            ],
+            vec![],
+        );
+
+        match parse_create_bucket_acl(&req) {
+            Err(ServerError::InvalidArgument { reason }) => {
+                assert!(reason.contains("cannot be combined"));
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_acl_grants_rejects_malformed_header_value() {
         let req = new_req(
             http::Method::PUT,
             "/",
             "",
-            vec![("x-amz-grant-read".to_string(), "id=no-quotes".to_string())],
+            vec![("x-amz-grant-read".to_string(), "id=".to_string())],
             vec![],
         );
 
