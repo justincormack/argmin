@@ -3809,6 +3809,7 @@ impl Coordinator {
         encryption: &ObjectEncryption,
         sse_customer: Option<&SseCustomerRequest>,
         segment_scope: SseCustomerSegmentScope,
+        headers_required: bool,
     ) -> Result<Option<SseCustomerWriteContext>, ServerError> {
         match encryption {
             ObjectEncryption::None => {
@@ -3821,9 +3822,15 @@ impl Coordinator {
                 Ok(None)
             }
             ObjectEncryption::SseCustomer(state) => {
-                let request = sse_customer.ok_or(ServerError::InvalidRequest {
-                    reason: "SSE-C headers are required for this multipart upload".to_string(),
-                })?;
+                let Some(request) = sse_customer else {
+                    if headers_required {
+                        return Err(ServerError::InvalidRequest {
+                            reason: "SSE-C headers are required for this multipart upload"
+                                .to_string(),
+                        });
+                    }
+                    return Ok(None);
+                };
                 let validator =
                     self.sse_c_validator
                         .as_ref()
@@ -4201,6 +4208,7 @@ impl Coordinator {
             &upload.encryption,
             req.sse_customer,
             SseCustomerSegmentScope::multipart_part(part_number)?,
+            true,
         )?;
 
         // Generate session ID.
@@ -5418,11 +5426,18 @@ impl Coordinator {
         let stored_encryption = match encryption {
             ObjectEncryption::None => ObjectEncryption::None,
             ObjectEncryption::SseCustomer(_) => {
-                let sse_customer_write = sse_customer_write.ok_or(ServerError::InternalError {
-                    reason: "missing SSE-C write context for encrypted object".to_string(),
-                })?;
                 let checksum = stored_system_metadata.take_checksum();
-                sse_customer_write.seal_checksum_metadata(checksum.as_ref())?
+                if let Some(sse_customer_write) = sse_customer_write {
+                    sse_customer_write.seal_checksum_metadata(checksum.as_ref())?
+                } else if checksum.is_none() {
+                    encryption.clone()
+                } else {
+                    return Err(ServerError::InvalidRequest {
+                        reason:
+                            "SSE-C headers are required when storing checksum metadata for this object"
+                                .to_string(),
+                    });
+                }
             }
         };
         Ok((
@@ -7574,6 +7589,7 @@ impl Coordinator {
                 &upload.encryption,
                 req.sse_customer,
                 SseCustomerSegmentScope::object(),
+                false,
             )?;
 
             let checksum_algo = upload.checksum.map(MultipartChecksumConfig::algorithm);

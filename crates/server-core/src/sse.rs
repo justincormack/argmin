@@ -262,7 +262,7 @@ pub(crate) fn resume_sse_customer_write(
     request: &SseCustomerRequest,
     segment_scope: SseCustomerSegmentScope,
 ) -> Result<SseCustomerWriteContext, ServerError> {
-    validate_sse_customer_read(validator, state, request)?;
+    validate_sse_customer_write(validator, state, request)?;
     let kek = derive_wrap_key(request.customer_key(), &state.wrap_salt)?;
     let dek = unwrap_dek(&kek, &state.wrap_nonce, &state.wrapped_dek)?;
     Ok(SseCustomerWriteContext {
@@ -286,6 +286,27 @@ pub fn validate_sse_customer_read(
     let actual = compute_validator_hmac(validator, &state.validator_salt, request.customer_key());
     if !constant_time_eq(&state.validator_hmac, &actual) {
         return Err(ServerError::AccessDenied);
+    }
+    Ok(request.response_headers())
+}
+
+fn validate_sse_customer_write(
+    validator: &SseCustomerValidatorConfig,
+    state: &SseCustomerObjectState,
+    request: &SseCustomerRequest,
+) -> Result<SseCustomerResponseHeaders, ServerError> {
+    if state.validator_key_id != validator.key_id {
+        return Err(ServerError::InvalidRequest {
+            reason: "The provided encryption parameters did not match the ones used originally."
+                .to_string(),
+        });
+    }
+    let actual = compute_validator_hmac(validator, &state.validator_salt, request.customer_key());
+    if !constant_time_eq(&state.validator_hmac, &actual) {
+        return Err(ServerError::InvalidRequest {
+            reason: "The provided encryption parameters did not match the ones used originally."
+                .to_string(),
+        });
     }
     Ok(request.response_headers())
 }
@@ -723,6 +744,25 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, ServerError::InternalError { .. }));
+    }
+
+    #[test]
+    fn sse_c_resume_write_rejects_wrong_key_with_invalid_request() {
+        let req = request();
+        let validator = validator();
+        let ctx = prepare_sse_customer_write(&validator, &req).unwrap();
+        let ObjectEncryption::SseCustomer(state) = ctx.encryption() else {
+            panic!("expected SSE-C object state");
+        };
+        let wrong = SseCustomerRequest::new([1u8; SSE_C_CUSTOMER_KEY_LEN], "wrong".to_string());
+        let err = resume_sse_customer_write(
+            &validator,
+            state,
+            &wrong,
+            SseCustomerSegmentScope::multipart_part(1).unwrap(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ServerError::InvalidRequest { .. }));
     }
 
     #[test]

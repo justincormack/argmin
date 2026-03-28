@@ -1,5 +1,5 @@
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumMode};
+use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumMode, ObjectAttributes};
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use ring::hmac;
 use s3_tests::{
@@ -7,6 +7,8 @@ use s3_tests::{
     unique_bucket, TestServer, CTX,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
+
+const MULTIPART_MIN_PART_SIZE: usize = 5 * 1024 * 1024;
 
 macro_rules! with_sse_c_headers {
     ($op:expr, $key_b64:expr, $key_md5_b64:expr) => {{
@@ -255,6 +257,12 @@ fn xml_tag<'a>(body: &'a str, tag: &str) -> Option<&'a str> {
     let start_idx = body.find(&start)? + start.len();
     let end_idx = body[start_idx..].find(&end)? + start_idx;
     Some(&body[start_idx..end_idx])
+}
+
+fn patterned_bytes(len: usize, seed: u8) -> Vec<u8> {
+    (0..len)
+        .map(|i| seed.wrapping_add((i % 251) as u8))
+        .collect()
 }
 
 #[test]
@@ -714,6 +722,353 @@ fn test_sse_c_multipart_round_trip() {
 }
 
 #[test]
+fn test_sse_c_multipart_range_read() {
+    if !endpoint_is_https() {
+        return;
+    }
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let key = test_sse_c_key();
+        let (key_b64, key_md5_b64) = sse_c_header_values(&key);
+        let part_sizes = [
+            MULTIPART_MIN_PART_SIZE + 1,
+            MULTIPART_MIN_PART_SIZE + 3,
+            1024 * 1024,
+        ];
+        let parts_data = [
+            patterned_bytes(part_sizes[0], 0x10),
+            patterned_bytes(part_sizes[1], 0x40),
+            patterned_bytes(part_sizes[2], 0x70),
+        ];
+        let full_body: Vec<u8> = parts_data.iter().flatten().copied().collect();
+
+        let create = with_sse_c_headers!(
+            client.create_multipart_upload().bucket(&bucket).key("obj"),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+
+        let mut completed = Vec::new();
+        for (idx, data) in parts_data.iter().enumerate() {
+            let part = with_sse_c_headers!(
+                client
+                    .upload_part()
+                    .bucket(&bucket)
+                    .key("obj")
+                    .upload_id(&upload_id)
+                    .part_number((idx + 1) as i32)
+                    .body(ByteStream::from(data.clone())),
+                key_b64,
+                key_md5_b64
+            )
+            .send()
+            .await
+            .unwrap();
+            completed.push(
+                CompletedPart::builder()
+                    .e_tag(part.e_tag().unwrap())
+                    .part_number((idx + 1) as i32)
+                    .build(),
+            );
+        }
+
+        with_sse_c_headers!(
+            client
+                .complete_multipart_upload()
+                .bucket(&bucket)
+                .key("obj")
+                .upload_id(&upload_id)
+                .multipart_upload(
+                    CompletedMultipartUpload::builder()
+                        .set_parts(Some(completed))
+                        .build()
+                ),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+
+        let ranges = [
+            (0usize, 1023usize),
+            (MULTIPART_MIN_PART_SIZE - 8, MULTIPART_MIN_PART_SIZE + 16),
+            (
+                part_sizes[0] + part_sizes[1] - 12,
+                part_sizes[0] + part_sizes[1] + 12,
+            ),
+            (full_body.len() - 4096, full_body.len() - 1),
+        ];
+        for (start, end) in ranges {
+            let resp = with_sse_c_headers!(
+                client
+                    .get_object()
+                    .bucket(&bucket)
+                    .key("obj")
+                    .range(format!("bytes={start}-{end}")),
+                key_b64,
+                key_md5_b64
+            )
+            .send()
+            .await
+            .unwrap();
+            let body = resp.body.collect().await.unwrap().into_bytes();
+            assert_eq!(
+                body.as_ref(),
+                &full_body[start..=end],
+                "range {start}-{end} mismatch"
+            );
+        }
+
+        cleanup(&bucket, "obj").await;
+    });
+}
+
+#[test]
+fn test_sse_c_multipart_get_part() {
+    if !endpoint_is_https() {
+        return;
+    }
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let key = test_sse_c_key();
+        let (key_b64, key_md5_b64) = sse_c_header_values(&key);
+        let part_sizes = [
+            MULTIPART_MIN_PART_SIZE,
+            MULTIPART_MIN_PART_SIZE,
+            MULTIPART_MIN_PART_SIZE,
+            1024 * 1024,
+        ];
+        let parts_data = [
+            patterned_bytes(part_sizes[0], b'A'),
+            patterned_bytes(part_sizes[1], b'B'),
+            patterned_bytes(part_sizes[2], b'C'),
+            patterned_bytes(part_sizes[3], b'D'),
+        ];
+
+        let create = with_sse_c_headers!(
+            client.create_multipart_upload().bucket(&bucket).key("obj"),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+
+        let mut completed = Vec::new();
+        for (idx, data) in parts_data.iter().enumerate() {
+            let part_number = (idx + 1) as i32;
+            let part = with_sse_c_headers!(
+                client
+                    .upload_part()
+                    .bucket(&bucket)
+                    .key("obj")
+                    .upload_id(&upload_id)
+                    .part_number(part_number)
+                    .body(ByteStream::from(data.clone())),
+                key_b64,
+                key_md5_b64
+            )
+            .send()
+            .await
+            .unwrap();
+            completed.push(
+                CompletedPart::builder()
+                    .e_tag(part.e_tag().unwrap())
+                    .part_number(part_number)
+                    .build(),
+            );
+        }
+
+        let complete = with_sse_c_headers!(
+            client
+                .complete_multipart_upload()
+                .bucket(&bucket)
+                .key("obj")
+                .upload_id(&upload_id)
+                .multipart_upload(
+                    CompletedMultipartUpload::builder()
+                        .set_parts(Some(completed))
+                        .build()
+                ),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+        let etag = complete.e_tag().unwrap().to_string();
+        let part_count = part_sizes.len() as i32;
+
+        for (idx, data) in parts_data.iter().enumerate() {
+            let pn = (idx + 1) as i32;
+
+            let head = with_sse_c_headers!(
+                client
+                    .head_object()
+                    .bucket(&bucket)
+                    .key("obj")
+                    .part_number(pn),
+                key_b64,
+                key_md5_b64
+            )
+            .send()
+            .await
+            .unwrap();
+            assert_eq!(head.parts_count(), Some(part_count));
+            assert_eq!(head.e_tag().unwrap(), etag);
+            assert_eq!(head.content_length(), Some(data.len() as i64));
+
+            let get = with_sse_c_headers!(
+                client
+                    .get_object()
+                    .bucket(&bucket)
+                    .key("obj")
+                    .part_number(pn),
+                key_b64,
+                key_md5_b64
+            )
+            .send()
+            .await
+            .unwrap();
+            assert_eq!(get.parts_count(), Some(part_count));
+            assert_eq!(get.e_tag().unwrap(), etag);
+            assert_eq!(get.content_length(), Some(data.len() as i64));
+            let body = get.body.collect().await.unwrap().into_bytes();
+            assert_eq!(body.as_ref(), data.as_slice());
+        }
+
+        let get = with_sse_c_headers!(
+            client
+                .get_object()
+                .bucket(&bucket)
+                .key("obj")
+                .part_number(part_count + 1),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await;
+        assert_eq!(err_status(&get), 416);
+
+        let head = with_sse_c_headers!(
+            client
+                .head_object()
+                .bucket(&bucket)
+                .key("obj")
+                .part_number(part_count + 1),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await;
+        assert_eq!(err_status(&head), 416);
+
+        cleanup(&bucket, "obj").await;
+    });
+}
+
+#[test]
+fn test_sse_c_non_multipart_get_part() {
+    if !endpoint_is_https() {
+        return;
+    }
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let key = test_sse_c_key();
+        let (key_b64, key_md5_b64) = sse_c_header_values(&key);
+        let body = b"body".to_vec();
+
+        let put = with_sse_c_headers!(
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key("obj")
+                .body(ByteStream::from(body.clone())),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+        let etag = put.e_tag().unwrap().to_string();
+
+        let get = with_sse_c_headers!(
+            client
+                .get_object()
+                .bucket(&bucket)
+                .key("obj")
+                .part_number(2),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await;
+        assert_eq!(err_status(&get), 416);
+
+        let head = with_sse_c_headers!(
+            client
+                .head_object()
+                .bucket(&bucket)
+                .key("obj")
+                .part_number(2),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await;
+        assert_eq!(err_status(&head), 416);
+
+        let head = with_sse_c_headers!(
+            client
+                .head_object()
+                .bucket(&bucket)
+                .key("obj")
+                .part_number(1),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(head.e_tag().unwrap(), etag);
+        assert_eq!(head.content_length(), Some(body.len() as i64));
+
+        let get = with_sse_c_headers!(
+            client
+                .get_object()
+                .bucket(&bucket)
+                .key("obj")
+                .part_number(1),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(get.e_tag().unwrap(), etag);
+        let got = get.body.collect().await.unwrap().into_bytes();
+        assert_eq!(got.as_ref(), body.as_slice());
+
+        cleanup(&bucket, "obj").await;
+    });
+}
+
+#[test]
 fn test_sse_c_upload_part_requires_headers() {
     if !endpoint_is_https() {
         return;
@@ -744,6 +1099,358 @@ fn test_sse_c_upload_part_requires_headers() {
             .body(ByteStream::from_static(b"secret"))
             .send()
             .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "InvalidRequest");
+
+        cleanup_multipart(&bucket, "obj", &upload_id).await;
+    });
+}
+
+#[test]
+fn test_sse_c_upload_part_rejects_wrong_key() {
+    if !endpoint_is_https() {
+        return;
+    }
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let key = test_sse_c_key();
+        let (key_b64, key_md5_b64) = sse_c_header_values(&key);
+        let wrong_key = [42u8; 32];
+        let (wrong_key_b64, wrong_key_md5_b64) = sse_c_header_values(&wrong_key);
+        let create = with_sse_c_headers!(
+            client.create_multipart_upload().bucket(&bucket).key("obj"),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+
+        let result = with_sse_c_headers!(
+            client
+                .upload_part()
+                .bucket(&bucket)
+                .key("obj")
+                .upload_id(&upload_id)
+                .part_number(1)
+                .body(ByteStream::from_static(b"secret")),
+            wrong_key_b64,
+            wrong_key_md5_b64
+        )
+        .send()
+        .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "InvalidRequest");
+
+        cleanup_multipart(&bucket, "obj", &upload_id).await;
+    });
+}
+
+#[test]
+fn test_sse_c_complete_multipart_allows_missing_headers() {
+    if !endpoint_is_https() {
+        return;
+    }
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let key = test_sse_c_key();
+        let (key_b64, key_md5_b64) = sse_c_header_values(&key);
+        let create = with_sse_c_headers!(
+            client.create_multipart_upload().bucket(&bucket).key("obj"),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+
+        let part = with_sse_c_headers!(
+            client
+                .upload_part()
+                .bucket(&bucket)
+                .key("obj")
+                .upload_id(&upload_id)
+                .part_number(1)
+                .body(ByteStream::from_static(b"secret")),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+
+        let result = client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key("obj")
+            .upload_id(&upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(part.e_tag().unwrap())
+                            .part_number(1)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send()
+            .await;
+        result.unwrap();
+
+        cleanup(&bucket, "obj").await;
+    });
+}
+
+#[test]
+fn test_sse_c_complete_multipart_checksum_requires_headers() {
+    if !endpoint_is_https() {
+        return;
+    }
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let key = test_sse_c_key();
+        let (key_b64, key_md5_b64) = sse_c_header_values(&key);
+        let create = with_sse_c_headers!(
+            client
+                .create_multipart_upload()
+                .bucket(&bucket)
+                .key("obj")
+                .checksum_algorithm(ChecksumAlgorithm::Sha256),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+
+        let part = with_sse_c_headers!(
+            client
+                .upload_part()
+                .bucket(&bucket)
+                .key("obj")
+                .upload_id(&upload_id)
+                .part_number(1)
+                .body(ByteStream::from(vec![b'A'; 1024]))
+                .checksum_algorithm(ChecksumAlgorithm::Sha256)
+                .checksum_sha256("arcu6553sHVAiX4MjW0j7I7vD4w6R+Gz9Ok0Q9lTa+0="),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+
+        let result = client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key("obj")
+            .upload_id(&upload_id)
+            .checksum_sha256("Ok6Cs5b96ux6+MWQkJO7UBT5sKPBeXBLwvj/hK89smg=-1")
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(part.e_tag().unwrap())
+                            .checksum_sha256(part.checksum_sha256().unwrap())
+                            .part_number(1)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "InvalidRequest");
+
+        cleanup_multipart(&bucket, "obj", &upload_id).await;
+    });
+}
+
+#[test]
+fn test_sse_c_complete_multipart_checksum_round_trip() {
+    if !endpoint_is_https() {
+        return;
+    }
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let key = test_sse_c_key();
+        let (key_b64, key_md5_b64) = sse_c_header_values(&key);
+        let part_checksum = "arcu6553sHVAiX4MjW0j7I7vD4w6R+Gz9Ok0Q9lTa+0=";
+        let object_checksum = "Ok6Cs5b96ux6+MWQkJO7UBT5sKPBeXBLwvj/hK89smg=";
+        let object_checksum_claim = "Ok6Cs5b96ux6+MWQkJO7UBT5sKPBeXBLwvj/hK89smg=-1";
+        let create = with_sse_c_headers!(
+            client
+                .create_multipart_upload()
+                .bucket(&bucket)
+                .key("obj")
+                .checksum_algorithm(ChecksumAlgorithm::Sha256),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+
+        let part = with_sse_c_headers!(
+            client
+                .upload_part()
+                .bucket(&bucket)
+                .key("obj")
+                .upload_id(&upload_id)
+                .part_number(1)
+                .body(ByteStream::from(vec![b'A'; 1024]))
+                .checksum_algorithm(ChecksumAlgorithm::Sha256)
+                .checksum_sha256(part_checksum),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+
+        with_sse_c_headers!(
+            client
+                .complete_multipart_upload()
+                .bucket(&bucket)
+                .key("obj")
+                .upload_id(&upload_id)
+                .checksum_sha256(object_checksum_claim)
+                .multipart_upload(
+                    CompletedMultipartUpload::builder()
+                        .parts(
+                            CompletedPart::builder()
+                                .e_tag(part.e_tag().unwrap())
+                                .checksum_sha256(part.checksum_sha256().unwrap())
+                                .part_number(1)
+                                .build(),
+                        )
+                        .build(),
+                ),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+
+        let head = with_sse_c_headers!(
+            client
+                .head_object()
+                .bucket(&bucket)
+                .key("obj")
+                .checksum_mode(ChecksumMode::Enabled),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(head.checksum_sha256(), Some(object_checksum_claim));
+        assert_eq!(
+            head.checksum_type(),
+            Some(&aws_sdk_s3::types::ChecksumType::Composite)
+        );
+
+        let attrs = with_sse_c_headers!(
+            client
+                .get_object_attributes()
+                .bucket(&bucket)
+                .key("obj")
+                .object_attributes(ObjectAttributes::Checksum),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+        let checksum = attrs.checksum().expect("expected checksum");
+        assert_eq!(checksum.checksum_sha256(), Some(object_checksum));
+        assert_eq!(
+            checksum.checksum_type(),
+            Some(&aws_sdk_s3::types::ChecksumType::Composite)
+        );
+
+        cleanup(&bucket, "obj").await;
+    });
+}
+
+#[test]
+fn test_sse_c_complete_multipart_rejects_wrong_key() {
+    if !endpoint_is_https() {
+        return;
+    }
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let key = test_sse_c_key();
+        let (key_b64, key_md5_b64) = sse_c_header_values(&key);
+        let wrong_key = [42u8; 32];
+        let (wrong_key_b64, wrong_key_md5_b64) = sse_c_header_values(&wrong_key);
+        let create = with_sse_c_headers!(
+            client.create_multipart_upload().bucket(&bucket).key("obj"),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+
+        let part = with_sse_c_headers!(
+            client
+                .upload_part()
+                .bucket(&bucket)
+                .key("obj")
+                .upload_id(&upload_id)
+                .part_number(1)
+                .body(ByteStream::from_static(b"secret")),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+
+        let result = with_sse_c_headers!(
+            client
+                .complete_multipart_upload()
+                .bucket(&bucket)
+                .key("obj")
+                .upload_id(&upload_id)
+                .multipart_upload(
+                    CompletedMultipartUpload::builder()
+                        .parts(
+                            CompletedPart::builder()
+                                .e_tag(part.e_tag().unwrap())
+                                .part_number(1)
+                                .build(),
+                        )
+                        .build(),
+                ),
+            wrong_key_b64,
+            wrong_key_md5_b64
+        )
+        .send()
+        .await;
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "InvalidRequest");
 
@@ -1055,6 +1762,88 @@ fn test_sse_c_upload_part_copy_requires_source_headers() {
                 .copy_source(format!("{}/src", bucket)),
             dst_key_b64,
             dst_key_md5_b64
+        )
+        .send()
+        .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "InvalidRequest");
+
+        let client = CTX.client();
+        let _ = client
+            .delete_object()
+            .bucket(&bucket)
+            .key("src")
+            .send()
+            .await;
+        let _ = client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key("dst")
+            .upload_id(&upload_id)
+            .send()
+            .await;
+        let _ = client
+            .delete_object()
+            .bucket(&bucket)
+            .key("dst")
+            .send()
+            .await;
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_sse_c_upload_part_copy_rejects_wrong_destination_key() {
+    if !endpoint_is_https() {
+        return;
+    }
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let src_key = test_sse_c_key();
+        let (src_key_b64, src_key_md5_b64) = sse_c_header_values(&src_key);
+        let dst_key = [9u8; 32];
+        let (dst_key_b64, dst_key_md5_b64) = sse_c_header_values(&dst_key);
+        let wrong_dst_key = [11u8; 32];
+        let (wrong_dst_key_b64, wrong_dst_key_md5_b64) = sse_c_header_values(&wrong_dst_key);
+
+        with_sse_c_headers!(
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key("src")
+                .body(ByteStream::from_static(b"secret-copy-part")),
+            src_key_b64,
+            src_key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+
+        let create = with_sse_c_headers!(
+            client.create_multipart_upload().bucket(&bucket).key("dst"),
+            dst_key_b64,
+            dst_key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+
+        let result = with_sse_c_copy_headers!(
+            client
+                .upload_part_copy()
+                .bucket(&bucket)
+                .key("dst")
+                .upload_id(&upload_id)
+                .part_number(1)
+                .copy_source(format!("{}/src", bucket)),
+            src_key_b64,
+            src_key_md5_b64,
+            wrong_dst_key_b64,
+            wrong_dst_key_md5_b64
         )
         .send()
         .await;
