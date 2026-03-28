@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::VersioningConfiguration;
 use s3_tests::{
@@ -16,6 +18,26 @@ fn assert_canonical_owner_id(id: &str) {
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
         "expected lowercase hex canonical owner ID, got {id}"
     );
+}
+
+async fn recreate_bucket_after_delete(client: &aws_sdk_s3::Client, bucket: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let result = client.create_bucket().bucket(bucket).send().await;
+        match result {
+            Ok(_) => return,
+            Err(err) => {
+                let debug = format!("{err:?}");
+                if !debug.contains("BucketAlreadyExists") {
+                    panic!("expected BucketAlreadyExists while waiting to recreate bucket, got {debug}");
+                }
+                if Instant::now() >= deadline {
+                    panic!("bucket {bucket} was not reusable within 5s after delete: {debug}");
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
 }
 
 // ── CreateBucket ─────────────────────────────────────────────────────
@@ -162,8 +184,9 @@ fn test_bucket_delete_then_recreate() {
         client.create_bucket().bucket(&bucket).send().await.unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
 
-        // Recreating after delete should succeed
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        // AWS documents that bucket removal can take time to finish, and
+        // immediate same-name recreate may transiently return BucketAlreadyExists.
+        recreate_bucket_after_delete(client, &bucket).await;
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
 }
