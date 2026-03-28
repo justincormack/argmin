@@ -1,6 +1,9 @@
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::VersioningConfiguration;
-use s3_tests::{cleanup_versioned_bucket, err_status, unique_bucket, CTX};
+use s3_tests::{
+    assert_s3_err_code, cleanup_versioned_bucket, ensure_distinct_s3_owners_or_skip, err_status,
+    unique_bucket, CTX,
+};
 
 fn assert_canonical_owner_id(id: &str) {
     assert_eq!(
@@ -381,9 +384,35 @@ fn test_buckets_list_ctime() {
 }
 
 #[test]
-#[ignore = "not implemented: multi-user"]
 fn test_bucket_create_exists_nonowner() {
-    s3_tests::run(async {});
+    s3_tests::run(async {
+        let client = CTX.client();
+        if !CTX.has_alt_client() {
+            eprintln!(
+                "skipping test_bucket_create_exists_nonowner: alternate credentials are not configured"
+            );
+            return;
+        }
+        let alt_client = CTX.alt_client();
+        if !ensure_distinct_s3_owners_or_skip(
+            client,
+            alt_client,
+            "test_bucket_create_exists_nonowner",
+        )
+        .await
+        {
+            return;
+        }
+
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let result = alt_client.create_bucket().bucket(&bucket).send().await;
+        assert_eq!(err_status(&result), 409);
+        assert_s3_err_code(&result, "BucketAlreadyExists");
+
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
 }
 
 #[test]
