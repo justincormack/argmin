@@ -19,6 +19,8 @@ pub enum S3Operation {
     ListObjectVersions { bucket: String },
     PutBucketVersioning { bucket: String },
     GetBucketVersioning { bucket: String },
+    PutBucketObjectLockConfiguration { bucket: String },
+    GetBucketObjectLockConfiguration { bucket: String },
     PutBucketEncryption { bucket: String },
     GetBucketEncryption { bucket: String },
     PutBucketCors { bucket: String },
@@ -30,6 +32,10 @@ pub enum S3Operation {
     PutObjectTagging { bucket: String, key: String },
     GetObjectTagging { bucket: String, key: String },
     DeleteObjectTagging { bucket: String, key: String },
+    PutObjectRetention { bucket: String, key: String },
+    GetObjectRetention { bucket: String, key: String },
+    PutObjectLegalHold { bucket: String, key: String },
+    GetObjectLegalHold { bucket: String, key: String },
     PutObjectAcl { bucket: String, key: String },
     GetObjectAcl { bucket: String, key: String },
     PutBucketPublicAccessBlock { bucket: String },
@@ -197,6 +203,11 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
                 bucket: bucket.to_string(),
             })
         }
+        ("PUT", None) if has_query_key(query, "object-lock") => {
+            Ok(S3Operation::PutBucketObjectLockConfiguration {
+                bucket: bucket.to_string(),
+            })
+        }
         ("PUT", None) if has_query_key(query, "encryption") => {
             Ok(S3Operation::PutBucketEncryption {
                 bucket: bucket.to_string(),
@@ -309,6 +320,12 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
                     bucket: bucket.to_string(),
                 });
             }
+            // Check for ?object-lock → GetBucketObjectLockConfiguration
+            if has_query_key(query, "object-lock") {
+                return Ok(S3Operation::GetBucketObjectLockConfiguration {
+                    bucket: bucket.to_string(),
+                });
+            }
             // Check for ?encryption → GetBucketEncryption
             if has_query_key(query, "encryption") {
                 return Ok(S3Operation::GetBucketEncryption {
@@ -373,6 +390,30 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
         }),
         ("DELETE", Some(key)) if has_query_key(query, "tagging") => {
             Ok(S3Operation::DeleteObjectTagging {
+                bucket: bucket.to_string(),
+                key,
+            })
+        }
+        ("PUT", Some(key)) if has_query_key(query, "retention") => {
+            Ok(S3Operation::PutObjectRetention {
+                bucket: bucket.to_string(),
+                key,
+            })
+        }
+        ("GET", Some(key)) if has_query_key(query, "retention") => {
+            Ok(S3Operation::GetObjectRetention {
+                bucket: bucket.to_string(),
+                key,
+            })
+        }
+        ("PUT", Some(key)) if has_query_key(query, "legal-hold") => {
+            Ok(S3Operation::PutObjectLegalHold {
+                bucket: bucket.to_string(),
+                key,
+            })
+        }
+        ("GET", Some(key)) if has_query_key(query, "legal-hold") => {
+            Ok(S3Operation::GetObjectLegalHold {
                 bucket: bucket.to_string(),
                 key,
             })
@@ -762,6 +803,26 @@ mod tests {
     }
 
     #[test]
+    fn put_bucket_object_lock_configuration() {
+        assert_eq!(
+            route("PUT", "/mybucket", "object-lock").unwrap(),
+            S3Operation::PutBucketObjectLockConfiguration {
+                bucket: "mybucket".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn get_bucket_object_lock_configuration() {
+        assert_eq!(
+            route("GET", "/mybucket", "object-lock").unwrap(),
+            S3Operation::GetBucketObjectLockConfiguration {
+                bucket: "mybucket".to_string()
+            }
+        );
+    }
+
+    #[test]
     fn put_bucket_encryption() {
         assert_eq!(
             route("PUT", "/mybucket", "encryption").unwrap(),
@@ -1001,6 +1062,71 @@ mod tests {
         assert_eq!(
             route("GET", "/mybucket/mykey", "").unwrap(),
             S3Operation::GetObject {
+                bucket: "mybucket".to_string(),
+                key: "mykey".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn put_object_retention_takes_priority_over_put_object() {
+        assert_eq!(
+            route("PUT", "/mybucket/mykey", "retention&versionId=123").unwrap(),
+            S3Operation::PutObjectRetention {
+                bucket: "mybucket".to_string(),
+                key: "mykey".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn get_object_retention_takes_priority_over_get_object() {
+        assert_eq!(
+            route("GET", "/mybucket/mykey", "retention").unwrap(),
+            S3Operation::GetObjectRetention {
+                bucket: "mybucket".to_string(),
+                key: "mykey".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn put_object_legal_hold_takes_priority_over_put_object() {
+        assert_eq!(
+            route("PUT", "/mybucket/mykey", "legal-hold").unwrap(),
+            S3Operation::PutObjectLegalHold {
+                bucket: "mybucket".to_string(),
+                key: "mykey".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn get_object_legal_hold_takes_priority_over_get_object() {
+        assert_eq!(
+            route("GET", "/mybucket/mykey", "legal-hold").unwrap(),
+            S3Operation::GetObjectLegalHold {
+                bucket: "mybucket".to_string(),
+                key: "mykey".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_bucket_query_still_falls_through_to_list_objects() {
+        assert_eq!(
+            route("GET", "/mybucket", "foo=bar").unwrap(),
+            S3Operation::ListObjectsV1 {
+                bucket: "mybucket".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_object_query_still_falls_through_to_put_object() {
+        assert_eq!(
+            route("PUT", "/mybucket/mykey", "foo=bar").unwrap(),
+            S3Operation::PutObject {
                 bucket: "mybucket".to_string(),
                 key: "mykey".to_string()
             }

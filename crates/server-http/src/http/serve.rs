@@ -2885,6 +2885,17 @@ mod tests {
     }
 
     #[test]
+    fn streaming_put_object_retention_excluded() {
+        // PUT /<bucket>/<key>?retention is an object-lock API, not PutObject.
+        let parts = make_parts(
+            "PUT",
+            "/mybucket/mykey?retention",
+            &[("x-amz-content-sha256", "UNSIGNED-PAYLOAD")],
+        );
+        assert_eq!(is_streaming_write(&parts), None);
+    }
+
+    #[test]
     fn streaming_put_deep_key() {
         let parts = make_parts(
             "PUT",

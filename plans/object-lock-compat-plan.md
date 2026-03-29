@@ -112,6 +112,12 @@ Recommended rollout:
   still failing solely because Argmin does not implement the feature yet
 - remove all ignores before considering the feature complete
 
+AWS validation note from the Phase 1 port:
+- the native `object_lock.rs` port passed against AWS with no `ignore`s needed
+- `PutObjectLockConfiguration` with bucket default retention `Days=0` or
+  `Years=-1` returns `400 InvalidArgument` on AWS, not Ceph's
+  `InvalidRetentionPeriod`
+
 This gives us an executable target while the storage and HTTP work is in
 progress.
 

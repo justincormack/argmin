@@ -56,8 +56,20 @@ The committed policy assumes:
 - buckets are created under the `claude-s3-` prefix
 - both users can create and delete prefixed buckets
 - both users can perform the bucket/object operations exercised by `s3-tests`
+- object-lock validation requires:
+  - `s3:PutBucketObjectLockConfiguration`
+  - `s3:GetBucketObjectLockConfiguration`
+  - `s3:PutObjectRetention`
+  - `s3:GetObjectRetention`
+  - `s3:PutObjectLegalHold`
+  - `s3:GetObjectLegalHold`
+  - `s3:BypassGovernanceRetention`
 
 If you change `S3_TEST_BUCKET_PREFIX`, update the policy resource ARNs to match.
+
+If AWS-backed object-lock tests fail immediately with `AccessDenied` on
+`PutBucketObjectLockConfiguration`, re-attach the committed policy after pulling
+the latest version.
 
 ## Account-level S3 settings
 
