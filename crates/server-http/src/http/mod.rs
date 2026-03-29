@@ -964,21 +964,29 @@ impl HttpFrontend {
                     let cond = write_condition_from_headers(req)?;
                     let requester = Self::requester_from_auth(auth);
                     let acl = parse_put_object_write_acl(req)?;
-                    let result =
-                        self.coordinator
-                            .put_object(&crate::coordinator::PutObjectRequest {
-                                bucket: &bucket,
-                                key: &key,
-                                data: &req.body,
-                                metadata: &metadata_blob,
-                                system_metadata: &system_metadata,
-                                tags: inline_tags_xml.as_deref(),
-                                cond: &cond,
-                                requester,
-                                acl,
-                                sse_customer: sse_customer.as_ref(),
-                                expected_bucket_owner,
-                            })?;
+                    let policy_context = put_object_policy_context_from_request(
+                        req,
+                        inline_tags_xml.as_deref(),
+                        None,
+                        None,
+                        acl.policy_condition_value(),
+                    );
+                    let result = self.coordinator.put_object_with_policy_context(
+                        &crate::coordinator::PutObjectRequest {
+                            bucket: &bucket,
+                            key: &key,
+                            data: &req.body,
+                            metadata: &metadata_blob,
+                            system_metadata: &system_metadata,
+                            tags: inline_tags_xml.as_deref(),
+                            cond: &cond,
+                            requester,
+                            acl,
+                            sse_customer: sse_customer.as_ref(),
+                            expected_bucket_owner,
+                        },
+                        policy_context,
+                    )?;
                     let mut resp = S3Response::put_object(&result);
                     apply_sse_customer_write_response_headers(&mut resp, sse_customer.as_ref());
                     for &(_, header) in CHECKSUM_HEADERS {
@@ -1846,7 +1854,7 @@ impl HttpFrontend {
                     None
                 };
                 let requester = Self::requester_from_auth(auth);
-                let acl = parse_put_object_acl(req.header("x-amz-acl"));
+                let acl = parse_put_object_write_acl(req)?;
 
                 let result = self.coordinator.create_multipart_upload(
                     &crate::coordinator::CreateMultipartUploadRequest {
@@ -1859,6 +1867,11 @@ impl HttpFrontend {
                         requester,
                         acl,
                         sse_customer: sse_customer.as_ref(),
+                        grant_read: req.header("x-amz-grant-read"),
+                        grant_write: req.header("x-amz-grant-write"),
+                        grant_read_acp: req.header("x-amz-grant-read-acp"),
+                        grant_write_acp: req.header("x-amz-grant-write-acp"),
+                        grant_full_control: req.header("x-amz-grant-full-control"),
                         expected_bucket_owner,
                     },
                 )?;
@@ -2581,7 +2594,12 @@ impl HttpFrontend {
             key: &key,
             requester: requester.clone(),
             acl: acl.into(),
-            policy: crate::coordinator::PutObjectPolicyContext::default(),
+            policy: crate::coordinator::PutObjectPolicyContext::new(
+                None,
+                None,
+                acl.policy_condition_value(),
+            )
+            .with_request_object_tags_xml(tags_xml.as_deref()),
             encryption: sse_customer
                 .as_ref()
                 .map_or(storage::ObjectEncryption::None, |ctx| {
@@ -2691,9 +2709,15 @@ impl HttpFrontend {
             }
         }
 
-        let result = self
-            .coordinator
-            .finalize_stream_put(&FinalizeStreamPutRequest {
+        let acl = parse_put_object_acl(ctx.acl_header.as_deref());
+        let policy_context = crate::coordinator::PutObjectPolicyContext::new(
+            None,
+            None,
+            acl.policy_condition_value(),
+        )
+        .with_request_object_tags_xml(ctx.tags_xml.as_deref());
+        let result = self.coordinator.finalize_stream_put_with_policy_context(
+            &FinalizeStreamPutRequest {
                 bucket: &ctx.binding.bucket,
                 key: &ctx.binding.key,
                 session_id: &ctx.binding.session_id,
@@ -2705,10 +2729,12 @@ impl HttpFrontend {
                 tags: ctx.tags_xml.as_deref(),
                 cond: &crate::conditional::WriteCondition::default(),
                 requester: ctx.requester.clone(),
-                acl: parse_put_object_acl(ctx.acl_header.as_deref()).into(),
+                acl: acl.into(),
                 copy_source: None,
                 metadata_directive: None,
-            })?;
+            },
+            policy_context,
+        )?;
 
         let mut resp = S3Response::post_object(
             &result,
@@ -2917,6 +2943,11 @@ impl HttpFrontend {
             requester: Self::requester_from_auth(&auth),
             expected_bucket_owner: expected_bucket_owner(req).map(str::to_string),
             acl_header: req.header("x-amz-acl").map(str::to_string),
+            grant_read_header: req.header("x-amz-grant-read").map(str::to_string),
+            grant_write_header: req.header("x-amz-grant-write").map(str::to_string),
+            grant_read_acp_header: req.header("x-amz-grant-read-acp").map(str::to_string),
+            grant_write_acp_header: req.header("x-amz-grant-write-acp").map(str::to_string),
+            grant_full_control_header: req.header("x-amz-grant-full-control").map(str::to_string),
             acl_grants,
             metadata_blob,
             system_metadata,
@@ -2953,7 +2984,7 @@ impl HttpFrontend {
                 ctx.acl_header.as_deref(),
                 ctx.acl_grants.as_ref(),
             ),
-            policy: crate::coordinator::PutObjectPolicyContext::default(),
+            policy: ctx.policy_context(),
             encryption: ctx
                 .sse_customer
                 .as_ref()
@@ -3014,9 +3045,8 @@ impl HttpFrontend {
         );
         let metadata_blob = Self::merged_streaming_put_metadata_blob(ctx, trailer_checksums);
         let system_metadata = Self::merged_streaming_put_system_metadata(ctx, trailer_checksums);
-        let result = self
-            .coordinator
-            .put_object(&crate::coordinator::PutObjectRequest {
+        let result = self.coordinator.put_object_with_policy_context(
+            &crate::coordinator::PutObjectRequest {
                 bucket: &ctx.bucket,
                 key: &ctx.key,
                 data,
@@ -3034,7 +3064,9 @@ impl HttpFrontend {
                     .as_ref()
                     .map(SseCustomerWriteContext::request),
                 expected_bucket_owner: ctx.expected_bucket_owner.as_deref(),
-            })?;
+            },
+            ctx.policy_context(),
+        )?;
 
         let mut resp = S3Response::put_object(&result);
         apply_sse_customer_write_response_headers(
@@ -3073,9 +3105,8 @@ impl HttpFrontend {
         let metadata_blob = Self::merged_streaming_put_metadata_blob(ctx, trailer_checksums);
         let system_metadata = Self::merged_streaming_put_system_metadata(ctx, trailer_checksums);
 
-        let result = self
-            .coordinator
-            .finalize_stream_put(&FinalizeStreamPutRequest {
+        let result = self.coordinator.finalize_stream_put_with_policy_context(
+            &FinalizeStreamPutRequest {
                 bucket: &ctx.bucket,
                 key: &ctx.key,
                 session_id,
@@ -3093,7 +3124,9 @@ impl HttpFrontend {
                 ),
                 copy_source: None,
                 metadata_directive: None,
-            })?;
+            },
+            ctx.policy_context(),
+        )?;
 
         let mut resp = S3Response::put_object(&result);
         apply_sse_customer_write_response_headers(
@@ -3375,6 +3408,11 @@ pub struct StreamingPutContext {
     pub requester: crate::coordinator::Requester,
     pub expected_bucket_owner: Option<String>,
     pub acl_header: Option<String>,
+    pub grant_read_header: Option<String>,
+    pub grant_write_header: Option<String>,
+    pub grant_read_acp_header: Option<String>,
+    pub grant_write_acp_header: Option<String>,
+    pub grant_full_control_header: Option<String>,
     pub acl_grants: Option<s3_types::AclGrants>,
     pub metadata_blob: crate::metadata_blob::MetadataBlob,
     pub system_metadata: SystemMetadata,
@@ -3384,6 +3422,24 @@ pub struct StreamingPutContext {
     pub sse_customer: Option<SseCustomerWriteContext>,
     /// Signing context for aws-chunked modes, None for unsigned/plain.
     pub streaming_signing: Option<auth::StreamingSigningContext>,
+}
+
+impl StreamingPutContext {
+    fn policy_context(&self) -> crate::coordinator::PutObjectPolicyContext<'_> {
+        put_object_policy_context_from_request_fields(
+            self.inline_tags_xml.as_deref(),
+            None,
+            None,
+            parse_put_object_acl(self.acl_header.as_deref()).policy_condition_value(),
+            PutObjectGrantHeaders {
+                grant_read: self.grant_read_header.as_deref(),
+                grant_write: self.grant_write_header.as_deref(),
+                grant_read_acp: self.grant_read_acp_header.as_deref(),
+                grant_write_acp: self.grant_write_acp_header.as_deref(),
+                grant_full_control: self.grant_full_control_header.as_deref(),
+            },
+        )
+    }
 }
 
 /// Context for an in-progress streaming `PostObject`.
@@ -4192,6 +4248,55 @@ fn parse_put_object_write_acl(
         req.header("x-amz-acl"),
         acl_grants.as_ref(),
     ))
+}
+
+fn put_object_policy_context_from_request<'a>(
+    req: &'a S3Request,
+    tags_xml: Option<&'a str>,
+    copy_source: Option<&'a str>,
+    metadata_directive: Option<&'a str>,
+    canned_acl: Option<&'a str>,
+) -> crate::coordinator::PutObjectPolicyContext<'a> {
+    put_object_policy_context_from_request_fields(
+        tags_xml,
+        copy_source,
+        metadata_directive,
+        canned_acl,
+        PutObjectGrantHeaders {
+            grant_read: req.header("x-amz-grant-read"),
+            grant_write: req.header("x-amz-grant-write"),
+            grant_read_acp: req.header("x-amz-grant-read-acp"),
+            grant_write_acp: req.header("x-amz-grant-write-acp"),
+            grant_full_control: req.header("x-amz-grant-full-control"),
+        },
+    )
+}
+
+#[derive(Clone, Copy, Default)]
+struct PutObjectGrantHeaders<'a> {
+    grant_read: Option<&'a str>,
+    grant_write: Option<&'a str>,
+    grant_read_acp: Option<&'a str>,
+    grant_write_acp: Option<&'a str>,
+    grant_full_control: Option<&'a str>,
+}
+
+fn put_object_policy_context_from_request_fields<'a>(
+    tags_xml: Option<&'a str>,
+    copy_source: Option<&'a str>,
+    metadata_directive: Option<&'a str>,
+    canned_acl: Option<&'a str>,
+    grants: PutObjectGrantHeaders<'a>,
+) -> crate::coordinator::PutObjectPolicyContext<'a> {
+    crate::coordinator::PutObjectPolicyContext::new(copy_source, metadata_directive, canned_acl)
+        .with_request_object_tags_xml(tags_xml)
+        .with_acl_grant_headers(
+            grants.grant_read,
+            grants.grant_write,
+            grants.grant_read_acp,
+            grants.grant_write_acp,
+            grants.grant_full_control,
+        )
 }
 
 fn parse_bucket_ownership(

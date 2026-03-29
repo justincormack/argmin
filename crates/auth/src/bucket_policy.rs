@@ -33,6 +33,14 @@ impl BucketPolicy {
         })
     }
 
+    #[must_use]
+    pub fn requires_request_object_tags_for_action(&self, action: PolicyAction) -> bool {
+        let action = action.as_str();
+        self.statements.iter().any(|statement| {
+            statement.matches_action(action) && statement.references_request_object_tag_condition()
+        })
+    }
+
     pub fn validate_evaluable_object_conditions(&self) -> Result<(), BucketPolicyError> {
         for statement in &self.statements {
             if statement.references_evaluable_object_action()
@@ -141,9 +149,15 @@ pub struct PolicyRequest<'a> {
     requester_principal: Option<&'a str>,
     requester_canonical_user_id: Option<&'a CanonicalUserId>,
     existing_object_tags: &'a [PolicyTag<'a>],
+    request_object_tags: &'a [PolicyTag<'a>],
     copy_source: Option<&'a str>,
     metadata_directive: Option<&'a str>,
     canned_acl: Option<&'a str>,
+    grant_read: Option<&'a str>,
+    grant_write: Option<&'a str>,
+    grant_read_acp: Option<&'a str>,
+    grant_write_acp: Option<&'a str>,
+    grant_full_control: Option<&'a str>,
 }
 
 impl<'a> PolicyRequest<'a> {
@@ -163,9 +177,15 @@ impl<'a> PolicyRequest<'a> {
             requester_principal,
             requester_canonical_user_id,
             existing_object_tags: &[],
+            request_object_tags: &[],
             copy_source: None,
             metadata_directive: None,
             canned_acl: None,
+            grant_read: None,
+            grant_write: None,
+            grant_read_acp: None,
+            grant_write_acp: None,
+            grant_full_control: None,
         }
     }
 
@@ -184,9 +204,15 @@ impl<'a> PolicyRequest<'a> {
             requester_principal,
             requester_canonical_user_id,
             existing_object_tags: &[],
+            request_object_tags: &[],
             copy_source: None,
             metadata_directive: None,
             canned_acl: None,
+            grant_read: None,
+            grant_write: None,
+            grant_read_acp: None,
+            grant_write_acp: None,
+            grant_full_control: None,
         }
     }
 
@@ -234,6 +260,12 @@ impl<'a> PolicyRequest<'a> {
     }
 
     #[must_use]
+    pub fn with_request_object_tags(mut self, request_object_tags: &'a [PolicyTag<'a>]) -> Self {
+        self.request_object_tags = request_object_tags;
+        self
+    }
+
+    #[must_use]
     pub fn with_copy_source(mut self, copy_source: Option<&'a str>) -> Self {
         self.copy_source = copy_source;
         self
@@ -252,6 +284,36 @@ impl<'a> PolicyRequest<'a> {
     }
 
     #[must_use]
+    pub fn with_grant_read(mut self, grant_read: Option<&'a str>) -> Self {
+        self.grant_read = grant_read;
+        self
+    }
+
+    #[must_use]
+    pub fn with_grant_write(mut self, grant_write: Option<&'a str>) -> Self {
+        self.grant_write = grant_write;
+        self
+    }
+
+    #[must_use]
+    pub fn with_grant_read_acp(mut self, grant_read_acp: Option<&'a str>) -> Self {
+        self.grant_read_acp = grant_read_acp;
+        self
+    }
+
+    #[must_use]
+    pub fn with_grant_write_acp(mut self, grant_write_acp: Option<&'a str>) -> Self {
+        self.grant_write_acp = grant_write_acp;
+        self
+    }
+
+    #[must_use]
+    pub fn with_grant_full_control(mut self, grant_full_control: Option<&'a str>) -> Self {
+        self.grant_full_control = grant_full_control;
+        self
+    }
+
+    #[must_use]
     fn copy_source(&self) -> Option<&'a str> {
         self.copy_source
     }
@@ -264,6 +326,39 @@ impl<'a> PolicyRequest<'a> {
     #[must_use]
     fn canned_acl(&self) -> Option<&'a str> {
         self.canned_acl
+    }
+
+    #[must_use]
+    fn request_object_tag_value(&self, key: &str) -> Option<&'a str> {
+        self.request_object_tags
+            .iter()
+            .find(|tag| tag.key == key)
+            .map(|tag| tag.value)
+    }
+
+    #[must_use]
+    fn grant_read(&self) -> Option<&'a str> {
+        self.grant_read
+    }
+
+    #[must_use]
+    fn grant_write(&self) -> Option<&'a str> {
+        self.grant_write
+    }
+
+    #[must_use]
+    fn grant_read_acp(&self) -> Option<&'a str> {
+        self.grant_read_acp
+    }
+
+    #[must_use]
+    fn grant_write_acp(&self) -> Option<&'a str> {
+        self.grant_write_acp
+    }
+
+    #[must_use]
+    fn grant_full_control(&self) -> Option<&'a str> {
+        self.grant_full_control
     }
 }
 
@@ -375,6 +470,12 @@ impl PolicyStatement {
         self.conditions
             .iter()
             .any(|clause| clause.key.starts_with("s3:ExistingObjectTag/"))
+    }
+
+    fn references_request_object_tag_condition(&self) -> bool {
+        self.conditions
+            .iter()
+            .any(|clause| clause.key.starts_with("s3:RequestObjectTag/"))
     }
 
     fn references_evaluable_object_action(&self) -> bool {
@@ -872,6 +973,9 @@ fn condition_clause_matches_request(
     if let Some(tag_key) = clause.key.strip_prefix("s3:ExistingObjectTag/") {
         return string_equals_condition_matches(clause, request.existing_object_tag_value(tag_key));
     }
+    if let Some(tag_key) = clause.key.strip_prefix("s3:RequestObjectTag/") {
+        return string_condition_matches(clause, request.request_object_tag_value(tag_key));
+    }
 
     match clause.key.as_str() {
         "s3:x-amz-copy-source" => string_condition_matches(clause, request.copy_source()),
@@ -879,17 +983,37 @@ fn condition_clause_matches_request(
             string_condition_matches(clause, request.metadata_directive())
         }
         "s3:x-amz-acl" => string_condition_matches(clause, request.canned_acl()),
+        "s3:x-amz-grant-read" => string_condition_matches(clause, request.grant_read()),
+        "s3:x-amz-grant-write" => string_condition_matches(clause, request.grant_write()),
+        "s3:x-amz-grant-read-acp" => string_condition_matches(clause, request.grant_read_acp()),
+        "s3:x-amz-grant-write-acp" => string_condition_matches(clause, request.grant_write_acp()),
+        "s3:x-amz-grant-full-control" => {
+            string_condition_matches(clause, request.grant_full_control())
+        }
         _ => ConditionMatchResult::Unsupported,
     }
 }
 
 fn condition_clause_supported_for_evaluable_object_actions(clause: &PolicyConditionClause) -> bool {
     (clause.operator == "StringEquals" && clause.key.starts_with("s3:ExistingObjectTag/"))
-        || (matches!(clause.operator.as_str(), "StringEquals" | "StringLike")
-            && matches!(
-                clause.key.as_str(),
-                "s3:x-amz-copy-source" | "s3:x-amz-metadata-directive" | "s3:x-amz-acl"
-            ))
+        || (matches!(
+            clause.operator.as_str(),
+            "StringEquals" | "StringLike" | "StringNotEquals" | "Null"
+        ) && matches!(
+            clause.key.as_str(),
+            "s3:x-amz-copy-source"
+                | "s3:x-amz-metadata-directive"
+                | "s3:x-amz-acl"
+                | "s3:x-amz-grant-read"
+                | "s3:x-amz-grant-write"
+                | "s3:x-amz-grant-read-acp"
+                | "s3:x-amz-grant-write-acp"
+                | "s3:x-amz-grant-full-control"
+        ))
+        || (matches!(
+            clause.operator.as_str(),
+            "StringEquals" | "StringLike" | "StringNotEquals" | "Null"
+        ) && clause.key.starts_with("s3:RequestObjectTag/"))
 }
 
 fn string_equals_condition_matches(
@@ -911,12 +1035,11 @@ fn string_condition_matches(
     clause: &PolicyConditionClause,
     actual: Option<&str>,
 ) -> ConditionMatchResult {
-    let Some(actual) = actual else {
-        return ConditionMatchResult::NoMatch;
-    };
-
     match clause.operator.as_str() {
         "StringEquals" => {
+            let Some(actual) = actual else {
+                return ConditionMatchResult::NoMatch;
+            };
             if clause.values.iter().any(|expected| expected == actual) {
                 ConditionMatchResult::Matches
             } else {
@@ -924,10 +1047,39 @@ fn string_condition_matches(
             }
         }
         "StringLike" => {
+            let Some(actual) = actual else {
+                return ConditionMatchResult::NoMatch;
+            };
             if clause
                 .values
                 .iter()
                 .any(|expected| wildcard_matches(expected, actual))
+            {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        "StringNotEquals" => match actual {
+            Some(actual) => {
+                if clause.values.iter().all(|expected| expected != actual) {
+                    ConditionMatchResult::Matches
+                } else {
+                    ConditionMatchResult::NoMatch
+                }
+            }
+            None => ConditionMatchResult::Matches,
+        },
+        "Null" => {
+            let is_null = actual.is_none();
+            if clause
+                .values
+                .iter()
+                .any(|expected| match expected.as_str() {
+                    "true" => is_null,
+                    "false" => !is_null,
+                    _ => false,
+                })
             {
                 ConditionMatchResult::Matches
             } else {
@@ -1300,6 +1452,125 @@ mod tests {
 
         assert!(policy.requires_existing_object_tags_for_action(PolicyAction::GetObject));
         assert!(!policy.requires_existing_object_tags_for_action(PolicyAction::GetObjectTagging));
+    }
+
+    #[test]
+    fn requires_request_object_tags_for_matching_action() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:RequestObjectTag/security":"public"}}},{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+        )
+        .unwrap();
+
+        assert!(policy.requires_request_object_tags_for_action(PolicyAction::PutObject));
+        assert!(!policy.requires_request_object_tags_for_action(PolicyAction::GetObject));
+    }
+
+    #[test]
+    fn request_object_tag_condition_matches() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:RequestObjectTag/security":"public"}}}]}"#,
+        )
+        .unwrap();
+        let request_tags = [PolicyTag::new("security", "public")];
+        let request = PolicyRequest::new(
+            PolicyAction::PutObject,
+            "bucket",
+            "key",
+            Some("caller"),
+            None,
+        )
+        .with_request_object_tags(&request_tags);
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+    }
+
+    #[test]
+    fn request_object_tag_null_condition_matches_missing_tag() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"Null":{"s3:RequestObjectTag/security":"true"}}}]}"#,
+        )
+        .unwrap();
+        let request = PolicyRequest::new(
+            PolicyAction::PutObject,
+            "bucket",
+            "key",
+            Some("caller"),
+            None,
+        );
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitDeny);
+    }
+
+    #[test]
+    fn request_object_tag_string_not_equals_matches_mismatched_tag() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringNotEquals":{"s3:RequestObjectTag/security":"public"}}}]}"#,
+        )
+        .unwrap();
+        let request_tags = [PolicyTag::new("security", "private")];
+        let request = PolicyRequest::new(
+            PolicyAction::PutObject,
+            "bucket",
+            "key",
+            Some("caller"),
+            None,
+        )
+        .with_request_object_tags(&request_tags);
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitDeny);
+    }
+
+    #[test]
+    fn grant_full_control_condition_matches() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:x-amz-grant-full-control":"id=owner-canonical-id"}}}]}"#,
+        )
+        .unwrap();
+        let request = PolicyRequest::new(
+            PolicyAction::PutObject,
+            "bucket",
+            "key",
+            Some("caller"),
+            None,
+        )
+        .with_grant_full_control(Some("id=owner-canonical-id"));
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+    }
+
+    #[test]
+    fn grant_full_control_null_condition_matches_missing_header() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"Null":{"s3:x-amz-grant-full-control":"true"}}}]}"#,
+        )
+        .unwrap();
+        let request = PolicyRequest::new(
+            PolicyAction::PutObject,
+            "bucket",
+            "key",
+            Some("caller"),
+            None,
+        );
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitDeny);
+    }
+
+    #[test]
+    fn grant_full_control_string_not_equals_matches_mismatched_header() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringNotEquals":{"s3:x-amz-grant-full-control":"id=owner-canonical-id"}}}]}"#,
+        )
+        .unwrap();
+        let request = PolicyRequest::new(
+            PolicyAction::PutObject,
+            "bucket",
+            "key",
+            Some("caller"),
+            None,
+        )
+        .with_grant_full_control(Some("id=someone-else"));
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitDeny);
     }
 
     #[test]

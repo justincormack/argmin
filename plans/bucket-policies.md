@@ -406,31 +406,34 @@ Notes:
 ### Phase 7: Multipart And Extended PutObject Conditions
 
 Status:
-- pending
+- completed for the supported write surface
+- deferred follow-up remains for SSE-S3 / SSE-KMS condition keys because the
+  implementation currently supports SSE-C only
 
 Deliver:
 - bucket-policy enforcement on `CreateMultipartUpload`
 - bucket-policy enforcement on `UploadPartCopy` using source-read and
   destination-write request context
 - `PutObject` condition support for `s3:x-amz-grant-*`
-- `PutObject` condition support for
-  `s3:x-amz-server-side-encryption` and
-  `s3:x-amz-server-side-encryption-aws-kms-key-id`
 - `PutObject` condition support for `s3:RequestObjectTag/<key>`
+- tagged `PutObject` / `CreateMultipartUpload` requests require
+  `s3:PutObjectTagging` authorization in addition to `s3:PutObject`, matching
+  AWS
 - request-time operator support needed by those tests, including `Null` and
   `StringNotEquals`
 
 Success criteria:
 - native equivalents exist for Ceph `test_bucket_policy_multipart`,
   `test_bucket_policy_upload_part_copy`, `test_bucket_policy_put_obj_grant`,
-  the SSE-S3 / SSE-KMS bucket-policy tests, and
   `test_bucket_policy_put_obj_request_obj_tag`
+- the SSE-S3 / SSE-KMS bucket-policy tests remain explicitly out of scope until
+  the server implements the corresponding request headers and semantics
 
 Notes:
 - this phase should continue reusing the shared evaluator and request-context
   extraction rather than adding multipart-specific string checks
-- encryption-policy tests are about policy condition evaluation on request
-  headers, not about introducing non-AWS KMS shortcuts
+- encryption-policy follow-up is about policy condition evaluation on real
+  request headers, not about introducing non-AWS KMS shortcuts
 
 ### Phase 8: Policy Status And Remaining Surface Parity
 
