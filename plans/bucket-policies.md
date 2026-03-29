@@ -30,22 +30,22 @@ Current implementation status:
 - storage exposes `put/get/delete_bucket_policy`
 - the router and HTTP handler support `PUT ?policy`, `GET ?policy`, and
   `DELETE ?policy`
-- `PUT ?policy` requires a UTF-8 body and stores the provided JSON string
-  without parsing or validation
+- `PUT ?policy` requires a UTF-8 body, parses the policy into a typed internal
+  representation, and stores the provided JSON string only after validation
 - `GET ?policy` returns the stored policy JSON, or `NoSuchBucketPolicy` when
   no policy is configured
 - `DELETE ?policy` removes the stored policy
 - bucket policy administration is wired through bucket-admin authorization
 - the public access block XML parser already supports `BlockPublicPolicy` and
   `RestrictPublicBuckets`
-- there is no typed bucket policy parser, public-policy classifier, or
-  request-time policy evaluation yet
+- there is now a shared typed bucket policy parser and public-policy classifier
+- `PutBucketPolicy` rejects public `Allow` policies when
+  `BlockPublicPolicy=true`
+- there is still no request-time policy evaluation yet
 - raw policy is intentionally not stored in bucket fast-path metadata
 
 Remaining ignored tests tied directly to the unimplemented policy-evaluation
 gap:
-- block public policy
-- block public policy with principal
 - restrict public buckets
 - get public block deny bucket policy
 - all current tagging tests marked `bucket policies`
@@ -229,6 +229,9 @@ Notes:
 
 ### Phase 2: Typed Policy Parser And Public Classifier
 
+Status:
+- completed
+
 Deliver:
 - typed policy representation
 - validation for the supported policy subset
@@ -236,6 +239,13 @@ Deliver:
 
 Success criteria:
 - `BlockPublicPolicy` can reject public policy writes correctly
+
+Notes:
+- the shared parser/classifier lives outside the HTTP layer so later phases can
+  reuse it for request-time authorization
+- the current classifier covers the public-policy cases exercised by the
+  unignored public-access-block tests: wildcard public `Allow` is public, fixed
+  principals are non-public, and `Deny` statements are not treated as public
 
 ### Phase 3: Core Evaluation For Public Object And Tagging Access
 

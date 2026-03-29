@@ -97,6 +97,9 @@ pub enum ServerError {
     #[error("no bucket policy: {bucket}")]
     NoSuchBucketPolicy { bucket: String },
 
+    #[error("malformed policy: {reason}")]
+    MalformedPolicy { reason: String },
+
     #[error("ownership controls not found: {bucket}")]
     OwnershipControlsNotFound { bucket: String },
 
@@ -214,6 +217,7 @@ impl ServerError {
                 "NoSuchPublicAccessBlockConfiguration"
             }
             Self::NoSuchBucketPolicy { .. } => "NoSuchBucketPolicy",
+            Self::MalformedPolicy { .. } => "MalformedPolicy",
             Self::OwnershipControlsNotFound { .. } => "OwnershipControlsNotFoundError",
             Self::AccessControlListNotSupported => "AccessControlListNotSupported",
             Self::InvalidBucketAclWithObjectOwnership => "InvalidBucketAclWithObjectOwnership",
@@ -270,6 +274,7 @@ impl ServerError {
             Self::NoSuchPublicAccessBlockConfiguration { .. } | Self::NoSuchBucketPolicy { .. } => {
                 404
             }
+            Self::MalformedPolicy { .. } => 400,
             Self::OwnershipControlsNotFound { .. } => 404,
             Self::InvalidTag { .. } => 400,
             Self::AccessControlListNotSupported
@@ -338,6 +343,17 @@ mod tests {
         assert_eq!(
             ServerError::BucketNotEmpty.s3_error_code(),
             "BucketNotEmpty"
+        );
+    }
+
+    #[test]
+    fn s3_error_code_malformed_policy() {
+        assert_eq!(
+            ServerError::MalformedPolicy {
+                reason: "bad".to_string()
+            }
+            .s3_error_code(),
+            "MalformedPolicy"
         );
     }
 
@@ -546,6 +562,14 @@ mod tests {
             .http_status(),
             404
         );
+        assert_eq!(
+            ServerError::NoSuchPublicAccessBlockConfiguration { bucket: "b".into() }.http_status(),
+            404
+        );
+        assert_eq!(
+            ServerError::NoSuchBucketPolicy { bucket: "b".into() }.http_status(),
+            404
+        );
     }
 
     #[test]
@@ -570,6 +594,13 @@ mod tests {
         );
         assert_eq!(
             ServerError::ObjectTooLarge { size: 1, max: 0 }.http_status(),
+            400
+        );
+        assert_eq!(
+            ServerError::MalformedPolicy {
+                reason: "bad".into()
+            }
+            .http_status(),
             400
         );
     }

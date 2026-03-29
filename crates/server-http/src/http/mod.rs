@@ -4617,6 +4617,30 @@ mod tests {
     }
 
     #[test]
+    fn put_bucket_policy_rejects_invalid_json() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+
+        let put_req = new_req(http::Method::PUT, "/", "policy", vec![], b"{".to_vec());
+        match fe.dispatch_routed(
+            &put_req,
+            &test_auth(),
+            S3Operation::PutBucketPolicy {
+                bucket: "mybucket".to_string(),
+            },
+        ) {
+            Err(ServerError::MalformedPolicy { reason }) => {
+                assert!(reason.contains("invalid JSON"));
+            }
+            Err(e) => panic!("expected MalformedPolicy, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
     fn put_object_accepts_header_grants_and_renders_them() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());

@@ -1,5 +1,5 @@
 use aws_sdk_s3::types::{BucketCannedAcl, ObjectCannedAcl, ObjectOwnership, Permission};
-use s3_tests::{unique_bucket, CTX};
+use s3_tests::{assert_s3_err_code, err_status, unique_bucket, CTX};
 
 fn assert_canonical_owner_id(id: &str) {
     assert_eq!(
@@ -507,15 +507,115 @@ fn test_block_public_object_canned_acls() {
 }
 
 #[test]
-#[ignore = "not implemented: bucket policies"]
 fn test_block_public_policy() {
-    s3_tests::run(async {});
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let pab = aws_sdk_s3::types::PublicAccessBlockConfiguration::builder()
+            .block_public_acls(false)
+            .ignore_public_acls(false)
+            .block_public_policy(true)
+            .restrict_public_buckets(false)
+            .build();
+        client
+            .put_public_access_block()
+            .bucket(&bucket)
+            .public_access_block_configuration(pab)
+            .send()
+            .await
+            .unwrap();
+
+        let policy = serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": {"AWS": "*"},
+                "Action": "s3:GetObject",
+                "Resource": format!("arn:aws:s3:::{bucket}/*"),
+            }],
+        })
+        .to_string();
+
+        let result = client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 403);
+        assert_s3_err_code(&result, "AccessDenied");
+
+        cleanup(&bucket).await;
+    });
 }
 
 #[test]
-#[ignore = "not implemented: bucket policies"]
 fn test_block_public_policy_with_principal() {
-    s3_tests::run(async {});
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let pab = aws_sdk_s3::types::PublicAccessBlockConfiguration::builder()
+            .block_public_acls(false)
+            .ignore_public_acls(false)
+            .block_public_policy(true)
+            .restrict_public_buckets(false)
+            .build();
+        client
+            .put_public_access_block()
+            .bucket(&bucket)
+            .public_access_block_configuration(pab)
+            .send()
+            .await
+            .unwrap();
+
+        let principal = if let Some(account_id) = CTX.account_id() {
+            serde_json::json!({"AWS": format!("arn:aws:iam::{account_id}:root")})
+        } else {
+            serde_json::json!({"Service": "logging.s3.amazonaws.com"})
+        };
+        let policy = serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": principal,
+                "Action": "s3:GetObject",
+                "Resource": format!("arn:aws:s3:::{bucket}/*"),
+            }],
+        })
+        .to_string();
+
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy.clone())
+            .send()
+            .await
+            .unwrap();
+
+        let resp = client
+            .get_bucket_policy()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        let actual_policy: serde_json::Value =
+            serde_json::from_str(resp.policy().unwrap()).unwrap();
+        let expected_policy: serde_json::Value = serde_json::from_str(&policy).unwrap();
+        assert_eq!(actual_policy, expected_policy);
+
+        client
+            .delete_bucket_policy()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+
+        cleanup(&bucket).await;
+    });
 }
 
 #[test]

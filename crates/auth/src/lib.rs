@@ -14,6 +14,7 @@
     clippy::unreadable_literal
 )]
 
+pub mod bucket_policy;
 pub mod canonical;
 pub mod credential;
 pub mod error;
@@ -52,6 +53,10 @@ pub(crate) fn is_lower_hex(value: &str) -> bool {
         .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+pub use bucket_policy::{
+    parse_bucket_policy, BucketPolicy, BucketPolicyError, PolicyConditionClause, PolicyEffect,
+    PolicyPrincipal, PolicyStatement, PolicyVersion,
+};
 pub use canonical::parse_amz_date;
 pub use credential::{CredentialRecord, CredentialScope, CredentialStore, SecretKey};
 pub use error::AuthError;
