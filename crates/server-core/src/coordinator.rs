@@ -3502,6 +3502,36 @@ impl Coordinator {
         }
     }
 
+    fn requester_can_list_bucket_with_bucket_policy(
+        requester: &Requester,
+        bucket: &BucketSummary,
+        policy: Option<&auth::BucketPolicy>,
+    ) -> bool {
+        match Self::bucket_policy_decision_for_bucket(
+            requester,
+            bucket,
+            auth::PolicyAction::ListBucket,
+            policy,
+        ) {
+            auth::PolicyEvaluation::ExplicitDeny => false,
+            auth::PolicyEvaluation::ExplicitAllow
+                if Self::bucket_policy_allow_survives_restrict_public_buckets(
+                    requester, bucket,
+                ) =>
+            {
+                true
+            }
+            auth::PolicyEvaluation::ExplicitAllow | auth::PolicyEvaluation::NoMatch => {
+                Self::requester_can_read_bucket(
+                    requester,
+                    &bucket.owner_principal,
+                    &bucket.acl_grants,
+                    Self::effective_public_read(bucket),
+                )
+            }
+        }
+    }
+
     fn parse_policy_existing_object_tags(
         object: &StoredObject,
     ) -> Result<Vec<(String, String)>, ServerError> {
@@ -9608,8 +9638,16 @@ impl Coordinator {
         let delimiter = req.delimiter;
         let continuation_token = req.continuation_token;
         let max_keys = req.max_keys;
-        let bucket_info =
-            self.authorize_bucket_read_requester(&req.requester, bucket, expected_bucket_owner)?;
+        let bucket_info = self.active_bucket_summary(bucket)?;
+        Self::ensure_expected_bucket_owner(&bucket_info, expected_bucket_owner)?;
+        let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
+        if !Self::requester_can_list_bucket_with_bucket_policy(
+            &req.requester,
+            &bucket_info,
+            bucket_policy.as_deref(),
+        ) {
+            return Err(ServerError::AccessDenied);
+        }
 
         // MaxKeys=0 is valid per S3 spec: return empty result
         if max_keys == 0 {
@@ -11780,6 +11818,36 @@ mod tests {
             .put_bucket_policy(
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringNotEquals":{"aws:PrincipalArn":"arn:aws:iam::444455556666:user/other"}}}]}"#,
+                Requester::principal("owner-a"),
+            )
+            .unwrap_err();
+        assert!(matches!(err, ServerError::MalformedPolicy { .. }));
+        assert_eq!(
+            coord
+                .get_bucket_policy("bucket", Requester::principal("owner-a"))
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn put_bucket_policy_rejects_list_bucket_object_only_resource() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+
+        coord
+            .create_bucket_for_requester(&CreateBucketRequest {
+                name: "bucket",
+                requester: Requester::principal("owner-a"),
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+            })
+            .unwrap();
+
+        let err = coord
+            .put_bucket_policy(
+                "bucket",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket/*"}]}"#,
                 Requester::principal("owner-a"),
             )
             .unwrap_err();
@@ -14909,6 +14977,24 @@ mod tests {
     }
 
     #[test]
+    fn list_objects_nonexistent_bucket_for_non_owner_still_returns_bucket_not_found() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+
+        let err = coord
+            .list_objects_v2(&ListObjectsV2Request {
+                bucket: "no-bucket",
+                prefix: None,
+                delimiter: None,
+                continuation_token: None,
+                max_keys: 1000,
+                requester: Requester::principal("other-user"),
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::BucketNotFound { .. }));
+    }
+
+    #[test]
     fn delete_objects_batch() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
@@ -17186,6 +17272,95 @@ mod tests {
                 continuation_token: None,
                 max_keys: 1000,
                 requester: Requester::principal("other-user"),
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn list_objects_allows_explicit_bucket_policy_allow() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "key",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                requester: Requester::principal("owner-a"),
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        coord
+            .put_bucket_policy(
+                "bucket",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket"}]}"#,
+                Requester::principal("owner-a"),
+            )
+            .unwrap();
+
+        let result = coord
+            .list_objects_v2(&ListObjectsV2Request {
+                bucket: "bucket",
+                prefix: None,
+                delimiter: None,
+                continuation_token: None,
+                max_keys: 1000,
+                requester: Requester::principal("other-user"),
+            })
+            .unwrap();
+        assert_eq!(result.objects.len(), 1);
+        assert_eq!(result.objects[0].key, "key");
+    }
+
+    #[test]
+    fn list_objects_bucket_policy_deny_overrides_public_read_acl() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", true)
+            .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "key",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                requester: Requester::principal("owner-a"),
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        coord
+            .put_bucket_policy(
+                "bucket",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket"}]}"#,
+                Requester::principal("owner-a"),
+            )
+            .unwrap();
+
+        let err = coord
+            .list_objects_v2(&ListObjectsV2Request {
+                bucket: "bucket",
+                prefix: None,
+                delimiter: None,
+                continuation_token: None,
+                max_keys: 1000,
+                requester: Requester::anonymous(),
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));

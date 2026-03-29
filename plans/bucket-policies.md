@@ -52,7 +52,8 @@ Current implementation status:
 - `PutBucketPolicy` rejects public `Allow` policies when
   `BlockPublicPolicy=true`
 - request-time policy evaluation now covers object reads, object tagging, copy
-  destination writes, `GetObjectAcl`, and `GetBucketPublicAccessBlock`
+  destination writes, `GetObjectAcl`, `GetBucketPublicAccessBlock`, and
+  `ListObjects` / `ListObjectsV2` via `s3:ListBucket`
 - supported request-time condition keys now include:
   `s3:ExistingObjectTag/<key>`,
   `s3:x-amz-copy-source`,
@@ -66,9 +67,7 @@ Current implementation status:
   the parsed policy before object-PG locking to avoid same-PG self-deadlock
 - raw policy is intentionally not stored in bucket fast-path metadata
 
-Remaining Ceph/AWS parity gaps after Phases 1-5:
-- no bucket-level request-time evaluation yet for `s3:ListBucket` on
-  `ListObjects` / `ListObjectsV2`
+Remaining Ceph/AWS parity gaps after Phases 1-6:
 - no `GetBucketPolicyStatus` API surface yet, even though the public/non-public
   classifier already exists internally
 - no bucket-policy enforcement yet on `CreateMultipartUpload` or
@@ -125,6 +124,7 @@ Policy evaluation must compose with:
 ### Supported Policy Features In Completed Phases
 
 Actions currently implemented:
+- `s3:ListBucket`
 - `s3:GetObject`
 - `s3:GetObjectTagging`
 - `s3:PutObjectTagging`
@@ -374,7 +374,7 @@ Notes:
 ### Phase 6: Bucket-Level Policy Evaluation
 
 Status:
-- pending
+- completed
 
 Deliver:
 - request-time evaluation for `s3:ListBucket` on `ListObjects` and
@@ -390,6 +390,13 @@ Success criteria:
   `test_bucketv2_policy_acl`, and the bucket-vs-object ARN multipart setup case
 
 Notes:
+- `ListObjects` and `ListObjectsV2` now evaluate `s3:ListBucket` through the
+  shared bucket-policy evaluator
+- explicit bucket-policy `Deny` now overrides bucket ACL list access, and
+  explicit `Allow` composes with `RestrictPublicBuckets` in the same way as the
+  existing object-level helpers
+- native coverage now includes v1/v2 list allow, deny-overrides-ACL, and
+  bucket-resource-vs-object-resource mismatch cases
 - RGW tenant-addressing tests such as `test_bucket_policy_different_tenant` and
   `test_bucket_policy_tenanted_bucket` should not drive implementation because
   AWS does not expose tenant-prefixed bucket names
@@ -450,6 +457,10 @@ Success criteria:
 ## Test Plan
 
 Targeted integration tests:
+- `cargo test -p s3-tests --test bucket_policy test_bucket_policy_list_objects_v1 -- --exact --nocapture`
+- `cargo test -p s3-tests --test bucket_policy test_bucket_policy_list_objects_v2 -- --exact --nocapture`
+- `cargo test -p s3-tests --test bucket_policy test_bucket_policy_list_deny_overrides_bucket_acl -- --exact --nocapture`
+- `cargo test -p s3-tests --test bucket_policy test_bucket_policy_list_requires_bucket_resource -- --exact --nocapture`
 - `cargo test -p s3-tests --test public_access_block test_block_public_policy -- --exact --nocapture`
 - `cargo test -p s3-tests --test public_access_block test_block_public_policy_with_principal -- --exact --nocapture`
 - `cargo test -p s3-tests --test public_access_block test_block_public_restrict_public_buckets -- --exact --nocapture`
@@ -466,6 +477,7 @@ Targeted integration tests:
 - `cargo test -p s3-tests --test tagging test_bucket_policy_get_obj_acl_existing_tag -- --exact --nocapture`
 
 Regression coverage:
+- `cargo test -p s3-tests --test bucket_policy`
 - `cargo test -p s3-tests --test public_access_block`
 - `cargo test -p s3-tests --test tagging`
 - `cargo test -p s3-tests --test copy_object`

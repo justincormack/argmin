@@ -285,6 +285,28 @@ fn test_anon_list_objects_v1_private_bucket_fail() {
     });
 }
 
+#[test]
+fn test_anon_list_objects_v1_nonexistent_bucket_returns_404() {
+    s3_tests::run(async {
+        let bucket = unique_bucket();
+
+        let url = format!("{}/{}", CTX.endpoint(), bucket);
+        let mut resp = agent().get(&url).call().expect("transport error");
+        let status = resp.status().as_u16();
+        let body = resp.body_mut().read_to_string().unwrap();
+        assert_eq!(
+            status, 404,
+            "expected 404 for anon list on nonexistent bucket, got {}",
+            status
+        );
+        assert!(
+            body.contains("<Code>NoSuchBucket</Code>"),
+            "expected NoSuchBucket in body: {}",
+            body
+        );
+    });
+}
+
 // ── Anonymous ListObjects V2 ────────────────────────────────────────────
 
 #[test]
@@ -337,6 +359,28 @@ fn test_anon_list_objects_v2_private_bucket_fail() {
         );
 
         cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_anon_list_objects_v2_nonexistent_bucket_returns_404() {
+    s3_tests::run(async {
+        let bucket = unique_bucket();
+
+        let url = format!("{}/{}?list-type=2", CTX.endpoint(), bucket);
+        let mut resp = agent().get(&url).call().expect("transport error");
+        let status = resp.status().as_u16();
+        let body = resp.body_mut().read_to_string().unwrap();
+        assert_eq!(
+            status, 404,
+            "expected 404 for anon listv2 on nonexistent bucket, got {}",
+            status
+        );
+        assert!(
+            body.contains("<Code>NoSuchBucket</Code>"),
+            "expected NoSuchBucket in body: {}",
+            body
+        );
     });
 }
 

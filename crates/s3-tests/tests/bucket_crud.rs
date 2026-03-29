@@ -413,7 +413,34 @@ fn test_bucket_list_objects_nonexistent_bucket() {
         let client = CTX.client();
         let bucket = unique_bucket();
         let result = client.list_objects_v2().bucket(&bucket).send().await;
-        assert!(result.is_err());
+        assert_eq!(err_status(&result), 404);
+        assert_s3_err_code(&result, "NoSuchBucket");
+    });
+}
+
+#[test]
+fn test_bucket_list_objects_nonexistent_bucket_alt_client() {
+    s3_tests::run(async {
+        if !CTX.has_alt_client() {
+            return;
+        }
+
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        if !ensure_distinct_s3_owners_or_skip(
+            client,
+            alt_client,
+            "test_bucket_list_objects_nonexistent_bucket_alt_client",
+        )
+        .await
+        {
+            return;
+        }
+
+        let bucket = unique_bucket();
+        let result = alt_client.list_objects_v2().bucket(&bucket).send().await;
+        assert_eq!(err_status(&result), 404);
+        assert_s3_err_code(&result, "NoSuchBucket");
     });
 }
 

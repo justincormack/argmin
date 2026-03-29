@@ -74,6 +74,7 @@ impl BucketPolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyAction {
     GetBucketPublicAccessBlock,
+    ListBucket,
     GetObject,
     GetObjectVersion,
     GetObjectAcl,
@@ -92,6 +93,7 @@ impl PolicyAction {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::GetBucketPublicAccessBlock => "s3:GetBucketPublicAccessBlock",
+            Self::ListBucket => "s3:ListBucket",
             Self::GetObject => "s3:GetObject",
             Self::GetObjectVersion => "s3:GetObjectVersion",
             Self::GetObjectAcl => "s3:GetObjectAcl",
@@ -648,6 +650,7 @@ fn parse_statement(value: &Value) -> Result<PolicyStatement, BucketPolicyError> 
         })?,
         "Resource must be a string or array of strings",
     )?;
+    validate_resource_applicability(&actions, &resources)?;
     let conditions = match object.get("Condition") {
         Some(value) => parse_conditions(value)?,
         None => Vec::new(),
@@ -661,6 +664,88 @@ fn parse_statement(value: &Value) -> Result<PolicyStatement, BucketPolicyError> 
         resources,
         conditions,
     })
+}
+
+fn validate_resource_applicability(
+    actions: &[String],
+    resources: &[String],
+) -> Result<(), BucketPolicyError> {
+    let has_bucket_action = actions.iter().any(|pattern| {
+        SUPPORTED_BUCKET_POLICY_BUCKET_ACTIONS
+            .iter()
+            .any(|action| action_pattern_matches(pattern, action.as_str()))
+    });
+    let has_object_action = actions.iter().any(|pattern| {
+        SUPPORTED_BUCKET_POLICY_OBJECT_ACTIONS
+            .iter()
+            .any(|action| action_pattern_matches(pattern, action.as_str()))
+    });
+
+    if !has_bucket_action && !has_object_action {
+        return Ok(());
+    }
+
+    let has_bucket_resource = resources.iter().any(|resource| {
+        matches!(
+            resource_scope(resource),
+            Some(ResourceScope::Bucket) | Some(ResourceScope::Both)
+        )
+    });
+    let has_object_resource = resources.iter().any(|resource| {
+        matches!(
+            resource_scope(resource),
+            Some(ResourceScope::Object) | Some(ResourceScope::Both)
+        )
+    });
+
+    if (has_bucket_action && !has_bucket_resource) || (has_object_action && !has_object_resource) {
+        return Err(BucketPolicyError::Malformed {
+            reason: "Action does not apply to any resource(s) in statement",
+        });
+    }
+
+    Ok(())
+}
+
+const SUPPORTED_BUCKET_POLICY_BUCKET_ACTIONS: [PolicyAction; 2] = [
+    PolicyAction::GetBucketPublicAccessBlock,
+    PolicyAction::ListBucket,
+];
+
+const SUPPORTED_BUCKET_POLICY_OBJECT_ACTIONS: [PolicyAction; 11] = [
+    PolicyAction::GetObject,
+    PolicyAction::GetObjectVersion,
+    PolicyAction::GetObjectAcl,
+    PolicyAction::GetObjectVersionAcl,
+    PolicyAction::GetObjectTagging,
+    PolicyAction::GetObjectVersionTagging,
+    PolicyAction::PutObject,
+    PolicyAction::PutObjectTagging,
+    PolicyAction::PutObjectVersionTagging,
+    PolicyAction::DeleteObjectTagging,
+    PolicyAction::DeleteObjectVersionTagging,
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResourceScope {
+    Bucket,
+    Object,
+    Both,
+}
+
+fn resource_scope(resource: &str) -> Option<ResourceScope> {
+    if resource == "*" {
+        return Some(ResourceScope::Both);
+    }
+
+    let suffix = resource.strip_prefix("arn:aws:s3:::")?;
+    if suffix == "*" {
+        return Some(ResourceScope::Both);
+    }
+    if suffix.contains('/') {
+        return Some(ResourceScope::Object);
+    }
+    Some(ResourceScope::Bucket)
 }
 
 fn parse_effect(effect: &str) -> Result<PolicyEffect, BucketPolicyError> {
@@ -1341,5 +1426,46 @@ mod tests {
         );
 
         assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitDeny);
+    }
+
+    #[test]
+    fn list_bucket_matches_bucket_resource() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket"}]}"#,
+        )
+        .unwrap();
+        let request = bucket_request(PolicyAction::ListBucket, "bucket", Some("caller"));
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+    }
+
+    #[test]
+    fn list_bucket_object_only_resource_is_rejected() {
+        let err = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            BucketPolicyError::Malformed {
+                reason: "Action does not apply to any resource(s) in statement",
+            }
+        );
+    }
+
+    #[test]
+    fn get_object_bucket_only_resource_is_rejected() {
+        let err = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket"}]}"#,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            BucketPolicyError::Malformed {
+                reason: "Action does not apply to any resource(s) in statement",
+            }
+        );
     }
 }
