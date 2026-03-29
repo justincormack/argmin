@@ -1656,11 +1656,13 @@ pub struct ListMultipartUploadsRequest<'a> {
     pub expected_bucket_owner: Option<&'a str>,
 }
 
-/// A single entry in a batch-delete request, with an already-parsed version ID.
+/// A single entry in a batch-delete request, with an already-parsed version ID
+/// and any per-object conditional delete settings from the XML body.
 #[derive(Debug)]
 pub struct DeleteEntry<'a> {
     pub key: &'a str,
     pub version_id: Option<VersionId>,
+    pub cond: DeleteCondition,
 }
 
 /// Request for a DeleteObjects (multi-delete) operation.
@@ -1668,7 +1670,6 @@ pub struct DeleteEntry<'a> {
 pub struct DeleteObjectsRequest<'a> {
     pub bucket: &'a str,
     pub entries: &'a [DeleteEntry<'a>],
-    pub cond: &'a DeleteCondition,
     pub requester: Requester,
     #[cfg(not(test))]
     pub expected_bucket_owner: Option<&'a str>,
@@ -2094,6 +2095,7 @@ pub struct DeletedObject {
 #[derive(Debug)]
 pub struct DeleteError {
     pub key: String,
+    pub version_id: Option<VersionId>,
     pub code: String,
     pub message: String,
 }
@@ -9823,6 +9825,12 @@ impl Coordinator {
                 let meta_pg = pgs.meta();
                 let is_delete_marker = stored.is_delete_marker();
 
+                if !cond.is_empty() {
+                    return Err(ServerError::NotImplemented {
+                        feature: "conditional delete with versionId".to_string(),
+                    });
+                }
+
                 // Delete shards if it's a live object (not a delete marker)
                 if let StoredObject::Live(record) = &stored {
                     if matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
@@ -9909,6 +9917,46 @@ impl Coordinator {
 
             // Versioned/Suspended + no versionId: insert delete marker
             (_, None) => {
+                if !cond.is_empty() {
+                    let LockedReadObject {
+                        record: stored,
+                        pgs,
+                    } = match self.lock_object_pgs_for_read(bucket, key, None) {
+                        Ok(locked) => locked,
+                        Err(ServerError::ObjectNotFound { .. }) => {
+                            return Err(ServerError::PreconditionFailed);
+                        }
+                        Err(other) => return Err(other),
+                    };
+
+                    let record = match stored {
+                        StoredObject::Live(record) => record,
+                        StoredObject::DeleteMarker(_) => {
+                            return Err(ServerError::PreconditionFailed);
+                        }
+                    };
+
+                    let etag_str = record.etag.format();
+                    check_delete_conditions(cond, &etag_str)?;
+                    let meta_pg = pgs.meta();
+                    let marker_vid = meta_pg.next_version_id(bucket, key)?;
+                    meta_pg.put_object_meta(&PutObjectReq::DeleteMarker(PutDeleteMarkerReq {
+                        bucket: BucketName::from(bucket),
+                        key: ObjectKey::from(key),
+                        version_id: marker_vid,
+                        owner: Self::effective_object_owner(
+                            &bucket_info,
+                            &req.requester,
+                            PutObjectAcl::None,
+                        ),
+                    }))?;
+
+                    return Ok(DeleteObjectResult {
+                        version_id: marker_vid,
+                        delete_marker: true,
+                    });
+                }
+
                 let meta_pg_id = self.object_pg_id(bucket, key);
                 let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
                 let marker_vid = meta_pg.next_version_id(bucket, key)?;
@@ -10251,7 +10299,6 @@ impl Coordinator {
         );
         let bucket = req.bucket;
         let entries = req.entries;
-        let cond = req.cond;
         let requester = &req.requester;
         let _bucket_info =
             self.authorize_bucket_admin_requester(requester, bucket, expected_bucket_owner)?;
@@ -10265,7 +10312,7 @@ impl Coordinator {
                     bucket,
                     entry.key,
                     entry.version_id,
-                    cond,
+                    &entry.cond,
                     requester.clone(),
                     expected_bucket_owner,
                 ),
@@ -10281,6 +10328,7 @@ impl Coordinator {
                 Err(e) => {
                     errors.push(DeleteError {
                         key: entry.key.to_string(),
+                        version_id: entry.version_id,
                         code: e.s3_error_code().to_string(),
                         message: e.to_string(),
                     });
@@ -15465,15 +15513,18 @@ mod tests {
             DeleteEntry {
                 key: "key1",
                 version_id: None,
+                cond: DeleteCondition::None,
             },
             DeleteEntry {
                 key: "key2",
                 version_id: None,
+                cond: DeleteCondition::None,
             },
             // key3 doesn't exist — should still succeed (idempotent)
             DeleteEntry {
                 key: "key3",
                 version_id: None,
+                cond: DeleteCondition::None,
             },
         ];
 
@@ -15481,7 +15532,6 @@ mod tests {
             .delete_objects(&DeleteObjectsRequest {
                 bucket: "bucket",
                 entries: &entries,
-                cond: NO_DELETE,
                 requester: TEST_REQUESTER,
             })
             .unwrap();
@@ -15519,13 +15569,13 @@ mod tests {
         let entries = vec![DeleteEntry {
             key: "key1",
             version_id: None,
+            cond: DeleteCondition::None,
         }];
 
         let err = coord
             .delete_objects(&DeleteObjectsRequest {
                 bucket: "no-bucket",
                 entries: &entries,
-                cond: NO_DELETE,
                 requester: TEST_REQUESTER,
             })
             .unwrap_err();
@@ -17794,12 +17844,12 @@ mod tests {
         let entries = vec![DeleteEntry {
             key: "key",
             version_id: None,
+            cond: DeleteCondition::None,
         }];
         let err = coord
             .delete_objects(&DeleteObjectsRequest {
                 bucket: "bucket",
                 entries: &entries,
-                cond: NO_DELETE,
                 requester: Requester::principal("other-user"),
             })
             .unwrap_err();
@@ -18700,6 +18750,78 @@ mod tests {
     }
 
     #[test]
+    fn delete_version_if_match_is_not_implemented() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+        coord
+            .put_bucket_versioning("bucket", BucketVersioningState::Enabled, TEST_REQUESTER)
+            .unwrap();
+
+        let v1 = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "key",
+                data: b"v1",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "key",
+                data: b"v2",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        let cond = DeleteCondition::IfMatch("\"0000000000000000\"".into());
+        let err = coord
+            .delete_object(&DeleteObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: Some(v1.version_id),
+                cond: &cond,
+                requester: TEST_REQUESTER,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ServerError::NotImplemented { ref feature }
+            if feature == "conditional delete with versionId"
+        ));
+
+        let v1_obj = coord
+            .get_object(&GetObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "key",
+                version_id: Some(v1.version_id),
+                cond: NO_READ,
+                requester: TEST_REQUESTER,
+            })
+            .unwrap();
+        assert_eq!(v1_obj.body.read_all().unwrap(), b"v1");
+    }
+
+    #[test]
     fn delete_objects_if_match_per_entry() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
@@ -18738,23 +18860,23 @@ mod tests {
         )
         .unwrap();
 
-        // Use key1's etag for both entries; key2 will fail the condition
-        let cond = DeleteCondition::IfMatch(p1.etag.into());
+        // Use key1's etag for both entries; key2 will fail the condition.
         let entries = vec![
             DeleteEntry {
                 key: "key1",
                 version_id: None,
+                cond: DeleteCondition::IfMatch(p1.etag.clone().into()),
             },
             DeleteEntry {
                 key: "key2",
                 version_id: None,
+                cond: DeleteCondition::IfMatch(p1.etag.into()),
             },
         ];
         let result = coord
             .delete_objects(&DeleteObjectsRequest {
                 bucket: "bucket",
                 entries: &entries,
-                cond: &cond,
                 requester: TEST_REQUESTER,
             })
             .unwrap();

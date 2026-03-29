@@ -1,6 +1,7 @@
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::primitives::DateTime;
-use s3_tests::{err_status, unique_bucket, CTX};
+use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
+use s3_tests::{cleanup_versioned_bucket, err_status, unique_bucket, CTX};
 
 /// Create a bucket, returning its name.
 async fn setup_bucket() -> String {
@@ -1116,6 +1117,70 @@ fn test_delete_object_if_match() {
         assert_eq!(&data[..], b"hello");
 
         cleanup(&bucket, &["obj"]).await;
+    });
+}
+
+#[test]
+fn test_delete_object_version_if_match_not_implemented() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        client
+            .put_bucket_versioning()
+            .bucket(&bucket)
+            .versioning_configuration(
+                VersioningConfiguration::builder()
+                    .status(BucketVersioningStatus::Enabled)
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let put = client
+            .put_object()
+            .bucket(&bucket)
+            .key("obj")
+            .body(ByteStream::from_static(b"hello"))
+            .send()
+            .await
+            .unwrap();
+        let version_id = put.version_id().unwrap().to_string();
+        let etag = put.e_tag().unwrap().to_string();
+
+        let bad = client
+            .delete_object()
+            .bucket(&bucket)
+            .key("obj")
+            .version_id(&version_id)
+            .if_match("\"0000000000000000\"")
+            .send()
+            .await;
+        assert_eq!(err_status(&bad), 501);
+
+        let good = client
+            .delete_object()
+            .bucket(&bucket)
+            .key("obj")
+            .version_id(&version_id)
+            .if_match(&etag)
+            .send()
+            .await;
+        assert_eq!(err_status(&good), 501);
+
+        let resp = client
+            .get_object()
+            .bucket(&bucket)
+            .key("obj")
+            .version_id(&version_id)
+            .send()
+            .await
+            .unwrap();
+        let data = resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], b"hello");
+
+        cleanup_versioned_bucket(client, &bucket).await;
     });
 }
 

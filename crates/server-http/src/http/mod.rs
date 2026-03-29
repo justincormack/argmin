@@ -1146,6 +1146,13 @@ impl HttpFrontend {
             S3Operation::DeleteObject { bucket, key } => {
                 let cond = delete_condition_from_headers(req)?;
                 let vid = parse_version_id(req)?;
+                if vid.is_some() && !cond.is_empty() {
+                    return Err(ServerError::NotImplemented {
+                        feature:
+                            "A header you provided implies functionality that is not implemented"
+                                .to_string(),
+                    });
+                }
                 let requester = Self::requester_from_auth(auth);
                 let result =
                     self.coordinator
@@ -1318,31 +1325,57 @@ impl HttpFrontend {
             S3Operation::DeleteObjects { bucket } => {
                 require_content_md5(req)?;
                 let (xml_entries, quiet) = xml::parse_delete_objects_xml(&req.body)?;
-                let cond = delete_condition_from_headers(req)?;
                 let requester = Self::requester_from_auth(auth);
-                let entries: Vec<crate::coordinator::DeleteEntry> = xml_entries
-                    .iter()
-                    .map(|e| {
-                        let version_id = e
-                            .version_id
-                            .as_deref()
-                            .map(parse_version_id_str)
-                            .transpose()?;
-                        Ok(crate::coordinator::DeleteEntry {
-                            key: &e.key,
+                let mut entries: Vec<crate::coordinator::DeleteEntry> = Vec::new();
+                let mut validation_errors: Vec<crate::coordinator::DeleteError> = Vec::new();
+                for e in &xml_entries {
+                    let version_id = e
+                        .version_id
+                        .as_deref()
+                        .map(parse_version_id_str)
+                        .transpose()?;
+                    let has_unsupported_form_fields =
+                        e.last_modified_time.is_some() || e.size.is_some();
+                    let has_unsupported_versioned_etag = version_id.is_some() && e.etag.is_some();
+                    if has_unsupported_form_fields || has_unsupported_versioned_etag {
+                        validation_errors.push(crate::coordinator::DeleteError {
+                            key: e.key.clone(),
                             version_id,
-                        })
-                    })
-                    .collect::<Result<_, ServerError>>()?;
-                let result =
+                            code: "NotImplemented".to_string(),
+                            message:
+                                "A form field you provided implies functionality that is not implemented"
+                                    .to_string(),
+                        });
+                        continue;
+                    }
+
+                    let cond = match e.etag.as_deref() {
+                        Some(etag) => crate::conditional::DeleteCondition::IfMatch(
+                            crate::conditional::EtagMatchList::from_header_value(etag),
+                        ),
+                        None => crate::conditional::DeleteCondition::None,
+                    };
+                    entries.push(crate::coordinator::DeleteEntry {
+                        key: &e.key,
+                        version_id,
+                        cond,
+                    });
+                }
+                let mut result = if entries.is_empty() {
+                    crate::coordinator::DeleteObjectsResult {
+                        deleted: Vec::new(),
+                        errors: Vec::new(),
+                    }
+                } else {
                     self.coordinator
                         .delete_objects(&crate::coordinator::DeleteObjectsRequest {
                             bucket: &bucket,
                             entries: &entries,
-                            cond: &cond,
                             requester,
                             expected_bucket_owner,
-                        })?;
+                        })?
+                };
+                result.errors.extend(validation_errors);
                 Ok(S3Response::delete_objects(&result, quiet))
             }
             S3Operation::PutBucketVersioning { bucket } => {

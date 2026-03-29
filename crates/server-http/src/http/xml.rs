@@ -608,6 +608,9 @@ pub fn list_objects_v1_xml(
 pub struct DeleteObjectEntry {
     pub key: String,
     pub version_id: Option<String>,
+    pub etag: Option<String>,
+    pub last_modified_time: Option<String>,
+    pub size: Option<String>,
 }
 
 /// Parse a `DeleteObjects` XML request body.
@@ -621,7 +624,10 @@ pub fn parse_delete_objects_xml(
         Start,
         InDelete,
         InObject,
+        InEtag,
         InKey,
+        InLastModifiedTime,
+        InSize,
         InVersionId,
         InQuiet,
         Done,
@@ -638,7 +644,10 @@ pub fn parse_delete_objects_xml(
     let mut state = State::Start;
     let mut entries = Vec::new();
     let mut quiet = false;
+    let mut current_etag: Option<String> = None;
     let mut current_key: Option<String> = None;
+    let mut current_last_modified_time: Option<String> = None;
+    let mut current_size: Option<String> = None;
     let mut current_version_id: Option<String> = None;
     let mut current_text = String::new();
 
@@ -647,7 +656,10 @@ pub fn parse_delete_objects_xml(
             Ok(Event::Start(e)) => match (state, e.name().as_ref()) {
                 (State::Start, b"Delete") => state = State::InDelete,
                 (State::InDelete, b"Object") => {
+                    current_etag = None;
                     current_key = None;
+                    current_last_modified_time = None;
+                    current_size = None;
                     current_version_id = None;
                     state = State::InObject;
                 }
@@ -655,9 +667,21 @@ pub fn parse_delete_objects_xml(
                     current_text.clear();
                     state = State::InQuiet;
                 }
+                (State::InObject, b"ETag") => {
+                    current_text.clear();
+                    state = State::InEtag;
+                }
                 (State::InObject, b"Key") => {
                     current_text.clear();
                     state = State::InKey;
+                }
+                (State::InObject, b"LastModifiedTime") => {
+                    current_text.clear();
+                    state = State::InLastModifiedTime;
+                }
+                (State::InObject, b"Size") => {
+                    current_text.clear();
+                    state = State::InSize;
                 }
                 (State::InObject, b"VersionId") => {
                     current_text.clear();
@@ -671,8 +695,17 @@ pub fn parse_delete_objects_xml(
                     return Err(malformed_delete_xml("Object missing <Key> element"));
                 }
                 (State::InDelete, b"Quiet") => {}
+                (State::InObject, b"ETag") => {
+                    current_etag = Some(String::new());
+                }
                 (State::InObject, b"Key") => {
                     return Err(malformed_delete_xml("Object missing <Key> element"));
+                }
+                (State::InObject, b"LastModifiedTime") => {
+                    current_last_modified_time = Some(String::new());
+                }
+                (State::InObject, b"Size") => {
+                    current_size = Some(String::new());
                 }
                 (State::InObject, b"VersionId") => {
                     current_version_id = Some(String::new());
@@ -690,7 +723,10 @@ pub fn parse_delete_objects_xml(
                         .take()
                         .ok_or_else(|| malformed_delete_xml("Object missing <Key> element"))?;
                     entries.push(DeleteObjectEntry {
+                        etag: current_etag.take(),
                         key,
+                        last_modified_time: current_last_modified_time.take(),
+                        size: current_size.take(),
                         version_id: current_version_id.take(),
                     });
                     if entries.len() > 1000 {
@@ -700,8 +736,20 @@ pub fn parse_delete_objects_xml(
                     }
                     state = State::InDelete;
                 }
+                (State::InEtag, b"ETag") => {
+                    current_etag = Some(std::mem::take(&mut current_text));
+                    state = State::InObject;
+                }
                 (State::InKey, b"Key") => {
                     current_key = Some(std::mem::take(&mut current_text));
+                    state = State::InObject;
+                }
+                (State::InLastModifiedTime, b"LastModifiedTime") => {
+                    current_last_modified_time = Some(std::mem::take(&mut current_text));
+                    state = State::InObject;
+                }
+                (State::InSize, b"Size") => {
+                    current_size = Some(std::mem::take(&mut current_text));
                     state = State::InObject;
                 }
                 (State::InVersionId, b"VersionId") => {
@@ -726,7 +774,12 @@ pub fn parse_delete_objects_xml(
                     "invalid XML entity in delete XML body",
                 )?;
                 match state {
-                    State::InKey | State::InVersionId | State::InQuiet => {
+                    State::InEtag
+                    | State::InKey
+                    | State::InLastModifiedTime
+                    | State::InSize
+                    | State::InVersionId
+                    | State::InQuiet => {
                         current_text.push_str(&text);
                     }
                     _ if text.trim().is_empty() => {}
@@ -737,7 +790,12 @@ pub fn parse_delete_objects_xml(
                 let text = std::str::from_utf8(t.as_ref())
                     .map_err(|_| malformed_delete_xml("invalid UTF-8 in delete XML body"))?;
                 match state {
-                    State::InKey | State::InVersionId | State::InQuiet => {
+                    State::InEtag
+                    | State::InKey
+                    | State::InLastModifiedTime
+                    | State::InSize
+                    | State::InVersionId
+                    | State::InQuiet => {
                         current_text.push_str(text);
                     }
                     _ if text.trim().is_empty() => {}
@@ -749,9 +807,12 @@ pub fn parse_delete_objects_xml(
                 return match state {
                     State::Done => Ok((entries, quiet)),
                     State::Start => Err(malformed_delete_xml("missing <Delete> element")),
-                    State::InObject | State::InKey | State::InVersionId => {
-                        Err(malformed_delete_xml("unclosed <Object> element"))
-                    }
+                    State::InObject
+                    | State::InEtag
+                    | State::InKey
+                    | State::InLastModifiedTime
+                    | State::InSize
+                    | State::InVersionId => Err(malformed_delete_xml("unclosed <Object> element")),
                     _ => Err(malformed_delete_xml("unexpected end of delete XML")),
                 };
             }
@@ -794,7 +855,14 @@ pub fn delete_objects_result_xml(
     for e in errors {
         xml.push_str("<Error><Key>");
         xml.push_str(&xml_escape(&e.key));
-        xml.push_str("</Key><Code>");
+        xml.push_str("</Key>");
+        if let Some(version_id) = e.version_id {
+            let vid = super::response::format_version_id(version_id);
+            xml.push_str("<VersionId>");
+            xml.push_str(&xml_escape(&vid));
+            xml.push_str("</VersionId>");
+        }
+        xml.push_str("<Code>");
         xml.push_str(&xml_escape(&e.code));
         xml.push_str("</Code><Message>");
         xml.push_str(&xml_escape(&e.message));
@@ -2996,7 +3064,6 @@ mod tests {
     }
 
     const NO_WRITE: &WriteCondition = &WriteCondition::None;
-    const NO_DELETE: &DeleteCondition = &DeleteCondition::None;
     const NO_PUT_OBJECT_ACL: PutObjectAcl<'static> = PutObjectAcl::None;
 
     fn test_requester() -> Requester {
@@ -3347,6 +3414,18 @@ mod tests {
     }
 
     #[test]
+    fn parse_delete_objects_with_conditional_fields() {
+        let xml = b"<Delete><Object><ETag>\"etag\"</ETag><Key>key1</Key><LastModifiedTime>Tue, 15 Oct 2024 15:04:05 GMT</LastModifiedTime><Size>50</Size></Object></Delete>";
+        let (entries, _) = parse_delete_objects_xml(xml).unwrap();
+        assert_eq!(entries[0].etag.as_deref(), Some("\"etag\""));
+        assert_eq!(
+            entries[0].last_modified_time.as_deref(),
+            Some("Tue, 15 Oct 2024 15:04:05 GMT")
+        );
+        assert_eq!(entries[0].size.as_deref(), Some("50"));
+    }
+
+    #[test]
     fn parse_delete_objects_quiet_mode() {
         let xml = b"<Delete><Quiet>true</Quiet><Object><Key>key1</Key></Object></Delete>";
         let (_, quiet) = parse_delete_objects_xml(xml).unwrap();
@@ -3376,6 +3455,7 @@ mod tests {
         }];
         let errors = vec![DeleteError {
             key: "key2".to_string(),
+            version_id: None,
             code: "AccessDenied".to_string(),
             message: "Access Denied".to_string(),
         }];
@@ -3384,6 +3464,21 @@ mod tests {
         assert!(xml.contains("<Error><Key>key2</Key>"));
         assert!(xml.contains("<Code>AccessDenied</Code>"));
         assert!(xml.contains("DeleteResult"));
+    }
+
+    #[test]
+    fn delete_result_xml_error_includes_version_id() {
+        use crate::coordinator::DeleteError;
+        let errors = vec![DeleteError {
+            key: "key2".to_string(),
+            version_id: Some(VersionId::from_u64(7)),
+            code: "NotImplemented".to_string(),
+            message: "A form field you provided implies functionality that is not implemented"
+                .to_string(),
+        }];
+        let xml = delete_objects_result_xml(&[], &errors, false);
+        assert!(xml
+            .contains("<Error><Key>key2</Key><VersionId>7</VersionId><Code>NotImplemented</Code>"));
     }
 
     #[test]
@@ -5071,6 +5166,7 @@ mod tests {
             .map(|e| DeleteEntry {
                 key: &e.key,
                 version_id: None,
+                cond: DeleteCondition::None,
             })
             .collect();
 
@@ -5078,7 +5174,6 @@ mod tests {
             .delete_objects(&DeleteObjectsRequest {
                 bucket: "test-bucket",
                 entries: &entries,
-                cond: NO_DELETE,
                 requester: test_requester(),
                 expected_bucket_owner: None,
             })
@@ -5200,6 +5295,7 @@ mod tests {
             .map(|e| DeleteEntry {
                 key: &e.key,
                 version_id: None,
+                cond: DeleteCondition::None,
             })
             .collect();
 
@@ -5207,7 +5303,6 @@ mod tests {
             .delete_objects(&DeleteObjectsRequest {
                 bucket: "bucket",
                 entries: &entries,
-                cond: NO_DELETE,
                 requester: test_requester(),
                 expected_bucket_owner: None,
             })

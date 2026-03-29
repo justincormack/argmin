@@ -16,6 +16,27 @@ fn make_object_id(key: &str) -> ObjectIdentifier {
         .expect("build ObjectIdentifier")
 }
 
+fn make_object_id_with_etag(key: &str, etag: &str) -> ObjectIdentifier {
+    ObjectIdentifier::builder()
+        .key(key)
+        .e_tag(etag)
+        .build()
+        .expect("build ObjectIdentifier")
+}
+
+fn make_object_id_with_version_and_etag(
+    key: &str,
+    version_id: &str,
+    etag: &str,
+) -> ObjectIdentifier {
+    ObjectIdentifier::builder()
+        .key(key)
+        .version_id(version_id)
+        .e_tag(etag)
+        .build()
+        .expect("build ObjectIdentifier")
+}
+
 fn make_delete_request(keys: &[&str], quiet: bool) -> Delete {
     let objects: Vec<ObjectIdentifier> = keys.iter().map(|k| make_object_id(k)).collect();
     Delete::builder()
@@ -277,6 +298,61 @@ fn test_multi_object_delete_verify_response() {
         assert!(resp.errors().is_empty());
 
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_multi_object_delete_per_object_if_match() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let ok = client
+            .put_object()
+            .bucket(&bucket)
+            .key("ok")
+            .body(ByteStream::from_static(b"ok"))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("stale")
+            .body(ByteStream::from_static(b"stale"))
+            .send()
+            .await
+            .unwrap();
+
+        let delete = Delete::builder()
+            .set_objects(Some(vec![
+                make_object_id_with_etag("ok", ok.e_tag().unwrap()),
+                make_object_id_with_etag("stale", "\"0000000000000000\""),
+            ]))
+            .quiet(false)
+            .build()
+            .unwrap();
+        let resp = delete_objects_with_md5(client, &bucket, delete)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.deleted().len(), 1);
+        assert_eq!(resp.deleted()[0].key(), Some("ok"));
+        assert_eq!(resp.errors().len(), 1);
+        assert_eq!(resp.errors()[0].key(), Some("stale"));
+        assert_eq!(resp.errors()[0].code(), Some("PreconditionFailed"));
+
+        client
+            .head_object()
+            .bucket(&bucket)
+            .key("stale")
+            .send()
+            .await
+            .unwrap();
+
+        delete_all_and_bucket(client, &bucket, &["stale".to_string()]).await;
     });
 }
 
@@ -663,6 +739,166 @@ fn test_versioning_multi_object_delete_marker_create() {
             "original version should still exist"
         );
         assert_eq!(list.delete_markers().len(), 1, "delete marker should exist");
+
+        cleanup_versioned_bucket(&bucket).await;
+    });
+}
+
+#[test]
+fn test_versioning_multi_object_delete_current_if_match() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_versioned_bucket().await;
+        let put = client
+            .put_object()
+            .bucket(&bucket)
+            .key("obj")
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+
+        let bad_delete = Delete::builder()
+            .set_objects(Some(vec![make_object_id_with_etag(
+                "obj",
+                "\"0000000000000000\"",
+            )]))
+            .quiet(false)
+            .build()
+            .unwrap();
+        let bad_resp = delete_objects_with_md5(client, &bucket, bad_delete)
+            .send()
+            .await
+            .unwrap();
+        assert!(bad_resp.deleted().is_empty());
+        assert_eq!(bad_resp.errors().len(), 1);
+        assert_eq!(bad_resp.errors()[0].key(), Some("obj"));
+        assert_eq!(bad_resp.errors()[0].code(), Some("PreconditionFailed"));
+
+        let delete = Delete::builder()
+            .set_objects(Some(vec![make_object_id_with_etag(
+                "obj",
+                put.e_tag().unwrap(),
+            )]))
+            .quiet(false)
+            .build()
+            .unwrap();
+        let resp = delete_objects_with_md5(client, &bucket, delete)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.deleted().len(), 1);
+        let deleted = &resp.deleted()[0];
+        assert_eq!(deleted.key(), Some("obj"));
+        assert_eq!(deleted.delete_marker(), Some(true));
+        assert!(deleted.delete_marker_version_id().is_some());
+
+        let get_result = client.get_object().bucket(&bucket).key("obj").send().await;
+        assert!(get_result.is_err());
+
+        cleanup_versioned_bucket(&bucket).await;
+    });
+}
+
+#[test]
+fn test_versioning_multi_object_delete_version_id_with_etag_not_implemented() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_versioned_bucket().await;
+        let key = "obj";
+
+        let first = client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"v1"))
+            .send()
+            .await
+            .unwrap();
+        let first_version = first.version_id().unwrap().to_string();
+        let first_etag = first.e_tag().unwrap().to_string();
+
+        let second = client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"v2"))
+            .send()
+            .await
+            .unwrap();
+        let second_version = second.version_id().unwrap().to_string();
+
+        // AWS does not support DeleteObjects entries that combine VersionId
+        // and ETag on general-purpose buckets. Both matching and mismatching
+        // ETags return per-object NotImplemented and leave the version intact.
+        let bad_delete = Delete::builder()
+            .set_objects(Some(vec![make_object_id_with_version_and_etag(
+                key,
+                &first_version,
+                "\"0000000000000000\"",
+            )]))
+            .quiet(false)
+            .build()
+            .unwrap();
+        let bad_resp = delete_objects_with_md5(client, &bucket, bad_delete)
+            .send()
+            .await
+            .unwrap();
+
+        assert!(bad_resp.deleted().is_empty());
+        assert_eq!(bad_resp.errors().len(), 1);
+        assert_eq!(bad_resp.errors()[0].key(), Some(key));
+        assert_eq!(
+            bad_resp.errors()[0].version_id(),
+            Some(first_version.as_str())
+        );
+        assert_eq!(bad_resp.errors()[0].code(), Some("NotImplemented"));
+
+        let good_delete = Delete::builder()
+            .set_objects(Some(vec![make_object_id_with_version_and_etag(
+                key,
+                &first_version,
+                &first_etag,
+            )]))
+            .quiet(false)
+            .build()
+            .unwrap();
+        let good_resp = delete_objects_with_md5(client, &bucket, good_delete)
+            .send()
+            .await
+            .unwrap();
+
+        assert!(good_resp.deleted().is_empty());
+        assert_eq!(good_resp.errors().len(), 1);
+        assert_eq!(good_resp.errors()[0].key(), Some(key));
+        assert_eq!(
+            good_resp.errors()[0].version_id(),
+            Some(first_version.as_str())
+        );
+        assert_eq!(good_resp.errors()[0].code(), Some("NotImplemented"));
+
+        let first_get = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&first_version)
+            .send()
+            .await
+            .unwrap();
+        let first_data = first_get.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&first_data[..], b"v1");
+
+        let second_get = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&second_version)
+            .send()
+            .await
+            .unwrap();
+        let data = second_get.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], b"v2");
 
         cleanup_versioned_bucket(&bucket).await;
     });
