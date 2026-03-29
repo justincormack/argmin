@@ -91,6 +91,13 @@ pub trait PgMetadataStore {
         state: BucketVersioningState,
     ) -> Result<(), MetadataError>;
 
+    /// Store bucket-level Object Lock configuration.
+    fn put_bucket_object_lock(
+        &self,
+        name: &str,
+        config: BucketObjectLockConfig,
+    ) -> Result<(), MetadataError>;
+
     /// Store a CORS configuration for a bucket (serialized XML string).
     fn put_bucket_cors(&self, name: &str, config: &str) -> Result<(), MetadataError>;
 

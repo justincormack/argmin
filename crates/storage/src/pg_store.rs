@@ -29,6 +29,8 @@ const TRACE_TARGET: &str = "storage";
 /// in-progress staging rows are invisible to reads of completed objects.
 const PART_SEGMENT_STAGING_VERSION_ID: VersionId = MULTIPART_PART_SEGMENT_STAGING_VERSION_ID;
 type StreamSessionRow = (u8, u8, BucketName, ObjectKey, Option<UploadId>, Option<i64>);
+type BucketObjectLockSqlValues = (i64, Option<u8>, Option<i64>, Option<i64>);
+type ObjectLockSqlValues = (Option<u8>, Option<i64>, u8);
 
 struct PreparedShardFile {
     key: ShardKey,
@@ -700,10 +702,201 @@ impl PgStore {
         })
     }
 
+    fn parse_optional_u64(
+        value: Option<i64>,
+        col: usize,
+        field: &str,
+    ) -> Result<Option<u64>, rusqlite::Error> {
+        value
+            .map(|v| {
+                u64::try_from(v).map_err(|_| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        col,
+                        rusqlite::types::Type::Integer,
+                        Box::from(format!(
+                            "invalid {field}: {v} (expected integer in 0..={})",
+                            u64::MAX
+                        )),
+                    )
+                })
+            })
+            .transpose()
+    }
+
+    fn parse_bucket_object_lock(
+        (enabled_raw, default_mode_raw, default_days_raw, default_years_raw): BucketObjectLockSqlValues,
+        [enabled_col, mode_col, days_col, years_col]: [usize; 4],
+    ) -> Result<BucketObjectLockConfig, rusqlite::Error> {
+        let enabled = match enabled_raw {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(rusqlite::Error::FromSqlConversionFailure(
+                    enabled_col,
+                    rusqlite::types::Type::Integer,
+                    Box::from(format!("invalid object_lock_enabled: {enabled_raw}")),
+                ));
+            }
+        };
+        let default_mode = default_mode_raw
+            .map(|raw| {
+                Self::parse_enum(
+                    raw,
+                    mode_col,
+                    "object_lock_default_mode",
+                    ObjectLockMode::from_u8,
+                )
+            })
+            .transpose()?;
+        let default_days =
+            Self::parse_optional_u32(default_days_raw, days_col, "object_lock_default_days")?;
+        let default_years =
+            Self::parse_optional_u32(default_years_raw, years_col, "object_lock_default_years")?;
+        let default_retention = match (default_mode, default_days, default_years) {
+            (None, None, None) => None,
+            (Some(mode), Some(days), None) => Some(ObjectLockDefaultRetention {
+                mode,
+                period: RetentionPeriod::days(days).ok_or_else(|| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        days_col,
+                        rusqlite::types::Type::Integer,
+                        Box::from("object_lock_default_days must be > 0"),
+                    )
+                })?,
+            }),
+            (Some(mode), None, Some(years)) => Some(ObjectLockDefaultRetention {
+                mode,
+                period: RetentionPeriod::years(years).ok_or_else(|| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        years_col,
+                        rusqlite::types::Type::Integer,
+                        Box::from("object_lock_default_years must be > 0"),
+                    )
+                })?,
+            }),
+            _ => {
+                return Err(rusqlite::Error::FromSqlConversionFailure(
+                    mode_col,
+                    rusqlite::types::Type::Integer,
+                    Box::from("invalid bucket object lock default retention state"),
+                ));
+            }
+        };
+        Ok(BucketObjectLockConfig {
+            enabled,
+            default_retention,
+        })
+    }
+
+    fn parse_object_lock_state(
+        retention_mode_raw: Option<u8>,
+        retain_until_raw: Option<i64>,
+        legal_hold_raw: u8,
+        mode_col: usize,
+        retain_until_col: usize,
+        legal_hold_col: usize,
+    ) -> Result<ObjectLockState, rusqlite::Error> {
+        let retention_mode = retention_mode_raw
+            .map(|raw| {
+                Self::parse_enum(
+                    raw,
+                    mode_col,
+                    "object_lock_retention_mode",
+                    ObjectLockMode::from_u8,
+                )
+            })
+            .transpose()?;
+        let retain_until = Self::parse_optional_u64(
+            retain_until_raw,
+            retain_until_col,
+            "object_lock_retain_until",
+        )?;
+        let legal_hold = Self::parse_enum(
+            legal_hold_raw,
+            legal_hold_col,
+            "object_lock_legal_hold",
+            StoredLegalHoldStatus::from_u8,
+        )?;
+        let retention = match (retention_mode, retain_until) {
+            (None, None) => None,
+            (Some(mode), Some(retain_until_unix_seconds)) if retain_until_unix_seconds > 0 => {
+                Some(ObjectRetention {
+                    retain_until_unix_seconds,
+                    mode,
+                })
+            }
+            (Some(_), Some(_)) => {
+                return Err(rusqlite::Error::FromSqlConversionFailure(
+                    retain_until_col,
+                    rusqlite::types::Type::Integer,
+                    Box::from("object_lock_retain_until must be > 0"),
+                ));
+            }
+            _ => {
+                return Err(rusqlite::Error::FromSqlConversionFailure(
+                    mode_col,
+                    rusqlite::types::Type::Integer,
+                    Box::from("invalid object lock retention state"),
+                ));
+            }
+        };
+        Ok(ObjectLockState {
+            retention,
+            legal_hold,
+        })
+    }
+
+    fn bucket_object_lock_sql_values(
+        config: BucketObjectLockConfig,
+    ) -> Result<BucketObjectLockSqlValues, rusqlite::Error> {
+        let enabled = i64::from(config.enabled);
+        let (default_mode, default_days, default_years) = match config.default_retention {
+            None => (None, None, None),
+            Some(default_retention) => {
+                let (days, years) = match default_retention.period {
+                    RetentionPeriod::Days(days) => (Some(i64::from(days.get())), None),
+                    RetentionPeriod::Years(years) => (None, Some(i64::from(years.get()))),
+                };
+                (Some(default_retention.mode as u8), days, years)
+            }
+        };
+        Ok((enabled, default_mode, default_days, default_years))
+    }
+
+    fn object_lock_sql_values(
+        object_lock: ObjectLockState,
+    ) -> Result<ObjectLockSqlValues, rusqlite::Error> {
+        let (retention_mode, retain_until) = match object_lock.retention {
+            None => (None, None),
+            Some(retention) => {
+                let retain_until =
+                    i64::try_from(retention.retain_until_unix_seconds).map_err(|_| {
+                        rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(
+                            format!(
+                                "object lock retain-until exceeds SQLite INTEGER: {}",
+                                retention.retain_until_unix_seconds
+                            ),
+                        )))
+                    })?;
+                (Some(retention.mode as u8), Some(retain_until))
+            }
+        };
+        Ok((retention_mode, retain_until, object_lock.legal_hold as u8))
+    }
+
     fn row_to_bucket_info(row: &rusqlite::Row<'_>) -> Result<BucketInfo, rusqlite::Error> {
         let owner_canonical_id_raw: String = row.get(2)?;
         let owner_canonical_id =
             Self::parse_canonical_user_id(owner_canonical_id_raw, 2, "owner_canonical_id")?;
+        let object_lock = Self::parse_bucket_object_lock(
+            (
+                row.get::<_, i64>(20)?,
+                row.get::<_, Option<u8>>(21)?,
+                row.get::<_, Option<i64>>(22)?,
+                row.get::<_, Option<i64>>(23)?,
+            ),
+            [20, 21, 22, 23],
+        )?;
         let acl_grants = Self::parse_acl_grants(row.get::<_, String>(7)?, 7, "acl_grants")?;
         Ok(BucketInfo {
             name: row.get(0)?,
@@ -718,7 +911,7 @@ impl PgStore {
                 "versioning",
                 BucketVersioningState::from_u8,
             )?,
-            object_lock: BucketObjectLockConfig::default(),
+            object_lock,
             acl_grants,
             public_read: row.get::<_, i64>(8)? != 0,
             public_write: row.get::<_, i64>(9)? != 0,
@@ -747,7 +940,8 @@ impl PgStore {
     /// etag, etag_kind, last_modified, storage_class, ec_k, ec_m, status,
     /// tags, data_layout, parts_count, metadata_blob, system_metadata_blob,
     /// encryption_type, encryption_state, owner_principal, owner_canonical_id,
-    /// acl_grants, public_read)
+    /// acl_grants, public_read, object_lock_retention_mode,
+    /// object_lock_retain_until, object_lock_legal_hold)
     /// to a StoredObject.
     fn parse_canonical_user_id(
         raw: String,
@@ -890,6 +1084,14 @@ impl PgStore {
             Self::parse_owner_identity(row, 19, 20, "owner_principal", "owner_canonical_id")?;
         let acl_grants = Self::parse_acl_grants(row.get::<_, String>(21)?, 21, "acl_grants")?;
         let public_read = row.get::<_, i64>(22)? != 0;
+        let object_lock = Self::parse_object_lock_state(
+            row.get::<_, Option<u8>>(23)?,
+            row.get::<_, Option<i64>>(24)?,
+            row.get::<_, u8>(25)?,
+            23,
+            24,
+            25,
+        )?;
 
         match status {
             ObjectState::DeleteMarker => {
@@ -928,6 +1130,7 @@ impl PgStore {
                     || encryption != ObjectEncryption::None
                     || !acl_grants.is_empty()
                     || public_read
+                    || object_lock != ObjectLockState::default()
                 {
                     return Err(rusqlite::Error::FromSqlConversionFailure(
                         11,
@@ -1012,7 +1215,7 @@ impl PgStore {
                     system_metadata_blob: row
                         .get::<_, Option<Vec<u8>>>(16)?
                         .map(SerializedSystemMetadataBlob::from),
-                    object_lock: ObjectLockState::default(),
+                    object_lock,
                     encryption,
                 }))
             }
@@ -1266,7 +1469,7 @@ impl PgMetadataStore for PgStore {
     fn head_bucket_raw(&self, name: &str) -> Result<BucketInfo, MetadataError> {
         self.conn
             .query_row(
-                "SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, write_reservations_blocked, active_write_reservations, cors_config, tags, public_access_block, ownership_controls, bucket_policy, bucket_policy_public, bucket_policy_generation, sse_c_blocked \
+                "SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, write_reservations_blocked, active_write_reservations, cors_config, tags, public_access_block, ownership_controls, bucket_policy, bucket_policy_public, bucket_policy_generation, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years \
                  FROM buckets WHERE name = ?1",
                 params![name],
                 Self::row_to_bucket_info,
@@ -1292,7 +1495,7 @@ impl PgMetadataStore for PgStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, write_reservations_blocked, active_write_reservations, cors_config, tags, public_access_block, ownership_controls, bucket_policy, bucket_policy_public, bucket_policy_generation, sse_c_blocked \
+                "SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, write_reservations_blocked, active_write_reservations, cors_config, tags, public_access_block, ownership_controls, bucket_policy, bucket_policy_public, bucket_policy_generation, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years \
                  FROM buckets WHERE owner_principal = ?1 AND state = ?2 ORDER BY name ASC",
             )
             .map_err(|e| MetadataError::Db {
@@ -1481,6 +1684,39 @@ impl PgMetadataStore for PgStore {
                 context: "put bucket versioning",
                 source: e,
             })?;
+        Ok(())
+    }
+
+    fn put_bucket_object_lock(
+        &self,
+        name: &str,
+        config: BucketObjectLockConfig,
+    ) -> Result<(), MetadataError> {
+        let (enabled, default_mode, default_days, default_years) =
+            Self::bucket_object_lock_sql_values(config).map_err(|e| MetadataError::Db {
+                context: "put bucket object lock (encode)",
+                source: e,
+            })?;
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE buckets \
+                 SET object_lock_enabled = ?1, \
+                     object_lock_default_mode = ?2, \
+                     object_lock_default_days = ?3, \
+                     object_lock_default_years = ?4 \
+                 WHERE name = ?5",
+                params![enabled, default_mode, default_days, default_years, name],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "put bucket object lock",
+                source: e,
+            })?;
+        if updated == 0 {
+            return Err(MetadataError::BucketNotFound {
+                name: BucketName::from(name),
+            });
+        }
         Ok(())
     }
 
@@ -1879,18 +2115,25 @@ impl PgMetadataStore for PgStore {
                     .system_metadata_blob
                     .as_ref()
                     .map(SerializedSystemMetadataBlob::as_slice);
+                let (object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) =
+                    Self::object_lock_sql_values(req.object_lock).map_err(|e| {
+                        MetadataError::Db {
+                            context: "put object meta (encode object lock)",
+                            source: e,
+                        }
+                    })?;
                 let encryption_type = req.encryption.encryption_type() as u8;
                 let encryption_state = req.encryption.encode_state();
                 let sql = if req.version_id.is_null() {
                     "INSERT OR REPLACE INTO objects \
                      (bucket, key, version_id, generation_id, size, etag, etag_kind, last_modified, \
-                      storage_class, ec_k, ec_m, status, data_layout, parts_count, tags, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)"
+                      storage_class, ec_k, ec_m, status, data_layout, parts_count, tags, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)"
                 } else {
                     "INSERT INTO objects \
                      (bucket, key, version_id, generation_id, size, etag, etag_kind, last_modified, \
-                      storage_class, ec_k, ec_m, status, data_layout, parts_count, tags, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)"
+                      storage_class, ec_k, ec_m, status, data_layout, parts_count, tags, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)"
                 };
                 self.conn
                     .execute(
@@ -1918,6 +2161,9 @@ impl PgMetadataStore for PgStore {
                             req.owner.canonical_id.as_str(),
                             req.acl_grants.serialized(),
                             i32::from(req.public_read),
+                            object_lock_retention_mode,
+                            object_lock_retain_until,
+                            object_lock_legal_hold,
                         ],
                     )
                     .map_err(|e| MetadataError::Db {
@@ -1972,7 +2218,7 @@ impl PgMetadataStore for PgStore {
             .query_row(
                 "SELECT bucket, key, version_id, generation_id, size, etag, etag_kind, \
                  last_modified, storage_class, ec_k, ec_m, status, tags, \
-                 data_layout, parts_count, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read \
+                 data_layout, parts_count, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold \
                  FROM objects WHERE bucket = ?1 AND key = ?2 \
                  ORDER BY last_modified DESC, version_id DESC LIMIT 1",
                 params![bucket, key],
@@ -2005,7 +2251,7 @@ impl PgMetadataStore for PgStore {
             .query_row(
                 "SELECT bucket, key, version_id, generation_id, size, etag, etag_kind, \
                  last_modified, storage_class, ec_k, ec_m, status, tags, \
-                 data_layout, parts_count, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read \
+                 data_layout, parts_count, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold \
                  FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
                 params![bucket, key, version_id.to_u64() as i64],
                 Self::row_to_object_record,
@@ -2165,7 +2411,8 @@ impl PgMetadataStore for PgStore {
                    o.last_modified, o.storage_class, o.ec_k, o.ec_m, o.status, o.tags, \
                    o.data_layout, o.parts_count, o.metadata_blob, o.system_metadata_blob, \
                    o.encryption_type, o.encryption_state, o.owner_principal, o.owner_canonical_id, \
-                   o.acl_grants, o.public_read \
+                   o.acl_grants, o.public_read, o.object_lock_retention_mode, \
+                   o.object_lock_retain_until, o.object_lock_legal_hold \
             FROM objects o \
             INNER JOIN latest l ON o.bucket = l.bucket AND o.key = l.key AND o.version_id = l.max_vid \
             WHERE {where_str} AND o.status = 0 \
@@ -2268,7 +2515,7 @@ impl PgMetadataStore for PgStore {
         let sql = format!(
             "SELECT bucket, key, version_id, generation_id, size, etag, etag_kind, \
              last_modified, storage_class, ec_k, ec_m, status, tags, \
-             data_layout, parts_count, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read \
+             data_layout, parts_count, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold \
              FROM objects \
              WHERE {where_str} \
              ORDER BY key ASC, version_id DESC LIMIT ?{param_idx}"
@@ -3181,6 +3428,11 @@ impl PgMetadataStore for PgStore {
         let algo = req.checksum.map(|c| c.algorithm() as u8);
         let ctype = req.checksum.map(|c| c.checksum_type() as u8);
         let tags = req.tags.as_ref().map(SerializedTagSet::as_str);
+        let (object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) =
+            Self::object_lock_sql_values(req.object_lock).map_err(|e| MetadataError::Db {
+                context: "create multipart upload (encode object lock)",
+                source: e,
+            })?;
         let encryption_type = req.encryption.encryption_type() as u8;
         let encryption_state = req.encryption.encode_state();
         let system_metadata_blob = req.system_metadata_blob.as_slice();
@@ -3188,8 +3440,8 @@ impl PgMetadataStore for PgStore {
             .execute(
                 "INSERT INTO multipart_uploads \
                  (upload_id, bucket, key, initiated_at, state, tags, metadata_blob, system_metadata_blob, owner_principal, owner_canonical_id, \
-                  initiator_principal, initiator_canonical_id, checksum_algorithm, checksum_type, encryption_type, encryption_state, acl_grants, public_read) \
-                 VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                  initiator_principal, initiator_canonical_id, checksum_algorithm, checksum_type, encryption_type, encryption_state, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) \
+                 VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
                 params![
                     req.upload_id,
                     req.bucket,
@@ -3210,6 +3462,9 @@ impl PgMetadataStore for PgStore {
                     encryption_state,
                     req.acl_grants.serialized(),
                     i32::from(req.public_read),
+                    object_lock_retention_mode,
+                    object_lock_retain_until,
+                    object_lock_legal_hold,
                 ],
             )
             .map_err(|e| MetadataError::Db {
@@ -3227,13 +3482,21 @@ impl PgMetadataStore for PgStore {
             .query_row(
                 "SELECT upload_id, bucket, key, initiated_at, state, tags, metadata_blob, \
                  system_metadata_blob, owner_principal, owner_canonical_id, initiator_principal, initiator_canonical_id, \
-                 checksum_algorithm, checksum_type, encryption_type, encryption_state, acl_grants, public_read \
+                 checksum_algorithm, checksum_type, encryption_type, encryption_state, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold \
                  FROM multipart_uploads WHERE upload_id = ?1",
                 params![upload_id],
                 |row| {
                     let state_raw = row.get::<_, u8>(4)?;
                     let algo_raw: Option<u8> = row.get(12)?;
                     let ctype_raw: Option<u8> = row.get(13)?;
+                    let object_lock = Self::parse_object_lock_state(
+                        row.get::<_, Option<u8>>(18)?,
+                        row.get::<_, Option<i64>>(19)?,
+                        row.get::<_, u8>(20)?,
+                        18,
+                        19,
+                        20,
+                    )?;
                     let checksum = if let Some(algo_val) = algo_raw {
                         let algo = ChecksumAlgorithm::from_u8(algo_val).ok_or_else(|| {
                             rusqlite::Error::FromSqlConversionFailure(
@@ -3302,7 +3565,7 @@ impl PgMetadataStore for PgStore {
                             "multipart acl_grants",
                         )?,
                         public_read: row.get::<_, i64>(17)? != 0,
-                        object_lock: ObjectLockState::default(),
+                        object_lock,
                         checksum,
                         encryption: Self::parse_object_encryption(
                             row.get::<_, u8>(14)?,
@@ -3468,7 +3731,7 @@ impl PgMetadataStore for PgStore {
         let sql = format!(
             "SELECT upload_id, bucket, key, initiated_at, state, tags, metadata_blob, \
              system_metadata_blob, owner_principal, owner_canonical_id, initiator_principal, initiator_canonical_id, \
-             checksum_algorithm, checksum_type, encryption_type, encryption_state, acl_grants, public_read \
+             checksum_algorithm, checksum_type, encryption_type, encryption_state, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold \
              FROM multipart_uploads \
              WHERE {where_str} \
              ORDER BY key ASC, initiated_at ASC, upload_id ASC \
@@ -3488,6 +3751,14 @@ impl PgMetadataStore for PgStore {
                 let state_raw = row.get::<_, u8>(4)?;
                 let algo_raw: Option<u8> = row.get(12)?;
                 let ctype_raw: Option<u8> = row.get(13)?;
+                let object_lock = Self::parse_object_lock_state(
+                    row.get::<_, Option<u8>>(18)?,
+                    row.get::<_, Option<i64>>(19)?,
+                    row.get::<_, u8>(20)?,
+                    18,
+                    19,
+                    20,
+                )?;
                 let checksum = if let Some(algo_val) = algo_raw {
                     let algo = ChecksumAlgorithm::from_u8(algo_val).ok_or_else(|| {
                         rusqlite::Error::FromSqlConversionFailure(
@@ -3551,7 +3822,7 @@ impl PgMetadataStore for PgStore {
                         "multipart acl_grants",
                     )?,
                     public_read: row.get::<_, i64>(17)? != 0,
-                    object_lock: ObjectLockState::default(),
+                    object_lock,
                     checksum,
                     encryption: Self::parse_object_encryption(
                         row.get::<_, u8>(14)?,
@@ -4238,18 +4509,31 @@ impl PgMetadataStore for PgStore {
                     }
                 }
             }
+            let (object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) =
+                self.conn.query_row(
+                    "SELECT object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold \
+                     FROM multipart_uploads WHERE upload_id = ?1",
+                    params![upload_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<u8>>(0)?,
+                            row.get::<_, Option<i64>>(1)?,
+                            row.get::<_, u8>(2)?,
+                        ))
+                    },
+                )?;
 
             // 2. Write/overwrite object metadata row.
             let obj_sql = if obj.version_id.is_null() {
                 "INSERT OR REPLACE INTO objects \
                  (bucket, key, version_id, generation_id, size, etag, etag_kind, last_modified, \
-                  storage_class, ec_k, ec_m, status, tags, data_layout, parts_count, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)"
+                  storage_class, ec_k, ec_m, status, tags, data_layout, parts_count, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)"
             } else {
                 "INSERT INTO objects \
                  (bucket, key, version_id, generation_id, size, etag, etag_kind, last_modified, \
-                  storage_class, ec_k, ec_m, status, tags, data_layout, parts_count, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)"
+                  storage_class, ec_k, ec_m, status, tags, data_layout, parts_count, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)"
             };
             self.conn.execute(
                 obj_sql,
@@ -4276,6 +4560,9 @@ impl PgMetadataStore for PgStore {
                     obj.owner.canonical_id.as_str(),
                     obj.acl_grants.serialized(),
                     i32::from(obj.public_read),
+                    object_lock_retention_mode,
+                    object_lock_retain_until,
+                    object_lock_legal_hold,
                 ],
             )?;
 
@@ -4737,17 +5024,22 @@ impl PgMetadataStore for PgStore {
                 .system_metadata_blob
                 .as_ref()
                 .map(SerializedSystemMetadataBlob::as_slice);
+            let (object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) =
+                Self::object_lock_sql_values(obj.object_lock).map_err(|e| MetadataError::Db {
+                    context: "commit stream put (encode object lock)",
+                    source: e,
+                })?;
 
             let obj_sql = if obj.version_id.is_null() {
                 "INSERT OR REPLACE INTO objects \
                  (bucket, key, version_id, generation_id, size, etag, etag_kind, last_modified, \
-                  storage_class, ec_k, ec_m, status, data_layout, parts_count, tags, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)"
+                  storage_class, ec_k, ec_m, status, data_layout, parts_count, tags, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)"
             } else {
                 "INSERT INTO objects \
                  (bucket, key, version_id, generation_id, size, etag, etag_kind, last_modified, \
-                  storage_class, ec_k, ec_m, status, data_layout, parts_count, tags, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)"
+                  storage_class, ec_k, ec_m, status, data_layout, parts_count, tags, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)"
             };
             self.conn
                 .execute(
@@ -4777,6 +5069,9 @@ impl PgMetadataStore for PgStore {
                         obj.owner.canonical_id.as_str(),
                         obj.acl_grants.serialized(),
                         i32::from(obj.public_read),
+                        object_lock_retention_mode,
+                        object_lock_retain_until,
+                        object_lock_legal_hold,
                     ],
                 )
                 .map_err(|e| MetadataError::Db {
@@ -4917,19 +5212,24 @@ impl PgMetadataStore for PgStore {
                 .system_metadata_blob
                 .as_ref()
                 .map(SerializedSystemMetadataBlob::as_slice);
+            let (object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) =
+                Self::object_lock_sql_values(obj.object_lock).map_err(|e| MetadataError::Db {
+                    context: "put segment object (encode object lock)",
+                    source: e,
+                })?;
             let encryption_type = obj.encryption.encryption_type() as u8;
             let encryption_state = obj.encryption.encode_state();
 
             let obj_sql = if obj.version_id.is_null() {
                 "INSERT OR REPLACE INTO objects \
                  (bucket, key, version_id, generation_id, size, etag, etag_kind, last_modified, \
-                  storage_class, ec_k, ec_m, status, data_layout, parts_count, tags, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)"
+                  storage_class, ec_k, ec_m, status, data_layout, parts_count, tags, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)"
             } else {
                 "INSERT INTO objects \
                  (bucket, key, version_id, generation_id, size, etag, etag_kind, last_modified, \
-                  storage_class, ec_k, ec_m, status, data_layout, parts_count, tags, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)"
+                  storage_class, ec_k, ec_m, status, data_layout, parts_count, tags, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)"
             };
             self.conn
                 .execute(
@@ -4957,6 +5257,9 @@ impl PgMetadataStore for PgStore {
                         obj.owner.canonical_id.as_str(),
                         obj.acl_grants.serialized(),
                         i32::from(obj.public_read),
+                        object_lock_retention_mode,
+                        object_lock_retain_until,
+                        object_lock_legal_hold,
                     ],
                 )
                 .map_err(|e| MetadataError::Db {
@@ -5591,6 +5894,7 @@ mod tests {
                     tags: None,
                     metadata_blob: None,
                     system_metadata_blob: None,
+                    object_lock: ObjectLockState::default(),
                     encryption: ObjectEncryption::None,
                 }))
                 .unwrap();
@@ -5690,7 +5994,10 @@ mod tests {
                     'owner' AS owner_principal, \
                     ?1 AS owner_canonical_id, \
                     '' AS acl_grants, \
-                    0 AS public_read",
+                    0 AS public_read, \
+                    NULL AS object_lock_retention_mode, \
+                    NULL AS object_lock_retain_until, \
+                    0 AS object_lock_legal_hold",
                 params![CanonicalUserId::from_principal("owner").as_str()],
                 PgStore::row_to_object_record,
             )
@@ -5731,7 +6038,10 @@ mod tests {
                     'owner' AS owner_principal, \
                     ?1 AS owner_canonical_id, \
                     '' AS acl_grants, \
-                    0 AS public_read",
+                    0 AS public_read, \
+                    NULL AS object_lock_retention_mode, \
+                    NULL AS object_lock_retain_until, \
+                    0 AS object_lock_legal_hold",
                 params![CanonicalUserId::from_principal("owner").as_str()],
                 PgStore::row_to_object_record,
             )
@@ -5766,6 +6076,7 @@ mod tests {
                     tags: None,
                     metadata_blob: None,
                     system_metadata_blob: None,
+                    object_lock: ObjectLockState::default(),
                     encryption: ObjectEncryption::None,
                 }))
                 .unwrap();

@@ -38,6 +38,13 @@ CREATE TABLE IF NOT EXISTS objects (
     owner_canonical_id TEXT NOT NULL CHECK (length(owner_canonical_id) = 64),
     acl_grants TEXT NOT NULL DEFAULT '',
     public_read INTEGER NOT NULL DEFAULT 0 CHECK (public_read IN (0, 1)),
+    object_lock_retention_mode INTEGER CHECK (
+        object_lock_retention_mode IS NULL OR object_lock_retention_mode IN (0, 1)
+    ),
+    object_lock_retain_until INTEGER CHECK (
+        object_lock_retain_until IS NULL OR object_lock_retain_until > 0
+    ),
+    object_lock_legal_hold INTEGER NOT NULL DEFAULT 0 CHECK (object_lock_legal_hold IN (0, 1, 2)),
     CHECK (status IN (0, 1)),
     CHECK (etag_kind IN (0, 1)),
     CHECK (data_layout IN (0, 1)),
@@ -50,7 +57,9 @@ CREATE TABLE IF NOT EXISTS objects (
         )) OR
         (status = 1 AND generation_id IS NULL AND data_layout = 0 AND parts_count IS NULL AND tags IS NULL AND metadata_blob IS NULL AND system_metadata_blob IS NULL
          AND size = 0 AND etag = X'' AND etag_kind = 0 AND storage_class = 0 AND ec_k = 0 AND ec_m = 0
-         AND encryption_type = 0 AND encryption_state IS NULL AND public_read = 0)
+         AND encryption_type = 0 AND encryption_state IS NULL AND public_read = 0
+         AND object_lock_retention_mode IS NULL AND object_lock_retain_until IS NULL
+         AND object_lock_legal_hold = 0)
     ),
     PRIMARY KEY (bucket, key, version_id)
 )";
@@ -77,7 +86,14 @@ CREATE TABLE IF NOT EXISTS multipart_uploads (
         initiator_canonical_id IS NULL OR length(initiator_canonical_id) = 64
     ),
     acl_grants TEXT NOT NULL DEFAULT '',
-    public_read INTEGER NOT NULL DEFAULT 0 CHECK (public_read IN (0, 1))
+    public_read INTEGER NOT NULL DEFAULT 0 CHECK (public_read IN (0, 1)),
+    object_lock_retention_mode INTEGER CHECK (
+        object_lock_retention_mode IS NULL OR object_lock_retention_mode IN (0, 1)
+    ),
+    object_lock_retain_until INTEGER CHECK (
+        object_lock_retain_until IS NULL OR object_lock_retain_until > 0
+    ),
+    object_lock_legal_hold INTEGER NOT NULL DEFAULT 0 CHECK (object_lock_legal_hold IN (0, 1, 2))
 )";
 
 /// Index for listing multipart uploads by bucket/key.
@@ -326,7 +342,17 @@ CREATE TABLE IF NOT EXISTS buckets (
     bucket_policy    TEXT,
     bucket_policy_public INTEGER NOT NULL DEFAULT 0 CHECK (bucket_policy_public IN (0, 1)),
     bucket_policy_generation INTEGER NOT NULL DEFAULT 0 CHECK (bucket_policy_generation >= 0),
-    sse_c_blocked    INTEGER NOT NULL DEFAULT 0 CHECK (sse_c_blocked IN (0, 1))
+    sse_c_blocked    INTEGER NOT NULL DEFAULT 0 CHECK (sse_c_blocked IN (0, 1)),
+    object_lock_enabled INTEGER NOT NULL DEFAULT 0 CHECK (object_lock_enabled IN (0, 1)),
+    object_lock_default_mode INTEGER CHECK (
+        object_lock_default_mode IS NULL OR object_lock_default_mode IN (0, 1)
+    ),
+    object_lock_default_days INTEGER CHECK (
+        object_lock_default_days IS NULL OR object_lock_default_days > 0
+    ),
+    object_lock_default_years INTEGER CHECK (
+        object_lock_default_years IS NULL OR object_lock_default_years > 0
+    )
 )";
 
 /// Index for bucket listing by owner and bucket name.
@@ -374,6 +400,7 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     migrate_bucket_write_reservation_columns(conn)?;
     migrate_bucket_policy_columns(conn)?;
     migrate_multipart_upload_tag_columns(conn)?;
+    create_object_lock_triggers(conn)?;
     Ok(())
 }
 
@@ -714,5 +741,148 @@ fn migrate_bucket_write_reservation_columns(conn: &Connection) -> Result<(), rus
             Err(e) => return Err(e),
         }
     }
+    Ok(())
+}
+
+fn create_object_lock_triggers(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS check_bucket_object_lock_insert
+         BEFORE INSERT ON buckets
+         BEGIN
+           SELECT RAISE(ABORT, 'invalid bucket object lock default mode')
+             WHERE NEW.object_lock_default_mode IS NOT NULL
+               AND NEW.object_lock_default_mode NOT IN (0, 1);
+           SELECT RAISE(ABORT, 'invalid bucket object lock default days')
+             WHERE NEW.object_lock_default_days IS NOT NULL
+               AND NEW.object_lock_default_days <= 0;
+           SELECT RAISE(ABORT, 'invalid bucket object lock default years')
+             WHERE NEW.object_lock_default_years IS NOT NULL
+               AND NEW.object_lock_default_years <= 0;
+           SELECT RAISE(ABORT, 'bucket object lock defaults require object lock enabled')
+             WHERE NEW.object_lock_enabled = 0
+               AND (
+                 NEW.object_lock_default_mode IS NOT NULL
+                 OR NEW.object_lock_default_days IS NOT NULL
+                 OR NEW.object_lock_default_years IS NOT NULL
+               );
+           SELECT RAISE(ABORT, 'bucket object lock default period requires mode')
+             WHERE NEW.object_lock_default_mode IS NULL
+               AND (
+                 NEW.object_lock_default_days IS NOT NULL
+                 OR NEW.object_lock_default_years IS NOT NULL
+               );
+           SELECT RAISE(ABORT, 'bucket object lock mode requires period')
+             WHERE NEW.object_lock_default_mode IS NOT NULL
+               AND NEW.object_lock_default_days IS NULL
+               AND NEW.object_lock_default_years IS NULL;
+           SELECT RAISE(ABORT, 'bucket object lock default days/years are mutually exclusive')
+             WHERE NEW.object_lock_default_days IS NOT NULL
+               AND NEW.object_lock_default_years IS NOT NULL;
+         END;
+         CREATE TRIGGER IF NOT EXISTS check_bucket_object_lock_update
+         BEFORE UPDATE ON buckets
+         BEGIN
+           SELECT RAISE(ABORT, 'invalid bucket object lock default mode')
+             WHERE NEW.object_lock_default_mode IS NOT NULL
+               AND NEW.object_lock_default_mode NOT IN (0, 1);
+           SELECT RAISE(ABORT, 'invalid bucket object lock default days')
+             WHERE NEW.object_lock_default_days IS NOT NULL
+               AND NEW.object_lock_default_days <= 0;
+           SELECT RAISE(ABORT, 'invalid bucket object lock default years')
+             WHERE NEW.object_lock_default_years IS NOT NULL
+               AND NEW.object_lock_default_years <= 0;
+           SELECT RAISE(ABORT, 'bucket object lock defaults require object lock enabled')
+             WHERE NEW.object_lock_enabled = 0
+               AND (
+                 NEW.object_lock_default_mode IS NOT NULL
+                 OR NEW.object_lock_default_days IS NOT NULL
+                 OR NEW.object_lock_default_years IS NOT NULL
+               );
+           SELECT RAISE(ABORT, 'bucket object lock default period requires mode')
+             WHERE NEW.object_lock_default_mode IS NULL
+               AND (
+                 NEW.object_lock_default_days IS NOT NULL
+                 OR NEW.object_lock_default_years IS NOT NULL
+               );
+           SELECT RAISE(ABORT, 'bucket object lock mode requires period')
+             WHERE NEW.object_lock_default_mode IS NOT NULL
+               AND NEW.object_lock_default_days IS NULL
+               AND NEW.object_lock_default_years IS NULL;
+           SELECT RAISE(ABORT, 'bucket object lock default days/years are mutually exclusive')
+             WHERE NEW.object_lock_default_days IS NOT NULL
+               AND NEW.object_lock_default_years IS NOT NULL;
+         END;
+         CREATE TRIGGER IF NOT EXISTS check_object_lock_state_insert
+         BEFORE INSERT ON objects
+         BEGIN
+           SELECT RAISE(ABORT, 'invalid object lock retention mode')
+             WHERE NEW.object_lock_retention_mode IS NOT NULL
+               AND NEW.object_lock_retention_mode NOT IN (0, 1);
+           SELECT RAISE(ABORT, 'invalid object lock retain-until timestamp')
+             WHERE NEW.object_lock_retain_until IS NOT NULL
+               AND NEW.object_lock_retain_until <= 0;
+           SELECT RAISE(ABORT, 'invalid object lock legal hold')
+             WHERE NEW.object_lock_legal_hold NOT IN (0, 1, 2);
+           SELECT RAISE(ABORT, 'object lock retention mode/date must be set together')
+             WHERE (NEW.object_lock_retention_mode IS NULL) != (NEW.object_lock_retain_until IS NULL);
+           SELECT RAISE(ABORT, 'delete markers cannot carry object lock state')
+             WHERE NEW.status = 1
+               AND (
+                 NEW.object_lock_retention_mode IS NOT NULL
+                 OR NEW.object_lock_retain_until IS NOT NULL
+                 OR NEW.object_lock_legal_hold != 0
+               );
+         END;
+         CREATE TRIGGER IF NOT EXISTS check_object_lock_state_update
+         BEFORE UPDATE ON objects
+         BEGIN
+           SELECT RAISE(ABORT, 'invalid object lock retention mode')
+             WHERE NEW.object_lock_retention_mode IS NOT NULL
+               AND NEW.object_lock_retention_mode NOT IN (0, 1);
+           SELECT RAISE(ABORT, 'invalid object lock retain-until timestamp')
+             WHERE NEW.object_lock_retain_until IS NOT NULL
+               AND NEW.object_lock_retain_until <= 0;
+           SELECT RAISE(ABORT, 'invalid object lock legal hold')
+             WHERE NEW.object_lock_legal_hold NOT IN (0, 1, 2);
+           SELECT RAISE(ABORT, 'object lock retention mode/date must be set together')
+             WHERE (NEW.object_lock_retention_mode IS NULL) != (NEW.object_lock_retain_until IS NULL);
+           SELECT RAISE(ABORT, 'delete markers cannot carry object lock state')
+             WHERE NEW.status = 1
+               AND (
+                 NEW.object_lock_retention_mode IS NOT NULL
+                 OR NEW.object_lock_retain_until IS NOT NULL
+                 OR NEW.object_lock_legal_hold != 0
+               );
+         END;
+         CREATE TRIGGER IF NOT EXISTS check_multipart_object_lock_insert
+         BEFORE INSERT ON multipart_uploads
+         BEGIN
+           SELECT RAISE(ABORT, 'invalid multipart object lock retention mode')
+             WHERE NEW.object_lock_retention_mode IS NOT NULL
+               AND NEW.object_lock_retention_mode NOT IN (0, 1);
+           SELECT RAISE(ABORT, 'invalid multipart object lock retain-until timestamp')
+             WHERE NEW.object_lock_retain_until IS NOT NULL
+               AND NEW.object_lock_retain_until <= 0;
+           SELECT RAISE(ABORT, 'invalid multipart object lock legal hold')
+             WHERE NEW.object_lock_legal_hold NOT IN (0, 1, 2);
+           SELECT RAISE(ABORT, 'multipart object lock retention mode/date must be set together')
+             WHERE (NEW.object_lock_retention_mode IS NULL) != (NEW.object_lock_retain_until IS NULL);
+         END;
+         CREATE TRIGGER IF NOT EXISTS check_multipart_object_lock_update
+         BEFORE UPDATE ON multipart_uploads
+         BEGIN
+           SELECT RAISE(ABORT, 'invalid multipart object lock retention mode')
+             WHERE NEW.object_lock_retention_mode IS NOT NULL
+               AND NEW.object_lock_retention_mode NOT IN (0, 1);
+           SELECT RAISE(ABORT, 'invalid multipart object lock retain-until timestamp')
+             WHERE NEW.object_lock_retain_until IS NOT NULL
+               AND NEW.object_lock_retain_until <= 0;
+           SELECT RAISE(ABORT, 'invalid multipart object lock legal hold')
+             WHERE NEW.object_lock_legal_hold NOT IN (0, 1, 2);
+           SELECT RAISE(ABORT, 'multipart object lock retention mode/date must be set together')
+             WHERE (NEW.object_lock_retention_mode IS NULL) != (NEW.object_lock_retain_until IS NULL);
+         END;",
+    )?;
+
     Ok(())
 }

@@ -1274,6 +1274,8 @@ pub struct PutLiveObjectReq {
     pub metadata_blob: Option<SerializedMetadataBlob>,
     /// Serialized system metadata headers.
     pub system_metadata_blob: Option<SerializedSystemMetadataBlob>,
+    /// Per-version Object Lock state to persist on the committed version.
+    pub object_lock: ObjectLockState,
     pub encryption: ObjectEncryption,
 }
 
@@ -1363,6 +1365,8 @@ pub struct CommitStreamPutReq {
     pub metadata_blob: Option<SerializedMetadataBlob>,
     /// Serialized system metadata headers.
     pub system_metadata_blob: Option<SerializedSystemMetadataBlob>,
+    /// Per-version Object Lock state to persist on the committed version.
+    pub object_lock: ObjectLockState,
     pub encryption: ObjectEncryption,
 }
 
@@ -1506,6 +1510,8 @@ pub struct CreateMultipartUploadReq {
     pub owner: OwnerIdentity,
     pub acl_grants: AclGrants,
     pub public_read: bool,
+    /// Pending Object Lock state to copy onto the completed version.
+    pub object_lock: ObjectLockState,
     pub checksum: Option<MultipartChecksumConfig>,
     pub encryption: ObjectEncryption,
 }

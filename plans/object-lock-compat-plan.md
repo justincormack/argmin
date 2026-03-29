@@ -180,8 +180,8 @@ Likely files:
 - `crates/storage/src/traits.rs`
 - `crates/storage/src/pg_store.rs`
 
-Because the repository is still pre-release, schema updates can be handled as
-forward-only in-place migrations without external migration compatibility work.
+Because the repository is still pre-release, schema updates do not need a
+backward-compatibility migration path; the schema can be updated directly.
 
 ### Phase 4: Bucket Object Lock APIs
 

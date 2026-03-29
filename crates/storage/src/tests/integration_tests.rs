@@ -36,6 +36,7 @@ fn shard_and_metadata_roundtrip() {
         tags: None,
         metadata_blob: None,
         system_metadata_blob: None,
+        object_lock: ObjectLockState::default(),
         encryption: ObjectEncryption::None,
     });
     store.put_object_meta(&req).unwrap();
@@ -142,6 +143,7 @@ fn full_lifecycle() {
         tags: None,
         metadata_blob: None,
         system_metadata_blob: None,
+        object_lock: ObjectLockState::default(),
         encryption: ObjectEncryption::None,
     }))
     .unwrap();
@@ -198,6 +200,7 @@ fn pg_store_persistence() {
                 tags: None,
                 metadata_blob: None,
                 system_metadata_blob: None,
+                object_lock: ObjectLockState::default(),
                 encryption: ObjectEncryption::None,
             }))
             .unwrap();
@@ -250,6 +253,7 @@ fn multipart_upload_lifecycle() {
             owner: test_owner(),
             acl_grants: AclGrants::default(),
             public_read: false,
+            object_lock: ObjectLockState::default(),
             checksum: None,
             encryption: ObjectEncryption::None,
         })
@@ -500,6 +504,7 @@ fn streaming_put_object_lifecycle() {
                 tags: None,
                 metadata_blob: None,
                 system_metadata_blob: None,
+                object_lock: ObjectLockState::default(),
                 encryption: ObjectEncryption::None,
             },
             &committed_segments,
@@ -554,6 +559,7 @@ fn streaming_upload_part_lifecycle() {
             owner: test_owner(),
             acl_grants: AclGrants::default(),
             public_read: false,
+            object_lock: ObjectLockState::default(),
             checksum: None,
             encryption: ObjectEncryption::None,
         })
@@ -707,6 +713,7 @@ fn versioned_object_lifecycle() {
                 tags: None,
                 metadata_blob: None,
                 system_metadata_blob: None,
+                object_lock: ObjectLockState::default(),
                 encryption: ObjectEncryption::None,
             }))
             .unwrap();
@@ -801,6 +808,7 @@ fn object_overwrite_with_reclaim() {
             tags: None,
             metadata_blob: None,
             system_metadata_blob: None,
+            object_lock: ObjectLockState::default(),
             encryption: ObjectEncryption::None,
         }))
         .unwrap();
@@ -837,6 +845,7 @@ fn object_overwrite_with_reclaim() {
             tags: None,
             metadata_blob: None,
             system_metadata_blob: None,
+            object_lock: ObjectLockState::default(),
             encryption: ObjectEncryption::None,
         }))
         .unwrap();
@@ -914,6 +923,7 @@ fn bucket_deletion_lifecycle() {
             tags: None,
             metadata_blob: None,
             system_metadata_blob: None,
+            object_lock: ObjectLockState::default(),
             encryption: ObjectEncryption::None,
         }))
         .unwrap();
@@ -979,6 +989,7 @@ fn multipart_abort_cleanup() {
             owner: test_owner(),
             acl_grants: AclGrants::default(),
             public_read: false,
+            object_lock: ObjectLockState::default(),
             checksum: None,
             encryption: ObjectEncryption::None,
         })
@@ -1103,6 +1114,7 @@ fn object_tags_through_overwrite_and_versioned_delete() {
             tags: Some("<t>old</t>".into()),
             metadata_blob: None,
             system_metadata_blob: None,
+            object_lock: ObjectLockState::default(),
             encryption: ObjectEncryption::None,
         }))
         .unwrap();
@@ -1127,6 +1139,7 @@ fn object_tags_through_overwrite_and_versioned_delete() {
             tags: None,
             metadata_blob: None,
             system_metadata_blob: None,
+            object_lock: ObjectLockState::default(),
             encryption: ObjectEncryption::None,
         }))
         .unwrap();
@@ -1159,6 +1172,7 @@ fn object_tags_through_overwrite_and_versioned_delete() {
                 tags: Some(tag.into()),
                 metadata_blob: None,
                 system_metadata_blob: None,
+                object_lock: ObjectLockState::default(),
                 encryption: ObjectEncryption::None,
             }))
             .unwrap();
@@ -1249,6 +1263,7 @@ fn persistence_complex_state_through_reopen() {
                 owner: test_owner(),
                 acl_grants: AclGrants::default(),
                 public_read: false,
+                object_lock: ObjectLockState::default(),
                 checksum: None,
                 encryption: ObjectEncryption::None,
             })
