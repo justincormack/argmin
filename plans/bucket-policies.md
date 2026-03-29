@@ -2,8 +2,9 @@
 
 ## Scope
 
-This plan covers bucket policy support needed for the remaining ignored Ceph
-tests tied to public-policy and conditional-policy behavior.
+This plan covers bucket policy support needed for AWS-compatible bucket policy
+behavior, including the Ceph-derived parity gaps we still have after the first
+five phases landed.
 
 In scope:
 - `PutBucketPolicy`, `GetBucketPolicy`, and `DeleteBucketPolicy`
@@ -11,11 +12,16 @@ In scope:
 - bucket policy parsing, validation, and evaluation
 - public-policy classification for public access block interaction
 - request-context extraction for the condition keys exercised by current tests
+- bucket-level policy evaluation for listing and policy-status APIs
+- multipart policy enforcement and the additional `PutObject` condition keys
+  exercised by the remaining Ceph bucket-policy tests
 
 Out of scope:
 - IAM user and role policy APIs
 - STS APIs
 - account-level public access block
+- RGW tenant-prefixed bucket names and tenant-specific ARN/resource syntax that
+  AWS S3 does not expose
 - a generic external policy engine dependency without prior approval
 
 Dependencies:
@@ -53,16 +59,28 @@ Current implementation status:
   `s3:x-amz-metadata-directive`, and
   `s3:x-amz-acl`
 - request-time `RestrictPublicBuckets` enforcement now suppresses policy-based
-  `Allow` results for public bucket policies unless the requester is an AWS
-  service principal or is in the bucket owner's account
+  `Allow` results for public bucket policies unless the requester is in the
+  bucket owner's account
 - request-time evaluation uses a parsed-policy cache outside
   `BucketFastPathInfo`, keyed by shared bucket policy generation, and snapshots
   the parsed policy before object-PG locking to avoid same-PG self-deadlock
 - raw policy is intentionally not stored in bucket fast-path metadata
 
-Remaining ignored tests tied directly to the unimplemented policy-evaluation
-gap:
-- none in the current planned scope
+Remaining Ceph/AWS parity gaps after Phases 1-5:
+- no bucket-level request-time evaluation yet for `s3:ListBucket` on
+  `ListObjects` / `ListObjectsV2`
+- no `GetBucketPolicyStatus` API surface yet, even though the public/non-public
+  classifier already exists internally
+- no bucket-policy enforcement yet on `CreateMultipartUpload` or
+  `UploadPartCopy`
+- `PutObject` policy conditions do not yet cover `s3:x-amz-grant-*`,
+  `s3:x-amz-server-side-encryption`,
+  `s3:x-amz-server-side-encryption-aws-kms-key-id`, or
+  `s3:RequestObjectTag/<key>`
+- unsupported policy forms such as `NotPrincipal` are rejected by parser tests,
+  but do not yet have end-to-end S3 coverage
+- Ceph tests that depend on RGW tenant namespace syntax are not AWS scope and
+  should stay documented as exclusions rather than driving implementation
 
 ## Goals
 
@@ -104,9 +122,9 @@ Policy evaluation must compose with:
 - ACL checks
 - public access block checks
 
-### Supported Policy Features For This Plan
+### Supported Policy Features In Completed Phases
 
-Actions needed for the currently ignored tests:
+Actions currently implemented:
 - `s3:GetObject`
 - `s3:GetObjectTagging`
 - `s3:PutObjectTagging`
@@ -114,15 +132,26 @@ Actions needed for the currently ignored tests:
 - `s3:PutObject`
 - `s3:GetObjectAcl`
 
-Principal forms needed for the current tests:
+Principal forms currently implemented:
 - `"*"`
 - explicit AWS principal strings used by test callers
 
-Condition keys needed for the current tests:
+Condition keys currently implemented:
 - `s3:ExistingObjectTag/<key>`
 - `s3:x-amz-copy-source`
 - `s3:x-amz-metadata-directive`
 - `s3:x-amz-acl`
+
+Additional features targeted by the pending phases:
+- `s3:ListBucket`
+- `s3:GetBucketPolicyStatus`
+- multipart write and copy flows that should reuse `s3:PutObject` and
+  `s3:GetObject` policy evaluation
+- `s3:x-amz-grant-*`
+- `s3:x-amz-server-side-encryption`
+- `s3:x-amz-server-side-encryption-aws-kms-key-id`
+- `s3:RequestObjectTag/<key>`
+- request-time `Null` and `StringNotEquals` handling for those condition keys
 
 This plan should also support the basic statement structure AWS policies use:
 - `Version`
@@ -336,11 +365,87 @@ Notes:
   public policies; explicit `Deny` still wins, and ACL / ownership fallback
   behavior remains intact
 - when a bucket policy is public and `RestrictPublicBuckets=true`, same-account
-  requesters and AWS service principals can still use policy-based access, but
-  anonymous and cross-account policy-based access is blocked
+  requesters can still use policy-based access, but anonymous and cross-account
+  policy-based access is blocked
 - request-time bucket-policy evaluation now also covers
   `s3:GetBucketPublicAccessBlock`, which is enough for the remaining public
   access block deny test
+
+### Phase 6: Bucket-Level Policy Evaluation
+
+Status:
+- pending
+
+Deliver:
+- request-time evaluation for `s3:ListBucket` on `ListObjects` and
+  `ListObjectsV2`
+- bucket-resource matching that distinguishes `arn:aws:s3:::bucket` from
+  `arn:aws:s3:::bucket/*`
+- deny/allow composition with bucket ACL fallback on listing APIs
+- alternate-account integration coverage for bucket-level allow and deny cases
+
+Success criteria:
+- native equivalents exist for Ceph `test_bucket_policy`,
+  `test_bucketv2_policy`, `test_bucket_policy_acl`,
+  `test_bucketv2_policy_acl`, and the bucket-vs-object ARN multipart setup case
+
+Notes:
+- RGW tenant-addressing tests such as `test_bucket_policy_different_tenant` and
+  `test_bucket_policy_tenanted_bucket` should not drive implementation because
+  AWS does not expose tenant-prefixed bucket names
+- cross-account principal matching remains in scope; tenant-specific resource
+  syntax does not
+
+### Phase 7: Multipart And Extended PutObject Conditions
+
+Status:
+- pending
+
+Deliver:
+- bucket-policy enforcement on `CreateMultipartUpload`
+- bucket-policy enforcement on `UploadPartCopy` using source-read and
+  destination-write request context
+- `PutObject` condition support for `s3:x-amz-grant-*`
+- `PutObject` condition support for
+  `s3:x-amz-server-side-encryption` and
+  `s3:x-amz-server-side-encryption-aws-kms-key-id`
+- `PutObject` condition support for `s3:RequestObjectTag/<key>`
+- request-time operator support needed by those tests, including `Null` and
+  `StringNotEquals`
+
+Success criteria:
+- native equivalents exist for Ceph `test_bucket_policy_multipart`,
+  `test_bucket_policy_upload_part_copy`, `test_bucket_policy_put_obj_grant`,
+  the SSE-S3 / SSE-KMS bucket-policy tests, and
+  `test_bucket_policy_put_obj_request_obj_tag`
+
+Notes:
+- this phase should continue reusing the shared evaluator and request-context
+  extraction rather than adding multipart-specific string checks
+- encryption-policy tests are about policy condition evaluation on request
+  headers, not about introducing non-AWS KMS shortcuts
+
+### Phase 8: Policy Status And Remaining Surface Parity
+
+Status:
+- pending
+
+Deliver:
+- `GetBucketPolicyStatus`
+- `IsPublic` computation wired from bucket policy and public ACL state
+- end-to-end S3 coverage for rejected unsupported policy forms such as
+  `NotPrincipal`
+- explicit documentation of the remaining RGW-only exclusions after AWS parity
+  work is complete
+
+Success criteria:
+- native equivalents exist for Ceph `test_get_bucket_policy_status`,
+  `test_get_public_acl_bucket_policy_status`,
+  `test_get_authpublic_acl_bucket_policy_status`,
+  `test_get_publicpolicy_acl_bucket_policy_status`,
+  `test_get_nonpublicpolicy_acl_bucket_policy_status`,
+  `test_get_nonpublicpolicy_principal_bucket_policy_status`, and
+  `test_bucket_policy_allow_notprincipal`
 
 ## Test Plan
 
