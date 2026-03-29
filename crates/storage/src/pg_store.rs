@@ -718,6 +718,7 @@ impl PgStore {
                 "versioning",
                 BucketVersioningState::from_u8,
             )?,
+            object_lock: BucketObjectLockConfig::default(),
             acl_grants,
             public_read: row.get::<_, i64>(8)? != 0,
             public_write: row.get::<_, i64>(9)? != 0,
@@ -1011,6 +1012,7 @@ impl PgStore {
                     system_metadata_blob: row
                         .get::<_, Option<Vec<u8>>>(16)?
                         .map(SerializedSystemMetadataBlob::from),
+                    object_lock: ObjectLockState::default(),
                     encryption,
                 }))
             }
@@ -3300,6 +3302,7 @@ impl PgMetadataStore for PgStore {
                             "multipart acl_grants",
                         )?,
                         public_read: row.get::<_, i64>(17)? != 0,
+                        object_lock: ObjectLockState::default(),
                         checksum,
                         encryption: Self::parse_object_encryption(
                             row.get::<_, u8>(14)?,
@@ -3548,6 +3551,7 @@ impl PgMetadataStore for PgStore {
                         "multipart acl_grants",
                     )?,
                     public_read: row.get::<_, i64>(17)? != 0,
+                    object_lock: ObjectLockState::default(),
                     checksum,
                     encryption: Self::parse_object_encryption(
                         row.get::<_, u8>(14)?,

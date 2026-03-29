@@ -6,7 +6,11 @@ pub use checksum::{
     ChecksumAlgorithm, ChecksumBytes, ChecksumType, InvalidChecksumConfig, MultipartChecksumConfig,
     RawChecksum,
 };
-pub use s3_types::{AclGrants, BucketVersioningState, CanonicalUserId, VersionId};
+pub use s3_types::{
+    AclGrants, BucketObjectLockConfig, BucketVersioningState, CanonicalUserId, LegalHoldStatus,
+    ObjectLockDefaultRetention, ObjectLockMode, ObjectLockState, ObjectRetention, RetentionPeriod,
+    StoredLegalHoldStatus, VersionId,
+};
 
 /// Internal immutable payload generation identifier.
 ///
@@ -992,6 +996,8 @@ pub struct LiveObjectRecord {
     pub metadata_blob: Option<SerializedMetadataBlob>,
     /// Serialized system metadata headers.
     pub system_metadata_blob: Option<SerializedSystemMetadataBlob>,
+    /// First-class per-version Object Lock state.
+    pub object_lock: ObjectLockState,
     pub encryption: ObjectEncryption,
 }
 
@@ -1137,6 +1143,7 @@ pub struct BucketInfo {
     pub region: u16,
     pub state: BucketState,
     pub versioning: BucketVersioningState,
+    pub object_lock: BucketObjectLockConfig,
     pub acl_grants: AclGrants,
     pub public_read: bool,
     pub public_write: bool,
@@ -1169,6 +1176,7 @@ pub struct BucketFastPathInfo {
     pub created_at: u64,
     pub state: BucketState,
     pub versioning: BucketVersioningState,
+    pub object_lock: BucketObjectLockConfig,
     pub acl_grants: AclGrants,
     pub public_read: bool,
     pub public_write: bool,
@@ -1198,6 +1206,7 @@ impl From<BucketInfo> for BucketFastPathInfo {
             created_at: info.created_at,
             state: info.state,
             versioning: info.versioning,
+            object_lock: info.object_lock,
             acl_grants: info.acl_grants,
             public_read: info.public_read,
             public_write: info.public_write,
@@ -1220,6 +1229,7 @@ impl From<&BucketInfo> for BucketFastPathInfo {
             created_at: info.created_at,
             state: info.state,
             versioning: info.versioning,
+            object_lock: info.object_lock,
             acl_grants: info.acl_grants.clone(),
             public_read: info.public_read,
             public_write: info.public_write,
@@ -1429,6 +1439,8 @@ pub struct MultipartUploadRecord {
     pub owner: OwnerIdentity,
     pub acl_grants: AclGrants,
     pub public_read: bool,
+    /// Pending Object Lock state to apply to the committed object version.
+    pub object_lock: ObjectLockState,
     /// Validated checksum configuration for this upload.
     pub checksum: Option<MultipartChecksumConfig>,
     pub encryption: ObjectEncryption,

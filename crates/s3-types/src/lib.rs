@@ -1,7 +1,7 @@
 //! Shared S3/domain value types used across storage and server layers.
 
 use std::fmt::Write;
-use std::num::NonZeroU64;
+use std::num::{NonZeroU32, NonZeroU64};
 
 /// Maximum supported principal string length stored in metadata.
 pub const MAX_PRINCIPAL_LEN: usize = 256;
@@ -28,6 +28,148 @@ impl BucketVersioningState {
             _ => None,
         }
     }
+}
+
+/// Object Lock retention mode.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectLockMode {
+    Governance = 0,
+    Compliance = 1,
+}
+
+impl ObjectLockMode {
+    #[must_use]
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Governance),
+            1 => Some(Self::Compliance),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Governance => "GOVERNANCE",
+            Self::Compliance => "COMPLIANCE",
+        }
+    }
+}
+
+/// Object Lock legal hold status.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegalHoldStatus {
+    Off = 0,
+    On = 1,
+}
+
+impl LegalHoldStatus {
+    #[must_use]
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Off),
+            1 => Some(Self::On),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "OFF",
+            Self::On => "ON",
+        }
+    }
+}
+
+/// Stored tri-state legal hold metadata for object versions.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StoredLegalHoldStatus {
+    #[default]
+    NotSet = 0,
+    Off = 1,
+    On = 2,
+}
+
+impl StoredLegalHoldStatus {
+    #[must_use]
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::NotSet),
+            1 => Some(Self::Off),
+            2 => Some(Self::On),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_legal_hold_status(self) -> Option<LegalHoldStatus> {
+        match self {
+            Self::NotSet => None,
+            Self::Off => Some(LegalHoldStatus::Off),
+            Self::On => Some(LegalHoldStatus::On),
+        }
+    }
+
+    #[must_use]
+    pub const fn from_legal_hold_status(status: Option<LegalHoldStatus>) -> Self {
+        match status {
+            None => Self::NotSet,
+            Some(LegalHoldStatus::Off) => Self::Off,
+            Some(LegalHoldStatus::On) => Self::On,
+        }
+    }
+}
+
+/// Bucket default retention period.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetentionPeriod {
+    Days(NonZeroU32),
+    Years(NonZeroU32),
+}
+
+impl RetentionPeriod {
+    #[must_use]
+    pub fn days(days: u32) -> Option<Self> {
+        NonZeroU32::new(days).map(Self::Days)
+    }
+
+    #[must_use]
+    pub fn years(years: u32) -> Option<Self> {
+        NonZeroU32::new(years).map(Self::Years)
+    }
+}
+
+/// Default retention rule for an Object Lock-enabled bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectLockDefaultRetention {
+    pub mode: ObjectLockMode,
+    pub period: RetentionPeriod,
+}
+
+/// Bucket-level Object Lock configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BucketObjectLockConfig {
+    pub enabled: bool,
+    pub default_retention: Option<ObjectLockDefaultRetention>,
+}
+
+/// Per-version retention metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectRetention {
+    /// Absolute retain-until date as a Unix timestamp in seconds.
+    pub retain_until_unix_seconds: u64,
+    pub mode: ObjectLockMode,
+}
+
+/// First-class per-version Object Lock state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ObjectLockState {
+    pub retention: Option<ObjectRetention>,
+    pub legal_hold: StoredLegalHoldStatus,
 }
 
 /// Object version identifier.
@@ -391,8 +533,10 @@ impl AclGrants {
 #[cfg(test)]
 mod tests {
     use super::{
-        AccountIdentity, AclGrant, AclGrantee, AclGrants, AclPermission, BucketVersioningState,
-        CanonicalUserId, VersionId, CANONICAL_USER_ID_LEN,
+        AccountIdentity, AclGrant, AclGrantee, AclGrants, AclPermission, BucketObjectLockConfig,
+        BucketVersioningState, CanonicalUserId, LegalHoldStatus, ObjectLockDefaultRetention,
+        ObjectLockMode, ObjectLockState, ObjectRetention, RetentionPeriod, StoredLegalHoldStatus,
+        VersionId, CANONICAL_USER_ID_LEN,
     };
 
     #[test]
@@ -410,6 +554,119 @@ mod tests {
             Some(BucketVersioningState::Suspended)
         );
         assert_eq!(BucketVersioningState::from_u8(3), None);
+    }
+
+    #[test]
+    fn object_lock_mode_from_u8_round_trip() {
+        assert_eq!(ObjectLockMode::from_u8(0), Some(ObjectLockMode::Governance));
+        assert_eq!(ObjectLockMode::from_u8(1), Some(ObjectLockMode::Compliance));
+        assert_eq!(ObjectLockMode::from_u8(2), None);
+        assert_eq!(ObjectLockMode::Governance.as_str(), "GOVERNANCE");
+        assert_eq!(ObjectLockMode::Compliance.as_str(), "COMPLIANCE");
+    }
+
+    #[test]
+    fn legal_hold_status_round_trip() {
+        assert_eq!(LegalHoldStatus::from_u8(0), Some(LegalHoldStatus::Off));
+        assert_eq!(LegalHoldStatus::from_u8(1), Some(LegalHoldStatus::On));
+        assert_eq!(LegalHoldStatus::from_u8(2), None);
+        assert_eq!(LegalHoldStatus::Off.as_str(), "OFF");
+        assert_eq!(LegalHoldStatus::On.as_str(), "ON");
+    }
+
+    #[test]
+    fn stored_legal_hold_status_round_trip() {
+        assert_eq!(
+            StoredLegalHoldStatus::from_u8(0),
+            Some(StoredLegalHoldStatus::NotSet)
+        );
+        assert_eq!(
+            StoredLegalHoldStatus::from_u8(1),
+            Some(StoredLegalHoldStatus::Off)
+        );
+        assert_eq!(
+            StoredLegalHoldStatus::from_u8(2),
+            Some(StoredLegalHoldStatus::On)
+        );
+        assert_eq!(StoredLegalHoldStatus::from_u8(3), None);
+        assert_eq!(
+            StoredLegalHoldStatus::from_legal_hold_status(None),
+            StoredLegalHoldStatus::NotSet
+        );
+        assert_eq!(
+            StoredLegalHoldStatus::from_legal_hold_status(Some(LegalHoldStatus::Off)),
+            StoredLegalHoldStatus::Off
+        );
+        assert_eq!(
+            StoredLegalHoldStatus::from_legal_hold_status(Some(LegalHoldStatus::On)),
+            StoredLegalHoldStatus::On
+        );
+        assert_eq!(StoredLegalHoldStatus::NotSet.as_legal_hold_status(), None);
+        assert_eq!(
+            StoredLegalHoldStatus::Off.as_legal_hold_status(),
+            Some(LegalHoldStatus::Off)
+        );
+        assert_eq!(
+            StoredLegalHoldStatus::On.as_legal_hold_status(),
+            Some(LegalHoldStatus::On)
+        );
+    }
+
+    #[test]
+    fn retention_period_rejects_zero() {
+        assert_eq!(RetentionPeriod::days(0), None);
+        assert_eq!(RetentionPeriod::years(0), None);
+        assert!(matches!(
+            RetentionPeriod::days(1),
+            Some(RetentionPeriod::Days(_))
+        ));
+        assert!(matches!(
+            RetentionPeriod::years(1),
+            Some(RetentionPeriod::Years(_))
+        ));
+    }
+
+    #[test]
+    fn object_lock_state_defaults_to_unset() {
+        assert_eq!(
+            ObjectLockState::default(),
+            ObjectLockState {
+                retention: None,
+                legal_hold: StoredLegalHoldStatus::NotSet,
+            }
+        );
+        assert!(!BucketObjectLockConfig::default().enabled);
+        assert_eq!(BucketObjectLockConfig::default().default_retention, None);
+    }
+
+    #[test]
+    fn object_lock_types_compare_by_value() {
+        let retention = ObjectRetention {
+            mode: ObjectLockMode::Governance,
+            retain_until_unix_seconds: 1_893_456_000,
+        };
+        let default_retention = ObjectLockDefaultRetention {
+            mode: ObjectLockMode::Compliance,
+            period: RetentionPeriod::years(1).unwrap(),
+        };
+
+        assert_eq!(
+            retention,
+            ObjectRetention {
+                mode: ObjectLockMode::Governance,
+                retain_until_unix_seconds: 1_893_456_000,
+            }
+        );
+        assert_eq!(
+            BucketObjectLockConfig {
+                enabled: true,
+                default_retention: Some(default_retention),
+            },
+            BucketObjectLockConfig {
+                enabled: true,
+                default_retention: Some(default_retention),
+            }
+        );
     }
 
     #[test]

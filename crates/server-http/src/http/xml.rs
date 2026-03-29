@@ -3092,6 +3092,7 @@ mod tests {
             created_at: 1685000000000,
             acl_grants: s3_types::AclGrants::default(),
             versioning: BucketVersioningState::Disabled,
+            object_lock: s3_types::BucketObjectLockConfig::default(),
             public_read: false,
             public_write: false,
             public_access_block: None,
