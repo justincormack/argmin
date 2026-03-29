@@ -887,7 +887,15 @@ impl HttpFrontend {
                                 checksum_algorithm: replace_checksum_algo,
                             }
                         }
-                        _ => MetadataDirective::Copy,
+                        Some(d) if d.eq_ignore_ascii_case("COPY") => {
+                            MetadataDirective::CopyExplicit
+                        }
+                        Some(other) => {
+                            return Err(ServerError::InvalidArgument {
+                                reason: format!("invalid x-amz-metadata-directive value: {other}"),
+                            });
+                        }
+                        None => MetadataDirective::Copy,
                     };
                     // Parse inline tags before writing so invalid tags don't leave orphan objects
                     let replace_tags_xml = if req
@@ -2573,6 +2581,7 @@ impl HttpFrontend {
             key: &key,
             requester: requester.clone(),
             acl: acl.into(),
+            policy: crate::coordinator::PutObjectPolicyContext::default(),
             encryption: sse_customer
                 .as_ref()
                 .map_or(storage::ObjectEncryption::None, |ctx| {
@@ -2697,6 +2706,8 @@ impl HttpFrontend {
                 cond: &crate::conditional::WriteCondition::default(),
                 requester: ctx.requester.clone(),
                 acl: parse_put_object_acl(ctx.acl_header.as_deref()).into(),
+                copy_source: None,
+                metadata_directive: None,
             })?;
 
         let mut resp = S3Response::post_object(
@@ -2942,6 +2953,7 @@ impl HttpFrontend {
                 ctx.acl_header.as_deref(),
                 ctx.acl_grants.as_ref(),
             ),
+            policy: crate::coordinator::PutObjectPolicyContext::default(),
             encryption: ctx
                 .sse_customer
                 .as_ref()
@@ -3079,6 +3091,8 @@ impl HttpFrontend {
                     ctx.acl_header.as_deref(),
                     ctx.acl_grants.as_ref(),
                 ),
+                copy_source: None,
+                metadata_directive: None,
             })?;
 
         let mut resp = S3Response::put_object(&result);

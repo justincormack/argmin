@@ -1048,6 +1048,8 @@ pub struct GetObjectPartResult {
 pub enum MetadataDirective<'a> {
     /// Preserve source object's metadata.
     Copy,
+    /// Preserve source metadata with an explicit `x-amz-metadata-directive: COPY` header.
+    CopyExplicit,
     /// Replace metadata with an already-parsed blob and optional checksum algorithm.
     ///
     /// The `MetadataBlob` should already have checksum value headers stripped
@@ -1061,11 +1063,44 @@ pub enum MetadataDirective<'a> {
     },
 }
 
+impl MetadataDirective<'_> {
+    #[must_use]
+    const fn policy_condition_value(&self) -> Option<&'static str> {
+        match self {
+            Self::Copy => None,
+            Self::CopyExplicit => Some("COPY"),
+            Self::Replace { .. } => Some("REPLACE"),
+        }
+    }
+}
+
 /// Tagging handling directive for `CopyObject`.
 #[derive(Debug)]
 pub enum TaggingDirective<'a> {
     Copy,
     Replace(Option<&'a str>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PutObjectPolicyContext<'a> {
+    pub copy_source: Option<&'a str>,
+    pub metadata_directive: Option<&'a str>,
+    pub canned_acl: Option<&'a str>,
+}
+
+impl<'a> PutObjectPolicyContext<'a> {
+    #[must_use]
+    const fn new(
+        copy_source: Option<&'a str>,
+        metadata_directive: Option<&'a str>,
+        canned_acl: Option<&'a str>,
+    ) -> Self {
+        Self {
+            copy_source,
+            metadata_directive,
+            canned_acl,
+        }
+    }
 }
 
 /// Parsed copy-source reference, shared by CopyObject and UploadPartCopy.
@@ -1268,6 +1303,20 @@ impl PutObjectAcl<'_> {
             Self::None | Self::Private | Self::BucketOwnerFullControl
         )
     }
+
+    const fn policy_condition_value(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::Private => Some("private"),
+            Self::PublicRead => Some("public-read"),
+            Self::PublicReadWrite => Some("public-read-write"),
+            Self::AuthenticatedRead => Some("authenticated-read"),
+            Self::AwsExecRead => Some("aws-exec-read"),
+            Self::BucketOwnerRead => Some("bucket-owner-read"),
+            Self::BucketOwnerFullControl => Some("bucket-owner-full-control"),
+            Self::Invalid(_) => None,
+        }
+    }
 }
 
 /// Parsed ACL input relevant to direct PutObject authorization rules.
@@ -1284,6 +1333,15 @@ impl<'a> From<PutObjectAcl<'a>> for PutObjectWriteAcl<'a> {
         match value {
             PutObjectAcl::None => Self::None,
             other => Self::Canned(other),
+        }
+    }
+}
+
+impl PutObjectWriteAcl<'_> {
+    const fn policy_condition_value(&self) -> Option<&'static str> {
+        match self {
+            Self::None | Self::Grants(_) => None,
+            Self::Canned(acl) => acl.policy_condition_value(),
         }
     }
 }
@@ -1658,6 +1716,7 @@ pub struct BeginStreamPutRequest<'a> {
     pub key: &'a str,
     pub requester: Requester,
     pub acl: PutObjectWriteAcl<'a>,
+    pub policy: PutObjectPolicyContext<'a>,
     pub encryption: ObjectEncryption,
     #[cfg(not(test))]
     pub expected_bucket_owner: Option<&'a str>,
@@ -1730,6 +1789,7 @@ impl<'a> BeginStreamPutRequest<'a> {
         key: &'a str,
         requester: Requester,
         acl: impl Into<PutObjectWriteAcl<'a>>,
+        policy: PutObjectPolicyContext<'a>,
         encryption: ObjectEncryption,
         _expected_bucket_owner: Option<&'a str>,
     ) -> Self {
@@ -1738,6 +1798,7 @@ impl<'a> BeginStreamPutRequest<'a> {
             key,
             requester,
             acl: acl.into(),
+            policy,
             encryption,
             #[cfg(not(test))]
             expected_bucket_owner: _expected_bucket_owner,
@@ -1804,6 +1865,8 @@ pub struct FinalizeStreamPutRequest<'a> {
     pub cond: &'a WriteCondition,
     pub requester: Requester,
     pub acl: PutObjectWriteAcl<'a>,
+    pub copy_source: Option<&'a str>,
+    pub metadata_directive: Option<&'a str>,
 }
 
 /// Parsed request for finalizing a streaming UploadPart.
@@ -2077,6 +2140,11 @@ struct ReclaimSweeper {
 struct CachedBucketPolicy {
     generation: u64,
     policy: Arc<auth::BucketPolicy>,
+}
+
+enum ObjectAclAuthorization {
+    ReadWithPolicy(auth::PolicyAction),
+    Write,
 }
 
 impl Drop for ReclaimSweeper {
@@ -3076,6 +3144,14 @@ impl Coordinator {
         }
     }
 
+    fn get_object_acl_policy_action(version_id: Option<VersionId>) -> auth::PolicyAction {
+        if version_id.is_some() {
+            auth::PolicyAction::GetObjectVersionAcl
+        } else {
+            auth::PolicyAction::GetObjectAcl
+        }
+    }
+
     fn get_object_tagging_policy_action(version_id: Option<VersionId>) -> auth::PolicyAction {
         if version_id.is_some() {
             auth::PolicyAction::GetObjectVersionTagging
@@ -3190,9 +3266,33 @@ impl Coordinator {
             object.key().as_str(),
             requester.principal_opt(),
             requester.canonical_user_id(),
-            &request_tags,
         );
+        let request = request.with_existing_object_tags(&request_tags);
         Ok(policy.evaluate(&request))
+    }
+
+    fn bucket_policy_decision_for_put_object(
+        requester: &Requester,
+        bucket: &BucketSummary,
+        key: &str,
+        policy_context: PutObjectPolicyContext<'_>,
+        policy: Option<&auth::BucketPolicy>,
+    ) -> auth::PolicyEvaluation {
+        let Some(policy) = policy else {
+            return auth::PolicyEvaluation::NoMatch;
+        };
+
+        let request = auth::PolicyRequest::new(
+            auth::PolicyAction::PutObject,
+            &bucket.name,
+            key,
+            requester.principal_opt(),
+            requester.canonical_user_id(),
+        )
+        .with_copy_source(policy_context.copy_source)
+        .with_metadata_directive(policy_context.metadata_directive)
+        .with_canned_acl(policy_context.canned_acl);
+        policy.evaluate(&request)
     }
 
     fn requester_can_read_object_with_bucket_policy(
@@ -3233,6 +3333,51 @@ impl Coordinator {
                 }
             },
         )
+    }
+
+    fn requester_can_read_object_acl_with_bucket_policy(
+        requester: &Requester,
+        bucket: &BucketSummary,
+        object: &StoredObject,
+        action: auth::PolicyAction,
+        policy: Option<&auth::BucketPolicy>,
+    ) -> Result<bool, ServerError> {
+        Ok(
+            match Self::bucket_policy_decision_for_object(
+                requester, bucket, object, action, policy,
+            )? {
+                auth::PolicyEvaluation::ExplicitDeny => false,
+                auth::PolicyEvaluation::ExplicitAllow => true,
+                auth::PolicyEvaluation::NoMatch => {
+                    Self::requester_can_read_object_acl(requester, bucket, object)
+                }
+            },
+        )
+    }
+
+    fn requester_can_put_object_with_bucket_policy(
+        requester: &Requester,
+        bucket: &BucketSummary,
+        key: &str,
+        policy_context: PutObjectPolicyContext<'_>,
+        policy: Option<&auth::BucketPolicy>,
+    ) -> bool {
+        match Self::bucket_policy_decision_for_put_object(
+            requester,
+            bucket,
+            key,
+            policy_context,
+            policy,
+        ) {
+            auth::PolicyEvaluation::ExplicitDeny => false,
+            auth::PolicyEvaluation::ExplicitAllow => true,
+            auth::PolicyEvaluation::NoMatch => Self::requester_can_object_write(
+                requester,
+                &bucket.owner_principal,
+                &bucket.acl_grants,
+                Self::effective_public_write(bucket),
+            ),
+        }
     }
 
     fn parse_policy_existing_object_tags(
@@ -3706,13 +3851,17 @@ impl Coordinator {
         bucket: &str,
         key: &str,
         version_id: Option<VersionId>,
-        require_write: bool,
+        authorization: ObjectAclAuthorization,
         expected_bucket_owner: Option<&str>,
     ) -> Result<(BucketSummary, LockedReadObject<'a>), ServerError> {
         let bucket_info = self.active_bucket_summary(bucket)?;
         Self::ensure_expected_bucket_owner(&bucket_info, expected_bucket_owner)?;
         let can_discover_missing =
             Self::requester_can_bucket_admin(requester, &bucket_info.owner_principal);
+        let bucket_policy = match authorization {
+            ObjectAclAuthorization::ReadWithPolicy(_) => self.cached_bucket_policy(&bucket_info)?,
+            ObjectAclAuthorization::Write => None,
+        };
         let locked = match self.lock_object_pgs_for_read(bucket, key, version_id) {
             Ok(locked) => locked,
             Err(ServerError::ObjectNotFound { .. } | ServerError::VersionNotFound { .. })
@@ -3722,10 +3871,19 @@ impl Coordinator {
             }
             Err(other) => return Err(other),
         };
-        let allowed = if require_write {
-            Self::requester_can_write_object_acl(requester, &bucket_info, &locked.record)
-        } else {
-            Self::requester_can_read_object_acl(requester, &bucket_info, &locked.record)
+        let allowed = match authorization {
+            ObjectAclAuthorization::Write => {
+                Self::requester_can_write_object_acl(requester, &bucket_info, &locked.record)
+            }
+            ObjectAclAuthorization::ReadWithPolicy(policy_action) => {
+                Self::requester_can_read_object_acl_with_bucket_policy(
+                    requester,
+                    &bucket_info,
+                    &locked.record,
+                    policy_action,
+                    bucket_policy.as_deref(),
+                )?
+            }
         };
         if allowed {
             Ok((bucket_info, locked))
@@ -3796,6 +3954,30 @@ impl Coordinator {
             &info.owner_principal,
             &info.acl_grants,
             Self::effective_public_write(&info),
+        ) {
+            Ok(info)
+        } else {
+            Err(ServerError::AccessDenied)
+        }
+    }
+
+    fn authorize_put_object_requester(
+        &self,
+        requester: &Requester,
+        bucket: &str,
+        key: &str,
+        policy_context: PutObjectPolicyContext<'_>,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<BucketSummary, ServerError> {
+        let info = self.active_bucket_summary(bucket)?;
+        Self::ensure_expected_bucket_owner(&info, expected_bucket_owner)?;
+        let bucket_policy = self.cached_bucket_policy(&info)?;
+        if Self::requester_can_put_object_with_bucket_policy(
+            requester,
+            &info,
+            key,
+            policy_context,
+            bucket_policy.as_deref(),
         ) {
             Ok(info)
         } else {
@@ -5425,7 +5607,7 @@ impl Coordinator {
             bucket,
             key,
             version_id,
-            true,
+            ObjectAclAuthorization::Write,
             expected_bucket_owner,
         )?;
         if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_deref()) {
@@ -5466,7 +5648,7 @@ impl Coordinator {
             bucket,
             key,
             version_id,
-            true,
+            ObjectAclAuthorization::Write,
             expected_bucket_owner,
         )?;
         if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_deref()) {
@@ -5521,7 +5703,7 @@ impl Coordinator {
             bucket,
             key,
             version_id,
-            false,
+            ObjectAclAuthorization::ReadWithPolicy(Self::get_object_acl_policy_action(version_id)),
             expected_bucket_owner,
         )?;
         let LockedReadObject { record: stored, .. } = locked;
@@ -6070,14 +6252,23 @@ impl Coordinator {
             req.data.len()
         );
         let write_encryption = self.prepare_sse_customer_write_context(req.sse_customer)?;
+        let canned_acl = req.acl.policy_condition_value();
 
         if req.data.len() > INTERNAL_SEGMENT_SIZE {
+            self.authorize_put_object_requester(
+                &req.requester,
+                req.bucket,
+                req.key,
+                PutObjectPolicyContext::new(None, None, canned_acl),
+                expected_bucket_owner,
+            )?;
             let session_id = self.begin_stream_put_with_expected_bucket_owner(
                 &BeginStreamPutRequest::new(
                     req.bucket,
                     req.key,
                     req.requester.clone(),
                     req.acl.clone(),
+                    PutObjectPolicyContext::new(None, None, canned_acl),
                     write_encryption
                         .as_ref()
                         .map(|ctx| ctx.encryption().clone())
@@ -6114,6 +6305,8 @@ impl Coordinator {
                     cond: req.cond,
                     requester: req.requester.clone(),
                     acl: req.acl.clone(),
+                    copy_source: None,
+                    metadata_directive: None,
                 })
             })();
             if result.is_err() {
@@ -6124,11 +6317,13 @@ impl Coordinator {
 
         self.with_bucket_write_reservation(req.bucket, |bucket_info| {
             Self::ensure_expected_bucket_owner(&bucket_info, expected_bucket_owner)?;
-            if !Self::requester_can_object_write(
+            let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
+            if !Self::requester_can_put_object_with_bucket_policy(
                 &req.requester,
-                &bucket_info.owner_principal,
-                &bucket_info.acl_grants,
-                Self::effective_public_write(&bucket_info),
+                &bucket_info,
+                req.key,
+                PutObjectPolicyContext::new(None, None, canned_acl),
+                bucket_policy.as_deref(),
             ) {
                 return Err(ServerError::AccessDenied);
             }
@@ -6300,11 +6495,17 @@ impl Coordinator {
         let key = req.key;
         self.with_bucket_write_reservation(bucket, |bucket_info| {
             Self::ensure_expected_bucket_owner(&bucket_info, expected_bucket_owner)?;
-            if !Self::requester_can_object_write(
+            let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
+            if !Self::requester_can_put_object_with_bucket_policy(
                 &req.requester,
-                &bucket_info.owner_principal,
-                &bucket_info.acl_grants,
-                Self::effective_public_write(&bucket_info),
+                &bucket_info,
+                key,
+                PutObjectPolicyContext::new(
+                    req.policy.copy_source,
+                    req.policy.metadata_directive,
+                    req.policy.canned_acl.or(req.acl.policy_condition_value()),
+                ),
+                bucket_policy.as_deref(),
             ) {
                 return Err(ServerError::AccessDenied);
             }
@@ -6803,11 +7004,17 @@ impl Coordinator {
         let tags = req.tags;
         let cond = req.cond;
         self.with_bucket_write_reservation(bucket, |bucket_info| {
-            if !Self::requester_can_object_write(
+            let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
+            if !Self::requester_can_put_object_with_bucket_policy(
                 &req.requester,
-                &bucket_info.owner_principal,
-                &bucket_info.acl_grants,
-                Self::effective_public_write(&bucket_info),
+                &bucket_info,
+                key,
+                PutObjectPolicyContext::new(
+                    req.copy_source,
+                    req.metadata_directive,
+                    req.acl.policy_condition_value(),
+                ),
+                bucket_policy.as_deref(),
             ) {
                 return Err(ServerError::AccessDenied);
             }
@@ -7318,10 +7525,27 @@ impl Coordinator {
         let dst_response_sse_customer = dst_write_sse_customer
             .as_ref()
             .map(|ctx| ctx.request().response_headers());
+        let copy_source_policy_value = req.source.version_id.map_or_else(
+            || format!("{}/{}", req.source.bucket, req.source.key),
+            |version_id| {
+                format!(
+                    "{}/{}?versionId={}",
+                    req.source.bucket, req.source.key, version_id
+                )
+            },
+        );
+        let metadata_directive = req.directive.policy_condition_value();
+        let canned_acl = acl.policy_condition_value();
 
-        let dst_bucket_info = self.authorize_object_write_requester(
+        let dst_bucket_info = self.authorize_put_object_requester(
             requester,
             dst_bucket,
+            dst_key,
+            PutObjectPolicyContext::new(
+                Some(copy_source_policy_value.as_str()),
+                metadata_directive,
+                canned_acl,
+            ),
             expected_dst_bucket_owner,
         )?;
 
@@ -7375,8 +7599,10 @@ impl Coordinator {
                         src_request.customer_key() == dst_request.customer_key()
                     }),
             };
-            if matches!(directive, MetadataDirective::Copy)
-                && same_key_same_bucket
+            if matches!(
+                directive,
+                MetadataDirective::Copy | MetadataDirective::CopyExplicit
+            ) && same_key_same_bucket
                 && encryption_attrs_unchanged
             {
                 return Err(ServerError::InvalidRequest {
@@ -7482,14 +7708,14 @@ impl Coordinator {
 
         // Phase 2: Stream into destination staging session.
         let metadata_blob = match directive {
-            MetadataDirective::Copy => src_metadata,
+            MetadataDirective::Copy | MetadataDirective::CopyExplicit => src_metadata,
             MetadataDirective::Replace {
                 metadata: new_metadata,
                 ..
             } => (*new_metadata).clone(),
         };
         let mut system_metadata = match directive {
-            MetadataDirective::Copy => src_system_metadata,
+            MetadataDirective::Copy | MetadataDirective::CopyExplicit => src_system_metadata,
             MetadataDirective::Replace {
                 system_metadata: new_system_metadata,
                 ..
@@ -7511,6 +7737,11 @@ impl Coordinator {
             dst_key,
             requester.clone(),
             acl,
+            PutObjectPolicyContext::new(
+                Some(copy_source_policy_value.as_str()),
+                metadata_directive,
+                canned_acl,
+            ),
             dst_write_sse_customer
                 .as_ref()
                 .map(|ctx| ctx.encryption().clone())
@@ -7584,6 +7815,8 @@ impl Coordinator {
                 cond: dst_cond,
                 requester: requester.clone(),
                 acl: acl.into(),
+                copy_source: Some(copy_source_policy_value.as_str()),
+                metadata_directive,
             })?;
 
             let dst_meta_pg = self
@@ -10967,6 +11200,7 @@ mod tests {
             key,
             requester: TEST_REQUESTER,
             acl: NO_PUT_OBJECT_ACL.into(),
+            policy: PutObjectPolicyContext::default(),
             encryption: ObjectEncryption::None,
         })
     }
@@ -15463,6 +15697,405 @@ mod tests {
     }
 
     #[test]
+    fn copy_object_bucket_policy_copy_source_controls_access() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "src", false)
+            .unwrap();
+        coord
+            .create_bucket_for_owner("owner-a", "dst", false)
+            .unwrap();
+        coord
+            .put_bucket_policy(
+                "src",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::src/*"}]}"#,
+                Requester::principal("owner-a"),
+            )
+            .unwrap();
+        coord
+            .put_bucket_policy(
+                "dst",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::dst/*","Condition":{"StringLike":{"s3:x-amz-copy-source":"src/public/*"}}}]}"#,
+                Requester::principal("owner-a"),
+            )
+            .unwrap();
+
+        for (key, body) in [
+            ("public/foo", b"public-foo".as_slice()),
+            ("private/foo", b"private-foo".as_slice()),
+        ] {
+            test_helpers::put_object(
+                &coord,
+                &PutObjectRequest {
+                    sse_customer: None,
+                    bucket: "src",
+                    key,
+                    data: body,
+                    metadata: &MetadataBlob::new(),
+                    system_metadata: &SystemMetadata::EMPTY,
+                    tags: None,
+                    cond: NO_WRITE,
+                    requester: Requester::principal("owner-a"),
+                    acl: NO_PUT_OBJECT_ACL.into(),
+                },
+            )
+            .unwrap();
+        }
+
+        let source = coord
+            .get_object(&GetObjectRequest {
+                sse_customer: None,
+                bucket: "src",
+                key: "public/foo",
+                version_id: None,
+                cond: NO_READ,
+                requester: Requester::principal("other-user"),
+            })
+            .unwrap();
+        assert_eq!(source.body.read_all().unwrap(), b"public-foo");
+        coord
+            .authorize_put_object_requester(
+                &Requester::principal("other-user"),
+                "dst",
+                "copied",
+                PutObjectPolicyContext::new(Some("src/public/foo"), None, None),
+                None,
+            )
+            .unwrap();
+
+        let copied = coord
+            .copy_object(&CopyObjectRequest {
+                source: CopySource {
+                    bucket: "src",
+                    key: "public/foo",
+                    version_id: None,
+                    condition: NO_READ,
+                },
+                dst_bucket: "dst",
+                dst_key: "copied",
+                dst_condition: NO_WRITE,
+                directive: MetadataDirective::Copy,
+                tagging: TaggingDirective::Copy,
+                requester: Requester::principal("other-user"),
+                acl: PutObjectAcl::None,
+                source_sse_customer: None,
+                dst_sse_customer: None,
+            })
+            .unwrap();
+        assert_eq!(copied.version_id, VersionId::Null);
+
+        let copied_body = coord
+            .get_object(&GetObjectRequest {
+                sse_customer: None,
+                bucket: "dst",
+                key: "copied",
+                version_id: None,
+                cond: NO_READ,
+                requester: Requester::principal("other-user"),
+            })
+            .unwrap();
+        assert_eq!(copied_body.body.read_all().unwrap(), b"public-foo");
+
+        let err = coord
+            .copy_object(&CopyObjectRequest {
+                source: CopySource {
+                    bucket: "src",
+                    key: "private/foo",
+                    version_id: None,
+                    condition: NO_READ,
+                },
+                dst_bucket: "dst",
+                dst_key: "denied",
+                dst_condition: NO_WRITE,
+                directive: MetadataDirective::Copy,
+                tagging: TaggingDirective::Copy,
+                requester: Requester::principal("other-user"),
+                acl: PutObjectAcl::None,
+                source_sse_customer: None,
+                dst_sse_customer: None,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn copy_object_bucket_policy_requires_explicit_copy_metadata_directive() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "src", false)
+            .unwrap();
+        coord
+            .create_bucket_for_owner("owner-a", "dst", false)
+            .unwrap();
+        coord
+            .put_bucket_policy(
+                "src",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::src/*"}]}"#,
+                Requester::principal("owner-a"),
+            )
+            .unwrap();
+        coord
+            .put_bucket_policy(
+                "dst",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::dst/*","Condition":{"StringEquals":{"s3:x-amz-metadata-directive":"COPY"}}}]}"#,
+                Requester::principal("owner-a"),
+            )
+            .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                bucket: "src",
+                key: "public/foo",
+                data: b"public-foo",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                requester: Requester::principal("owner-a"),
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        let source = coord
+            .get_object(&GetObjectRequest {
+                sse_customer: None,
+                bucket: "src",
+                key: "public/foo",
+                version_id: None,
+                cond: NO_READ,
+                requester: Requester::principal("other-user"),
+            })
+            .unwrap();
+        assert_eq!(source.body.read_all().unwrap(), b"public-foo");
+        coord
+            .authorize_put_object_requester(
+                &Requester::principal("other-user"),
+                "dst",
+                "copied",
+                PutObjectPolicyContext::new(Some("src/public/foo"), Some("COPY"), None),
+                None,
+            )
+            .unwrap();
+
+        coord
+            .copy_object(&CopyObjectRequest {
+                source: CopySource {
+                    bucket: "src",
+                    key: "public/foo",
+                    version_id: None,
+                    condition: NO_READ,
+                },
+                dst_bucket: "dst",
+                dst_key: "copied",
+                dst_condition: NO_WRITE,
+                directive: MetadataDirective::CopyExplicit,
+                tagging: TaggingDirective::Copy,
+                requester: Requester::principal("other-user"),
+                acl: PutObjectAcl::None,
+                source_sse_customer: None,
+                dst_sse_customer: None,
+            })
+            .unwrap();
+
+        let err = coord
+            .copy_object(&CopyObjectRequest {
+                source: CopySource {
+                    bucket: "src",
+                    key: "public/foo",
+                    version_id: None,
+                    condition: NO_READ,
+                },
+                dst_bucket: "dst",
+                dst_key: "denied",
+                dst_condition: NO_WRITE,
+                directive: MetadataDirective::Copy,
+                tagging: TaggingDirective::Copy,
+                requester: Requester::principal("other-user"),
+                acl: PutObjectAcl::None,
+                source_sse_customer: None,
+                dst_sse_customer: None,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn put_object_bucket_policy_deny_on_public_acl() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        coord
+            .put_bucket_policy(
+                "bucket",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*"},{"Effect":"Deny","Principal":{"AWS":"other-user"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringLike":{"s3:x-amz-acl":"public*"}}}]}"#,
+                Requester::principal("owner-a"),
+            )
+            .unwrap();
+
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "private-key",
+                data: b"private",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                requester: Requester::principal("other-user"),
+                acl: PutObjectAcl::None.into(),
+            },
+        )
+        .unwrap();
+
+        let err = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "public-key",
+                data: b"public",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                requester: Requester::principal("other-user"),
+                acl: PutObjectAcl::PublicRead.into(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn begin_stream_put_bucket_policy_deny_on_public_acl() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        coord
+            .put_bucket_policy(
+                "bucket",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*"},{"Effect":"Deny","Principal":{"AWS":"other-user"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringLike":{"s3:x-amz-acl":"public*"}}}]}"#,
+                Requester::principal("owner-a"),
+            )
+            .unwrap();
+
+        let private_session = coord
+            .begin_stream_put(&BeginStreamPutRequest {
+                bucket: "bucket",
+                key: "private-key",
+                requester: Requester::principal("other-user"),
+                acl: PutObjectAcl::None.into(),
+                policy: PutObjectPolicyContext::default(),
+                encryption: ObjectEncryption::None,
+            })
+            .unwrap();
+        coord
+            .abort_stream_put("bucket", "private-key", &private_session)
+            .unwrap();
+
+        let err = coord
+            .begin_stream_put(&BeginStreamPutRequest {
+                bucket: "bucket",
+                key: "public-key",
+                requester: Requester::principal("other-user"),
+                acl: PutObjectAcl::PublicRead.into(),
+                policy: PutObjectPolicyContext::default(),
+                encryption: ObjectEncryption::None,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn get_object_acl_bucket_policy_existing_tag_controls_access() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        coord
+            .put_bucket_policy(
+                "bucket",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:GetObjectAcl","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}}]}"#,
+                Requester::principal("owner-a"),
+            )
+            .unwrap();
+
+        for (key, body, tags) in [
+            (
+                "publictag",
+                b"public".as_slice(),
+                Some("<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag><Tag><Key>foo</Key><Value>bar</Value></Tag></TagSet></Tagging>"),
+            ),
+            (
+                "privatetag",
+                b"private".as_slice(),
+                Some("<Tagging><TagSet><Tag><Key>security</Key><Value>private</Value></Tag></TagSet></Tagging>"),
+            ),
+            (
+                "invalidtag",
+                b"invalid".as_slice(),
+                Some("<Tagging><TagSet><Tag><Key>security1</Key><Value>public</Value></Tag></TagSet></Tagging>"),
+            ),
+        ] {
+            test_helpers::put_object(
+                &coord,
+                &PutObjectRequest {
+                    sse_customer: None,
+                    bucket: "bucket",
+                    key,
+                    data: body,
+                    metadata: &MetadataBlob::new(),
+                    system_metadata: &SystemMetadata::EMPTY,
+                    tags,
+                    cond: NO_WRITE,
+                    requester: Requester::principal("owner-a"),
+                    acl: NO_PUT_OBJECT_ACL.into(),
+                },
+            )
+            .unwrap();
+        }
+
+        let acl = coord
+            .get_object_acl(
+                "bucket",
+                "publictag",
+                None,
+                Requester::principal("other-user"),
+            )
+            .unwrap();
+        assert_eq!(acl.version_id, VersionId::Null);
+
+        let denied_object = coord
+            .get_object(&GetObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "publictag",
+                version_id: None,
+                cond: NO_READ,
+                requester: Requester::principal("other-user"),
+            })
+            .unwrap_err();
+        assert!(matches!(denied_object, ServerError::AccessDenied));
+
+        for key in ["privatetag", "invalidtag"] {
+            let err = coord
+                .get_object_acl("bucket", key, None, Requester::principal("other-user"))
+                .unwrap_err();
+            assert!(matches!(err, ServerError::AccessDenied));
+        }
+    }
+
+    #[test]
     fn bucket_policy_cache_invalidates_across_coordinators_on_replace() {
         let tmp = test_util::tempdir();
         let (admin, reader) = setup_coordinators_with_pg_count(tmp.path(), 4);
@@ -16375,6 +17008,7 @@ mod tests {
                 key: "key",
                 requester: Requester::principal("other-user"),
                 acl: NO_PUT_OBJECT_ACL.into(),
+                policy: PutObjectPolicyContext::default(),
                 encryption: ObjectEncryption::None,
             })
             .unwrap_err();
@@ -16437,6 +17071,7 @@ mod tests {
                 key: "key",
                 requester: Requester::principal("owner-a"),
                 acl: PutObjectAcl::PublicRead.into(),
+                policy: PutObjectPolicyContext::default(),
                 encryption: ObjectEncryption::None,
             })
             .unwrap_err();
@@ -18419,6 +19054,7 @@ mod tests {
                 key: "key",
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                policy: PutObjectPolicyContext::default(),
                 encryption,
             })
             .unwrap_err();
@@ -19322,6 +19958,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                copy_source: None,
+                metadata_directive: None,
             })
             .unwrap();
         assert_object_maps_meta_pg_gt_shard_pg(&admin, "race-bucket", &key);
@@ -23528,6 +24166,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                copy_source: None,
+                metadata_directive: None,
             })
             .unwrap();
 
@@ -23720,6 +24360,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                copy_source: None,
+                metadata_directive: None,
             })
             .unwrap();
 
@@ -23765,6 +24407,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                copy_source: None,
+                metadata_directive: None,
             })
             .unwrap();
         assert_eq!(result.version_id, VersionId::Null);
@@ -23835,6 +24479,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                copy_source: None,
+                metadata_directive: None,
             })
             .unwrap();
 
@@ -23878,6 +24524,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                copy_source: None,
+                metadata_directive: None,
             })
             .unwrap_err();
         assert!(
@@ -23937,6 +24585,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                copy_source: None,
+                metadata_directive: None,
             })
             .unwrap_err();
         assert!(
@@ -24005,6 +24655,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                copy_source: None,
+                metadata_directive: None,
             })
             .unwrap();
         assert_eq!(result.etag, format_etag(crc));
@@ -24069,6 +24721,8 @@ mod tests {
                 cond: &cond,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                copy_source: None,
+                metadata_directive: None,
             })
             .unwrap();
 
@@ -24093,6 +24747,8 @@ mod tests {
                 cond: &bad_cond,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                copy_source: None,
+                metadata_directive: None,
             })
             .unwrap_err();
         assert!(
@@ -24137,6 +24793,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                copy_source: None,
+                metadata_directive: None,
             })
             .unwrap();
         assert_eq!(result.etag, format_etag(crc));
@@ -24212,6 +24870,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                copy_source: None,
+                metadata_directive: None,
             })
             .unwrap();
 
@@ -24277,6 +24937,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                copy_source: None,
+                metadata_directive: None,
             })
             .unwrap();
 
@@ -24352,6 +25014,8 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                copy_source: None,
+                metadata_directive: None,
             })
             .unwrap();
 
@@ -24415,6 +25079,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                copy_source: None,
+                metadata_directive: None,
             })
             .unwrap();
 
@@ -24501,6 +25167,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                copy_source: None,
+                metadata_directive: None,
             })
             .unwrap();
 
@@ -24767,6 +25435,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                copy_source: None,
+                metadata_directive: None,
             })
             .unwrap();
 
@@ -24810,6 +25480,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                copy_source: None,
+                metadata_directive: None,
             })
             .unwrap();
 
@@ -24855,6 +25527,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                copy_source: None,
+                metadata_directive: None,
             })
             .unwrap();
 
@@ -24929,6 +25603,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                copy_source: None,
+                metadata_directive: None,
             })
             .unwrap();
 
@@ -24982,6 +25658,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                copy_source: None,
+                metadata_directive: None,
             })
             .unwrap();
 
@@ -25043,6 +25721,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                copy_source: None,
+                metadata_directive: None,
             })
             .unwrap();
 
@@ -25118,6 +25798,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                copy_source: None,
+                metadata_directive: None,
             })
             .unwrap();
 
@@ -25305,6 +25987,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                copy_source: None,
+                metadata_directive: None,
             })
             .unwrap();
     }
@@ -25337,6 +26021,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                copy_source: None,
+                metadata_directive: None,
             })
             .unwrap_err();
         assert!(
@@ -25870,6 +26556,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                copy_source: None,
+                metadata_directive: None,
             })
             .unwrap();
 
@@ -25961,6 +26649,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                copy_source: None,
+                metadata_directive: None,
             })
             .unwrap();
 
@@ -26110,6 +26800,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                copy_source: None,
+                metadata_directive: None,
             })
             .unwrap();
 
@@ -26182,6 +26874,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                copy_source: None,
+                metadata_directive: None,
             })
             .unwrap();
 
@@ -26204,6 +26898,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                copy_source: None,
+                metadata_directive: None,
             })
             .unwrap();
 

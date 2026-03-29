@@ -27,6 +27,8 @@ Dependencies:
 
 Current implementation status:
 - bucket metadata now stores raw bucket policy JSON in `buckets.bucket_policy`
+- bucket metadata also stores a shared bucket policy generation used to
+  invalidate parsed-policy caches across coordinators
 - storage exposes `put/get/delete_bucket_policy`
 - the router and HTTP handler support `PUT ?policy`, `GET ?policy`, and
   `DELETE ?policy`
@@ -41,18 +43,23 @@ Current implementation status:
 - there is now a shared typed bucket policy parser and public-policy classifier
 - `PutBucketPolicy` rejects public `Allow` policies when
   `BlockPublicPolicy=true`
-- there is still no request-time policy evaluation yet
+- request-time policy evaluation now covers object reads, object tagging, copy
+  destination writes, and `GetObjectAcl`
+- supported request-time condition keys now include:
+  `s3:ExistingObjectTag/<key>`,
+  `s3:x-amz-copy-source`,
+  `s3:x-amz-metadata-directive`, and
+  `s3:x-amz-acl`
+- request-time evaluation uses a parsed-policy cache outside
+  `BucketFastPathInfo`, keyed by shared bucket policy generation, and snapshots
+  the parsed policy before object-PG locking to avoid same-PG self-deadlock
 - raw policy is intentionally not stored in bucket fast-path metadata
 
 Remaining ignored tests tied directly to the unimplemented policy-evaluation
 gap:
 - restrict public buckets
 - get public block deny bucket policy
-- all current tagging tests marked `bucket policies`
-- policy tests involving `s3:ExistingObjectTag`
-- policy tests involving `s3:x-amz-copy-source`
-- policy tests involving `s3:x-amz-metadata-directive`
-- policy tests involving `s3:x-amz-acl`
+- policy tests involving `RestrictPublicBuckets`
 
 ## Goals
 
@@ -279,13 +286,32 @@ Notes:
 
 ### Phase 4: Copy And ACL-Condition Evaluation
 
+Status:
+- completed
+
 Deliver:
 - policy evaluation for `s3:x-amz-copy-source`
 - policy evaluation for `s3:x-amz-metadata-directive`
 - policy evaluation for `s3:x-amz-acl`
+- policy evaluation for `s3:GetObjectAcl` requests using the shared request-time
+  evaluator
 
 Success criteria:
 - copy-source and ACL-conditioned policy tests can be unignored
+
+Notes:
+- Phase 4 extends request-time evaluation to `s3:PutObject` and
+  `s3:GetObjectAcl` for the condition keys exercised by the current Ceph tests
+- `s3:x-amz-copy-source`, `s3:x-amz-metadata-directive`, and `s3:x-amz-acl`
+  currently support `StringEquals` and `StringLike`
+- policy request context for copy destination writes is derived once and carried
+  through direct put, streaming put, and finalize paths so large-copy and
+  streamed-write authorization is consistent
+- `x-amz-metadata-directive: COPY` is distinguished from an absent
+  `x-amz-metadata-directive` header because AWS treats those differently for the
+  conditional policy tests
+- the copy-source, metadata-directive, canned-ACL, and `GetObjectAcl`
+  bucket-policy tagging tests are now unignored
 
 ### Phase 5: Restrict Public Buckets
 
