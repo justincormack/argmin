@@ -619,15 +619,172 @@ fn test_block_public_policy_with_principal() {
 }
 
 #[test]
-#[ignore = "not implemented: bucket policies"]
 fn test_block_public_restrict_public_buckets() {
-    s3_tests::run(async {});
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        client
+            .delete_public_access_block()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("foo")
+            .body(aws_sdk_s3::primitives::ByteStream::from_static(b"bar"))
+            .send()
+            .await
+            .unwrap();
+
+        let policy = serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": {"AWS": "*"},
+                "Action": "s3:GetObject",
+                "Resource": format!("arn:aws:s3:::{bucket}/*"),
+            }],
+        })
+        .to_string();
+        let put_policy = client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await;
+        if put_policy.is_err()
+            && std::env::var("S3_TEST_ENDPOINT").is_ok()
+            && err_status(&put_policy) == 403
+        {
+            assert_s3_err_code(&put_policy, "AccessDenied");
+            client
+                .delete_object()
+                .bucket(&bucket)
+                .key("foo")
+                .send()
+                .await
+                .unwrap();
+            cleanup(&bucket).await;
+            return;
+        }
+        put_policy.unwrap();
+
+        let get_url = format!("{}/{bucket}/foo", CTX.endpoint());
+        let mut public_resp = agent().get(&get_url).call().expect("transport error");
+        assert_eq!(public_resp.status().as_u16(), 200);
+        assert_eq!(public_resp.body_mut().read_to_string().unwrap(), "bar");
+
+        let pab = aws_sdk_s3::types::PublicAccessBlockConfiguration::builder()
+            .block_public_acls(false)
+            .ignore_public_acls(false)
+            .block_public_policy(false)
+            .restrict_public_buckets(true)
+            .build();
+        client
+            .put_public_access_block()
+            .bucket(&bucket)
+            .public_access_block_configuration(pab)
+            .send()
+            .await
+            .unwrap();
+
+        let mut denied_resp = agent().get(&get_url).call().expect("transport error");
+        let _ = denied_resp.body_mut().read_to_string();
+        assert_eq!(denied_resp.status().as_u16(), 403);
+
+        let owner_resp = client
+            .get_object()
+            .bucket(&bucket)
+            .key("foo")
+            .send()
+            .await
+            .unwrap();
+        let body = owner_resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&body[..], b"bar");
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key("foo")
+            .send()
+            .await
+            .unwrap();
+        cleanup(&bucket).await;
+    });
 }
 
 #[test]
-#[ignore = "not implemented: bucket policies"]
 fn test_get_public_block_deny_bucket_policy() {
-    s3_tests::run(async {});
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let pab = aws_sdk_s3::types::PublicAccessBlockConfiguration::builder()
+            .block_public_acls(true)
+            .ignore_public_acls(true)
+            .block_public_policy(true)
+            .restrict_public_buckets(false)
+            .build();
+        client
+            .put_public_access_block()
+            .bucket(&bucket)
+            .public_access_block_configuration(pab)
+            .send()
+            .await
+            .unwrap();
+
+        let resp = client
+            .get_public_access_block()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        let config = resp.public_access_block_configuration().unwrap();
+        assert_eq!(config.block_public_acls(), Some(true));
+        assert_eq!(config.ignore_public_acls(), Some(true));
+        assert_eq!(config.block_public_policy(), Some(true));
+        assert_eq!(config.restrict_public_buckets(), Some(false));
+
+        let policy = serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Deny",
+                "Principal": {"AWS": "*"},
+                "Action": "s3:GetBucketPublicAccessBlock",
+                "Resource": format!("arn:aws:s3:::{bucket}"),
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        let denied = client
+            .get_public_access_block()
+            .bucket(&bucket)
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        client
+            .delete_bucket_policy()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        cleanup(&bucket).await;
+    });
 }
 
 // ── Helper: send a signed PUT request via raw HTTP ───────────────────

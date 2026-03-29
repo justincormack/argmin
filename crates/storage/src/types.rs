@@ -1152,6 +1152,8 @@ pub struct BucketInfo {
     pub ownership_controls: Option<String>,
     /// Original bucket policy JSON document (None = no policy).
     pub bucket_policy: Option<String>,
+    /// Whether the stored bucket policy is classified as public.
+    pub bucket_policy_public: bool,
     /// Monotonic generation incremented on every bucket policy update/delete.
     pub bucket_policy_generation: u64,
     /// Bucket encryption configuration subset currently modeled by storage.
@@ -1173,6 +1175,7 @@ pub struct BucketFastPathInfo {
     pub public_access_block: Option<String>,
     pub ownership_controls: Option<String>,
     pub bucket_policy_present: bool,
+    pub bucket_policy_public: bool,
     pub bucket_policy_generation: u64,
     pub encryption: BucketEncryptionConfig,
 }
@@ -1201,6 +1204,7 @@ impl From<BucketInfo> for BucketFastPathInfo {
             public_access_block: info.public_access_block,
             ownership_controls: info.ownership_controls,
             bucket_policy_present: info.bucket_policy.is_some(),
+            bucket_policy_public: info.bucket_policy_public,
             bucket_policy_generation: info.bucket_policy_generation,
             encryption: info.encryption,
         }
@@ -1222,6 +1226,7 @@ impl From<&BucketInfo> for BucketFastPathInfo {
             public_access_block: info.public_access_block.clone(),
             ownership_controls: info.ownership_controls.clone(),
             bucket_policy_present: info.bucket_policy.is_some(),
+            bucket_policy_public: info.bucket_policy_public,
             bucket_policy_generation: info.bucket_policy_generation,
             encryption: info.encryption,
         }

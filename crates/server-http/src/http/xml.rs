@@ -3030,6 +3030,7 @@ mod tests {
             public_access_block: None,
             ownership_controls: None,
             bucket_policy_present: false,
+            bucket_policy_public: false,
             bucket_policy_generation: 0,
             encryption: BucketEncryptionConfig::default(),
         }];

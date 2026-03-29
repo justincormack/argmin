@@ -165,6 +165,7 @@ pub struct BucketSummary {
     pub public_access_block: Option<String>,
     pub ownership_controls: Option<String>,
     pub bucket_policy_present: bool,
+    pub bucket_policy_public: bool,
     pub bucket_policy_generation: u64,
     pub encryption: BucketEncryptionConfig,
 }
@@ -3063,6 +3064,35 @@ impl Coordinator {
         })
     }
 
+    fn principal_account_id(principal: &str) -> Option<&str> {
+        if principal.len() == 12 && principal.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Some(principal);
+        }
+
+        let arn = principal.strip_prefix("arn:aws:iam::")?;
+        let (account_id, _) = arn.split_once(':')?;
+        (!account_id.is_empty()).then_some(account_id)
+    }
+
+    fn requester_is_bucket_owner_account(requester: &Requester, bucket: &BucketSummary) -> bool {
+        #[cfg(test)]
+        if requester.is_system {
+            return true;
+        }
+
+        let Some(account) = requester.account() else {
+            return false;
+        };
+        if account.principal() == bucket.owner_principal {
+            return true;
+        }
+
+        let Some(requester_account_id) = Self::principal_account_id(account.principal()) else {
+            return false;
+        };
+        Self::principal_account_id(&bucket.owner_principal) == Some(requester_account_id)
+    }
+
     fn requester_can_manage_multipart_upload(
         requester: &Requester,
         bucket: &BucketSummary,
@@ -3128,12 +3158,34 @@ impl Coordinator {
         config_xml.is_some_and(|xml| xml.contains("<BlockPublicPolicy>true</BlockPublicPolicy>"))
     }
 
+    fn restricts_public_buckets(config_xml: Option<&str>) -> bool {
+        config_xml
+            .is_some_and(|xml| xml.contains("<RestrictPublicBuckets>true</RestrictPublicBuckets>"))
+    }
+
     fn effective_public_read(bucket: &BucketSummary) -> bool {
         bucket.public_read && !Self::ignores_public_acls(bucket.public_access_block.as_deref())
     }
 
     fn effective_public_write(bucket: &BucketSummary) -> bool {
         bucket.public_write && !Self::ignores_public_acls(bucket.public_access_block.as_deref())
+    }
+
+    fn bucket_policy_allow_survives_restrict_public_buckets(
+        requester: &Requester,
+        bucket: &BucketSummary,
+    ) -> bool {
+        if !bucket.bucket_policy_public
+            || !Self::restricts_public_buckets(bucket.public_access_block.as_deref())
+        {
+            return true;
+        }
+
+        // AWS also preserves access for trusted service principals here.
+        // The current requester model only carries authenticated account
+        // identities, so service principals are not distinguishable from
+        // spoofed user-chosen principal strings at this layer.
+        Self::requester_is_bucket_owner_account(requester, bucket)
     }
 
     fn get_object_policy_action(version_id: Option<VersionId>) -> auth::PolicyAction {
@@ -3271,6 +3323,25 @@ impl Coordinator {
         Ok(policy.evaluate(&request))
     }
 
+    fn bucket_policy_decision_for_bucket(
+        requester: &Requester,
+        bucket: &BucketSummary,
+        action: auth::PolicyAction,
+        policy: Option<&auth::BucketPolicy>,
+    ) -> auth::PolicyEvaluation {
+        let Some(policy) = policy else {
+            return auth::PolicyEvaluation::NoMatch;
+        };
+
+        let request = auth::PolicyRequest::for_bucket(
+            action,
+            &bucket.name,
+            requester.principal_opt(),
+            requester.canonical_user_id(),
+        );
+        policy.evaluate(&request)
+    }
+
     fn bucket_policy_decision_for_put_object(
         requester: &Requester,
         bucket: &BucketSummary,
@@ -3307,8 +3378,14 @@ impl Coordinator {
                 requester, bucket, object, action, policy,
             )? {
                 auth::PolicyEvaluation::ExplicitDeny => false,
-                auth::PolicyEvaluation::ExplicitAllow => true,
-                auth::PolicyEvaluation::NoMatch => {
+                auth::PolicyEvaluation::ExplicitAllow
+                    if Self::bucket_policy_allow_survives_restrict_public_buckets(
+                        requester, bucket,
+                    ) =>
+                {
+                    true
+                }
+                auth::PolicyEvaluation::ExplicitAllow | auth::PolicyEvaluation::NoMatch => {
                     Self::requester_can_read_object(requester, bucket, object)
                 }
             },
@@ -3327,8 +3404,14 @@ impl Coordinator {
                 requester, bucket, object, action, policy,
             )? {
                 auth::PolicyEvaluation::ExplicitDeny => false,
-                auth::PolicyEvaluation::ExplicitAllow => true,
-                auth::PolicyEvaluation::NoMatch => {
+                auth::PolicyEvaluation::ExplicitAllow
+                    if Self::bucket_policy_allow_survives_restrict_public_buckets(
+                        requester, bucket,
+                    ) =>
+                {
+                    true
+                }
+                auth::PolicyEvaluation::ExplicitAllow | auth::PolicyEvaluation::NoMatch => {
                     Self::requester_can_manage_object_tags(requester, bucket, object)
                 }
             },
@@ -3347,8 +3430,14 @@ impl Coordinator {
                 requester, bucket, object, action, policy,
             )? {
                 auth::PolicyEvaluation::ExplicitDeny => false,
-                auth::PolicyEvaluation::ExplicitAllow => true,
-                auth::PolicyEvaluation::NoMatch => {
+                auth::PolicyEvaluation::ExplicitAllow
+                    if Self::bucket_policy_allow_survives_restrict_public_buckets(
+                        requester, bucket,
+                    ) =>
+                {
+                    true
+                }
+                auth::PolicyEvaluation::ExplicitAllow | auth::PolicyEvaluation::NoMatch => {
                     Self::requester_can_read_object_acl(requester, bucket, object)
                 }
             },
@@ -3370,13 +3459,46 @@ impl Coordinator {
             policy,
         ) {
             auth::PolicyEvaluation::ExplicitDeny => false,
-            auth::PolicyEvaluation::ExplicitAllow => true,
-            auth::PolicyEvaluation::NoMatch => Self::requester_can_object_write(
-                requester,
-                &bucket.owner_principal,
-                &bucket.acl_grants,
-                Self::effective_public_write(bucket),
-            ),
+            auth::PolicyEvaluation::ExplicitAllow
+                if Self::bucket_policy_allow_survives_restrict_public_buckets(
+                    requester, bucket,
+                ) =>
+            {
+                true
+            }
+            auth::PolicyEvaluation::ExplicitAllow | auth::PolicyEvaluation::NoMatch => {
+                Self::requester_can_object_write(
+                    requester,
+                    &bucket.owner_principal,
+                    &bucket.acl_grants,
+                    Self::effective_public_write(bucket),
+                )
+            }
+        }
+    }
+
+    fn requester_can_get_bucket_public_access_block_with_bucket_policy(
+        requester: &Requester,
+        bucket: &BucketSummary,
+        policy: Option<&auth::BucketPolicy>,
+    ) -> bool {
+        match Self::bucket_policy_decision_for_bucket(
+            requester,
+            bucket,
+            auth::PolicyAction::GetBucketPublicAccessBlock,
+            policy,
+        ) {
+            auth::PolicyEvaluation::ExplicitDeny => false,
+            auth::PolicyEvaluation::ExplicitAllow
+                if Self::bucket_policy_allow_survives_restrict_public_buckets(
+                    requester, bucket,
+                ) =>
+            {
+                true
+            }
+            auth::PolicyEvaluation::ExplicitAllow | auth::PolicyEvaluation::NoMatch => {
+                Self::requester_can_bucket_admin(requester, &bucket.owner_principal)
+            }
         }
     }
 
@@ -4158,6 +4280,7 @@ impl Coordinator {
             public_access_block: info.public_access_block,
             ownership_controls: info.ownership_controls,
             bucket_policy_present: info.bucket_policy.is_some(),
+            bucket_policy_public: info.bucket_policy_public,
             bucket_policy_generation: info.bucket_policy_generation,
             encryption: info.encryption,
         }
@@ -4176,6 +4299,7 @@ impl Coordinator {
             public_access_block: info.public_access_block,
             ownership_controls: info.ownership_controls,
             bucket_policy_present: info.bucket_policy_present,
+            bucket_policy_public: info.bucket_policy_public,
             bucket_policy_generation: info.bucket_policy_generation,
             encryption: info.encryption,
         }
@@ -5206,14 +5330,15 @@ impl Coordinator {
             .map_err(|e| ServerError::MalformedPolicy {
                 reason: e.reason().to_string(),
             })?;
+        let policy_is_public = parsed_policy.is_public();
         if Self::blocks_public_policy(bucket_info.public_access_block.as_deref())
-            && parsed_policy.is_public()
+            && policy_is_public
         {
             return Err(ServerError::AccessDenied);
         }
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg
-            .put_bucket_policy(name, policy)
+            .put_bucket_policy(name, policy, policy_is_public)
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
                     name: name.to_string(),
@@ -5368,8 +5493,16 @@ impl Coordinator {
             "bucket={}",
             name
         );
-        let _bucket_info =
-            self.authorize_bucket_admin_requester(&requester, name, expected_bucket_owner)?;
+        let bucket_info = self.active_bucket_summary(name)?;
+        Self::ensure_expected_bucket_owner(&bucket_info, expected_bucket_owner)?;
+        let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
+        if !Self::requester_can_get_bucket_public_access_block_with_bucket_policy(
+            &requester,
+            &bucket_info,
+            bucket_policy.as_deref(),
+        ) {
+            return Err(ServerError::AccessDenied);
+        }
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg
             .get_bucket_public_access_block(name)
@@ -11691,6 +11824,250 @@ mod tests {
                 .unwrap(),
             Some(policy.to_string())
         );
+    }
+
+    #[test]
+    fn get_object_restrict_public_buckets_blocks_anonymous_public_policy_access() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("111122223333", "bucket", false)
+            .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "foo",
+                data: b"bar",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                requester: Requester::principal("111122223333"),
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        coord
+            .put_bucket_policy(
+                "bucket",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+                Requester::principal("111122223333"),
+            )
+            .unwrap();
+        coord
+            .put_bucket_public_access_block(
+                "bucket",
+                "<PublicAccessBlockConfiguration><BlockPublicAcls>false</BlockPublicAcls><IgnorePublicAcls>false</IgnorePublicAcls><BlockPublicPolicy>false</BlockPublicPolicy><RestrictPublicBuckets>true</RestrictPublicBuckets></PublicAccessBlockConfiguration>",
+                Requester::principal("111122223333"),
+            )
+            .unwrap();
+
+        let err = coord
+            .get_object(&GetObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "foo",
+                version_id: None,
+                cond: NO_READ,
+                requester: Requester::anonymous(),
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+
+        let obj = coord
+            .get_object(&GetObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "foo",
+                version_id: None,
+                cond: NO_READ,
+                requester: Requester::principal("111122223333"),
+            })
+            .unwrap();
+        assert_eq!(obj.body.read_all().unwrap(), b"bar");
+    }
+
+    #[test]
+    fn get_object_restrict_public_buckets_allows_same_account_iam_principal() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("111122223333", "bucket", false)
+            .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "foo",
+                data: b"bar",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                requester: Requester::principal("111122223333"),
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        coord
+            .put_bucket_policy(
+                "bucket",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+                Requester::principal("111122223333"),
+            )
+            .unwrap();
+        coord
+            .put_bucket_public_access_block(
+                "bucket",
+                "<PublicAccessBlockConfiguration><BlockPublicAcls>false</BlockPublicAcls><IgnorePublicAcls>false</IgnorePublicAcls><BlockPublicPolicy>false</BlockPublicPolicy><RestrictPublicBuckets>true</RestrictPublicBuckets></PublicAccessBlockConfiguration>",
+                Requester::principal("111122223333"),
+            )
+            .unwrap();
+
+        let obj = coord
+            .get_object(&GetObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "foo",
+                version_id: None,
+                cond: NO_READ,
+                requester: Requester::principal("arn:aws:iam::111122223333:user/reader"),
+            })
+            .unwrap();
+        assert_eq!(obj.body.read_all().unwrap(), b"bar");
+    }
+
+    #[test]
+    fn get_object_restrict_public_buckets_blocks_cross_account_allow_when_policy_is_public() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("111122223333", "bucket", false)
+            .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "foo",
+                data: b"bar",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                requester: Requester::principal("111122223333"),
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        coord
+            .put_bucket_policy(
+                "bucket",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::444455556666:root"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"},{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+                Requester::principal("111122223333"),
+            )
+            .unwrap();
+        coord
+            .put_bucket_public_access_block(
+                "bucket",
+                "<PublicAccessBlockConfiguration><BlockPublicAcls>false</BlockPublicAcls><IgnorePublicAcls>false</IgnorePublicAcls><BlockPublicPolicy>false</BlockPublicPolicy><RestrictPublicBuckets>true</RestrictPublicBuckets></PublicAccessBlockConfiguration>",
+                Requester::principal("111122223333"),
+            )
+            .unwrap();
+
+        let err = coord
+            .get_object(&GetObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "foo",
+                version_id: None,
+                cond: NO_READ,
+                requester: Requester::principal("444455556666"),
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn get_object_restrict_public_buckets_blocks_spoofed_service_principal_name() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("111122223333", "bucket", false)
+            .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "foo",
+                data: b"bar",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                requester: Requester::principal("111122223333"),
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        coord
+            .put_bucket_policy(
+                "bucket",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+                Requester::principal("111122223333"),
+            )
+            .unwrap();
+        coord
+            .put_bucket_public_access_block(
+                "bucket",
+                "<PublicAccessBlockConfiguration><BlockPublicAcls>false</BlockPublicAcls><IgnorePublicAcls>false</IgnorePublicAcls><BlockPublicPolicy>false</BlockPublicPolicy><RestrictPublicBuckets>true</RestrictPublicBuckets></PublicAccessBlockConfiguration>",
+                Requester::principal("111122223333"),
+            )
+            .unwrap();
+
+        let err = coord
+            .get_object(&GetObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "foo",
+                version_id: None,
+                cond: NO_READ,
+                requester: Requester::principal("evil.amazonaws.com"),
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn get_bucket_public_access_block_bucket_policy_deny_applies() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("111122223333", "bucket", false)
+            .unwrap();
+        coord
+            .put_bucket_public_access_block(
+                "bucket",
+                "<PublicAccessBlockConfiguration><BlockPublicAcls>true</BlockPublicAcls><IgnorePublicAcls>true</IgnorePublicAcls><BlockPublicPolicy>true</BlockPublicPolicy><RestrictPublicBuckets>false</RestrictPublicBuckets></PublicAccessBlockConfiguration>",
+                Requester::principal("111122223333"),
+            )
+            .unwrap();
+        coord
+            .put_bucket_policy(
+                "bucket",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetBucketPublicAccessBlock","Resource":"arn:aws:s3:::bucket"}]}"#,
+                Requester::principal("111122223333"),
+            )
+            .unwrap();
+
+        let err = coord
+            .get_bucket_public_access_block("bucket", Requester::principal("111122223333"))
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
     }
 
     #[test]

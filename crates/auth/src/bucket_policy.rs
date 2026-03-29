@@ -49,7 +49,7 @@ impl BucketPolicy {
     #[must_use]
     pub fn evaluate(&self, request: &PolicyRequest<'_>) -> PolicyEvaluation {
         let action = request.action.as_str();
-        let resource = request.object_resource_arn();
+        let resource = request.resource_arn();
         let mut saw_allow = false;
 
         for statement in &self.statements {
@@ -73,6 +73,7 @@ impl BucketPolicy {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyAction {
+    GetBucketPublicAccessBlock,
     GetObject,
     GetObjectVersion,
     GetObjectAcl,
@@ -90,6 +91,7 @@ impl PolicyAction {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::GetBucketPublicAccessBlock => "s3:GetBucketPublicAccessBlock",
             Self::GetObject => "s3:GetObject",
             Self::GetObjectVersion => "s3:GetObjectVersion",
             Self::GetObjectAcl => "s3:GetObjectAcl",
@@ -133,6 +135,7 @@ pub struct PolicyRequest<'a> {
     action: PolicyAction,
     bucket: &'a str,
     key: &'a str,
+    bucket_resource: bool,
     requester_principal: Option<&'a str>,
     requester_canonical_user_id: Option<&'a CanonicalUserId>,
     existing_object_tags: &'a [PolicyTag<'a>],
@@ -154,6 +157,28 @@ impl<'a> PolicyRequest<'a> {
             action,
             bucket,
             key,
+            bucket_resource: false,
+            requester_principal,
+            requester_canonical_user_id,
+            existing_object_tags: &[],
+            copy_source: None,
+            metadata_directive: None,
+            canned_acl: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn for_bucket(
+        action: PolicyAction,
+        bucket: &'a str,
+        requester_principal: Option<&'a str>,
+        requester_canonical_user_id: Option<&'a CanonicalUserId>,
+    ) -> Self {
+        Self {
+            action,
+            bucket,
+            key: "",
+            bucket_resource: true,
             requester_principal,
             requester_canonical_user_id,
             existing_object_tags: &[],
@@ -179,8 +204,12 @@ impl<'a> PolicyRequest<'a> {
     }
 
     #[must_use]
-    pub fn object_resource_arn(&self) -> String {
-        format!("arn:aws:s3:::{}", self.object_path())
+    pub fn resource_arn(&self) -> String {
+        if self.bucket_resource {
+            format!("arn:aws:s3:::{}", self.bucket)
+        } else {
+            format!("arn:aws:s3:::{}", self.object_path())
+        }
     }
 
     #[must_use]
@@ -964,6 +993,14 @@ mod tests {
             .with_existing_object_tags(existing_object_tags)
     }
 
+    fn bucket_request<'a>(
+        action: PolicyAction,
+        bucket: &'a str,
+        requester_principal: Option<&'a str>,
+    ) -> PolicyRequest<'a> {
+        PolicyRequest::for_bucket(action, bucket, requester_principal, None)
+    }
+
     #[test]
     fn parse_empty_statement_array() {
         let policy = parse_bucket_policy(r#"{"Version":"2012-10-17","Statement":[]}"#).unwrap();
@@ -1289,5 +1326,20 @@ mod tests {
         );
 
         assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+    }
+
+    #[test]
+    fn bucket_resource_request_matches_bucket_action() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetBucketPublicAccessBlock","Resource":"arn:aws:s3:::bucket"}]}"#,
+        )
+        .unwrap();
+        let request = bucket_request(
+            PolicyAction::GetBucketPublicAccessBlock,
+            "bucket",
+            Some("caller"),
+        );
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitDeny);
     }
 }

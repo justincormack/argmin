@@ -324,6 +324,7 @@ CREATE TABLE IF NOT EXISTS buckets (
     public_access_block TEXT,
     ownership_controls TEXT,
     bucket_policy    TEXT,
+    bucket_policy_public INTEGER NOT NULL DEFAULT 0 CHECK (bucket_policy_public IN (0, 1)),
     bucket_policy_generation INTEGER NOT NULL DEFAULT 0 CHECK (bucket_policy_generation >= 0),
     sse_c_blocked    INTEGER NOT NULL DEFAULT 0 CHECK (sse_c_blocked IN (0, 1))
 )";

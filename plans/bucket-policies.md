@@ -27,6 +27,8 @@ Dependencies:
 
 Current implementation status:
 - bucket metadata now stores raw bucket policy JSON in `buckets.bucket_policy`
+- bucket metadata also stores a compact `bucket_policy_public` summary used by
+  hot auth paths
 - bucket metadata also stores a shared bucket policy generation used to
   invalidate parsed-policy caches across coordinators
 - storage exposes `put/get/delete_bucket_policy`
@@ -44,12 +46,15 @@ Current implementation status:
 - `PutBucketPolicy` rejects public `Allow` policies when
   `BlockPublicPolicy=true`
 - request-time policy evaluation now covers object reads, object tagging, copy
-  destination writes, and `GetObjectAcl`
+  destination writes, `GetObjectAcl`, and `GetBucketPublicAccessBlock`
 - supported request-time condition keys now include:
   `s3:ExistingObjectTag/<key>`,
   `s3:x-amz-copy-source`,
   `s3:x-amz-metadata-directive`, and
   `s3:x-amz-acl`
+- request-time `RestrictPublicBuckets` enforcement now suppresses policy-based
+  `Allow` results for public bucket policies unless the requester is an AWS
+  service principal or is in the bucket owner's account
 - request-time evaluation uses a parsed-policy cache outside
   `BucketFastPathInfo`, keyed by shared bucket policy generation, and snapshots
   the parsed policy before object-PG locking to avoid same-PG self-deadlock
@@ -57,9 +62,7 @@ Current implementation status:
 
 Remaining ignored tests tied directly to the unimplemented policy-evaluation
 gap:
-- restrict public buckets
-- get public block deny bucket policy
-- policy tests involving `RestrictPublicBuckets`
+- none in the current planned scope
 
 ## Goals
 
@@ -315,6 +318,9 @@ Notes:
 
 ### Phase 5: Restrict Public Buckets
 
+Status:
+- completed
+
 Deliver:
 - request-time enforcement of `RestrictPublicBuckets`
 - shared policy-publicness summary available to hot auth paths
@@ -322,23 +328,37 @@ Deliver:
 Success criteria:
 - public access block policy restriction tests can be unignored
 
+Notes:
+- bucket metadata and fast-path summaries now carry a compact
+  `bucket_policy_public` flag, while parsed policy documents remain outside the
+  hot bucket fast path
+- `RestrictPublicBuckets` only suppresses bucket-policy `Allow` results for
+  public policies; explicit `Deny` still wins, and ACL / ownership fallback
+  behavior remains intact
+- when a bucket policy is public and `RestrictPublicBuckets=true`, same-account
+  requesters and AWS service principals can still use policy-based access, but
+  anonymous and cross-account policy-based access is blocked
+- request-time bucket-policy evaluation now also covers
+  `s3:GetBucketPublicAccessBlock`, which is enough for the remaining public
+  access block deny test
+
 ## Test Plan
 
 Targeted integration tests:
-- `cargo test -p s3-tests --test public_access_block test_block_public_policy -- --ignored`
-- `cargo test -p s3-tests --test public_access_block test_block_public_policy_with_principal -- --ignored`
-- `cargo test -p s3-tests --test public_access_block test_block_public_restrict_public_buckets -- --ignored`
-- `cargo test -p s3-tests --test public_access_block test_get_public_block_deny_bucket_policy -- --ignored`
+- `cargo test -p s3-tests --test public_access_block test_block_public_policy -- --exact --nocapture`
+- `cargo test -p s3-tests --test public_access_block test_block_public_policy_with_principal -- --exact --nocapture`
+- `cargo test -p s3-tests --test public_access_block test_block_public_restrict_public_buckets -- --exact --nocapture`
+- `cargo test -p s3-tests --test public_access_block test_get_public_block_deny_bucket_policy -- --exact --nocapture`
 - `cargo test -p s3-tests --test tagging test_get_tags_acl_public -- --exact --nocapture`
 - `cargo test -p s3-tests --test tagging test_put_tags_acl_public -- --exact --nocapture`
 - `cargo test -p s3-tests --test tagging test_delete_tags_obj_public -- --exact --nocapture`
 - `cargo test -p s3-tests --test tagging test_bucket_policy_get_obj_existing_tag -- --exact --nocapture`
 - `cargo test -p s3-tests --test tagging test_bucket_policy_get_obj_tagging_existing_tag -- --exact --nocapture`
 - `cargo test -p s3-tests --test tagging test_bucket_policy_put_obj_tagging_existing_tag -- --exact --nocapture`
-- `cargo test -p s3-tests --test tagging test_bucket_policy_put_obj_copy_source -- --ignored`
-- `cargo test -p s3-tests --test tagging test_bucket_policy_put_obj_copy_source_meta -- --ignored`
-- `cargo test -p s3-tests --test tagging test_bucket_policy_put_obj_acl -- --ignored`
-- `cargo test -p s3-tests --test tagging test_bucket_policy_get_obj_acl_existing_tag -- --ignored`
+- `cargo test -p s3-tests --test tagging test_bucket_policy_put_obj_copy_source -- --exact --nocapture`
+- `cargo test -p s3-tests --test tagging test_bucket_policy_put_obj_copy_source_meta -- --exact --nocapture`
+- `cargo test -p s3-tests --test tagging test_bucket_policy_put_obj_acl -- --exact --nocapture`
+- `cargo test -p s3-tests --test tagging test_bucket_policy_get_obj_acl_existing_tag -- --exact --nocapture`
 
 Regression coverage:
 - `cargo test -p s3-tests --test public_access_block`

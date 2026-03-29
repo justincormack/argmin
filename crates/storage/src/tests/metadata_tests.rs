@@ -605,7 +605,7 @@ fn file_bucket_metadata_config_roundtrip() {
     );
 
     store
-        .put_bucket_policy("bucket", "{\"Version\":\"2012-10-17\"}")
+        .put_bucket_policy("bucket", "{\"Version\":\"2012-10-17\"}", true)
         .unwrap();
     assert_eq!(
         store.get_bucket_policy("bucket").unwrap(),
@@ -615,6 +615,7 @@ fn file_bucket_metadata_config_roundtrip() {
         store.head_bucket("bucket").unwrap().bucket_policy,
         Some("{\"Version\":\"2012-10-17\"}".to_string())
     );
+    assert!(store.head_bucket("bucket").unwrap().bucket_policy_public);
     assert_eq!(
         store
             .head_bucket("bucket")
@@ -624,6 +625,7 @@ fn file_bucket_metadata_config_roundtrip() {
     );
     store.delete_bucket_policy("bucket").unwrap();
     assert_eq!(store.get_bucket_policy("bucket").unwrap(), None);
+    assert!(!store.head_bucket("bucket").unwrap().bucket_policy_public);
     assert_eq!(
         store
             .head_bucket("bucket")
