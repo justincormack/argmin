@@ -103,6 +103,12 @@ pub enum ServerError {
     #[error("ownership controls not found: {bucket}")]
     OwnershipControlsNotFound { bucket: String },
 
+    #[error("object lock configuration not found: {bucket}")]
+    ObjectLockConfigurationNotFound { bucket: String },
+
+    #[error("bucket is in an invalid state for this operation")]
+    InvalidBucketState,
+
     #[error("ACL not supported with BucketOwnerEnforced")]
     AccessControlListNotSupported,
 
@@ -219,6 +225,8 @@ impl ServerError {
             Self::NoSuchBucketPolicy { .. } => "NoSuchBucketPolicy",
             Self::MalformedPolicy { .. } => "MalformedPolicy",
             Self::OwnershipControlsNotFound { .. } => "OwnershipControlsNotFoundError",
+            Self::ObjectLockConfigurationNotFound { .. } => "ObjectLockConfigurationNotFoundError",
+            Self::InvalidBucketState => "InvalidBucketState",
             Self::AccessControlListNotSupported => "AccessControlListNotSupported",
             Self::InvalidBucketAclWithObjectOwnership => "InvalidBucketAclWithObjectOwnership",
             Self::AccessDenied => "AccessDenied",
@@ -276,6 +284,8 @@ impl ServerError {
             }
             Self::MalformedPolicy { .. } => 400,
             Self::OwnershipControlsNotFound { .. } => 404,
+            Self::ObjectLockConfigurationNotFound { .. } => 404,
+            Self::InvalidBucketState => 409,
             Self::InvalidTag { .. } => 400,
             Self::AccessControlListNotSupported
             | Self::InvalidBucketAclWithObjectOwnership
@@ -354,6 +364,22 @@ mod tests {
             }
             .s3_error_code(),
             "MalformedPolicy"
+        );
+    }
+
+    #[test]
+    fn s3_error_code_object_lock_configuration_not_found() {
+        assert_eq!(
+            ServerError::ObjectLockConfigurationNotFound { bucket: "b".into() }.s3_error_code(),
+            "ObjectLockConfigurationNotFoundError"
+        );
+    }
+
+    #[test]
+    fn s3_error_code_invalid_bucket_state() {
+        assert_eq!(
+            ServerError::InvalidBucketState.s3_error_code(),
+            "InvalidBucketState"
         );
     }
 
@@ -570,12 +596,17 @@ mod tests {
             ServerError::NoSuchBucketPolicy { bucket: "b".into() }.http_status(),
             404
         );
+        assert_eq!(
+            ServerError::ObjectLockConfigurationNotFound { bucket: "b".into() }.http_status(),
+            404
+        );
     }
 
     #[test]
     fn http_status_409() {
         assert_eq!(ServerError::BucketAlreadyExists.http_status(), 409);
         assert_eq!(ServerError::BucketNotEmpty.http_status(), 409);
+        assert_eq!(ServerError::InvalidBucketState.http_status(), 409);
     }
 
     #[test]

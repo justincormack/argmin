@@ -9,7 +9,7 @@ use crate::coordinator::{
 use crate::error::ServerError;
 use auth::canonical::uri_encode;
 use checksum::{ChecksumAlgorithm, ChecksumType, RawChecksum};
-use s3_types::{BucketVersioningState, CanonicalUserId, VersionId};
+use s3_types::{BucketObjectLockConfig, BucketVersioningState, CanonicalUserId, VersionId};
 use server_core::sse::{SseCustomerResponseHeaders, SSE_CUSTOMER_ALGORITHM};
 use server_core::system_metadata::SystemMetadata;
 use storage::BucketEncryptionConfig;
@@ -496,6 +496,19 @@ impl S3Response {
     #[must_use]
     pub fn get_bucket_versioning(state: BucketVersioningState) -> Self {
         let body = xml::get_bucket_versioning_xml(state);
+        Self::new(200).xml_body(body)
+    }
+
+    /// Build a response for `PutObjectLockConfiguration`.
+    #[must_use]
+    pub fn put_bucket_object_lock_configuration() -> Self {
+        Self::new(200)
+    }
+
+    /// Build a response for `GetObjectLockConfiguration`.
+    #[must_use]
+    pub fn get_bucket_object_lock_configuration(config: BucketObjectLockConfig) -> Self {
+        let body = xml::get_bucket_object_lock_configuration_xml(config);
         Self::new(200).xml_body(body)
     }
 
@@ -1568,6 +1581,22 @@ mod tests {
     fn delete_bucket_response() {
         let resp = S3Response::delete_bucket();
         assert_eq!(resp.status_code, 204);
+    }
+
+    #[test]
+    fn get_bucket_object_lock_configuration_response() {
+        let resp = S3Response::get_bucket_object_lock_configuration(BucketObjectLockConfig {
+            enabled: true,
+            default_retention: Some(s3_types::ObjectLockDefaultRetention {
+                mode: s3_types::ObjectLockMode::Governance,
+                period: s3_types::RetentionPeriod::days(1).unwrap(),
+            }),
+        });
+        assert_eq!(resp.status_code, 200);
+        assert_eq!(find_header(&resp, "Content-Type"), Some("application/xml"));
+        let body = String::from_utf8(resp.body).unwrap();
+        assert!(body.contains("<ObjectLockEnabled>Enabled</ObjectLockEnabled>"));
+        assert!(body.contains("<Days>1</Days>"));
     }
 
     // ── head_bucket ───────────────────────────────────────────────────

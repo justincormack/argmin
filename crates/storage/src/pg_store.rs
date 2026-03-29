@@ -1380,36 +1380,51 @@ impl ShardStore for PgStore {
     }
 }
 
-impl PgMetadataStore for PgStore {
-    fn create_bucket(
+impl PgStore {
+    pub fn create_bucket_with_config(
         &self,
-        name: &str,
-        owner_principal: &str,
-        owner_canonical_id: &CanonicalUserId,
-        acl_grants: &AclGrants,
-        public_read: bool,
-        public_write: bool,
+        config: &CreateBucketConfig<'_>,
     ) -> Result<(), MetadataError> {
         observability::trace_scope!(
             TRACE_TARGET,
-            "PgStore::create_bucket",
-            "pg_id={} bucket={} owner={}",
+            "PgStore::create_bucket_with_config",
+            "pg_id={} bucket={} owner={} versioning={:?} object_lock_enabled={}",
             self.pg_id,
-            name,
-            owner_principal
+            config.name,
+            config.owner_principal,
+            config.versioning,
+            config.object_lock.enabled
         );
         let now = PgStore::now_millis() as i64;
+        let (
+            object_lock_enabled,
+            object_lock_default_mode,
+            object_lock_default_days,
+            object_lock_default_years,
+        ) = Self::bucket_object_lock_sql_values(config.object_lock).map_err(|e| {
+            MetadataError::Db {
+                context: "create bucket (encode object lock)",
+                source: e,
+            }
+        })?;
         let result = self.conn.execute(
-            "INSERT INTO buckets (name, owner_principal, owner_canonical_id, created_at, state, acl_grants, public_read, public_write, write_reservations_blocked, active_write_reservations) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, 0)",
+            "INSERT INTO buckets \
+             (name, owner_principal, owner_canonical_id, created_at, state, versioning, acl_grants, public_read, public_write, write_reservations_blocked, active_write_reservations, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, 0, ?10, ?11, ?12, ?13)",
             params![
-                name,
-                owner_principal,
-                owner_canonical_id.as_str(),
+                config.name,
+                config.owner_principal,
+                config.owner_canonical_id.as_str(),
                 now,
                 BucketState::Active as u8,
-                acl_grants.serialized(),
-                i32::from(public_read),
-                i32::from(public_write)
+                config.versioning as u8 as i64,
+                config.acl_grants.serialized(),
+                i32::from(config.public_read),
+                i32::from(config.public_write),
+                object_lock_enabled,
+                object_lock_default_mode,
+                object_lock_default_days,
+                object_lock_default_years,
             ],
         );
         match result {
@@ -1424,6 +1439,29 @@ impl PgMetadataStore for PgStore {
                 source: e,
             }),
         }
+    }
+}
+
+impl PgMetadataStore for PgStore {
+    fn create_bucket(
+        &self,
+        name: &str,
+        owner_principal: &str,
+        owner_canonical_id: &CanonicalUserId,
+        acl_grants: &AclGrants,
+        public_read: bool,
+        public_write: bool,
+    ) -> Result<(), MetadataError> {
+        self.create_bucket_with_config(&CreateBucketConfig {
+            name,
+            owner_principal,
+            owner_canonical_id,
+            acl_grants,
+            public_read,
+            public_write,
+            versioning: BucketVersioningState::Disabled,
+            object_lock: BucketObjectLockConfig::default(),
+        })
     }
 
     fn delete_bucket(&self, name: &str) -> Result<(), MetadataError> {

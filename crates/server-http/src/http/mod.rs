@@ -722,16 +722,21 @@ impl HttpFrontend {
             }
             S3Operation::CreateBucket { bucket } => {
                 let acl = parse_create_bucket_acl(req)?;
+                let object_lock_enabled = parse_bucket_object_lock_enabled(
+                    req.header("x-amz-bucket-object-lock-enabled"),
+                )?;
                 let ownership = parse_bucket_ownership(req.header("x-amz-object-ownership"))?;
                 let requester = Self::requester_from_auth(auth);
-                self.coordinator.create_bucket_for_requester(
-                    &crate::coordinator::CreateBucketRequest {
-                        name: &bucket,
-                        requester,
-                        acl,
-                        ownership,
-                    },
-                )?;
+                self.coordinator
+                    .create_bucket_for_requester_with_object_lock(
+                        &crate::coordinator::CreateBucketRequest {
+                            name: &bucket,
+                            requester,
+                            acl,
+                            ownership,
+                        },
+                        object_lock_enabled,
+                    )?;
                 Ok(S3Response::create_bucket(&bucket))
             }
             S3Operation::DeleteBucket { bucket } => {
@@ -1410,11 +1415,34 @@ impl HttpFrontend {
                 )?;
                 Ok(S3Response::get_bucket_versioning(state))
             }
-            S3Operation::PutBucketObjectLockConfiguration { .. } => {
-                unsupported_s3_operation("PutBucketObjectLockConfiguration")
+            S3Operation::PutBucketObjectLockConfiguration { bucket } => {
+                let config = xml::parse_bucket_object_lock_configuration_xml(&req.body)?;
+                let requester = Self::requester_from_auth(auth);
+                self.coordinator
+                    .put_bucket_object_lock_configuration_for_request(
+                        &crate::coordinator::PutBucketObjectLockConfigurationRequest {
+                            bucket: crate::coordinator::BucketRequest {
+                                name: &bucket,
+                                requester,
+                                expected_bucket_owner,
+                            },
+                            config,
+                        },
+                    )?;
+                Ok(S3Response::put_bucket_object_lock_configuration())
             }
-            S3Operation::GetBucketObjectLockConfiguration { .. } => {
-                unsupported_s3_operation("GetBucketObjectLockConfiguration")
+            S3Operation::GetBucketObjectLockConfiguration { bucket } => {
+                let requester = Self::requester_from_auth(auth);
+                let config = self
+                    .coordinator
+                    .get_bucket_object_lock_configuration_for_request(
+                        &crate::coordinator::BucketRequest {
+                            name: &bucket,
+                            requester,
+                            expected_bucket_owner,
+                        },
+                    )?;
+                Ok(S3Response::get_bucket_object_lock_configuration(config))
             }
             S3Operation::PutBucketEncryption { bucket } => {
                 let config = xml::parse_bucket_encryption_xml(&req.body)?;
@@ -4385,6 +4413,17 @@ fn parse_bucket_ownership(
     }
 }
 
+fn parse_bucket_object_lock_enabled(value: Option<&str>) -> Result<bool, ServerError> {
+    match value {
+        None => Ok(false),
+        Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        Some(other) => Err(ServerError::InvalidArgument {
+            reason: format!("invalid x-amz-bucket-object-lock-enabled value: {other}"),
+        }),
+    }
+}
+
 fn parse_put_object_acl(value: Option<&str>) -> crate::coordinator::PutObjectAcl<'_> {
     match value {
         None => crate::coordinator::PutObjectAcl::None,
@@ -4944,37 +4983,132 @@ mod tests {
     }
 
     #[test]
-    fn object_lock_operations_are_not_implemented() {
+    fn create_bucket_with_object_lock_header_enables_bucket_object_lock() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+
+        let req = new_req(
+            http::Method::PUT,
+            "/mybucket",
+            "",
+            vec![(
+                "x-amz-bucket-object-lock-enabled".to_string(),
+                "true".to_string(),
+            )],
+            vec![],
+        );
+        let resp = fe
+            .dispatch_routed(
+                &req,
+                &test_auth(),
+                S3Operation::CreateBucket {
+                    bucket: "mybucket".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(resp.status_code, 200);
+        assert_eq!(
+            fe.coordinator
+                .get_bucket_versioning(
+                    "mybucket",
+                    crate::coordinator::Requester::principal("testuser")
+                )
+                .unwrap(),
+            s3_types::BucketVersioningState::Enabled
+        );
+        assert_eq!(
+            fe.coordinator
+                .get_bucket_object_lock_configuration(
+                    "mybucket",
+                    crate::coordinator::Requester::principal("testuser"),
+                )
+                .unwrap(),
+            s3_types::BucketObjectLockConfig {
+                enabled: true,
+                default_retention: None,
+            }
+        );
+    }
+
+    #[test]
+    fn bucket_object_lock_operations_are_implemented() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+
+        let create_req = new_req(http::Method::PUT, "/mybucket", "", vec![], vec![]);
+        fe.dispatch_routed(
+            &create_req,
+            &test_auth(),
+            S3Operation::CreateBucket {
+                bucket: "mybucket".to_string(),
+            },
+        )
+        .unwrap();
+        fe.coordinator
+            .put_bucket_versioning(
+                "mybucket",
+                s3_types::BucketVersioningState::Enabled,
+                crate::coordinator::Requester::principal("testuser"),
+            )
+            .unwrap();
+
+        let put_req = new_req(
+            http::Method::PUT,
+            "/mybucket",
+            "object-lock",
+            vec![],
+            br#"
+                <ObjectLockConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                  <ObjectLockEnabled>Enabled</ObjectLockEnabled>
+                  <Rule>
+                    <DefaultRetention>
+                      <Mode>GOVERNANCE</Mode>
+                      <Days>1</Days>
+                    </DefaultRetention>
+                  </Rule>
+                </ObjectLockConfiguration>
+            "#
+            .to_vec(),
+        );
+        let put_resp = fe
+            .dispatch_routed(
+                &put_req,
+                &test_auth(),
+                S3Operation::PutBucketObjectLockConfiguration {
+                    bucket: "mybucket".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(put_resp.status_code, 200);
+
+        let get_req = new_req(
+            http::Method::GET,
+            "/mybucket",
+            "object-lock",
+            vec![],
+            vec![],
+        );
+        let get_resp = fe
+            .dispatch_routed(
+                &get_req,
+                &test_auth(),
+                S3Operation::GetBucketObjectLockConfiguration {
+                    bucket: "mybucket".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(get_resp.status_code, 200);
+        let body = String::from_utf8(get_resp.body).unwrap();
+        assert!(body.contains("<ObjectLockEnabled>Enabled</ObjectLockEnabled>"));
+        assert!(body.contains("<Days>1</Days>"));
+    }
+
+    #[test]
+    fn object_level_object_lock_operations_are_not_implemented() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
 
         let cases = [
-            (
-                new_req(
-                    http::Method::PUT,
-                    "/mybucket",
-                    "object-lock",
-                    vec![],
-                    vec![],
-                ),
-                S3Operation::PutBucketObjectLockConfiguration {
-                    bucket: "mybucket".to_string(),
-                },
-                "PutBucketObjectLockConfiguration",
-            ),
-            (
-                new_req(
-                    http::Method::GET,
-                    "/mybucket",
-                    "object-lock",
-                    vec![],
-                    vec![],
-                ),
-                S3Operation::GetBucketObjectLockConfiguration {
-                    bucket: "mybucket".to_string(),
-                },
-                "GetBucketObjectLockConfiguration",
-            ),
             (
                 new_req(
                     http::Method::PUT,

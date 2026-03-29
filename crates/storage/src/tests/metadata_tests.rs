@@ -5477,12 +5477,44 @@ fn bucket_object_lock_round_trip() {
             false,
         )
         .unwrap();
+    store
+        .put_bucket_versioning("mybucket", BucketVersioningState::Enabled)
+        .unwrap();
 
     let config = sample_bucket_object_lock();
     store.put_bucket_object_lock("mybucket", config).unwrap();
 
     let info = store.head_bucket_raw("mybucket").unwrap();
     assert_eq!(info.object_lock, config);
+}
+
+#[test]
+fn bucket_object_lock_requires_enabled_versioning() {
+    let (_dir, store) = make_pg_store();
+    store
+        .create_bucket(
+            "mybucket",
+            "owner",
+            &CanonicalUserId::from_principal("owner"),
+            &AclGrants::default(),
+            false,
+            false,
+        )
+        .unwrap();
+
+    let config = sample_bucket_object_lock();
+    let err = store
+        .put_bucket_object_lock("mybucket", config)
+        .unwrap_err();
+    assert!(matches!(err, crate::error::MetadataError::Db { .. }));
+
+    store
+        .put_bucket_versioning("mybucket", BucketVersioningState::Suspended)
+        .unwrap();
+    let err = store
+        .put_bucket_object_lock("mybucket", config)
+        .unwrap_err();
+    assert!(matches!(err, crate::error::MetadataError::Db { .. }));
 }
 
 #[test]
@@ -5507,6 +5539,37 @@ fn bucket_object_lock_rejects_default_retention_without_enablement() {
                 default_retention: sample_bucket_object_lock().default_retention,
             },
         )
+        .unwrap_err();
+    assert!(matches!(err, crate::error::MetadataError::Db { .. }));
+}
+
+#[test]
+fn bucket_object_lock_cannot_be_disabled_or_suspended() {
+    let (_dir, store) = make_pg_store();
+    store
+        .create_bucket(
+            "mybucket",
+            "owner",
+            &CanonicalUserId::from_principal("owner"),
+            &AclGrants::default(),
+            false,
+            false,
+        )
+        .unwrap();
+    store
+        .put_bucket_versioning("mybucket", BucketVersioningState::Enabled)
+        .unwrap();
+    store
+        .put_bucket_object_lock("mybucket", sample_bucket_object_lock())
+        .unwrap();
+
+    let err = store
+        .put_bucket_versioning("mybucket", BucketVersioningState::Suspended)
+        .unwrap_err();
+    assert!(matches!(err, crate::error::MetadataError::Db { .. }));
+
+    let err = store
+        .put_bucket_object_lock("mybucket", BucketObjectLockConfig::default())
         .unwrap_err();
     assert!(matches!(err, crate::error::MetadataError::Db { .. }));
 }

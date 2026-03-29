@@ -25,6 +25,28 @@ core Object Lock surface is correct.
 ## Current Status
 
 Implemented already:
+- Phase 1 test port: `crates/s3-tests/tests/object_lock.rs` exists, was
+  validated against real AWS with all 39 cases enabled, and currently keeps the
+  11 completed bucket-level cases active while the remaining 28 object-level
+  cases stay `ignore`d until their features land
+- explicit Object Lock domain types exist across `s3-types`, storage, and
+  coordinator code
+- durable Object Lock persistence exists for bucket metadata, live object
+  versions, and multipart upload state
+- HTTP routing no longer misroutes `?object-lock`, `?retention`, or
+  `?legal-hold` into plain bucket/object CRUD
+- bucket Object Lock control-plane support:
+  - `CreateBucket` honors `x-amz-bucket-object-lock-enabled`
+  - `PUT /<bucket>?object-lock`
+  - `GET /<bucket>?object-lock`
+- bucket-level Object Lock invariants are now enforced in both coordinator and
+  storage:
+  - Object Lock requires bucket versioning `Enabled`
+  - Object Lock cannot be disabled once enabled
+  - versioning cannot be suspended on an Object Lock bucket
+- AWS-specific bucket error mapping exists for:
+  - `InvalidBucketState`
+  - `ObjectLockConfigurationNotFoundError`
 - bucket versioning
 - version-specific reads/deletes and delete markers
 - `HeadObject` / `GetObject` metadata plumbing
@@ -32,18 +54,16 @@ Implemented already:
 - enough auth/ACL foundations for owner-driven object operations
 
 Missing today:
-- no bucket metadata for Object Lock enablement or default retention
-- no per-version retention or legal-hold metadata
-- no HTTP routing for `?object-lock`, `?retention`, or `?legal-hold`
-- `CreateBucket` ignores `x-amz-bucket-object-lock-enabled`
-- `PutBucketVersioning` still allows suspension after lock enablement
 - `PutObject`, `CopyObject`, and multipart initiation do not accept Object Lock
   headers
 - `HeadObject` / `GetObject` do not project Object Lock headers
+- no object-level `PutObjectRetention` / `GetObjectRetention`
+- no object-level `PutObjectLegalHold` / `GetObjectLegalHold`
 - `DeleteObject` / `DeleteObjects` do not enforce WORM semantics or governance
   bypass
-- `crates/s3-tests/tests/object_lock.rs` does not exist yet
 - bucket-policy action coverage does not include Object Lock actions
+- the 28 object-level tests in `crates/s3-tests/tests/object_lock.rs` remain
+  `ignore`d until the later phases land
 
 ## AWS Contract To Match
 
@@ -185,6 +205,13 @@ backward-compatibility migration path; the schema can be updated directly.
 
 ### Phase 4: Bucket Object Lock APIs
 
+Status update:
+- complete
+- implemented together with the bucket-level versioning invariants because AWS
+  treats those rules as inseparable from bucket Object Lock enablement
+- validated by the 11 active bucket-level cases in
+  `crates/s3-tests/tests/object_lock.rs`
+
 Implement the bucket-level Object Lock surface:
 - `CreateBucket` support for `x-amz-bucket-object-lock-enabled`
 - `PUT /<bucket>?object-lock`
@@ -211,6 +238,11 @@ Likely files:
 - `crates/server-core/src/coordinator.rs`
 
 ### Phase 5: Versioning Invariants Once Object Lock Is Enabled
+
+Status update:
+- complete as part of Phase 4 follow-through
+- enforced in both coordinator and storage, so illegal bucket state is not
+  representable through direct storage calls either
 
 Update versioning control-plane behavior so it matches AWS once Object Lock is
 on:

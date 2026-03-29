@@ -1167,6 +1167,19 @@ pub struct BucketInfo {
     pub encryption: BucketEncryptionConfig,
 }
 
+/// Complete bucket metadata required when creating a bucket row.
+#[derive(Debug, Clone, Copy)]
+pub struct CreateBucketConfig<'a> {
+    pub name: &'a str,
+    pub owner_principal: &'a str,
+    pub owner_canonical_id: &'a CanonicalUserId,
+    pub acl_grants: &'a AclGrants,
+    pub public_read: bool,
+    pub public_write: bool,
+    pub versioning: BucketVersioningState,
+    pub object_lock: BucketObjectLockConfig,
+}
+
 /// Authoritative in-memory subset of bucket metadata used on hot object paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BucketFastPathInfo {

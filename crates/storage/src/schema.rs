@@ -352,7 +352,8 @@ CREATE TABLE IF NOT EXISTS buckets (
     ),
     object_lock_default_years INTEGER CHECK (
         object_lock_default_years IS NULL OR object_lock_default_years > 0
-    )
+    ),
+    CHECK (object_lock_enabled = 0 OR versioning = 1)
 )";
 
 /// Index for bucket listing by owner and bucket name.
@@ -765,6 +766,9 @@ fn create_object_lock_triggers(conn: &Connection) -> Result<(), rusqlite::Error>
                  OR NEW.object_lock_default_days IS NOT NULL
                  OR NEW.object_lock_default_years IS NOT NULL
                );
+           SELECT RAISE(ABORT, 'bucket object lock requires enabled versioning')
+             WHERE NEW.object_lock_enabled = 1
+               AND NEW.versioning != 1;
            SELECT RAISE(ABORT, 'bucket object lock default period requires mode')
              WHERE NEW.object_lock_default_mode IS NULL
                AND (
@@ -798,6 +802,12 @@ fn create_object_lock_triggers(conn: &Connection) -> Result<(), rusqlite::Error>
                  OR NEW.object_lock_default_days IS NOT NULL
                  OR NEW.object_lock_default_years IS NOT NULL
                );
+           SELECT RAISE(ABORT, 'bucket object lock requires enabled versioning')
+             WHERE NEW.object_lock_enabled = 1
+               AND NEW.versioning != 1;
+           SELECT RAISE(ABORT, 'bucket object lock cannot be disabled once enabled')
+             WHERE OLD.object_lock_enabled = 1
+               AND NEW.object_lock_enabled = 0;
            SELECT RAISE(ABORT, 'bucket object lock default period requires mode')
              WHERE NEW.object_lock_default_mode IS NULL
                AND (

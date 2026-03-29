@@ -502,7 +502,6 @@ fn governance_retain_until_later() -> DateTime {
 }
 
 #[test]
-#[ignore = "Object Lock / WORM not implemented yet"]
 fn test_object_lock_put_obj_lock() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -532,7 +531,6 @@ fn test_object_lock_put_obj_lock() {
 }
 
 #[test]
-#[ignore = "Object Lock / WORM not implemented yet"]
 fn test_object_lock_put_obj_lock_invalid_bucket() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -553,7 +551,6 @@ fn test_object_lock_put_obj_lock_invalid_bucket() {
 }
 
 #[test]
-#[ignore = "Object Lock / WORM not implemented yet"]
 fn test_object_lock_put_obj_lock_enable_after_create() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -613,7 +610,6 @@ fn test_object_lock_put_obj_lock_enable_after_create() {
 }
 
 #[test]
-#[ignore = "Object Lock / WORM not implemented yet"]
 fn test_object_lock_put_obj_lock_with_days_and_years() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -648,7 +644,6 @@ fn test_object_lock_put_obj_lock_with_days_and_years() {
 }
 
 #[test]
-#[ignore = "Object Lock / WORM not implemented yet"]
 fn test_object_lock_put_obj_lock_invalid_days() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -671,7 +666,6 @@ fn test_object_lock_put_obj_lock_invalid_days() {
 }
 
 #[test]
-#[ignore = "Object Lock / WORM not implemented yet"]
 fn test_object_lock_put_obj_lock_invalid_years() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -694,7 +688,6 @@ fn test_object_lock_put_obj_lock_invalid_years() {
 }
 
 #[test]
-#[ignore = "Object Lock / WORM not implemented yet"]
 fn test_object_lock_put_obj_lock_invalid_mode() {
     s3_tests::run(async {
         let bucket = setup_object_lock_bucket().await;
@@ -715,7 +708,6 @@ fn test_object_lock_put_obj_lock_invalid_mode() {
 }
 
 #[test]
-#[ignore = "Object Lock / WORM not implemented yet"]
 fn test_object_lock_put_obj_lock_invalid_status() {
     s3_tests::run(async {
         let bucket = setup_object_lock_bucket().await;
@@ -731,7 +723,6 @@ fn test_object_lock_put_obj_lock_invalid_status() {
 }
 
 #[test]
-#[ignore = "Object Lock / WORM not implemented yet"]
 fn test_object_lock_suspend_versioning() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -755,7 +746,6 @@ fn test_object_lock_suspend_versioning() {
 }
 
 #[test]
-#[ignore = "Object Lock / WORM not implemented yet"]
 fn test_object_lock_get_obj_lock() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -776,7 +766,6 @@ fn test_object_lock_get_obj_lock() {
 }
 
 #[test]
-#[ignore = "Object Lock / WORM not implemented yet"]
 fn test_object_lock_get_obj_lock_invalid_bucket() {
     s3_tests::run(async {
         let client = CTX.client();

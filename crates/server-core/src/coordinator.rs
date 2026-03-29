@@ -12,7 +12,7 @@ use checksum::{
 use ec::{EcConfig, ErasureCodec};
 use s3_types::{
     AccountIdentity, AclGrant, AclGrantee, AclGrants, AclPermission, BucketVersioningState,
-    CanonicalUserId, VersionId,
+    CanonicalUserId, ObjectLockDefaultRetention, VersionId,
 };
 use storage::traits::{PgMetadataStore, ShardStore};
 #[cfg(test)]
@@ -1493,6 +1493,20 @@ pub struct PutBucketConfigRequest<'a> {
 pub struct PutBucketVersioningRequest<'a> {
     pub bucket: BucketRequest<'a>,
     pub state: BucketVersioningState,
+}
+
+/// Parsed `PutObjectLockConfiguration` bucket update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BucketObjectLockConfigurationUpdate {
+    pub object_lock_enabled: Option<bool>,
+    pub default_retention: Option<ObjectLockDefaultRetention>,
+}
+
+/// Request for a `PutObjectLockConfiguration` operation.
+#[derive(Debug)]
+pub struct PutBucketObjectLockConfigurationRequest<'a> {
+    pub bucket: BucketRequest<'a>,
+    pub config: BucketObjectLockConfigurationUpdate,
 }
 
 /// Request for a PutBucketEncryption operation.
@@ -4718,11 +4732,20 @@ impl Coordinator {
         &self,
         req: &CreateBucketRequest<'_>,
     ) -> Result<(), ServerError> {
+        self.create_bucket_for_requester_with_object_lock(req, false)
+    }
+
+    pub fn create_bucket_for_requester_with_object_lock(
+        &self,
+        req: &CreateBucketRequest<'_>,
+        object_lock_enabled: bool,
+    ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::create_bucket_for_requester",
-            "bucket={}",
-            req.name
+            "bucket={} object_lock_enabled={}",
+            req.name,
+            object_lock_enabled
         );
         let owner_account = req.requester.account().ok_or(ServerError::AccessDenied)?;
         if req.ownership == BucketObjectOwnership::BucketOwnerEnforced && req.acl.is_explicit() {
@@ -4746,6 +4769,7 @@ impl Coordinator {
             owner_account.canonical_user_id(),
             req.name,
             acl_grants,
+            object_lock_enabled,
         )?;
         match create_outcome {
             BucketCreateOutcome::Created => self.put_bucket_ownership_controls(
@@ -4770,6 +4794,7 @@ impl Coordinator {
             name,
             public_read,
             false,
+            false,
         )?;
         Ok(())
     }
@@ -4781,6 +4806,7 @@ impl Coordinator {
         name: &str,
         public_read: bool,
         public_write: bool,
+        object_lock_enabled: bool,
     ) -> Result<BucketCreateOutcome, ServerError> {
         let owner = OwnerIdentity::new(owner_principal.to_string(), owner_canonical_id.clone());
         let acl_grants = Self::bucket_acl_grants_from_flags(&owner, public_read, public_write);
@@ -4789,6 +4815,7 @@ impl Coordinator {
             owner_canonical_id,
             name,
             acl_grants,
+            object_lock_enabled,
         )
     }
 
@@ -4798,19 +4825,31 @@ impl Coordinator {
         owner_canonical_id: &CanonicalUserId,
         name: &str,
         acl_grants: AclGrants,
+        object_lock_enabled: bool,
     ) -> Result<BucketCreateOutcome, ServerError> {
         let _bucket_guard = self.storage_node.lock_bucket(name);
         let bucket_pg = self.get_bucket_pg(name)?;
         let public_read = Self::acl_grants_public_read(&acl_grants);
         let public_write = Self::acl_grants_public_write(&acl_grants);
-        match bucket_pg.create_bucket(
+        let initial_versioning = if object_lock_enabled {
+            BucketVersioningState::Enabled
+        } else {
+            BucketVersioningState::Disabled
+        };
+        let initial_object_lock = BucketObjectLockConfig {
+            enabled: object_lock_enabled,
+            default_retention: None,
+        };
+        match bucket_pg.create_bucket_with_config(&storage::CreateBucketConfig {
             name,
             owner_principal,
             owner_canonical_id,
-            &acl_grants,
+            acl_grants: &acl_grants,
             public_read,
             public_write,
-        ) {
+            versioning: initial_versioning,
+            object_lock: initial_object_lock,
+        }) {
             Ok(()) => {
                 let info = bucket_pg.head_bucket_raw(name).map_err(|e| match e {
                     storage::MetadataError::BucketNotFound { name } => {
@@ -4993,6 +5032,29 @@ impl Coordinator {
         req: &BucketRequest<'_>,
     ) -> Result<BucketVersioningState, ServerError> {
         self.get_bucket_versioning_with_expected_bucket_owner(
+            req.name,
+            req.requester.clone(),
+            req.expected_bucket_owner(),
+        )
+    }
+
+    pub fn put_bucket_object_lock_configuration_for_request(
+        &self,
+        req: &PutBucketObjectLockConfigurationRequest<'_>,
+    ) -> Result<(), ServerError> {
+        self.put_bucket_object_lock_configuration_with_expected_bucket_owner(
+            req.bucket.name,
+            req.config,
+            req.bucket.requester.clone(),
+            req.bucket.expected_bucket_owner(),
+        )
+    }
+
+    pub fn get_bucket_object_lock_configuration_for_request(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<BucketObjectLockConfig, ServerError> {
+        self.get_bucket_object_lock_configuration_with_expected_bucket_owner(
             req.name,
             req.requester.clone(),
             req.expected_bucket_owner(),
@@ -5261,8 +5323,11 @@ impl Coordinator {
             name,
             state
         );
-        let _bucket_info =
+        let bucket_info =
             self.authorize_bucket_admin_requester(&requester, name, expected_bucket_owner)?;
+        if bucket_info.object_lock.enabled && state != BucketVersioningState::Enabled {
+            return Err(ServerError::InvalidBucketState);
+        }
         let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg
             .put_bucket_versioning(name, state)
@@ -5304,6 +5369,93 @@ impl Coordinator {
         );
         let info = self.authorize_bucket_read_requester(&requester, name, expected_bucket_owner)?;
         Ok(info.versioning)
+    }
+
+    pub fn put_bucket_object_lock_configuration(
+        &self,
+        name: &str,
+        config: BucketObjectLockConfigurationUpdate,
+        requester: Requester,
+    ) -> Result<(), ServerError> {
+        self.put_bucket_object_lock_configuration_with_expected_bucket_owner(
+            name, config, requester, None,
+        )
+    }
+
+    pub fn put_bucket_object_lock_configuration_with_expected_bucket_owner(
+        &self,
+        name: &str,
+        config: BucketObjectLockConfigurationUpdate,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<(), ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::put_bucket_object_lock_configuration",
+            "bucket={} enable_requested={} has_default_retention={}",
+            name,
+            config.object_lock_enabled.unwrap_or(false),
+            config.default_retention.is_some()
+        );
+        let bucket_info =
+            self.authorize_bucket_admin_requester(&requester, name, expected_bucket_owner)?;
+        if bucket_info.versioning != BucketVersioningState::Enabled {
+            return Err(ServerError::InvalidBucketState);
+        }
+
+        let final_enabled = bucket_info.object_lock.enabled || config.object_lock_enabled.is_some();
+        if !final_enabled {
+            return Err(ServerError::InvalidRequest {
+                reason: "Object Lock must be enabled before configuring this bucket".to_string(),
+            });
+        }
+
+        let final_config = BucketObjectLockConfig {
+            enabled: true,
+            default_retention: config.default_retention,
+        };
+        let bucket_pg = self.get_bucket_pg(name)?;
+        bucket_pg
+            .put_bucket_object_lock(name, final_config)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })?;
+        self.storage_node
+            .update_bucket_fast_path_if_present(name, |info| info.object_lock = final_config);
+        Ok(())
+    }
+
+    pub fn get_bucket_object_lock_configuration(
+        &self,
+        name: &str,
+        requester: Requester,
+    ) -> Result<BucketObjectLockConfig, ServerError> {
+        self.get_bucket_object_lock_configuration_with_expected_bucket_owner(name, requester, None)
+    }
+
+    pub fn get_bucket_object_lock_configuration_with_expected_bucket_owner(
+        &self,
+        name: &str,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<BucketObjectLockConfig, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::get_bucket_object_lock_configuration",
+            "bucket={}",
+            name
+        );
+        let info =
+            self.authorize_bucket_admin_requester(&requester, name, expected_bucket_owner)?;
+        if !info.object_lock.enabled {
+            return Err(ServerError::ObjectLockConfigurationNotFound {
+                bucket: name.to_string(),
+            });
+        }
+        Ok(info.object_lock)
     }
 
     pub fn put_bucket_encryption(
@@ -17778,7 +17930,14 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         let owner_canonical_id = CanonicalUserId::from_principal("owner-a");
         coord
-            .create_bucket_for_owner_with_acl("owner-a", &owner_canonical_id, "bucket", false, true)
+            .create_bucket_for_owner_with_acl(
+                "owner-a",
+                &owner_canonical_id,
+                "bucket",
+                false,
+                true,
+                false,
+            )
             .unwrap();
         let tags_xml =
             "<Tagging><TagSet><Tag><Key>env</Key><Value>writer</Value></Tag></TagSet></Tagging>";
@@ -17918,7 +18077,14 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         let owner_canonical_id = CanonicalUserId::from_principal("owner-a");
         coord
-            .create_bucket_for_owner_with_acl("owner-a", &owner_canonical_id, "bucket", false, true)
+            .create_bucket_for_owner_with_acl(
+                "owner-a",
+                &owner_canonical_id,
+                "bucket",
+                false,
+                true,
+                false,
+            )
             .unwrap();
         test_helpers::put_object(
             &coord,
@@ -17956,7 +18122,14 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         let owner_canonical_id = CanonicalUserId::from_principal("owner-a");
         coord
-            .create_bucket_for_owner_with_acl("owner-a", &owner_canonical_id, "bucket", false, true)
+            .create_bucket_for_owner_with_acl(
+                "owner-a",
+                &owner_canonical_id,
+                "bucket",
+                false,
+                true,
+                false,
+            )
             .unwrap();
         test_helpers::put_object(
             &coord,
@@ -19063,7 +19236,14 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         let owner_canonical_id = CanonicalUserId::from_principal("owner-a");
         coord
-            .create_bucket_for_owner_with_acl("owner-a", &owner_canonical_id, "bucket", false, true)
+            .create_bucket_for_owner_with_acl(
+                "owner-a",
+                &owner_canonical_id,
+                "bucket",
+                false,
+                true,
+                false,
+            )
             .unwrap();
 
         test_helpers::put_object(
@@ -20347,6 +20527,41 @@ mod tests {
     }
 
     #[test]
+    fn create_bucket_with_object_lock_enables_versioning() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let owner = AccountIdentity::from_principal("owner-a");
+
+        coord
+            .create_bucket_for_requester_with_object_lock(
+                &CreateBucketRequest {
+                    name: "bucket",
+                    requester: Requester::authenticated(owner),
+                    acl: CreateBucketAcl::DefaultPrivate,
+                    ownership: BucketObjectOwnership::ObjectWriter,
+                },
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(
+            coord
+                .get_bucket_versioning("bucket", Requester::principal("owner-a"))
+                .unwrap(),
+            BucketVersioningState::Enabled
+        );
+        assert_eq!(
+            coord
+                .get_bucket_object_lock_configuration("bucket", Requester::principal("owner-a"))
+                .unwrap(),
+            BucketObjectLockConfig {
+                enabled: true,
+                default_retention: None,
+            }
+        );
+    }
+
+    #[test]
     fn bucket_versioning_suspend_then_enable() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
@@ -20385,6 +20600,34 @@ mod tests {
     }
 
     #[test]
+    fn bucket_versioning_cannot_suspend_object_lock_bucket() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let owner = AccountIdentity::from_principal("owner-a");
+
+        coord
+            .create_bucket_for_requester_with_object_lock(
+                &CreateBucketRequest {
+                    name: "bucket",
+                    requester: Requester::authenticated(owner),
+                    acl: CreateBucketAcl::DefaultPrivate,
+                    ownership: BucketObjectOwnership::ObjectWriter,
+                },
+                true,
+            )
+            .unwrap();
+
+        let err = coord
+            .put_bucket_versioning(
+                "bucket",
+                BucketVersioningState::Suspended,
+                Requester::principal("owner-a"),
+            )
+            .unwrap_err();
+        assert!(matches!(err, ServerError::InvalidBucketState));
+    }
+
+    #[test]
     fn bucket_versioning_nonexistent_bucket() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
@@ -20411,6 +20654,76 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn put_bucket_object_lock_requires_enabled_versioning() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        let update = BucketObjectLockConfigurationUpdate {
+            object_lock_enabled: Some(true),
+            default_retention: Some(ObjectLockDefaultRetention {
+                mode: s3_types::ObjectLockMode::Governance,
+                period: s3_types::RetentionPeriod::days(1).unwrap(),
+            }),
+        };
+
+        let err = coord
+            .put_bucket_object_lock_configuration("bucket", update, Requester::principal("owner-a"))
+            .unwrap_err();
+        assert!(matches!(err, ServerError::InvalidBucketState));
+
+        coord
+            .put_bucket_versioning(
+                "bucket",
+                BucketVersioningState::Suspended,
+                Requester::principal("owner-a"),
+            )
+            .unwrap();
+        let err = coord
+            .put_bucket_object_lock_configuration("bucket", update, Requester::principal("owner-a"))
+            .unwrap_err();
+        assert!(matches!(err, ServerError::InvalidBucketState));
+
+        coord
+            .put_bucket_versioning(
+                "bucket",
+                BucketVersioningState::Enabled,
+                Requester::principal("owner-a"),
+            )
+            .unwrap();
+        coord
+            .put_bucket_object_lock_configuration("bucket", update, Requester::principal("owner-a"))
+            .unwrap();
+        assert_eq!(
+            coord
+                .get_bucket_object_lock_configuration("bucket", Requester::principal("owner-a"))
+                .unwrap(),
+            BucketObjectLockConfig {
+                enabled: true,
+                default_retention: update.default_retention,
+            }
+        );
+    }
+
+    #[test]
+    fn get_bucket_object_lock_configuration_missing_reports_not_found() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+
+        let err = coord
+            .get_bucket_object_lock_configuration("bucket", Requester::principal("owner-a"))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ServerError::ObjectLockConfigurationNotFound { .. }
+        ));
     }
 
     #[test]
@@ -22099,7 +22412,14 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         let owner_canonical_id = CanonicalUserId::from_principal("owner-a");
         coord
-            .create_bucket_for_owner_with_acl("owner-a", &owner_canonical_id, "bucket", false, true)
+            .create_bucket_for_owner_with_acl(
+                "owner-a",
+                &owner_canonical_id,
+                "bucket",
+                false,
+                true,
+                false,
+            )
             .unwrap();
 
         let err = coord

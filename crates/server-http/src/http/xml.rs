@@ -1,7 +1,8 @@
 /// Hand-formatted XML for S3 responses with lightweight request XML parsing.
 use crate::coordinator::{
-    BucketAcl, BucketSummary, ChecksumClaim, CompletePart, DeleteError, DeletedObject,
-    ListObjectVersionsResult, ListObjectsResult, ListPartsResult, ObjectPartsInfo,
+    BucketAcl, BucketObjectLockConfigurationUpdate, BucketSummary, ChecksumClaim, CompletePart,
+    DeleteError, DeletedObject, ListObjectVersionsResult, ListObjectsResult, ListPartsResult,
+    ObjectPartsInfo,
 };
 use crate::error::ServerError;
 use auth::canonical::uri_encode_path;
@@ -10,7 +11,8 @@ use quick_xml::{escape::unescape, events::Event, Reader};
 #[cfg(test)]
 use s3_types::VersionId;
 use s3_types::{
-    AclGrant, AclGrantee, AclGrants, AclPermission, BucketVersioningState, CanonicalUserId,
+    AclGrant, AclGrantee, AclGrants, AclPermission, BucketObjectLockConfig, BucketVersioningState,
+    CanonicalUserId, ObjectLockDefaultRetention, ObjectLockMode, RetentionPeriod,
 };
 use storage::BucketEncryptionConfig;
 
@@ -1009,6 +1011,278 @@ pub fn get_bucket_versioning_xml(state: BucketVersioningState) -> String {
     }
 
     xml.push_str("</VersioningConfiguration>");
+    xml
+}
+
+fn invalid_object_lock_configuration_xml() -> ServerError {
+    ServerError::MalformedXML {
+        reason:
+            "The XML you provided was not well-formed or did not validate against our published schema"
+                .to_string(),
+    }
+}
+
+/// Parse a `PutObjectLockConfiguration` XML request body.
+pub fn parse_bucket_object_lock_configuration_xml(
+    data: &[u8],
+) -> Result<BucketObjectLockConfigurationUpdate, ServerError> {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum State {
+        Start,
+        InRoot,
+        InObjectLockEnabled,
+        InRule,
+        InDefaultRetention,
+        InMode,
+        InDays,
+        InYears,
+        Done,
+    }
+
+    fn decode_object_lock_text(bytes: &[u8]) -> Result<String, ServerError> {
+        decode_xml_text(
+            bytes,
+            "invalid UTF-8 in object lock configuration XML body",
+            "invalid XML entity in object lock configuration XML body",
+        )
+    }
+
+    fn parse_mode(text: &str) -> Result<ObjectLockMode, ServerError> {
+        match text.trim() {
+            "GOVERNANCE" => Ok(ObjectLockMode::Governance),
+            "COMPLIANCE" => Ok(ObjectLockMode::Compliance),
+            _ => Err(invalid_object_lock_configuration_xml()),
+        }
+    }
+
+    fn parse_period(raw_value: &str, unit: &str) -> Result<RetentionPeriod, ServerError> {
+        let parsed: i64 = raw_value
+            .trim()
+            .parse()
+            .map_err(|_| invalid_object_lock_configuration_xml())?;
+        let positive = u32::try_from(parsed).map_err(|_| ServerError::InvalidArgument {
+            reason: format!("DefaultRetention {unit} must be greater than zero"),
+        })?;
+        match unit {
+            "Days" => RetentionPeriod::days(positive),
+            "Years" => RetentionPeriod::years(positive),
+            _ => unreachable!("unexpected retention period unit"),
+        }
+        .ok_or_else(|| ServerError::InvalidArgument {
+            reason: format!("DefaultRetention {unit} must be greater than zero"),
+        })
+    }
+
+    let mut reader = Reader::from_reader(data);
+    reader.config_mut().trim_text(true);
+
+    let mut buf = Vec::new();
+    let mut state = State::Start;
+    let mut current_text = String::new();
+    let mut object_lock_enabled = None;
+    let mut mode_text: Option<String> = None;
+    let mut days_text: Option<String> = None;
+    let mut years_text: Option<String> = None;
+    let mut saw_rule = false;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => match (state, e.local_name().as_ref()) {
+                (State::Start, b"ObjectLockConfiguration") => state = State::InRoot,
+                (State::InRoot, b"ObjectLockEnabled") => {
+                    current_text.clear();
+                    state = State::InObjectLockEnabled;
+                }
+                (State::InRoot, b"Rule") => {
+                    saw_rule = true;
+                    state = State::InRule;
+                }
+                (State::InRule, b"DefaultRetention") => state = State::InDefaultRetention,
+                (State::InDefaultRetention, b"Mode") => {
+                    current_text.clear();
+                    state = State::InMode;
+                }
+                (State::InDefaultRetention, b"Days") => {
+                    current_text.clear();
+                    state = State::InDays;
+                }
+                (State::InDefaultRetention, b"Years") => {
+                    current_text.clear();
+                    state = State::InYears;
+                }
+                _ => {
+                    return Err(ServerError::MalformedXML {
+                        reason: "unexpected element in object lock configuration XML".to_string(),
+                    });
+                }
+            },
+            Ok(Event::Empty(e)) => match (state, e.local_name().as_ref()) {
+                (State::Start, b"ObjectLockConfiguration") => state = State::Done,
+                (State::InRoot, b"ObjectLockEnabled") => object_lock_enabled = Some(String::new()),
+                (State::InRoot, b"Rule") => {
+                    saw_rule = true;
+                }
+                (State::InRule, b"DefaultRetention") => {}
+                (State::InDefaultRetention, b"Mode") => mode_text = Some(String::new()),
+                (State::InDefaultRetention, b"Days") => days_text = Some(String::new()),
+                (State::InDefaultRetention, b"Years") => years_text = Some(String::new()),
+                _ => {
+                    return Err(ServerError::MalformedXML {
+                        reason: "unexpected empty element in object lock configuration XML"
+                            .to_string(),
+                    });
+                }
+            },
+            Ok(Event::End(e)) => match (state, e.local_name().as_ref()) {
+                (State::InRoot, b"ObjectLockConfiguration") => state = State::Done,
+                (State::InObjectLockEnabled, b"ObjectLockEnabled") => {
+                    object_lock_enabled = Some(std::mem::take(&mut current_text));
+                    state = State::InRoot;
+                }
+                (State::InRule, b"Rule") => state = State::InRoot,
+                (State::InDefaultRetention, b"DefaultRetention") => state = State::InRule,
+                (State::InMode, b"Mode") => {
+                    mode_text = Some(std::mem::take(&mut current_text));
+                    state = State::InDefaultRetention;
+                }
+                (State::InDays, b"Days") => {
+                    days_text = Some(std::mem::take(&mut current_text));
+                    state = State::InDefaultRetention;
+                }
+                (State::InYears, b"Years") => {
+                    years_text = Some(std::mem::take(&mut current_text));
+                    state = State::InDefaultRetention;
+                }
+                _ => {
+                    return Err(ServerError::MalformedXML {
+                        reason: "unexpected closing element in object lock configuration XML"
+                            .to_string(),
+                    });
+                }
+            },
+            Ok(Event::Text(t)) => {
+                let text = decode_object_lock_text(t.as_ref())?;
+                match state {
+                    State::InObjectLockEnabled | State::InMode | State::InDays | State::InYears => {
+                        current_text.push_str(&text);
+                    }
+                    _ if text.trim().is_empty() => {}
+                    _ => {
+                        return Err(ServerError::MalformedXML {
+                            reason: "unexpected text in object lock configuration XML".to_string(),
+                        });
+                    }
+                }
+            }
+            Ok(Event::CData(t)) => {
+                let text =
+                    std::str::from_utf8(t.as_ref()).map_err(|_| ServerError::MalformedXML {
+                        reason: "invalid UTF-8 in object lock configuration XML body".to_string(),
+                    })?;
+                match state {
+                    State::InObjectLockEnabled | State::InMode | State::InDays | State::InYears => {
+                        current_text.push_str(text);
+                    }
+                    _ if text.trim().is_empty() => {}
+                    _ => {
+                        return Err(ServerError::MalformedXML {
+                            reason: "unexpected CDATA in object lock configuration XML".to_string(),
+                        });
+                    }
+                }
+            }
+            Ok(Event::Comment(_) | Event::Decl(_) | Event::PI(_) | Event::DocType(_)) => {}
+            Ok(Event::Eof) => {
+                if state == State::Start {
+                    return Err(ServerError::MalformedXML {
+                        reason: "missing <ObjectLockConfiguration> element".to_string(),
+                    });
+                }
+                if state != State::Done {
+                    return Err(ServerError::MalformedXML {
+                        reason: "unexpected end of object lock configuration XML".to_string(),
+                    });
+                }
+
+                let object_lock_enabled = match object_lock_enabled.as_deref() {
+                    Some("Enabled") => Some(true),
+                    Some(_) => return Err(invalid_object_lock_configuration_xml()),
+                    None => None,
+                };
+
+                let default_retention = match (
+                    mode_text.as_deref(),
+                    days_text.as_deref(),
+                    years_text.as_deref(),
+                ) {
+                    (None, None, None) => None,
+                    (Some(_), Some(_), Some(_)) => {
+                        return Err(invalid_object_lock_configuration_xml())
+                    }
+                    (Some(mode), Some(days), None) => Some(ObjectLockDefaultRetention {
+                        mode: parse_mode(mode)?,
+                        period: parse_period(days, "Days")?,
+                    }),
+                    (Some(mode), None, Some(years)) => Some(ObjectLockDefaultRetention {
+                        mode: parse_mode(mode)?,
+                        period: parse_period(years, "Years")?,
+                    }),
+                    _ => return Err(invalid_object_lock_configuration_xml()),
+                };
+
+                if object_lock_enabled.is_none() && !saw_rule {
+                    return Err(invalid_object_lock_configuration_xml());
+                }
+
+                return Ok(BucketObjectLockConfigurationUpdate {
+                    object_lock_enabled,
+                    default_retention,
+                });
+            }
+            Err(_) => {
+                return Err(ServerError::MalformedXML {
+                    reason: "malformed object lock configuration XML".to_string(),
+                });
+            }
+        }
+        buf.clear();
+    }
+}
+
+/// Format a `GetObjectLockConfiguration` XML response.
+#[must_use]
+pub fn get_bucket_object_lock_configuration_xml(config: BucketObjectLockConfig) -> String {
+    debug_assert!(
+        config.enabled,
+        "S3 only returns object lock XML for enabled buckets"
+    );
+
+    let mut xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <ObjectLockConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <ObjectLockEnabled>Enabled</ObjectLockEnabled>",
+    );
+
+    if let Some(default_retention) = config.default_retention {
+        xml.push_str("<Rule><DefaultRetention><Mode>");
+        xml.push_str(default_retention.mode.as_str());
+        xml.push_str("</Mode>");
+        match default_retention.period {
+            RetentionPeriod::Days(days) => {
+                xml.push_str("<Days>");
+                xml.push_str(&days.get().to_string());
+                xml.push_str("</Days>");
+            }
+            RetentionPeriod::Years(years) => {
+                xml.push_str("<Years>");
+                xml.push_str(&years.get().to_string());
+                xml.push_str("</Years>");
+            }
+        }
+        xml.push_str("</DefaultRetention></Rule>");
+    }
+
+    xml.push_str("</ObjectLockConfiguration>");
     xml
 }
 
@@ -3675,6 +3949,134 @@ mod tests {
     fn get_bucket_versioning_suspended() {
         let xml = get_bucket_versioning_xml(BucketVersioningState::Suspended);
         assert!(xml.contains("<Status>Suspended</Status>"));
+    }
+
+    #[test]
+    fn parse_bucket_object_lock_configuration_days() {
+        let xml = br#"
+            <ObjectLockConfiguration>
+              <ObjectLockEnabled>Enabled</ObjectLockEnabled>
+              <Rule>
+                <DefaultRetention>
+                  <Mode>GOVERNANCE</Mode>
+                  <Days>7</Days>
+                </DefaultRetention>
+              </Rule>
+            </ObjectLockConfiguration>
+        "#;
+        let config = parse_bucket_object_lock_configuration_xml(xml).unwrap();
+        assert_eq!(
+            config,
+            BucketObjectLockConfigurationUpdate {
+                object_lock_enabled: Some(true),
+                default_retention: Some(ObjectLockDefaultRetention {
+                    mode: ObjectLockMode::Governance,
+                    period: RetentionPeriod::days(7).unwrap(),
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_bucket_object_lock_configuration_invalid_status() {
+        let xml = br#"
+            <ObjectLockConfiguration>
+              <ObjectLockEnabled>Disabled</ObjectLockEnabled>
+            </ObjectLockConfiguration>
+        "#;
+        assert!(matches!(
+            parse_bucket_object_lock_configuration_xml(xml),
+            Err(ServerError::MalformedXML { .. })
+        ));
+    }
+
+    #[test]
+    fn parse_bucket_object_lock_configuration_invalid_mode() {
+        let xml = br#"
+            <ObjectLockConfiguration>
+              <ObjectLockEnabled>Enabled</ObjectLockEnabled>
+              <Rule>
+                <DefaultRetention>
+                  <Mode>governance</Mode>
+                  <Days>1</Days>
+                </DefaultRetention>
+              </Rule>
+            </ObjectLockConfiguration>
+        "#;
+        assert!(matches!(
+            parse_bucket_object_lock_configuration_xml(xml),
+            Err(ServerError::MalformedXML { .. })
+        ));
+    }
+
+    #[test]
+    fn parse_bucket_object_lock_configuration_rejects_days_and_years() {
+        let xml = br#"
+            <ObjectLockConfiguration>
+              <ObjectLockEnabled>Enabled</ObjectLockEnabled>
+              <Rule>
+                <DefaultRetention>
+                  <Mode>GOVERNANCE</Mode>
+                  <Days>1</Days>
+                  <Years>1</Years>
+                </DefaultRetention>
+              </Rule>
+            </ObjectLockConfiguration>
+        "#;
+        assert!(matches!(
+            parse_bucket_object_lock_configuration_xml(xml),
+            Err(ServerError::MalformedXML { .. })
+        ));
+    }
+
+    #[test]
+    fn parse_bucket_object_lock_configuration_rejects_non_positive_periods() {
+        let days_xml = br#"
+            <ObjectLockConfiguration>
+              <ObjectLockEnabled>Enabled</ObjectLockEnabled>
+              <Rule>
+                <DefaultRetention>
+                  <Mode>GOVERNANCE</Mode>
+                  <Days>0</Days>
+                </DefaultRetention>
+              </Rule>
+            </ObjectLockConfiguration>
+        "#;
+        assert!(matches!(
+            parse_bucket_object_lock_configuration_xml(days_xml),
+            Err(ServerError::InvalidArgument { .. })
+        ));
+
+        let years_xml = br#"
+            <ObjectLockConfiguration>
+              <ObjectLockEnabled>Enabled</ObjectLockEnabled>
+              <Rule>
+                <DefaultRetention>
+                  <Mode>COMPLIANCE</Mode>
+                  <Years>-1</Years>
+                </DefaultRetention>
+              </Rule>
+            </ObjectLockConfiguration>
+        "#;
+        assert!(matches!(
+            parse_bucket_object_lock_configuration_xml(years_xml),
+            Err(ServerError::InvalidArgument { .. })
+        ));
+    }
+
+    #[test]
+    fn bucket_object_lock_xml_round_trip() {
+        let config = BucketObjectLockConfig {
+            enabled: true,
+            default_retention: Some(ObjectLockDefaultRetention {
+                mode: ObjectLockMode::Compliance,
+                period: RetentionPeriod::years(3).unwrap(),
+            }),
+        };
+        let xml = get_bucket_object_lock_configuration_xml(config);
+        assert!(xml.contains("<ObjectLockEnabled>Enabled</ObjectLockEnabled>"));
+        assert!(xml.contains("<Mode>COMPLIANCE</Mode>"));
+        assert!(xml.contains("<Years>3</Years>"));
     }
 
     #[test]
