@@ -12,8 +12,8 @@ use aws_sdk_s3::types::{
     PublicAccessBlockConfiguration,
 };
 use s3_tests::{
-    assert_s3_err_code, copy_source_with_version, create_public_write_bucket,
-    ensure_distinct_s3_owners_or_skip, err_status, unique_bucket, CTX,
+    assert_s3_err_code, copy_source_with_version, create_public_write_bucket, err_status,
+    unique_bucket, CTX,
 };
 
 const PART_SIZE: usize = 5 * 1024 * 1024; // 5 MB minimum part size
@@ -2567,22 +2567,7 @@ fn test_upload_part_copy_percent_encoded_key() {
 fn test_list_multipart_upload_owner() {
     s3_tests::run(async {
         let client = CTX.client();
-        if !CTX.has_alt_client() {
-            eprintln!(
-                "skipping test_list_multipart_upload_owner: alternate credentials are not configured"
-            );
-            return;
-        }
         let alt_client = CTX.alt_client();
-        if !ensure_distinct_s3_owners_or_skip(
-            client,
-            alt_client,
-            "test_list_multipart_upload_owner",
-        )
-        .await
-        {
-            return;
-        }
 
         let bucket = create_public_write_bucket(client).await;
         let owner_id = client
@@ -2718,22 +2703,7 @@ fn test_anon_create_multipart_upload_public_write_bucket_fail() {
 fn test_multipart_initiator_cannot_continue_after_bucket_acl_change() {
     s3_tests::run(async {
         let client = CTX.client();
-        if !CTX.has_alt_client() {
-            eprintln!(
-                "skipping test_multipart_initiator_cannot_continue_after_bucket_acl_change: alternate credentials are not configured"
-            );
-            return;
-        }
         let alt_client = CTX.alt_client();
-        if !ensure_distinct_s3_owners_or_skip(
-            client,
-            alt_client,
-            "test_multipart_initiator_cannot_continue_after_bucket_acl_change",
-        )
-        .await
-        {
-            return;
-        }
 
         let bucket = create_public_write_bucket(client).await;
         let key = "multipart-acl-change";

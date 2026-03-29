@@ -1,12 +1,14 @@
 pub mod helpers;
+mod post_form;
 pub mod server;
 
 pub use helpers::{
     assert_s3_err_code, bucket_prefix, cleanup_versioned_bucket, copy_source_with_version,
     create_objects, create_objects_with_keys, create_public_bucket, create_public_write_bucket,
-    delete_all_and_bucket, delete_objects_with_md5, ensure_distinct_s3_owners_or_skip, err_status,
+    delete_all_and_bucket, delete_objects_with_md5, disable_bucket_public_access_block, err_status,
     sse_c_header_values, test_sse_c_key, unique_bucket,
 };
+pub use post_form::{post_object_to_test_endpoint, sigv4_post_sse_c_fields_for_credentials};
 pub use server::TestServer;
 
 use std::sync::LazyLock;
@@ -45,12 +47,12 @@ pub fn run<F: std::future::Future>(f: F) -> F::Output {
 /// `TestServer` on a random port with well-known test credentials.
 pub struct TestContext {
     client: Client,
-    alt_client: Option<Client>,
+    alt_client: Client,
     endpoint: String,
     access_key: String,
     secret_key: String,
-    account_id: Option<String>,
-    alt_account_id: Option<String>,
+    account_id: String,
+    alt_account_id: String,
     region: String,
     _server: Option<TestServer>,
 }
@@ -62,8 +64,13 @@ impl TestContext {
     /// server or connect to an external endpoint:
     ///
     /// - `S3_TEST_ENDPOINT`: external endpoint URL
-    /// - `S3_TEST_ACCESS_KEY`: access key (defaults to test key)
-    /// - `S3_TEST_SECRET_KEY`: secret key (defaults to test key)
+    /// - `S3_TEST_ACCESS_KEY`: primary access key
+    /// - `S3_TEST_SECRET_KEY`: primary secret key
+    /// - `S3_TEST_ACCOUNT_ID`: primary AWS account ID
+    /// - `S3_TEST_ALT_ACCESS_KEY`: alternate access key from a different AWS account
+    /// - `S3_TEST_ALT_SECRET_KEY`: alternate secret key from a different AWS account
+    /// - `S3_TEST_ALT_ACCOUNT_ID`: alternate AWS account ID
+    /// - `S3_TEST_BUCKET_PREFIX`: required prefix for external test buckets
     /// - `S3_TEST_REGION`: region (defaults to "us-east-1")
     ///
     /// Local embedded-server tracing helpers:
@@ -77,29 +84,37 @@ impl TestContext {
 
         if let Some(endpoint) = external_endpoint {
             // External endpoint mode
+            assert!(
+                endpoint.starts_with("https://"),
+                "S3_TEST_ENDPOINT must use https:// for full external s3-tests coverage; got {endpoint}"
+            );
             let access_key = std::env::var("S3_TEST_ACCESS_KEY")
                 .expect("S3_TEST_ACCESS_KEY required with S3_TEST_ENDPOINT");
             let secret_key = std::env::var("S3_TEST_SECRET_KEY")
                 .expect("S3_TEST_SECRET_KEY required with S3_TEST_ENDPOINT");
-            let account_id = std::env::var("S3_TEST_ACCOUNT_ID").ok();
-            let alt_access_key = std::env::var("S3_TEST_ALT_ACCESS_KEY").ok();
-            let alt_secret_key = std::env::var("S3_TEST_ALT_SECRET_KEY").ok();
-            let alt_account_id = std::env::var("S3_TEST_ALT_ACCOUNT_ID").ok();
+            let account_id = std::env::var("S3_TEST_ACCOUNT_ID").expect(
+                "S3_TEST_ACCOUNT_ID required with S3_TEST_ENDPOINT; full external s3-tests runs need the primary AWS account ID",
+            );
+            let alt_access_key = std::env::var("S3_TEST_ALT_ACCESS_KEY").expect(
+                "S3_TEST_ALT_ACCESS_KEY required with S3_TEST_ENDPOINT; full external s3-tests runs need alternate credentials from a different AWS account",
+            );
+            let alt_secret_key = std::env::var("S3_TEST_ALT_SECRET_KEY").expect(
+                "S3_TEST_ALT_SECRET_KEY required with S3_TEST_ENDPOINT; full external s3-tests runs need alternate credentials from a different AWS account",
+            );
+            let alt_account_id = std::env::var("S3_TEST_ALT_ACCOUNT_ID").expect(
+                "S3_TEST_ALT_ACCOUNT_ID required with S3_TEST_ENDPOINT; full external s3-tests runs need the alternate AWS account ID",
+            );
+            let _bucket_prefix = std::env::var("S3_TEST_BUCKET_PREFIX").expect(
+                "S3_TEST_BUCKET_PREFIX required with S3_TEST_ENDPOINT; use a dedicated prefix such as claude-s3- that matches the test IAM policy",
+            );
             let region =
                 std::env::var("S3_TEST_REGION").unwrap_or_else(|_| "us-east-1".to_string());
 
             let client = build_client(&endpoint, &access_key, &secret_key, &region).await;
-            let alt_client = match (alt_access_key.as_deref(), alt_secret_key.as_deref()) {
-                (Some(access_key), Some(secret_key)) => {
-                    Some(build_client(&endpoint, access_key, secret_key, &region).await)
-                }
-                (None, None) => None,
-                _ => {
-                    panic!(
-                        "S3_TEST_ALT_ACCESS_KEY and S3_TEST_ALT_SECRET_KEY must either both be set or both be unset"
-                    );
-                }
-            };
+            let alt_client =
+                build_client(&endpoint, &alt_access_key, &alt_secret_key, &region).await;
+            assert_distinct_external_s3_owners(&client, &alt_client, &account_id, &alt_account_id)
+                .await;
             TestContext {
                 client,
                 alt_client,
@@ -133,12 +148,12 @@ impl TestContext {
             .await;
             TestContext {
                 client,
-                alt_client: Some(alt_client),
+                alt_client,
                 endpoint,
                 access_key: server::TEST_ACCESS_KEY.to_string(),
                 secret_key: server::TEST_SECRET_KEY.to_string(),
-                account_id: Some(server::TEST_ACCOUNT_ID.to_string()),
-                alt_account_id: Some(server::ALT_ACCOUNT_ID.to_string()),
+                account_id: server::TEST_ACCOUNT_ID.to_string(),
+                alt_account_id: server::ALT_ACCOUNT_ID.to_string(),
                 region: server::TEST_REGION.to_string(),
                 _server: Some(server),
             }
@@ -152,15 +167,7 @@ impl TestContext {
 
     /// An alternate S3 client (different user, not the bucket owner).
     pub fn alt_client(&self) -> &Client {
-        self.alt_client.as_ref().expect(
-            "alternate client is unavailable; set S3_TEST_ALT_ACCESS_KEY and \
-S3_TEST_ALT_SECRET_KEY when running against an external endpoint",
-        )
-    }
-
-    /// Whether an alternate authenticated client is configured.
-    pub fn has_alt_client(&self) -> bool {
-        self.alt_client.is_some()
+        &self.alt_client
     }
 
     /// The HTTP endpoint URL (e.g. "http://127.0.0.1:12345").
@@ -178,14 +185,14 @@ S3_TEST_ALT_SECRET_KEY when running against an external endpoint",
         &self.secret_key
     }
 
-    /// The primary test account ID, if configured.
-    pub fn account_id(&self) -> Option<&str> {
-        self.account_id.as_deref()
+    /// The primary test account ID.
+    pub fn account_id(&self) -> &str {
+        &self.account_id
     }
 
-    /// The alternate test account ID, if configured.
-    pub fn alt_account_id(&self) -> Option<&str> {
-        self.alt_account_id.as_deref()
+    /// The alternate test account ID.
+    pub fn alt_account_id(&self) -> &str {
+        &self.alt_account_id
     }
 
     /// The region.
@@ -245,6 +252,73 @@ pub async fn build_client_with_ca(
         .build();
 
     Client::from_conf(s3_config)
+}
+
+async fn assert_distinct_external_s3_owners(
+    client: &Client,
+    alt_client: &Client,
+    account_id: &str,
+    alt_account_id: &str,
+) {
+    assert_ne!(
+        account_id, alt_account_id,
+        "S3_TEST_ALT_ACCESS_KEY/S3_TEST_ALT_SECRET_KEY must belong to a different AWS account than S3_TEST_ACCESS_KEY/S3_TEST_SECRET_KEY"
+    );
+
+    let primary_bucket = unique_bucket();
+    client
+        .create_bucket()
+        .bucket(&primary_bucket)
+        .send()
+        .await
+        .expect("create primary probe bucket for external s3-tests setup");
+
+    let alt_bucket = unique_bucket();
+    if let Err(err) = alt_client.create_bucket().bucket(&alt_bucket).send().await {
+        let _ = client.delete_bucket().bucket(&primary_bucket).send().await;
+        panic!("create alternate probe bucket for external s3-tests setup: {err:?}");
+    }
+
+    let primary_owner_id = client
+        .get_bucket_acl()
+        .bucket(&primary_bucket)
+        .send()
+        .await
+        .expect("get primary probe bucket ACL during external s3-tests setup")
+        .owner()
+        .expect("expected owner in primary probe GetBucketAcl during external s3-tests setup")
+        .id()
+        .expect("expected owner ID in primary probe GetBucketAcl during external s3-tests setup")
+        .to_string();
+    let alt_owner_id = alt_client
+        .get_bucket_acl()
+        .bucket(&alt_bucket)
+        .send()
+        .await
+        .expect("get alternate probe bucket ACL during external s3-tests setup")
+        .owner()
+        .expect("expected owner in alternate probe GetBucketAcl during external s3-tests setup")
+        .id()
+        .expect("expected owner ID in alternate probe GetBucketAcl during external s3-tests setup")
+        .to_string();
+
+    client
+        .delete_bucket()
+        .bucket(&primary_bucket)
+        .send()
+        .await
+        .expect("delete primary probe bucket during external s3-tests setup");
+    alt_client
+        .delete_bucket()
+        .bucket(&alt_bucket)
+        .send()
+        .await
+        .expect("delete alternate probe bucket during external s3-tests setup");
+
+    assert_ne!(
+        primary_owner_id, alt_owner_id,
+        "S3_TEST_ALT_ACCESS_KEY/S3_TEST_ALT_SECRET_KEY resolve to the same S3 canonical owner ID as the primary credentials; use alternate credentials from a different AWS account"
+    );
 }
 
 pub fn test_agent() -> ureq::Agent {

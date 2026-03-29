@@ -1,8 +1,5 @@
 use aws_sdk_s3::types::{BucketCannedAcl, ObjectCannedAcl, ObjectOwnership};
-use s3_tests::{
-    assert_s3_err_code, create_public_write_bucket, ensure_distinct_s3_owners_or_skip, err_status,
-    unique_bucket, CTX,
-};
+use s3_tests::{assert_s3_err_code, create_public_write_bucket, err_status, unique_bucket, CTX};
 
 /// Build an agent that returns all HTTP responses (including 4xx/5xx) as Ok.
 fn agent() -> ureq::Agent {
@@ -80,24 +77,9 @@ fn test_create_bucket_existing_bucket_does_not_overwrite_ownership_controls() {
 
 #[test]
 fn test_bucket_owner_cannot_get_private_object_written_by_other_user() {
-    if !CTX.has_alt_client() {
-        eprintln!(
-            "skipping test_bucket_owner_cannot_get_private_object_written_by_other_user: alternate credentials are not configured"
-        );
-        return;
-    }
     s3_tests::run(async {
         let client = CTX.client();
         let alt_client = CTX.alt_client();
-        if !ensure_distinct_s3_owners_or_skip(
-            client,
-            alt_client,
-            "test_bucket_owner_cannot_get_private_object_written_by_other_user",
-        )
-        .await
-        {
-            return;
-        }
         let bucket = create_public_write_bucket(client).await;
 
         alt_client

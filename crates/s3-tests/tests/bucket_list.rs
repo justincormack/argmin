@@ -17,16 +17,6 @@ fn assert_canonical_owner_id(id: &str) {
     );
 }
 
-fn primary_account_id_or_skip(test_name: &str) -> Option<String> {
-    match CTX.account_id() {
-        Some(account_id) => Some(account_id.to_string()),
-        None => {
-            eprintln!("skipping {test_name}: S3_TEST_ACCOUNT_ID is not configured");
-            None
-        }
-    }
-}
-
 // ── Test data sets ──────────────────────────────────────────────────
 
 /// Set A — 6 keys for delimiter tests.
@@ -70,11 +60,7 @@ fn test_bucket_list_empty() {
 #[test]
 fn test_bucket_list_v2_expected_bucket_owner() {
     s3_tests::run(async {
-        let Some(account_id) =
-            primary_account_id_or_skip("test_bucket_list_v2_expected_bucket_owner")
-        else {
-            return;
-        };
+        let account_id = CTX.account_id().to_string();
         let client = CTX.client();
         let (bucket, keys) = create_objects_with_keys(client, &["foo", "bar"]).await;
 

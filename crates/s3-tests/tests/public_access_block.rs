@@ -572,11 +572,8 @@ fn test_block_public_policy_with_principal() {
             .await
             .unwrap();
 
-        let principal = if let Some(account_id) = CTX.account_id() {
-            serde_json::json!({"AWS": format!("arn:aws:iam::{account_id}:root")})
-        } else {
-            serde_json::json!({"Service": "logging.s3.amazonaws.com"})
-        };
+        let principal =
+            serde_json::json!({"AWS": format!("arn:aws:iam::{}:root", CTX.account_id())});
         let policy = serde_json::json!({
             "Version": "2012-10-17",
             "Statement": [{
@@ -651,28 +648,33 @@ fn test_block_public_restrict_public_buckets() {
             }],
         })
         .to_string();
-        let put_policy = client
+        match client
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
             .send()
-            .await;
-        if put_policy.is_err()
-            && std::env::var("S3_TEST_ENDPOINT").is_ok()
-            && err_status(&put_policy) == 403
+            .await
         {
-            assert_s3_err_code(&put_policy, "AccessDenied");
-            client
-                .delete_object()
-                .bucket(&bucket)
-                .key("foo")
-                .send()
-                .await
-                .unwrap();
-            cleanup(&bucket).await;
-            return;
+            Ok(_) => {}
+            Err(err) => {
+                if std::env::var("S3_TEST_ENDPOINT").is_ok()
+                    && err.raw_response().map(|resp| resp.status().as_u16()) == Some(403)
+                {
+                    client
+                        .delete_object()
+                        .bucket(&bucket)
+                        .key("foo")
+                        .send()
+                        .await
+                        .unwrap();
+                    cleanup(&bucket).await;
+                    panic!(
+                        "account-level S3 Block Public Access must allow public bucket policies for AWS s3-tests; put_bucket_policy failed while setting up RestrictPublicBuckets coverage: {err:?}"
+                    );
+                }
+                panic!("put_bucket_policy failed: {err:?}");
+            }
         }
-        put_policy.unwrap();
 
         let get_url = format!("{}/{bucket}/foo", CTX.endpoint());
         let mut public_resp = agent().get(&get_url).call().expect("transport error");

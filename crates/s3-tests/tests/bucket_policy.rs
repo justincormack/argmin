@@ -4,7 +4,7 @@ use aws_sdk_s3::types::{
     CompletedMultipartUpload, CompletedPart, Grant, ObjectOwnership, Permission,
 };
 use s3_tests::{
-    assert_s3_err_code, create_public_bucket, ensure_distinct_s3_owners_or_skip, err_status,
+    assert_s3_err_code, create_public_bucket, disable_bucket_public_access_block, err_status,
     unique_bucket, CTX,
 };
 use serde_json::json;
@@ -55,6 +55,13 @@ async fn cleanup(bucket: &str, keys: &[&str]) {
     cleanup_with_client(CTX.client(), bucket, keys).await;
 }
 
+async fn create_bucket_allowing_public_policy(client: &aws_sdk_s3::Client) -> String {
+    let bucket = unique_bucket();
+    client.create_bucket().bucket(&bucket).send().await.unwrap();
+    disable_bucket_public_access_block(client, &bucket).await;
+    bucket
+}
+
 fn bucket_resource(bucket: &str) -> String {
     format!("arn:aws:s3:::{bucket}")
 }
@@ -63,17 +70,12 @@ fn bucket_wildcard_resource(bucket: &str) -> String {
     format!("arn:aws:s3:::{bucket}/*")
 }
 
-fn alt_policy_principal() -> Option<serde_json::Value> {
-    CTX.alt_account_id()
-        .map(|account_id| json!({ "AWS": format!("arn:aws:iam::{account_id}:root") }))
+fn alt_policy_principal() -> serde_json::Value {
+    json!({ "AWS": format!("arn:aws:iam::{}:root", CTX.alt_account_id()) })
 }
 
 fn fixed_nonpublic_principal() -> serde_json::Value {
-    if let Some(account_id) = CTX.alt_account_id().or(CTX.account_id()) {
-        json!({ "AWS": format!("arn:aws:iam::{account_id}:root") })
-    } else {
-        json!({ "Service": "logging.s3.amazonaws.com" })
-    }
+    json!({ "AWS": format!("arn:aws:iam::{}:root", CTX.alt_account_id()) })
 }
 
 async fn bucket_policy_status_is_public(client: &aws_sdk_s3::Client, bucket: &str) -> bool {
@@ -173,8 +175,7 @@ async fn complete_single_part_upload(
 fn test_bucket_policy_put_get_delete() {
     s3_tests::run(async {
         let client = CTX.client();
-        let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        let bucket = create_bucket_allowing_public_policy(client).await;
 
         let policy = serde_json::json!({
             "Version": "2012-10-17",
@@ -286,8 +287,7 @@ fn test_get_bucket_policy_status_public_bucket_acl() {
 fn test_get_bucket_policy_status_public_bucket_policy() {
     s3_tests::run(async {
         let client = CTX.client();
-        let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        let bucket = create_bucket_allowing_public_policy(client).await;
 
         let put_result = client
             .put_bucket_policy()
@@ -308,11 +308,10 @@ fn test_get_bucket_policy_status_public_bucket_policy() {
                         == Some("AccessDenied")
                     && format!("{err:?}").contains("BlockPublicPolicy") =>
             {
-                eprintln!(
-                    "skipping test_get_bucket_policy_status_public_bucket_policy: account-level BlockPublicPolicy prevented installing the required public policy"
-                );
                 cleanup(&bucket, &[]).await;
-                return;
+                panic!(
+                    "account-level S3 Block Public Access must allow public bucket policies for AWS s3-tests; put_bucket_policy failed with BlockPublicPolicy: {err:?}"
+                );
             }
             Err(err) => panic!("put_bucket_policy failed unexpectedly: {err:?}"),
         }
@@ -327,8 +326,7 @@ fn test_get_bucket_policy_status_public_bucket_policy() {
 fn test_get_bucket_policy_status_nonpublic_bucket_policy() {
     s3_tests::run(async {
         let client = CTX.client();
-        let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        let bucket = create_bucket_allowing_public_policy(client).await;
         let policy = json!({
             "Version": "2012-10-17",
             "Statement": [{
@@ -391,24 +389,9 @@ fn test_get_bucket_policy_status_nonpublic_fixed_principal_policy() {
 #[test]
 fn test_get_bucket_policy_status_cross_account_allow() {
     s3_tests::run(async {
-        if !CTX.has_alt_client() {
-            return;
-        }
-        let Some(principal) = alt_policy_principal() else {
-            return;
-        };
-
+        let principal = alt_policy_principal();
         let client = CTX.client();
         let alt_client = CTX.alt_client();
-        if !ensure_distinct_s3_owners_or_skip(
-            client,
-            alt_client,
-            "test_get_bucket_policy_status_cross_account_allow",
-        )
-        .await
-        {
-            return;
-        }
 
         let bucket = unique_bucket();
         client.create_bucket().bucket(&bucket).send().await.unwrap();
@@ -441,24 +424,9 @@ fn test_get_bucket_policy_status_cross_account_allow() {
 #[test]
 fn test_get_bucket_policy_status_cross_account_deny_overrides_allow() {
     s3_tests::run(async {
-        if !CTX.has_alt_client() {
-            return;
-        }
-        let Some(principal) = alt_policy_principal() else {
-            return;
-        };
-
+        let principal = alt_policy_principal();
         let client = CTX.client();
         let alt_client = CTX.alt_client();
-        if !ensure_distinct_s3_owners_or_skip(
-            client,
-            alt_client,
-            "test_get_bucket_policy_status_cross_account_deny_overrides_allow",
-        )
-        .await
-        {
-            return;
-        }
 
         let bucket = unique_bucket();
         client.create_bucket().bucket(&bucket).send().await.unwrap();
@@ -545,24 +513,9 @@ fn test_put_bucket_policy_not_principal_rejected() {
 #[test]
 fn test_bucket_policy_list_objects_v1() {
     s3_tests::run(async {
-        if !CTX.has_alt_client() {
-            return;
-        }
-        let Some(principal) = alt_policy_principal() else {
-            return;
-        };
-
+        let principal = alt_policy_principal();
         let client = CTX.client();
         let alt_client = CTX.alt_client();
-        if !ensure_distinct_s3_owners_or_skip(
-            client,
-            alt_client,
-            "test_bucket_policy_list_objects_v1",
-        )
-        .await
-        {
-            return;
-        }
 
         let bucket = unique_bucket();
         client.create_bucket().bucket(&bucket).send().await.unwrap();
@@ -604,24 +557,9 @@ fn test_bucket_policy_list_objects_v1() {
 #[test]
 fn test_bucket_policy_list_objects_v2() {
     s3_tests::run(async {
-        if !CTX.has_alt_client() {
-            return;
-        }
-        let Some(principal) = alt_policy_principal() else {
-            return;
-        };
-
+        let principal = alt_policy_principal();
         let client = CTX.client();
         let alt_client = CTX.alt_client();
-        if !ensure_distinct_s3_owners_or_skip(
-            client,
-            alt_client,
-            "test_bucket_policy_list_objects_v2",
-        )
-        .await
-        {
-            return;
-        }
 
         let bucket = unique_bucket();
         client.create_bucket().bucket(&bucket).send().await.unwrap();
@@ -718,8 +656,7 @@ fn test_bucket_policy_list_deny_overrides_bucket_acl() {
 fn test_bucket_policy_list_requires_bucket_resource() {
     s3_tests::run(async {
         let client = CTX.client();
-        let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        let bucket = create_bucket_allowing_public_policy(client).await;
         let result = client
             .put_bucket_policy()
             .bucket(&bucket)
@@ -741,24 +678,9 @@ fn test_bucket_policy_list_requires_bucket_resource() {
 #[test]
 fn test_bucket_policy_put_obj_grant_full_control() {
     s3_tests::run(async {
-        if !CTX.has_alt_client() {
-            return;
-        }
-        let Some(principal) = alt_policy_principal() else {
-            return;
-        };
-
+        let principal = alt_policy_principal();
         let client = CTX.client();
         let alt_client = CTX.alt_client();
-        if !ensure_distinct_s3_owners_or_skip(
-            client,
-            alt_client,
-            "test_bucket_policy_put_obj_grant_full_control",
-        )
-        .await
-        {
-            return;
-        }
 
         let bucket = unique_bucket();
         let control_bucket = unique_bucket();
@@ -927,24 +849,9 @@ fn test_bucket_policy_put_obj_grant_full_control() {
 #[test]
 fn test_bucket_policy_put_obj_request_object_tag() {
     s3_tests::run(async {
-        if !CTX.has_alt_client() {
-            return;
-        }
-        let Some(principal) = alt_policy_principal() else {
-            return;
-        };
-
+        let principal = alt_policy_principal();
         let client = CTX.client();
         let alt_client = CTX.alt_client();
-        if !ensure_distinct_s3_owners_or_skip(
-            client,
-            alt_client,
-            "test_bucket_policy_put_obj_request_object_tag",
-        )
-        .await
-        {
-            return;
-        }
 
         let bucket = unique_bucket();
         client.create_bucket().bucket(&bucket).send().await.unwrap();
@@ -1004,24 +911,9 @@ fn test_bucket_policy_put_obj_request_object_tag() {
 #[test]
 fn test_bucket_policy_multipart_upload_request_object_tag() {
     s3_tests::run(async {
-        if !CTX.has_alt_client() {
-            return;
-        }
-        let Some(principal) = alt_policy_principal() else {
-            return;
-        };
-
+        let principal = alt_policy_principal();
         let client = CTX.client();
         let alt_client = CTX.alt_client();
-        if !ensure_distinct_s3_owners_or_skip(
-            client,
-            alt_client,
-            "test_bucket_policy_multipart_upload_request_object_tag",
-        )
-        .await
-        {
-            return;
-        }
 
         let bucket = unique_bucket();
         client.create_bucket().bucket(&bucket).send().await.unwrap();
@@ -1088,24 +980,9 @@ fn test_bucket_policy_multipart_upload_request_object_tag() {
 #[test]
 fn test_bucket_policy_upload_part_copy_copy_source() {
     s3_tests::run(async {
-        if !CTX.has_alt_client() {
-            return;
-        }
-        let Some(principal) = alt_policy_principal() else {
-            return;
-        };
-
+        let principal = alt_policy_principal();
         let client = CTX.client();
         let alt_client = CTX.alt_client();
-        if !ensure_distinct_s3_owners_or_skip(
-            client,
-            alt_client,
-            "test_bucket_policy_upload_part_copy_copy_source",
-        )
-        .await
-        {
-            return;
-        }
 
         let src_bucket = unique_bucket();
         let dst_bucket = unique_bucket();

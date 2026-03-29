@@ -86,12 +86,16 @@ fn agent() -> ureq::Agent {
     s3_tests::test_agent()
 }
 
-fn is_external() -> bool {
-    std::env::var("S3_TEST_ENDPOINT").is_ok()
-}
-
 fn endpoint_is_https() -> bool {
     CTX.endpoint().starts_with("https://")
+}
+
+fn require_https_endpoint() {
+    assert!(
+        endpoint_is_https(),
+        "SSE-C coverage requires an https:// endpoint; got {}",
+        CTX.endpoint()
+    );
 }
 
 async fn insecure_local_client() -> (TestServer, aws_sdk_s3::Client) {
@@ -267,9 +271,7 @@ fn patterned_bytes(len: usize, seed: u8) -> Vec<u8> {
 
 #[test]
 fn test_sse_c_put_get_head_round_trip() {
-    if !endpoint_is_https() {
-        return;
-    }
+    require_https_endpoint();
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
@@ -326,9 +328,7 @@ fn test_sse_c_put_get_head_round_trip() {
 
 #[test]
 fn test_sse_c_get_requires_headers() {
-    if !endpoint_is_https() {
-        return;
-    }
+    require_https_endpoint();
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
@@ -360,9 +360,7 @@ fn test_sse_c_get_requires_headers() {
 
 #[test]
 fn test_sse_c_head_requires_headers() {
-    if !endpoint_is_https() {
-        return;
-    }
+    require_https_endpoint();
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
@@ -393,16 +391,8 @@ fn test_sse_c_head_requires_headers() {
 
 #[test]
 fn test_sse_c_put_requires_https() {
-    if is_external() && endpoint_is_https() {
-        return;
-    }
     s3_tests::run(async {
-        let (_server, client) = if is_external() {
-            (None, CTX.client().clone())
-        } else {
-            let (server, client) = insecure_local_client().await;
-            (Some(server), client)
-        };
+        let (_server, client) = insecure_local_client().await;
         let bucket = unique_bucket();
         client.create_bucket().bucket(&bucket).send().await.unwrap();
 
@@ -427,16 +417,8 @@ fn test_sse_c_put_requires_https() {
 
 #[test]
 fn test_sse_c_get_and_head_require_https() {
-    if is_external() && endpoint_is_https() {
-        return;
-    }
     s3_tests::run(async {
-        let (_server, client) = if is_external() {
-            (None, CTX.client().clone())
-        } else {
-            let (server, client) = insecure_local_client().await;
-            (Some(server), client)
-        };
+        let (_server, client) = insecure_local_client().await;
         let bucket = unique_bucket();
         client.create_bucket().bucket(&bucket).send().await.unwrap();
         client
@@ -486,9 +468,6 @@ fn test_sse_c_get_and_head_require_https() {
 
 #[test]
 fn test_plain_http_without_sse_c_still_works() {
-    if is_external() {
-        return;
-    }
     s3_tests::run(async {
         let (_server, client) = insecure_local_client().await;
         let bucket = unique_bucket();
@@ -527,9 +506,7 @@ fn test_plain_http_without_sse_c_still_works() {
 
 #[test]
 fn test_sse_c_get_rejects_wrong_key() {
-    if !endpoint_is_https() {
-        return;
-    }
+    require_https_endpoint();
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
@@ -569,9 +546,7 @@ fn test_sse_c_get_rejects_wrong_key() {
 
 #[test]
 fn test_sse_c_head_checksum_mode_uses_customer_key() {
-    if !endpoint_is_https() {
-        return;
-    }
+    require_https_endpoint();
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
@@ -618,9 +593,7 @@ fn test_sse_c_head_checksum_mode_uses_customer_key() {
 
 #[test]
 fn test_sse_c_multipart_round_trip() {
-    if !endpoint_is_https() {
-        return;
-    }
+    require_https_endpoint();
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
@@ -723,9 +696,7 @@ fn test_sse_c_multipart_round_trip() {
 
 #[test]
 fn test_sse_c_multipart_range_read() {
-    if !endpoint_is_https() {
-        return;
-    }
+    require_https_endpoint();
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
@@ -833,9 +804,7 @@ fn test_sse_c_multipart_range_read() {
 
 #[test]
 fn test_sse_c_multipart_get_part() {
-    if !endpoint_is_https() {
-        return;
-    }
+    require_https_endpoint();
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
@@ -981,9 +950,7 @@ fn test_sse_c_multipart_get_part() {
 
 #[test]
 fn test_sse_c_non_multipart_get_part() {
-    if !endpoint_is_https() {
-        return;
-    }
+    require_https_endpoint();
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
@@ -1070,9 +1037,7 @@ fn test_sse_c_non_multipart_get_part() {
 
 #[test]
 fn test_sse_c_upload_part_requires_headers() {
-    if !endpoint_is_https() {
-        return;
-    }
+    require_https_endpoint();
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
@@ -1108,9 +1073,7 @@ fn test_sse_c_upload_part_requires_headers() {
 
 #[test]
 fn test_sse_c_upload_part_rejects_wrong_key() {
-    if !endpoint_is_https() {
-        return;
-    }
+    require_https_endpoint();
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
@@ -1152,9 +1115,7 @@ fn test_sse_c_upload_part_rejects_wrong_key() {
 
 #[test]
 fn test_sse_c_complete_multipart_allows_missing_headers() {
-    if !endpoint_is_https() {
-        return;
-    }
+    require_https_endpoint();
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
@@ -1212,9 +1173,7 @@ fn test_sse_c_complete_multipart_allows_missing_headers() {
 
 #[test]
 fn test_sse_c_complete_multipart_checksum_requires_headers() {
-    if !endpoint_is_https() {
-        return;
-    }
+    require_https_endpoint();
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
@@ -1281,9 +1240,7 @@ fn test_sse_c_complete_multipart_checksum_requires_headers() {
 
 #[test]
 fn test_sse_c_complete_multipart_checksum_round_trip() {
-    if !endpoint_is_https() {
-        return;
-    }
+    require_https_endpoint();
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
@@ -1393,9 +1350,7 @@ fn test_sse_c_complete_multipart_checksum_round_trip() {
 
 #[test]
 fn test_sse_c_complete_multipart_rejects_wrong_key() {
-    if !endpoint_is_https() {
-        return;
-    }
+    require_https_endpoint();
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
@@ -1460,9 +1415,7 @@ fn test_sse_c_complete_multipart_rejects_wrong_key() {
 
 #[test]
 fn test_sse_c_copy_object_round_trip() {
-    if !endpoint_is_https() {
-        return;
-    }
+    require_https_endpoint();
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
@@ -1544,9 +1497,7 @@ fn test_sse_c_copy_object_round_trip() {
 
 #[test]
 fn test_sse_c_copy_object_requires_source_headers() {
-    if !endpoint_is_https() {
-        return;
-    }
+    require_https_endpoint();
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
@@ -1591,9 +1542,7 @@ fn test_sse_c_copy_object_requires_source_headers() {
 
 #[test]
 fn test_sse_c_upload_part_copy_round_trip() {
-    if !endpoint_is_https() {
-        return;
-    }
+    require_https_endpoint();
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
@@ -1716,9 +1665,7 @@ fn test_sse_c_upload_part_copy_round_trip() {
 
 #[test]
 fn test_sse_c_upload_part_copy_requires_source_headers() {
-    if !endpoint_is_https() {
-        return;
-    }
+    require_https_endpoint();
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
@@ -1794,9 +1741,7 @@ fn test_sse_c_upload_part_copy_requires_source_headers() {
 
 #[test]
 fn test_sse_c_upload_part_copy_rejects_wrong_destination_key() {
-    if !endpoint_is_https() {
-        return;
-    }
+    require_https_endpoint();
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();

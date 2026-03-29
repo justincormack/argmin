@@ -38,9 +38,8 @@ fn bucket_wildcard_resource(bucket: &str) -> String {
     format!("arn:aws:s3:::{bucket}/*")
 }
 
-fn alt_policy_principal() -> Option<serde_json::Value> {
-    CTX.alt_account_id()
-        .map(|account_id| json!({ "AWS": format!("arn:aws:iam::{account_id}:root") }))
+fn alt_policy_principal() -> serde_json::Value {
+    json!({ "AWS": format!("arn:aws:iam::{}:root", CTX.alt_account_id()) })
 }
 
 fn bucket_policy_document(
@@ -1651,13 +1650,7 @@ fn test_get_tags_acl_public() {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     s3_tests::run(async {
-        if !CTX.has_alt_client() {
-            return;
-        }
-        let Some(principal) = alt_policy_principal() else {
-            return;
-        };
-
+        let principal = alt_policy_principal();
         let client = CTX.client();
         let alt_client = CTX.alt_client();
         let bucket = unique_bucket();
@@ -1719,13 +1712,7 @@ fn test_put_tags_acl_public() {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     s3_tests::run(async {
-        if !CTX.has_alt_client() {
-            return;
-        }
-        let Some(principal) = alt_policy_principal() else {
-            return;
-        };
-
+        let principal = alt_policy_principal();
         let client = CTX.client();
         let alt_client = CTX.alt_client();
         let bucket = unique_bucket();
@@ -1787,13 +1774,7 @@ fn test_delete_tags_obj_public() {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     s3_tests::run(async {
-        if !CTX.has_alt_client() {
-            return;
-        }
-        let Some(principal) = alt_policy_principal() else {
-            return;
-        };
-
+        let principal = alt_policy_principal();
         let client = CTX.client();
         let alt_client = CTX.alt_client();
         let bucket = unique_bucket();
@@ -1862,13 +1843,7 @@ fn test_bucket_policy_get_obj_existing_tag() {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     s3_tests::run(async {
-        if !CTX.has_alt_client() {
-            return;
-        }
-        let Some(principal) = alt_policy_principal() else {
-            return;
-        };
-
+        let principal = alt_policy_principal();
         let client = CTX.client();
         let alt_client = CTX.alt_client();
         let bucket = unique_bucket();
@@ -1959,13 +1934,7 @@ fn test_bucket_policy_get_obj_tagging_existing_tag() {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     s3_tests::run(async {
-        if !CTX.has_alt_client() {
-            return;
-        }
-        let Some(principal) = alt_policy_principal() else {
-            return;
-        };
-
+        let principal = alt_policy_principal();
         let client = CTX.client();
         let alt_client = CTX.alt_client();
         let bucket = unique_bucket();
@@ -2067,13 +2036,7 @@ fn test_bucket_policy_put_obj_tagging_existing_tag() {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     s3_tests::run(async {
-        if !CTX.has_alt_client() {
-            return;
-        }
-        let Some(principal) = alt_policy_principal() else {
-            return;
-        };
-
+        let principal = alt_policy_principal();
         let client = CTX.client();
         let alt_client = CTX.alt_client();
         let bucket = unique_bucket();
@@ -2175,13 +2138,7 @@ fn test_bucket_policy_put_obj_copy_source() {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     s3_tests::run(async {
-        if !CTX.has_alt_client() {
-            return;
-        }
-        let Some(principal) = alt_policy_principal() else {
-            return;
-        };
-
+        let principal = alt_policy_principal();
         let client = CTX.client();
         let alt_client = CTX.alt_client();
         let src_bucket = unique_bucket();
@@ -2301,13 +2258,7 @@ fn test_bucket_policy_put_obj_copy_source_meta() {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     s3_tests::run(async {
-        if !CTX.has_alt_client() {
-            return;
-        }
-        let Some(principal) = alt_policy_principal() else {
-            return;
-        };
-
+        let principal = alt_policy_principal();
         let client = CTX.client();
         let alt_client = CTX.alt_client();
         let src_bucket = unique_bucket();
@@ -2414,13 +2365,7 @@ fn test_bucket_policy_put_obj_acl() {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     s3_tests::run(async {
-        if !CTX.has_alt_client() {
-            return;
-        }
-        let Some(principal) = alt_policy_principal() else {
-            return;
-        };
-
+        let principal = alt_policy_principal();
         let client = CTX.client();
         let alt_client = CTX.alt_client();
         let bucket = unique_bucket();
@@ -2506,13 +2451,7 @@ fn test_bucket_policy_get_obj_acl_existing_tag() {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     s3_tests::run(async {
-        if !CTX.has_alt_client() {
-            return;
-        }
-        let Some(principal) = alt_policy_principal() else {
-            return;
-        };
-
+        let principal = alt_policy_principal();
         let client = CTX.client();
         let alt_client = CTX.alt_client();
         let bucket = unique_bucket();

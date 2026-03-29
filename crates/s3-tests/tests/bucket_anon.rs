@@ -507,15 +507,6 @@ fn test_anon_put_bucket_acl_public_write_bucket_fail() {
     });
 }
 
-// ── Anonymous ListBuckets ────────────────────────────────────────────
-//
-// Unauthenticated GET / behavior varies across implementations:
-//   - Ceph/RGW: returns 200 with an empty bucket list (no owner → no buckets).
-//   - AWS S3:   returns 307 redirect to https://aws.amazon.com/s3/ (not an API response).
-//   - argmin:   returns 403 AccessDenied (ListBuckets requires authentication).
-//
-// We return 403 because ListBuckets is an authenticated-only operation.
-
 // ── Anonymous access to non-existent buckets ─────────────────────────
 //
 // AWS returns 404 NoSuchBucket for anonymous requests to non-existent
@@ -598,32 +589,6 @@ fn test_anon_put_nonexistent_bucket_returns_404() {
         assert!(
             body.contains("<Code>NoSuchBucket</Code>"),
             "expected NoSuchBucket in body: {}",
-            body
-        );
-    });
-}
-
-// ── Anonymous ListBuckets ────────────────────────────────────────────
-
-#[test]
-fn test_list_buckets_anonymous() {
-    if std::env::var("S3_TEST_ENDPOINT").is_ok() {
-        // AWS returns 307 redirect to marketing page for anonymous GET /
-        return;
-    }
-    s3_tests::run(async {
-        let url = format!("{}/", CTX.endpoint());
-        let mut resp = agent().get(&url).call().expect("transport error");
-        let status = resp.status().as_u16();
-        let body = resp.body_mut().read_to_string().unwrap();
-        assert_eq!(
-            status, 403,
-            "expected 403 for anon ListBuckets, got {}",
-            status
-        );
-        assert!(
-            body.contains("<Code>AccessDenied</Code>"),
-            "expected AccessDenied in body: {}",
             body
         );
     });

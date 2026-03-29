@@ -5,8 +5,8 @@ use aws_sdk_s3::types::{
 };
 use aws_sdk_s3::Client;
 use s3_tests::{
-    assert_s3_err_code, cleanup_versioned_bucket, copy_source_with_version,
-    ensure_distinct_s3_owners_or_skip, err_status, unique_bucket, CTX,
+    assert_s3_err_code, cleanup_versioned_bucket, copy_source_with_version, err_status,
+    unique_bucket, CTX,
 };
 
 /// Create a bucket, returning its name.
@@ -892,24 +892,9 @@ fn test_object_copy_versioning_multipart_upload() {
 
 #[test]
 fn test_object_copy_not_owned_bucket() {
-    if !CTX.has_alt_client() {
-        eprintln!(
-            "skipping test_object_copy_not_owned_bucket: alternate credentials are not configured"
-        );
-        return;
-    }
     s3_tests::run(async {
         let client = CTX.client();
         let alt_client = CTX.alt_client();
-        if !ensure_distinct_s3_owners_or_skip(
-            client,
-            alt_client,
-            "test_object_copy_not_owned_bucket",
-        )
-        .await
-        {
-            return;
-        }
         let bucket1 = unique_bucket();
         let bucket2 = unique_bucket();
 
@@ -1285,24 +1270,9 @@ fn test_copy_object_source_empty_key() {
 
 #[test]
 fn test_object_copy_not_owned_object_bucket() {
-    if !CTX.has_alt_client() {
-        eprintln!(
-            "skipping test_object_copy_not_owned_object_bucket: alternate credentials are not configured"
-        );
-        return;
-    }
     s3_tests::run(async {
         let client = CTX.client();
         let alt_client = CTX.alt_client();
-        if !ensure_distinct_s3_owners_or_skip(
-            client,
-            alt_client,
-            "test_object_copy_not_owned_object_bucket",
-        )
-        .await
-        {
-            return;
-        }
 
         let bucket = setup_bucket().await;
         set_object_writer_ownership(&bucket).await;
@@ -1428,18 +1398,9 @@ fn test_object_copy_not_owned_object_bucket() {
 
 #[test]
 fn test_object_copy_canned_acl() {
-    if !CTX.has_alt_client() {
-        eprintln!("skipping test_object_copy_canned_acl: alternate credentials are not configured");
-        return;
-    }
     s3_tests::run(async {
         let client = CTX.client();
         let alt_client = CTX.alt_client();
-        if !ensure_distinct_s3_owners_or_skip(client, alt_client, "test_object_copy_canned_acl")
-            .await
-        {
-            return;
-        }
 
         let bucket = setup_bucket().await;
         set_object_writer_ownership(&bucket).await;

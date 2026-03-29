@@ -5,7 +5,7 @@ use aws_sdk_s3::types::{
 };
 use s3_tests::{
     assert_s3_err_code, cleanup_versioned_bucket, copy_source_with_version,
-    delete_objects_with_md5, ensure_distinct_s3_owners_or_skip, err_status, unique_bucket, CTX,
+    delete_objects_with_md5, err_status, unique_bucket, CTX,
 };
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -1612,17 +1612,9 @@ fn test_versioning_bucket_create_suspend() {
 
 #[test]
 fn test_versioned_object_acl() {
-    if !CTX.has_alt_client() {
-        eprintln!("skipping test_versioned_object_acl: alternate credentials are not configured");
-        return;
-    }
     s3_tests::run(async {
         let client = CTX.client();
         let alt_client = CTX.alt_client();
-        if !ensure_distinct_s3_owners_or_skip(client, alt_client, "test_versioned_object_acl").await
-        {
-            return;
-        }
 
         let bucket = setup_versioned_acl_bucket().await;
         let key = "xyz";
@@ -1710,24 +1702,9 @@ fn test_versioned_object_acl() {
 
 #[test]
 fn test_versioned_object_acl_no_version_specified() {
-    if !CTX.has_alt_client() {
-        eprintln!(
-            "skipping test_versioned_object_acl_no_version_specified: alternate credentials are not configured"
-        );
-        return;
-    }
     s3_tests::run(async {
         let client = CTX.client();
         let alt_client = CTX.alt_client();
-        if !ensure_distinct_s3_owners_or_skip(
-            client,
-            alt_client,
-            "test_versioned_object_acl_no_version_specified",
-        )
-        .await
-        {
-            return;
-        }
 
         let bucket = setup_versioned_acl_bucket().await;
         let key = "xyz";

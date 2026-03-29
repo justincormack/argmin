@@ -16,16 +16,19 @@ const TEST_SSE_C_KEY_BYTES: [u8; 32] = *b"abcdefghijklmnopqrstuvwxyzABCDEF";
 
 /// Bucket name prefix, configurable via `S3_TEST_BUCKET_PREFIX`.
 /// Defaults to `"test"`.
-static BUCKET_PREFIX: LazyLock<String> =
-    LazyLock::new(|| std::env::var("S3_TEST_BUCKET_PREFIX").unwrap_or_else(|_| "test".to_string()));
+static BUCKET_PREFIX: LazyLock<String> = LazyLock::new(|| {
+    if std::env::var("S3_TEST_ENDPOINT").is_ok() {
+        std::env::var("S3_TEST_BUCKET_PREFIX").expect(
+            "S3_TEST_BUCKET_PREFIX required with S3_TEST_ENDPOINT; use a dedicated prefix such as claude-s3- that matches the test IAM policy",
+        )
+    } else {
+        std::env::var("S3_TEST_BUCKET_PREFIX").unwrap_or_else(|_| "test".to_string())
+    }
+});
 
 /// Return the bucket prefix (from `S3_TEST_BUCKET_PREFIX` or `"test"`).
 pub fn bucket_prefix() -> &'static str {
     &BUCKET_PREFIX
-}
-
-fn is_external_endpoint() -> bool {
-    std::env::var("S3_TEST_ENDPOINT").is_ok()
 }
 
 /// Fixed 32-byte customer key for SSE-C integration tests.
@@ -50,6 +53,28 @@ pub fn unique_bucket() -> String {
     let n = BUCKET_COUNTER.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
     format!("{}-{}-{}-{}", bucket_prefix(), pid, n, timestamp_millis())
+}
+
+/// Configure bucket-level Public Access Block to allow public ACL and policy tests.
+///
+/// This only affects the bucket-level setting. Account-level or org-level block
+/// public access can still override this configuration.
+pub async fn disable_bucket_public_access_block(client: &Client, bucket: &str) {
+    use aws_sdk_s3::types::PublicAccessBlockConfiguration;
+
+    let pab = PublicAccessBlockConfiguration::builder()
+        .block_public_acls(false)
+        .ignore_public_acls(false)
+        .block_public_policy(false)
+        .restrict_public_buckets(false)
+        .build();
+    client
+        .put_public_access_block()
+        .bucket(bucket)
+        .public_access_block_configuration(pab)
+        .send()
+        .await
+        .expect("disable bucket public access block");
 }
 
 fn timestamp_millis() -> u64 {
@@ -121,9 +146,7 @@ pub async fn create_objects_with_keys(client: &Client, keys: &[&str]) -> (String
 /// account-level BlockPublicAccess (if enabled) can still override
 /// bucket-level settings and cause these calls to fail.
 pub async fn create_public_bucket(client: &Client) -> String {
-    use aws_sdk_s3::types::{
-        BucketCannedAcl, ObjectOwnership, OwnershipControlsRule, PublicAccessBlockConfiguration,
-    };
+    use aws_sdk_s3::types::{BucketCannedAcl, ObjectOwnership, OwnershipControlsRule};
 
     let bucket = unique_bucket();
 
@@ -136,19 +159,7 @@ pub async fn create_public_bucket(client: &Client) -> String {
         .expect("create bucket");
 
     // 2. Disable BlockPublicAccess on this bucket
-    let pab = PublicAccessBlockConfiguration::builder()
-        .block_public_acls(false)
-        .ignore_public_acls(false)
-        .block_public_policy(false)
-        .restrict_public_buckets(false)
-        .build();
-    client
-        .put_public_access_block()
-        .bucket(&bucket)
-        .public_access_block_configuration(pab)
-        .send()
-        .await
-        .expect("disable public access block");
+    disable_bucket_public_access_block(client, &bucket).await;
 
     // 3. Set ownership to BucketOwnerPreferred (required to use canned ACLs)
     let ownership_rule = OwnershipControlsRule::builder()
@@ -184,9 +195,7 @@ pub async fn create_public_bucket(client: &Client) -> String {
 /// Disables bucket-level BlockPublicAccess, sets ObjectOwnership to
 /// BucketOwnerPreferred, then applies the public-read-write ACL.
 pub async fn create_public_write_bucket(client: &Client) -> String {
-    use aws_sdk_s3::types::{
-        BucketCannedAcl, ObjectOwnership, OwnershipControlsRule, PublicAccessBlockConfiguration,
-    };
+    use aws_sdk_s3::types::{BucketCannedAcl, ObjectOwnership, OwnershipControlsRule};
 
     let bucket = unique_bucket();
 
@@ -197,19 +206,7 @@ pub async fn create_public_write_bucket(client: &Client) -> String {
         .await
         .expect("create bucket");
 
-    let pab = PublicAccessBlockConfiguration::builder()
-        .block_public_acls(false)
-        .ignore_public_acls(false)
-        .block_public_policy(false)
-        .restrict_public_buckets(false)
-        .build();
-    client
-        .put_public_access_block()
-        .bucket(&bucket)
-        .public_access_block_configuration(pab)
-        .send()
-        .await
-        .expect("disable public access block");
+    disable_bucket_public_access_block(client, &bucket).await;
 
     let ownership_rule = OwnershipControlsRule::builder()
         .object_ownership(ObjectOwnership::BucketOwnerPreferred)
@@ -401,80 +398,4 @@ pub fn err_status<T, E: std::fmt::Debug>(
             .map(|r| r.status().as_u16())
             .unwrap_or_else(|| panic!("error has no raw HTTP response: {:?}", sdk_err)),
     }
-}
-
-/// For external endpoints, verify that two authenticated clients resolve to
-/// distinct S3 canonical owners before running cross-owner tests.
-///
-/// AWS S3 ownership is account-scoped, so two IAM users in the same account do
-/// not behave as distinct object owners. This helper creates one short-lived
-/// probe bucket per client, compares the `GetBucketAcl` owner IDs, and skips
-/// the caller's test when they are the same.
-pub async fn ensure_distinct_s3_owners_or_skip(
-    client: &Client,
-    alt_client: &Client,
-    test_name: &str,
-) -> bool {
-    if !is_external_endpoint() {
-        return true;
-    }
-
-    let primary_bucket = unique_bucket();
-    client
-        .create_bucket()
-        .bucket(&primary_bucket)
-        .send()
-        .await
-        .expect("create primary probe bucket");
-
-    let alt_bucket = unique_bucket();
-    if let Err(err) = alt_client.create_bucket().bucket(&alt_bucket).send().await {
-        client
-            .delete_bucket()
-            .bucket(&primary_bucket)
-            .send()
-            .await
-            .expect("delete primary probe bucket after alternate create failure");
-        panic!("create alternate probe bucket: {err:?}");
-    }
-
-    let primary_acl = client.get_bucket_acl().bucket(&primary_bucket).send().await;
-    let alt_acl = alt_client.get_bucket_acl().bucket(&alt_bucket).send().await;
-
-    client
-        .delete_bucket()
-        .bucket(&primary_bucket)
-        .send()
-        .await
-        .expect("delete primary probe bucket");
-    alt_client
-        .delete_bucket()
-        .bucket(&alt_bucket)
-        .send()
-        .await
-        .expect("delete alternate probe bucket");
-
-    let primary_owner_id = primary_acl
-        .expect("get primary probe bucket ACL")
-        .owner()
-        .expect("expected owner in primary probe GetBucketAcl")
-        .id()
-        .expect("expected owner ID in primary probe GetBucketAcl")
-        .to_string();
-    let alt_owner_id = alt_acl
-        .expect("get alternate probe bucket ACL")
-        .owner()
-        .expect("expected owner in alternate probe GetBucketAcl")
-        .id()
-        .expect("expected owner ID in alternate probe GetBucketAcl")
-        .to_string();
-
-    if primary_owner_id == alt_owner_id {
-        eprintln!(
-            "skipping {test_name}: S3_TEST_ALT_ACCESS_KEY/S3_TEST_ALT_SECRET_KEY resolve to the same S3 canonical owner ID as the primary credentials; use alternate credentials from a different AWS account"
-        );
-        return false;
-    }
-
-    true
 }

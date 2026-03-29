@@ -5,9 +5,7 @@ use aws_sdk_s3::types::{
 };
 use aws_sdk_s3::Client;
 use ring::{digest, hmac};
-use s3_tests::{
-    assert_s3_err_code, ensure_distinct_s3_owners_or_skip, err_status, unique_bucket, CTX,
-};
+use s3_tests::{assert_s3_err_code, err_status, unique_bucket, CTX};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Create a bucket, returning its name. Tests are responsible for cleanup.
@@ -84,12 +82,9 @@ fn has_grant(
     })
 }
 
-async fn run_object_header_acl_grants_case(test_name: &str, key: &str, body: Vec<u8>) {
+async fn run_object_header_acl_grants_case(key: &str, body: Vec<u8>) {
     let client = CTX.client();
     let alt_client = CTX.alt_client();
-    if !ensure_distinct_s3_owners_or_skip(client, alt_client, test_name).await {
-        return;
-    }
 
     let bucket = setup_bucket().await;
     set_object_writer_ownership(&bucket).await;
@@ -209,16 +204,6 @@ async fn run_object_header_acl_grants_case(test_name: &str, key: &str, body: Vec
         .await
         .unwrap();
     client.delete_bucket().bucket(&bucket).send().await.unwrap();
-}
-
-fn primary_account_id_or_skip(test_name: &str) -> Option<String> {
-    match CTX.account_id() {
-        Some(account_id) => Some(account_id.to_string()),
-        None => {
-            eprintln!("skipping {test_name}: S3_TEST_ACCOUNT_ID is not configured");
-            None
-        }
-    }
 }
 
 fn agent() -> ureq::Agent {
@@ -377,10 +362,7 @@ fn test_object_write_file() {
 #[test]
 fn test_get_object_expected_bucket_owner() {
     s3_tests::run(async {
-        let Some(account_id) = primary_account_id_or_skip("test_get_object_expected_bucket_owner")
-        else {
-            return;
-        };
+        let account_id = CTX.account_id().to_string();
         let client = CTX.client();
         let bucket = setup_bucket().await;
         let body = b"hello expected owner";
@@ -1708,37 +1690,15 @@ fn test_object_content_encoding_aws_chunked() {
 
 #[test]
 fn test_object_header_acl_grants() {
-    if !CTX.has_alt_client() {
-        eprintln!(
-            "skipping test_object_header_acl_grants: alternate credentials are not configured"
-        );
-        return;
-    }
     s3_tests::run(async {
-        run_object_header_acl_grants_case(
-            "test_object_header_acl_grants",
-            "testobj",
-            b"header-acl".to_vec(),
-        )
-        .await;
+        run_object_header_acl_grants_case("testobj", b"header-acl".to_vec()).await;
     });
 }
 
 #[test]
 fn test_object_header_acl_grants_streaming_put() {
-    if !CTX.has_alt_client() {
-        eprintln!(
-            "skipping test_object_header_acl_grants_streaming_put: alternate credentials are not configured"
-        );
-        return;
-    }
     s3_tests::run(async {
         let body = vec![0x5Au8; server_core::coordinator::INTERNAL_SEGMENT_SIZE + 1];
-        run_object_header_acl_grants_case(
-            "test_object_header_acl_grants_streaming_put",
-            "streaming-testobj",
-            body,
-        )
-        .await;
+        run_object_header_acl_grants_case("streaming-testobj", body).await;
     });
 }

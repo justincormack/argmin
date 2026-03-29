@@ -2,10 +2,7 @@ use std::time::{Duration, Instant};
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{ObjectOwnership, Permission, VersioningConfiguration};
-use s3_tests::{
-    assert_s3_err_code, cleanup_versioned_bucket, ensure_distinct_s3_owners_or_skip, err_status,
-    unique_bucket, CTX,
-};
+use s3_tests::{assert_s3_err_code, cleanup_versioned_bucket, err_status, unique_bucket, CTX};
 
 fn assert_canonical_owner_id(id: &str) {
     assert_eq!(
@@ -36,16 +33,6 @@ async fn recreate_bucket_after_delete(client: &aws_sdk_s3::Client, bucket: &str)
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
-        }
-    }
-}
-
-fn primary_account_id_or_skip(test_name: &str) -> Option<String> {
-    match CTX.account_id() {
-        Some(account_id) => Some(account_id.to_string()),
-        None => {
-            eprintln!("skipping {test_name}: S3_TEST_ACCOUNT_ID is not configured");
-            None
         }
     }
 }
@@ -249,9 +236,7 @@ fn test_bucket_head() {
 #[test]
 fn test_bucket_head_expected_owner() {
     s3_tests::run(async {
-        let Some(account_id) = primary_account_id_or_skip("test_bucket_head_expected_owner") else {
-            return;
-        };
+        let account_id = CTX.account_id().to_string();
         let client = CTX.client();
         let bucket = unique_bucket();
         client.create_bucket().bucket(&bucket).send().await.unwrap();
@@ -421,22 +406,7 @@ fn test_bucket_list_objects_nonexistent_bucket() {
 #[test]
 fn test_bucket_list_objects_nonexistent_bucket_alt_client() {
     s3_tests::run(async {
-        if !CTX.has_alt_client() {
-            return;
-        }
-
-        let client = CTX.client();
         let alt_client = CTX.alt_client();
-        if !ensure_distinct_s3_owners_or_skip(
-            client,
-            alt_client,
-            "test_bucket_list_objects_nonexistent_bucket_alt_client",
-        )
-        .await
-        {
-            return;
-        }
-
         let bucket = unique_bucket();
         let result = alt_client.list_objects_v2().bucket(&bucket).send().await;
         assert_eq!(err_status(&result), 404);
@@ -529,22 +499,7 @@ fn test_buckets_list_ctime() {
 fn test_bucket_create_exists_nonowner() {
     s3_tests::run(async {
         let client = CTX.client();
-        if !CTX.has_alt_client() {
-            eprintln!(
-                "skipping test_bucket_create_exists_nonowner: alternate credentials are not configured"
-            );
-            return;
-        }
         let alt_client = CTX.alt_client();
-        if !ensure_distinct_s3_owners_or_skip(
-            client,
-            alt_client,
-            "test_bucket_create_exists_nonowner",
-        )
-        .await
-        {
-            return;
-        }
 
         let bucket = unique_bucket();
         client.create_bucket().bucket(&bucket).send().await.unwrap();
@@ -561,18 +516,7 @@ fn test_bucket_create_exists_nonowner() {
 fn test_bucket_header_acl_grants() {
     s3_tests::run(async {
         let client = CTX.client();
-        if !CTX.has_alt_client() {
-            eprintln!(
-                "skipping test_bucket_header_acl_grants: alternate credentials are not configured"
-            );
-            return;
-        }
         let alt_client = CTX.alt_client();
-        if !ensure_distinct_s3_owners_or_skip(client, alt_client, "test_bucket_header_acl_grants")
-            .await
-        {
-            return;
-        }
 
         let alt_owner_id = canonical_owner_id(alt_client).await;
         assert_canonical_owner_id(&alt_owner_id);

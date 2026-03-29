@@ -206,22 +206,15 @@ S3_TEST_TIMEOUT_SECS=30 \
 cargo test -p s3-tests --no-fail-fast
 ```
 
-`S3_TEST_ALT_ACCESS_KEY` and `S3_TEST_ALT_SECRET_KEY` are optional unless you
-want the multi-user integration cases to run against the external endpoint. If
-they are unset, tests that require a second authenticated user skip
-themselves. If one is set, both must be set.
+External `s3-tests` runs now fail fast if the alternate credentials, account
+IDs, or bucket prefix are missing. For AWS S3, the alternate credentials must
+belong to a different AWS account with a different S3 canonical owner ID. A
+second IAM user in the same AWS account is not sufficient.
 
-`S3_TEST_ACCOUNT_ID` and `S3_TEST_ALT_ACCOUNT_ID` are optional. They are only
-needed for tests that must send a matching `x-amz-expected-bucket-owner` or
-`x-amz-source-expected-bucket-owner` value against an external endpoint. Local
-embedded `s3-tests` runs provide these automatically.
-
-For AWS S3, the alternate credentials must belong to a different AWS account
-with a different S3 canonical owner ID. A second IAM user in the same AWS
-account is not sufficient for cross-owner ownership and ACL tests, because S3
-ownership is account-scoped rather than IAM-user-scoped. If the alternate
-credentials resolve to the same S3 owner, the cross-owner tests skip
-themselves with an explicit message.
+Full AWS environment setup, including the committed IAM policy, required
+account-level S3 Block Public Access settings, and the separate local-only
+`s3-local-tests` crate, is documented in
+[`guides/aws-s3-tests-environment.md`](guides/aws-s3-tests-environment.md).
 
 For local `s3-tests`, the embedded test server also supports trace helpers:
 

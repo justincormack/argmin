@@ -11,6 +11,14 @@ fn endpoint_is_https() -> bool {
     CTX.endpoint().starts_with("https://")
 }
 
+fn require_https_endpoint() {
+    assert!(
+        endpoint_is_https(),
+        "bucket encryption SSE-C coverage requires an https:// endpoint; got {}",
+        CTX.endpoint()
+    );
+}
+
 macro_rules! with_sse_c_headers {
     ($op:expr, $key_b64:expr, $key_md5_b64:expr) => {{
         $op.customize().mutate_request({
@@ -155,9 +163,7 @@ fn test_put_get_bucket_encryption_blocks_and_unblocks_sse_c() {
 
 #[test]
 fn test_bucket_encryption_blocks_sse_c_put_object() {
-    if !endpoint_is_https() {
-        return;
-    }
+    require_https_endpoint();
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
@@ -193,9 +199,7 @@ fn test_bucket_encryption_blocks_sse_c_put_object() {
 
 #[test]
 fn test_bucket_encryption_blocks_sse_c_create_multipart_upload() {
-    if !endpoint_is_https() {
-        return;
-    }
+    require_https_endpoint();
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
@@ -227,9 +231,7 @@ fn test_bucket_encryption_blocks_sse_c_create_multipart_upload() {
 
 #[test]
 fn test_bucket_encryption_does_not_block_existing_sse_c_reads() {
-    if !endpoint_is_https() {
-        return;
-    }
+    require_https_endpoint();
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();

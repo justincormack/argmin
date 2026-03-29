@@ -1,24 +1,43 @@
-use aws_sdk_s3::primitives::ByteStream;
-use s3_tests::{err_status, unique_bucket, CTX};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Returns `true` when running against an external endpoint (e.g. AWS).
-///
-/// Bucket naming tests use hardcoded or short names that can collide in the
-/// global AWS bucket namespace.  They only validate our server's naming logic,
-/// so skip them when the target is a real S3 endpoint.
-fn is_external() -> bool {
-    std::env::var("S3_TEST_ENDPOINT").is_ok()
+use aws_sdk_s3::primitives::ByteStream;
+use s3_tests::{build_client_with_ca, err_status, TestServer, RT};
+
+static BUCKET_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn run_local<F: std::future::Future>(f: F) -> F::Output {
+    RT.block_on(f)
+}
+
+async fn local_client() -> (TestServer, aws_sdk_s3::Client) {
+    let server = TestServer::start().await;
+    let client = build_client_with_ca(
+        server.endpoint(),
+        s3_tests::server::TEST_ACCESS_KEY,
+        s3_tests::server::TEST_SECRET_KEY,
+        s3_tests::server::TEST_REGION,
+        server.tls_ca_pem(),
+    )
+    .await;
+    (server, client)
+}
+
+fn unique_bucket() -> String {
+    let n = BUCKET_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    format!("local-bucket-{pid}-{n}-{timestamp}")
 }
 
 // ── Good names ──────────────────────────────────────────────────────────
 
 #[test]
 fn test_bucket_create_naming_good_starts_alpha() {
-    if is_external() {
-        return;
-    }
-    s3_tests::run(async {
-        let client = CTX.client();
+    run_local(async {
+        let (_server, client) = local_client().await;
         let bucket = format!("abc-{}", unique_bucket());
         client.create_bucket().bucket(&bucket).send().await.unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
@@ -27,11 +46,8 @@ fn test_bucket_create_naming_good_starts_alpha() {
 
 #[test]
 fn test_bucket_create_naming_good_starts_digit() {
-    if is_external() {
-        return;
-    }
-    s3_tests::run(async {
-        let client = CTX.client();
+    run_local(async {
+        let (_server, client) = local_client().await;
         let bucket = format!("3bucket-{}", unique_bucket());
         client.create_bucket().bucket(&bucket).send().await.unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
@@ -40,11 +56,8 @@ fn test_bucket_create_naming_good_starts_digit() {
 
 #[test]
 fn test_bucket_create_naming_good_contains_period() {
-    if is_external() {
-        return;
-    }
-    s3_tests::run(async {
-        let client = CTX.client();
+    run_local(async {
+        let (_server, client) = local_client().await;
         let bucket = format!("foo.bar.{}", unique_bucket());
         client.create_bucket().bucket(&bucket).send().await.unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
@@ -53,11 +66,8 @@ fn test_bucket_create_naming_good_contains_period() {
 
 #[test]
 fn test_bucket_create_naming_good_contains_hyphen() {
-    if is_external() {
-        return;
-    }
-    s3_tests::run(async {
-        let client = CTX.client();
+    run_local(async {
+        let (_server, client) = local_client().await;
         let bucket = format!("foo-bar-{}", unique_bucket());
         client.create_bucket().bucket(&bucket).send().await.unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
@@ -66,12 +76,8 @@ fn test_bucket_create_naming_good_contains_hyphen() {
 
 #[test]
 fn test_bucket_create_naming_good_long_63() {
-    if is_external() {
-        return;
-    }
-    s3_tests::run(async {
-        let client = CTX.client();
-        // 63 chars is the max allowed — pad unique_bucket() to exactly 63
+    run_local(async {
+        let (_server, client) = local_client().await;
         let base = unique_bucket();
         let bucket = if base.len() >= 63 {
             base[..63].to_string()
@@ -86,11 +92,8 @@ fn test_bucket_create_naming_good_long_63() {
 
 #[test]
 fn test_bucket_create_naming_good_three_chars() {
-    if is_external() {
-        return;
-    }
-    s3_tests::run(async {
-        let client = CTX.client();
+    run_local(async {
+        let (_server, client) = local_client().await;
         let bucket = "abc";
         client.create_bucket().bucket(bucket).send().await.unwrap();
         client.delete_bucket().bucket(bucket).send().await.unwrap();
@@ -99,25 +102,18 @@ fn test_bucket_create_naming_good_three_chars() {
 
 #[test]
 fn test_bucket_create_naming_good_all_digits() {
-    if is_external() {
-        return;
-    }
-    s3_tests::run(async {
-        let client = CTX.client();
+    run_local(async {
+        let (_server, client) = local_client().await;
         let bucket = "123456";
         client.create_bucket().bucket(bucket).send().await.unwrap();
         client.delete_bucket().bucket(bucket).send().await.unwrap();
     });
 }
 
-/// Verify that a bucket with periods in the name supports normal operations.
 #[test]
 fn test_bucket_create_naming_good_has_period_put_get() {
-    if is_external() {
-        return;
-    }
-    s3_tests::run(async {
-        let client = CTX.client();
+    run_local(async {
+        let (_server, client) = local_client().await;
         let bucket = format!("a.b.{}", unique_bucket());
         client.create_bucket().bucket(&bucket).send().await.unwrap();
 
@@ -150,14 +146,10 @@ fn test_bucket_create_naming_good_has_period_put_get() {
     });
 }
 
-/// Verify that a bucket with hyphens supports normal operations.
 #[test]
 fn test_bucket_create_naming_good_has_hyphen_put_get() {
-    if is_external() {
-        return;
-    }
-    s3_tests::run(async {
-        let client = CTX.client();
+    run_local(async {
+        let (_server, client) = local_client().await;
         let bucket = format!("a-b-{}", unique_bucket());
         client.create_bucket().bucket(&bucket).send().await.unwrap();
 
@@ -194,11 +186,8 @@ fn test_bucket_create_naming_good_has_hyphen_put_get() {
 
 #[test]
 fn test_bucket_create_naming_bad_short_empty() {
-    if is_external() {
-        return;
-    }
-    s3_tests::run(async {
-        let client = CTX.client();
+    run_local(async {
+        let (_server, client) = local_client().await;
         let result = client.create_bucket().bucket("").send().await;
         assert!(result.is_err());
     });
@@ -206,11 +195,8 @@ fn test_bucket_create_naming_bad_short_empty() {
 
 #[test]
 fn test_bucket_create_naming_bad_short_one() {
-    if is_external() {
-        return;
-    }
-    s3_tests::run(async {
-        let client = CTX.client();
+    run_local(async {
+        let (_server, client) = local_client().await;
         let result = client.create_bucket().bucket("a").send().await;
         assert!(result.is_err());
     });
@@ -218,11 +204,8 @@ fn test_bucket_create_naming_bad_short_one() {
 
 #[test]
 fn test_bucket_create_naming_bad_short_two() {
-    if is_external() {
-        return;
-    }
-    s3_tests::run(async {
-        let client = CTX.client();
+    run_local(async {
+        let (_server, client) = local_client().await;
         let result = client.create_bucket().bucket("ab").send().await;
         assert!(result.is_err());
     });
@@ -230,12 +213,8 @@ fn test_bucket_create_naming_bad_short_two() {
 
 #[test]
 fn test_bucket_create_naming_dns_long() {
-    if is_external() {
-        return;
-    }
-    s3_tests::run(async {
-        let client = CTX.client();
-        // 64 chars exceeds the limit
+    run_local(async {
+        let (_server, client) = local_client().await;
         let bucket = "a".repeat(64);
         let result = client.create_bucket().bucket(&bucket).send().await;
         assert!(result.is_err());
@@ -244,11 +223,8 @@ fn test_bucket_create_naming_dns_long() {
 
 #[test]
 fn test_bucket_create_naming_bad_long_256() {
-    if is_external() {
-        return;
-    }
-    s3_tests::run(async {
-        let client = CTX.client();
+    run_local(async {
+        let (_server, client) = local_client().await;
         let bucket = "a".repeat(256);
         let result = client.create_bucket().bucket(&bucket).send().await;
         assert!(result.is_err());
@@ -259,11 +235,8 @@ fn test_bucket_create_naming_bad_long_256() {
 
 #[test]
 fn test_bucket_create_naming_bad_starts_dash() {
-    if is_external() {
-        return;
-    }
-    s3_tests::run(async {
-        let client = CTX.client();
+    run_local(async {
+        let (_server, client) = local_client().await;
         let result = client.create_bucket().bucket("-bucket").send().await;
         assert!(result.is_err());
     });
@@ -271,11 +244,8 @@ fn test_bucket_create_naming_bad_starts_dash() {
 
 #[test]
 fn test_bucket_create_naming_dns_dash_at_end() {
-    if is_external() {
-        return;
-    }
-    s3_tests::run(async {
-        let client = CTX.client();
+    run_local(async {
+        let (_server, client) = local_client().await;
         let result = client.create_bucket().bucket("foo-").send().await;
         assert_eq!(err_status(&result), 400);
     });
@@ -283,11 +253,8 @@ fn test_bucket_create_naming_dns_dash_at_end() {
 
 #[test]
 fn test_bucket_create_naming_bad_starts_dot() {
-    if is_external() {
-        return;
-    }
-    s3_tests::run(async {
-        let client = CTX.client();
+    run_local(async {
+        let (_server, client) = local_client().await;
         let result = client.create_bucket().bucket(".bucket").send().await;
         assert!(result.is_err());
     });
@@ -295,11 +262,8 @@ fn test_bucket_create_naming_bad_starts_dot() {
 
 #[test]
 fn test_bucket_create_naming_bad_ends_dot() {
-    if is_external() {
-        return;
-    }
-    s3_tests::run(async {
-        let client = CTX.client();
+    run_local(async {
+        let (_server, client) = local_client().await;
         let result = client.create_bucket().bucket("bucket.").send().await;
         assert!(result.is_err());
     });
@@ -309,11 +273,8 @@ fn test_bucket_create_naming_bad_ends_dot() {
 
 #[test]
 fn test_bucket_create_naming_bad_uppercase() {
-    if is_external() {
-        return;
-    }
-    s3_tests::run(async {
-        let client = CTX.client();
+    run_local(async {
+        let (_server, client) = local_client().await;
         let result = client.create_bucket().bucket("MyBucket").send().await;
         assert!(result.is_err());
     });
@@ -321,11 +282,8 @@ fn test_bucket_create_naming_bad_uppercase() {
 
 #[test]
 fn test_bucket_create_naming_dns_underscore() {
-    if is_external() {
-        return;
-    }
-    s3_tests::run(async {
-        let client = CTX.client();
+    run_local(async {
+        let (_server, client) = local_client().await;
         let result = client.create_bucket().bucket("foo_bar").send().await;
         assert_eq!(err_status(&result), 400);
     });
@@ -333,11 +291,8 @@ fn test_bucket_create_naming_dns_underscore() {
 
 #[test]
 fn test_bucket_create_naming_bad_special_at() {
-    if is_external() {
-        return;
-    }
-    s3_tests::run(async {
-        let client = CTX.client();
+    run_local(async {
+        let (_server, client) = local_client().await;
         let result = client.create_bucket().bucket("foo@bar").send().await;
         assert!(result.is_err());
     });
@@ -345,11 +300,8 @@ fn test_bucket_create_naming_bad_special_at() {
 
 #[test]
 fn test_bucket_create_naming_bad_special_hash() {
-    if is_external() {
-        return;
-    }
-    s3_tests::run(async {
-        let client = CTX.client();
+    run_local(async {
+        let (_server, client) = local_client().await;
         let result = client.create_bucket().bucket("foo#bar").send().await;
         assert!(result.is_err());
     });
@@ -357,11 +309,8 @@ fn test_bucket_create_naming_bad_special_hash() {
 
 #[test]
 fn test_bucket_create_naming_bad_space() {
-    if is_external() {
-        return;
-    }
-    s3_tests::run(async {
-        let client = CTX.client();
+    run_local(async {
+        let (_server, client) = local_client().await;
         let result = client.create_bucket().bucket("foo bar").send().await;
         assert!(result.is_err());
     });
@@ -371,11 +320,8 @@ fn test_bucket_create_naming_bad_space() {
 
 #[test]
 fn test_bucket_create_naming_dns_dot_dot() {
-    if is_external() {
-        return;
-    }
-    s3_tests::run(async {
-        let client = CTX.client();
+    run_local(async {
+        let (_server, client) = local_client().await;
         let result = client.create_bucket().bucket("foo..bar").send().await;
         assert_eq!(err_status(&result), 400);
     });
@@ -383,11 +329,8 @@ fn test_bucket_create_naming_dns_dot_dot() {
 
 #[test]
 fn test_bucket_create_naming_dns_dot_dash() {
-    if is_external() {
-        return;
-    }
-    s3_tests::run(async {
-        let client = CTX.client();
+    run_local(async {
+        let (_server, client) = local_client().await;
         let result = client.create_bucket().bucket("foo.-bar").send().await;
         assert_eq!(err_status(&result), 400);
     });
@@ -395,11 +338,8 @@ fn test_bucket_create_naming_dns_dot_dash() {
 
 #[test]
 fn test_bucket_create_naming_dns_dash_dot() {
-    if is_external() {
-        return;
-    }
-    s3_tests::run(async {
-        let client = CTX.client();
+    run_local(async {
+        let (_server, client) = local_client().await;
         let result = client.create_bucket().bucket("foo-.bar").send().await;
         assert_eq!(err_status(&result), 400);
     });
@@ -409,11 +349,8 @@ fn test_bucket_create_naming_dns_dash_dot() {
 
 #[test]
 fn test_bucket_create_naming_bad_ip() {
-    if is_external() {
-        return;
-    }
-    s3_tests::run(async {
-        let client = CTX.client();
+    run_local(async {
+        let (_server, client) = local_client().await;
         let result = client.create_bucket().bucket("192.168.5.123").send().await;
         assert!(result.is_err());
     });
@@ -421,11 +358,8 @@ fn test_bucket_create_naming_bad_ip() {
 
 #[test]
 fn test_bucket_create_naming_bad_xn_prefix() {
-    if is_external() {
-        return;
-    }
-    s3_tests::run(async {
-        let client = CTX.client();
+    run_local(async {
+        let (_server, client) = local_client().await;
         let result = client.create_bucket().bucket("xn--bucket").send().await;
         assert!(result.is_err());
     });
@@ -435,11 +369,8 @@ fn test_bucket_create_naming_bad_xn_prefix() {
 
 #[test]
 fn test_bucket_create_naming_good_long_60() {
-    if is_external() {
-        return;
-    }
-    s3_tests::run(async {
-        let client = CTX.client();
+    run_local(async {
+        let (_server, client) = local_client().await;
         let base = unique_bucket();
         let bucket = if base.len() >= 60 {
             base[..60].to_string()
@@ -454,11 +385,8 @@ fn test_bucket_create_naming_good_long_60() {
 
 #[test]
 fn test_bucket_create_naming_good_long_61() {
-    if is_external() {
-        return;
-    }
-    s3_tests::run(async {
-        let client = CTX.client();
+    run_local(async {
+        let (_server, client) = local_client().await;
         let base = unique_bucket();
         let bucket = if base.len() >= 61 {
             base[..61].to_string()
@@ -473,11 +401,8 @@ fn test_bucket_create_naming_good_long_61() {
 
 #[test]
 fn test_bucket_create_naming_good_long_62() {
-    if is_external() {
-        return;
-    }
-    s3_tests::run(async {
-        let client = CTX.client();
+    run_local(async {
+        let (_server, client) = local_client().await;
         let base = unique_bucket();
         let bucket = if base.len() >= 62 {
             base[..62].to_string()
@@ -494,11 +419,8 @@ fn test_bucket_create_naming_good_long_62() {
 
 #[test]
 fn test_bucket_create_naming_bad_starts_nonalpha() {
-    if is_external() {
-        return;
-    }
-    s3_tests::run(async {
-        let client = CTX.client();
+    run_local(async {
+        let (_server, client) = local_client().await;
         let result = client.create_bucket().bucket("!bucket").send().await;
         assert!(result.is_err());
     });

@@ -1,0 +1,9 @@
+[package]
+name = "s3-local-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+s3-tests = { path = "../s3-tests" }
+aws-sdk-s3 = "1"
