@@ -7,6 +7,10 @@ use s3_tests::{
     assert_s3_err_code, cleanup_versioned_bucket, create_public_bucket, err_status, unique_bucket,
     CTX,
 };
+use serde_json::json;
+use std::sync::{LazyLock, Mutex};
+
+static BUCKET_POLICY_TEST_GUARD: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 /// Cleanup helper.
 async fn cleanup(bucket: &str, keys: &[&str]) {
@@ -23,6 +27,41 @@ fn tag(key: &str, value: &str) -> Tag {
 
 fn tagging(tags: Vec<Tag>) -> Tagging {
     Tagging::builder().set_tag_set(Some(tags)).build().unwrap()
+}
+
+fn object_resource(bucket: &str, key: &str) -> String {
+    format!("arn:aws:s3:::{bucket}/{key}")
+}
+
+fn bucket_wildcard_resource(bucket: &str) -> String {
+    format!("arn:aws:s3:::{bucket}/*")
+}
+
+fn alt_policy_principal() -> Option<serde_json::Value> {
+    CTX.alt_account_id()
+        .map(|account_id| json!({ "AWS": format!("arn:aws:iam::{account_id}:root") }))
+}
+
+fn bucket_policy_document(
+    principal: serde_json::Value,
+    action: &str,
+    resource: String,
+    conditions: Option<serde_json::Value>,
+) -> String {
+    let mut statement = json!({
+        "Effect": "Allow",
+        "Principal": principal,
+        "Action": action,
+        "Resource": resource,
+    });
+    if let Some(conditions) = conditions {
+        statement["Condition"] = conditions;
+    }
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [statement],
+    })
+    .to_string()
 }
 
 // ── Bucket tagging ──────────────────────────────────────────────────────
@@ -1606,65 +1645,526 @@ fn test_set_multipart_tagging() {
 // ── Bucket policy tagging access control ──────────────────────────────
 
 #[test]
-#[ignore = "not implemented: bucket policies"]
 fn test_get_tags_acl_public() {
+    let _guard = BUCKET_POLICY_TEST_GUARD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     s3_tests::run(async {
-        let _client = CTX.client();
-        // Bucket policy allows public GetObjectTagging; alt client reads tags.
-        todo!("bucket policy for GetObjectTagging");
+        if !CTX.has_alt_client() {
+            return;
+        }
+        let Some(principal) = alt_policy_principal() else {
+            return;
+        };
+
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = unique_bucket();
+        let key = "testputtagsacl";
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+
+        let policy = bucket_policy_document(
+            principal,
+            "s3:GetObjectTagging",
+            object_resource(&bucket, key),
+            None,
+        );
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        let input_tags = tagging(
+            (0..10)
+                .map(|i| tag(&format!("{i}"), &format!("{i}")))
+                .collect(),
+        );
+        client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key(key)
+            .tagging(input_tags.clone())
+            .send()
+            .await
+            .unwrap();
+
+        let response = alt_client
+            .get_object_tagging()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.tag_set(), input_tags.tag_set());
+
+        cleanup(&bucket, &[key]).await;
     });
 }
 
 #[test]
-#[ignore = "not implemented: bucket policies"]
 fn test_put_tags_acl_public() {
+    let _guard = BUCKET_POLICY_TEST_GUARD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     s3_tests::run(async {
-        let _client = CTX.client();
-        // Bucket policy allows public PutObjectTagging; alt client writes tags.
-        todo!("bucket policy for PutObjectTagging");
+        if !CTX.has_alt_client() {
+            return;
+        }
+        let Some(principal) = alt_policy_principal() else {
+            return;
+        };
+
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = unique_bucket();
+        let key = "testputtagsacl";
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+
+        let policy = bucket_policy_document(
+            principal,
+            "s3:PutObjectTagging",
+            object_resource(&bucket, key),
+            None,
+        );
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        let input_tags = tagging(
+            (0..10)
+                .map(|i| tag(&format!("{i}"), &format!("{i}")))
+                .collect(),
+        );
+        alt_client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key(key)
+            .tagging(input_tags.clone())
+            .send()
+            .await
+            .unwrap();
+
+        let response = client
+            .get_object_tagging()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.tag_set(), input_tags.tag_set());
+
+        cleanup(&bucket, &[key]).await;
     });
 }
 
 #[test]
-#[ignore = "not implemented: bucket policies"]
 fn test_delete_tags_obj_public() {
+    let _guard = BUCKET_POLICY_TEST_GUARD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     s3_tests::run(async {
-        let _client = CTX.client();
-        // Bucket policy allows public DeleteObjectTagging; alt client deletes tags.
-        todo!("bucket policy for DeleteObjectTagging");
+        if !CTX.has_alt_client() {
+            return;
+        }
+        let Some(principal) = alt_policy_principal() else {
+            return;
+        };
+
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = unique_bucket();
+        let key = "testputtagsacl";
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+
+        let policy = bucket_policy_document(
+            principal,
+            "s3:DeleteObjectTagging",
+            object_resource(&bucket, key),
+            None,
+        );
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key(key)
+            .tagging(tagging(
+                (0..10)
+                    .map(|i| tag(&format!("{i}"), &format!("{i}")))
+                    .collect(),
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        alt_client
+            .delete_object_tagging()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+
+        let response = client
+            .get_object_tagging()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert!(response.tag_set().is_empty());
+
+        cleanup(&bucket, &[key]).await;
     });
 }
 
 #[test]
-#[ignore = "not implemented: bucket policies"]
 fn test_bucket_policy_get_obj_existing_tag() {
+    let _guard = BUCKET_POLICY_TEST_GUARD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     s3_tests::run(async {
-        let _client = CTX.client();
-        // Conditional policy: s3:ExistingObjectTag/security=public restricts GetObject.
-        // Object with matching tag accessible, others denied (403).
-        todo!("conditional bucket policy ExistingObjectTag for GetObject");
+        if !CTX.has_alt_client() {
+            return;
+        }
+        let Some(principal) = alt_policy_principal() else {
+            return;
+        };
+
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        for key in ["publictag", "privatetag", "invalidtag"] {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from(key.as_bytes().to_vec()))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        let policy = bucket_policy_document(
+            principal,
+            "s3:GetObject",
+            bucket_wildcard_resource(&bucket),
+            Some(json!({
+                "StringEquals": {
+                    "s3:ExistingObjectTag/security": "public"
+                }
+            })),
+        );
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key("publictag")
+            .tagging(tagging(vec![tag("security", "public"), tag("foo", "bar")]))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key("privatetag")
+            .tagging(tagging(vec![tag("security", "private")]))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key("invalidtag")
+            .tagging(tagging(vec![tag("security1", "public")]))
+            .send()
+            .await
+            .unwrap();
+
+        let response = alt_client
+            .get_object()
+            .bucket(&bucket)
+            .key("publictag")
+            .send()
+            .await
+            .unwrap();
+        let body = response.body.collect().await.unwrap().into_bytes();
+        assert_eq!(body.as_ref(), b"publictag");
+
+        for key in ["privatetag", "invalidtag"] {
+            let result = alt_client
+                .get_object()
+                .bucket(&bucket)
+                .key(key)
+                .send()
+                .await;
+            assert_eq!(err_status(&result), 403);
+            assert_s3_err_code(&result, "AccessDenied");
+        }
+
+        cleanup(&bucket, &["publictag", "privatetag", "invalidtag"]).await;
     });
 }
 
 #[test]
-#[ignore = "not implemented: bucket policies"]
 fn test_bucket_policy_get_obj_tagging_existing_tag() {
+    let _guard = BUCKET_POLICY_TEST_GUARD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     s3_tests::run(async {
-        let _client = CTX.client();
-        // Conditional policy: s3:ExistingObjectTag/security=public restricts GetObjectTagging.
-        // Alt client can read tags only on objects with matching tag.
-        todo!("conditional bucket policy ExistingObjectTag for GetObjectTagging");
+        if !CTX.has_alt_client() {
+            return;
+        }
+        let Some(principal) = alt_policy_principal() else {
+            return;
+        };
+
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        for key in ["publictag", "privatetag", "invalidtag"] {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from(key.as_bytes().to_vec()))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        let policy = bucket_policy_document(
+            principal,
+            "s3:GetObjectTagging",
+            bucket_wildcard_resource(&bucket),
+            Some(json!({
+                "StringEquals": {
+                    "s3:ExistingObjectTag/security": "public"
+                }
+            })),
+        );
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key("publictag")
+            .tagging(tagging(vec![tag("security", "public"), tag("foo", "bar")]))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key("privatetag")
+            .tagging(tagging(vec![tag("security", "private")]))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key("invalidtag")
+            .tagging(tagging(vec![tag("security1", "public")]))
+            .send()
+            .await
+            .unwrap();
+
+        let response = alt_client
+            .get_object_tagging()
+            .bucket(&bucket)
+            .key("publictag")
+            .send()
+            .await
+            .unwrap();
+        assert!(response
+            .tag_set()
+            .iter()
+            .any(|tag| tag.key() == "security" && tag.value() == "public"));
+
+        let get_object = alt_client
+            .get_object()
+            .bucket(&bucket)
+            .key("publictag")
+            .send()
+            .await;
+        assert_eq!(err_status(&get_object), 403);
+        assert_s3_err_code(&get_object, "AccessDenied");
+
+        for key in ["privatetag", "invalidtag"] {
+            let result = alt_client
+                .get_object_tagging()
+                .bucket(&bucket)
+                .key(key)
+                .send()
+                .await;
+            assert_eq!(err_status(&result), 403);
+            assert_s3_err_code(&result, "AccessDenied");
+        }
+
+        cleanup(&bucket, &["publictag", "privatetag", "invalidtag"]).await;
     });
 }
 
 #[test]
-#[ignore = "not implemented: bucket policies"]
 fn test_bucket_policy_put_obj_tagging_existing_tag() {
+    let _guard = BUCKET_POLICY_TEST_GUARD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     s3_tests::run(async {
-        let _client = CTX.client();
-        // Conditional policy: s3:ExistingObjectTag/security=public restricts PutObjectTagging.
-        // Alt client can set tags only on objects with matching existing tag.
-        todo!("conditional bucket policy ExistingObjectTag for PutObjectTagging");
+        if !CTX.has_alt_client() {
+            return;
+        }
+        let Some(principal) = alt_policy_principal() else {
+            return;
+        };
+
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        for key in ["publictag", "privatetag"] {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from(key.as_bytes().to_vec()))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        let policy = bucket_policy_document(
+            principal,
+            "s3:PutObjectTagging",
+            bucket_wildcard_resource(&bucket),
+            Some(json!({
+                "StringEquals": {
+                    "s3:ExistingObjectTag/security": "public"
+                }
+            })),
+        );
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key("publictag")
+            .tagging(tagging(vec![tag("security", "public"), tag("foo", "bar")]))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key("privatetag")
+            .tagging(tagging(vec![tag("security", "private")]))
+            .send()
+            .await
+            .unwrap();
+
+        let public_tags = tagging(vec![tag("security", "public"), tag("foo", "bar")]);
+        alt_client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key("publictag")
+            .tagging(public_tags.clone())
+            .send()
+            .await
+            .unwrap();
+
+        let private_result = alt_client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key("privatetag")
+            .tagging(public_tags.clone())
+            .send()
+            .await;
+        assert_eq!(err_status(&private_result), 403);
+        assert_s3_err_code(&private_result, "AccessDenied");
+
+        let private_tags = tagging(vec![tag("security", "private")]);
+        alt_client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key("publictag")
+            .tagging(private_tags)
+            .send()
+            .await
+            .unwrap();
+
+        let second_result = alt_client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key("publictag")
+            .tagging(public_tags)
+            .send()
+            .await;
+        assert_eq!(err_status(&second_result), 403);
+        assert_s3_err_code(&second_result, "AccessDenied");
+
+        cleanup(&bucket, &["publictag", "privatetag"]).await;
     });
 }
 

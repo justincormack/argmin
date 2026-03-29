@@ -249,12 +249,33 @@ Notes:
 
 ### Phase 3: Core Evaluation For Public Object And Tagging Access
 
+Status:
+- completed
+
 Deliver:
 - policy evaluation for object reads and tagging APIs
 - condition support for `s3:ExistingObjectTag`
 
 Success criteria:
 - the current tagging policy tests can be unignored
+
+Notes:
+- request-time evaluation now lives in the shared `auth` policy layer with
+  explicit deny / explicit allow / no-match outcomes
+- Phase 3 currently covers `s3:GetObject`,
+  `s3:GetObject{Version,VersionTagging,Tagging}`,
+  `s3:PutObject{VersionTagging,Tagging}`, and
+  `s3:DeleteObject{VersionTagging,Tagging}` for object reads and tagging APIs
+- `s3:ExistingObjectTag/<key>` currently supports `StringEquals`
+- policies that use other condition operators or condition keys on those
+  currently-enforced object/tagging actions are rejected at `PutBucketPolicy`
+  time, and unsupported `Deny` conditions are still treated conservatively at
+  request time
+- raw bucket policy still stays out of `BucketFastPathInfo`; coordinator policy
+  evaluation uses a separate parsed-policy cache keyed by a shared bucket policy
+  generation so replacements invalidate correctly across coordinators
+- explicit AWS root-account principals are matched in a way that keeps the same
+  test policies usable against both the local test server and AWS
 
 ### Phase 4: Copy And ACL-Condition Evaluation
 
@@ -282,12 +303,12 @@ Targeted integration tests:
 - `cargo test -p s3-tests --test public_access_block test_block_public_policy_with_principal -- --ignored`
 - `cargo test -p s3-tests --test public_access_block test_block_public_restrict_public_buckets -- --ignored`
 - `cargo test -p s3-tests --test public_access_block test_get_public_block_deny_bucket_policy -- --ignored`
-- `cargo test -p s3-tests --test tagging test_get_tags_acl_public -- --ignored`
-- `cargo test -p s3-tests --test tagging test_put_tags_acl_public -- --ignored`
-- `cargo test -p s3-tests --test tagging test_delete_tags_obj_public -- --ignored`
-- `cargo test -p s3-tests --test tagging test_bucket_policy_get_obj_existing_tag -- --ignored`
-- `cargo test -p s3-tests --test tagging test_bucket_policy_get_obj_tagging_existing_tag -- --ignored`
-- `cargo test -p s3-tests --test tagging test_bucket_policy_put_obj_tagging_existing_tag -- --ignored`
+- `cargo test -p s3-tests --test tagging test_get_tags_acl_public -- --exact --nocapture`
+- `cargo test -p s3-tests --test tagging test_put_tags_acl_public -- --exact --nocapture`
+- `cargo test -p s3-tests --test tagging test_delete_tags_obj_public -- --exact --nocapture`
+- `cargo test -p s3-tests --test tagging test_bucket_policy_get_obj_existing_tag -- --exact --nocapture`
+- `cargo test -p s3-tests --test tagging test_bucket_policy_get_obj_tagging_existing_tag -- --exact --nocapture`
+- `cargo test -p s3-tests --test tagging test_bucket_policy_put_obj_tagging_existing_tag -- --exact --nocapture`
 - `cargo test -p s3-tests --test tagging test_bucket_policy_put_obj_copy_source -- --ignored`
 - `cargo test -p s3-tests --test tagging test_bucket_policy_put_obj_copy_source_meta -- --ignored`
 - `cargo test -p s3-tests --test tagging test_bucket_policy_put_obj_acl -- --ignored`

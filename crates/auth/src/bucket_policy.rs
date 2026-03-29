@@ -1,3 +1,4 @@
+use s3_types::CanonicalUserId;
 use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +24,174 @@ impl BucketPolicy {
             .iter()
             .any(PolicyStatement::allows_public_access)
     }
+
+    #[must_use]
+    pub fn requires_existing_object_tags_for_action(&self, action: PolicyAction) -> bool {
+        let action = action.as_str();
+        self.statements.iter().any(|statement| {
+            statement.matches_action(action) && statement.references_existing_object_tag_condition()
+        })
+    }
+
+    pub fn validate_evaluable_object_conditions(&self) -> Result<(), BucketPolicyError> {
+        for statement in &self.statements {
+            if statement.references_evaluable_object_action()
+                && !statement.conditions_supported_for_evaluable_object_actions()
+            {
+                return Err(BucketPolicyError::Malformed {
+                    reason:
+                        "unsupported Condition for currently enforced object/tagging bucket policy action",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn evaluate(&self, request: &PolicyRequest<'_>) -> PolicyEvaluation {
+        let action = request.action.as_str();
+        let resource = request.object_resource_arn();
+        let mut saw_allow = false;
+
+        for statement in &self.statements {
+            let Some(effect) = statement.request_effect(request, action, &resource) else {
+                continue;
+            };
+
+            match effect {
+                PolicyEffect::Deny => return PolicyEvaluation::ExplicitDeny,
+                PolicyEffect::Allow => saw_allow = true,
+            }
+        }
+
+        if saw_allow {
+            PolicyEvaluation::ExplicitAllow
+        } else {
+            PolicyEvaluation::NoMatch
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyAction {
+    GetObject,
+    GetObjectVersion,
+    GetObjectTagging,
+    GetObjectVersionTagging,
+    PutObjectTagging,
+    PutObjectVersionTagging,
+    DeleteObjectTagging,
+    DeleteObjectVersionTagging,
+}
+
+impl PolicyAction {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::GetObject => "s3:GetObject",
+            Self::GetObjectVersion => "s3:GetObjectVersion",
+            Self::GetObjectTagging => "s3:GetObjectTagging",
+            Self::GetObjectVersionTagging => "s3:GetObjectVersionTagging",
+            Self::PutObjectTagging => "s3:PutObjectTagging",
+            Self::PutObjectVersionTagging => "s3:PutObjectVersionTagging",
+            Self::DeleteObjectTagging => "s3:DeleteObjectTagging",
+            Self::DeleteObjectVersionTagging => "s3:DeleteObjectVersionTagging",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PolicyTag<'a> {
+    key: &'a str,
+    value: &'a str,
+}
+
+impl<'a> PolicyTag<'a> {
+    #[must_use]
+    pub const fn new(key: &'a str, value: &'a str) -> Self {
+        Self { key, value }
+    }
+
+    #[must_use]
+    pub const fn key(self) -> &'a str {
+        self.key
+    }
+
+    #[must_use]
+    pub const fn value(self) -> &'a str {
+        self.value
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PolicyRequest<'a> {
+    action: PolicyAction,
+    bucket: &'a str,
+    key: &'a str,
+    requester_principal: Option<&'a str>,
+    requester_canonical_user_id: Option<&'a CanonicalUserId>,
+    existing_object_tags: &'a [PolicyTag<'a>],
+}
+
+impl<'a> PolicyRequest<'a> {
+    #[must_use]
+    pub const fn new(
+        action: PolicyAction,
+        bucket: &'a str,
+        key: &'a str,
+        requester_principal: Option<&'a str>,
+        requester_canonical_user_id: Option<&'a CanonicalUserId>,
+        existing_object_tags: &'a [PolicyTag<'a>],
+    ) -> Self {
+        Self {
+            action,
+            bucket,
+            key,
+            requester_principal,
+            requester_canonical_user_id,
+            existing_object_tags,
+        }
+    }
+
+    #[must_use]
+    pub const fn action(&self) -> PolicyAction {
+        self.action
+    }
+
+    #[must_use]
+    pub const fn requester_principal(&self) -> Option<&'a str> {
+        self.requester_principal
+    }
+
+    #[must_use]
+    pub const fn requester_canonical_user_id(&self) -> Option<&'a CanonicalUserId> {
+        self.requester_canonical_user_id
+    }
+
+    #[must_use]
+    pub fn object_resource_arn(&self) -> String {
+        format!("arn:aws:s3:::{}", self.object_path())
+    }
+
+    #[must_use]
+    fn object_path(&self) -> String {
+        format!("{}/{}", self.bucket, self.key)
+    }
+
+    #[must_use]
+    fn existing_object_tag_value(&self, key: &str) -> Option<&'a str> {
+        self.existing_object_tags
+            .iter()
+            .find(|tag| tag.key == key)
+            .map(|tag| tag.value)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyEvaluation {
+    ExplicitDeny,
+    ExplicitAllow,
+    NoMatch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,12 +252,104 @@ impl PolicyStatement {
 
         !conditions_constrain_public_principal(&self.conditions)
     }
+
+    fn request_effect(
+        &self,
+        request: &PolicyRequest<'_>,
+        action: &str,
+        resource: &str,
+    ) -> Option<PolicyEffect> {
+        if !self.matches_principal(request)
+            || !self.matches_action(action)
+            || !self.matches_resource(resource)
+        {
+            return None;
+        }
+
+        match self.condition_match_result(request) {
+            ConditionMatchResult::Matches => Some(self.effect),
+            ConditionMatchResult::NoMatch => None,
+            ConditionMatchResult::Unsupported => {
+                (self.effect == PolicyEffect::Deny).then_some(PolicyEffect::Deny)
+            }
+        }
+    }
+
+    fn matches_principal(&self, request: &PolicyRequest<'_>) -> bool {
+        self.principal.matches_request(request)
+    }
+
+    fn matches_action(&self, action: &str) -> bool {
+        self.actions
+            .iter()
+            .any(|pattern| action_pattern_matches(pattern, action))
+    }
+
+    fn matches_resource(&self, resource: &str) -> bool {
+        self.resources
+            .iter()
+            .any(|pattern| wildcard_matches(pattern, resource))
+    }
+
+    fn references_existing_object_tag_condition(&self) -> bool {
+        self.conditions
+            .iter()
+            .any(|clause| clause.key.starts_with("s3:ExistingObjectTag/"))
+    }
+
+    fn references_evaluable_object_action(&self) -> bool {
+        self.actions.iter().any(|pattern| {
+            EVALUABLE_OBJECT_POLICY_ACTIONS
+                .iter()
+                .any(|action| action_pattern_matches(pattern, action.as_str()))
+        })
+    }
+
+    fn conditions_supported_for_evaluable_object_actions(&self) -> bool {
+        self.conditions
+            .iter()
+            .all(condition_clause_supported_for_evaluable_object_actions)
+    }
+
+    fn condition_match_result(&self, request: &PolicyRequest<'_>) -> ConditionMatchResult {
+        let mut saw_unsupported = false;
+        for clause in &self.conditions {
+            match condition_clause_matches_request(clause, request) {
+                ConditionMatchResult::Matches => {}
+                ConditionMatchResult::NoMatch => return ConditionMatchResult::NoMatch,
+                ConditionMatchResult::Unsupported => saw_unsupported = true,
+            }
+        }
+        if saw_unsupported {
+            ConditionMatchResult::Unsupported
+        } else {
+            ConditionMatchResult::Matches
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyEffect {
     Allow,
     Deny,
+}
+
+const EVALUABLE_OBJECT_POLICY_ACTIONS: [PolicyAction; 8] = [
+    PolicyAction::GetObject,
+    PolicyAction::GetObjectVersion,
+    PolicyAction::GetObjectTagging,
+    PolicyAction::GetObjectVersionTagging,
+    PolicyAction::PutObjectTagging,
+    PolicyAction::PutObjectVersionTagging,
+    PolicyAction::DeleteObjectTagging,
+    PolicyAction::DeleteObjectVersionTagging,
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConditionMatchResult {
+    Matches,
+    NoMatch,
+    Unsupported,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -138,6 +399,26 @@ impl PolicyPrincipal {
             .chain(&self.canonical_user)
             .map(String::as_str)
             .collect()
+    }
+
+    fn matches_request(&self, request: &PolicyRequest<'_>) -> bool {
+        if self.wildcard {
+            return true;
+        }
+
+        let requester_principal = request.requester_principal();
+        let requester_canonical_user_id = request.requester_canonical_user_id();
+
+        self.aws.iter().any(|value| {
+            requester_principal
+                .is_some_and(|requester| aws_principal_matches_request(requester, value))
+        }) || self
+            .service
+            .iter()
+            .any(|value| requester_principal == Some(value.as_str()))
+            || self.canonical_user.iter().any(|value| {
+                requester_canonical_user_id.is_some_and(|requester| requester.as_str() == value)
+            })
     }
 }
 
@@ -418,6 +699,115 @@ fn conditions_constrain_public_principal(conditions: &[PolicyConditionClause]) -
     conditions.iter().any(is_non_public_condition_clause)
 }
 
+fn condition_clause_matches_request(
+    clause: &PolicyConditionClause,
+    request: &PolicyRequest<'_>,
+) -> ConditionMatchResult {
+    let Some(tag_key) = clause.key.strip_prefix("s3:ExistingObjectTag/") else {
+        return ConditionMatchResult::Unsupported;
+    };
+
+    if clause.operator != "StringEquals" {
+        return ConditionMatchResult::Unsupported;
+    }
+
+    if request
+        .existing_object_tag_value(tag_key)
+        .is_some_and(|actual| clause.values.iter().any(|expected| expected == actual))
+    {
+        ConditionMatchResult::Matches
+    } else {
+        ConditionMatchResult::NoMatch
+    }
+}
+
+fn condition_clause_supported_for_evaluable_object_actions(clause: &PolicyConditionClause) -> bool {
+    clause.operator == "StringEquals" && clause.key.starts_with("s3:ExistingObjectTag/")
+}
+
+fn action_pattern_matches(pattern: &str, action: &str) -> bool {
+    wildcard_matches(&pattern.to_ascii_lowercase(), &action.to_ascii_lowercase())
+}
+
+fn wildcard_matches(pattern: &str, value: &str) -> bool {
+    if !pattern.contains('*') {
+        return pattern == value;
+    }
+
+    let segments: Vec<&str> = pattern.split('*').collect();
+    if segments.iter().all(|segment| segment.is_empty()) {
+        return true;
+    }
+
+    let mut search_start = 0;
+    let mut start_index = 0;
+
+    if !pattern.starts_with('*') {
+        let first = segments
+            .first()
+            .expect("split always yields a first segment");
+        let Some(_remaining) = value.strip_prefix(first) else {
+            return false;
+        };
+        search_start = first.len();
+        start_index = 1;
+    }
+
+    let end_index = if pattern.ends_with('*') {
+        segments.len()
+    } else {
+        segments.len().saturating_sub(1)
+    };
+    for segment in &segments[start_index..end_index] {
+        if segment.is_empty() {
+            continue;
+        }
+        let Some(found) = value[search_start..].find(segment) else {
+            return false;
+        };
+        search_start += found + segment.len();
+    }
+
+    if pattern.ends_with('*') {
+        true
+    } else {
+        let last = segments.last().expect("split always yields a last segment");
+        value[search_start..].ends_with(last)
+    }
+}
+
+fn aws_principal_matches_request(requester_principal: &str, policy_value: &str) -> bool {
+    if requester_principal == policy_value {
+        return true;
+    }
+
+    let Some(policy_root_account_id) = root_account_principal_account_id(policy_value) else {
+        return false;
+    };
+
+    requester_principal == policy_root_account_id
+        || iam_principal_account_id(requester_principal) == Some(policy_root_account_id)
+}
+
+fn root_account_principal_account_id(value: &str) -> Option<&str> {
+    let account_id = iam_principal_account_id(value)?;
+    value.ends_with(":root").then_some(account_id)
+}
+
+fn iam_principal_account_id(value: &str) -> Option<&str> {
+    let rest = value.strip_prefix("arn:")?;
+    let mut parts = rest.splitn(6, ':');
+    let _partition = parts.next()?;
+    let service = parts.next()?;
+    if service != "iam" {
+        return None;
+    }
+    let _region = parts.next()?;
+    let account_id = parts.next()?;
+    let _resource = parts.next()?;
+    (!account_id.is_empty()).then_some(account_id)
+}
+
 fn is_non_public_condition_clause(clause: &PolicyConditionClause) -> bool {
     match clause.key.as_str() {
         "aws:PrincipalOrgID"
@@ -463,6 +853,23 @@ fn is_fixed_source_ip(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn request<'a>(
+        action: PolicyAction,
+        bucket: &'a str,
+        key: &'a str,
+        requester_principal: Option<&'a str>,
+        existing_object_tags: &'a [PolicyTag<'a>],
+    ) -> PolicyRequest<'a> {
+        PolicyRequest::new(
+            action,
+            bucket,
+            key,
+            requester_principal,
+            None,
+            existing_object_tags,
+        )
+    }
 
     #[test]
     fn parse_empty_statement_array() {
@@ -551,5 +958,165 @@ mod tests {
                 reason: "NotPrincipal, NotAction, and NotResource are not supported"
             }
         );
+    }
+
+    #[test]
+    fn existing_object_tag_condition_matches_matching_tag() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::444455556666:root"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}}]}"#,
+        )
+        .unwrap();
+        let tags = [PolicyTag::new("security", "public")];
+        let request = request(
+            PolicyAction::GetObject,
+            "bucket",
+            "key",
+            Some("444455556666"),
+            &tags,
+        );
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+    }
+
+    #[test]
+    fn existing_object_tag_condition_rejects_missing_or_mismatched_tag() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}}]}"#,
+        )
+        .unwrap();
+        let missing_tags: [PolicyTag<'_>; 0] = [];
+        let missing_request = request(
+            PolicyAction::GetObject,
+            "bucket",
+            "key",
+            Some("caller"),
+            &missing_tags,
+        );
+        let mismatched_tags = [PolicyTag::new("security", "private")];
+        let mismatched_request = request(
+            PolicyAction::GetObject,
+            "bucket",
+            "key",
+            Some("caller"),
+            &mismatched_tags,
+        );
+
+        assert_eq!(policy.evaluate(&missing_request), PolicyEvaluation::NoMatch);
+        assert_eq!(
+            policy.evaluate(&mismatched_request),
+            PolicyEvaluation::NoMatch
+        );
+    }
+
+    #[test]
+    fn explicit_deny_beats_allow() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"},{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/private/*"}]}"#,
+        )
+        .unwrap();
+        let tags: [PolicyTag<'_>; 0] = [];
+        let allowed_request = request(
+            PolicyAction::GetObject,
+            "bucket",
+            "public/key",
+            Some("caller"),
+            &tags,
+        );
+        let denied_request = request(
+            PolicyAction::GetObject,
+            "bucket",
+            "private/key",
+            Some("caller"),
+            &tags,
+        );
+
+        assert_eq!(
+            policy.evaluate(&allowed_request),
+            PolicyEvaluation::ExplicitAllow
+        );
+        assert_eq!(
+            policy.evaluate(&denied_request),
+            PolicyEvaluation::ExplicitDeny
+        );
+    }
+
+    #[test]
+    fn version_requests_require_version_action() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+        )
+        .unwrap();
+        let tags: [PolicyTag<'_>; 0] = [];
+        let request = request(
+            PolicyAction::GetObjectVersion,
+            "bucket",
+            "key",
+            Some("caller"),
+            &tags,
+        );
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::NoMatch);
+    }
+
+    #[test]
+    fn root_account_principal_matches_account_id_requester() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::444455556666:root"},"Action":"s3:GetObjectTagging","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+        )
+        .unwrap();
+        let tags: [PolicyTag<'_>; 0] = [];
+        let request = request(
+            PolicyAction::GetObjectTagging,
+            "bucket",
+            "key",
+            Some("444455556666"),
+            &tags,
+        );
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+    }
+
+    #[test]
+    fn requires_existing_object_tags_for_matching_action() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}},{"Effect":"Allow","Principal":"*","Action":"s3:GetObjectTagging","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+        )
+        .unwrap();
+
+        assert!(policy.requires_existing_object_tags_for_action(PolicyAction::GetObject));
+        assert!(!policy.requires_existing_object_tags_for_action(PolicyAction::GetObjectTagging));
+    }
+
+    #[test]
+    fn evaluable_object_conditions_reject_unsupported_condition_clause() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringNotEquals":{"s3:ExistingObjectTag/security":"public"}}}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            policy.validate_evaluable_object_conditions(),
+            Err(BucketPolicyError::Malformed {
+                reason: "unsupported Condition for currently enforced object/tagging bucket policy action",
+            })
+        );
+    }
+
+    #[test]
+    fn unsupported_deny_condition_is_treated_conservatively_at_evaluation_time() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringNotEquals":{"aws:PrincipalArn":"arn:aws:iam::444455556666:user/other"}}}]}"#,
+        )
+        .unwrap();
+        let tags: [PolicyTag<'_>; 0] = [];
+        let request = request(
+            PolicyAction::GetObject,
+            "bucket",
+            "key",
+            Some("444455556666"),
+            &tags,
+        );
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitDeny);
     }
 }

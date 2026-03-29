@@ -615,8 +615,22 @@ fn file_bucket_metadata_config_roundtrip() {
         store.head_bucket("bucket").unwrap().bucket_policy,
         Some("{\"Version\":\"2012-10-17\"}".to_string())
     );
+    assert_eq!(
+        store
+            .head_bucket("bucket")
+            .unwrap()
+            .bucket_policy_generation,
+        1
+    );
     store.delete_bucket_policy("bucket").unwrap();
     assert_eq!(store.get_bucket_policy("bucket").unwrap(), None);
+    assert_eq!(
+        store
+            .head_bucket("bucket")
+            .unwrap()
+            .bucket_policy_generation,
+        2
+    );
 
     store
         .put_bucket_ownership_controls("bucket", "<OwnershipControls/>")

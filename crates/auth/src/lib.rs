@@ -54,8 +54,9 @@ pub(crate) fn is_lower_hex(value: &str) -> bool {
 }
 
 pub use bucket_policy::{
-    parse_bucket_policy, BucketPolicy, BucketPolicyError, PolicyConditionClause, PolicyEffect,
-    PolicyPrincipal, PolicyStatement, PolicyVersion,
+    parse_bucket_policy, BucketPolicy, BucketPolicyError, PolicyAction, PolicyConditionClause,
+    PolicyEffect, PolicyEvaluation, PolicyPrincipal, PolicyRequest, PolicyStatement, PolicyTag,
+    PolicyVersion,
 };
 pub use canonical::parse_amz_date;
 pub use credential::{CredentialRecord, CredentialScope, CredentialStore, SecretKey};

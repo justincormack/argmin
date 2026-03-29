@@ -1,8 +1,9 @@
 /// Coordinator: orchestrates S3 operations across EC, storage, and metadata layers.
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(test)]
 use std::sync::OnceLock;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::thread::JoinHandle;
 
 use checksum::{
@@ -163,6 +164,8 @@ pub struct BucketSummary {
     pub versioning: BucketVersioningState,
     pub public_access_block: Option<String>,
     pub ownership_controls: Option<String>,
+    pub bucket_policy_present: bool,
+    pub bucket_policy_generation: u64,
     pub encryption: BucketEncryptionConfig,
 }
 
@@ -2070,6 +2073,12 @@ struct ReclaimSweeper {
     handle: Option<JoinHandle<()>>,
 }
 
+#[derive(Debug, Clone)]
+struct CachedBucketPolicy {
+    generation: u64,
+    policy: Arc<auth::BucketPolicy>,
+}
+
 impl Drop for ReclaimSweeper {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
@@ -2082,6 +2091,7 @@ impl Drop for ReclaimSweeper {
 
 pub struct Coordinator {
     storage_node: Arc<SharedStorageNode>,
+    bucket_policy_cache: RwLock<HashMap<String, CachedBucketPolicy>>,
     pg_topology: PgTopology,
     ec_codec: Arc<ErasureCodec>,
     ec_config: EcConfig,
@@ -3058,6 +3068,272 @@ impl Coordinator {
         bucket.public_write && !Self::ignores_public_acls(bucket.public_access_block.as_deref())
     }
 
+    fn get_object_policy_action(version_id: Option<VersionId>) -> auth::PolicyAction {
+        if version_id.is_some() {
+            auth::PolicyAction::GetObjectVersion
+        } else {
+            auth::PolicyAction::GetObject
+        }
+    }
+
+    fn get_object_tagging_policy_action(version_id: Option<VersionId>) -> auth::PolicyAction {
+        if version_id.is_some() {
+            auth::PolicyAction::GetObjectVersionTagging
+        } else {
+            auth::PolicyAction::GetObjectTagging
+        }
+    }
+
+    fn put_object_tagging_policy_action(version_id: Option<VersionId>) -> auth::PolicyAction {
+        if version_id.is_some() {
+            auth::PolicyAction::PutObjectVersionTagging
+        } else {
+            auth::PolicyAction::PutObjectTagging
+        }
+    }
+
+    fn delete_object_tagging_policy_action(version_id: Option<VersionId>) -> auth::PolicyAction {
+        if version_id.is_some() {
+            auth::PolicyAction::DeleteObjectVersionTagging
+        } else {
+            auth::PolicyAction::DeleteObjectTagging
+        }
+    }
+
+    fn cached_bucket_policy(
+        &self,
+        bucket: &BucketSummary,
+    ) -> Result<Option<Arc<auth::BucketPolicy>>, ServerError> {
+        if !bucket.bucket_policy_present {
+            return Ok(None);
+        }
+
+        if let Some(cached) = self
+            .bucket_policy_cache
+            .read()
+            .unwrap()
+            .get(&bucket.name)
+            .cloned()
+        {
+            if cached.generation == bucket.bucket_policy_generation {
+                return Ok(Some(cached.policy));
+            }
+        }
+
+        let bucket_pg = self.get_bucket_pg(&bucket.name)?;
+        let raw_policy = bucket_pg
+            .get_bucket_policy(&bucket.name)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })?;
+        let parsed_policy = match raw_policy {
+            Some(policy) => Arc::new(auth::parse_bucket_policy(&policy).map_err(|e| {
+                ServerError::InternalError {
+                    reason: format!(
+                        "stored bucket policy for {} failed to parse at request time: {}",
+                        bucket.name,
+                        e.reason()
+                    ),
+                }
+            })?),
+            None => {
+                self.clear_bucket_policy_cache(&bucket.name);
+                return Ok(None);
+            }
+        };
+
+        self.cache_bucket_policy(
+            &bucket.name,
+            bucket.bucket_policy_generation,
+            Arc::clone(&parsed_policy),
+        );
+        Ok(Some(parsed_policy))
+    }
+
+    fn cache_bucket_policy(&self, bucket: &str, generation: u64, policy: Arc<auth::BucketPolicy>) {
+        self.bucket_policy_cache.write().unwrap().insert(
+            bucket.to_string(),
+            CachedBucketPolicy { generation, policy },
+        );
+    }
+
+    fn clear_bucket_policy_cache(&self, bucket: &str) {
+        self.bucket_policy_cache.write().unwrap().remove(bucket);
+    }
+
+    fn bucket_policy_decision_for_object(
+        requester: &Requester,
+        bucket: &BucketSummary,
+        object: &StoredObject,
+        action: auth::PolicyAction,
+        policy: Option<&auth::BucketPolicy>,
+    ) -> Result<auth::PolicyEvaluation, ServerError> {
+        let Some(policy) = policy else {
+            return Ok(auth::PolicyEvaluation::NoMatch);
+        };
+
+        let existing_tags = if policy.requires_existing_object_tags_for_action(action) {
+            Self::parse_policy_existing_object_tags(object)?
+        } else {
+            Vec::new()
+        };
+        let request_tags: Vec<auth::PolicyTag<'_>> = existing_tags
+            .iter()
+            .map(|(key, value)| auth::PolicyTag::new(key, value))
+            .collect();
+        let request = auth::PolicyRequest::new(
+            action,
+            &bucket.name,
+            object.key().as_str(),
+            requester.principal_opt(),
+            requester.canonical_user_id(),
+            &request_tags,
+        );
+        Ok(policy.evaluate(&request))
+    }
+
+    fn requester_can_read_object_with_bucket_policy(
+        requester: &Requester,
+        bucket: &BucketSummary,
+        object: &StoredObject,
+        action: auth::PolicyAction,
+        policy: Option<&auth::BucketPolicy>,
+    ) -> Result<bool, ServerError> {
+        Ok(
+            match Self::bucket_policy_decision_for_object(
+                requester, bucket, object, action, policy,
+            )? {
+                auth::PolicyEvaluation::ExplicitDeny => false,
+                auth::PolicyEvaluation::ExplicitAllow => true,
+                auth::PolicyEvaluation::NoMatch => {
+                    Self::requester_can_read_object(requester, bucket, object)
+                }
+            },
+        )
+    }
+
+    fn requester_can_manage_object_tags_with_bucket_policy(
+        requester: &Requester,
+        bucket: &BucketSummary,
+        object: &StoredObject,
+        action: auth::PolicyAction,
+        policy: Option<&auth::BucketPolicy>,
+    ) -> Result<bool, ServerError> {
+        Ok(
+            match Self::bucket_policy_decision_for_object(
+                requester, bucket, object, action, policy,
+            )? {
+                auth::PolicyEvaluation::ExplicitDeny => false,
+                auth::PolicyEvaluation::ExplicitAllow => true,
+                auth::PolicyEvaluation::NoMatch => {
+                    Self::requester_can_manage_object_tags(requester, bucket, object)
+                }
+            },
+        )
+    }
+
+    fn parse_policy_existing_object_tags(
+        object: &StoredObject,
+    ) -> Result<Vec<(String, String)>, ServerError> {
+        let Some(tags_xml) = object.as_live().and_then(|record| record.tags.as_deref()) else {
+            return Ok(Vec::new());
+        };
+        Self::parse_serialized_tag_set(tags_xml)
+    }
+
+    fn parse_serialized_tag_set(tags_xml: &str) -> Result<Vec<(String, String)>, ServerError> {
+        let mut tags = Vec::new();
+        let mut remaining = tags_xml;
+
+        while let Some(tag_start) = remaining.find("<Tag>") {
+            remaining = &remaining[tag_start + "<Tag>".len()..];
+            let Some(tag_end) = remaining.find("</Tag>") else {
+                return Err(ServerError::InternalError {
+                    reason: "stored object tags missing </Tag> terminator".to_string(),
+                });
+            };
+            let tag_xml = &remaining[..tag_end];
+            let key = Self::xml_unescape(Self::extract_xml_text(
+                tag_xml,
+                "Key",
+                "stored object tags missing <Key>",
+            )?)?;
+            let value = Self::xml_unescape(Self::extract_xml_text(
+                tag_xml,
+                "Value",
+                "stored object tags missing <Value>",
+            )?)?;
+            tags.push((key, value));
+            remaining = &remaining[tag_end + "</Tag>".len()..];
+        }
+
+        Ok(tags)
+    }
+
+    fn extract_xml_text<'a>(
+        xml: &'a str,
+        tag: &str,
+        missing_reason: &'static str,
+    ) -> Result<&'a str, ServerError> {
+        let open = format!("<{tag}>");
+        let close = format!("</{tag}>");
+        let Some(start) = xml.find(&open) else {
+            return Err(ServerError::InternalError {
+                reason: missing_reason.to_string(),
+            });
+        };
+        let content = &xml[start + open.len()..];
+        let Some(end) = content.find(&close) else {
+            return Err(ServerError::InternalError {
+                reason: format!("stored object tags missing closing </{tag}>"),
+            });
+        };
+        Ok(&content[..end])
+    }
+
+    fn xml_unescape(value: &str) -> Result<String, ServerError> {
+        let mut out = String::with_capacity(value.len());
+        let mut chars = value.chars();
+
+        while let Some(ch) = chars.next() {
+            if ch != '&' {
+                out.push(ch);
+                continue;
+            }
+
+            let mut entity = String::new();
+            loop {
+                let Some(next) = chars.next() else {
+                    return Err(ServerError::InternalError {
+                        reason: "stored object tags ended mid-entity".to_string(),
+                    });
+                };
+                entity.push(next);
+                if next == ';' {
+                    break;
+                }
+            }
+
+            match entity.as_str() {
+                "amp;" => out.push('&'),
+                "lt;" => out.push('<'),
+                "gt;" => out.push('>'),
+                "quot;" => out.push('"'),
+                "apos;" => out.push('\''),
+                _ => {
+                    return Err(ServerError::InternalError {
+                        reason: format!("stored object tags contain unsupported entity &{entity}"),
+                    });
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
     fn ensure_sse_c_allowed(bucket: &BucketSummary, uses_sse_c: bool) -> Result<(), ServerError> {
         if uses_sse_c && bucket.encryption.sse_c_blocked {
             return Err(ServerError::AccessDenied);
@@ -3393,12 +3669,14 @@ impl Coordinator {
         bucket: &str,
         key: &str,
         version_id: Option<VersionId>,
+        policy_action: auth::PolicyAction,
         expected_bucket_owner: Option<&str>,
     ) -> Result<LockedReadObject<'a>, ServerError> {
         let bucket_info = self.active_bucket_summary(bucket)?;
         Self::ensure_expected_bucket_owner(&bucket_info, expected_bucket_owner)?;
         let can_discover_missing =
             Self::requester_can_bucket_admin(requester, &bucket_info.owner_principal);
+        let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
         let locked = match self.lock_object_pgs_for_read(bucket, key, version_id) {
             Ok(locked) => locked,
             Err(ServerError::ObjectNotFound { .. } | ServerError::VersionNotFound { .. })
@@ -3409,7 +3687,13 @@ impl Coordinator {
             Err(other) => return Err(other),
         };
 
-        if Self::requester_can_manage_object_tags(requester, &bucket_info, &locked.record) {
+        if Self::requester_can_manage_object_tags_with_bucket_policy(
+            requester,
+            &bucket_info,
+            &locked.record,
+            policy_action,
+            bucket_policy.as_deref(),
+        )? {
             Ok(locked)
         } else {
             Err(ServerError::AccessDenied)
@@ -3552,6 +3836,47 @@ impl Coordinator {
         }
     }
 
+    fn lock_object_for_authorized_read_with_policy<'a>(
+        &'a self,
+        requester: &Requester,
+        bucket: &str,
+        key: &str,
+        version_id: Option<VersionId>,
+        policy_action: auth::PolicyAction,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<LockedReadObject<'a>, ServerError> {
+        let bucket_info = self.active_bucket_summary(bucket)?;
+        Self::ensure_expected_bucket_owner(&bucket_info, expected_bucket_owner)?;
+        let can_read_bucket = Self::requester_can_read_bucket(
+            requester,
+            &bucket_info.owner_principal,
+            &bucket_info.acl_grants,
+            Self::effective_public_read(&bucket_info),
+        );
+        let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
+        let locked = match self.lock_object_pgs_for_read(bucket, key, version_id) {
+            Ok(locked) => locked,
+            Err(ServerError::ObjectNotFound { .. } | ServerError::VersionNotFound { .. })
+                if !can_read_bucket =>
+            {
+                return Err(ServerError::AccessDenied);
+            }
+            Err(other) => return Err(other),
+        };
+
+        if Self::requester_can_read_object_with_bucket_policy(
+            requester,
+            &bucket_info,
+            &locked.record,
+            policy_action,
+            bucket_policy.as_deref(),
+        )? {
+            Ok(locked)
+        } else {
+            Err(ServerError::AccessDenied)
+        }
+    }
+
     fn acquire_bucket_write_reservation(&self, bucket: &str) -> Result<BucketSummary, ServerError> {
         loop {
             let bucket_pg = self.get_bucket_pg(bucket)?;
@@ -3650,6 +3975,8 @@ impl Coordinator {
             versioning: info.versioning,
             public_access_block: info.public_access_block,
             ownership_controls: info.ownership_controls,
+            bucket_policy_present: info.bucket_policy.is_some(),
+            bucket_policy_generation: info.bucket_policy_generation,
             encryption: info.encryption,
         }
     }
@@ -3666,6 +3993,8 @@ impl Coordinator {
             versioning: info.versioning,
             public_access_block: info.public_access_block,
             ownership_controls: info.ownership_controls,
+            bucket_policy_present: info.bucket_policy_present,
+            bucket_policy_generation: info.bucket_policy_generation,
             encryption: info.encryption,
         }
     }
@@ -3759,6 +4088,7 @@ impl Coordinator {
         let sweeper_storage_node = Arc::clone(&storage_node);
         Ok(Self {
             storage_node,
+            bucket_policy_cache: RwLock::new(HashMap::new()),
             pg_topology,
             ec_codec,
             ec_config,
@@ -4013,6 +4343,7 @@ impl Coordinator {
                 other => ServerError::Metadata(other),
             })?;
             self.storage_node.remove_bucket_fast_path(name);
+            self.clear_bucket_policy_cache(name);
             marked_deleting = true;
             self.read_runtime().enqueue_bucket_delete_finalize(name);
             Ok(())
@@ -4688,6 +5019,11 @@ impl Coordinator {
             auth::parse_bucket_policy(policy).map_err(|e| ServerError::MalformedPolicy {
                 reason: e.reason().to_string(),
             })?;
+        parsed_policy
+            .validate_evaluable_object_conditions()
+            .map_err(|e| ServerError::MalformedPolicy {
+                reason: e.reason().to_string(),
+            })?;
         if Self::blocks_public_policy(bucket_info.public_access_block.as_deref())
             && parsed_policy.is_public()
         {
@@ -4702,6 +5038,14 @@ impl Coordinator {
                 },
                 other => ServerError::Metadata(other),
             })?;
+        let info = bucket_pg.head_bucket_raw(name).map_err(|e| match e {
+            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                name: name.to_string(),
+            },
+            other => ServerError::Metadata(other),
+        })?;
+        self.storage_node.upsert_bucket_fast_path((&info).into());
+        self.cache_bucket_policy(name, info.bucket_policy_generation, Arc::new(parsed_policy));
         Ok(())
     }
 
@@ -4765,6 +5109,14 @@ impl Coordinator {
             },
             other => ServerError::Metadata(other),
         })?;
+        let info = bucket_pg.head_bucket_raw(name).map_err(|e| match e {
+            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                name: name.to_string(),
+            },
+            other => ServerError::Metadata(other),
+        })?;
+        self.storage_node.upsert_bucket_fast_path((&info).into());
+        self.clear_bucket_policy_cache(name);
         Ok(())
     }
 
@@ -5424,6 +5776,7 @@ impl Coordinator {
             bucket,
             key,
             version_id,
+            Self::put_object_tagging_policy_action(version_id),
             expected_bucket_owner,
         )?;
         if stored.is_delete_marker() {
@@ -5467,6 +5820,7 @@ impl Coordinator {
             bucket,
             key,
             version_id,
+            Self::get_object_tagging_policy_action(version_id),
             expected_bucket_owner,
         )?;
         if stored.is_delete_marker() {
@@ -5510,6 +5864,7 @@ impl Coordinator {
             bucket,
             key,
             version_id,
+            Self::delete_object_tagging_policy_action(version_id),
             expected_bucket_owner,
         )?;
         if stored.is_delete_marker() {
@@ -6977,11 +7332,12 @@ impl Coordinator {
             let LockedReadObject {
                 record: src_stored,
                 pgs,
-            } = self.lock_object_for_authorized_read(
+            } = self.lock_object_for_authorized_read_with_policy(
                 requester,
                 src_bucket,
                 src_key,
                 src_version_id,
+                Self::get_object_policy_action(src_version_id),
                 expected_source_bucket_owner,
             )?;
 
@@ -7731,11 +8087,12 @@ impl Coordinator {
         let LockedReadObject {
             record: stored,
             pgs,
-        } = self.lock_object_for_authorized_read(
+        } = self.lock_object_for_authorized_read_with_policy(
             requester,
             bucket,
             key,
             version_id,
+            Self::get_object_policy_action(version_id),
             expected_bucket_owner,
         )?;
 
@@ -7884,11 +8241,12 @@ impl Coordinator {
         let LockedReadObject {
             record: stored,
             pgs,
-        } = self.lock_object_for_authorized_read(
+        } = self.lock_object_for_authorized_read_with_policy(
             requester,
             bucket,
             key,
             version_id,
+            Self::get_object_policy_action(version_id),
             expected_bucket_owner,
         )?;
 
@@ -8076,11 +8434,12 @@ impl Coordinator {
         let LockedReadObject {
             record: stored,
             pgs,
-        } = self.lock_object_for_authorized_read(
+        } = self.lock_object_for_authorized_read_with_policy(
             requester,
             bucket,
             key,
             version_id,
+            Self::get_object_policy_action(version_id),
             expected_bucket_owner,
         )?;
 
@@ -8202,13 +8561,15 @@ impl Coordinator {
         let version_id = req.version_id;
         let cond = req.cond;
         let requester = &req.requester;
-        let LockedReadObject { record: stored, .. } = self.lock_object_for_authorized_read(
-            requester,
-            bucket,
-            key,
-            version_id,
-            expected_bucket_owner,
-        )?;
+        let LockedReadObject { record: stored, .. } = self
+            .lock_object_for_authorized_read_with_policy(
+                requester,
+                bucket,
+                key,
+                version_id,
+                Self::get_object_policy_action(version_id),
+                expected_bucket_owner,
+            )?;
 
         // If latest version is a delete marker, return 404 with x-amz-delete-marker
         let record = match stored {
@@ -8280,11 +8641,12 @@ impl Coordinator {
         let LockedReadObject {
             record: stored,
             pgs,
-        } = self.lock_object_for_authorized_read(
+        } = self.lock_object_for_authorized_read_with_policy(
             requester,
             bucket,
             key,
             version_id,
+            Self::get_object_policy_action(version_id),
             expected_bucket_owner,
         )?;
 
@@ -9356,11 +9718,12 @@ impl Coordinator {
             let LockedReadObject {
                 record: src_stored,
                 pgs,
-            } = self.lock_object_for_authorized_read(
+            } = self.lock_object_for_authorized_read_with_policy(
                 requester,
                 src_bucket,
                 src_key,
                 src_version_id,
+                Self::get_object_policy_action(src_version_id),
                 expected_source_bucket_owner,
             )?;
 
@@ -10519,10 +10882,32 @@ mod tests {
     }
 
     fn setup_coordinator(dir: &Path) -> Coordinator {
-        let pg_ids: Vec<u32> = (0..4).collect();
+        setup_coordinator_with_pg_count(dir, 4)
+    }
+
+    fn setup_coordinator_with_pg_count(dir: &Path, pg_count: u32) -> Coordinator {
+        let pg_ids: Vec<u32> = (0..pg_count).collect();
         let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
         let ec_config = EcConfig::new(4, 2).unwrap();
         Coordinator::new(storage_node, ec_config, "us-east-1".to_string()).unwrap()
+    }
+
+    fn setup_coordinator_with_shared_storage(storage_node: Arc<SharedStorageNode>) -> Coordinator {
+        let ec_config = EcConfig::new(4, 2).unwrap();
+        Coordinator::new(storage_node, ec_config, "us-east-1".to_string()).unwrap()
+    }
+
+    fn setup_coordinators_with_pg_count(dir: &Path, pg_count: u32) -> (Coordinator, Coordinator) {
+        let pg_ids: Vec<u32> = (0..pg_count).collect();
+        let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
+        (
+            setup_coordinator_with_shared_storage(Arc::clone(&storage_node)),
+            setup_coordinator_with_shared_storage(storage_node),
+        )
+    }
+
+    fn setup_coordinators_with_single_pg(dir: &Path) -> (Coordinator, Coordinator) {
+        setup_coordinators_with_pg_count(dir, 1)
     }
 
     fn setup_coordinator_with_sse_c(dir: &Path) -> Coordinator {
@@ -10974,7 +11359,7 @@ mod tests {
     }
 
     #[test]
-    fn put_bucket_policy_rejects_string_not_equals_vpc_under_block_public_policy() {
+    fn put_bucket_policy_rejects_string_not_equals_vpc_for_enforced_object_action() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
@@ -11001,7 +11386,37 @@ mod tests {
                 Requester::principal("owner-a"),
             )
             .unwrap_err();
-        assert!(matches!(err, ServerError::AccessDenied));
+        assert!(matches!(err, ServerError::MalformedPolicy { .. }));
+        assert_eq!(
+            coord
+                .get_bucket_policy("bucket", Requester::principal("owner-a"))
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn put_bucket_policy_rejects_unsupported_condition_on_enforced_object_action() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+
+        coord
+            .create_bucket_for_requester(&CreateBucketRequest {
+                name: "bucket",
+                requester: Requester::principal("owner-a"),
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+            })
+            .unwrap();
+
+        let err = coord
+            .put_bucket_policy(
+                "bucket",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringNotEquals":{"aws:PrincipalArn":"arn:aws:iam::444455556666:user/other"}}}]}"#,
+                Requester::principal("owner-a"),
+            )
+            .unwrap_err();
+        assert!(matches!(err, ServerError::MalformedPolicy { .. }));
         assert_eq!(
             coord
                 .get_bucket_policy("bucket", Requester::principal("owner-a"))
@@ -14908,6 +15323,315 @@ mod tests {
             .get_object_tags("bucket", "key", None, Requester::principal("other-user"))
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn get_object_bucket_policy_existing_tag_controls_access() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        coord
+            .put_bucket_policy(
+                "bucket",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}}]}"#,
+                Requester::principal("owner-a"),
+            )
+            .unwrap();
+
+        let public_tags = "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag><Tag><Key>foo</Key><Value>bar</Value></Tag></TagSet></Tagging>";
+        let private_tags =
+            "<Tagging><TagSet><Tag><Key>security</Key><Value>private</Value></Tag></TagSet></Tagging>";
+        let invalid_tags =
+            "<Tagging><TagSet><Tag><Key>security1</Key><Value>public</Value></Tag></TagSet></Tagging>";
+
+        for (key, body, tags) in [
+            ("publictag", b"public".as_slice(), Some(public_tags)),
+            ("privatetag", b"private".as_slice(), Some(private_tags)),
+            ("invalidtag", b"invalid".as_slice(), Some(invalid_tags)),
+        ] {
+            test_helpers::put_object(
+                &coord,
+                &PutObjectRequest {
+                    sse_customer: None,
+                    bucket: "bucket",
+                    key,
+                    data: body,
+                    metadata: &MetadataBlob::new(),
+                    system_metadata: &SystemMetadata::EMPTY,
+                    tags,
+                    cond: NO_WRITE,
+                    requester: Requester::principal("owner-a"),
+                    acl: NO_PUT_OBJECT_ACL.into(),
+                },
+            )
+            .unwrap();
+        }
+
+        let object = coord
+            .get_object(&GetObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "publictag",
+                version_id: None,
+                cond: NO_READ,
+                requester: Requester::principal("other-user"),
+            })
+            .unwrap();
+        assert_eq!(object.body.read_all().unwrap(), b"public");
+
+        for key in ["privatetag", "invalidtag"] {
+            let err = coord
+                .get_object(&GetObjectRequest {
+                    sse_customer: None,
+                    bucket: "bucket",
+                    key,
+                    version_id: None,
+                    cond: NO_READ,
+                    requester: Requester::principal("other-user"),
+                })
+                .unwrap_err();
+            assert!(matches!(err, ServerError::AccessDenied));
+        }
+    }
+
+    #[test]
+    fn put_object_tagging_bucket_policy_uses_current_existing_tags() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        coord
+            .put_bucket_policy(
+                "bucket",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:PutObjectTagging","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}}]}"#,
+                Requester::principal("owner-a"),
+            )
+            .unwrap();
+
+        let public_tags =
+            "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>";
+        let private_tags =
+            "<Tagging><TagSet><Tag><Key>security</Key><Value>private</Value></Tag></TagSet></Tagging>";
+
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "key",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: Some(public_tags),
+                cond: NO_WRITE,
+                requester: Requester::principal("owner-a"),
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        coord
+            .put_object_tags(
+                "bucket",
+                "key",
+                None,
+                private_tags,
+                Requester::principal("other-user"),
+            )
+            .unwrap();
+
+        let err = coord
+            .put_object_tags(
+                "bucket",
+                "key",
+                None,
+                public_tags,
+                Requester::principal("other-user"),
+            )
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+
+        let tags = coord
+            .get_object_tags("bucket", "key", None, Requester::principal("owner-a"))
+            .unwrap()
+            .expect("expected tags after update");
+        assert!(tags.contains("<Key>security</Key>"));
+        assert!(tags.contains("<Value>private</Value>"));
+    }
+
+    #[test]
+    fn bucket_policy_cache_invalidates_across_coordinators_on_replace() {
+        let tmp = test_util::tempdir();
+        let (admin, reader) = setup_coordinators_with_pg_count(tmp.path(), 4);
+        admin
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        let tags_xml =
+            "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>";
+        test_helpers::put_object(
+            &admin,
+            &PutObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "key",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: Some(tags_xml),
+                cond: NO_WRITE,
+                requester: Requester::principal("owner-a"),
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        admin
+            .put_bucket_policy(
+                "bucket",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}}]}"#,
+                Requester::principal("owner-a"),
+            )
+            .unwrap();
+
+        let first = reader
+            .get_object(&GetObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: NO_READ,
+                requester: Requester::principal("other-user"),
+            })
+            .unwrap();
+        assert_eq!(first.body.read_all().unwrap(), b"data");
+
+        admin
+            .put_bucket_policy(
+                "bucket",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":{"AWS":"other-user"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}}]}"#,
+                Requester::principal("owner-a"),
+            )
+            .unwrap();
+
+        let err = reader
+            .get_object(&GetObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: NO_READ,
+                requester: Requester::principal("other-user"),
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn get_object_bucket_policy_same_pg_completes_without_deadlock() {
+        let tmp = test_util::tempdir();
+        let (admin, reader) = setup_coordinators_with_single_pg(tmp.path());
+        admin
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        admin
+            .put_bucket_policy(
+                "bucket",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}}]}"#,
+                Requester::principal("owner-a"),
+            )
+            .unwrap();
+        test_helpers::put_object(
+            &admin,
+            &PutObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "key",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: Some(
+                    "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
+                ),
+                cond: NO_WRITE,
+                requester: Requester::principal("owner-a"),
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let res = reader.get_object(&GetObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                cond: NO_READ,
+                requester: Requester::principal("other-user"),
+            });
+            tx.send(res.map(|result| result.body.read_all())).unwrap();
+        });
+
+        let body = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("get_object with bucket policy should not self-deadlock")
+            .unwrap()
+            .unwrap();
+        assert_eq!(body, b"data");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn get_object_tagging_bucket_policy_same_pg_completes_without_deadlock() {
+        let tmp = test_util::tempdir();
+        let (admin, reader) = setup_coordinators_with_single_pg(tmp.path());
+        admin
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        admin
+            .put_bucket_policy(
+                "bucket",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:GetObjectTagging","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}}]}"#,
+                Requester::principal("owner-a"),
+            )
+            .unwrap();
+        let tags_xml =
+            "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>";
+        test_helpers::put_object(
+            &admin,
+            &PutObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "key",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: Some(tags_xml),
+                cond: NO_WRITE,
+                requester: Requester::principal("owner-a"),
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let res =
+                reader.get_object_tags("bucket", "key", None, Requester::principal("other-user"));
+            tx.send(res).unwrap();
+        });
+
+        let tags = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("get_object_tagging with bucket policy should not self-deadlock")
+            .unwrap()
+            .expect("expected tags");
+        assert!(tags.contains("<Key>security</Key>"));
+        assert!(tags.contains("<Value>public</Value>"));
+        handle.join().unwrap();
     }
 
     #[test]

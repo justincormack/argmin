@@ -1563,6 +1563,8 @@ mod tests {
             public_write: false,
             public_access_block: None,
             ownership_controls: None,
+            bucket_policy_present: false,
+            bucket_policy_generation: 0,
             encryption: BucketEncryptionConfig::default(),
         };
         let resp = S3Response::head_bucket(&info);
@@ -1584,6 +1586,8 @@ mod tests {
             public_write: false,
             public_access_block: None,
             ownership_controls: None,
+            bucket_policy_present: false,
+            bucket_policy_generation: 0,
             encryption: BucketEncryptionConfig::default(),
         }];
         let owner_canonical_id = CanonicalUserId::from_principal("owner");

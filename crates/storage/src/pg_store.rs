@@ -734,8 +734,9 @@ impl PgStore {
             public_access_block: row.get(14)?,
             ownership_controls: row.get(15)?,
             bucket_policy: row.get(16)?,
+            bucket_policy_generation: row.get::<_, i64>(17)? as u64,
             encryption: BucketEncryptionConfig {
-                sse_c_blocked: row.get::<_, i64>(17)? != 0,
+                sse_c_blocked: row.get::<_, i64>(18)? != 0,
             },
         })
     }
@@ -1262,7 +1263,7 @@ impl PgMetadataStore for PgStore {
     fn head_bucket_raw(&self, name: &str) -> Result<BucketInfo, MetadataError> {
         self.conn
             .query_row(
-                "SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, write_reservations_blocked, active_write_reservations, cors_config, tags, public_access_block, ownership_controls, bucket_policy, sse_c_blocked \
+                "SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, write_reservations_blocked, active_write_reservations, cors_config, tags, public_access_block, ownership_controls, bucket_policy, bucket_policy_generation, sse_c_blocked \
                  FROM buckets WHERE name = ?1",
                 params![name],
                 Self::row_to_bucket_info,
@@ -1288,7 +1289,7 @@ impl PgMetadataStore for PgStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, write_reservations_blocked, active_write_reservations, cors_config, tags, public_access_block, ownership_controls, bucket_policy, sse_c_blocked \
+                "SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, write_reservations_blocked, active_write_reservations, cors_config, tags, public_access_block, ownership_controls, bucket_policy, bucket_policy_generation, sse_c_blocked \
                  FROM buckets WHERE owner_principal = ?1 AND state = ?2 ORDER BY name ASC",
             )
             .map_err(|e| MetadataError::Db {
@@ -1653,7 +1654,9 @@ impl PgMetadataStore for PgStore {
         let updated = self
             .conn
             .execute(
-                "UPDATE buckets SET bucket_policy = ?1 WHERE name = ?2",
+                "UPDATE buckets \
+                 SET bucket_policy = ?1, bucket_policy_generation = bucket_policy_generation + 1 \
+                 WHERE name = ?2",
                 params![policy, name],
             )
             .map_err(|e| MetadataError::Db {
@@ -1689,7 +1692,9 @@ impl PgMetadataStore for PgStore {
         let updated = self
             .conn
             .execute(
-                "UPDATE buckets SET bucket_policy = NULL WHERE name = ?1",
+                "UPDATE buckets \
+                 SET bucket_policy = NULL, bucket_policy_generation = bucket_policy_generation + 1 \
+                 WHERE name = ?1",
                 params![name],
             )
             .map_err(|e| MetadataError::Db {
