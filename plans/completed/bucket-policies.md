@@ -39,11 +39,14 @@ Current implementation status:
   invalidate parsed-policy caches across coordinators
 - storage exposes `put/get/delete_bucket_policy`
 - the router and HTTP handler support `PUT ?policy`, `GET ?policy`, and
-  `DELETE ?policy`
+  `DELETE ?policy`, plus `GET ?policyStatus`
 - `PUT ?policy` requires a UTF-8 body, parses the policy into a typed internal
   representation, and stores the provided JSON string only after validation
 - `GET ?policy` returns the stored policy JSON, or `NoSuchBucketPolicy` when
   no policy is configured
+- `GET ?policyStatus` returns AWS-compatible XML with
+  `PolicyStatus.IsPublic` derived from bucket-policy publicness, and returns
+  `NoSuchBucketPolicy` when no bucket policy is configured
 - `DELETE ?policy` removes the stored policy
 - bucket policy administration is wired through bucket-admin authorization
 - the public access block XML parser already supports `BlockPublicPolicy` and
@@ -52,8 +55,9 @@ Current implementation status:
 - `PutBucketPolicy` rejects public `Allow` policies when
   `BlockPublicPolicy=true`
 - request-time policy evaluation now covers object reads, object tagging, copy
-  destination writes, `GetObjectAcl`, `GetBucketPublicAccessBlock`, and
-  `ListObjects` / `ListObjectsV2` via `s3:ListBucket`
+  destination writes, `GetObjectAcl`, `GetBucketPublicAccessBlock`,
+  `GetBucketPolicyStatus`, and `ListObjects` / `ListObjectsV2` via
+  `s3:ListBucket`
 - supported request-time condition keys now include:
   `s3:ExistingObjectTag/<key>`,
   `s3:x-amz-copy-source`,
@@ -67,17 +71,13 @@ Current implementation status:
   the parsed policy before object-PG locking to avoid same-PG self-deadlock
 - raw policy is intentionally not stored in bucket fast-path metadata
 
-Remaining Ceph/AWS parity gaps after Phases 1-6:
-- no `GetBucketPolicyStatus` API surface yet, even though the public/non-public
-  classifier already exists internally
-- no bucket-policy enforcement yet on `CreateMultipartUpload` or
-  `UploadPartCopy`
-- `PutObject` policy conditions do not yet cover `s3:x-amz-grant-*`,
-  `s3:x-amz-server-side-encryption`,
-  `s3:x-amz-server-side-encryption-aws-kms-key-id`, or
-  `s3:RequestObjectTag/<key>`
-- unsupported policy forms such as `NotPrincipal` are rejected by parser tests,
-  but do not yet have end-to-end S3 coverage
+Remaining Ceph/AWS parity gaps after Phases 1-8:
+- Ceph ACL-only policy-status cases are out of AWS scope because
+  `GetBucketPolicyStatus` returns `NoSuchBucketPolicy` when no bucket policy is
+  configured; `authenticated-read` bucket ACLs themselves remain intentionally
+  `NotImplemented`
+- SSE-S3 / SSE-KMS bucket-policy condition keys remain out of scope until the
+  server implements the corresponding request headers and semantics
 - Ceph tests that depend on RGW tenant namespace syntax are not AWS scope and
   should stay documented as exclusions rather than driving implementation
 
@@ -125,6 +125,7 @@ Policy evaluation must compose with:
 
 Actions currently implemented:
 - `s3:ListBucket`
+- `s3:GetBucketPolicyStatus`
 - `s3:GetObject`
 - `s3:GetObjectTagging`
 - `s3:PutObjectTagging`
@@ -141,17 +142,18 @@ Condition keys currently implemented:
 - `s3:x-amz-copy-source`
 - `s3:x-amz-metadata-directive`
 - `s3:x-amz-acl`
-
-Additional features targeted by the pending phases:
-- `s3:ListBucket`
-- `s3:GetBucketPolicyStatus`
-- multipart write and copy flows that should reuse `s3:PutObject` and
-  `s3:GetObject` policy evaluation
 - `s3:x-amz-grant-*`
+- `s3:RequestObjectTag/<key>`
+
+Operator support currently implemented for the enforced condition subset:
+- `StringEquals`
+- `StringLike`
+- `Null`
+- `StringNotEquals`
+
+Still explicitly out of scope:
 - `s3:x-amz-server-side-encryption`
 - `s3:x-amz-server-side-encryption-aws-kms-key-id`
-- `s3:RequestObjectTag/<key>`
-- request-time `Null` and `StringNotEquals` handling for those condition keys
 
 This plan should also support the basic statement structure AWS policies use:
 - `Version`
@@ -438,11 +440,11 @@ Notes:
 ### Phase 8: Policy Status And Remaining Surface Parity
 
 Status:
-- pending
+- completed for the currently implemented ACL and encryption surface
 
 Deliver:
 - `GetBucketPolicyStatus`
-- `IsPublic` computation wired from bucket policy and public ACL state
+- `IsPublic` computation wired from bucket policy publicness
 - end-to-end S3 coverage for rejected unsupported policy forms such as
   `NotPrincipal`
 - explicit documentation of the remaining RGW-only exclusions after AWS parity
@@ -450,16 +452,23 @@ Deliver:
 
 Success criteria:
 - native equivalents exist for Ceph `test_get_bucket_policy_status`,
-  `test_get_public_acl_bucket_policy_status`,
-  `test_get_authpublic_acl_bucket_policy_status`,
   `test_get_publicpolicy_acl_bucket_policy_status`,
   `test_get_nonpublicpolicy_acl_bucket_policy_status`,
   `test_get_nonpublicpolicy_principal_bucket_policy_status`, and
   `test_bucket_policy_allow_notprincipal`
+- ACL-only buckets follow AWS and return `NoSuchBucketPolicy`
 
 ## Test Plan
 
 Targeted integration tests:
+- `cargo test -p s3-tests --test bucket_policy test_get_bucket_policy_status_private_bucket -- --exact --nocapture`
+- `cargo test -p s3-tests --test bucket_policy test_get_bucket_policy_status_public_bucket_acl -- --exact --nocapture`
+- `cargo test -p s3-tests --test bucket_policy test_get_bucket_policy_status_public_bucket_policy -- --exact --nocapture`
+- `cargo test -p s3-tests --test bucket_policy test_get_bucket_policy_status_nonpublic_bucket_policy -- --exact --nocapture`
+- `cargo test -p s3-tests --test bucket_policy test_get_bucket_policy_status_nonpublic_fixed_principal_policy -- --exact --nocapture`
+- `cargo test -p s3-tests --test bucket_policy test_get_bucket_policy_status_cross_account_allow -- --exact --nocapture`
+- `cargo test -p s3-tests --test bucket_policy test_get_bucket_policy_status_cross_account_deny_overrides_allow -- --exact --nocapture`
+- `cargo test -p s3-tests --test bucket_policy test_put_bucket_policy_not_principal_rejected -- --exact --nocapture`
 - `cargo test -p s3-tests --test bucket_policy test_bucket_policy_list_objects_v1 -- --exact --nocapture`
 - `cargo test -p s3-tests --test bucket_policy test_bucket_policy_list_objects_v2 -- --exact --nocapture`
 - `cargo test -p s3-tests --test bucket_policy test_bucket_policy_list_deny_overrides_bucket_acl -- --exact --nocapture`

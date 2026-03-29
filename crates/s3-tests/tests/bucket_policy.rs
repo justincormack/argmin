@@ -68,6 +68,26 @@ fn alt_policy_principal() -> Option<serde_json::Value> {
         .map(|account_id| json!({ "AWS": format!("arn:aws:iam::{account_id}:root") }))
 }
 
+fn fixed_nonpublic_principal() -> serde_json::Value {
+    if let Some(account_id) = CTX.alt_account_id().or(CTX.account_id()) {
+        json!({ "AWS": format!("arn:aws:iam::{account_id}:root") })
+    } else {
+        json!({ "Service": "logging.s3.amazonaws.com" })
+    }
+}
+
+async fn bucket_policy_status_is_public(client: &aws_sdk_s3::Client, bucket: &str) -> bool {
+    client
+        .get_bucket_policy_status()
+        .bucket(bucket)
+        .send()
+        .await
+        .unwrap()
+        .policy_status()
+        .and_then(|status| status.is_public())
+        .expect("expected PolicyStatus.IsPublic")
+}
+
 async fn set_object_writer_ownership(bucket: &str) {
     let rule = aws_sdk_s3::types::OwnershipControlsRule::builder()
         .object_ownership(ObjectOwnership::ObjectWriter)
@@ -208,6 +228,315 @@ fn test_bucket_policy_put_get_delete() {
             .send()
             .await
             .unwrap();
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_get_bucket_policy_status_private_bucket() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let result = client
+            .get_bucket_policy_status()
+            .bucket(&bucket)
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 404);
+        assert_eq!(
+            result
+                .unwrap_err()
+                .as_service_error()
+                .and_then(ProvideErrorMetadata::code),
+            Some("NoSuchBucketPolicy")
+        );
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_get_bucket_policy_status_public_bucket_acl() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = create_public_bucket(client).await;
+
+        let result = client
+            .get_bucket_policy_status()
+            .bucket(&bucket)
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 404);
+        assert_eq!(
+            result
+                .unwrap_err()
+                .as_service_error()
+                .and_then(ProvideErrorMetadata::code),
+            Some("NoSuchBucketPolicy")
+        );
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_get_bucket_policy_status_public_bucket_policy() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let put_result = client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(bucket_policy_document(
+                json!("*"),
+                "Allow",
+                "s3:ListBucket",
+                bucket_resource(&bucket),
+            ))
+            .send()
+            .await;
+        match put_result {
+            Ok(_) => {}
+            Err(err)
+                if std::env::var("S3_TEST_ENDPOINT").is_ok()
+                    && err.as_service_error().and_then(ProvideErrorMetadata::code)
+                        == Some("AccessDenied")
+                    && format!("{err:?}").contains("BlockPublicPolicy") =>
+            {
+                eprintln!(
+                    "skipping test_get_bucket_policy_status_public_bucket_policy: account-level BlockPublicPolicy prevented installing the required public policy"
+                );
+                cleanup(&bucket, &[]).await;
+                return;
+            }
+            Err(err) => panic!("put_bucket_policy failed unexpectedly: {err:?}"),
+        }
+
+        assert!(bucket_policy_status_is_public(client, &bucket).await);
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_get_bucket_policy_status_nonpublic_bucket_policy() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": "s3:ListBucket",
+                "Resource": bucket_resource(&bucket),
+                "Condition": {
+                    "IpAddress": {
+                        "aws:SourceIp": "10.0.0.0/32"
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        assert!(!bucket_policy_status_is_public(client, &bucket).await);
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_get_bucket_policy_status_nonpublic_fixed_principal_policy() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": fixed_nonpublic_principal(),
+                "Action": "s3:ListBucket",
+                "Resource": bucket_resource(&bucket),
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        assert!(!bucket_policy_status_is_public(client, &bucket).await);
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_get_bucket_policy_status_cross_account_allow() {
+    s3_tests::run(async {
+        if !CTX.has_alt_client() {
+            return;
+        }
+        let Some(principal) = alt_policy_principal() else {
+            return;
+        };
+
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        if !ensure_distinct_s3_owners_or_skip(
+            client,
+            alt_client,
+            "test_get_bucket_policy_status_cross_account_allow",
+        )
+        .await
+        {
+            return;
+        }
+
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        let policy = bucket_policy_document(
+            principal,
+            "Allow",
+            "s3:GetBucketPolicyStatus",
+            bucket_resource(&bucket),
+        );
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+        client
+            .get_bucket_policy()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+
+        assert!(!bucket_policy_status_is_public(alt_client, &bucket).await);
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_get_bucket_policy_status_cross_account_deny_overrides_allow() {
+    s3_tests::run(async {
+        if !CTX.has_alt_client() {
+            return;
+        }
+        let Some(principal) = alt_policy_principal() else {
+            return;
+        };
+
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        if !ensure_distinct_s3_owners_or_skip(
+            client,
+            alt_client,
+            "test_get_bucket_policy_status_cross_account_deny_overrides_allow",
+        )
+        .await
+        {
+            return;
+        }
+
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": principal.clone(),
+                    "Action": "s3:GetBucketPolicyStatus",
+                    "Resource": bucket_resource(&bucket),
+                },
+                {
+                    "Effect": "Deny",
+                    "Principal": principal,
+                    "Action": "s3:GetBucketPolicyStatus",
+                    "Resource": bucket_resource(&bucket),
+                }
+            ],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+        client
+            .get_bucket_policy()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+
+        let result = alt_client
+            .get_bucket_policy_status()
+            .bucket(&bucket)
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 403);
+        assert_eq!(
+            result
+                .unwrap_err()
+                .as_service_error()
+                .and_then(ProvideErrorMetadata::code),
+            Some("AccessDenied")
+        );
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_put_bucket_policy_not_principal_rejected() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "NotPrincipal": fixed_nonpublic_principal(),
+                "Action": "s3:ListBucket",
+                "Resource": bucket_resource(&bucket),
+            }],
+        })
+        .to_string();
+
+        let result = client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "MalformedPolicy");
 
         cleanup(&bucket, &[]).await;
     });

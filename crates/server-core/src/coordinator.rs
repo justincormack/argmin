@@ -3698,6 +3698,31 @@ impl Coordinator {
         }
     }
 
+    fn requester_can_get_bucket_policy_status_with_bucket_policy(
+        requester: &Requester,
+        bucket: &BucketSummary,
+        policy: Option<&auth::BucketPolicy>,
+    ) -> bool {
+        match Self::bucket_policy_decision_for_bucket(
+            requester,
+            bucket,
+            auth::PolicyAction::GetBucketPolicyStatus,
+            policy,
+        ) {
+            auth::PolicyEvaluation::ExplicitDeny => false,
+            auth::PolicyEvaluation::ExplicitAllow
+                if Self::bucket_policy_allow_survives_restrict_public_buckets(
+                    requester, bucket,
+                ) =>
+            {
+                true
+            }
+            auth::PolicyEvaluation::ExplicitAllow | auth::PolicyEvaluation::NoMatch => {
+                Self::requester_can_bucket_admin(requester, &bucket.owner_principal)
+            }
+        }
+    }
+
     fn requester_can_list_bucket_with_bucket_policy(
         requester: &Requester,
         bucket: &BucketSummary,
@@ -5078,6 +5103,17 @@ impl Coordinator {
         )
     }
 
+    pub fn get_bucket_policy_status_for_request(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<bool, ServerError> {
+        self.get_bucket_policy_status_with_expected_bucket_owner(
+            req.name,
+            req.requester.clone(),
+            req.expected_bucket_owner(),
+        )
+    }
+
     pub fn delete_bucket_policy_for_request(
         &self,
         req: &BucketRequest<'_>,
@@ -5651,6 +5687,47 @@ impl Coordinator {
         self.storage_node.upsert_bucket_fast_path((&info).into());
         self.clear_bucket_policy_cache(name);
         Ok(())
+    }
+
+    pub fn get_bucket_policy_status(
+        &self,
+        name: &str,
+        requester: Requester,
+    ) -> Result<bool, ServerError> {
+        self.get_bucket_policy_status_with_expected_bucket_owner(name, requester, None)
+    }
+
+    pub fn get_bucket_policy_status_with_expected_bucket_owner(
+        &self,
+        name: &str,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<bool, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::get_bucket_policy_status",
+            "bucket={}",
+            name
+        );
+        let bucket_info = self.active_bucket_summary(name)?;
+        Self::ensure_expected_bucket_owner(&bucket_info, expected_bucket_owner)?;
+        if !bucket_info.bucket_policy_present {
+            if !Self::requester_can_bucket_admin(&requester, &bucket_info.owner_principal) {
+                return Err(ServerError::AccessDenied);
+            }
+            return Err(ServerError::NoSuchBucketPolicy {
+                bucket: name.to_string(),
+            });
+        }
+        let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
+        if !Self::requester_can_get_bucket_policy_status_with_bucket_policy(
+            &requester,
+            &bucket_info,
+            bucket_policy.as_deref(),
+        ) {
+            return Err(ServerError::AccessDenied);
+        }
+        Ok(bucket_info.bucket_policy_public)
     }
 
     // ── Public access block ───────────────────────────────────────────
@@ -12392,6 +12469,99 @@ mod tests {
 
         let err = coord
             .get_bucket_public_access_block("bucket", Requester::principal("111122223333"))
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn get_bucket_policy_status_defaults_private() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("111122223333", "bucket", false)
+            .unwrap();
+
+        let err = coord
+            .get_bucket_policy_status("bucket", Requester::principal("111122223333"))
+            .unwrap_err();
+        assert!(matches!(err, ServerError::NoSuchBucketPolicy { .. }));
+    }
+
+    #[test]
+    fn get_bucket_policy_status_public_bucket_acl_without_policy_returns_no_such_bucket_policy() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let owner = Requester::principal("111122223333");
+        coord
+            .create_bucket_for_owner("111122223333", "bucket", false)
+            .unwrap();
+        coord
+            .put_bucket_canned_acl("bucket", BucketAcl::PublicRead, owner.clone())
+            .unwrap();
+
+        let err = coord.get_bucket_policy_status("bucket", owner).unwrap_err();
+        assert!(matches!(err, ServerError::NoSuchBucketPolicy { .. }));
+    }
+
+    #[test]
+    fn get_bucket_policy_status_reports_public_bucket_policy() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("111122223333", "bucket", false)
+            .unwrap();
+        coord
+            .put_bucket_policy(
+                "bucket",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket"}]}"#,
+                Requester::principal("111122223333"),
+            )
+            .unwrap();
+
+        let is_public = coord
+            .get_bucket_policy_status("bucket", Requester::principal("111122223333"))
+            .unwrap();
+        assert!(is_public);
+    }
+
+    #[test]
+    fn get_bucket_policy_status_bucket_policy_allow_applies() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("111122223333", "bucket", false)
+            .unwrap();
+        coord
+            .put_bucket_policy(
+                "bucket",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"444455556666"},"Action":"s3:GetBucketPolicyStatus","Resource":"arn:aws:s3:::bucket"}]}"#,
+                Requester::principal("111122223333"),
+            )
+            .unwrap();
+
+        let is_public = coord
+            .get_bucket_policy_status("bucket", Requester::principal("444455556666"))
+            .unwrap();
+        assert!(!is_public);
+    }
+
+    #[test]
+    fn get_bucket_policy_status_bucket_policy_deny_applies() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("111122223333", "bucket", false)
+            .unwrap();
+        coord
+            .put_bucket_policy(
+                "bucket",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetBucketPolicyStatus","Resource":"arn:aws:s3:::bucket"}]}"#,
+                Requester::principal("111122223333"),
+            )
+            .unwrap();
+
+        let err = coord
+            .get_bucket_policy_status("bucket", Requester::principal("111122223333"))
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
     }

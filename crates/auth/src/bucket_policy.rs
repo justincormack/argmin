@@ -81,6 +81,7 @@ impl BucketPolicy {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyAction {
+    GetBucketPolicyStatus,
     GetBucketPublicAccessBlock,
     ListBucket,
     GetObject,
@@ -100,6 +101,7 @@ impl PolicyAction {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::GetBucketPolicyStatus => "s3:GetBucketPolicyStatus",
             Self::GetBucketPublicAccessBlock => "s3:GetBucketPublicAccessBlock",
             Self::ListBucket => "s3:ListBucket",
             Self::GetObject => "s3:GetObject",
@@ -808,7 +810,8 @@ fn validate_resource_applicability(
     Ok(())
 }
 
-const SUPPORTED_BUCKET_POLICY_BUCKET_ACTIONS: [PolicyAction; 2] = [
+const SUPPORTED_BUCKET_POLICY_BUCKET_ACTIONS: [PolicyAction; 3] = [
+    PolicyAction::GetBucketPolicyStatus,
     PolicyAction::GetBucketPublicAccessBlock,
     PolicyAction::ListBucket,
 ];
@@ -1700,6 +1703,21 @@ mod tests {
     }
 
     #[test]
+    fn get_bucket_policy_status_matches_bucket_resource() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetBucketPolicyStatus","Resource":"arn:aws:s3:::bucket"}]}"#,
+        )
+        .unwrap();
+        let request = bucket_request(
+            PolicyAction::GetBucketPolicyStatus,
+            "bucket",
+            Some("caller"),
+        );
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+    }
+
+    #[test]
     fn list_bucket_matches_bucket_resource() {
         let policy = parse_bucket_policy(
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket"}]}"#,
@@ -1708,6 +1726,21 @@ mod tests {
         let request = bucket_request(PolicyAction::ListBucket, "bucket", Some("caller"));
 
         assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+    }
+
+    #[test]
+    fn get_bucket_policy_status_object_only_resource_is_rejected() {
+        let err = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetBucketPolicyStatus","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            BucketPolicyError::Malformed {
+                reason: "Action does not apply to any resource(s) in statement",
+            }
+        );
     }
 
     #[test]

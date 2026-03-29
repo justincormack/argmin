@@ -28,7 +28,7 @@ checks first would force another authz rewrite later.
 
 This plan should land before:
 - `plans/completed/object-and-bucket-acls.md`
-- `plans/bucket-policies.md`
+- `plans/completed/bucket-policies.md`
 
 ## Current State
 
@@ -63,7 +63,7 @@ The ownership foundations work covered here is done.
 
 Remaining follow-up work is outside this plan:
 - broader ACL/header-grant coverage belongs to `plans/completed/object-and-bucket-acls.md`
-- bucket-policy behavior belongs to `plans/bucket-policies.md`
+- bucket-policy behavior belongs to `plans/completed/bucket-policies.md`
 
 Completed in Phase 1:
 - shared `AccountIdentity` type added for auth and request handling

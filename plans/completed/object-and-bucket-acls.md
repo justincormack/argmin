@@ -49,7 +49,7 @@ object and bucket ACL surface covered here is implemented and exercised by live
 integration tests.
 
 Remaining follow-up work is outside this plan:
-- bucket-policy evaluation belongs to `plans/bucket-policies.md`
+- bucket-policy evaluation belongs to `plans/completed/bucket-policies.md`
 - account-level public access block remains out of scope
 - `AuthenticatedUsers` parsing and serialization exist, but those grants are
   still rejected on write because enforcement semantics remain a separate

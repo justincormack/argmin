@@ -1730,6 +1730,17 @@ impl HttpFrontend {
                     }),
                 }
             }
+            S3Operation::GetBucketPolicyStatus { bucket } => {
+                let requester = Self::requester_from_auth(auth);
+                let is_public = self.coordinator.get_bucket_policy_status_for_request(
+                    &crate::coordinator::BucketRequest {
+                        name: &bucket,
+                        requester,
+                        expected_bucket_owner,
+                    },
+                )?;
+                Ok(S3Response::get_bucket_policy_status(is_public))
+            }
             S3Operation::DeleteBucketPolicy { bucket } => {
                 let requester = Self::requester_from_auth(auth);
                 self.coordinator.delete_bucket_policy_for_request(
@@ -4757,6 +4768,37 @@ mod tests {
             Err(e) => panic!("expected MalformedPolicy, got {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
+    }
+
+    #[test]
+    fn get_bucket_policy_status_renders_xml() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        fe.coordinator
+            .create_bucket_for_owner("testuser", "mybucket", false)
+            .unwrap();
+        fe.coordinator
+            .put_bucket_policy(
+                "mybucket",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::mybucket"}]}"#,
+                crate::coordinator::Requester::principal("testuser"),
+            )
+            .unwrap();
+
+        let get_req = new_req(http::Method::GET, "/", "policyStatus", vec![], vec![]);
+        let get_resp = fe
+            .dispatch_routed(
+                &get_req,
+                &test_auth(),
+                S3Operation::GetBucketPolicyStatus {
+                    bucket: "mybucket".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(get_resp.status_code, 200);
+        let body = String::from_utf8(get_resp.body).unwrap();
+        assert!(body.contains("<PolicyStatus"));
+        assert!(body.contains("<IsPublic>true</IsPublic>"));
     }
 
     #[test]

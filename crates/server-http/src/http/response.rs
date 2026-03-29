@@ -716,6 +716,15 @@ impl S3Response {
         Self::new(200).json_body(policy.to_string())
     }
 
+    /// Build a response for `GetBucketPolicyStatus` (200 OK, XML body).
+    #[must_use]
+    pub fn get_bucket_policy_status(is_public: bool) -> Self {
+        let is_public = if is_public { "true" } else { "false" };
+        Self::new(200).xml_body(format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><PolicyStatus xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><IsPublic>{is_public}</IsPublic></PolicyStatus>"
+        ))
+    }
+
     /// Build a response for `DeleteBucketPolicy` (204 No Content).
     #[must_use]
     pub fn delete_bucket_policy() -> Self {
@@ -1602,6 +1611,16 @@ mod tests {
         assert!(body.contains("ListAllMyBucketsResult"));
         assert!(body.contains(owner_canonical_id.as_str()));
         assert!(body.contains("<DisplayName>Owner A</DisplayName>"));
+    }
+
+    #[test]
+    fn get_bucket_policy_status_response() {
+        let resp = S3Response::get_bucket_policy_status(true);
+        assert_eq!(resp.status_code, 200);
+        assert_eq!(find_header(&resp, "Content-Type"), Some("application/xml"));
+        let body = String::from_utf8(resp.body).unwrap();
+        assert!(body.contains("<PolicyStatus"));
+        assert!(body.contains("<IsPublic>true</IsPublic>"));
     }
 
     // ── list_objects_v2 ───────────────────────────────────────────────

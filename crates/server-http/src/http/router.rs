@@ -49,6 +49,7 @@ pub enum S3Operation {
     ListParts { bucket: String, key: String },
     PutBucketPolicy { bucket: String },
     GetBucketPolicy { bucket: String },
+    GetBucketPolicyStatus { bucket: String },
     DeleteBucketPolicy { bucket: String },
     OptionsRequest { bucket: String, key: Option<String> },
 }
@@ -287,6 +288,12 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
             // Check for ?policy → GetBucketPolicy
             if has_query_key(query, "policy") {
                 return Ok(S3Operation::GetBucketPolicy {
+                    bucket: bucket.to_string(),
+                });
+            }
+            // Check for ?policyStatus → GetBucketPolicyStatus
+            if has_query_key(query, "policyStatus") {
+                return Ok(S3Operation::GetBucketPolicyStatus {
                     bucket: bucket.to_string(),
                 });
             }
@@ -942,6 +949,16 @@ mod tests {
         assert_eq!(
             route("GET", "/mybucket", "policy").unwrap(),
             S3Operation::GetBucketPolicy {
+                bucket: "mybucket".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn get_bucket_policy_status() {
+        assert_eq!(
+            route("GET", "/mybucket", "policyStatus").unwrap(),
+            S3Operation::GetBucketPolicyStatus {
                 bucket: "mybucket".to_string()
             }
         );
