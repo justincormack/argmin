@@ -11,7 +11,7 @@ use auth::canonical::uri_encode;
 use checksum::{ChecksumAlgorithm, ChecksumType, RawChecksum};
 use s3_types::{
     BucketObjectLockConfig, BucketVersioningState, CanonicalUserId, LegalHoldStatus,
-    ObjectRetention, VersionId,
+    ObjectLockState, ObjectRetention, VersionId,
 };
 use server_core::sse::{SseCustomerResponseHeaders, SSE_CUSTOMER_ALGORITHM};
 use server_core::system_metadata::SystemMetadata;
@@ -210,6 +210,20 @@ impl S3Response {
         self
     }
 
+    fn apply_object_lock_headers(mut self, object_lock: ObjectLockState) -> Self {
+        if let Some(retention) = object_lock.retention {
+            self = self.header("x-amz-object-lock-mode", retention.mode.as_str());
+            self = self.header(
+                "x-amz-object-lock-retain-until-date",
+                &xml::format_object_lock_timestamp(retention.retain_until_unix_seconds),
+            );
+        }
+        if let Some(legal_hold) = object_lock.legal_hold.as_legal_hold_status() {
+            self = self.header("x-amz-object-lock-legal-hold", legal_hold.as_str());
+        }
+        self
+    }
+
     fn apply_checksum_mode_headers(mut self, metadata: &SystemMetadata) -> Self {
         for (name, value) in metadata.checksum_header_pairs() {
             self = self.header(name, value);
@@ -291,7 +305,8 @@ impl S3Response {
         }
         resp = resp
             .apply_system_metadata_headers(&result.system_metadata)
-            .apply_user_metadata_headers(&result.metadata);
+            .apply_user_metadata_headers(&result.metadata)
+            .apply_object_lock_headers(result.object_lock);
 
         // Checksum headers (only when ChecksumMode=ENABLED)
         if checksum_mode.is_some_and(|m| m.eq_ignore_ascii_case("ENABLED")) {
@@ -333,7 +348,8 @@ impl S3Response {
         }
         resp = resp
             .apply_system_metadata_headers(&result.system_metadata)
-            .apply_user_metadata_headers(&result.metadata);
+            .apply_user_metadata_headers(&result.metadata)
+            .apply_object_lock_headers(result.object_lock);
 
         // Checksum headers (only when ChecksumMode=ENABLED)
         if checksum_mode.is_some_and(|m| m.eq_ignore_ascii_case("ENABLED")) {
@@ -359,7 +375,8 @@ impl S3Response {
         }
         resp = resp
             .apply_system_metadata_headers(&result.system_metadata)
-            .apply_user_metadata_headers(&result.metadata);
+            .apply_user_metadata_headers(&result.metadata)
+            .apply_object_lock_headers(result.object_lock);
 
         // Per-part checksum (always emitted for part-level requests)
         if let Some(ref cksum) = result.checksum {
@@ -392,7 +409,8 @@ impl S3Response {
         }
         resp = resp
             .apply_system_metadata_headers(&result.system_metadata)
-            .apply_user_metadata_headers(&result.metadata);
+            .apply_user_metadata_headers(&result.metadata)
+            .apply_object_lock_headers(result.object_lock);
 
         resp.apply_sse_customer_headers(result.sse_customer.as_ref())
             .streaming_body(result.body, result.range_end - result.range_start + 1)
@@ -424,7 +442,8 @@ impl S3Response {
         }
         resp = resp
             .apply_system_metadata_headers(&result.system_metadata)
-            .apply_user_metadata_headers(&result.metadata);
+            .apply_user_metadata_headers(&result.metadata)
+            .apply_object_lock_headers(result.object_lock);
 
         // Per-part checksum (always emitted for part-level GETs)
         if let Some(ref cksum) = result.checksum {
@@ -1443,6 +1462,41 @@ mod tests {
         assert_eq!(find_header(&resp, "x-amz-checksum-type"), None);
     }
 
+    #[test]
+    fn get_object_emits_object_lock_headers() {
+        let result = GetObjectResult {
+            sse_customer: None,
+            body: ReadHandle::from_buffered_bytes(vec![]),
+            metadata: MetadataBlob::new(),
+            system_metadata: SystemMetadata::new(),
+            object_lock: s3_types::ObjectLockState {
+                retention: Some(ObjectRetention {
+                    mode: s3_types::ObjectLockMode::Governance,
+                    retain_until_unix_seconds: 1_775_001_600,
+                }),
+                legal_hold: s3_types::StoredLegalHoldStatus::On,
+            },
+            etag: "\"e\"".into(),
+            size: 0,
+            last_modified: 0,
+            version_id: VersionId::Null,
+            tags: None,
+        };
+        let resp = S3Response::get_object(result, None);
+        assert_eq!(
+            find_header(&resp, "x-amz-object-lock-mode"),
+            Some("GOVERNANCE")
+        );
+        assert_eq!(
+            find_header(&resp, "x-amz-object-lock-retain-until-date"),
+            Some("2026-04-01T00:00:00.000Z")
+        );
+        assert_eq!(
+            find_header(&resp, "x-amz-object-lock-legal-hold"),
+            Some("ON")
+        );
+    }
+
     // ── head_object ───────────────────────────────────────────────────
 
     #[test]
@@ -1566,6 +1620,37 @@ mod tests {
         assert_eq!(find_header(&resp, "x-amz-checksum-type"), None);
     }
 
+    #[test]
+    fn head_object_emits_object_lock_headers_and_omits_never_set_legal_hold() {
+        let result = HeadObjectResult {
+            sse_customer: None,
+            metadata: MetadataBlob::new(),
+            system_metadata: SystemMetadata::new(),
+            object_lock: s3_types::ObjectLockState {
+                retention: Some(ObjectRetention {
+                    mode: s3_types::ObjectLockMode::Compliance,
+                    retain_until_unix_seconds: 1_775_001_600,
+                }),
+                legal_hold: s3_types::StoredLegalHoldStatus::NotSet,
+            },
+            etag: "\"e\"".into(),
+            size: 0,
+            last_modified: 0,
+            version_id: VersionId::Null,
+            tags: None,
+        };
+        let resp = S3Response::head_object(&result, None);
+        assert_eq!(
+            find_header(&resp, "x-amz-object-lock-mode"),
+            Some("COMPLIANCE")
+        );
+        assert_eq!(
+            find_header(&resp, "x-amz-object-lock-retain-until-date"),
+            Some("2026-04-01T00:00:00.000Z")
+        );
+        assert_eq!(find_header(&resp, "x-amz-object-lock-legal-hold"), None);
+    }
+
     // ── delete_object ─────────────────────────────────────────────────
 
     #[test]
@@ -1632,7 +1717,7 @@ mod tests {
     fn get_object_retention_response() {
         let resp = S3Response::get_object_retention(Some(ObjectRetention {
             mode: s3_types::ObjectLockMode::Governance,
-            retain_until_unix_seconds: 5_364_662_400,
+            retain_until_unix_seconds: 1_775_001_600,
         }));
         assert_eq!(resp.status_code, 200);
         assert_eq!(find_header(&resp, "Content-Type"), Some("application/xml"));

@@ -27,7 +27,7 @@ core Object Lock surface is correct.
 Implemented already:
 - Phase 1 test port: `crates/s3-tests/tests/object_lock.rs` exists, was
   validated against real AWS with all 39 cases enabled, and currently keeps the
-  38 completed bucket/object API cases active while the remaining 10
+  41 completed bucket/object API cases active while the remaining 7
   later-phase cases stay `ignore`d until their features land
 - explicit Object Lock domain types exist across `s3-types`, storage, and
   coordinator code
@@ -65,17 +65,20 @@ Implemented already:
 - bucket versioning
 - version-specific reads/deletes and delete markers
 - `HeadObject` / `GetObject` metadata plumbing
+- `HeadObject` / `GetObject` now project Object Lock headers from version
+  metadata:
+  - `x-amz-object-lock-mode`
+  - `x-amz-object-lock-retain-until-date`
+  - `x-amz-object-lock-legal-hold`, omitted when never set
 - multipart upload create/complete paths
 - enough auth/ACL foundations for owner-driven object operations
 
 Missing today:
-- `HeadObject` / `GetObject` do not project Object Lock headers
 - `DeleteObject` / `DeleteObjects` do not enforce WORM semantics or governance
   bypass
 - bucket-policy action coverage does not include Object Lock actions
-- the remaining 10 `ignore`d cases in `crates/s3-tests/tests/object_lock.rs`
+- the remaining 7 `ignore`d cases in `crates/s3-tests/tests/object_lock.rs`
   are now concentrated in later phases:
-  - `HeadObject` Object Lock headers
   - WORM delete / multi-delete enforcement
 
 ## AWS Contract To Match
@@ -361,6 +364,17 @@ Likely touch points:
 - `complete_multipart_upload`
 
 ### Phase 8: Response Headers On Read Paths
+
+Status update:
+- complete
+- local and AWS validation currently have `41 passed / 7 ignored` in
+  `crates/s3-tests/tests/object_lock.rs`
+- verified against real AWS for:
+  - `HeadObject` Object Lock headers
+  - `GetObject` Object Lock headers
+  - omission of `x-amz-object-lock-legal-hold` when no legal hold was ever set
+  - inline write-path Object Lock state being reflected immediately on
+    subsequent reads
 
 Project stored Object Lock state back onto read responses:
 - `HeadObject`

@@ -11,16 +11,15 @@ use base64::Engine;
 use ring::hmac;
 use s3_tests::{assert_s3_err_code, err_status, unique_bucket, CTX};
 
-const DATE_2030_01_01: i64 = 1_893_456_000;
-const DATE_2030_01_03: i64 = 1_893_628_800;
-const DATE_2140_01_01: i64 = 5_364_662_400;
+// Keep AWS-backed Object Lock tests on short retention windows so cleanup does
+// not strand long-lived governed objects if a test fails midway. Compliance
+// cases use an even shorter window because cleanup cannot bypass compliance.
+const GOVERNANCE_RETENTION_SECS: u64 = 24 * 60 * 60;
+const GOVERNANCE_RETENTION_LATER_SECS: u64 = 2 * 24 * 60 * 60;
+const COMPLIANCE_RETENTION_SECS: u64 = 10;
 
 fn agent() -> ureq::Agent {
     s3_tests::test_agent()
-}
-
-fn date_time(epoch_seconds: i64) -> DateTime {
-    DateTime::from_secs(epoch_seconds)
 }
 
 fn future_date(seconds_from_now: u64) -> DateTime {
@@ -494,11 +493,11 @@ fn legal_hold_xml(status: &str) -> String {
 }
 
 fn governance_retain_until() -> DateTime {
-    date_time(DATE_2030_01_01)
+    future_date(GOVERNANCE_RETENTION_SECS)
 }
 
 fn governance_retain_until_later() -> DateTime {
-    date_time(DATE_2030_01_03)
+    future_date(GOVERNANCE_RETENTION_LATER_SECS)
 }
 
 fn assert_retention_within_window(
@@ -808,7 +807,7 @@ fn test_object_lock_put_obj_retention() {
         let bucket = setup_object_lock_bucket().await;
         let key = "file1";
         let version_id = put_object_bytes(&bucket, key, b"abc").await;
-        let retain_until = date_time(DATE_2140_01_01);
+        let retain_until = governance_retain_until();
         let retention = retention(ObjectLockRetentionMode::Governance, retain_until);
 
         client
@@ -839,7 +838,7 @@ fn test_object_lock_put_object_headers_persist() {
         let client = CTX.client();
         let bucket = setup_object_lock_bucket().await;
         let key = "file1";
-        let retain_until = date_time(DATE_2140_01_01);
+        let retain_until = governance_retain_until();
         let version_id = client
             .put_object()
             .bucket(&bucket)
@@ -927,7 +926,7 @@ fn test_object_lock_put_object_headers_invalid_bucket_large_body() {
         let client = CTX.client();
         let bucket = setup_bucket().await;
         let key = "file1";
-        let retain_until = date_time(DATE_2140_01_01);
+        let retain_until = governance_retain_until();
         let body = vec![b'x'; server_core::coordinator::INTERNAL_SEGMENT_SIZE + 1];
 
         let result = client
@@ -989,14 +988,16 @@ fn test_object_lock_put_obj_retention_invalid_mode() {
         let key = "file1";
         put_object_bytes(&bucket, key, b"abc").await;
         let url = object_retention_url(&bucket, key);
-        let retain_until = "2030-01-01T00:00:00Z";
+        let retain_until = governance_retain_until()
+            .fmt(DateTimeFormat::DateTime)
+            .unwrap();
 
-        let body = object_retention_xml("governance", retain_until);
+        let body = object_retention_xml("governance", &retain_until);
         let (status, response_body) = signed_put_xml(&url, body.as_bytes());
         assert_eq!(status, 400, "body: {response_body}");
         assert_xml_error_code(&response_body, "MalformedXML");
 
-        let body = object_retention_xml("abc", retain_until);
+        let body = object_retention_xml("abc", &retain_until);
         let (status, response_body) = signed_put_xml(&url, body.as_bytes());
         assert_eq!(status, 400, "body: {response_body}");
         assert_xml_error_code(&response_body, "MalformedXML");
@@ -1014,7 +1015,7 @@ fn test_object_lock_get_obj_retention() {
         let version_id = put_object_bytes(&bucket, key, b"abc").await;
         let retention = retention(
             ObjectLockRetentionMode::Governance,
-            governance_retain_until(),
+            governance_retain_until_later(),
         );
 
         client
@@ -1040,14 +1041,13 @@ fn test_object_lock_get_obj_retention() {
 }
 
 #[test]
-#[ignore = "Object Lock / WORM not implemented yet"]
 fn test_object_lock_get_obj_retention_iso8601() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = setup_object_lock_bucket().await;
         let key = "file1";
         let version_id = put_object_bytes(&bucket, key, b"abc").await;
-        let retain_until = future_date(365 * 24 * 60 * 60);
+        let retain_until = governance_retain_until();
         let retention = retention(ObjectLockRetentionMode::Governance, retain_until);
 
         client
@@ -1151,7 +1151,7 @@ fn test_object_lock_put_obj_retention_override_default_retention() {
         let version_id = put_object_bytes(&bucket, key, b"abc").await;
         let retention = retention(
             ObjectLockRetentionMode::Governance,
-            governance_retain_until(),
+            governance_retain_until_later(),
         );
         client
             .put_object_retention()
@@ -1813,7 +1813,7 @@ fn test_object_lock_copy_object_headers_persist() {
         let dst_bucket = setup_object_lock_bucket().await;
         let src_key = "src";
         let dst_key = "dst";
-        let retain_until = date_time(DATE_2140_01_01);
+        let retain_until = governance_retain_until();
 
         client
             .put_object()
@@ -1890,7 +1890,7 @@ fn test_object_lock_copy_object_headers_invalid_bucket() {
         let dst_bucket = setup_bucket().await;
         let src_key = "src";
         let dst_key = "dst";
-        let retain_until = date_time(DATE_2140_01_01);
+        let retain_until = governance_retain_until();
         let source_body = vec![b'a'; server_core::coordinator::INTERNAL_SEGMENT_SIZE + 1];
 
         client
@@ -2073,7 +2073,6 @@ fn test_object_lock_delete_object_with_legal_hold_off() {
 }
 
 #[test]
-#[ignore = "Object Lock / WORM not implemented yet"]
 fn test_object_lock_get_obj_metadata() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -2128,7 +2127,6 @@ fn test_object_lock_get_obj_metadata() {
 }
 
 #[test]
-#[ignore = "Object Lock / WORM not implemented yet"]
 fn test_object_lock_uploading_obj() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -2184,7 +2182,7 @@ fn test_object_lock_changing_mode_from_governance_with_bypass() {
         let client = CTX.client();
         let bucket = setup_object_lock_bucket().await;
         let key = "file1";
-        let retain_until = future_date(10);
+        let retain_until = future_date(COMPLIANCE_RETENTION_SECS);
         let version_id = put_object_bytes(&bucket, key, b"abc").await;
 
         client
@@ -2234,7 +2232,7 @@ fn test_object_lock_create_multipart_upload_headers_persist() {
         let client = CTX.client();
         let bucket = setup_object_lock_bucket().await;
         let key = "file1";
-        let retain_until = date_time(DATE_2140_01_01);
+        let retain_until = governance_retain_until();
 
         let create = client
             .create_multipart_upload()
@@ -2403,7 +2401,7 @@ fn test_object_lock_changing_mode_from_governance_without_bypass() {
         let client = CTX.client();
         let bucket = setup_object_lock_bucket().await;
         let key = "file1";
-        let retain_until = future_date(10);
+        let retain_until = future_date(COMPLIANCE_RETENTION_SECS);
         let version_id = put_object_bytes(&bucket, key, b"abc").await;
 
         client
@@ -2454,7 +2452,7 @@ fn test_object_lock_changing_mode_from_compliance() {
         let client = CTX.client();
         let bucket = setup_object_lock_bucket().await;
         let key = "file1";
-        let retain_until = future_date(10);
+        let retain_until = future_date(COMPLIANCE_RETENTION_SECS);
         let version_id = put_object_bytes(&bucket, key, b"abc").await;
 
         client

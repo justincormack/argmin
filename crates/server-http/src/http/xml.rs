@@ -2357,7 +2357,7 @@ fn days_in_month(year: i64, month: u32) -> Option<u32> {
     })
 }
 
-fn format_object_lock_timestamp(unix_seconds: u64) -> String {
+pub(crate) fn format_object_lock_timestamp(unix_seconds: u64) -> String {
     format_timestamp(unix_seconds.saturating_mul(1000))
 }
 
@@ -4471,14 +4471,14 @@ mod tests {
         let xml = br#"
             <Retention>
               <Mode>GOVERNANCE</Mode>
-              <RetainUntilDate>2140-01-01T00:00:00Z</RetainUntilDate>
+              <RetainUntilDate>2026-04-01T00:00:00Z</RetainUntilDate>
             </Retention>
         "#;
         assert_eq!(
             parse_object_retention_xml(xml).unwrap(),
             ObjectRetention {
                 mode: ObjectLockMode::Governance,
-                retain_until_unix_seconds: 5_364_662_400,
+                retain_until_unix_seconds: 1_775_001_600,
             }
         );
     }
@@ -4488,14 +4488,14 @@ mod tests {
         let xml = br#"
             <ObjectLockRetention>
               <Mode>COMPLIANCE</Mode>
-              <RetainUntilDate>2140-01-01T00:00:00.000Z</RetainUntilDate>
+              <RetainUntilDate>2026-04-01T00:00:00.000Z</RetainUntilDate>
             </ObjectLockRetention>
         "#;
         assert_eq!(
             parse_object_retention_xml(xml).unwrap(),
             ObjectRetention {
                 mode: ObjectLockMode::Compliance,
-                retain_until_unix_seconds: 5_364_662_400,
+                retain_until_unix_seconds: 1_775_001_600,
             }
         );
     }
@@ -4505,7 +4505,7 @@ mod tests {
         let xml = br#"
             <Retention>
               <Mode>governance</Mode>
-              <RetainUntilDate>2140-01-01T00:00:00Z</RetainUntilDate>
+              <RetainUntilDate>2026-04-01T00:00:00Z</RetainUntilDate>
             </Retention>
         "#;
         assert!(matches!(
@@ -4518,11 +4518,11 @@ mod tests {
     fn object_retention_xml_round_trip() {
         let xml = get_object_retention_xml(Some(ObjectRetention {
             mode: ObjectLockMode::Governance,
-            retain_until_unix_seconds: 5_364_662_400,
+            retain_until_unix_seconds: 1_775_001_600,
         }));
         assert!(xml.contains("<Retention"));
         assert!(xml.contains("<Mode>GOVERNANCE</Mode>"));
-        assert!(xml.contains("<RetainUntilDate>2140-01-01T00:00:00.000Z</RetainUntilDate>"));
+        assert!(xml.contains("<RetainUntilDate>2026-04-01T00:00:00.000Z</RetainUntilDate>"));
     }
 
     #[test]
