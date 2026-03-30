@@ -1352,6 +1352,8 @@ pub struct CommitMultipartReq {
     pub metadata_blob: Option<SerializedMetadataBlob>,
     /// Serialized system metadata headers.
     pub system_metadata_blob: Option<SerializedSystemMetadataBlob>,
+    /// Per-version Object Lock state to persist on the committed version.
+    pub object_lock: ObjectLockState,
     pub encryption: ObjectEncryption,
 }
 

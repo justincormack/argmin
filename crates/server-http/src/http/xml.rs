@@ -2361,78 +2361,87 @@ fn format_object_lock_timestamp(unix_seconds: u64) -> String {
     format_timestamp(unix_seconds.saturating_mul(1000))
 }
 
-fn parse_object_lock_timestamp_secs(raw: &str) -> Result<u64, ServerError> {
-    fn malformed() -> ServerError {
-        ServerError::MalformedXML {
-            reason: "malformed object retention XML".to_string(),
-        }
-    }
-
+fn parse_object_lock_timestamp_secs_with<F>(raw: &str, invalid: F) -> Result<u64, ServerError>
+where
+    F: Fn() -> ServerError,
+{
     let raw = raw.trim();
-    let datetime = raw.strip_suffix('Z').ok_or_else(malformed)?;
-    let (date, time) = datetime.split_once('T').ok_or_else(malformed)?;
+    let datetime = raw.strip_suffix('Z').ok_or_else(&invalid)?;
+    let (date, time) = datetime.split_once('T').ok_or_else(&invalid)?;
     let mut date_parts = date.split('-');
     let year: i64 = date_parts
         .next()
-        .ok_or_else(malformed)?
+        .ok_or_else(&invalid)?
         .parse()
-        .map_err(|_| malformed())?;
+        .map_err(|_| invalid())?;
     let month: u32 = date_parts
         .next()
-        .ok_or_else(malformed)?
+        .ok_or_else(&invalid)?
         .parse()
-        .map_err(|_| malformed())?;
+        .map_err(|_| invalid())?;
     let day: u32 = date_parts
         .next()
-        .ok_or_else(malformed)?
+        .ok_or_else(&invalid)?
         .parse()
-        .map_err(|_| malformed())?;
+        .map_err(|_| invalid())?;
     if date_parts.next().is_some() {
-        return Err(malformed());
+        return Err(invalid());
     }
 
     let (hms, fractional) = time
         .split_once('.')
         .map_or((time, None), |(h, f)| (h, Some(f)));
     if fractional.is_some_and(|part| !part.chars().all(|c| c.is_ascii_digit())) {
-        return Err(malformed());
+        return Err(invalid());
     }
     let mut time_parts = hms.split(':');
     let hour: u32 = time_parts
         .next()
-        .ok_or_else(malformed)?
+        .ok_or_else(&invalid)?
         .parse()
-        .map_err(|_| malformed())?;
+        .map_err(|_| invalid())?;
     let minute: u32 = time_parts
         .next()
-        .ok_or_else(malformed)?
+        .ok_or_else(&invalid)?
         .parse()
-        .map_err(|_| malformed())?;
+        .map_err(|_| invalid())?;
     let second: u32 = time_parts
         .next()
-        .ok_or_else(malformed)?
+        .ok_or_else(&invalid)?
         .parse()
-        .map_err(|_| malformed())?;
+        .map_err(|_| invalid())?;
     if time_parts.next().is_some() {
-        return Err(malformed());
+        return Err(invalid());
     }
 
-    let max_day = days_in_month(year, month).ok_or_else(malformed)?;
+    let max_day = days_in_month(year, month).ok_or_else(&invalid)?;
     if day == 0 || day > max_day || hour > 23 || minute > 59 || second > 59 {
-        return Err(malformed());
+        return Err(invalid());
     }
 
     let days = date_to_days(year, month, day);
     if days < 0 {
-        return Err(malformed());
+        return Err(invalid());
     }
     let secs = days
         .checked_mul(86_400)
         .and_then(|v| v.checked_add(i64::from(hour) * 3_600))
         .and_then(|v| v.checked_add(i64::from(minute) * 60))
         .and_then(|v| v.checked_add(i64::from(second)))
-        .ok_or_else(malformed)?;
-    u64::try_from(secs).map_err(|_| malformed())
+        .ok_or_else(&invalid)?;
+    u64::try_from(secs).map_err(|_| invalid())
+}
+
+fn parse_object_lock_timestamp_secs(raw: &str) -> Result<u64, ServerError> {
+    parse_object_lock_timestamp_secs_with(raw, || ServerError::MalformedXML {
+        reason: "malformed object retention XML".to_string(),
+    })
+}
+
+pub(crate) fn parse_object_lock_header_timestamp_secs(raw: &str) -> Result<u64, ServerError> {
+    parse_object_lock_timestamp_secs_with(raw, || ServerError::InvalidArgument {
+        reason: format!("invalid x-amz-object-lock-retain-until-date value: {raw}"),
+    })
 }
 
 /// Parse a `<Tagging>` XML request body into a list of (key, value) pairs.

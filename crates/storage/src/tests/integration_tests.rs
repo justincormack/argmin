@@ -331,6 +331,7 @@ fn multipart_upload_lifecycle() {
         tags: None,
         metadata_blob: Some(vec![].into()),
         system_metadata_blob: None,
+        object_lock: ObjectLockState::default(),
         encryption: ObjectEncryption::None,
     };
     let committed_parts = vec![

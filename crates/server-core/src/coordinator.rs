@@ -13,7 +13,7 @@ use ec::{EcConfig, ErasureCodec};
 use s3_types::{
     AccountIdentity, AclGrant, AclGrantee, AclGrants, AclPermission, BucketVersioningState,
     CanonicalUserId, LegalHoldStatus, ObjectLockDefaultRetention, ObjectLockMode, ObjectRetention,
-    StoredLegalHoldStatus, VersionId,
+    RetentionPeriod, StoredLegalHoldStatus, VersionId,
 };
 use storage::traits::{PgMetadataStore, ShardStore};
 #[cfg(test)]
@@ -1815,6 +1815,7 @@ pub struct BeginStreamPutRequest<'a> {
     pub acl: PutObjectWriteAcl<'a>,
     pub policy: PutObjectPolicyContext<'a>,
     pub encryption: ObjectEncryption,
+    pub object_lock: ObjectLockState,
     #[cfg(not(test))]
     pub expected_bucket_owner: Option<&'a str>,
 }
@@ -1900,6 +1901,7 @@ impl<'a> ObjectVersionRequest<'a> {
 }
 
 impl<'a> BeginStreamPutRequest<'a> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         bucket: &'a str,
         key: &'a str,
@@ -1907,6 +1909,7 @@ impl<'a> BeginStreamPutRequest<'a> {
         acl: impl Into<PutObjectWriteAcl<'a>>,
         policy: PutObjectPolicyContext<'a>,
         encryption: ObjectEncryption,
+        object_lock: ObjectLockState,
         _expected_bucket_owner: Option<&'a str>,
     ) -> Self {
         Self {
@@ -1916,6 +1919,7 @@ impl<'a> BeginStreamPutRequest<'a> {
             acl: acl.into(),
             policy,
             encryption,
+            object_lock,
             #[cfg(not(test))]
             expected_bucket_owner: _expected_bucket_owner,
         }
@@ -6482,6 +6486,138 @@ impl Coordinator {
         }
     }
 
+    fn requested_object_lock_present(state: ObjectLockState) -> bool {
+        state.retention.is_some() || state.legal_hold != StoredLegalHoldStatus::NotSet
+    }
+
+    fn is_leap_year(year: i64) -> bool {
+        (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+    }
+
+    fn days_in_month(year: i64, month: u32) -> Option<u32> {
+        Some(match month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 if Self::is_leap_year(year) => 29,
+            2 => 28,
+            _ => return None,
+        })
+    }
+
+    fn days_to_date(days: i64) -> (i64, u32, u32) {
+        let z = days + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+        let mut year = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let day = doy - (153 * mp + 2) / 5 + 1;
+        let month = mp + if mp < 10 { 3 } else { -9 };
+        if month <= 2 {
+            year += 1;
+        }
+        (year, month as u32, day as u32)
+    }
+
+    fn date_to_days(year: i64, month: u32, day: u32) -> i64 {
+        let adjust = if month <= 2 { 1 } else { 0 };
+        let y = year - adjust;
+        let era = if y >= 0 { y } else { y - 399 } / 400;
+        let yoe = y - era * 400;
+        let month_i = i64::from(month);
+        let day_i = i64::from(day);
+        let doy = (153 * (month_i + if month > 2 { -3 } else { 9 }) + 2) / 5 + day_i - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        era * 146_097 + doe - 719_468
+    }
+
+    fn current_unix_seconds() -> Result<u64, ServerError> {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .map_err(|_| ServerError::InternalError {
+                reason: "system clock is before the Unix epoch".to_string(),
+            })
+    }
+
+    fn default_retention_deadline(
+        default_retention: ObjectLockDefaultRetention,
+        created_at_unix_seconds: u64,
+    ) -> Result<u64, ServerError> {
+        match default_retention.period {
+            RetentionPeriod::Days(days) => created_at_unix_seconds
+                .checked_add(u64::from(days.get()) * 86_400)
+                .ok_or_else(|| ServerError::InternalError {
+                    reason: "default Object Lock retention overflowed".to_string(),
+                }),
+            RetentionPeriod::Years(years) => {
+                let days = created_at_unix_seconds / 86_400;
+                let seconds_of_day = created_at_unix_seconds % 86_400;
+                let (year, month, day) = Self::days_to_date(days as i64);
+                let target_year = year.checked_add(i64::from(years.get())).ok_or_else(|| {
+                    ServerError::InternalError {
+                        reason: "default Object Lock retention overflowed".to_string(),
+                    }
+                })?;
+                let target_day =
+                    day.min(Self::days_in_month(target_year, month).ok_or_else(|| {
+                        ServerError::InternalError {
+                            reason: "invalid month while applying default Object Lock retention"
+                                .to_string(),
+                        }
+                    })?);
+                let target_days = Self::date_to_days(target_year, month, target_day);
+                let target_days =
+                    u64::try_from(target_days).map_err(|_| ServerError::InternalError {
+                        reason: "default Object Lock retention underflowed".to_string(),
+                    })?;
+                target_days
+                    .checked_mul(86_400)
+                    .and_then(|seconds| seconds.checked_add(seconds_of_day))
+                    .ok_or_else(|| ServerError::InternalError {
+                        reason: "default Object Lock retention overflowed".to_string(),
+                    })
+            }
+        }
+    }
+
+    fn validate_requested_object_lock_state(
+        bucket: &BucketSummary,
+        requested: ObjectLockState,
+    ) -> Result<(), ServerError> {
+        if !bucket.object_lock.enabled && Self::requested_object_lock_present(requested) {
+            return Err(ServerError::InvalidRequest {
+                reason: "Bucket is missing Object Lock Configuration".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn resolve_new_object_lock_state(
+        bucket: &BucketSummary,
+        requested: ObjectLockState,
+    ) -> Result<ObjectLockState, ServerError> {
+        Self::validate_requested_object_lock_state(bucket, requested)?;
+        if !bucket.object_lock.enabled {
+            return Ok(ObjectLockState::default());
+        }
+
+        let mut resolved = requested;
+        if resolved.retention.is_none() {
+            if let Some(default_retention) = bucket.object_lock.default_retention {
+                resolved.retention = Some(ObjectRetention {
+                    mode: default_retention.mode,
+                    retain_until_unix_seconds: Self::default_retention_deadline(
+                        default_retention,
+                        Self::current_unix_seconds()?,
+                    )?,
+                });
+            }
+        }
+        Ok(resolved)
+    }
+
     fn lock_object_for_authorized_object_lock<'a>(
         &'a self,
         requester: &Requester,
@@ -7117,10 +7253,24 @@ impl Coordinator {
         req: &PutObjectRequest<'_>,
         policy_context: PutObjectPolicyContext<'_>,
     ) -> Result<PutObjectResult, ServerError> {
+        self.put_object_with_policy_context_and_object_lock(
+            req,
+            policy_context,
+            ObjectLockState::default(),
+        )
+    }
+
+    pub fn put_object_with_policy_context_and_object_lock(
+        &self,
+        req: &PutObjectRequest<'_>,
+        policy_context: PutObjectPolicyContext<'_>,
+        requested_object_lock: ObjectLockState,
+    ) -> Result<PutObjectResult, ServerError> {
         self.put_object_with_expected_bucket_owner_and_policy(
             req,
             req.expected_bucket_owner(),
             policy_context,
+            requested_object_lock,
         )
     }
 
@@ -7133,6 +7283,7 @@ impl Coordinator {
             req,
             expected_bucket_owner,
             PutObjectPolicyContext::default().with_request_object_tags_xml(req.tags),
+            ObjectLockState::default(),
         )
     }
 
@@ -7141,6 +7292,7 @@ impl Coordinator {
         req: &PutObjectRequest<'_>,
         expected_bucket_owner: Option<&str>,
         policy_context: PutObjectPolicyContext<'_>,
+        requested_object_lock: ObjectLockState,
     ) -> Result<PutObjectResult, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
@@ -7178,6 +7330,7 @@ impl Coordinator {
                         .as_ref()
                         .map(|ctx| ctx.encryption().clone())
                         .unwrap_or_default(),
+                    requested_object_lock,
                     expected_bucket_owner,
                 ),
                 expected_bucket_owner,
@@ -7215,6 +7368,7 @@ impl Coordinator {
                         metadata_directive: None,
                     },
                     policy_context,
+                    requested_object_lock,
                 )
             })();
             if result.is_err() {
@@ -7237,6 +7391,8 @@ impl Coordinator {
             }
             Self::ensure_sse_c_allowed(&bucket_info, write_encryption.is_some())?;
             Self::ensure_put_object_write_acl_supported(&bucket_info, &req.acl)?;
+            let resolved_object_lock =
+                Self::resolve_new_object_lock_state(&bucket_info, requested_object_lock)?;
 
             let transient_segment_id = {
                 let rng = ring::rand::SystemRandom::new();
@@ -7341,7 +7497,7 @@ impl Coordinator {
                     k: self.ec_config.data_shards,
                     m: self.ec_config.parity_shards,
                 },
-                object_lock: ObjectLockState::default(),
+                object_lock: resolved_object_lock,
                 encryption: prepared.encryption.clone(),
                 layout: ObjectLayout::Standard,
                 tags: prepared.tags.clone(),
@@ -7420,6 +7576,7 @@ impl Coordinator {
                 matches!(req.encryption, ObjectEncryption::SseCustomer(_)),
             )?;
             Self::ensure_put_object_write_acl_supported(&bucket_info, &req.acl)?;
+            Self::validate_requested_object_lock_state(&bucket_info, req.object_lock)?;
 
             let rng = ring::rand::SystemRandom::new();
             let mut id_bytes = [0u8; 16];
@@ -7892,6 +8049,14 @@ impl Coordinator {
         &self,
         req: &FinalizeStreamPutRequest,
     ) -> Result<PutObjectResult, ServerError> {
+        self.finalize_stream_put_with_object_lock(req, ObjectLockState::default())
+    }
+
+    pub fn finalize_stream_put_with_object_lock(
+        &self,
+        req: &FinalizeStreamPutRequest,
+        requested_object_lock: ObjectLockState,
+    ) -> Result<PutObjectResult, ServerError> {
         self.finalize_stream_put_with_policy_context(
             req,
             PutObjectPolicyContext::new(
@@ -7900,6 +8065,7 @@ impl Coordinator {
                 req.acl.policy_condition_value(),
             )
             .with_request_object_tags_xml(req.tags),
+            requested_object_lock,
         )
     }
 
@@ -7907,6 +8073,7 @@ impl Coordinator {
         &self,
         req: &FinalizeStreamPutRequest,
         policy_context: PutObjectPolicyContext<'_>,
+        requested_object_lock: ObjectLockState,
     ) -> Result<PutObjectResult, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
@@ -7939,6 +8106,8 @@ impl Coordinator {
                 return Err(ServerError::AccessDenied);
             }
             Self::ensure_put_object_write_acl_supported(&bucket_info, &req.acl)?;
+            let resolved_object_lock =
+                Self::resolve_new_object_lock_state(&bucket_info, requested_object_lock)?;
 
             let meta_pg_id = self.object_pg_id(bucket, key);
             let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
@@ -8022,7 +8191,7 @@ impl Coordinator {
                             k: self.ec_config.data_shards,
                             m: self.ec_config.parity_shards,
                         },
-                        object_lock: ObjectLockState::default(),
+                        object_lock: resolved_object_lock,
                         encryption: prepared.encryption.clone(),
                         tags: prepared.tags.clone(),
                         metadata_blob: Some(prepared.metadata_blob.clone()),
@@ -8408,10 +8577,19 @@ impl Coordinator {
     /// and metadata directive (COPY preserves source metadata, REPLACE
     /// uses new headers).
     pub fn copy_object(&self, req: &CopyObjectRequest) -> Result<CopyObjectResult, ServerError> {
+        self.copy_object_with_object_lock(req, ObjectLockState::default())
+    }
+
+    pub fn copy_object_with_object_lock(
+        &self,
+        req: &CopyObjectRequest,
+        requested_object_lock: ObjectLockState,
+    ) -> Result<CopyObjectResult, ServerError> {
         self.copy_object_with_expected_bucket_owners(
             req,
             req.expected_bucket_owner(),
             req.source.expected_bucket_owner(),
+            requested_object_lock,
         )
     }
 
@@ -8420,6 +8598,7 @@ impl Coordinator {
         req: &CopyObjectRequest,
         expected_dst_bucket_owner: Option<&str>,
         expected_source_bucket_owner: Option<&str>,
+        requested_object_lock: ObjectLockState,
     ) -> Result<CopyObjectResult, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
@@ -8667,6 +8846,7 @@ impl Coordinator {
                 .as_ref()
                 .map(|ctx| ctx.encryption().clone())
                 .unwrap_or_default(),
+            requested_object_lock,
             expected_dst_bucket_owner,
         ))?;
         let not_found = |e: ServerError| match e {
@@ -8723,22 +8903,25 @@ impl Coordinator {
                 system_metadata.set_checksum(algo, None, b64);
             }
 
-            let put_result = self.finalize_stream_put(&FinalizeStreamPutRequest {
-                bucket: dst_bucket,
-                key: dst_key,
-                session_id: &session_id,
-                crc64: crc64.finalize(),
-                total_size,
-                metadata_blob: &metadata_blob,
-                system_metadata: &system_metadata,
-                sse_customer: dst_write_sse_customer.as_ref(),
-                tags: tags.as_deref(),
-                cond: dst_cond,
-                requester: requester.clone(),
-                acl: acl.into(),
-                copy_source: Some(copy_source_policy_value.as_str()),
-                metadata_directive,
-            })?;
+            let put_result = self.finalize_stream_put_with_object_lock(
+                &FinalizeStreamPutRequest {
+                    bucket: dst_bucket,
+                    key: dst_key,
+                    session_id: &session_id,
+                    crc64: crc64.finalize(),
+                    total_size,
+                    metadata_blob: &metadata_blob,
+                    system_metadata: &system_metadata,
+                    sse_customer: dst_write_sse_customer.as_ref(),
+                    tags: tags.as_deref(),
+                    cond: dst_cond,
+                    requester: requester.clone(),
+                    acl: acl.into(),
+                    copy_source: Some(copy_source_policy_value.as_str()),
+                    metadata_directive,
+                },
+                requested_object_lock,
+            )?;
 
             let dst_meta_pg = self
                 .storage_node
@@ -10795,13 +10978,26 @@ impl Coordinator {
         &self,
         req: &CreateMultipartUploadRequest,
     ) -> Result<CreateMultipartUploadResult, ServerError> {
-        self.create_multipart_upload_with_expected_bucket_owner(req, req.expected_bucket_owner())
+        self.create_multipart_upload_with_object_lock(req, ObjectLockState::default())
+    }
+
+    pub fn create_multipart_upload_with_object_lock(
+        &self,
+        req: &CreateMultipartUploadRequest,
+        requested_object_lock: ObjectLockState,
+    ) -> Result<CreateMultipartUploadResult, ServerError> {
+        self.create_multipart_upload_with_expected_bucket_owner(
+            req,
+            req.expected_bucket_owner(),
+            requested_object_lock,
+        )
     }
 
     pub fn create_multipart_upload_with_expected_bucket_owner(
         &self,
         req: &CreateMultipartUploadRequest,
         expected_bucket_owner: Option<&str>,
+        requested_object_lock: ObjectLockState,
     ) -> Result<CreateMultipartUploadResult, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
@@ -10857,6 +11053,7 @@ impl Coordinator {
             let owner = Self::effective_put_object_owner(&bucket_info, &req.requester, &acl);
             let acl_grants = Self::object_acl_grants_for_put_object(&bucket_info, &owner, &acl);
             let public_read = Self::acl_grants_public_read(&acl_grants);
+            Self::validate_requested_object_lock_state(&bucket_info, requested_object_lock)?;
 
             let meta_pg_id = self.object_pg_id(bucket, key);
             let pg = self.storage_node.get_pg(meta_pg_id)?;
@@ -10871,7 +11068,7 @@ impl Coordinator {
                 owner,
                 acl_grants,
                 public_read,
-                object_lock: ObjectLockState::default(),
+                object_lock: requested_object_lock,
                 checksum: req.checksum,
                 encryption,
             })?;
@@ -11507,6 +11704,7 @@ impl Coordinator {
                 tags: upload.tags.clone(),
                 metadata_blob: Some(upload.metadata_blob.clone()),
                 system_metadata_blob: Some(system_metadata_bytes),
+                object_lock: Self::resolve_new_object_lock_state(&bucket_info, upload.object_lock)?,
                 encryption: final_encryption,
             };
 
@@ -12203,6 +12401,7 @@ mod tests {
             acl: NO_PUT_OBJECT_ACL.into(),
             policy: PutObjectPolicyContext::default(),
             encryption: ObjectEncryption::None,
+            object_lock: ObjectLockState::default(),
         })
     }
 
@@ -17781,6 +17980,7 @@ mod tests {
                 acl: PutObjectAcl::None.into(),
                 policy: PutObjectPolicyContext::default(),
                 encryption: ObjectEncryption::None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
         coord
@@ -17795,6 +17995,7 @@ mod tests {
                 acl: PutObjectAcl::PublicRead.into(),
                 policy: PutObjectPolicyContext::default(),
                 encryption: ObjectEncryption::None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -18914,6 +19115,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 policy: PutObjectPolicyContext::default(),
                 encryption: ObjectEncryption::None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -18977,9 +19179,33 @@ mod tests {
                 acl: PutObjectAcl::PublicRead.into(),
                 policy: PutObjectPolicyContext::default(),
                 encryption: ObjectEncryption::None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessControlListNotSupported));
+    }
+
+    #[test]
+    fn begin_stream_put_rejects_object_lock_headers_on_plain_bucket() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("bucket").unwrap();
+
+        let err = coord
+            .begin_stream_put(&BeginStreamPutRequest {
+                bucket: "bucket",
+                key: "key",
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL.into(),
+                policy: PutObjectPolicyContext::default(),
+                encryption: ObjectEncryption::None,
+                object_lock: ObjectLockState {
+                    retention: None,
+                    legal_hold: StoredLegalHoldStatus::On,
+                },
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::InvalidRequest { .. }));
     }
 
     #[test]
@@ -21003,6 +21229,185 @@ mod tests {
     }
 
     #[test]
+    fn resolve_new_object_lock_state_applies_default_retention_and_preserves_legal_hold() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        coord
+            .put_bucket_versioning(
+                "bucket",
+                BucketVersioningState::Enabled,
+                Requester::principal("owner-a"),
+            )
+            .unwrap();
+        coord
+            .put_bucket_object_lock_configuration(
+                "bucket",
+                BucketObjectLockConfigurationUpdate {
+                    object_lock_enabled: Some(true),
+                    default_retention: Some(ObjectLockDefaultRetention {
+                        mode: ObjectLockMode::Governance,
+                        period: RetentionPeriod::days(1).unwrap(),
+                    }),
+                },
+                Requester::principal("owner-a"),
+            )
+            .unwrap();
+        let bucket = coord.active_bucket_summary("bucket").unwrap();
+        let before = Coordinator::current_unix_seconds().unwrap();
+        let resolved = Coordinator::resolve_new_object_lock_state(
+            &bucket,
+            ObjectLockState {
+                retention: None,
+                legal_hold: StoredLegalHoldStatus::Off,
+            },
+        )
+        .unwrap();
+        let after = Coordinator::current_unix_seconds().unwrap();
+
+        assert_eq!(resolved.legal_hold, StoredLegalHoldStatus::Off);
+        let retention = resolved.retention.unwrap();
+        assert_eq!(retention.mode, ObjectLockMode::Governance);
+        assert!(retention.retain_until_unix_seconds >= before + 86_400);
+        assert!(retention.retain_until_unix_seconds <= after + 86_405);
+    }
+
+    #[test]
+    fn resolve_new_object_lock_state_explicit_retention_overrides_bucket_default() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        coord
+            .put_bucket_versioning(
+                "bucket",
+                BucketVersioningState::Enabled,
+                Requester::principal("owner-a"),
+            )
+            .unwrap();
+        coord
+            .put_bucket_object_lock_configuration(
+                "bucket",
+                BucketObjectLockConfigurationUpdate {
+                    object_lock_enabled: Some(true),
+                    default_retention: Some(ObjectLockDefaultRetention {
+                        mode: ObjectLockMode::Governance,
+                        period: RetentionPeriod::days(1).unwrap(),
+                    }),
+                },
+                Requester::principal("owner-a"),
+            )
+            .unwrap();
+        let bucket = coord.active_bucket_summary("bucket").unwrap();
+        let explicit = ObjectLockState {
+            retention: Some(ObjectRetention {
+                mode: ObjectLockMode::Compliance,
+                retain_until_unix_seconds: 1_900_000_000,
+            }),
+            legal_hold: StoredLegalHoldStatus::NotSet,
+        };
+
+        let resolved = Coordinator::resolve_new_object_lock_state(&bucket, explicit).unwrap();
+        assert_eq!(resolved, explicit);
+    }
+
+    #[test]
+    fn validate_requested_object_lock_state_rejects_plain_bucket_headers() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        let bucket = coord.active_bucket_summary("bucket").unwrap();
+        let err = Coordinator::validate_requested_object_lock_state(
+            &bucket,
+            ObjectLockState {
+                retention: Some(ObjectRetention {
+                    mode: ObjectLockMode::Governance,
+                    retain_until_unix_seconds: 1_900_000_000,
+                }),
+                legal_hold: StoredLegalHoldStatus::NotSet,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ServerError::InvalidRequest { .. }));
+    }
+
+    #[test]
+    fn copy_object_with_object_lock_to_plain_bucket_rejects_before_reading_source() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord.create_bucket("src").unwrap();
+        coord.create_bucket("dst").unwrap();
+
+        let source_body = vec![b'x'; INTERNAL_SEGMENT_SIZE + 1];
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                bucket: "src",
+                key: "source",
+                data: &source_body,
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                requester: TEST_REQUESTER,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        let _serial = RECLAMATION_TEST_SERIAL
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap();
+        let first_segment_read = Arc::new(AtomicBool::new(false));
+        let first_segment_read_hook = Arc::clone(&first_segment_read);
+        let _guard = install_reclamation_test_hooks(ReclamationTestHooks {
+            target: Some(("src".to_string(), "source".to_string())),
+            after_object_segments_first_segment: Some(Arc::new(move || {
+                first_segment_read_hook.store(true, Ordering::SeqCst);
+            })),
+            ..ReclamationTestHooks::default()
+        });
+
+        let err = coord
+            .copy_object_with_object_lock(
+                &CopyObjectRequest {
+                    source: CopySource {
+                        bucket: "src",
+                        key: "source",
+                        version_id: None,
+                        condition: NO_READ,
+                    },
+                    dst_bucket: "dst",
+                    dst_key: "copied",
+                    dst_condition: NO_WRITE,
+                    directive: MetadataDirective::Copy,
+                    tagging: TaggingDirective::Copy,
+                    requester: TEST_REQUESTER,
+                    acl: PutObjectAcl::None,
+                    source_sse_customer: None,
+                    dst_sse_customer: None,
+                },
+                ObjectLockState {
+                    retention: None,
+                    legal_hold: StoredLegalHoldStatus::On,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, ServerError::InvalidRequest { .. }));
+        assert!(
+            !first_segment_read.load(Ordering::SeqCst),
+            "copy_object should reject invalid Object Lock headers before reading source data"
+        );
+    }
+
+    #[test]
     fn validate_retention_update_allows_governance_increase_without_bypass() {
         let current = ObjectRetention {
             mode: ObjectLockMode::Governance,
@@ -21225,6 +21630,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 policy: PutObjectPolicyContext::default(),
                 encryption,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));

@@ -4652,18 +4652,7 @@ impl PgMetadataStore for PgStore {
                 }
             }
             let (object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) =
-                self.conn.query_row(
-                    "SELECT object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold \
-                     FROM multipart_uploads WHERE upload_id = ?1",
-                    params![upload_id],
-                    |row| {
-                        Ok((
-                            row.get::<_, Option<u8>>(0)?,
-                            row.get::<_, Option<i64>>(1)?,
-                            row.get::<_, u8>(2)?,
-                        ))
-                    },
-                )?;
+                Self::object_lock_sql_values(obj.object_lock)?;
 
             // 2. Write/overwrite object metadata row.
             let obj_sql = if obj.version_id.is_null() {

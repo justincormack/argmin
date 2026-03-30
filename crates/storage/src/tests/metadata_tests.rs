@@ -1091,6 +1091,7 @@ fn mpu_complete_multipart_commit_preserves_checksums() {
         tags: Some(tags.into()),
         metadata_blob: Some(vec![].into()),
         system_metadata_blob: None,
+        object_lock: ObjectLockState::default(),
         encryption: ObjectEncryption::None,
     };
 
@@ -5433,6 +5434,7 @@ fn complete_multipart_commit_no_such_upload() {
         tags: None,
         metadata_blob: None,
         system_metadata_blob: None,
+        object_lock: ObjectLockState::default(),
         encryption: ObjectEncryption::None,
     };
     let parts = vec![ObjectPartRecord {
@@ -5742,6 +5744,7 @@ fn multipart_upload_object_lock_round_trip_and_commit_copies_state() {
         tags: None,
         metadata_blob: None,
         system_metadata_blob: None,
+        object_lock: sample_object_lock_state(),
         encryption: ObjectEncryption::None,
     };
     let parts = vec![ObjectPartRecord {

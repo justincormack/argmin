@@ -501,6 +501,24 @@ fn governance_retain_until_later() -> DateTime {
     date_time(DATE_2030_01_03)
 }
 
+fn assert_retention_within_window(
+    response: &aws_sdk_s3::operation::get_object_retention::GetObjectRetentionOutput,
+    mode: ObjectLockRetentionMode,
+    min_retain_until: i64,
+    max_retain_until: i64,
+) {
+    let retention = response.retention().expect("missing retention");
+    assert_eq!(retention.mode(), Some(&mode));
+    let retain_until = retention
+        .retain_until_date()
+        .expect("missing retain-until date")
+        .secs();
+    assert!(
+        (min_retain_until..=max_retain_until).contains(&retain_until),
+        "retain_until={retain_until} outside expected window [{min_retain_until}, {max_retain_until}]",
+    );
+}
+
 #[test]
 fn test_object_lock_put_obj_lock() {
     s3_tests::run(async {
@@ -816,6 +834,123 @@ fn test_object_lock_put_obj_retention() {
 }
 
 #[test]
+fn test_object_lock_put_object_headers_persist() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_object_lock_bucket().await;
+        let key = "file1";
+        let retain_until = date_time(DATE_2140_01_01);
+        let version_id = client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"abc"))
+            .object_lock_mode(ObjectLockMode::Governance)
+            .object_lock_retain_until_date(retain_until)
+            .object_lock_legal_hold_status(ObjectLockLegalHoldStatus::On)
+            .send()
+            .await
+            .unwrap()
+            .version_id()
+            .unwrap()
+            .to_string();
+
+        let retention_response = client
+            .get_object_retention()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&version_id)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            retention_response.retention(),
+            Some(&retention(
+                ObjectLockRetentionMode::Governance,
+                retain_until,
+            ))
+        );
+
+        let legal_hold_response = client
+            .get_object_legal_hold()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&version_id)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            legal_hold_response.legal_hold(),
+            Some(&legal_hold(ObjectLockLegalHoldStatus::On))
+        );
+
+        client
+            .put_object_legal_hold()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&version_id)
+            .legal_hold(legal_hold(ObjectLockLegalHoldStatus::Off))
+            .send()
+            .await
+            .unwrap();
+        delete_version_with_bypass(&bucket, key, &version_id).await;
+        cleanup_object_lock_bucket(&bucket).await;
+    });
+}
+
+#[test]
+fn test_object_lock_put_object_headers_invalid_bucket() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "file1";
+
+        let result = client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"abc"))
+            .object_lock_mode(ObjectLockMode::Governance)
+            .object_lock_retain_until_date(governance_retain_until())
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "InvalidRequest");
+
+        cleanup_plain_bucket(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_object_lock_put_object_headers_invalid_bucket_large_body() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "file1";
+        let retain_until = date_time(DATE_2140_01_01);
+        let body = vec![b'x'; server_core::coordinator::INTERNAL_SEGMENT_SIZE + 1];
+
+        let result = client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from(body))
+            .object_lock_mode(ObjectLockMode::Governance)
+            .object_lock_retain_until_date(retain_until)
+            .object_lock_legal_hold_status(ObjectLockLegalHoldStatus::On)
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "InvalidRequest");
+
+        let head = client.head_object().bucket(&bucket).key(key).send().await;
+        assert_eq!(err_status(&head), 404);
+
+        cleanup_plain_bucket(&bucket, &[]).await;
+    });
+}
+
+#[test]
 fn test_object_lock_put_obj_retention_invalid_bucket() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -1034,6 +1169,42 @@ fn test_object_lock_put_obj_retention_override_default_retention() {
             .await
             .unwrap();
         assert_eq!(response.retention(), Some(&retention));
+
+        delete_version_with_bypass(&bucket, key, &version_id).await;
+        cleanup_object_lock_bucket(&bucket).await;
+    });
+}
+
+#[test]
+fn test_object_lock_default_retention_applies_on_put_object() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_object_lock_bucket().await;
+        put_object_lock_configuration(
+            &bucket,
+            bucket_lock_config_days(ObjectLockRetentionMode::Governance, 1),
+        )
+        .await;
+
+        let key = "file1";
+        let before = now_epoch_secs();
+        let version_id = put_object_bytes(&bucket, key, b"abc").await;
+        let after = now_epoch_secs();
+
+        let response = client
+            .get_object_retention()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&version_id)
+            .send()
+            .await
+            .unwrap();
+        assert_retention_within_window(
+            &response,
+            ObjectLockRetentionMode::Governance,
+            before + 86_400,
+            after + 86_405,
+        );
 
         delete_version_with_bypass(&bucket, key, &version_id).await;
         cleanup_object_lock_bucket(&bucket).await;
@@ -1635,6 +1806,129 @@ fn test_object_lock_get_legal_hold_invalid_bucket() {
 }
 
 #[test]
+fn test_object_lock_copy_object_headers_persist() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let src_bucket = setup_bucket().await;
+        let dst_bucket = setup_object_lock_bucket().await;
+        let src_key = "src";
+        let dst_key = "dst";
+        let retain_until = date_time(DATE_2140_01_01);
+
+        client
+            .put_object()
+            .bucket(&src_bucket)
+            .key(src_key)
+            .body(ByteStream::from_static(b"abc"))
+            .send()
+            .await
+            .unwrap();
+
+        let version_id = client
+            .copy_object()
+            .copy_source(format!("{src_bucket}/{src_key}"))
+            .bucket(&dst_bucket)
+            .key(dst_key)
+            .object_lock_mode(ObjectLockMode::Governance)
+            .object_lock_retain_until_date(retain_until)
+            .object_lock_legal_hold_status(ObjectLockLegalHoldStatus::On)
+            .send()
+            .await
+            .unwrap()
+            .version_id()
+            .unwrap()
+            .to_string();
+
+        let retention_response = client
+            .get_object_retention()
+            .bucket(&dst_bucket)
+            .key(dst_key)
+            .version_id(&version_id)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            retention_response.retention(),
+            Some(&retention(
+                ObjectLockRetentionMode::Governance,
+                retain_until,
+            ))
+        );
+        let legal_hold_response = client
+            .get_object_legal_hold()
+            .bucket(&dst_bucket)
+            .key(dst_key)
+            .version_id(&version_id)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            legal_hold_response.legal_hold(),
+            Some(&legal_hold(ObjectLockLegalHoldStatus::On))
+        );
+
+        client
+            .put_object_legal_hold()
+            .bucket(&dst_bucket)
+            .key(dst_key)
+            .version_id(&version_id)
+            .legal_hold(legal_hold(ObjectLockLegalHoldStatus::Off))
+            .send()
+            .await
+            .unwrap();
+        delete_version_with_bypass(&dst_bucket, dst_key, &version_id).await;
+        cleanup_plain_bucket(&src_bucket, &[src_key]).await;
+        cleanup_object_lock_bucket(&dst_bucket).await;
+    });
+}
+
+#[test]
+fn test_object_lock_copy_object_headers_invalid_bucket() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let src_bucket = setup_bucket().await;
+        let dst_bucket = setup_bucket().await;
+        let src_key = "src";
+        let dst_key = "dst";
+        let retain_until = date_time(DATE_2140_01_01);
+        let source_body = vec![b'a'; server_core::coordinator::INTERNAL_SEGMENT_SIZE + 1];
+
+        client
+            .put_object()
+            .bucket(&src_bucket)
+            .key(src_key)
+            .body(ByteStream::from(source_body))
+            .send()
+            .await
+            .unwrap();
+
+        let result = client
+            .copy_object()
+            .copy_source(format!("{src_bucket}/{src_key}"))
+            .bucket(&dst_bucket)
+            .key(dst_key)
+            .object_lock_mode(ObjectLockMode::Governance)
+            .object_lock_retain_until_date(retain_until)
+            .object_lock_legal_hold_status(ObjectLockLegalHoldStatus::On)
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "InvalidRequest");
+
+        let head = client
+            .head_object()
+            .bucket(&dst_bucket)
+            .key(dst_key)
+            .send()
+            .await;
+        assert_eq!(err_status(&head), 404);
+
+        cleanup_plain_bucket(&src_bucket, &[src_key]).await;
+        cleanup_plain_bucket(&dst_bucket, &[]).await;
+    });
+}
+
+#[test]
 #[ignore = "Object Lock / WORM not implemented yet"]
 fn test_object_lock_delete_object_with_legal_hold_on() {
     s3_tests::run(async {
@@ -1930,6 +2224,175 @@ fn test_object_lock_changing_mode_from_governance_with_bypass() {
             ))
         );
 
+        cleanup_object_lock_bucket(&bucket).await;
+    });
+}
+
+#[test]
+fn test_object_lock_create_multipart_upload_headers_persist() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_object_lock_bucket().await;
+        let key = "file1";
+        let retain_until = date_time(DATE_2140_01_01);
+
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .object_lock_mode(ObjectLockMode::Governance)
+            .object_lock_retain_until_date(retain_until)
+            .object_lock_legal_hold_status(ObjectLockLegalHoldStatus::On)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap();
+
+        let part = client
+            .upload_part()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(1)
+            .body(ByteStream::from_static(b"abc"))
+            .send()
+            .await
+            .unwrap();
+        let version_id = client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(part.e_tag().unwrap())
+                            .part_number(1)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap()
+            .version_id()
+            .unwrap()
+            .to_string();
+
+        let retention_response = client
+            .get_object_retention()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&version_id)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            retention_response.retention(),
+            Some(&retention(
+                ObjectLockRetentionMode::Governance,
+                retain_until,
+            ))
+        );
+        let legal_hold_response = client
+            .get_object_legal_hold()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&version_id)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            legal_hold_response.legal_hold(),
+            Some(&legal_hold(ObjectLockLegalHoldStatus::On))
+        );
+
+        client
+            .put_object_legal_hold()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&version_id)
+            .legal_hold(legal_hold(ObjectLockLegalHoldStatus::Off))
+            .send()
+            .await
+            .unwrap();
+        delete_version_with_bypass(&bucket, key, &version_id).await;
+        cleanup_object_lock_bucket(&bucket).await;
+    });
+}
+
+#[test]
+fn test_object_lock_default_retention_applies_on_complete_multipart_upload() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_object_lock_bucket().await;
+        put_object_lock_configuration(
+            &bucket,
+            bucket_lock_config_days(ObjectLockRetentionMode::Governance, 1),
+        )
+        .await;
+        let key = "file1";
+        let before = now_epoch_secs();
+
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap();
+
+        let part = client
+            .upload_part()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(1)
+            .body(ByteStream::from_static(b"abc"))
+            .send()
+            .await
+            .unwrap();
+        let version_id = client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(part.e_tag().unwrap())
+                            .part_number(1)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap()
+            .version_id()
+            .unwrap()
+            .to_string();
+        let after = now_epoch_secs();
+
+        let response = client
+            .get_object_retention()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&version_id)
+            .send()
+            .await
+            .unwrap();
+        assert_retention_within_window(
+            &response,
+            ObjectLockRetentionMode::Governance,
+            before + 86_400,
+            after + 86_405,
+        );
+
+        delete_version_with_bypass(&bucket, key, &version_id).await;
         cleanup_object_lock_bucket(&bucket).await;
     });
 }

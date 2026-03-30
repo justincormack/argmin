@@ -27,7 +27,7 @@ core Object Lock surface is correct.
 Implemented already:
 - Phase 1 test port: `crates/s3-tests/tests/object_lock.rs` exists, was
   validated against real AWS with all 39 cases enabled, and currently keeps the
-  30 completed bucket/object API cases active while the remaining 10
+  38 completed bucket/object API cases active while the remaining 10
   later-phase cases stay `ignore`d until their features land
 - explicit Object Lock domain types exist across `s3-types`, storage, and
   coordinator code
@@ -54,6 +54,14 @@ Implemented already:
   - `GET /<bucket>/<key>?legal-hold`
 - retention/legal-hold XML parsing/rendering and governance/compliance
   transition enforcement for API-driven updates
+- write-path Object Lock support for new destination versions:
+  - `PutObject`
+  - streaming `PutObject` finalize path
+  - `CopyObject`
+  - `CreateMultipartUpload`
+  - `CompleteMultipartUpload`
+- bucket default retention is applied on newly committed versions when the
+  write request does not carry explicit retention
 - bucket versioning
 - version-specific reads/deletes and delete markers
 - `HeadObject` / `GetObject` metadata plumbing
@@ -61,15 +69,12 @@ Implemented already:
 - enough auth/ACL foundations for owner-driven object operations
 
 Missing today:
-- `PutObject`, `CopyObject`, and multipart initiation do not accept Object Lock
-  headers
 - `HeadObject` / `GetObject` do not project Object Lock headers
 - `DeleteObject` / `DeleteObjects` do not enforce WORM semantics or governance
   bypass
 - bucket-policy action coverage does not include Object Lock actions
 - the remaining 10 `ignore`d cases in `crates/s3-tests/tests/object_lock.rs`
   are now concentrated in later phases:
-  - write-path inline Object Lock headers
   - `HeadObject` Object Lock headers
   - WORM delete / multi-delete enforcement
 
@@ -311,6 +316,20 @@ Likely files:
 
 ### Phase 7: Write Paths Must Carry Object Lock State
 
+Status update:
+- complete
+- local and AWS validation currently have `38 passed / 10 ignored` in
+  `crates/s3-tests/tests/object_lock.rs`
+- verified against real AWS for:
+  - inline `PutObject` Object Lock headers
+  - large inline `PutObject` Object Lock requests rejected before stream ingest
+  - `CopyObject` destination Object Lock headers
+  - `CopyObject` to a plain bucket rejected before source-body streaming
+  - multipart initiation with Object Lock headers
+  - bucket default retention applied on `PutObject`
+  - bucket default retention applied when `CompleteMultipartUpload` publishes
+    the final version
+
 Extend all destination-object creation paths to accept and persist Object Lock
 state:
 - `PutObject`
@@ -442,8 +461,6 @@ AWS verification:
   - enabling Object Lock on an existing bucket and token/header expectations
   - behavior of `GetObjectRetention` / `GetObjectLegalHold` when nothing was set
   - null-version behavior after retroactive Object Lock enablement
-  - default-retention timestamp semantics for completed multipart uploads
-  - `CopyObject` destination retention/header behavior
 
 ## Expected File Set
 
