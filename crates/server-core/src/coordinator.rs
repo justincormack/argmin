@@ -1181,6 +1181,7 @@ pub struct CopyObjectRequest<'a> {
     pub acl: PutObjectAcl<'a>,
     pub source_sse_customer: Option<&'a SseCustomerRequest>,
     pub dst_sse_customer: Option<&'a SseCustomerRequest>,
+    pub object_lock: ObjectLockState,
     #[cfg(not(test))]
     pub expected_bucket_owner: Option<&'a str>,
 }
@@ -1213,6 +1214,8 @@ pub struct PutObjectRequest<'a> {
     pub cond: &'a WriteCondition,
     pub requester: Requester,
     pub acl: PutObjectWriteAcl<'a>,
+    pub policy_context: PutObjectPolicyContext<'a>,
+    pub object_lock: ObjectLockState,
     pub sse_customer: Option<&'a SseCustomerRequest>,
     #[cfg(not(test))]
     pub expected_bucket_owner: Option<&'a str>,
@@ -1459,6 +1462,7 @@ pub struct CreateBucketRequest<'a> {
     pub requester: Requester,
     pub acl: CreateBucketAcl,
     pub ownership: BucketObjectOwnership,
+    pub object_lock_enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1747,6 +1751,7 @@ pub struct CreateMultipartUploadRequest<'a> {
     pub acl: PutObjectAcl<'a>,
     #[cfg(not(test))]
     pub acl: PutObjectWriteAcl<'a>,
+    pub object_lock: ObjectLockState,
     pub sse_customer: Option<&'a SseCustomerRequest>,
     #[cfg(not(test))]
     pub grant_read: Option<&'a str>,
@@ -2031,6 +2036,19 @@ impl<'a> CreateMultipartUploadRequest<'a> {
     }
 }
 
+impl<'a> PutObjectRequest<'a> {
+    fn effective_policy_context(&self) -> PutObjectPolicyContext<'a> {
+        let policy_context = self
+            .policy_context
+            .with_default_canned_acl(self.acl.policy_condition_value());
+        if policy_context.request_object_tags_xml.is_some() {
+            policy_context
+        } else {
+            policy_context.with_request_object_tags_xml(self.tags)
+        }
+    }
+}
+
 impl<'a> DeleteObjectRequest<'a> {
     fn new(
         bucket: &'a str,
@@ -2069,8 +2087,8 @@ pub struct FinalizeStreamPutRequest<'a> {
     pub cond: &'a WriteCondition,
     pub requester: Requester,
     pub acl: PutObjectWriteAcl<'a>,
-    pub copy_source: Option<&'a str>,
-    pub metadata_directive: Option<&'a str>,
+    pub policy_context: PutObjectPolicyContext<'a>,
+    pub requested_object_lock: ObjectLockState,
 }
 
 /// Parsed request for finalizing a streaming UploadPart.
@@ -4907,20 +4925,12 @@ impl Coordinator {
         &self,
         req: &CreateBucketRequest<'_>,
     ) -> Result<(), ServerError> {
-        self.create_bucket_for_requester_with_object_lock(req, false)
-    }
-
-    pub fn create_bucket_for_requester_with_object_lock(
-        &self,
-        req: &CreateBucketRequest<'_>,
-        object_lock_enabled: bool,
-    ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::create_bucket_for_requester",
             "bucket={} object_lock_enabled={}",
             req.name,
-            object_lock_enabled
+            req.object_lock_enabled
         );
         let owner_account = req.requester.account().ok_or(ServerError::AccessDenied)?;
         if req.ownership == BucketObjectOwnership::BucketOwnerEnforced && req.acl.is_explicit() {
@@ -4944,7 +4954,7 @@ impl Coordinator {
             owner_account.canonical_user_id(),
             req.name,
             acl_grants,
-            object_lock_enabled,
+            req.object_lock_enabled,
         )?;
         match create_outcome {
             BucketCreateOutcome::Created => self.put_bucket_ownership_controls(
@@ -7148,31 +7158,7 @@ impl Coordinator {
 
     /// Put an object, using a direct single-segment commit when possible.
     pub fn put_object(&self, req: &PutObjectRequest<'_>) -> Result<PutObjectResult, ServerError> {
-        self.put_object_with_policy_context_and_object_lock(
-            req,
-            PutObjectPolicyContext::default(),
-            ObjectLockState::default(),
-        )
-    }
-
-    pub fn put_object_with_policy_context(
-        &self,
-        req: &PutObjectRequest<'_>,
-        policy_context: PutObjectPolicyContext<'_>,
-    ) -> Result<PutObjectResult, ServerError> {
-        self.put_object_with_policy_context_and_object_lock(
-            req,
-            policy_context,
-            ObjectLockState::default(),
-        )
-    }
-
-    pub fn put_object_with_policy_context_and_object_lock(
-        &self,
-        req: &PutObjectRequest<'_>,
-        policy_context: PutObjectPolicyContext<'_>,
-        requested_object_lock: ObjectLockState,
-    ) -> Result<PutObjectResult, ServerError> {
+        let policy_context = req.effective_policy_context();
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_object",
@@ -7182,13 +7168,6 @@ impl Coordinator {
             req.data.len()
         );
         let write_encryption = self.prepare_sse_customer_write_context(req.sse_customer)?;
-        let policy_context =
-            policy_context.with_default_canned_acl(req.acl.policy_condition_value());
-        let policy_context = if policy_context.request_object_tags_xml.is_some() {
-            policy_context
-        } else {
-            policy_context.with_request_object_tags_xml(req.tags)
-        };
 
         if req.data.len() > INTERNAL_SEGMENT_SIZE {
             self.authorize_put_object_requester(
@@ -7208,7 +7187,7 @@ impl Coordinator {
                     .as_ref()
                     .map(|ctx| ctx.encryption().clone())
                     .unwrap_or_default(),
-                requested_object_lock,
+                req.object_lock,
                 req.expected_bucket_owner(),
             ))?;
             let result = (|| {
@@ -7226,26 +7205,22 @@ impl Coordinator {
                         &chunk_storage,
                     )?;
                 }
-                self.finalize_stream_put_with_policy_context(
-                    &FinalizeStreamPutRequest {
-                        bucket: req.bucket,
-                        key: req.key,
-                        session_id: &session_id,
-                        crc64: checksum::crc64::checksum(req.data),
-                        total_size: req.data.len() as u64,
-                        metadata_blob: req.metadata,
-                        system_metadata: req.system_metadata,
-                        sse_customer: write_encryption.as_ref(),
-                        tags: req.tags,
-                        cond: req.cond,
-                        requester: req.requester.clone(),
-                        acl: req.acl.clone(),
-                        copy_source: None,
-                        metadata_directive: None,
-                    },
+                self.finalize_stream_put(&FinalizeStreamPutRequest {
+                    bucket: req.bucket,
+                    key: req.key,
+                    session_id: &session_id,
+                    crc64: checksum::crc64::checksum(req.data),
+                    total_size: req.data.len() as u64,
+                    metadata_blob: req.metadata,
+                    system_metadata: req.system_metadata,
+                    sse_customer: write_encryption.as_ref(),
+                    tags: req.tags,
+                    cond: req.cond,
+                    requester: req.requester.clone(),
+                    acl: req.acl.clone(),
                     policy_context,
-                    requested_object_lock,
-                )
+                    requested_object_lock: req.object_lock,
+                })
             })();
             if result.is_err() {
                 let _ = self.abort_stream_put(req.bucket, req.key, &session_id);
@@ -7268,7 +7243,7 @@ impl Coordinator {
             Self::ensure_sse_c_allowed(&bucket_info, write_encryption.is_some())?;
             Self::ensure_put_object_write_acl_supported(&bucket_info, &req.acl)?;
             let resolved_object_lock =
-                Self::resolve_new_object_lock_state(&bucket_info, requested_object_lock)?;
+                Self::resolve_new_object_lock_state(&bucket_info, req.object_lock)?;
 
             let transient_segment_id = {
                 let rng = ring::rand::SystemRandom::new();
@@ -7909,32 +7884,6 @@ impl Coordinator {
         &self,
         req: &FinalizeStreamPutRequest,
     ) -> Result<PutObjectResult, ServerError> {
-        self.finalize_stream_put_with_object_lock(req, ObjectLockState::default())
-    }
-
-    pub fn finalize_stream_put_with_object_lock(
-        &self,
-        req: &FinalizeStreamPutRequest,
-        requested_object_lock: ObjectLockState,
-    ) -> Result<PutObjectResult, ServerError> {
-        self.finalize_stream_put_with_policy_context(
-            req,
-            PutObjectPolicyContext::new(
-                req.copy_source,
-                req.metadata_directive,
-                req.acl.policy_condition_value(),
-            )
-            .with_request_object_tags_xml(req.tags),
-            requested_object_lock,
-        )
-    }
-
-    pub fn finalize_stream_put_with_policy_context(
-        &self,
-        req: &FinalizeStreamPutRequest,
-        policy_context: PutObjectPolicyContext<'_>,
-        requested_object_lock: ObjectLockState,
-    ) -> Result<PutObjectResult, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::finalize_stream_put",
@@ -7958,16 +7907,18 @@ impl Coordinator {
                 &req.requester,
                 &bucket_info,
                 key,
-                policy_context
+                req.policy_context
                     .with_default_canned_acl(req.acl.policy_condition_value())
-                    .with_request_object_tags_xml(policy_context.request_object_tags_xml.or(req.tags)),
+                    .with_request_object_tags_xml(
+                        req.policy_context.request_object_tags_xml.or(req.tags),
+                    ),
                 bucket_policy.as_deref(),
             )? {
                 return Err(ServerError::AccessDenied);
             }
             Self::ensure_put_object_write_acl_supported(&bucket_info, &req.acl)?;
             let resolved_object_lock =
-                Self::resolve_new_object_lock_state(&bucket_info, requested_object_lock)?;
+                Self::resolve_new_object_lock_state(&bucket_info, req.requested_object_lock)?;
 
             let meta_pg_id = self.object_pg_id(bucket, key);
             let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
@@ -8437,14 +8388,6 @@ impl Coordinator {
     /// and metadata directive (COPY preserves source metadata, REPLACE
     /// uses new headers).
     pub fn copy_object(&self, req: &CopyObjectRequest) -> Result<CopyObjectResult, ServerError> {
-        self.copy_object_with_object_lock(req, ObjectLockState::default())
-    }
-
-    pub fn copy_object_with_object_lock(
-        &self,
-        req: &CopyObjectRequest,
-        requested_object_lock: ObjectLockState,
-    ) -> Result<CopyObjectResult, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::copy_object",
@@ -8691,7 +8634,7 @@ impl Coordinator {
                 .as_ref()
                 .map(|ctx| ctx.encryption().clone())
                 .unwrap_or_default(),
-            requested_object_lock,
+            req.object_lock,
             req.expected_bucket_owner(),
         ))?;
         let not_found = |e: ServerError| match e {
@@ -8748,25 +8691,27 @@ impl Coordinator {
                 system_metadata.set_checksum(algo, None, b64);
             }
 
-            let put_result = self.finalize_stream_put_with_object_lock(
-                &FinalizeStreamPutRequest {
-                    bucket: dst_bucket,
-                    key: dst_key,
-                    session_id: &session_id,
-                    crc64: crc64.finalize(),
-                    total_size,
-                    metadata_blob: &metadata_blob,
-                    system_metadata: &system_metadata,
-                    sse_customer: dst_write_sse_customer.as_ref(),
-                    tags: tags.as_deref(),
-                    cond: dst_cond,
-                    requester: requester.clone(),
-                    acl: acl.into(),
-                    copy_source: Some(copy_source_policy_value.as_str()),
+            let put_result = self.finalize_stream_put(&FinalizeStreamPutRequest {
+                bucket: dst_bucket,
+                key: dst_key,
+                session_id: &session_id,
+                crc64: crc64.finalize(),
+                total_size,
+                metadata_blob: &metadata_blob,
+                system_metadata: &system_metadata,
+                sse_customer: dst_write_sse_customer.as_ref(),
+                tags: tags.as_deref(),
+                cond: dst_cond,
+                requester: requester.clone(),
+                acl: acl.into(),
+                policy_context: PutObjectPolicyContext::new(
+                    Some(copy_source_policy_value.as_str()),
                     metadata_directive,
-                },
-                requested_object_lock,
-            )?;
+                    acl.policy_condition_value(),
+                )
+                .with_request_object_tags_xml(tags.as_deref()),
+                requested_object_lock: req.object_lock,
+            })?;
 
             let dst_meta_pg = self
                 .storage_node
@@ -10824,14 +10769,6 @@ impl Coordinator {
         &self,
         req: &CreateMultipartUploadRequest,
     ) -> Result<CreateMultipartUploadResult, ServerError> {
-        self.create_multipart_upload_with_object_lock(req, ObjectLockState::default())
-    }
-
-    pub fn create_multipart_upload_with_object_lock(
-        &self,
-        req: &CreateMultipartUploadRequest,
-        requested_object_lock: ObjectLockState,
-    ) -> Result<CreateMultipartUploadResult, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::create_multipart_upload",
@@ -10886,7 +10823,7 @@ impl Coordinator {
             let owner = Self::effective_put_object_owner(&bucket_info, &req.requester, &acl);
             let acl_grants = Self::object_acl_grants_for_put_object(&bucket_info, &owner, &acl);
             let public_read = Self::acl_grants_public_read(&acl_grants);
-            Self::validate_requested_object_lock_state(&bucket_info, requested_object_lock)?;
+            Self::validate_requested_object_lock_state(&bucket_info, req.object_lock)?;
 
             let meta_pg_id = self.object_pg_id(bucket, key);
             let pg = self.storage_node.get_pg(meta_pg_id)?;
@@ -10901,7 +10838,7 @@ impl Coordinator {
                 owner,
                 acl_grants,
                 public_read,
-                object_lock: requested_object_lock,
+                object_lock: req.object_lock,
                 checksum: req.checksum,
                 encryption,
             })?;
@@ -12472,6 +12409,7 @@ mod tests {
                 requester: Requester::principal("owner-a"),
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
             })
             .unwrap();
 
@@ -12493,6 +12431,7 @@ mod tests {
                 requester: Requester::principal("owner-a"),
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
             })
             .unwrap();
 
@@ -12534,6 +12473,7 @@ mod tests {
                 requester: Requester::principal("owner-a"),
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
             })
             .unwrap();
 
@@ -12554,6 +12494,7 @@ mod tests {
                 requester: Requester::principal("owner-a"),
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
             })
             .unwrap();
         coord
@@ -12589,6 +12530,7 @@ mod tests {
                 requester: Requester::principal("owner-a"),
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
             })
             .unwrap();
         coord
@@ -12624,6 +12566,7 @@ mod tests {
                 requester: Requester::principal("owner-a"),
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
             })
             .unwrap();
 
@@ -12653,6 +12596,7 @@ mod tests {
                 requester: Requester::principal("owner-a"),
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
             })
             .unwrap();
 
@@ -12682,6 +12626,7 @@ mod tests {
                 requester: Requester::principal("owner-a"),
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
             })
             .unwrap();
         coord
@@ -12715,6 +12660,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "foo",
                 data: b"bar",
@@ -12776,6 +12723,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "foo",
                 data: b"bar",
@@ -12825,6 +12774,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "foo",
                 data: b"bar",
@@ -12874,6 +12825,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "foo",
                 data: b"bar",
@@ -13043,6 +12996,7 @@ mod tests {
                 requester: Requester::authenticated(owner),
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
             })
             .unwrap();
 
@@ -13065,6 +13019,7 @@ mod tests {
                 requester: requester.clone(),
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
             })
             .unwrap();
 
@@ -13080,6 +13035,8 @@ mod tests {
                 requester: requester.clone(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -13110,6 +13067,7 @@ mod tests {
                 requester: requester.clone(),
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
             })
             .unwrap();
         coord
@@ -13132,6 +13090,8 @@ mod tests {
                 requester: requester.clone(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -13174,6 +13134,7 @@ mod tests {
                 requester: requester.clone(),
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
             })
             .unwrap();
 
@@ -13188,6 +13149,7 @@ mod tests {
                 requester: requester.clone(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -13266,6 +13228,7 @@ mod tests {
                 requester: Requester::authenticated(bucket_owner.clone()),
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
             })
             .unwrap();
         coord
@@ -13294,6 +13257,7 @@ mod tests {
                 requester: Requester::authenticated(writer.clone()),
                 acl: PutObjectAcl::BucketOwnerFullControl.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -13329,6 +13293,7 @@ mod tests {
                 requester: Requester::principal("owner-a"),
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
             })
             .unwrap();
 
@@ -13338,6 +13303,7 @@ mod tests {
                 requester: Requester::principal("owner-a"),
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::BucketOwnerEnforced,
+                object_lock_enabled: false,
             })
             .unwrap();
 
@@ -13360,6 +13326,7 @@ mod tests {
                 requester: Requester::principal("owner-a"),
                 acl: CreateBucketAcl::Canned(BucketAcl::PublicRead),
                 ownership: BucketObjectOwnership::BucketOwnerEnforced,
+                object_lock_enabled: false,
             })
             .unwrap_err();
         assert!(matches!(
@@ -13379,6 +13346,7 @@ mod tests {
                 requester: Requester::principal("owner-a"),
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::BucketOwnerEnforced,
+                object_lock_enabled: false,
             })
             .unwrap();
 
@@ -13400,6 +13368,7 @@ mod tests {
                 requester: Requester::principal("owner-a"),
                 acl: CreateBucketAcl::Canned(BucketAcl::Private),
                 ownership: BucketObjectOwnership::BucketOwnerEnforced,
+                object_lock_enabled: false,
             })
             .unwrap_err();
         assert!(matches!(
@@ -13452,6 +13421,7 @@ mod tests {
                     ),
                 ])),
                 ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
             })
             .unwrap();
 
@@ -13493,6 +13463,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"granted-write",
@@ -13589,6 +13561,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -13616,6 +13589,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -13645,6 +13620,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -13699,6 +13676,8 @@ mod tests {
                 &writer,
                 &PutObjectRequest {
                     sse_customer: None,
+                    policy_context: PutObjectPolicyContext::default(),
+                    object_lock: ObjectLockState::default(),
                     bucket: "bucket",
                     key: "key",
                     data: b"data",
@@ -13757,6 +13736,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             });
             tx.send(res).unwrap();
         });
@@ -13817,6 +13797,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: &key,
                 data: b"data",
@@ -13879,6 +13861,8 @@ mod tests {
             &admin,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: &key,
                 data: b"data",
@@ -13953,6 +13937,8 @@ mod tests {
             &admin,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: &key,
                 data: b"data",
@@ -14095,6 +14081,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "hello.txt",
                 data: b"Hello, world!",
@@ -14142,6 +14130,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "obj",
                 data: b"{}",
@@ -14184,6 +14174,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -14221,6 +14213,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"v1",
@@ -14237,6 +14231,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"v2",
@@ -14273,6 +14269,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "empty",
                 data: b"",
@@ -14310,6 +14308,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -14356,6 +14356,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"simple-data",
@@ -14425,6 +14427,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "a/1",
                 data: b"1",
@@ -14441,6 +14445,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "a/2",
                 data: b"2",
@@ -14457,6 +14463,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "b/1",
                 data: b"3",
@@ -14497,6 +14505,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "photos/cat.jpg",
                 data: b"cat",
@@ -14513,6 +14523,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "photos/dog.jpg",
                 data: b"dog",
@@ -14529,6 +14541,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "docs/readme.md",
                 data: b"md",
@@ -14565,6 +14579,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "photos/cat.jpg",
                 data: b"cat",
@@ -14581,6 +14597,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "photos/dog.jpg",
                 data: b"dog",
@@ -14597,6 +14615,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "docs/readme.md",
                 data: b"md",
@@ -14613,6 +14633,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "root.txt",
                 data: b"root",
@@ -14652,6 +14674,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "folder/",
                 data: b"data",
@@ -14803,6 +14827,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "resilient",
                 data,
@@ -14844,6 +14870,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "obj1",
                 data,
@@ -14883,6 +14911,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "obj-reconstruct",
                 data: &data,
@@ -14939,6 +14969,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "obj2",
                 data,
@@ -14981,6 +15013,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "obj3",
                 data,
@@ -15025,6 +15059,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "obj4",
                 data,
@@ -15064,6 +15100,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "obj5",
                 data,
@@ -15107,6 +15145,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "obj6",
                 data,
@@ -15147,6 +15187,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "obj7",
                 data,
@@ -15203,6 +15245,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "obj8",
                 data,
@@ -15258,6 +15302,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "no-such-bucket",
                 key: "key",
                 data: b"data",
@@ -15302,6 +15348,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -15350,6 +15398,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "a/1",
                 data: b"1",
@@ -15366,6 +15416,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "a/2",
                 data: b"2",
@@ -15382,6 +15434,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "b/1",
                 data: b"3",
@@ -15398,6 +15452,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "c/1",
                 data: b"4",
@@ -15414,6 +15470,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "root.txt",
                 data: b"5",
@@ -15477,6 +15535,8 @@ mod tests {
                 &coord,
                 &PutObjectRequest {
                     sse_customer: None,
+                    policy_context: PutObjectPolicyContext::default(),
+                    object_lock: ObjectLockState::default(),
                     bucket: "bucket",
                     key: &key,
                     data: b"data",
@@ -15516,6 +15576,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "no-bucket",
                 key: "key",
                 data: b"data",
@@ -15552,6 +15614,8 @@ mod tests {
                 &coord,
                 &PutObjectRequest {
                     sse_customer: None,
+                    policy_context: PutObjectPolicyContext::default(),
+                    object_lock: ObjectLockState::default(),
                     bucket: "bucket",
                     key: &key,
                     data: b"data",
@@ -15594,6 +15658,8 @@ mod tests {
                 &coord,
                 &PutObjectRequest {
                     sse_customer: None,
+                    policy_context: PutObjectPolicyContext::default(),
+                    object_lock: ObjectLockState::default(),
                     bucket: "bucket",
                     key: &key,
                     data: b"data",
@@ -15664,6 +15730,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "photos/2024/jan.jpg",
                 data: b"j",
@@ -15680,6 +15748,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "photos/2024/feb.jpg",
                 data: b"f",
@@ -15696,6 +15766,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "photos/2025/mar.jpg",
                 data: b"m",
@@ -15712,6 +15784,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "photos/top.jpg",
                 data: b"t",
@@ -15755,6 +15829,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "only-one",
                 data: b"data",
@@ -15793,6 +15869,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key1",
                 data: b"data",
@@ -15832,6 +15910,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "a/1",
                 data: b"data",
@@ -15906,6 +15986,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key1",
                 data: b"data1",
@@ -15922,6 +16004,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key2",
                 data: b"data2",
@@ -16039,6 +16123,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -16140,6 +16225,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"Hello, World!",
@@ -16181,6 +16268,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"Hello, World!",
@@ -16221,6 +16310,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"Hello, World!",
@@ -16259,6 +16350,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"Hello",
@@ -16297,6 +16390,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"Hello",
@@ -16343,6 +16438,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "new-key",
                 data: b"data",
@@ -16367,6 +16464,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"v1",
@@ -16385,6 +16484,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"v2",
@@ -16410,6 +16511,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"v1",
@@ -16427,6 +16530,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"v2",
@@ -16464,6 +16569,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"v1",
@@ -16481,6 +16588,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"v2",
@@ -16499,6 +16608,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"v3",
@@ -16524,6 +16635,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -16555,6 +16668,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -16643,6 +16758,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -16670,6 +16787,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -16701,6 +16820,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -16739,6 +16860,7 @@ mod tests {
                 requester: owner_requester.clone(),
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
             })
             .unwrap();
 
@@ -16746,6 +16868,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"granted-read",
@@ -16826,6 +16950,7 @@ mod tests {
                     AclPermission::Write,
                 )])),
                 ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
             })
             .unwrap();
 
@@ -16833,6 +16958,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"owned-by-writer",
@@ -16890,6 +17017,7 @@ mod tests {
                 requester: owner_requester.clone(),
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
             })
             .unwrap();
 
@@ -16897,6 +17025,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -16939,6 +17069,7 @@ mod tests {
                 requester: owner_requester.clone(),
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::BucketOwnerEnforced,
+                object_lock_enabled: false,
             })
             .unwrap();
 
@@ -16946,6 +17077,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -16975,6 +17108,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -17029,6 +17164,8 @@ mod tests {
                 &coord,
                 &PutObjectRequest {
                     sse_customer: None,
+                    policy_context: PutObjectPolicyContext::default(),
+                    object_lock: ObjectLockState::default(),
                     bucket: "bucket",
                     key,
                     data: body,
@@ -17093,6 +17230,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -17168,6 +17307,8 @@ mod tests {
                 &coord,
                 &PutObjectRequest {
                     sse_customer: None,
+                    policy_context: PutObjectPolicyContext::default(),
+                    object_lock: ObjectLockState::default(),
                     bucket: "src",
                     key,
                     data: body,
@@ -17220,6 +17361,7 @@ mod tests {
                 acl: PutObjectAcl::None,
                 source_sse_customer: None,
                 dst_sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
         assert_eq!(copied.version_id, VersionId::Null);
@@ -17253,6 +17395,7 @@ mod tests {
                 acl: PutObjectAcl::None,
                 source_sse_customer: None,
                 dst_sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -17284,6 +17427,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "src",
                 key: "public/foo",
                 data: b"public-foo",
@@ -17334,6 +17479,7 @@ mod tests {
                 acl: PutObjectAcl::None,
                 source_sse_customer: None,
                 dst_sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -17354,6 +17500,7 @@ mod tests {
                 acl: PutObjectAcl::None,
                 source_sse_customer: None,
                 dst_sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -17377,6 +17524,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "private-key",
                 data: b"private",
@@ -17394,6 +17543,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "public-key",
                 data: b"public",
@@ -17427,6 +17578,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "private-key",
                 data: b"private",
@@ -17445,6 +17598,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "public-key",
                 data: b"public",
@@ -17541,6 +17696,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "public-key",
                 data: b"public",
@@ -17583,6 +17740,7 @@ mod tests {
                 requester: Requester::principal("other-user"),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap_err();
         assert!(matches!(denied, ServerError::AccessDenied));
@@ -17600,6 +17758,7 @@ mod tests {
                 requester: Requester::principal("other-user"),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
         assert!(!upload.upload_id.is_empty());
@@ -17633,6 +17792,7 @@ mod tests {
                 requester: Requester::principal("other-user"),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap_err();
         assert!(matches!(denied, ServerError::AccessDenied));
@@ -17663,6 +17823,8 @@ mod tests {
                 &coord,
                 &PutObjectRequest {
                     sse_customer: None,
+                    policy_context: PutObjectPolicyContext::default(),
+                    object_lock: ObjectLockState::default(),
                     bucket: "src",
                     key,
                     data: body,
@@ -17688,6 +17850,7 @@ mod tests {
                 requester: Requester::principal("other-user"),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -17810,6 +17973,8 @@ mod tests {
                 &coord,
                 &PutObjectRequest {
                     sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                     bucket: "bucket",
                     key,
                     data: body,
@@ -17874,6 +18039,8 @@ mod tests {
             &admin,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -17943,6 +18110,8 @@ mod tests {
             &admin,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -17999,6 +18168,8 @@ mod tests {
             &admin,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -18042,20 +18213,20 @@ mod tests {
         let owner_requester = Requester::principal("owner-a");
 
         admin
-            .create_bucket_for_requester_with_object_lock(
-                &CreateBucketRequest {
-                    name: "bucket",
-                    requester: Requester::authenticated(owner),
-                    acl: CreateBucketAcl::DefaultPrivate,
-                    ownership: BucketObjectOwnership::ObjectWriter,
-                },
-                true,
-            )
+            .create_bucket_for_requester(&CreateBucketRequest {
+                name: "bucket",
+                requester: Requester::authenticated(owner),
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: true,
+            })
             .unwrap();
         let put = test_helpers::put_object(
             &admin,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -18169,6 +18340,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -18213,6 +18386,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -18252,6 +18427,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"public",
@@ -18292,6 +18469,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"writer-owned",
@@ -18334,6 +18513,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -18398,6 +18579,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"secret",
@@ -18443,6 +18626,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"writer-owned",
@@ -18488,6 +18673,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"writer-owned",
@@ -18525,6 +18712,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"public",
@@ -18562,6 +18751,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"public",
@@ -18676,6 +18867,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -18713,6 +18906,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -18757,6 +18952,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -18825,6 +19022,7 @@ mod tests {
                 requester: Requester::principal("other-user"),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -18849,6 +19047,7 @@ mod tests {
                 requester: Requester::principal("owner-a"),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -18894,6 +19093,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: PutObjectAcl::PublicRead.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessControlListNotSupported));
@@ -18918,6 +19118,7 @@ mod tests {
                 requester: Requester::principal("owner-a"),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -18954,6 +19155,7 @@ mod tests {
                 requester: Requester::principal("owner-a"),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -19009,6 +19211,7 @@ mod tests {
                 requester: Requester::principal("owner-a"),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -19086,6 +19289,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -19124,6 +19329,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -19164,6 +19371,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -19203,6 +19412,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -19242,6 +19453,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -19286,6 +19499,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -19331,6 +19546,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"v1",
@@ -19348,6 +19565,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"v2",
@@ -19401,6 +19620,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key1",
                 data: b"data1",
@@ -19417,6 +19638,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key2",
                 data: b"data2",
@@ -19467,6 +19690,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"Hello, World!",
@@ -19512,6 +19737,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "src",
                 data: b"hello copy",
@@ -19542,6 +19769,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
         assert!(!result.etag.is_empty());
@@ -19574,6 +19802,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "src-bucket",
                 key: "src",
                 data: b"private",
@@ -19604,6 +19834,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -19629,6 +19860,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "src",
                 data: b"private",
@@ -19659,6 +19892,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -19687,12 +19921,15 @@ mod tests {
                 requester: owner_requester.clone(),
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
             })
             .unwrap();
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "src",
                 data: b"granted-copy",
@@ -19747,6 +19984,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -19792,6 +20030,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "src",
                 data: b"data",
@@ -19822,6 +20062,7 @@ mod tests {
                 acl: PutObjectAcl::PublicRead.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessControlListNotSupported));
@@ -19838,6 +20079,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "src",
                 data: b"data",
@@ -19874,6 +20117,7 @@ mod tests {
                 acl: PutObjectAcl::PublicRead.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -19895,6 +20139,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "src",
                 data: b"data",
@@ -19925,6 +20171,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -19958,6 +20205,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "src",
                 data: b"data",
@@ -19995,6 +20244,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -20028,6 +20278,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -20065,6 +20317,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -20094,6 +20347,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "src",
                 data: b"data",
@@ -20124,6 +20379,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -20154,6 +20410,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "src",
                 data: b"data",
@@ -20184,6 +20442,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -20212,6 +20471,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "src",
                 data: b"hello",
@@ -20251,6 +20512,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -20283,6 +20545,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "src",
                 data,
@@ -20320,6 +20584,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -20379,6 +20644,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
@@ -20393,6 +20659,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "src",
                 data: b"data",
@@ -20423,6 +20691,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
@@ -20437,6 +20706,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "src",
                 data: b"data",
@@ -20471,6 +20742,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::PreconditionFailed));
@@ -20486,6 +20758,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "src",
                 data: b"data",
@@ -20502,6 +20776,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "dst",
                 data: b"existing",
@@ -20533,6 +20809,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::PreconditionFailed));
@@ -20548,6 +20825,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "src",
                 data: b"new data",
@@ -20564,6 +20843,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "dst",
                 data: b"old data",
@@ -20595,6 +20876,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
         assert!(!result.etag.is_empty());
@@ -20626,6 +20908,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "src-bucket",
                 key: "key",
                 data: b"cross bucket data",
@@ -20656,6 +20940,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -20739,6 +21024,7 @@ mod tests {
                 requester: requester.clone(),
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
             })
             .unwrap();
         coord
@@ -20754,6 +21040,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"v1",
@@ -20770,6 +21058,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"v2",
@@ -20835,6 +21125,7 @@ mod tests {
                 requester: requester.clone(),
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
             })
             .unwrap();
         coord
@@ -20850,6 +21141,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"old",
@@ -20866,6 +21159,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"current",
@@ -20951,15 +21246,13 @@ mod tests {
         let owner = AccountIdentity::from_principal("owner-a");
 
         coord
-            .create_bucket_for_requester_with_object_lock(
-                &CreateBucketRequest {
-                    name: "bucket",
-                    requester: Requester::authenticated(owner),
-                    acl: CreateBucketAcl::DefaultPrivate,
-                    ownership: BucketObjectOwnership::ObjectWriter,
-                },
-                true,
-            )
+            .create_bucket_for_requester(&CreateBucketRequest {
+                name: "bucket",
+                requester: Requester::authenticated(owner),
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: true,
+            })
             .unwrap();
 
         assert_eq!(
@@ -21053,15 +21346,13 @@ mod tests {
         let owner = AccountIdentity::from_principal("owner-a");
 
         coord
-            .create_bucket_for_requester_with_object_lock(
-                &CreateBucketRequest {
-                    name: "bucket",
-                    requester: Requester::authenticated(owner),
-                    acl: CreateBucketAcl::DefaultPrivate,
-                    ownership: BucketObjectOwnership::ObjectWriter,
-                },
-                true,
-            )
+            .create_bucket_for_requester(&CreateBucketRequest {
+                name: "bucket",
+                requester: Requester::authenticated(owner),
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: true,
+            })
             .unwrap();
 
         let err = coord
@@ -21208,15 +21499,13 @@ mod tests {
         let owner = AccountIdentity::from_principal("owner-a");
 
         coord
-            .create_bucket_for_requester_with_object_lock(
-                &CreateBucketRequest {
-                    name: "bucket",
-                    requester: Requester::authenticated(owner),
-                    acl: CreateBucketAcl::DefaultPrivate,
-                    ownership: BucketObjectOwnership::ObjectWriter,
-                },
-                true,
-            )
+            .create_bucket_for_requester(&CreateBucketRequest {
+                name: "bucket",
+                requester: Requester::authenticated(owner),
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: true,
+            })
             .unwrap();
         coord
             .put_bucket_policy(
@@ -21243,20 +21532,20 @@ mod tests {
         let owner_requester = Requester::principal("owner-a");
 
         coord
-            .create_bucket_for_requester_with_object_lock(
-                &CreateBucketRequest {
-                    name: "bucket",
-                    requester: Requester::authenticated(owner),
-                    acl: CreateBucketAcl::DefaultPrivate,
-                    ownership: BucketObjectOwnership::ObjectWriter,
-                },
-                true,
-            )
+            .create_bucket_for_requester(&CreateBucketRequest {
+                name: "bucket",
+                requester: Requester::authenticated(owner),
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: true,
+            })
             .unwrap();
         let put = test_helpers::put_object(
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -21311,20 +21600,20 @@ mod tests {
         let now = Coordinator::current_unix_seconds().unwrap();
 
         coord
-            .create_bucket_for_requester_with_object_lock(
-                &CreateBucketRequest {
-                    name: "bucket",
-                    requester: Requester::authenticated(owner),
-                    acl: CreateBucketAcl::DefaultPrivate,
-                    ownership: BucketObjectOwnership::ObjectWriter,
-                },
-                true,
-            )
+            .create_bucket_for_requester(&CreateBucketRequest {
+                name: "bucket",
+                requester: Requester::authenticated(owner),
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: true,
+            })
             .unwrap();
         let put = test_helpers::put_object(
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -21403,20 +21692,20 @@ mod tests {
         let now = Coordinator::current_unix_seconds().unwrap();
 
         coord
-            .create_bucket_for_requester_with_object_lock(
-                &CreateBucketRequest {
-                    name: "bucket",
-                    requester: Requester::authenticated(owner),
-                    acl: CreateBucketAcl::DefaultPrivate,
-                    ownership: BucketObjectOwnership::ObjectWriter,
-                },
-                true,
-            )
+            .create_bucket_for_requester(&CreateBucketRequest {
+                name: "bucket",
+                requester: Requester::authenticated(owner),
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: true,
+            })
             .unwrap();
         let put = test_helpers::put_object(
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -21473,20 +21762,20 @@ mod tests {
         let owner_requester = Requester::principal("owner-a");
 
         coord
-            .create_bucket_for_requester_with_object_lock(
-                &CreateBucketRequest {
-                    name: "bucket",
-                    requester: Requester::authenticated(owner),
-                    acl: CreateBucketAcl::DefaultPrivate,
-                    ownership: BucketObjectOwnership::ObjectWriter,
-                },
-                true,
-            )
+            .create_bucket_for_requester(&CreateBucketRequest {
+                name: "bucket",
+                requester: Requester::authenticated(owner),
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: true,
+            })
             .unwrap();
         let put = test_helpers::put_object(
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -21650,6 +21939,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "src",
                 key: "source",
                 data: &source_body,
@@ -21678,29 +21969,27 @@ mod tests {
         });
 
         let err = coord
-            .copy_object_with_object_lock(
-                &CopyObjectRequest {
-                    source: CopySource {
-                        bucket: "src",
-                        key: "source",
-                        version_id: None,
-                        condition: NO_READ,
-                    },
-                    dst_bucket: "dst",
-                    dst_key: "copied",
-                    dst_condition: NO_WRITE,
-                    directive: MetadataDirective::Copy,
-                    tagging: TaggingDirective::Copy,
-                    requester: TEST_REQUESTER,
-                    acl: PutObjectAcl::None,
-                    source_sse_customer: None,
-                    dst_sse_customer: None,
+            .copy_object(&CopyObjectRequest {
+                source: CopySource {
+                    bucket: "src",
+                    key: "source",
+                    version_id: None,
+                    condition: NO_READ,
                 },
-                ObjectLockState {
+                dst_bucket: "dst",
+                dst_key: "copied",
+                dst_condition: NO_WRITE,
+                directive: MetadataDirective::Copy,
+                tagging: TaggingDirective::Copy,
+                requester: TEST_REQUESTER,
+                acl: PutObjectAcl::None,
+                source_sse_customer: None,
+                dst_sse_customer: None,
+                object_lock: ObjectLockState {
                     retention: None,
                     legal_hold: StoredLegalHoldStatus::On,
                 },
-            )
+            })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidRequest { .. }));
         assert!(
@@ -21796,20 +22085,20 @@ mod tests {
         let now = Coordinator::current_unix_seconds().unwrap();
 
         coord
-            .create_bucket_for_requester_with_object_lock(
-                &CreateBucketRequest {
-                    name: "bucket",
-                    requester: Requester::authenticated(owner),
-                    acl: CreateBucketAcl::DefaultPrivate,
-                    ownership: BucketObjectOwnership::ObjectWriter,
-                },
-                true,
-            )
+            .create_bucket_for_requester(&CreateBucketRequest {
+                name: "bucket",
+                requester: Requester::authenticated(owner),
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: true,
+            })
             .unwrap();
         let put = test_helpers::put_object(
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -21864,20 +22153,20 @@ mod tests {
         let now = Coordinator::current_unix_seconds().unwrap();
 
         coord
-            .create_bucket_for_requester_with_object_lock(
-                &CreateBucketRequest {
-                    name: "bucket",
-                    requester: Requester::authenticated(AccountIdentity::from_principal("owner-a")),
-                    acl: CreateBucketAcl::DefaultPrivate,
-                    ownership: BucketObjectOwnership::ObjectWriter,
-                },
-                true,
-            )
+            .create_bucket_for_requester(&CreateBucketRequest {
+                name: "bucket",
+                requester: Requester::authenticated(AccountIdentity::from_principal("owner-a")),
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: true,
+            })
             .unwrap();
         let put = test_helpers::put_object(
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -21958,21 +22247,21 @@ mod tests {
         let requester = Requester::principal("owner-a");
 
         coord
-            .create_bucket_for_requester_with_object_lock(
-                &CreateBucketRequest {
-                    name: "bucket",
-                    requester: Requester::authenticated(owner),
-                    acl: CreateBucketAcl::DefaultPrivate,
-                    ownership: BucketObjectOwnership::ObjectWriter,
-                },
-                true,
-            )
+            .create_bucket_for_requester(&CreateBucketRequest {
+                name: "bucket",
+                requester: Requester::authenticated(owner),
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: true,
+            })
             .unwrap();
 
         let put = test_helpers::put_object(
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -22054,21 +22343,21 @@ mod tests {
         let requester = Requester::principal("owner-a");
 
         coord
-            .create_bucket_for_requester_with_object_lock(
-                &CreateBucketRequest {
-                    name: "bucket",
-                    requester: Requester::authenticated(owner),
-                    acl: CreateBucketAcl::DefaultPrivate,
-                    ownership: BucketObjectOwnership::ObjectWriter,
-                },
-                true,
-            )
+            .create_bucket_for_requester(&CreateBucketRequest {
+                name: "bucket",
+                requester: Requester::authenticated(owner),
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: true,
+            })
             .unwrap();
 
         let put = test_helpers::put_object(
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -22147,6 +22436,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "plain",
                 data: b"plain",
@@ -22175,6 +22466,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "locked",
                 data: b"locked",
@@ -22310,6 +22603,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: Some(&sse_customer),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -22345,6 +22640,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -22415,6 +22712,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: Some(&sse_customer),
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -22452,6 +22750,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -22477,6 +22777,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -22512,6 +22814,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -22582,6 +22886,8 @@ mod tests {
                     &coord_a,
                     &PutObjectRequest {
                         sse_customer: None,
+                        policy_context: PutObjectPolicyContext::default(),
+                        object_lock: ObjectLockState::default(),
                         bucket: "bucket",
                         key: &key_a,
                         data: b"v1",
@@ -22600,6 +22906,8 @@ mod tests {
                     &coord_b,
                     &PutObjectRequest {
                         sse_customer: None,
+                        policy_context: PutObjectPolicyContext::default(),
+                        object_lock: ObjectLockState::default(),
                         bucket: "bucket",
                         key: &key_b,
                         data: b"v2",
@@ -22651,6 +22959,8 @@ mod tests {
             &admin,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: &vec![b'A'; object_size],
@@ -22681,6 +22991,8 @@ mod tests {
                     &writer,
                     &PutObjectRequest {
                         sse_customer: None,
+                        policy_context: PutObjectPolicyContext::default(),
+                        object_lock: ObjectLockState::default(),
                         bucket: "bucket",
                         key: "key",
                         data: &new_payload,
@@ -22752,6 +23064,8 @@ mod tests {
             &admin,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "src-bucket",
                 key: "src",
                 data: &vec![b'A'; object_size],
@@ -22784,6 +23098,8 @@ mod tests {
                     &writer,
                     &PutObjectRequest {
                         sse_customer: None,
+                        policy_context: PutObjectPolicyContext::default(),
+                        object_lock: ObjectLockState::default(),
                         bucket: "src-bucket",
                         key: "src",
                         data: &new_payload,
@@ -22814,6 +23130,7 @@ mod tests {
                     acl: NO_PUT_OBJECT_ACL.into(),
                     source_sse_customer: None,
                     dst_sse_customer: None,
+                    object_lock: ObjectLockState::default(),
                 })
             });
 
@@ -22877,6 +23194,8 @@ mod tests {
             &admin,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "src",
                 data: &vec![b'A'; object_size],
@@ -22906,6 +23225,7 @@ mod tests {
                     requester: TEST_REQUESTER,
                     acl: NO_PUT_OBJECT_ACL.into(),
                     sse_customer: None,
+                    object_lock: ObjectLockState::default(),
                 })
                 .unwrap();
             let dst_key_for_copy = dst_key.clone();
@@ -22923,6 +23243,8 @@ mod tests {
                     &writer,
                     &PutObjectRequest {
                         sse_customer: None,
+                        policy_context: PutObjectPolicyContext::default(),
+                        object_lock: ObjectLockState::default(),
                         bucket: "bucket",
                         key: "src",
                         data: &new_payload,
@@ -23028,6 +23350,8 @@ mod tests {
             &admin,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: &vec![b'A'; object_size],
@@ -23057,6 +23381,8 @@ mod tests {
                     &writer,
                     &PutObjectRequest {
                         sse_customer: None,
+                        policy_context: PutObjectPolicyContext::default(),
+                        object_lock: ObjectLockState::default(),
                         bucket: "bucket",
                         key: "key",
                         data: &payload,
@@ -23303,8 +23629,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
-                copy_source: None,
-                metadata_directive: None,
+                policy_context: PutObjectPolicyContext::default(),
+                requested_object_lock: ObjectLockState::default(),
             })
             .unwrap();
         assert_object_maps_meta_pg_gt_shard_pg(&admin, "race-bucket", &key);
@@ -23383,6 +23709,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -23478,6 +23805,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
         });
         sync.snapshot_reached.wait();
@@ -23527,6 +23855,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"data",
@@ -23574,6 +23904,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -23601,6 +23932,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
         let r2 = coord
@@ -23615,6 +23947,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
         assert_ne!(r1.upload_id, r2.upload_id);
@@ -23638,6 +23971,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
@@ -23682,6 +24016,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
         let r2 = coord
@@ -23696,6 +24031,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -23740,6 +24076,7 @@ mod tests {
                 requester: Requester::authenticated(bucket_owner.clone()),
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
             })
             .unwrap();
         coord
@@ -23768,6 +24105,7 @@ mod tests {
                 requester: Requester::authenticated(writer.clone()),
                 acl: PutObjectAcl::BucketOwnerFullControl.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -23828,6 +24166,7 @@ mod tests {
                 requester: owner_requester.clone(),
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
             })
             .unwrap();
         coord
@@ -23845,6 +24184,7 @@ mod tests {
                 requester: writer_requester.clone(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -23942,6 +24282,7 @@ mod tests {
                 requester: Requester::anonymous(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -23970,6 +24311,7 @@ mod tests {
                 requester: owner_requester.clone(),
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
             })
             .unwrap();
         coord
@@ -23998,6 +24340,7 @@ mod tests {
                 requester: writer_requester.clone(),
                 acl: PutObjectAcl::BucketOwnerFullControl.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -24080,6 +24423,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
         let r2 = coord
@@ -24094,6 +24438,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -24141,6 +24486,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
         coord
@@ -24155,6 +24501,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
         coord
@@ -24169,6 +24516,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -24225,6 +24573,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
         coord
@@ -24239,6 +24588,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
         coord
@@ -24253,6 +24603,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -24289,6 +24640,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -24348,6 +24700,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -24386,6 +24739,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -24455,6 +24809,8 @@ mod tests {
             &admin,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"hello world",
@@ -24569,6 +24925,7 @@ mod tests {
                     requester: TEST_REQUESTER,
                     acl: NO_PUT_OBJECT_ACL.into(),
                     sse_customer: None,
+                    object_lock: ObjectLockState::default(),
                 })
                 .unwrap();
             upload_ids.push(r.upload_id);
@@ -24641,6 +24998,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -24702,6 +25060,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -24769,6 +25128,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -24809,6 +25169,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -24873,6 +25234,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -24958,6 +25320,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -25006,6 +25369,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -25067,6 +25431,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -25127,6 +25492,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -25216,6 +25582,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
         let mut complete_parts = Vec::new();
@@ -25514,6 +25881,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -25869,6 +26237,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -25919,6 +26288,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -26008,6 +26378,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
         test_helpers::upload_part(
@@ -26182,6 +26553,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -26242,6 +26614,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -26311,6 +26684,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
         test_helpers::upload_part(
@@ -26371,6 +26745,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -26426,6 +26801,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
         let mut complete_parts = Vec::new();
@@ -26483,6 +26859,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -26752,6 +27129,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -26898,6 +27276,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"hello world",
@@ -26953,6 +27333,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"",
@@ -27029,6 +27411,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -27117,6 +27500,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
         let mut complete_parts = Vec::new();
@@ -27529,8 +27913,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
-                copy_source: None,
-                metadata_directive: None,
+                policy_context: PutObjectPolicyContext::default(),
+                requested_object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -27572,6 +27956,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: Some(&sse_customer),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "obj",
                 data: b"checksum-body",
@@ -27655,6 +28041,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: Some(&sse_customer),
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -27723,8 +28110,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
-                copy_source: None,
-                metadata_directive: None,
+                policy_context: PutObjectPolicyContext::default(),
+                requested_object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -27770,8 +28157,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
-                copy_source: None,
-                metadata_directive: None,
+                policy_context: PutObjectPolicyContext::default(),
+                requested_object_lock: ObjectLockState::default(),
             })
             .unwrap();
         assert_eq!(result.version_id, VersionId::Null);
@@ -27842,8 +28229,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
-                copy_source: None,
-                metadata_directive: None,
+                policy_context: PutObjectPolicyContext::default(),
+                requested_object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -27887,8 +28274,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
-                copy_source: None,
-                metadata_directive: None,
+                policy_context: PutObjectPolicyContext::default(),
+                requested_object_lock: ObjectLockState::default(),
             })
             .unwrap_err();
         assert!(
@@ -27948,8 +28335,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
-                copy_source: None,
-                metadata_directive: None,
+                policy_context: PutObjectPolicyContext::default(),
+                requested_object_lock: ObjectLockState::default(),
             })
             .unwrap_err();
         assert!(
@@ -27982,6 +28369,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"old-data",
@@ -28018,8 +28407,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
-                copy_source: None,
-                metadata_directive: None,
+                policy_context: PutObjectPolicyContext::default(),
+                requested_object_lock: ObjectLockState::default(),
             })
             .unwrap();
         assert_eq!(result.etag, format_etag(crc));
@@ -28049,6 +28438,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"initial",
@@ -28084,8 +28475,8 @@ mod tests {
                 cond: &cond,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
-                copy_source: None,
-                metadata_directive: None,
+                policy_context: PutObjectPolicyContext::default(),
+                requested_object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -28110,8 +28501,8 @@ mod tests {
                 cond: &bad_cond,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
-                copy_source: None,
-                metadata_directive: None,
+                policy_context: PutObjectPolicyContext::default(),
+                requested_object_lock: ObjectLockState::default(),
             })
             .unwrap_err();
         assert!(
@@ -28156,8 +28547,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
-                copy_source: None,
-                metadata_directive: None,
+                policy_context: PutObjectPolicyContext::default(),
+                requested_object_lock: ObjectLockState::default(),
             })
             .unwrap();
         assert_eq!(result.etag, format_etag(crc));
@@ -28233,8 +28624,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
-                copy_source: None,
-                metadata_directive: None,
+                policy_context: PutObjectPolicyContext::default(),
+                requested_object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -28300,8 +28691,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
-                copy_source: None,
-                metadata_directive: None,
+                policy_context: PutObjectPolicyContext::default(),
+                requested_object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -28377,8 +28768,8 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
-                copy_source: None,
-                metadata_directive: None,
+                policy_context: PutObjectPolicyContext::default(),
+                requested_object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -28442,8 +28833,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
-                copy_source: None,
-                metadata_directive: None,
+                policy_context: PutObjectPolicyContext::default(),
+                requested_object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -28530,8 +28921,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
-                copy_source: None,
-                metadata_directive: None,
+                policy_context: PutObjectPolicyContext::default(),
+                requested_object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -28553,6 +28944,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -28591,6 +28983,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"tiny-data",
@@ -28637,6 +29031,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "exact",
                 data: &data,
@@ -28671,6 +29067,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: &data,
@@ -28723,6 +29121,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: &old_data,
@@ -28748,6 +29148,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"new-data",
@@ -28798,8 +29200,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
-                copy_source: None,
-                metadata_directive: None,
+                policy_context: PutObjectPolicyContext::default(),
+                requested_object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -28843,8 +29245,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
-                copy_source: None,
-                metadata_directive: None,
+                policy_context: PutObjectPolicyContext::default(),
+                requested_object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -28890,8 +29292,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
-                copy_source: None,
-                metadata_directive: None,
+                policy_context: PutObjectPolicyContext::default(),
+                requested_object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -28913,6 +29315,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "key",
                 data: b"normal-data",
@@ -28966,8 +29370,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
-                copy_source: None,
-                metadata_directive: None,
+                policy_context: PutObjectPolicyContext::default(),
+                requested_object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -29022,8 +29426,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
-                copy_source: None,
-                metadata_directive: None,
+                policy_context: PutObjectPolicyContext::default(),
+                requested_object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -29086,8 +29490,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
-                copy_source: None,
-                metadata_directive: None,
+                policy_context: PutObjectPolicyContext::default(),
+                requested_object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -29104,6 +29508,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -29163,8 +29568,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
-                copy_source: None,
-                metadata_directive: None,
+                policy_context: PutObjectPolicyContext::default(),
+                requested_object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -29181,6 +29586,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -29267,6 +29673,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "src",
                 data: b"source-data",
@@ -29291,6 +29699,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -29352,8 +29761,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
-                copy_source: None,
-                metadata_directive: None,
+                policy_context: PutObjectPolicyContext::default(),
+                requested_object_lock: ObjectLockState::default(),
             })
             .unwrap();
     }
@@ -29386,8 +29795,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
-                copy_source: None,
-                metadata_directive: None,
+                policy_context: PutObjectPolicyContext::default(),
+                requested_object_lock: ObjectLockState::default(),
             })
             .unwrap_err();
         assert!(
@@ -29464,6 +29873,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -29523,6 +29933,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -29584,6 +29995,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -29627,6 +30039,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
         let mpu_b = coord
@@ -29641,6 +30054,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -29770,6 +30184,7 @@ mod tests {
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
+                object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -29921,8 +30336,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
-                copy_source: None,
-                metadata_directive: None,
+                policy_context: PutObjectPolicyContext::default(),
+                requested_object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -30014,8 +30429,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
-                copy_source: None,
-                metadata_directive: None,
+                policy_context: PutObjectPolicyContext::default(),
+                requested_object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -30071,6 +30486,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "bad-segment-crc",
                 data: b"segment-data",
@@ -30166,8 +30583,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
-                copy_source: None,
-                metadata_directive: None,
+                policy_context: PutObjectPolicyContext::default(),
+                requested_object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -30188,6 +30605,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
                 bucket: "bucket",
                 key: "cycle",
                 data: b"v2-normal",
@@ -30241,8 +30660,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
-                copy_source: None,
-                metadata_directive: None,
+                policy_context: PutObjectPolicyContext::default(),
+                requested_object_lock: ObjectLockState::default(),
             })
             .unwrap();
 
@@ -30265,8 +30684,8 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
-                copy_source: None,
-                metadata_directive: None,
+                policy_context: PutObjectPolicyContext::default(),
+                requested_object_lock: ObjectLockState::default(),
             })
             .unwrap();
 

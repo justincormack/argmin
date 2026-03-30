@@ -724,16 +724,15 @@ impl HttpFrontend {
                 )?;
                 let ownership = parse_bucket_ownership(req.header("x-amz-object-ownership"))?;
                 let requester = Self::requester_from_auth(auth);
-                self.coordinator
-                    .create_bucket_for_requester_with_object_lock(
-                        &crate::coordinator::CreateBucketRequest {
-                            name: &bucket,
-                            requester,
-                            acl,
-                            ownership,
-                        },
+                self.coordinator.create_bucket_for_requester(
+                    &crate::coordinator::CreateBucketRequest {
+                        name: &bucket,
+                        requester,
+                        acl,
+                        ownership,
                         object_lock_enabled,
-                    )?;
+                    },
+                )?;
                 Ok(S3Response::create_bucket(&bucket))
             }
             S3Operation::DeleteBucket { bucket } => {
@@ -932,28 +931,26 @@ impl HttpFrontend {
                     } else {
                         TaggingDirective::Copy
                     };
-                    let result = self.coordinator.copy_object_with_object_lock(
-                        &CopyObjectRequest {
-                            source: CopySource {
-                                bucket: &src_bucket,
-                                key: &src_key,
-                                version_id: src_version_id,
-                                condition: &src_cond,
-                                expected_bucket_owner: expected_source_bucket_owner(req),
-                            },
-                            dst_bucket: &bucket,
-                            dst_key: &key,
-                            dst_condition: &dst_cond,
-                            directive,
-                            tagging,
-                            requester,
-                            acl,
-                            source_sse_customer: source_sse_customer.as_ref(),
-                            dst_sse_customer: dst_sse_customer.as_ref(),
-                            expected_bucket_owner,
+                    let result = self.coordinator.copy_object(&CopyObjectRequest {
+                        source: CopySource {
+                            bucket: &src_bucket,
+                            key: &src_key,
+                            version_id: src_version_id,
+                            condition: &src_cond,
+                            expected_bucket_owner: expected_source_bucket_owner(req),
                         },
+                        dst_bucket: &bucket,
+                        dst_key: &key,
+                        dst_condition: &dst_cond,
+                        directive,
+                        tagging,
+                        requester,
+                        acl,
+                        source_sse_customer: source_sse_customer.as_ref(),
+                        dst_sse_customer: dst_sse_customer.as_ref(),
                         object_lock,
-                    )?;
+                        expected_bucket_owner,
+                    })?;
                     Ok(S3Response::copy_object(&result))
                 } else {
                     // Normal PutObject — use streaming upload path directly.
@@ -984,10 +981,9 @@ impl HttpFrontend {
                         None,
                         acl.policy_condition_value(),
                     );
-                    let result = self
-                        .coordinator
-                        .put_object_with_policy_context_and_object_lock(
-                            &crate::coordinator::PutObjectRequest {
+                    let result =
+                        self.coordinator
+                            .put_object(&crate::coordinator::PutObjectRequest {
                                 bucket: &bucket,
                                 key: &key,
                                 data: &req.body,
@@ -997,12 +993,11 @@ impl HttpFrontend {
                                 cond: &cond,
                                 requester,
                                 acl,
+                                policy_context,
+                                object_lock,
                                 sse_customer: sse_customer.as_ref(),
                                 expected_bucket_owner,
-                            },
-                            policy_context,
-                            object_lock,
-                        )?;
+                            })?;
                     let mut resp = S3Response::put_object(&result);
                     apply_sse_customer_write_response_headers(&mut resp, sse_customer.as_ref());
                     for &(_, header) in CHECKSUM_HEADERS {
@@ -2020,7 +2015,7 @@ impl HttpFrontend {
                 let acl = parse_put_object_write_acl(req)?;
                 let object_lock = parse_object_lock_headers(req)?;
 
-                let result = self.coordinator.create_multipart_upload_with_object_lock(
+                let result = self.coordinator.create_multipart_upload(
                     &crate::coordinator::CreateMultipartUploadRequest {
                         bucket: &bucket,
                         key: &key,
@@ -2030,6 +2025,7 @@ impl HttpFrontend {
                         checksum,
                         requester,
                         acl,
+                        object_lock,
                         sse_customer: sse_customer.as_ref(),
                         grant_read: req.header("x-amz-grant-read"),
                         grant_write: req.header("x-amz-grant-write"),
@@ -2038,7 +2034,6 @@ impl HttpFrontend {
                         grant_full_control: req.header("x-amz-grant-full-control"),
                         expected_bucket_owner,
                     },
-                    object_lock,
                 )?;
                 Ok(S3Response::create_multipart_upload(
                     &bucket,
@@ -2883,8 +2878,9 @@ impl HttpFrontend {
             acl.policy_condition_value(),
         )
         .with_request_object_tags_xml(ctx.tags_xml.as_deref());
-        let result = self.coordinator.finalize_stream_put_with_policy_context(
-            &FinalizeStreamPutRequest {
+        let result = self
+            .coordinator
+            .finalize_stream_put(&FinalizeStreamPutRequest {
                 bucket: &ctx.binding.bucket,
                 key: &ctx.binding.key,
                 session_id: &ctx.binding.session_id,
@@ -2897,12 +2893,9 @@ impl HttpFrontend {
                 cond: &crate::conditional::WriteCondition::default(),
                 requester: ctx.requester.clone(),
                 acl: acl.into(),
-                copy_source: None,
-                metadata_directive: None,
-            },
-            policy_context,
-            ObjectLockState::default(),
-        )?;
+                policy_context,
+                requested_object_lock: ObjectLockState::default(),
+            })?;
 
         let mut resp = S3Response::post_object(
             &result,
@@ -3217,29 +3210,27 @@ impl HttpFrontend {
         let system_metadata = Self::merged_streaming_put_system_metadata(ctx, trailer_checksums);
         let result = self
             .coordinator
-            .put_object_with_policy_context_and_object_lock(
-                &crate::coordinator::PutObjectRequest {
-                    bucket: &ctx.bucket,
-                    key: &ctx.key,
-                    data,
-                    metadata: &metadata_blob,
-                    system_metadata: &system_metadata,
-                    tags: ctx.inline_tags_xml.as_deref(),
-                    cond: &ctx.cond,
-                    requester: ctx.requester.clone(),
-                    acl: put_object_write_acl_from_components(
-                        ctx.acl_header.as_deref(),
-                        ctx.acl_grants.as_ref(),
-                    ),
-                    sse_customer: ctx
-                        .sse_customer
-                        .as_ref()
-                        .map(SseCustomerWriteContext::request),
-                    expected_bucket_owner: ctx.expected_bucket_owner.as_deref(),
-                },
-                ctx.policy_context(),
-                ctx.object_lock,
-            )?;
+            .put_object(&crate::coordinator::PutObjectRequest {
+                bucket: &ctx.bucket,
+                key: &ctx.key,
+                data,
+                metadata: &metadata_blob,
+                system_metadata: &system_metadata,
+                tags: ctx.inline_tags_xml.as_deref(),
+                cond: &ctx.cond,
+                requester: ctx.requester.clone(),
+                acl: put_object_write_acl_from_components(
+                    ctx.acl_header.as_deref(),
+                    ctx.acl_grants.as_ref(),
+                ),
+                policy_context: ctx.policy_context(),
+                object_lock: ctx.object_lock,
+                sse_customer: ctx
+                    .sse_customer
+                    .as_ref()
+                    .map(SseCustomerWriteContext::request),
+                expected_bucket_owner: ctx.expected_bucket_owner.as_deref(),
+            })?;
 
         let mut resp = S3Response::put_object(&result);
         apply_sse_customer_write_response_headers(
@@ -3278,8 +3269,9 @@ impl HttpFrontend {
         let metadata_blob = Self::merged_streaming_put_metadata_blob(ctx, trailer_checksums);
         let system_metadata = Self::merged_streaming_put_system_metadata(ctx, trailer_checksums);
 
-        let result = self.coordinator.finalize_stream_put_with_policy_context(
-            &FinalizeStreamPutRequest {
+        let result = self
+            .coordinator
+            .finalize_stream_put(&FinalizeStreamPutRequest {
                 bucket: &ctx.bucket,
                 key: &ctx.key,
                 session_id,
@@ -3295,12 +3287,9 @@ impl HttpFrontend {
                     ctx.acl_header.as_deref(),
                     ctx.acl_grants.as_ref(),
                 ),
-                copy_source: None,
-                metadata_directive: None,
-            },
-            ctx.policy_context(),
-            ctx.object_lock,
-        )?;
+                policy_context: ctx.policy_context(),
+                requested_object_lock: ctx.object_lock,
+            })?;
 
         let mut resp = S3Response::put_object(&result);
         apply_sse_customer_write_response_headers(
@@ -4625,6 +4614,7 @@ mod tests {
                 requester: crate::coordinator::Requester::authenticated(account.clone()),
                 acl: crate::coordinator::CreateBucketAcl::DefaultPrivate,
                 ownership: crate::coordinator::BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
             })
             .unwrap();
 
@@ -5049,6 +5039,7 @@ mod tests {
                 requester: crate::coordinator::Requester::principal("testuser"),
                 acl: crate::coordinator::CreateBucketAcl::DefaultPrivate,
                 ownership: crate::coordinator::BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
             })
             .unwrap();
         let canonical_id = s3_types::CanonicalUserId::from_principal("grantee-a");
@@ -5268,6 +5259,8 @@ mod tests {
                 cond: &crate::conditional::WriteCondition::default(),
                 requester: crate::coordinator::Requester::principal("testuser"),
                 acl: crate::coordinator::PutObjectAcl::None.into(),
+                policy_context: crate::coordinator::PutObjectPolicyContext::default(),
+                object_lock: Default::default(),
                 sse_customer: None,
                 expected_bucket_owner: None,
             })

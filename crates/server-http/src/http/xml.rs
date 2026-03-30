@@ -5951,6 +5951,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: server_core::coordinator::PutObjectPolicyContext::default(),
+                object_lock: Default::default(),
                 bucket: "test-bucket",
                 key: "dir/file1.txt",
                 data: b"hello",
@@ -5968,6 +5970,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: server_core::coordinator::PutObjectPolicyContext::default(),
+                object_lock: Default::default(),
                 bucket: "test-bucket",
                 key: "dir/file2.txt",
                 data: b"world",
@@ -5985,6 +5989,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
+                policy_context: server_core::coordinator::PutObjectPolicyContext::default(),
+                object_lock: Default::default(),
                 bucket: "test-bucket",
                 key: "root.txt",
                 data: b"root",
@@ -6097,6 +6103,8 @@ mod tests {
                 &coord,
                 &PutObjectRequest {
                     sse_customer: None,
+                    policy_context: server_core::coordinator::PutObjectPolicyContext::default(),
+                    object_lock: Default::default(),
                     bucket: "bucket",
                     key: &key,
                     data: b"data",
