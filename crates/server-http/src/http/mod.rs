@@ -2771,7 +2771,8 @@ impl HttpFrontend {
                     ctx.encryption().clone()
                 }),
             object_lock: ObjectLockState::default(),
-            expected_bucket_owner: expected_bucket_owner(req),
+            // AWS ignores x-amz-expected-bucket-owner for browser-based POST uploads.
+            expected_bucket_owner: None,
         })?;
 
         let success_status = field("success_action_status")

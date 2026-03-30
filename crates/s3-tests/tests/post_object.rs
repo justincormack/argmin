@@ -352,7 +352,7 @@ fn test_post_object_authenticated_request() {
 }
 
 #[test]
-fn test_post_object_expected_bucket_owner() {
+fn test_post_object_ignores_expected_bucket_owner() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = setup_bucket().await;
@@ -371,19 +371,6 @@ fn test_post_object_expected_bucket_owner() {
             file_data,
             "test.txt",
             &[("x-amz-expected-bucket-owner", "000000000000")],
-        );
-        assert_eq!(status, 403, "expected 403, got {} body={}", status, body);
-        assert_error_code(&body, "AccessDenied");
-
-        let head = client.head_object().bucket(&bucket).key(key).send().await;
-        assert_eq!(err_status(&head), 404);
-
-        let (status, body) = post_object_with_headers(
-            &bucket,
-            &field_refs,
-            file_data,
-            "test.txt",
-            &[("x-amz-expected-bucket-owner", CTX.account_id())],
         );
         assert_eq!(status, 204, "expected 204, got {} body={}", status, body);
 
