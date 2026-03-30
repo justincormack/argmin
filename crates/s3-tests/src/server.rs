@@ -118,7 +118,7 @@ impl TestServer {
                     TEST_SSE_C_VALIDATOR_KEY_B64,
                 )
                 .expect("valid test SSE-C validator key");
-                let coordinator = server_core::coordinator::Coordinator::new_with_sse_c_validator(
+                let coordinator = server_core::coordinator::Coordinator::new(
                     Arc::clone(&storage_node),
                     ec_config,
                     TEST_REGION.to_string(),

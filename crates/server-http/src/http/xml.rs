@@ -3721,7 +3721,7 @@ mod tests {
         let pg_ids: Vec<u32> = (0..4).collect();
         let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
         let ec_config = EcConfig::new(4, 2).unwrap();
-        Coordinator::new(storage_node, ec_config, "us-east-1".to_string()).unwrap()
+        Coordinator::new(storage_node, ec_config, "us-east-1".to_string(), None).unwrap()
     }
 
     const NO_WRITE: &WriteCondition = &WriteCondition::None;

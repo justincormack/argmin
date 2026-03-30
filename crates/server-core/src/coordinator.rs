@@ -4809,15 +4809,6 @@ impl Coordinator {
         storage_node: Arc<SharedStorageNode>,
         ec_config: EcConfig,
         region: String,
-    ) -> Result<Self, ServerError> {
-        Self::new_with_sse_c_validator(storage_node, ec_config, region, None)
-    }
-
-    /// Create a new coordinator with an optional SSE-C validator key.
-    pub fn new_with_sse_c_validator(
-        storage_node: Arc<SharedStorageNode>,
-        ec_config: EcConfig,
-        region: String,
         sse_c_validator: Option<SseCustomerValidatorConfig>,
     ) -> Result<Self, ServerError> {
         let ec_codec = Arc::new(ErasureCodec::new(ec_config)?);
@@ -12046,12 +12037,12 @@ mod tests {
         let pg_ids: Vec<u32> = (0..pg_count).collect();
         let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
         let ec_config = EcConfig::new(4, 2).unwrap();
-        Coordinator::new(storage_node, ec_config, "us-east-1".to_string()).unwrap()
+        Coordinator::new(storage_node, ec_config, "us-east-1".to_string(), None).unwrap()
     }
 
     fn setup_coordinator_with_shared_storage(storage_node: Arc<SharedStorageNode>) -> Coordinator {
         let ec_config = EcConfig::new(4, 2).unwrap();
-        Coordinator::new(storage_node, ec_config, "us-east-1".to_string()).unwrap()
+        Coordinator::new(storage_node, ec_config, "us-east-1".to_string(), None).unwrap()
     }
 
     fn setup_coordinators_with_pg_count(dir: &Path, pg_count: u32) -> (Coordinator, Coordinator) {
@@ -12078,7 +12069,7 @@ mod tests {
             &base64::engine::general_purpose::STANDARD.encode([9u8; 32]),
         )
         .unwrap();
-        Coordinator::new_with_sse_c_validator(
+        Coordinator::new(
             storage_node,
             ec_config,
             "us-east-1".to_string(),
@@ -13484,7 +13475,8 @@ mod tests {
         let tmp = test_util::tempdir();
         let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &[0, 2, 5]).unwrap());
         let ec_config = EcConfig::new(4, 2).unwrap();
-        let coord = Coordinator::new(storage_node, ec_config, "us-east-1".to_string()).unwrap();
+        let coord =
+            Coordinator::new(storage_node, ec_config, "us-east-1".to_string(), None).unwrap();
         let bucket = "bucket-sparse";
         coord.create_bucket(bucket).unwrap();
 
@@ -13502,7 +13494,8 @@ mod tests {
         let tmp = test_util::tempdir();
         let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &[0, 2, 5]).unwrap());
         let ec_config = EcConfig::new(4, 2).unwrap();
-        let coord = Coordinator::new(storage_node, ec_config, "us-east-1".to_string()).unwrap();
+        let coord =
+            Coordinator::new(storage_node, ec_config, "us-east-1".to_string(), None).unwrap();
         let bucket = "bucket-sparse";
         coord.create_bucket(bucket).unwrap();
 
@@ -13524,7 +13517,8 @@ mod tests {
         let tmp = test_util::tempdir();
         let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &[0, 2, 5]).unwrap());
         let ec_config = EcConfig::new(4, 2).unwrap();
-        let coord = Coordinator::new(storage_node, ec_config, "us-east-1".to_string()).unwrap();
+        let coord =
+            Coordinator::new(storage_node, ec_config, "us-east-1".to_string(), None).unwrap();
         let bucket = "bucket-sparse";
         coord.create_bucket(bucket).unwrap();
 
@@ -13546,7 +13540,8 @@ mod tests {
         let tmp = test_util::tempdir();
         let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &[0, 2, 5]).unwrap());
         let ec_config = EcConfig::new(4, 2).unwrap();
-        let coord = Coordinator::new(storage_node, ec_config, "us-east-1".to_string()).unwrap();
+        let coord =
+            Coordinator::new(storage_node, ec_config, "us-east-1".to_string(), None).unwrap();
         let bucket = "bucket-sparse";
         let key = "key-sparse";
         coord.create_bucket(bucket).unwrap();
@@ -13659,12 +13654,14 @@ mod tests {
             Arc::clone(&storage_node),
             ec_config,
             "us-east-1".to_string(),
+            None,
         )
         .unwrap();
         let writer = Coordinator::new(
             Arc::clone(&storage_node),
             ec_config,
             "us-east-1".to_string(),
+            None,
         )
         .unwrap();
         admin.create_bucket("bucket").unwrap();
@@ -13712,12 +13709,14 @@ mod tests {
             Arc::clone(&storage_node),
             ec_config,
             "us-east-1".to_string(),
+            None,
         )
         .unwrap();
         let creator = Coordinator::new(
             Arc::clone(&storage_node),
             ec_config,
             "us-east-1".to_string(),
+            None,
         )
         .unwrap();
         admin.create_bucket("bucket").unwrap();
@@ -13761,12 +13760,14 @@ mod tests {
             Arc::clone(&storage_node),
             ec_config,
             "us-east-1".to_string(),
+            None,
         )
         .unwrap();
         let deleter = Coordinator::new(
             Arc::clone(&storage_node),
             ec_config,
             "us-east-1".to_string(),
+            None,
         )
         .unwrap();
         admin.create_bucket("bucket").unwrap();
@@ -13846,12 +13847,14 @@ mod tests {
             Arc::clone(&storage_node),
             ec_config,
             "us-east-1".to_string(),
+            None,
         )
         .unwrap();
         let reader = Coordinator::new(
             Arc::clone(&storage_node),
             ec_config,
             "us-east-1".to_string(),
+            None,
         )
         .unwrap();
 
@@ -13922,12 +13925,14 @@ mod tests {
             Arc::clone(&storage_node),
             ec_config,
             "us-east-1".to_string(),
+            None,
         )
         .unwrap();
         let deleter = Coordinator::new(
             Arc::clone(&storage_node),
             ec_config,
             "us-east-1".to_string(),
+            None,
         )
         .unwrap();
 
@@ -14010,12 +14015,14 @@ mod tests {
             Arc::clone(&storage_node),
             ec_config,
             "us-east-1".to_string(),
+            None,
         )
         .unwrap();
         let completer = Coordinator::new(
             Arc::clone(&storage_node),
             ec_config,
             "us-east-1".to_string(),
+            None,
         )
         .unwrap();
         admin.create_bucket("bucket").unwrap();
@@ -14053,7 +14060,8 @@ mod tests {
         let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
         let ec_config = EcConfig::new(4, 2).unwrap();
 
-        let coord = Coordinator::new(storage_node, ec_config, "us-east-1".to_string()).unwrap();
+        let coord =
+            Coordinator::new(storage_node, ec_config, "us-east-1".to_string(), None).unwrap();
         coord.create_bucket("bucket").unwrap();
 
         let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
@@ -22853,6 +22861,7 @@ mod tests {
                 Arc::clone(&storage_node),
                 ec_config,
                 "us-east-1".to_string(),
+                None,
             )
             .unwrap()
         };
@@ -22947,6 +22956,7 @@ mod tests {
                 Arc::clone(&storage_node),
                 ec_config,
                 "us-east-1".to_string(),
+                None,
             )
             .unwrap()
         };
@@ -23051,6 +23061,7 @@ mod tests {
                 Arc::clone(&storage_node),
                 ec_config,
                 "us-east-1".to_string(),
+                None,
             )
             .unwrap()
         };
@@ -23182,6 +23193,7 @@ mod tests {
                 Arc::clone(&storage_node),
                 ec_config,
                 "us-east-1".to_string(),
+                None,
             )
             .unwrap()
         };
@@ -23338,6 +23350,7 @@ mod tests {
                 Arc::clone(&storage_node),
                 ec_config,
                 "us-east-1".to_string(),
+                None,
             )
             .unwrap()
         };
@@ -23456,6 +23469,7 @@ mod tests {
                 Arc::clone(&storage_node),
                 ec_config,
                 "us-east-1".to_string(),
+                None,
             )
             .unwrap()
         };
@@ -23521,6 +23535,7 @@ mod tests {
                 Arc::clone(&storage_node),
                 ec_config,
                 "us-east-1".to_string(),
+                None,
             )
             .unwrap()
         };
@@ -23598,6 +23613,7 @@ mod tests {
                 Arc::clone(&storage_node),
                 ec_config,
                 "us-east-1".to_string(),
+                None,
             )
             .unwrap()
         };
@@ -23688,6 +23704,7 @@ mod tests {
                 Arc::clone(&storage_node),
                 ec_config,
                 "us-east-1".to_string(),
+                None,
             )
             .unwrap()
         };
@@ -23774,6 +23791,7 @@ mod tests {
                 Arc::clone(&storage_node),
                 ec_config,
                 "us-east-1".to_string(),
+                None,
             )
             .unwrap()
         };
@@ -24794,12 +24812,14 @@ mod tests {
             Arc::clone(&storage_node),
             ec_config,
             "us-east-1".to_string(),
+            None,
         )
         .unwrap();
         let deleter = Coordinator::new(
             Arc::clone(&storage_node),
             ec_config,
             "us-east-1".to_string(),
+            None,
         )
         .unwrap();
         admin.create_bucket("bucket").unwrap();

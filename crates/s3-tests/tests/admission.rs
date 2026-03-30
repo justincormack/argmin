@@ -51,6 +51,7 @@ async fn start_server(
                 Arc::clone(&storage_node),
                 ec_config,
                 "us-east-1".to_string(),
+                None,
             )
             .expect("create coordinator");
 

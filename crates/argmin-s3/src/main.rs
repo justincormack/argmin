@@ -103,7 +103,7 @@ async fn main() {
     // (PG access serialized by mutex).
     let mut frontends = Vec::with_capacity(config.workers as usize);
     for _ in 0..config.workers {
-        let coordinator = match Coordinator::new_with_sse_c_validator(
+        let coordinator = match Coordinator::new(
             Arc::clone(&storage_node),
             ec_config,
             config.region.clone(),
