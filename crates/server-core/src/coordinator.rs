@@ -3430,6 +3430,14 @@ impl Coordinator {
         }
     }
 
+    fn delete_object_policy_action(version_id: Option<VersionId>) -> auth::PolicyAction {
+        if version_id.is_some() {
+            auth::PolicyAction::DeleteObjectVersion
+        } else {
+            auth::PolicyAction::DeleteObject
+        }
+    }
+
     fn cached_bucket_policy(
         &self,
         bucket: &BucketSummary,
@@ -3523,6 +3531,27 @@ impl Coordinator {
         );
         let request = request.with_existing_object_tags(&request_tags);
         Ok(policy.evaluate(&request))
+    }
+
+    fn bucket_policy_decision_for_key(
+        requester: &Requester,
+        bucket: &BucketSummary,
+        key: &str,
+        action: auth::PolicyAction,
+        policy: Option<&auth::BucketPolicy>,
+    ) -> auth::PolicyEvaluation {
+        let Some(policy) = policy else {
+            return auth::PolicyEvaluation::NoMatch;
+        };
+
+        let request = auth::PolicyRequest::new(
+            action,
+            &bucket.name,
+            key,
+            requester.principal_opt(),
+            requester.canonical_user_id(),
+        );
+        policy.evaluate(&request)
     }
 
     fn bucket_policy_decision_for_bucket(
@@ -3672,6 +3701,67 @@ impl Coordinator {
         )
     }
 
+    fn requester_can_manage_object_lock_with_bucket_policy(
+        requester: &Requester,
+        bucket: &BucketSummary,
+        object: &StoredObject,
+        action: auth::PolicyAction,
+        policy: Option<&auth::BucketPolicy>,
+    ) -> Result<bool, ServerError> {
+        Ok(
+            match Self::bucket_policy_decision_for_object(
+                requester, bucket, object, action, policy,
+            )? {
+                auth::PolicyEvaluation::ExplicitDeny => false,
+                auth::PolicyEvaluation::ExplicitAllow
+                    if Self::bucket_policy_allow_survives_restrict_public_buckets(
+                        requester, bucket,
+                    ) =>
+                {
+                    true
+                }
+                auth::PolicyEvaluation::ExplicitAllow | auth::PolicyEvaluation::NoMatch => {
+                    Self::requester_can_bucket_admin(requester, &bucket.owner_principal)
+                }
+            },
+        )
+    }
+
+    fn requester_can_delete_object_with_bucket_policy(
+        requester: &Requester,
+        bucket: &BucketSummary,
+        key: &str,
+        object: Option<&StoredObject>,
+        action: auth::PolicyAction,
+        policy: Option<&auth::BucketPolicy>,
+    ) -> Result<bool, ServerError> {
+        let decision = match object {
+            Some(object) => {
+                Self::bucket_policy_decision_for_object(requester, bucket, object, action, policy)?
+            }
+            None => Self::bucket_policy_decision_for_key(requester, bucket, key, action, policy),
+        };
+
+        Ok(match decision {
+            auth::PolicyEvaluation::ExplicitDeny => false,
+            auth::PolicyEvaluation::ExplicitAllow
+                if Self::bucket_policy_allow_survives_restrict_public_buckets(
+                    requester, bucket,
+                ) =>
+            {
+                true
+            }
+            auth::PolicyEvaluation::ExplicitAllow | auth::PolicyEvaluation::NoMatch => {
+                Self::requester_can_object_write(
+                    requester,
+                    &bucket.owner_principal,
+                    &bucket.acl_grants,
+                    Self::effective_public_write(bucket),
+                )
+            }
+        })
+    }
+
     fn requester_can_read_object_acl_with_bucket_policy(
         requester: &Requester,
         bucket: &BucketSummary,
@@ -3772,6 +3862,31 @@ impl Coordinator {
             requester,
             bucket,
             auth::PolicyAction::GetBucketPolicyStatus,
+            policy,
+        ) {
+            auth::PolicyEvaluation::ExplicitDeny => false,
+            auth::PolicyEvaluation::ExplicitAllow
+                if Self::bucket_policy_allow_survives_restrict_public_buckets(
+                    requester, bucket,
+                ) =>
+            {
+                true
+            }
+            auth::PolicyEvaluation::ExplicitAllow | auth::PolicyEvaluation::NoMatch => {
+                Self::requester_can_bucket_admin(requester, &bucket.owner_principal)
+            }
+        }
+    }
+
+    fn requester_can_get_bucket_object_lock_configuration_with_bucket_policy(
+        requester: &Requester,
+        bucket: &BucketSummary,
+        policy: Option<&auth::BucketPolicy>,
+    ) -> bool {
+        match Self::bucket_policy_decision_for_bucket(
+            requester,
+            bucket,
+            auth::PolicyAction::GetBucketObjectLockConfiguration,
             policy,
         ) {
             auth::PolicyEvaluation::ExplicitDeny => false,
@@ -4379,32 +4494,41 @@ impl Coordinator {
         }
     }
 
-    fn authorize_object_write_requester(
-        &self,
-        requester: &Requester,
-        bucket: &str,
-        expected_bucket_owner: Option<&str>,
-    ) -> Result<BucketSummary, ServerError> {
-        let info = self.active_bucket_summary(bucket)?;
-        Self::ensure_expected_bucket_owner(&info, expected_bucket_owner)?;
-        if Self::requester_can_object_write(
-            requester,
-            &info.owner_principal,
-            &info.acl_grants,
-            Self::effective_public_write(&info),
-        ) {
-            Ok(info)
-        } else {
-            Err(ServerError::AccessDenied)
-        }
-    }
-
     fn requester_can_bypass_governance_retention(
         requester: &Requester,
         bucket: &BucketSummary,
     ) -> bool {
         Self::requester_can_bucket_admin(requester, &bucket.owner_principal)
             || Self::requester_is_bucket_owner_account(requester, bucket)
+    }
+
+    fn requester_can_bypass_governance_retention_with_bucket_policy(
+        requester: &Requester,
+        bucket: &BucketSummary,
+        object: &StoredObject,
+        policy: Option<&auth::BucketPolicy>,
+    ) -> Result<bool, ServerError> {
+        Ok(
+            match Self::bucket_policy_decision_for_object(
+                requester,
+                bucket,
+                object,
+                auth::PolicyAction::BypassGovernanceRetention,
+                policy,
+            )? {
+                auth::PolicyEvaluation::ExplicitDeny => false,
+                auth::PolicyEvaluation::ExplicitAllow
+                    if Self::bucket_policy_allow_survives_restrict_public_buckets(
+                        requester, bucket,
+                    ) =>
+                {
+                    true
+                }
+                auth::PolicyEvaluation::ExplicitAllow | auth::PolicyEvaluation::NoMatch => {
+                    Self::requester_can_bypass_governance_retention(requester, bucket)
+                }
+            },
+        )
     }
 
     fn authorize_put_object_requester(
@@ -5499,8 +5623,16 @@ impl Coordinator {
             "bucket={}",
             name
         );
-        let info =
-            self.authorize_bucket_admin_requester(&requester, name, expected_bucket_owner)?;
+        let info = self.active_bucket_summary(name)?;
+        Self::ensure_expected_bucket_owner(&info, expected_bucket_owner)?;
+        let bucket_policy = self.cached_bucket_policy(&info)?;
+        if !Self::requester_can_get_bucket_object_lock_configuration_with_bucket_policy(
+            &requester,
+            &info,
+            bucket_policy.as_deref(),
+        ) {
+            return Err(ServerError::AccessDenied);
+        }
         if !info.object_lock.enabled {
             return Err(ServerError::ObjectLockConfigurationNotFound {
                 bucket: name.to_string(),
@@ -6636,18 +6768,53 @@ impl Coordinator {
         bucket: &str,
         key: &str,
         version_id: Option<VersionId>,
+        policy_action: auth::PolicyAction,
         expected_bucket_owner: Option<&str>,
-    ) -> Result<LockedReadObject<'a>, ServerError> {
-        let bucket_info =
-            self.authorize_bucket_admin_requester(requester, bucket, expected_bucket_owner)?;
+    ) -> Result<
+        (
+            BucketSummary,
+            Option<Arc<auth::BucketPolicy>>,
+            LockedReadObject<'a>,
+        ),
+        ServerError,
+    > {
+        let bucket_info = self.active_bucket_summary(bucket)?;
+        Self::ensure_expected_bucket_owner(&bucket_info, expected_bucket_owner)?;
         Self::ensure_object_lock_bucket(&bucket_info)?;
-        self.lock_object_pgs_for_read(bucket, key, version_id)
+        let can_discover_missing =
+            Self::requester_can_bucket_admin(requester, &bucket_info.owner_principal);
+        let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
+        let locked = match self.lock_object_pgs_for_read(bucket, key, version_id) {
+            Ok(locked) => locked,
+            Err(ServerError::ObjectNotFound { .. } | ServerError::VersionNotFound { .. })
+                if !can_discover_missing =>
+            {
+                return Err(ServerError::AccessDenied);
+            }
+            Err(other) => return Err(other),
+        };
+
+        if Self::requester_can_manage_object_lock_with_bucket_policy(
+            requester,
+            &bucket_info,
+            &locked.record,
+            policy_action,
+            bucket_policy.as_deref(),
+        )? {
+            // Return the policy snapshot fetched before taking object locks so
+            // later authorization checks do not re-enter bucket metadata and
+            // invert the bucket/object lock order.
+            Ok((bucket_info, bucket_policy, locked))
+        } else {
+            Err(ServerError::AccessDenied)
+        }
     }
 
     fn validate_retention_update(
         current: Option<ObjectRetention>,
         requested: ObjectRetention,
-        bypass_governance: bool,
+        bypass_governance_requested: bool,
+        can_bypass_governance: bool,
     ) -> Result<(), ServerError> {
         let Some(current) = current else {
             return Ok(());
@@ -6658,7 +6825,10 @@ impl Coordinator {
                 let shortens =
                     requested.retain_until_unix_seconds < current.retain_until_unix_seconds;
                 let changes_mode = requested.mode != current.mode;
-                if (shortens || changes_mode) && !bypass_governance {
+                if shortens || changes_mode {
+                    if bypass_governance_requested && can_bypass_governance {
+                        return Ok(());
+                    }
                     return Err(ServerError::AccessDenied);
                 }
                 Ok(())
@@ -6786,21 +6956,34 @@ impl Coordinator {
             req.retention.mode,
             req.bypass_governance
         );
-        let LockedReadObject {
-            record: stored,
-            pgs,
-        } = self.lock_object_for_authorized_object_lock(
+        let (
+            bucket_info,
+            bucket_policy,
+            LockedReadObject {
+                record: stored,
+                pgs,
+            },
+        ) = self.lock_object_for_authorized_object_lock(
             &req.object.requester,
             req.object.bucket,
             req.object.key,
             req.object.version_id,
+            auth::PolicyAction::PutObjectRetention,
             req.object.expected_bucket_owner(),
         )?;
         let live = stored.as_live().ok_or(ServerError::MethodNotAllowed)?;
+        let can_bypass_governance =
+            Self::requester_can_bypass_governance_retention_with_bucket_policy(
+                &req.object.requester,
+                &bucket_info,
+                &stored,
+                bucket_policy.as_deref(),
+            )?;
         Self::validate_retention_update(
             live.object_lock.retention,
             req.retention,
             req.bypass_governance,
+            can_bypass_governance,
         )?;
         pgs.meta()
             .put_object_retention(
@@ -6829,13 +7012,15 @@ impl Coordinator {
             req.key,
             req.version_id
         );
-        let LockedReadObject { record: stored, .. } = self.lock_object_for_authorized_object_lock(
-            &req.requester,
-            req.bucket,
-            req.key,
-            req.version_id,
-            req.expected_bucket_owner(),
-        )?;
+        let (_bucket_info, _bucket_policy, LockedReadObject { record: stored, .. }) = self
+            .lock_object_for_authorized_object_lock(
+                &req.requester,
+                req.bucket,
+                req.key,
+                req.version_id,
+                auth::PolicyAction::GetObjectRetention,
+                req.expected_bucket_owner(),
+            )?;
         let live = stored.as_live().ok_or(ServerError::MethodNotAllowed)?;
         Ok(live.object_lock.retention)
     }
@@ -6853,14 +7038,19 @@ impl Coordinator {
             req.object.version_id,
             req.legal_hold
         );
-        let LockedReadObject {
-            record: stored,
-            pgs,
-        } = self.lock_object_for_authorized_object_lock(
+        let (
+            _bucket_info,
+            _bucket_policy,
+            LockedReadObject {
+                record: stored,
+                pgs,
+            },
+        ) = self.lock_object_for_authorized_object_lock(
             &req.object.requester,
             req.object.bucket,
             req.object.key,
             req.object.version_id,
+            auth::PolicyAction::PutObjectLegalHold,
             req.object.expected_bucket_owner(),
         )?;
         let live = stored.as_live().ok_or(ServerError::MethodNotAllowed)?;
@@ -6891,13 +7081,15 @@ impl Coordinator {
             req.key,
             req.version_id
         );
-        let LockedReadObject { record: stored, .. } = self.lock_object_for_authorized_object_lock(
-            &req.requester,
-            req.bucket,
-            req.key,
-            req.version_id,
-            req.expected_bucket_owner(),
-        )?;
+        let (_bucket_info, _bucket_policy, LockedReadObject { record: stored, .. }) = self
+            .lock_object_for_authorized_object_lock(
+                &req.requester,
+                req.bucket,
+                req.key,
+                req.version_id,
+                auth::PolicyAction::GetObjectLegalHold,
+                req.expected_bucket_owner(),
+            )?;
         let live = stored.as_live().ok_or(ServerError::MethodNotAllowed)?;
         Ok(live.object_lock.legal_hold.as_legal_hold_status())
     }
@@ -10352,8 +10544,9 @@ impl Coordinator {
         let request_version_id = req.version_id;
         let cond = req.cond;
         let requester = &req.requester;
-        let bucket_info =
-            self.authorize_object_write_requester(requester, bucket, expected_bucket_owner)?;
+        let bucket_info = self.active_bucket_summary(bucket)?;
+        Self::ensure_expected_bucket_owner(&bucket_info, expected_bucket_owner)?;
+        let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
 
         match (bucket_info.versioning, request_version_id) {
             // Unversioned bucket: physical delete (current behavior)
@@ -10364,6 +10557,16 @@ impl Coordinator {
                 } = match self.lock_object_pgs_for_read(bucket, key, None) {
                     Ok(locked) => locked,
                     Err(ServerError::ObjectNotFound { .. }) => {
+                        if !Self::requester_can_delete_object_with_bucket_policy(
+                            requester,
+                            &bucket_info,
+                            key,
+                            None,
+                            Self::delete_object_policy_action(None),
+                            bucket_policy.as_deref(),
+                        )? {
+                            return Err(ServerError::AccessDenied);
+                        }
                         if !cond.is_empty() {
                             return Err(ServerError::PreconditionFailed);
                         }
@@ -10374,6 +10577,17 @@ impl Coordinator {
                     }
                     Err(other) => return Err(other),
                 };
+
+                if !Self::requester_can_delete_object_with_bucket_policy(
+                    requester,
+                    &bucket_info,
+                    key,
+                    Some(&stored),
+                    Self::delete_object_policy_action(None),
+                    bucket_policy.as_deref(),
+                )? {
+                    return Err(ServerError::AccessDenied);
+                }
 
                 // Unversioned bucket objects are always live (no delete markers).
                 let record = match stored {
@@ -10483,6 +10697,16 @@ impl Coordinator {
                     Err(
                         ServerError::ObjectNotFound { .. } | ServerError::VersionNotFound { .. },
                     ) => {
+                        if !Self::requester_can_delete_object_with_bucket_policy(
+                            requester,
+                            &bucket_info,
+                            key,
+                            None,
+                            Self::delete_object_policy_action(Some(vid)),
+                            bucket_policy.as_deref(),
+                        )? {
+                            return Err(ServerError::AccessDenied);
+                        }
                         return Ok(DeleteObjectResult {
                             version_id: vid,
                             delete_marker: false,
@@ -10490,6 +10714,17 @@ impl Coordinator {
                     }
                     Err(other) => return Err(other),
                 };
+
+                if !Self::requester_can_delete_object_with_bucket_policy(
+                    requester,
+                    &bucket_info,
+                    key,
+                    Some(&stored),
+                    Self::delete_object_policy_action(Some(vid)),
+                    bucket_policy.as_deref(),
+                )? {
+                    return Err(ServerError::AccessDenied);
+                }
 
                 let meta_pg = pgs.meta();
                 let is_delete_marker = stored.is_delete_marker();
@@ -10503,7 +10738,12 @@ impl Coordinator {
                 // Delete shards if it's a live object (not a delete marker)
                 if let StoredObject::Live(record) = &stored {
                     let can_bypass_governance =
-                        Self::requester_can_bypass_governance_retention(requester, &bucket_info);
+                        Self::requester_can_bypass_governance_retention_with_bucket_policy(
+                            requester,
+                            &bucket_info,
+                            &stored,
+                            bucket_policy.as_deref(),
+                        )?;
                     Self::validate_delete_against_object_lock(
                         record.object_lock,
                         req.bypass_governance,
@@ -10593,28 +10833,34 @@ impl Coordinator {
             }
 
             // Versioned/Suspended + no versionId: insert delete marker
-            (_, None) => {
-                if !cond.is_empty() {
-                    let LockedReadObject {
-                        record: stored,
-                        pgs,
-                    } = match self.lock_object_pgs_for_read(bucket, key, None) {
-                        Ok(locked) => locked,
-                        Err(ServerError::ObjectNotFound { .. }) => {
-                            return Err(ServerError::PreconditionFailed);
-                        }
-                        Err(other) => return Err(other),
-                    };
+            (_, None) => match self.lock_object_pgs_for_read(bucket, key, None) {
+                Ok(LockedReadObject {
+                    record: stored,
+                    pgs,
+                }) => {
+                    if !Self::requester_can_delete_object_with_bucket_policy(
+                        requester,
+                        &bucket_info,
+                        key,
+                        Some(&stored),
+                        Self::delete_object_policy_action(None),
+                        bucket_policy.as_deref(),
+                    )? {
+                        return Err(ServerError::AccessDenied);
+                    }
 
-                    let record = match stored {
-                        StoredObject::Live(record) => record,
-                        StoredObject::DeleteMarker(_) => {
-                            return Err(ServerError::PreconditionFailed);
-                        }
-                    };
+                    if !cond.is_empty() {
+                        let record = match stored {
+                            StoredObject::Live(record) => record,
+                            StoredObject::DeleteMarker(_) => {
+                                return Err(ServerError::PreconditionFailed);
+                            }
+                        };
 
-                    let etag_str = record.etag.format();
-                    check_delete_conditions(cond, &etag_str)?;
+                        let etag_str = record.etag.format();
+                        check_delete_conditions(cond, &etag_str)?;
+                    }
+
                     let meta_pg = pgs.meta();
                     let marker_vid = meta_pg.next_version_id(bucket, key)?;
                     meta_pg.put_object_meta(&PutObjectReq::DeleteMarker(PutDeleteMarkerReq {
@@ -10628,31 +10874,47 @@ impl Coordinator {
                         ),
                     }))?;
 
-                    return Ok(DeleteObjectResult {
+                    Ok(DeleteObjectResult {
                         version_id: marker_vid,
                         delete_marker: true,
-                    });
+                    })
                 }
-
-                let meta_pg_id = self.object_pg_id(bucket, key);
-                let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
-                let marker_vid = meta_pg.next_version_id(bucket, key)?;
-                meta_pg.put_object_meta(&PutObjectReq::DeleteMarker(PutDeleteMarkerReq {
-                    bucket: BucketName::from(bucket),
-                    key: ObjectKey::from(key),
-                    version_id: marker_vid,
-                    owner: Self::effective_object_owner(
+                Err(ServerError::ObjectNotFound { .. }) => {
+                    if !Self::requester_can_delete_object_with_bucket_policy(
+                        requester,
                         &bucket_info,
-                        &req.requester,
-                        PutObjectAcl::None,
-                    ),
-                }))?;
+                        key,
+                        None,
+                        Self::delete_object_policy_action(None),
+                        bucket_policy.as_deref(),
+                    )? {
+                        return Err(ServerError::AccessDenied);
+                    }
+                    if !cond.is_empty() {
+                        return Err(ServerError::PreconditionFailed);
+                    }
 
-                Ok(DeleteObjectResult {
-                    version_id: marker_vid,
-                    delete_marker: true,
-                })
-            }
+                    let meta_pg_id = self.object_pg_id(bucket, key);
+                    let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
+                    let marker_vid = meta_pg.next_version_id(bucket, key)?;
+                    meta_pg.put_object_meta(&PutObjectReq::DeleteMarker(PutDeleteMarkerReq {
+                        bucket: BucketName::from(bucket),
+                        key: ObjectKey::from(key),
+                        version_id: marker_vid,
+                        owner: Self::effective_object_owner(
+                            &bucket_info,
+                            &req.requester,
+                            PutObjectAcl::None,
+                        ),
+                    }))?;
+
+                    Ok(DeleteObjectResult {
+                        version_id: marker_vid,
+                        delete_marker: true,
+                    })
+                }
+                Err(other) => Err(other),
+            },
         }
     }
 
@@ -18311,6 +18573,82 @@ mod tests {
     }
 
     #[test]
+    fn delete_object_object_lock_bucket_policy_same_pg_completes_without_deadlock() {
+        let tmp = test_util::tempdir();
+        let (admin, deleter) = setup_coordinators_with_single_pg(tmp.path());
+        let owner = AccountIdentity::from_principal("owner-a");
+        let owner_requester = Requester::principal("owner-a");
+
+        admin
+            .create_bucket_for_requester_with_object_lock(
+                &CreateBucketRequest {
+                    name: "bucket",
+                    requester: Requester::authenticated(owner),
+                    acl: CreateBucketAcl::DefaultPrivate,
+                    ownership: BucketObjectOwnership::ObjectWriter,
+                },
+                true,
+            )
+            .unwrap();
+        let put = test_helpers::put_object(
+            &admin,
+            &PutObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "key",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                requester: owner_requester.clone(),
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        admin
+            .put_object_retention(
+                "bucket",
+                "key",
+                Some(put.version_id),
+                ObjectRetention {
+                    mode: ObjectLockMode::Governance,
+                    retain_until_unix_seconds: Coordinator::current_unix_seconds().unwrap() + 3600,
+                },
+                false,
+                owner_requester.clone(),
+            )
+            .unwrap();
+        admin
+            .put_bucket_policy(
+                "bucket",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":{"AWS":"owner-a"},"Action":"s3:BypassGovernanceRetention","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+                owner_requester.clone(),
+            )
+            .unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let res = deleter.delete_object(&DeleteObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: Some(put.version_id),
+                cond: NO_DELETE,
+                requester: owner_requester,
+                bypass_governance: true,
+            });
+            tx.send(res).unwrap();
+        });
+
+        let err = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("delete_object with object lock bucket policy should not self-deadlock")
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+        handle.join().unwrap();
+    }
+
+    #[test]
     fn get_object_acl_masks_missing_object_for_unauthorized_requester() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
@@ -21295,6 +21633,333 @@ mod tests {
     }
 
     #[test]
+    fn get_bucket_object_lock_configuration_bucket_policy_allows_cross_account() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let owner = AccountIdentity::from_principal("owner-a");
+
+        coord
+            .create_bucket_for_requester_with_object_lock(
+                &CreateBucketRequest {
+                    name: "bucket",
+                    requester: Requester::authenticated(owner),
+                    acl: CreateBucketAcl::DefaultPrivate,
+                    ownership: BucketObjectOwnership::ObjectWriter,
+                },
+                true,
+            )
+            .unwrap();
+        coord
+            .put_bucket_policy(
+                "bucket",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:GetBucketObjectLockConfiguration","Resource":"arn:aws:s3:::bucket"}]}"#,
+                Requester::principal("owner-a"),
+            )
+            .unwrap();
+
+        let config = coord
+            .get_bucket_object_lock_configuration("bucket", Requester::principal("other-user"))
+            .unwrap();
+        assert!(config.enabled);
+    }
+
+    #[test]
+    fn get_object_retention_bucket_policy_allows_cross_account() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let owner = AccountIdentity::from_principal("owner-a");
+        let owner_requester = Requester::principal("owner-a");
+
+        coord
+            .create_bucket_for_requester_with_object_lock(
+                &CreateBucketRequest {
+                    name: "bucket",
+                    requester: Requester::authenticated(owner),
+                    acl: CreateBucketAcl::DefaultPrivate,
+                    ownership: BucketObjectOwnership::ObjectWriter,
+                },
+                true,
+            )
+            .unwrap();
+        let put = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "key",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                requester: owner_requester.clone(),
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        let retention = ObjectRetention {
+            mode: ObjectLockMode::Governance,
+            retain_until_unix_seconds: Coordinator::current_unix_seconds().unwrap() + 3600,
+        };
+        coord
+            .put_object_retention(
+                "bucket",
+                "key",
+                Some(put.version_id),
+                retention,
+                false,
+                owner_requester.clone(),
+            )
+            .unwrap();
+        coord
+            .put_bucket_policy(
+                "bucket",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:GetObjectRetention","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+                owner_requester,
+            )
+            .unwrap();
+
+        let fetched = coord
+            .get_object_retention(
+                "bucket",
+                "key",
+                Some(put.version_id),
+                Requester::principal("other-user"),
+            )
+            .unwrap();
+        assert_eq!(fetched, Some(retention));
+    }
+
+    #[test]
+    fn put_object_retention_bucket_policy_requires_explicit_bypass_allow_cross_account() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let owner = AccountIdentity::from_principal("owner-a");
+        let owner_requester = Requester::principal("owner-a");
+        let other_requester = Requester::principal("other-user");
+        let now = Coordinator::current_unix_seconds().unwrap();
+
+        coord
+            .create_bucket_for_requester_with_object_lock(
+                &CreateBucketRequest {
+                    name: "bucket",
+                    requester: Requester::authenticated(owner),
+                    acl: CreateBucketAcl::DefaultPrivate,
+                    ownership: BucketObjectOwnership::ObjectWriter,
+                },
+                true,
+            )
+            .unwrap();
+        let put = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "key",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                requester: owner_requester.clone(),
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        coord
+            .put_object_retention(
+                "bucket",
+                "key",
+                Some(put.version_id),
+                ObjectRetention {
+                    mode: ObjectLockMode::Governance,
+                    retain_until_unix_seconds: now + 200,
+                },
+                false,
+                owner_requester.clone(),
+            )
+            .unwrap();
+        coord
+            .put_bucket_policy(
+                "bucket",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:PutObjectRetention","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+                owner_requester.clone(),
+            )
+            .unwrap();
+
+        let err = coord
+            .put_object_retention(
+                "bucket",
+                "key",
+                Some(put.version_id),
+                ObjectRetention {
+                    mode: ObjectLockMode::Governance,
+                    retain_until_unix_seconds: now + 150,
+                },
+                true,
+                other_requester.clone(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+
+        coord
+            .put_bucket_policy(
+                "bucket",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":["s3:PutObjectRetention","s3:BypassGovernanceRetention"],"Resource":"arn:aws:s3:::bucket/*"}]}"#,
+                owner_requester,
+            )
+            .unwrap();
+
+        coord
+            .put_object_retention(
+                "bucket",
+                "key",
+                Some(put.version_id),
+                ObjectRetention {
+                    mode: ObjectLockMode::Governance,
+                    retain_until_unix_seconds: now + 150,
+                },
+                true,
+                other_requester,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn put_object_retention_bucket_policy_explicit_deny_blocks_owner_bypass() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let owner = AccountIdentity::from_principal("owner-a");
+        let owner_requester = Requester::principal("owner-a");
+        let now = Coordinator::current_unix_seconds().unwrap();
+
+        coord
+            .create_bucket_for_requester_with_object_lock(
+                &CreateBucketRequest {
+                    name: "bucket",
+                    requester: Requester::authenticated(owner),
+                    acl: CreateBucketAcl::DefaultPrivate,
+                    ownership: BucketObjectOwnership::ObjectWriter,
+                },
+                true,
+            )
+            .unwrap();
+        let put = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "key",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                requester: owner_requester.clone(),
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        coord
+            .put_object_retention(
+                "bucket",
+                "key",
+                Some(put.version_id),
+                ObjectRetention {
+                    mode: ObjectLockMode::Governance,
+                    retain_until_unix_seconds: now + 200,
+                },
+                false,
+                owner_requester.clone(),
+            )
+            .unwrap();
+        coord
+            .put_bucket_policy(
+                "bucket",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":{"AWS":"owner-a"},"Action":"s3:BypassGovernanceRetention","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+                owner_requester.clone(),
+            )
+            .unwrap();
+
+        let err = coord
+            .put_object_retention(
+                "bucket",
+                "key",
+                Some(put.version_id),
+                ObjectRetention {
+                    mode: ObjectLockMode::Governance,
+                    retain_until_unix_seconds: now + 150,
+                },
+                true,
+                owner_requester,
+            )
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn put_object_legal_hold_bucket_policy_allows_cross_account() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let owner = AccountIdentity::from_principal("owner-a");
+        let owner_requester = Requester::principal("owner-a");
+
+        coord
+            .create_bucket_for_requester_with_object_lock(
+                &CreateBucketRequest {
+                    name: "bucket",
+                    requester: Requester::authenticated(owner),
+                    acl: CreateBucketAcl::DefaultPrivate,
+                    ownership: BucketObjectOwnership::ObjectWriter,
+                },
+                true,
+            )
+            .unwrap();
+        let put = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "key",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                requester: owner_requester.clone(),
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        coord
+            .put_bucket_policy(
+                "bucket",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":["s3:PutObjectLegalHold","s3:GetObjectLegalHold"],"Resource":"arn:aws:s3:::bucket/*"}]}"#,
+                owner_requester,
+            )
+            .unwrap();
+
+        coord
+            .put_object_legal_hold(
+                "bucket",
+                "key",
+                Some(put.version_id),
+                LegalHoldStatus::On,
+                Requester::principal("other-user"),
+            )
+            .unwrap();
+        let fetched = coord
+            .get_object_legal_hold(
+                "bucket",
+                "key",
+                Some(put.version_id),
+                Requester::principal("other-user"),
+            )
+            .unwrap();
+        assert_eq!(fetched, Some(LegalHoldStatus::On));
+    }
+
+    #[test]
     fn resolve_new_object_lock_state_applies_default_retention_and_preserves_legal_hold() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
@@ -21483,7 +22148,9 @@ mod tests {
             mode: ObjectLockMode::Governance,
             retain_until_unix_seconds: 200,
         };
-        assert!(Coordinator::validate_retention_update(Some(current), requested, false).is_ok());
+        assert!(
+            Coordinator::validate_retention_update(Some(current), requested, false, false).is_ok()
+        );
     }
 
     #[test]
@@ -21496,10 +22163,15 @@ mod tests {
             mode: ObjectLockMode::Compliance,
             retain_until_unix_seconds: 100,
         };
-        let err =
-            Coordinator::validate_retention_update(Some(current), requested, false).unwrap_err();
+        let err = Coordinator::validate_retention_update(Some(current), requested, false, false)
+            .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
-        assert!(Coordinator::validate_retention_update(Some(current), requested, true).is_ok());
+        let err = Coordinator::validate_retention_update(Some(current), requested, true, false)
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+        assert!(
+            Coordinator::validate_retention_update(Some(current), requested, true, true).is_ok()
+        );
     }
 
     #[test]
@@ -21517,11 +22189,11 @@ mod tests {
             retain_until_unix_seconds: 100,
         };
         assert!(matches!(
-            Coordinator::validate_retention_update(Some(current), downgrade, true),
+            Coordinator::validate_retention_update(Some(current), downgrade, true, true),
             Err(ServerError::AccessDenied)
         ));
         assert!(matches!(
-            Coordinator::validate_retention_update(Some(current), shorten, true),
+            Coordinator::validate_retention_update(Some(current), shorten, true, true),
             Err(ServerError::AccessDenied)
         ));
     }
@@ -21542,6 +22214,143 @@ mod tests {
             Coordinator::validate_delete_against_object_lock(state, true, false, 100).unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
         assert!(Coordinator::validate_delete_against_object_lock(state, true, true, 100).is_ok());
+    }
+
+    #[test]
+    fn delete_object_bucket_policy_explicit_deny_blocks_owner_bypass() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let owner = AccountIdentity::from_principal("owner-a");
+        let owner_requester = Requester::principal("owner-a");
+        let now = Coordinator::current_unix_seconds().unwrap();
+
+        coord
+            .create_bucket_for_requester_with_object_lock(
+                &CreateBucketRequest {
+                    name: "bucket",
+                    requester: Requester::authenticated(owner),
+                    acl: CreateBucketAcl::DefaultPrivate,
+                    ownership: BucketObjectOwnership::ObjectWriter,
+                },
+                true,
+            )
+            .unwrap();
+        let put = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "key",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                requester: owner_requester.clone(),
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        coord
+            .put_object_retention(
+                "bucket",
+                "key",
+                Some(put.version_id),
+                ObjectRetention {
+                    mode: ObjectLockMode::Governance,
+                    retain_until_unix_seconds: now + 200,
+                },
+                false,
+                owner_requester.clone(),
+            )
+            .unwrap();
+        coord
+            .put_bucket_policy(
+                "bucket",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":{"AWS":"owner-a"},"Action":"s3:BypassGovernanceRetention","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+                owner_requester.clone(),
+            )
+            .unwrap();
+
+        let err = coord
+            .delete_object(&DeleteObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: Some(put.version_id),
+                cond: NO_DELETE,
+                requester: owner_requester,
+                bypass_governance: true,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn delete_object_bucket_policy_allows_cross_account_bypass() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let owner_requester = Requester::principal("owner-a");
+        let other_requester = Requester::principal("other-user");
+        let now = Coordinator::current_unix_seconds().unwrap();
+
+        coord
+            .create_bucket_for_requester_with_object_lock(
+                &CreateBucketRequest {
+                    name: "bucket",
+                    requester: Requester::authenticated(AccountIdentity::from_principal("owner-a")),
+                    acl: CreateBucketAcl::DefaultPrivate,
+                    ownership: BucketObjectOwnership::ObjectWriter,
+                },
+                true,
+            )
+            .unwrap();
+        let put = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "key",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                requester: owner_requester.clone(),
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        coord
+            .put_object_retention(
+                "bucket",
+                "key",
+                Some(put.version_id),
+                ObjectRetention {
+                    mode: ObjectLockMode::Governance,
+                    retain_until_unix_seconds: now + 200,
+                },
+                false,
+                owner_requester.clone(),
+            )
+            .unwrap();
+        coord
+            .put_bucket_policy(
+                "bucket",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":["s3:DeleteObjectVersion","s3:BypassGovernanceRetention"],"Resource":"arn:aws:s3:::bucket/*"}]}"#,
+                owner_requester,
+            )
+            .unwrap();
+
+        coord
+            .delete_object(&DeleteObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: Some(put.version_id),
+                cond: NO_DELETE,
+                requester: other_requester,
+                bypass_governance: true,
+            })
+            .unwrap();
     }
 
     #[test]

@@ -27,8 +27,8 @@ core Object Lock surface is correct.
 Implemented already:
 - Phase 1 test port: `crates/s3-tests/tests/object_lock.rs` exists, was
   validated against real AWS with all 39 original cases enabled, and the
-  current expanded Phase 1-9 surface now passes against real AWS with the full
-  50-case object-lock target active and no remaining `ignore`s
+  current expanded Phase 1-10 surface now passes against real AWS with the
+  full 57-case object-lock target active and no remaining `ignore`s
 - explicit Object Lock domain types exist across `s3-types`, storage, and
   coordinator code
 - durable Object Lock persistence exists for bucket metadata, live object
@@ -79,9 +79,30 @@ Implemented already:
     versioned/Object Lock buckets
 - multipart upload create/complete paths
 - enough auth/ACL foundations for owner-driven object operations
+- bucket-policy auth coverage now includes the core Object Lock actions AWS
+  exposes for:
+  - `GetBucketObjectLockConfiguration`
+  - `GetObjectRetention`
+  - `PutObjectRetention`
+  - `GetObjectLegalHold`
+  - `PutObjectLegalHold`
+  - `DeleteObject`
+  - `DeleteObjectVersion`
+- AWS-validated bucket-policy behavior for governance bypass is now captured:
+  - `s3:BypassGovernanceRetention` is recognized in the auth surface
+  - `s3:PutObjectRetention` alone does not grant governance bypass
+  - explicitly allowing both `s3:PutObjectRetention` and
+    `s3:BypassGovernanceRetention` does grant cross-account governance bypass
+    for retention updates on AWS
+  - explicit bucket-policy `Deny` on `s3:BypassGovernanceRetention` does block
+    trusted owner/admin bypass on both retention-shortening and permanent
+    version delete paths
+  - without an explicit bucket-policy allow, governance bypass remains
+    restricted to trusted bucket owner/admin identities
 
-Missing today:
-- bucket-policy action coverage does not include Object Lock actions
+Follow-up only:
+- bucket-policy condition keys related to retention remain out of scope for
+  this core Object Lock compatibility pass
 
 ## AWS Contract To Match
 
@@ -441,27 +462,38 @@ Likely files:
 
 ### Phase 10: Error Mapping And Auth Surface
 
-Add explicit server-side error variants and mappings instead of squeezing Object
-Lock failures through generic `InvalidRequest` where AWS exposes distinct codes.
-
-At minimum we will need AWS-accurate handling for:
+Completed:
 - `InvalidBucketState`
 - `ObjectLockConfigurationNotFoundError`
 - `AccessDenied` on blocked retention/legal-hold deletes
-- malformed XML cases for invalid modes/status/default-retention shapes
+- malformed XML handling for invalid modes/status/default-retention shapes
 
-Also extend bucket-policy action coverage for the Object Lock permissions AWS
-documents:
+Bucket-policy action coverage now includes the Object Lock permissions AWS
+documents for the core APIs:
 - `s3:GetBucketObjectLockConfiguration`
 - `s3:GetObjectRetention`
 - `s3:PutObjectRetention`
 - `s3:GetObjectLegalHold`
 - `s3:PutObjectLegalHold`
 - `s3:BypassGovernanceRetention`
+- `s3:DeleteObject`
+- `s3:DeleteObjectVersion`
 
-The initial owner-driven implementation can land before full policy-granularity
-tests exist, but the action names should be added while the APIs are introduced
-so we do not need another compatibility pass later.
+AWS validation for this phase now covers:
+- cross-account `GetBucketObjectLockConfiguration`
+- cross-account `GetObjectRetention`
+- cross-account `PutObjectRetention`
+- cross-account `GetObjectLegalHold`
+- cross-account `PutObjectLegalHold`
+- the current AWS behavior that cross-account `PutObjectRetention` alone does
+  not grant governance bypass, but explicitly allowing
+  `s3:BypassGovernanceRetention` does
+- cross-account `DeleteObject` on a governance-retained version requires both
+  `s3:DeleteObjectVersion` and `s3:BypassGovernanceRetention`, and AWS honors
+  that explicit bucket-policy allow on the permanent version-delete path
+- explicit bucket-policy `Deny` on `s3:BypassGovernanceRetention` for the
+  owner account, which overrides trusted bypass on both retention updates and
+  permanent version deletes
 
 ## Validation Plan
 

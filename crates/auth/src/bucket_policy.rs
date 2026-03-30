@@ -83,6 +83,7 @@ impl BucketPolicy {
 pub enum PolicyAction {
     GetBucketPolicyStatus,
     GetBucketPublicAccessBlock,
+    GetBucketObjectLockConfiguration,
     ListBucket,
     GetObject,
     GetObjectVersion,
@@ -90,9 +91,16 @@ pub enum PolicyAction {
     GetObjectVersionAcl,
     GetObjectTagging,
     GetObjectVersionTagging,
+    GetObjectRetention,
+    GetObjectLegalHold,
     PutObject,
     PutObjectTagging,
     PutObjectVersionTagging,
+    PutObjectRetention,
+    PutObjectLegalHold,
+    BypassGovernanceRetention,
+    DeleteObject,
+    DeleteObjectVersion,
     DeleteObjectTagging,
     DeleteObjectVersionTagging,
 }
@@ -103,6 +111,7 @@ impl PolicyAction {
         match self {
             Self::GetBucketPolicyStatus => "s3:GetBucketPolicyStatus",
             Self::GetBucketPublicAccessBlock => "s3:GetBucketPublicAccessBlock",
+            Self::GetBucketObjectLockConfiguration => "s3:GetBucketObjectLockConfiguration",
             Self::ListBucket => "s3:ListBucket",
             Self::GetObject => "s3:GetObject",
             Self::GetObjectVersion => "s3:GetObjectVersion",
@@ -110,9 +119,16 @@ impl PolicyAction {
             Self::GetObjectVersionAcl => "s3:GetObjectVersionAcl",
             Self::GetObjectTagging => "s3:GetObjectTagging",
             Self::GetObjectVersionTagging => "s3:GetObjectVersionTagging",
+            Self::GetObjectRetention => "s3:GetObjectRetention",
+            Self::GetObjectLegalHold => "s3:GetObjectLegalHold",
             Self::PutObject => "s3:PutObject",
             Self::PutObjectTagging => "s3:PutObjectTagging",
             Self::PutObjectVersionTagging => "s3:PutObjectVersionTagging",
+            Self::PutObjectRetention => "s3:PutObjectRetention",
+            Self::PutObjectLegalHold => "s3:PutObjectLegalHold",
+            Self::BypassGovernanceRetention => "s3:BypassGovernanceRetention",
+            Self::DeleteObject => "s3:DeleteObject",
+            Self::DeleteObjectVersion => "s3:DeleteObjectVersion",
             Self::DeleteObjectTagging => "s3:DeleteObjectTagging",
             Self::DeleteObjectVersionTagging => "s3:DeleteObjectVersionTagging",
         }
@@ -517,16 +533,23 @@ pub enum PolicyEffect {
     Deny,
 }
 
-const EVALUABLE_OBJECT_POLICY_ACTIONS: [PolicyAction; 11] = [
+const EVALUABLE_OBJECT_POLICY_ACTIONS: [PolicyAction; 18] = [
     PolicyAction::GetObject,
     PolicyAction::GetObjectVersion,
     PolicyAction::GetObjectAcl,
     PolicyAction::GetObjectVersionAcl,
     PolicyAction::GetObjectTagging,
     PolicyAction::GetObjectVersionTagging,
+    PolicyAction::GetObjectRetention,
+    PolicyAction::GetObjectLegalHold,
     PolicyAction::PutObject,
     PolicyAction::PutObjectTagging,
     PolicyAction::PutObjectVersionTagging,
+    PolicyAction::PutObjectRetention,
+    PolicyAction::PutObjectLegalHold,
+    PolicyAction::BypassGovernanceRetention,
+    PolicyAction::DeleteObject,
+    PolicyAction::DeleteObjectVersion,
     PolicyAction::DeleteObjectTagging,
     PolicyAction::DeleteObjectVersionTagging,
 ];
@@ -810,22 +833,30 @@ fn validate_resource_applicability(
     Ok(())
 }
 
-const SUPPORTED_BUCKET_POLICY_BUCKET_ACTIONS: [PolicyAction; 3] = [
+const SUPPORTED_BUCKET_POLICY_BUCKET_ACTIONS: [PolicyAction; 4] = [
     PolicyAction::GetBucketPolicyStatus,
     PolicyAction::GetBucketPublicAccessBlock,
+    PolicyAction::GetBucketObjectLockConfiguration,
     PolicyAction::ListBucket,
 ];
 
-const SUPPORTED_BUCKET_POLICY_OBJECT_ACTIONS: [PolicyAction; 11] = [
+const SUPPORTED_BUCKET_POLICY_OBJECT_ACTIONS: [PolicyAction; 18] = [
     PolicyAction::GetObject,
     PolicyAction::GetObjectVersion,
     PolicyAction::GetObjectAcl,
     PolicyAction::GetObjectVersionAcl,
     PolicyAction::GetObjectTagging,
     PolicyAction::GetObjectVersionTagging,
+    PolicyAction::GetObjectRetention,
+    PolicyAction::GetObjectLegalHold,
     PolicyAction::PutObject,
     PolicyAction::PutObjectTagging,
     PolicyAction::PutObjectVersionTagging,
+    PolicyAction::PutObjectRetention,
+    PolicyAction::PutObjectLegalHold,
+    PolicyAction::BypassGovernanceRetention,
+    PolicyAction::DeleteObject,
+    PolicyAction::DeleteObjectVersion,
     PolicyAction::DeleteObjectTagging,
     PolicyAction::DeleteObjectVersionTagging,
 ];
@@ -1688,6 +1719,60 @@ mod tests {
     }
 
     #[test]
+    fn get_object_retention_existing_tag_condition_matches() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObjectRetention","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}}]}"#,
+        )
+        .unwrap();
+        let tags = [PolicyTag::new("security", "public")];
+        let request = request(
+            PolicyAction::GetObjectRetention,
+            "bucket",
+            "key",
+            Some("caller"),
+            &tags,
+        );
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+    }
+
+    #[test]
+    fn bypass_governance_retention_matches_object_resource() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:BypassGovernanceRetention","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+        )
+        .unwrap();
+        let tags: [PolicyTag<'_>; 0] = [];
+        let request = request(
+            PolicyAction::BypassGovernanceRetention,
+            "bucket",
+            "key",
+            Some("caller"),
+            &tags,
+        );
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+    }
+
+    #[test]
+    fn delete_object_version_matches_object_resource() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:DeleteObjectVersion","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+        )
+        .unwrap();
+        let tags: [PolicyTag<'_>; 0] = [];
+        let request = request(
+            PolicyAction::DeleteObjectVersion,
+            "bucket",
+            "key",
+            Some("caller"),
+            &tags,
+        );
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+    }
+
+    #[test]
     fn bucket_resource_request_matches_bucket_action() {
         let policy = parse_bucket_policy(
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetBucketPublicAccessBlock","Resource":"arn:aws:s3:::bucket"}]}"#,
@@ -1718,6 +1803,21 @@ mod tests {
     }
 
     #[test]
+    fn get_bucket_object_lock_configuration_matches_bucket_resource() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetBucketObjectLockConfiguration","Resource":"arn:aws:s3:::bucket"}]}"#,
+        )
+        .unwrap();
+        let request = bucket_request(
+            PolicyAction::GetBucketObjectLockConfiguration,
+            "bucket",
+            Some("caller"),
+        );
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+    }
+
+    #[test]
     fn list_bucket_matches_bucket_resource() {
         let policy = parse_bucket_policy(
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket"}]}"#,
@@ -1732,6 +1832,21 @@ mod tests {
     fn get_bucket_policy_status_object_only_resource_is_rejected() {
         let err = parse_bucket_policy(
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetBucketPolicyStatus","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            BucketPolicyError::Malformed {
+                reason: "Action does not apply to any resource(s) in statement",
+            }
+        );
+    }
+
+    #[test]
+    fn get_bucket_object_lock_configuration_object_only_resource_is_rejected() {
+        let err = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetBucketObjectLockConfiguration","Resource":"arn:aws:s3:::bucket/*"}]}"#,
         )
         .unwrap_err();
 

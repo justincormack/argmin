@@ -13,13 +13,16 @@ use ring::hmac;
 use s3_tests::{
     assert_s3_err_code, disable_bucket_public_access_block, err_status, unique_bucket, CTX,
 };
+use serde_json::json;
 
 // Keep AWS-backed Object Lock tests on short retention windows so cleanup does
 // not strand long-lived governed objects if a test fails midway. Compliance
-// cases use an even shorter window because cleanup cannot bypass compliance.
+// cases use a small-but-not-tiny window because cleanup cannot bypass
+// compliance, while the assertions still need the retention to remain active
+// long enough to reach S3 reliably.
 const GOVERNANCE_RETENTION_SECS: u64 = 24 * 60 * 60;
 const GOVERNANCE_RETENTION_LATER_SECS: u64 = 2 * 24 * 60 * 60;
-const COMPLIANCE_RETENTION_SECS: u64 = 10;
+const COMPLIANCE_RETENTION_SECS: u64 = 3;
 
 fn agent() -> ureq::Agent {
     s3_tests::test_agent()
@@ -114,6 +117,121 @@ async fn setup_public_write_object_lock_bucket() -> String {
         .unwrap();
 
     bucket
+}
+
+fn bucket_resource(bucket: &str) -> String {
+    format!("arn:aws:s3:::{bucket}")
+}
+
+fn bucket_wildcard_resource(bucket: &str) -> String {
+    format!("arn:aws:s3:::{bucket}/*")
+}
+
+fn alt_policy_principal() -> serde_json::Value {
+    json!({ "AWS": format!("arn:aws:iam::{}:root", CTX.alt_account_id()) })
+}
+
+fn owner_policy_principal() -> serde_json::Value {
+    json!({ "AWS": format!("arn:aws:iam::{}:root", CTX.account_id()) })
+}
+
+async fn put_bucket_policy_json(bucket: &str, policy: serde_json::Value) {
+    CTX.client()
+        .put_bucket_policy()
+        .bucket(bucket)
+        .policy(policy.to_string())
+        .send()
+        .await
+        .unwrap();
+}
+
+async fn fresh_alt_client_for_policy_retry() -> aws_sdk_s3::Client {
+    if std::env::var("S3_TEST_ENDPOINT").is_ok() {
+        let access_key = std::env::var("S3_TEST_ALT_ACCESS_KEY")
+            .expect("S3_TEST_ALT_ACCESS_KEY required for external policy retries");
+        let secret_key = std::env::var("S3_TEST_ALT_SECRET_KEY")
+            .expect("S3_TEST_ALT_SECRET_KEY required for external policy retries");
+        s3_tests::build_client_with_ca(CTX.endpoint(), &access_key, &secret_key, CTX.region(), None)
+            .await
+    } else {
+        CTX.alt_client().clone()
+    }
+}
+
+async fn wait_for_bypass_retention_update_to_succeed(
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+    retention: ObjectLockRetention,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+
+    loop {
+        let client = fresh_alt_client_for_policy_retry().await;
+        let result = client
+            .put_object_retention()
+            .bucket(bucket)
+            .key(key)
+            .version_id(version_id)
+            .retention(retention.clone())
+            .bypass_governance_retention(true)
+            .send()
+            .await;
+
+        if result.is_ok() {
+            return;
+        }
+
+        assert_eq!(
+            err_status(&result),
+            403,
+            "unexpected retry result: {result:?}"
+        );
+        assert_s3_err_code(&result, "AccessDenied");
+
+        if tokio::time::Instant::now() >= deadline {
+            panic!("timed out waiting for bypass policy to propagate: {result:?}");
+        }
+
+        // AWS bucket policy reads can converge before the corresponding
+        // data-plane authorization update is visible to object-lock bypass.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+async fn wait_for_bypass_delete_to_succeed(bucket: &str, key: &str, version_id: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+
+    loop {
+        let client = fresh_alt_client_for_policy_retry().await;
+        let result = client
+            .delete_object()
+            .bucket(bucket)
+            .key(key)
+            .version_id(version_id)
+            .bypass_governance_retention(true)
+            .send()
+            .await;
+
+        if result.is_ok() {
+            return;
+        }
+
+        assert_eq!(
+            err_status(&result),
+            403,
+            "unexpected delete retry result: {result:?}"
+        );
+        assert_s3_err_code(&result, "AccessDenied");
+
+        if tokio::time::Instant::now() >= deadline {
+            panic!("timed out waiting for bypass delete policy to propagate: {result:?}");
+        }
+
+        // AWS bucket policy reads can converge before the corresponding
+        // data-plane authorization update is visible to object-lock bypass.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }
 
 async fn put_object_bytes(bucket: &str, key: &str, body: &[u8]) -> String {
@@ -846,6 +964,47 @@ fn test_object_lock_get_obj_lock() {
 }
 
 #[test]
+fn test_object_lock_bucket_policy_get_obj_lock() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = setup_object_lock_bucket().await;
+        let config = bucket_lock_config_days(ObjectLockRetentionMode::Governance, 1);
+
+        put_object_lock_configuration(&bucket, config.clone()).await;
+        put_bucket_policy_json(
+            &bucket,
+            json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": alt_policy_principal(),
+                    "Action": "s3:GetBucketObjectLockConfiguration",
+                    "Resource": bucket_resource(&bucket),
+                }],
+            }),
+        )
+        .await;
+        client
+            .get_bucket_policy()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+
+        let response = alt_client
+            .get_object_lock_configuration()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.object_lock_configuration(), Some(&config));
+
+        cleanup_object_lock_bucket(&bucket).await;
+    });
+}
+
+#[test]
 fn test_object_lock_get_obj_lock_invalid_bucket() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -869,7 +1028,7 @@ fn test_object_lock_put_obj_retention() {
         let client = CTX.client();
         let bucket = setup_object_lock_bucket().await;
         let key = "file1";
-        let version_id = put_object_bytes(&bucket, key, b"abc").await;
+        put_object_bytes(&bucket, key, b"abc").await;
         let retain_until = governance_retain_until();
         let retention = retention(ObjectLockRetentionMode::Governance, retain_until);
 
@@ -890,7 +1049,368 @@ fn test_object_lock_put_obj_retention() {
             .unwrap();
         assert_eq!(response.retention(), Some(&retention));
 
-        delete_version_with_bypass(&bucket, key, &version_id).await;
+        cleanup_object_lock_bucket(&bucket).await;
+    });
+}
+
+#[test]
+fn test_object_lock_bucket_policy_put_get_obj_retention() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = setup_object_lock_bucket().await;
+        let key = "file1";
+        put_object_bytes(&bucket, key, b"abc").await;
+        let retain_until = governance_retain_until();
+        let retention = retention(ObjectLockRetentionMode::Governance, retain_until);
+
+        put_bucket_policy_json(
+            &bucket,
+            json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": alt_policy_principal(),
+                    "Action": ["s3:PutObjectRetention", "s3:GetObjectRetention"],
+                    "Resource": bucket_wildcard_resource(&bucket),
+                }],
+            }),
+        )
+        .await;
+        client
+            .get_bucket_policy()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+
+        alt_client
+            .put_object_retention()
+            .bucket(&bucket)
+            .key(key)
+            .retention(retention.clone())
+            .send()
+            .await
+            .unwrap();
+        let response = alt_client
+            .get_object_retention()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.retention(), Some(&retention));
+
+        cleanup_object_lock_bucket(&bucket).await;
+    });
+}
+
+#[test]
+fn test_object_lock_bucket_policy_bypass_governance_retention_requires_explicit_allow() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = setup_object_lock_bucket().await;
+        let key = "file1";
+        let version_id = put_object_bytes(&bucket, key, b"abc").await;
+
+        client
+            .put_object_retention()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&version_id)
+            .retention(retention(
+                ObjectLockRetentionMode::Governance,
+                governance_retain_until_later(),
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        put_bucket_policy_json(
+            &bucket,
+            json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": alt_policy_principal(),
+                    "Action": "s3:PutObjectRetention",
+                    "Resource": bucket_wildcard_resource(&bucket),
+                }],
+            }),
+        )
+        .await;
+        client
+            .get_bucket_policy()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+
+        let denied_without_bypass_action = alt_client
+            .put_object_retention()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&version_id)
+            .retention(retention(
+                ObjectLockRetentionMode::Governance,
+                governance_retain_until(),
+            ))
+            .bypass_governance_retention(true)
+            .send()
+            .await;
+        assert_eq!(err_status(&denied_without_bypass_action), 403);
+        assert_s3_err_code(&denied_without_bypass_action, "AccessDenied");
+
+        put_bucket_policy_json(
+            &bucket,
+            json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": alt_policy_principal(),
+                    "Action": ["s3:PutObjectRetention", "s3:BypassGovernanceRetention"],
+                    "Resource": bucket_wildcard_resource(&bucket),
+                }],
+            }),
+        )
+        .await;
+        client
+            .get_bucket_policy()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+
+        wait_for_bypass_retention_update_to_succeed(
+            &bucket,
+            key,
+            &version_id,
+            retention(
+                ObjectLockRetentionMode::Governance,
+                governance_retain_until(),
+            ),
+        )
+        .await;
+
+        cleanup_object_lock_bucket(&bucket).await;
+    });
+}
+
+#[test]
+fn test_object_lock_bucket_policy_explicit_deny_blocks_owner_bypass_retention() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_object_lock_bucket().await;
+        let key = "file1";
+        let version_id = put_object_bytes(&bucket, key, b"abc").await;
+
+        client
+            .put_object_retention()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&version_id)
+            .retention(retention(
+                ObjectLockRetentionMode::Governance,
+                governance_retain_until_later(),
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        put_bucket_policy_json(
+            &bucket,
+            json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Deny",
+                    "Principal": owner_policy_principal(),
+                    "Action": "s3:BypassGovernanceRetention",
+                    "Resource": bucket_wildcard_resource(&bucket),
+                }],
+            }),
+        )
+        .await;
+        client
+            .get_bucket_policy()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+
+        let denied = client
+            .put_object_retention()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&version_id)
+            .retention(retention(
+                ObjectLockRetentionMode::Governance,
+                governance_retain_until(),
+            ))
+            .bypass_governance_retention(true)
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        client
+            .delete_bucket_policy()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        cleanup_object_lock_bucket(&bucket).await;
+    });
+}
+
+#[test]
+fn test_object_lock_bucket_policy_explicit_deny_blocks_owner_bypass_delete() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_object_lock_bucket().await;
+        let key = "file1";
+        let version_id = put_object_bytes(&bucket, key, b"abc").await;
+
+        client
+            .put_object_retention()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&version_id)
+            .retention(retention(
+                ObjectLockRetentionMode::Governance,
+                governance_retain_until_later(),
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        put_bucket_policy_json(
+            &bucket,
+            json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Deny",
+                    "Principal": owner_policy_principal(),
+                    "Action": "s3:BypassGovernanceRetention",
+                    "Resource": bucket_wildcard_resource(&bucket),
+                }],
+            }),
+        )
+        .await;
+        client
+            .get_bucket_policy()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+
+        let denied = client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&version_id)
+            .bypass_governance_retention(true)
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        client
+            .delete_bucket_policy()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        cleanup_object_lock_bucket(&bucket).await;
+    });
+}
+
+#[test]
+fn test_object_lock_bucket_policy_bypass_governance_delete_requires_explicit_allow() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = setup_object_lock_bucket().await;
+        let key = "file1";
+        let version_id = put_object_bytes(&bucket, key, b"abc").await;
+
+        client
+            .put_object_retention()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&version_id)
+            .retention(retention(
+                ObjectLockRetentionMode::Governance,
+                governance_retain_until_later(),
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        let denied_without_delete_version_allow = alt_client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&version_id)
+            .bypass_governance_retention(true)
+            .send()
+            .await;
+        assert_eq!(err_status(&denied_without_delete_version_allow), 403);
+        assert_s3_err_code(&denied_without_delete_version_allow, "AccessDenied");
+
+        put_bucket_policy_json(
+            &bucket,
+            json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": alt_policy_principal(),
+                    "Action": "s3:DeleteObjectVersion",
+                    "Resource": bucket_wildcard_resource(&bucket),
+                }],
+            }),
+        )
+        .await;
+        client
+            .get_bucket_policy()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+
+        let denied_without_bypass_allow = alt_client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&version_id)
+            .bypass_governance_retention(true)
+            .send()
+            .await;
+        assert_eq!(err_status(&denied_without_bypass_allow), 403);
+        assert_s3_err_code(&denied_without_bypass_allow, "AccessDenied");
+
+        put_bucket_policy_json(
+            &bucket,
+            json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": alt_policy_principal(),
+                    "Action": ["s3:DeleteObjectVersion", "s3:BypassGovernanceRetention"],
+                    "Resource": bucket_wildcard_resource(&bucket),
+                }],
+            }),
+        )
+        .await;
+        client
+            .get_bucket_policy()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+
+        wait_for_bypass_delete_to_succeed(&bucket, key, &version_id).await;
+
         cleanup_object_lock_bucket(&bucket).await;
     });
 }
@@ -955,7 +1475,6 @@ fn test_object_lock_put_object_headers_persist() {
             .send()
             .await
             .unwrap();
-        delete_version_with_bypass(&bucket, key, &version_id).await;
         cleanup_object_lock_bucket(&bucket).await;
     });
 }
@@ -1075,7 +1594,7 @@ fn test_object_lock_get_obj_retention() {
         let client = CTX.client();
         let bucket = setup_object_lock_bucket().await;
         let key = "file1";
-        let version_id = put_object_bytes(&bucket, key, b"abc").await;
+        put_object_bytes(&bucket, key, b"abc").await;
         let retention = retention(
             ObjectLockRetentionMode::Governance,
             governance_retain_until_later(),
@@ -1098,7 +1617,6 @@ fn test_object_lock_get_obj_retention() {
             .unwrap();
         assert_eq!(response.retention(), Some(&retention));
 
-        delete_version_with_bypass(&bucket, key, &version_id).await;
         cleanup_object_lock_bucket(&bucket).await;
     });
 }
@@ -1806,6 +2324,59 @@ fn test_object_lock_put_legal_hold() {
             .send()
             .await
             .unwrap();
+
+        cleanup_object_lock_bucket(&bucket).await;
+    });
+}
+
+#[test]
+fn test_object_lock_bucket_policy_put_get_legal_hold() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = setup_object_lock_bucket().await;
+        let key = "file1";
+        put_object_bytes(&bucket, key, b"abc").await;
+
+        put_bucket_policy_json(
+            &bucket,
+            json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": alt_policy_principal(),
+                    "Action": ["s3:PutObjectLegalHold", "s3:GetObjectLegalHold"],
+                    "Resource": bucket_wildcard_resource(&bucket),
+                }],
+            }),
+        )
+        .await;
+        client
+            .get_bucket_policy()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+
+        alt_client
+            .put_object_legal_hold()
+            .bucket(&bucket)
+            .key(key)
+            .legal_hold(legal_hold(ObjectLockLegalHoldStatus::On))
+            .send()
+            .await
+            .unwrap();
+        let response = alt_client
+            .get_object_legal_hold()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.legal_hold(),
+            Some(&legal_hold(ObjectLockLegalHoldStatus::On))
+        );
 
         cleanup_object_lock_bucket(&bucket).await;
     });
