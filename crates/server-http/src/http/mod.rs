@@ -5019,6 +5019,7 @@ mod tests {
                 "mybucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::mybucket"}]}"#,
                 crate::coordinator::Requester::principal("testuser"),
+                None,
             )
             .unwrap();
 
@@ -5152,7 +5153,8 @@ mod tests {
             fe.coordinator
                 .get_bucket_versioning(
                     "mybucket",
-                    crate::coordinator::Requester::principal("testuser")
+                    crate::coordinator::Requester::principal("testuser"),
+                    None,
                 )
                 .unwrap(),
             s3_types::BucketVersioningState::Enabled
@@ -5162,6 +5164,7 @@ mod tests {
                 .get_bucket_object_lock_configuration(
                     "mybucket",
                     crate::coordinator::Requester::principal("testuser"),
+                    None,
                 )
                 .unwrap(),
             s3_types::BucketObjectLockConfig {
@@ -5190,6 +5193,7 @@ mod tests {
                 "mybucket",
                 s3_types::BucketVersioningState::Enabled,
                 crate::coordinator::Requester::principal("testuser"),
+                None,
             )
             .unwrap();
 
@@ -5968,6 +5972,7 @@ mod tests {
                 "mybucket",
                 "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
                 crate::coordinator::Requester::principal("testuser"),
+                None,
             )
             .unwrap();
 
