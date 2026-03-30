@@ -258,6 +258,16 @@ fn post_object(
     file_data: &[u8],
     file_name: &str,
 ) -> (u16, String) {
+    post_object_with_headers(bucket, fields, file_data, file_name, &[])
+}
+
+fn post_object_with_headers(
+    bucket: &str,
+    fields: &[(&str, &str)],
+    file_data: &[u8],
+    file_name: &str,
+    headers: &[(&str, &str)],
+) -> (u16, String) {
     post_object_to_endpoint(
         CTX.endpoint(),
         &agent(),
@@ -265,6 +275,7 @@ fn post_object(
         fields,
         file_data,
         file_name,
+        headers,
     )
 }
 
@@ -275,15 +286,16 @@ fn post_object_to_endpoint(
     fields: &[(&str, &str)],
     file_data: &[u8],
     file_name: &str,
+    headers: &[(&str, &str)],
 ) -> (u16, String) {
     let url = format!("{}/{}", endpoint, bucket);
     let (content_type, body) = build_multipart(fields, file_data, file_name);
 
-    let mut resp = agent
-        .post(&url)
-        .header("Content-Type", &content_type)
-        .send(&body[..])
-        .expect("HTTP transport error");
+    let req = agent.post(&url).header("Content-Type", &content_type);
+    let req = headers
+        .iter()
+        .fold(req, |req, (name, value)| req.header(*name, *value));
+    let mut resp = req.send(&body[..]).expect("HTTP transport error");
 
     let status = resp.status().as_u16();
     let body_str = resp.body_mut().read_to_string().unwrap_or_default();
@@ -318,6 +330,63 @@ fn test_post_object_authenticated_request() {
         assert_eq!(status, 204, "expected 204, got {}", status);
 
         // Verify via GET
+        let resp = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let data = resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], file_data);
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_post_object_expected_bucket_owner() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "post-expected-owner";
+        let file_data = b"hello from POST expected owner";
+
+        let fields = sigv4_fields(&bucket, key, &[]);
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+
+        let (status, body) = post_object_with_headers(
+            &bucket,
+            &field_refs,
+            file_data,
+            "test.txt",
+            &[("x-amz-expected-bucket-owner", "000000000000")],
+        );
+        assert_eq!(status, 403, "expected 403, got {} body={}", status, body);
+        assert_error_code(&body, "AccessDenied");
+
+        let head = client.head_object().bucket(&bucket).key(key).send().await;
+        assert_eq!(err_status(&head), 404);
+
+        let (status, body) = post_object_with_headers(
+            &bucket,
+            &field_refs,
+            file_data,
+            "test.txt",
+            &[("x-amz-expected-bucket-owner", CTX.account_id())],
+        );
+        assert_eq!(status, 204, "expected 204, got {} body={}", status, body);
+
         let resp = client
             .get_object()
             .bucket(&bucket)

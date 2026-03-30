@@ -215,6 +215,28 @@ pub fn sigv4_post_sse_c_fields_for_credentials(
     fields
 }
 
+pub fn post_object_to_test_endpoint_with_headers(
+    endpoint: &str,
+    tls_ca_pem: Option<&[u8]>,
+    bucket: &str,
+    fields: &[(&str, &str)],
+    file_data: &[u8],
+    file_name: &str,
+    headers: &[(&str, &str)],
+) -> (u16, String) {
+    let url = format!("{}/{}", endpoint, bucket);
+    let (content_type, body) = build_multipart(fields, file_data, file_name);
+    let agent = build_test_agent(endpoint, tls_ca_pem);
+    let req = agent.post(&url).header("Content-Type", &content_type);
+    let req = headers
+        .iter()
+        .fold(req, |req, (name, value)| req.header(*name, *value));
+    let mut resp = req.send(&body[..]).expect("HTTP transport error");
+    let status = resp.status().as_u16();
+    let body = resp.body_mut().read_to_string().unwrap_or_default();
+    (status, body)
+}
+
 pub fn post_object_to_test_endpoint(
     endpoint: &str,
     tls_ca_pem: Option<&[u8]>,
@@ -223,15 +245,13 @@ pub fn post_object_to_test_endpoint(
     file_data: &[u8],
     file_name: &str,
 ) -> (u16, String) {
-    let url = format!("{}/{}", endpoint, bucket);
-    let (content_type, body) = build_multipart(fields, file_data, file_name);
-    let agent = build_test_agent(endpoint, tls_ca_pem);
-    let mut resp = agent
-        .post(&url)
-        .header("Content-Type", &content_type)
-        .send(&body[..])
-        .expect("HTTP transport error");
-    let status = resp.status().as_u16();
-    let body = resp.body_mut().read_to_string().unwrap_or_default();
-    (status, body)
+    post_object_to_test_endpoint_with_headers(
+        endpoint,
+        tls_ca_pem,
+        bucket,
+        fields,
+        file_data,
+        file_name,
+        &[],
+    )
 }

@@ -8,7 +8,10 @@ pub use helpers::{
     delete_all_and_bucket, delete_objects_with_md5, disable_bucket_public_access_block, err_status,
     sse_c_header_values, test_sse_c_key, unique_bucket,
 };
-pub use post_form::{post_object_to_test_endpoint, sigv4_post_sse_c_fields_for_credentials};
+pub use post_form::{
+    post_object_to_test_endpoint, post_object_to_test_endpoint_with_headers,
+    sigv4_post_sse_c_fields_for_credentials,
+};
 pub use server::TestServer;
 
 use std::sync::LazyLock;
