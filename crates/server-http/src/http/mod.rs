@@ -1162,6 +1162,7 @@ impl HttpFrontend {
             S3Operation::DeleteObject { bucket, key } => {
                 let cond = delete_condition_from_headers(req)?;
                 let vid = parse_version_id(req)?;
+                let bypass_governance = parse_bypass_governance_retention(req);
                 if vid.is_some() && !cond.is_empty() {
                     return Err(ServerError::NotImplemented {
                         feature:
@@ -1176,6 +1177,7 @@ impl HttpFrontend {
                             bucket: &bucket,
                             key: &key,
                             version_id: vid,
+                            bypass_governance,
                             cond: &cond,
                             requester,
                             expected_bucket_owner,
@@ -1340,6 +1342,7 @@ impl HttpFrontend {
             }
             S3Operation::DeleteObjects { bucket } => {
                 require_content_md5(req)?;
+                let bypass_governance = parse_bypass_governance_retention(req);
                 let (xml_entries, quiet) = xml::parse_delete_objects_xml(&req.body)?;
                 let requester = Self::requester_from_auth(auth);
                 let mut entries: Vec<crate::coordinator::DeleteEntry> = Vec::new();
@@ -1387,6 +1390,7 @@ impl HttpFrontend {
                         .delete_objects(&crate::coordinator::DeleteObjectsRequest {
                             bucket: &bucket,
                             entries: &entries,
+                            bypass_governance,
                             requester,
                             expected_bucket_owner,
                         })?
@@ -4553,6 +4557,11 @@ fn parse_object_lock_headers(req: &S3Request) -> Result<ObjectLockState, ServerE
         retention,
         legal_hold,
     })
+}
+
+fn parse_bypass_governance_retention(req: &S3Request) -> bool {
+    req.header("x-amz-bypass-governance-retention")
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"))
 }
 
 fn parse_put_object_acl(value: Option<&str>) -> crate::coordinator::PutObjectAcl<'_> {

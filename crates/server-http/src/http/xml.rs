@@ -6056,6 +6056,7 @@ mod tests {
             .delete_objects(&DeleteObjectsRequest {
                 bucket: "test-bucket",
                 entries: &entries,
+                bypass_governance: false,
                 requester: test_requester(),
                 expected_bucket_owner: None,
             })
@@ -6185,6 +6186,7 @@ mod tests {
             .delete_objects(&DeleteObjectsRequest {
                 bucket: "bucket",
                 entries: &entries,
+                bypass_governance: false,
                 requester: test_requester(),
                 expected_bucket_owner: None,
             })

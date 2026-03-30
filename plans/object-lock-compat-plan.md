@@ -26,9 +26,9 @@ core Object Lock surface is correct.
 
 Implemented already:
 - Phase 1 test port: `crates/s3-tests/tests/object_lock.rs` exists, was
-  validated against real AWS with all 39 cases enabled, and currently keeps the
-  41 completed bucket/object API cases active while the remaining 7
-  later-phase cases stay `ignore`d until their features land
+  validated against real AWS with all 39 original cases enabled, and the
+  current expanded Phase 1-9 surface now passes against real AWS with the full
+  50-case object-lock target active and no remaining `ignore`s
 - explicit Object Lock domain types exist across `s3-types`, storage, and
   coordinator code
 - durable Object Lock persistence exists for bucket metadata, live object
@@ -70,16 +70,18 @@ Implemented already:
   - `x-amz-object-lock-mode`
   - `x-amz-object-lock-retain-until-date`
   - `x-amz-object-lock-legal-hold`, omitted when never set
+- `DeleteObject` / `DeleteObjects` now enforce WORM semantics on version
+  deletes:
+  - governance retention requires explicit bypass before expiry
+  - compliance retention cannot be bypassed before expiry
+  - legal hold blocks permanent delete even when bypass is present
+  - simple deletes without `versionId` still create delete markers on
+    versioned/Object Lock buckets
 - multipart upload create/complete paths
 - enough auth/ACL foundations for owner-driven object operations
 
 Missing today:
-- `DeleteObject` / `DeleteObjects` do not enforce WORM semantics or governance
-  bypass
 - bucket-policy action coverage does not include Object Lock actions
-- the remaining 7 `ignore`d cases in `crates/s3-tests/tests/object_lock.rs`
-  are now concentrated in later phases:
-  - WORM delete / multi-delete enforcement
 
 ## AWS Contract To Match
 
@@ -394,6 +396,19 @@ The Ceph tests only check a subset of this, but the response header behavior
 should be implemented correctly while the storage model is fresh.
 
 ### Phase 9: Enforce WORM Delete Semantics
+
+Status update:
+- complete
+- local and AWS validation currently have `50 passed / 0 ignored` in
+  `crates/s3-tests/tests/object_lock.rs`
+- verified against real AWS that governance bypass remains a distinct auth
+  gate: a caller with ordinary delete access via a public-write bucket ACL is
+  still denied when attempting `x-amz-bypass-governance-retention`
+- verified against real AWS that `DeleteObjects` preserves batch semantics
+  while reusing the same WORM enforcement:
+  - a mixed batch can still succeed for ordinary delete-marker entries
+  - retained version entries return per-entry `AccessDenied` errors instead of
+    failing the whole request up front
 
 Update delete behavior to match AWS:
 

@@ -2,14 +2,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aws_sdk_s3::primitives::{ByteStream, DateTime, DateTimeFormat};
 use aws_sdk_s3::types::{
-    BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, DefaultRetention, Delete,
-    ObjectIdentifier, ObjectLockConfiguration, ObjectLockEnabled, ObjectLockLegalHold,
-    ObjectLockLegalHoldStatus, ObjectLockMode, ObjectLockRetention, ObjectLockRetentionMode,
-    ObjectLockRule, VersioningConfiguration,
+    BucketCannedAcl, BucketVersioningStatus, CompletedMultipartUpload, CompletedPart,
+    DefaultRetention, Delete, ObjectIdentifier, ObjectLockConfiguration, ObjectLockEnabled,
+    ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockMode, ObjectLockRetention,
+    ObjectLockRetentionMode, ObjectLockRule, ObjectOwnership, OwnershipControls,
+    OwnershipControlsRule, VersioningConfiguration,
 };
 use base64::Engine;
 use ring::hmac;
-use s3_tests::{assert_s3_err_code, err_status, unique_bucket, CTX};
+use s3_tests::{
+    assert_s3_err_code, disable_bucket_public_access_block, err_status, unique_bucket, CTX,
+};
 
 // Keep AWS-backed Object Lock tests on short retention windows so cleanup does
 // not strand long-lived governed objects if a test fails midway. Compliance
@@ -50,6 +53,66 @@ async fn setup_object_lock_bucket() -> String {
         .send()
         .await
         .unwrap();
+    bucket
+}
+
+async fn setup_public_write_object_lock_bucket() -> String {
+    let client = CTX.client();
+    let bucket = unique_bucket();
+    client
+        .create_bucket()
+        .bucket(&bucket)
+        .object_lock_enabled_for_bucket(true)
+        .send()
+        .await
+        .unwrap();
+
+    disable_bucket_public_access_block(client, &bucket).await;
+
+    let ownership_rule = OwnershipControlsRule::builder()
+        .object_ownership(ObjectOwnership::BucketOwnerPreferred)
+        .build()
+        .unwrap();
+    let ownership = OwnershipControls::builder()
+        .rules(ownership_rule)
+        .build()
+        .unwrap();
+    client
+        .put_bucket_ownership_controls()
+        .bucket(&bucket)
+        .ownership_controls(ownership)
+        .send()
+        .await
+        .unwrap();
+    client
+        .put_bucket_acl()
+        .bucket(&bucket)
+        .acl(BucketCannedAcl::PublicReadWrite)
+        .send()
+        .await
+        .unwrap();
+
+    // Match the public bucket helpers and give AWS one read-back pass after the
+    // control-plane writes before issuing cross-account data-plane requests.
+    client
+        .get_public_access_block()
+        .bucket(&bucket)
+        .send()
+        .await
+        .unwrap();
+    client
+        .get_bucket_ownership_controls()
+        .bucket(&bucket)
+        .send()
+        .await
+        .unwrap();
+    client
+        .get_bucket_acl()
+        .bucket(&bucket)
+        .send()
+        .await
+        .unwrap();
+
     bucket
 }
 
@@ -1343,7 +1406,6 @@ fn test_object_lock_put_obj_retention_shorten_period_bypass() {
 }
 
 #[test]
-#[ignore = "Object Lock / WORM not implemented yet"]
 fn test_object_lock_delete_object_with_retention() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -1379,7 +1441,137 @@ fn test_object_lock_delete_object_with_retention() {
 }
 
 #[test]
-#[ignore = "Object Lock / WORM not implemented yet"]
+fn test_object_lock_delete_object_bypass_requires_bucket_admin() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = setup_public_write_object_lock_bucket().await;
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("plain")
+            .body(ByteStream::from_static(b"plain"))
+            .send()
+            .await
+            .unwrap();
+        let delete_marker = alt_client
+            .delete_object()
+            .bucket(&bucket)
+            .key("plain")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(delete_marker.delete_marker(), Some(true));
+
+        let key = "locked";
+        let version_id = put_object_bytes(&bucket, key, b"locked").await;
+        client
+            .put_object_retention()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&version_id)
+            .retention(retention(
+                ObjectLockRetentionMode::Governance,
+                governance_retain_until(),
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        let result = alt_client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&version_id)
+            .bypass_governance_retention(true)
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 403);
+        assert_s3_err_code(&result, "AccessDenied");
+
+        delete_version_with_bypass(&bucket, key, &version_id).await;
+        cleanup_object_lock_bucket(&bucket).await;
+    });
+}
+
+#[test]
+fn test_object_lock_multi_delete_bypass_requires_bucket_admin() {
+    s3_tests::run(async {
+        use md5_legacy::Digest;
+
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = setup_public_write_object_lock_bucket().await;
+
+        let plain_key = "plain";
+        put_object_bytes(&bucket, plain_key, b"plain").await;
+
+        let locked_key = "locked";
+        let locked_version_id = put_object_bytes(&bucket, locked_key, b"locked").await;
+        client
+            .put_object_retention()
+            .bucket(&bucket)
+            .key(locked_key)
+            .version_id(&locked_version_id)
+            .retention(retention(
+                ObjectLockRetentionMode::Governance,
+                governance_retain_until(),
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        let delete = Delete::builder()
+            .objects(ObjectIdentifier::builder().key(plain_key).build().unwrap())
+            .objects(object_id(locked_key, &locked_version_id))
+            .build()
+            .unwrap();
+        let response = alt_client
+            .delete_objects()
+            .bucket(&bucket)
+            .delete(delete)
+            .bypass_governance_retention(true)
+            .customize()
+            .mutate_request(|req| {
+                let body = req.body().bytes().expect("DeleteObjects body in memory");
+                let digest = md5_legacy::Md5::digest(body);
+                let content_md5 = base64::engine::general_purpose::STANDARD.encode(&digest[..]);
+                req.headers_mut().insert("content-md5", content_md5);
+            })
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.deleted().len(),
+            1,
+            "deleted={:?} errors={:?}",
+            response.deleted(),
+            response.errors()
+        );
+        assert_eq!(
+            response.errors().len(),
+            1,
+            "deleted={:?} errors={:?}",
+            response.deleted(),
+            response.errors()
+        );
+        let deleted = &response.deleted()[0];
+        assert_eq!(deleted.key(), Some(plain_key));
+        assert_eq!(deleted.delete_marker(), Some(true));
+        assert!(deleted.delete_marker_version_id().is_some());
+        let failed = &response.errors()[0];
+        assert_eq!(failed.code(), Some("AccessDenied"));
+        assert_eq!(failed.key(), Some(locked_key));
+        assert_eq!(failed.version_id(), Some(locked_version_id.as_str()));
+
+        delete_version_with_bypass(&bucket, locked_key, &locked_version_id).await;
+        cleanup_object_lock_bucket(&bucket).await;
+    });
+}
+
+#[test]
 fn test_object_lock_delete_multipart_object_with_retention() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -1444,7 +1636,6 @@ fn test_object_lock_delete_multipart_object_with_retention() {
 }
 
 #[test]
-#[ignore = "Object Lock / WORM not implemented yet"]
 fn test_object_lock_delete_object_with_retention_and_marker() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -1508,7 +1699,6 @@ fn test_object_lock_delete_object_with_retention_and_marker() {
 }
 
 #[test]
-#[ignore = "Object Lock / WORM not implemented yet"]
 fn test_object_lock_multi_delete_object_with_retention() {
     s3_tests::run(async {
         use md5_legacy::Digest;
@@ -1929,7 +2119,6 @@ fn test_object_lock_copy_object_headers_invalid_bucket() {
 }
 
 #[test]
-#[ignore = "Object Lock / WORM not implemented yet"]
 fn test_object_lock_delete_object_with_legal_hold_on() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -1971,7 +2160,6 @@ fn test_object_lock_delete_object_with_legal_hold_on() {
 }
 
 #[test]
-#[ignore = "Object Lock / WORM not implemented yet"]
 fn test_object_lock_delete_multipart_object_with_legal_hold_on() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -2043,7 +2231,6 @@ fn test_object_lock_delete_multipart_object_with_legal_hold_on() {
 }
 
 #[test]
-#[ignore = "Object Lock / WORM not implemented yet"]
 fn test_object_lock_delete_object_with_legal_hold_off() {
     s3_tests::run(async {
         let client = CTX.client();

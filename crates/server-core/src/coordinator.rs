@@ -1634,6 +1634,7 @@ pub struct DeleteObjectRequest<'a> {
     pub bucket: &'a str,
     pub key: &'a str,
     pub version_id: Option<VersionId>,
+    pub bypass_governance: bool,
     pub cond: &'a DeleteCondition,
     pub requester: Requester,
     #[cfg(not(test))]
@@ -1706,6 +1707,7 @@ pub struct DeleteEntry<'a> {
 pub struct DeleteObjectsRequest<'a> {
     pub bucket: &'a str,
     pub entries: &'a [DeleteEntry<'a>],
+    pub bypass_governance: bool,
     pub requester: Requester,
     #[cfg(not(test))]
     pub expected_bucket_owner: Option<&'a str>,
@@ -2034,6 +2036,7 @@ impl<'a> DeleteObjectRequest<'a> {
         bucket: &'a str,
         key: &'a str,
         version_id: Option<VersionId>,
+        bypass_governance: bool,
         cond: &'a DeleteCondition,
         requester: Requester,
         _expected_bucket_owner: Option<&'a str>,
@@ -2042,6 +2045,7 @@ impl<'a> DeleteObjectRequest<'a> {
             bucket,
             key,
             version_id,
+            bypass_governance,
             cond,
             requester,
             #[cfg(not(test))]
@@ -4395,6 +4399,14 @@ impl Coordinator {
         }
     }
 
+    fn requester_can_bypass_governance_retention(
+        requester: &Requester,
+        bucket: &BucketSummary,
+    ) -> bool {
+        Self::requester_can_bucket_admin(requester, &bucket.owner_principal)
+            || Self::requester_is_bucket_owner_account(requester, bucket)
+    }
+
     fn authorize_put_object_requester(
         &self,
         requester: &Requester,
@@ -6659,6 +6671,33 @@ impl Coordinator {
                     return Err(ServerError::AccessDenied);
                 }
                 Ok(())
+            }
+        }
+    }
+
+    fn validate_delete_against_object_lock(
+        object_lock: ObjectLockState,
+        bypass_governance_requested: bool,
+        can_bypass_governance: bool,
+        now_unix_seconds: u64,
+    ) -> Result<(), ServerError> {
+        if object_lock.legal_hold == StoredLegalHoldStatus::On {
+            return Err(ServerError::AccessDenied);
+        }
+
+        let Some(retention) = object_lock.retention else {
+            return Ok(());
+        };
+        if retention.retain_until_unix_seconds <= now_unix_seconds {
+            return Ok(());
+        }
+
+        match retention.mode {
+            ObjectLockMode::Governance if bypass_governance_requested && can_bypass_governance => {
+                Ok(())
+            }
+            ObjectLockMode::Governance | ObjectLockMode::Compliance => {
+                Err(ServerError::AccessDenied)
             }
         }
     }
@@ -10302,10 +10341,11 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::delete_object",
-            "bucket={} key={} version_id={:?}",
+            "bucket={} key={} version_id={:?} bypass={}",
             req.bucket,
             req.key,
-            req.version_id
+            req.version_id,
+            req.bypass_governance
         );
         let bucket = req.bucket;
         let key = req.key;
@@ -10462,6 +10502,14 @@ impl Coordinator {
 
                 // Delete shards if it's a live object (not a delete marker)
                 if let StoredObject::Live(record) = &stored {
+                    let can_bypass_governance =
+                        Self::requester_can_bypass_governance_retention(requester, &bucket_info);
+                    Self::validate_delete_against_object_lock(
+                        record.object_lock,
+                        req.bypass_governance,
+                        can_bypass_governance,
+                        Self::current_unix_seconds()?,
+                    )?;
                     if matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
                         let obj_parts = meta_pg
                             .get_object_parts(bucket, key, vid)
@@ -10922,15 +10970,16 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::delete_objects",
-            "bucket={} objects={}",
+            "bucket={} objects={} bypass={}",
             req.bucket,
-            req.entries.len()
+            req.entries.len(),
+            req.bypass_governance
         );
         let bucket = req.bucket;
         let entries = req.entries;
         let requester = &req.requester;
-        let _bucket_info =
-            self.authorize_bucket_admin_requester(requester, bucket, expected_bucket_owner)?;
+        let bucket_info = self.active_bucket_summary(bucket)?;
+        Self::ensure_expected_bucket_owner(&bucket_info, expected_bucket_owner)?;
 
         let mut deleted = Vec::new();
         let mut errors = Vec::new();
@@ -10941,6 +10990,7 @@ impl Coordinator {
                     bucket,
                     entry.key,
                     entry.version_id,
+                    req.bypass_governance,
                     &entry.cond,
                     requester.clone(),
                     expected_bucket_owner,
@@ -13365,6 +13415,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
+                bypass_governance: false,
                 cond: NO_DELETE,
                 requester,
             })
@@ -14210,6 +14261,7 @@ mod tests {
                 bucket: "bucket",
                 key: &key_for_delete,
                 version_id: None,
+                bypass_governance: false,
                 cond: NO_DELETE,
                 requester: TEST_REQUESTER,
             });
@@ -14550,6 +14602,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
+                bypass_governance: false,
                 cond: NO_DELETE,
                 requester: TEST_REQUESTER,
             })
@@ -14609,6 +14662,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
+                bypass_governance: false,
                 cond: NO_DELETE,
                 requester: TEST_REQUESTER,
             })
@@ -14629,6 +14683,7 @@ mod tests {
                 bucket: "bucket",
                 key: "no-such-key",
                 version_id: None,
+                bypass_governance: false,
                 cond: NO_DELETE,
                 requester: TEST_REQUESTER,
             })
@@ -16178,6 +16233,7 @@ mod tests {
             .delete_objects(&DeleteObjectsRequest {
                 bucket: "bucket",
                 entries: &entries,
+                bypass_governance: false,
                 requester: TEST_REQUESTER,
             })
             .unwrap();
@@ -16222,6 +16278,7 @@ mod tests {
             .delete_objects(&DeleteObjectsRequest {
                 bucket: "no-bucket",
                 entries: &entries,
+                bypass_governance: false,
                 requester: TEST_REQUESTER,
             })
             .unwrap_err();
@@ -18481,6 +18538,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
+                bypass_governance: false,
                 cond: NO_DELETE,
                 requester: Requester::principal("other-user"),
             })
@@ -18501,14 +18559,18 @@ mod tests {
             version_id: None,
             cond: DeleteCondition::None,
         }];
-        let err = coord
+        let result = coord
             .delete_objects(&DeleteObjectsRequest {
                 bucket: "bucket",
                 entries: &entries,
+                bypass_governance: false,
                 requester: Requester::principal("other-user"),
             })
-            .unwrap_err();
-        assert!(matches!(err, ServerError::AccessDenied));
+            .unwrap();
+        assert!(result.deleted.is_empty());
+        assert_eq!(result.errors.len(), 1);
+        assert_eq!(result.errors[0].key, "key");
+        assert_eq!(result.errors[0].code, "AccessDenied");
     }
 
     #[test]
@@ -19392,6 +19454,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
+                bypass_governance: false,
                 cond: &cond,
                 requester: TEST_REQUESTER,
             })
@@ -19436,6 +19499,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
+                bypass_governance: false,
                 cond: &cond,
                 requester: TEST_REQUESTER,
             })
@@ -19492,6 +19556,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 version_id: Some(v1.version_id),
+                bypass_governance: false,
                 cond: &cond,
                 requester: TEST_REQUESTER,
             })
@@ -19571,6 +19636,7 @@ mod tests {
             .delete_objects(&DeleteObjectsRequest {
                 bucket: "bucket",
                 entries: &entries,
+                bypass_governance: false,
                 requester: TEST_REQUESTER,
             })
             .unwrap();
@@ -21461,6 +21527,317 @@ mod tests {
     }
 
     #[test]
+    fn validate_delete_against_object_lock_requires_bypass_for_governance_retention() {
+        let state = ObjectLockState {
+            retention: Some(ObjectRetention {
+                mode: ObjectLockMode::Governance,
+                retain_until_unix_seconds: 200,
+            }),
+            legal_hold: StoredLegalHoldStatus::NotSet,
+        };
+        let err =
+            Coordinator::validate_delete_against_object_lock(state, false, false, 100).unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+        let err =
+            Coordinator::validate_delete_against_object_lock(state, true, false, 100).unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+        assert!(Coordinator::validate_delete_against_object_lock(state, true, true, 100).is_ok());
+    }
+
+    #[test]
+    fn validate_delete_against_object_lock_rejects_compliance_even_with_bypass() {
+        let state = ObjectLockState {
+            retention: Some(ObjectRetention {
+                mode: ObjectLockMode::Compliance,
+                retain_until_unix_seconds: 200,
+            }),
+            legal_hold: StoredLegalHoldStatus::NotSet,
+        };
+        let err =
+            Coordinator::validate_delete_against_object_lock(state, true, true, 100).unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn validate_delete_against_object_lock_rejects_legal_hold_even_with_bypass() {
+        let state = ObjectLockState {
+            retention: Some(ObjectRetention {
+                mode: ObjectLockMode::Governance,
+                retain_until_unix_seconds: 50,
+            }),
+            legal_hold: StoredLegalHoldStatus::On,
+        };
+        let err =
+            Coordinator::validate_delete_against_object_lock(state, true, true, 100).unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn delete_object_with_retention_still_inserts_delete_marker_without_version_id() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let owner = AccountIdentity::from_principal("owner-a");
+        let requester = Requester::principal("owner-a");
+
+        coord
+            .create_bucket_for_requester_with_object_lock(
+                &CreateBucketRequest {
+                    name: "bucket",
+                    requester: Requester::authenticated(owner),
+                    acl: CreateBucketAcl::DefaultPrivate,
+                    ownership: BucketObjectOwnership::ObjectWriter,
+                },
+                true,
+            )
+            .unwrap();
+
+        let put = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "key",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                requester: requester.clone(),
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        coord
+            .put_object_retention(
+                "bucket",
+                "key",
+                Some(put.version_id),
+                ObjectRetention {
+                    mode: ObjectLockMode::Governance,
+                    retain_until_unix_seconds: Coordinator::current_unix_seconds().unwrap() + 3600,
+                },
+                false,
+                requester.clone(),
+            )
+            .unwrap();
+
+        let delete_marker = coord
+            .delete_object(&DeleteObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: None,
+                bypass_governance: false,
+                cond: NO_DELETE,
+                requester: requester.clone(),
+            })
+            .unwrap();
+        assert!(delete_marker.delete_marker);
+        assert!(delete_marker.version_id.is_versioned());
+
+        let err = coord
+            .delete_object(&DeleteObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: Some(put.version_id),
+                bypass_governance: false,
+                cond: NO_DELETE,
+                requester: requester.clone(),
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+
+        coord
+            .delete_object(&DeleteObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: Some(delete_marker.version_id),
+                bypass_governance: false,
+                cond: NO_DELETE,
+                requester: requester.clone(),
+            })
+            .unwrap();
+        coord
+            .delete_object(&DeleteObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: Some(put.version_id),
+                bypass_governance: true,
+                cond: NO_DELETE,
+                requester,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn delete_object_with_legal_hold_rejects_bypass() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let owner = AccountIdentity::from_principal("owner-a");
+        let requester = Requester::principal("owner-a");
+
+        coord
+            .create_bucket_for_requester_with_object_lock(
+                &CreateBucketRequest {
+                    name: "bucket",
+                    requester: Requester::authenticated(owner),
+                    acl: CreateBucketAcl::DefaultPrivate,
+                    ownership: BucketObjectOwnership::ObjectWriter,
+                },
+                true,
+            )
+            .unwrap();
+
+        let put = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "key",
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                requester: requester.clone(),
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        coord
+            .put_object_legal_hold(
+                "bucket",
+                "key",
+                Some(put.version_id),
+                LegalHoldStatus::On,
+                requester.clone(),
+            )
+            .unwrap();
+
+        let err = coord
+            .delete_object(&DeleteObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: Some(put.version_id),
+                bypass_governance: true,
+                cond: NO_DELETE,
+                requester: requester.clone(),
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+
+        coord
+            .put_object_legal_hold(
+                "bucket",
+                "key",
+                Some(put.version_id),
+                LegalHoldStatus::Off,
+                requester.clone(),
+            )
+            .unwrap();
+        coord
+            .delete_object(&DeleteObjectRequest {
+                bucket: "bucket",
+                key: "key",
+                version_id: Some(put.version_id),
+                bypass_governance: true,
+                cond: NO_DELETE,
+                requester,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn delete_object_with_governance_bypass_rejects_public_writer() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let owner_canonical_id = CanonicalUserId::from_principal("owner-a");
+        let owner_requester = Requester::principal("owner-a");
+        let writer_requester = Requester::principal("writer-a");
+
+        coord
+            .create_bucket_for_owner_with_acl(
+                "owner-a",
+                &owner_canonical_id,
+                "bucket",
+                false,
+                true,
+                true,
+            )
+            .unwrap();
+
+        let plain = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "plain",
+                data: b"plain",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                requester: owner_requester.clone(),
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        coord
+            .delete_object(&DeleteObjectRequest {
+                bucket: "bucket",
+                key: "plain",
+                version_id: Some(plain.version_id),
+                bypass_governance: false,
+                cond: NO_DELETE,
+                requester: writer_requester.clone(),
+            })
+            .unwrap();
+
+        let locked = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                bucket: "bucket",
+                key: "locked",
+                data: b"locked",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                requester: owner_requester.clone(),
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        coord
+            .put_object_retention(
+                "bucket",
+                "locked",
+                Some(locked.version_id),
+                ObjectRetention {
+                    mode: ObjectLockMode::Governance,
+                    retain_until_unix_seconds: Coordinator::current_unix_seconds().unwrap() + 3600,
+                },
+                false,
+                owner_requester,
+            )
+            .unwrap();
+
+        let err = coord
+            .delete_object(&DeleteObjectRequest {
+                bucket: "bucket",
+                key: "locked",
+                version_id: Some(locked.version_id),
+                bypass_governance: true,
+                cond: NO_DELETE,
+                requester: writer_requester,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
     fn bucket_encryption_default_unblocked() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
@@ -22308,6 +22685,7 @@ mod tests {
                     bucket: "bucket",
                     key: "key",
                     version_id: None,
+                    bypass_governance: false,
                     cond: NO_DELETE,
                     requester: TEST_REQUESTER,
                 })
@@ -22398,6 +22776,7 @@ mod tests {
                 bucket: "race-bucket",
                 key: &delete_key,
                 version_id: None,
+                bypass_governance: false,
                 cond: NO_DELETE,
                 requester: TEST_REQUESTER,
             })
@@ -22472,6 +22851,7 @@ mod tests {
                 bucket: "race-bucket",
                 key: &delete_key,
                 version_id: None,
+                bypass_governance: false,
                 cond: NO_DELETE,
                 requester: TEST_REQUESTER,
             })
@@ -22564,6 +22944,7 @@ mod tests {
                 bucket: "race-bucket",
                 key: &delete_key,
                 version_id: None,
+                bypass_governance: false,
                 cond: NO_DELETE,
                 requester: TEST_REQUESTER,
             })
@@ -22646,6 +23027,7 @@ mod tests {
                 bucket: "race-bucket",
                 key: &delete_key,
                 version_id: None,
+                bypass_governance: false,
                 cond: NO_DELETE,
                 requester: TEST_REQUESTER,
             })
@@ -22715,6 +23097,7 @@ mod tests {
                 bucket: "src-bucket",
                 key: "race-key-copy",
                 version_id: None,
+                bypass_governance: false,
                 cond: NO_DELETE,
                 requester: TEST_REQUESTER,
             })
@@ -22771,6 +23154,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
+                bypass_governance: false,
                 cond: NO_DELETE,
                 requester: TEST_REQUESTER,
             })
@@ -23721,6 +24105,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
+                bypass_governance: false,
                 cond: NO_DELETE,
                 requester: TEST_REQUESTER,
             })
@@ -24557,6 +24942,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
+                bypass_governance: false,
                 cond: NO_DELETE,
                 requester: TEST_REQUESTER,
             })
@@ -28196,6 +28582,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
+                bypass_governance: false,
                 cond: &crate::conditional::DeleteCondition::default(),
                 requester: TEST_REQUESTER,
             })
@@ -28257,6 +28644,7 @@ mod tests {
                 bucket: "bucket",
                 key: "key",
                 version_id: None,
+                bypass_governance: false,
                 cond: NO_DELETE,
                 requester: TEST_REQUESTER,
             })
@@ -29394,6 +29782,7 @@ mod tests {
                 bucket: "bucket",
                 key: "cycle",
                 version_id: None,
+                bypass_governance: false,
                 cond: &crate::conditional::DeleteCondition::default(),
                 requester: TEST_REQUESTER,
             })
