@@ -4935,12 +4935,17 @@ impl Coordinator {
             req.object_lock_enabled,
         )?;
         match create_outcome {
-            BucketCreateOutcome::Created => self.put_bucket_ownership_controls(
-                req.name,
-                &Self::ownership_controls_xml(req.ownership),
-                req.requester.clone(),
-                None,
-            ),
+            BucketCreateOutcome::Created => {
+                self.put_bucket_ownership_controls_for_request(&PutBucketConfigRequest {
+                    bucket: BucketRequest {
+                        name: req.name,
+                        requester: req.requester.clone(),
+                        #[cfg(not(test))]
+                        expected_bucket_owner: None,
+                    },
+                    config: &Self::ownership_controls_xml(req.ownership),
+                })
+            }
             BucketCreateOutcome::AlreadyOwned => Ok(()),
         }
     }
@@ -5134,269 +5139,24 @@ impl Coordinator {
         &self,
         req: &PutBucketVersioningRequest<'_>,
     ) -> Result<(), ServerError> {
-        self.put_bucket_versioning(
-            req.bucket.name,
-            req.state,
-            req.bucket.requester.clone(),
-            req.bucket.expected_bucket_owner(),
-        )
-    }
-
-    pub fn get_bucket_versioning_for_request(
-        &self,
-        req: &BucketRequest<'_>,
-    ) -> Result<BucketVersioningState, ServerError> {
-        self.get_bucket_versioning(req.name, req.requester.clone(), req.expected_bucket_owner())
-    }
-
-    pub fn put_bucket_object_lock_configuration_for_request(
-        &self,
-        req: &PutBucketObjectLockConfigurationRequest<'_>,
-    ) -> Result<(), ServerError> {
-        self.put_bucket_object_lock_configuration(
-            req.bucket.name,
-            req.config,
-            req.bucket.requester.clone(),
-            req.bucket.expected_bucket_owner(),
-        )
-    }
-
-    pub fn get_bucket_object_lock_configuration_for_request(
-        &self,
-        req: &BucketRequest<'_>,
-    ) -> Result<BucketObjectLockConfig, ServerError> {
-        self.get_bucket_object_lock_configuration(
-            req.name,
-            req.requester.clone(),
-            req.expected_bucket_owner(),
-        )
-    }
-
-    pub fn put_bucket_encryption_for_request(
-        &self,
-        req: &PutBucketEncryptionRequest<'_>,
-    ) -> Result<(), ServerError> {
-        self.put_bucket_encryption(
-            req.bucket.name,
-            req.config,
-            req.bucket.requester.clone(),
-            req.bucket.expected_bucket_owner(),
-        )
-    }
-
-    pub fn get_bucket_encryption_for_request(
-        &self,
-        req: &BucketRequest<'_>,
-    ) -> Result<BucketEncryptionConfig, ServerError> {
-        self.get_bucket_encryption(req.name, req.requester.clone(), req.expected_bucket_owner())
-    }
-
-    pub fn put_bucket_cors_for_request(
-        &self,
-        req: &PutBucketConfigRequest<'_>,
-    ) -> Result<(), ServerError> {
-        self.put_bucket_cors(
-            req.bucket.name,
-            req.config,
-            req.bucket.requester.clone(),
-            req.bucket.expected_bucket_owner(),
-        )
-    }
-
-    pub fn get_bucket_cors_for_request(
-        &self,
-        req: &BucketRequest<'_>,
-    ) -> Result<Option<String>, ServerError> {
-        self.get_bucket_cors(req.name, req.requester.clone(), req.expected_bucket_owner())
-    }
-
-    pub fn delete_bucket_cors_for_request(
-        &self,
-        req: &BucketRequest<'_>,
-    ) -> Result<(), ServerError> {
-        self.delete_bucket_cors(req.name, req.requester.clone(), req.expected_bucket_owner())
-    }
-
-    pub fn put_bucket_tags_for_request(
-        &self,
-        req: &PutBucketConfigRequest<'_>,
-    ) -> Result<(), ServerError> {
-        self.put_bucket_tags(
-            req.bucket.name,
-            req.config,
-            req.bucket.requester.clone(),
-            req.bucket.expected_bucket_owner(),
-        )
-    }
-
-    pub fn get_bucket_tags_for_request(
-        &self,
-        req: &BucketRequest<'_>,
-    ) -> Result<Option<String>, ServerError> {
-        self.get_bucket_tags(req.name, req.requester.clone(), req.expected_bucket_owner())
-    }
-
-    pub fn delete_bucket_tags_for_request(
-        &self,
-        req: &BucketRequest<'_>,
-    ) -> Result<(), ServerError> {
-        self.delete_bucket_tags(req.name, req.requester.clone(), req.expected_bucket_owner())
-    }
-
-    pub fn put_bucket_policy_for_request(
-        &self,
-        req: &PutBucketConfigRequest<'_>,
-    ) -> Result<(), ServerError> {
-        self.put_bucket_policy(
-            req.bucket.name,
-            req.config,
-            req.bucket.requester.clone(),
-            req.bucket.expected_bucket_owner(),
-        )
-    }
-
-    pub fn get_bucket_policy_for_request(
-        &self,
-        req: &BucketRequest<'_>,
-    ) -> Result<Option<String>, ServerError> {
-        self.get_bucket_policy(req.name, req.requester.clone(), req.expected_bucket_owner())
-    }
-
-    pub fn get_bucket_policy_status_for_request(
-        &self,
-        req: &BucketRequest<'_>,
-    ) -> Result<bool, ServerError> {
-        self.get_bucket_policy_status(req.name, req.requester.clone(), req.expected_bucket_owner())
-    }
-
-    pub fn delete_bucket_policy_for_request(
-        &self,
-        req: &BucketRequest<'_>,
-    ) -> Result<(), ServerError> {
-        self.delete_bucket_policy(req.name, req.requester.clone(), req.expected_bucket_owner())
-    }
-
-    pub fn put_bucket_public_access_block_for_request(
-        &self,
-        req: &PutBucketConfigRequest<'_>,
-    ) -> Result<(), ServerError> {
-        self.put_bucket_public_access_block(
-            req.bucket.name,
-            req.config,
-            req.bucket.requester.clone(),
-            req.bucket.expected_bucket_owner(),
-        )
-    }
-
-    pub fn get_bucket_public_access_block_for_request(
-        &self,
-        req: &BucketRequest<'_>,
-    ) -> Result<Option<String>, ServerError> {
-        self.get_bucket_public_access_block(
-            req.name,
-            req.requester.clone(),
-            req.expected_bucket_owner(),
-        )
-    }
-
-    pub fn delete_bucket_public_access_block_for_request(
-        &self,
-        req: &BucketRequest<'_>,
-    ) -> Result<(), ServerError> {
-        self.delete_bucket_public_access_block(
-            req.name,
-            req.requester.clone(),
-            req.expected_bucket_owner(),
-        )
-    }
-
-    pub fn put_bucket_ownership_controls_for_request(
-        &self,
-        req: &PutBucketConfigRequest<'_>,
-    ) -> Result<(), ServerError> {
-        self.put_bucket_ownership_controls(
-            req.bucket.name,
-            req.config,
-            req.bucket.requester.clone(),
-            req.bucket.expected_bucket_owner(),
-        )
-    }
-
-    pub fn get_bucket_ownership_controls_for_request(
-        &self,
-        req: &BucketRequest<'_>,
-    ) -> Result<Option<String>, ServerError> {
-        self.get_bucket_ownership_controls(
-            req.name,
-            req.requester.clone(),
-            req.expected_bucket_owner(),
-        )
-    }
-
-    pub fn delete_bucket_ownership_controls_for_request(
-        &self,
-        req: &BucketRequest<'_>,
-    ) -> Result<(), ServerError> {
-        self.delete_bucket_ownership_controls(
-            req.name,
-            req.requester.clone(),
-            req.expected_bucket_owner(),
-        )
-    }
-
-    pub fn get_bucket_acl_for_request(
-        &self,
-        req: &BucketRequest<'_>,
-    ) -> Result<GetBucketAclResult, ServerError> {
-        self.get_bucket_acl(req.name, req.requester.clone(), req.expected_bucket_owner())
-    }
-
-    pub fn put_bucket_acl_for_request(
-        &self,
-        req: &PutBucketAclRequest<'_>,
-    ) -> Result<(), ServerError> {
-        self.put_bucket_acl(
-            req.bucket.name,
-            req.acl_grants.clone(),
-            req.bucket.requester.clone(),
-            req.bucket.expected_bucket_owner(),
-        )
-    }
-
-    pub fn put_bucket_canned_acl_for_request(
-        &self,
-        req: &PutBucketCannedAclRequest<'_>,
-    ) -> Result<(), ServerError> {
-        self.put_bucket_canned_acl(
-            req.bucket.name,
-            req.acl,
-            req.bucket.requester.clone(),
-            req.bucket.expected_bucket_owner(),
-        )
-    }
-
-    pub fn put_bucket_versioning(
-        &self,
-        name: &str,
-        state: BucketVersioningState,
-        requester: Requester,
-        expected_bucket_owner: Option<&str>,
-    ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_bucket_versioning",
             "bucket={} state={:?}",
-            name,
-            state
+            req.bucket.name,
+            req.state
         );
-        let bucket_info =
-            self.authorize_bucket_admin_requester(&requester, name, expected_bucket_owner)?;
-        if bucket_info.object_lock.enabled && state != BucketVersioningState::Enabled {
+        let bucket_info = self.authorize_bucket_admin_requester(
+            &req.bucket.requester,
+            req.bucket.name,
+            req.bucket.expected_bucket_owner(),
+        )?;
+        if bucket_info.object_lock.enabled && req.state != BucketVersioningState::Enabled {
             return Err(ServerError::InvalidBucketState);
         }
-        let bucket_pg = self.get_bucket_pg(name)?;
+        let bucket_pg = self.get_bucket_pg(req.bucket.name)?;
         bucket_pg
-            .put_bucket_versioning(name, state)
+            .put_bucket_versioning(req.bucket.name, req.state)
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
                     name: name.to_string(),
@@ -5409,48 +5169,53 @@ impl Coordinator {
                 other => ServerError::Metadata(other),
             })?;
         self.storage_node
-            .update_bucket_fast_path_if_present(name, |info| info.versioning = state);
+            .update_bucket_fast_path_if_present(req.bucket.name, |info| {
+                info.versioning = req.state
+            });
         Ok(())
     }
 
-    pub fn get_bucket_versioning(
+    pub fn get_bucket_versioning_for_request(
         &self,
-        name: &str,
-        requester: Requester,
-        expected_bucket_owner: Option<&str>,
+        req: &BucketRequest<'_>,
     ) -> Result<BucketVersioningState, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_bucket_versioning",
             "bucket={}",
-            name
+            req.name
         );
-        let info = self.authorize_bucket_read_requester(&requester, name, expected_bucket_owner)?;
+        let info = self.authorize_bucket_read_requester(
+            &req.requester,
+            req.name,
+            req.expected_bucket_owner(),
+        )?;
         Ok(info.versioning)
     }
 
-    pub fn put_bucket_object_lock_configuration(
+    pub fn put_bucket_object_lock_configuration_for_request(
         &self,
-        name: &str,
-        config: BucketObjectLockConfigurationUpdate,
-        requester: Requester,
-        expected_bucket_owner: Option<&str>,
+        req: &PutBucketObjectLockConfigurationRequest<'_>,
     ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_bucket_object_lock_configuration",
             "bucket={} enable_requested={} has_default_retention={}",
-            name,
-            config.object_lock_enabled.unwrap_or(false),
-            config.default_retention.is_some()
+            req.bucket.name,
+            req.config.object_lock_enabled.unwrap_or(false),
+            req.config.default_retention.is_some()
         );
-        let bucket_info =
-            self.authorize_bucket_admin_requester(&requester, name, expected_bucket_owner)?;
+        let bucket_info = self.authorize_bucket_admin_requester(
+            &req.bucket.requester,
+            req.bucket.name,
+            req.bucket.expected_bucket_owner(),
+        )?;
         if bucket_info.versioning != BucketVersioningState::Enabled {
             return Err(ServerError::InvalidBucketState);
         }
 
-        let final_enabled = bucket_info.object_lock.enabled || config.object_lock_enabled.is_some();
+        let final_enabled =
+            bucket_info.object_lock.enabled || req.config.object_lock_enabled.is_some();
         if !final_enabled {
             return Err(ServerError::InvalidRequest {
                 reason: "Object Lock must be enabled before configuring this bucket".to_string(),
@@ -5459,11 +5224,11 @@ impl Coordinator {
 
         let final_config = BucketObjectLockConfig {
             enabled: true,
-            default_retention: config.default_retention,
+            default_retention: req.config.default_retention,
         };
-        let bucket_pg = self.get_bucket_pg(name)?;
+        let bucket_pg = self.get_bucket_pg(req.bucket.name)?;
         bucket_pg
-            .put_bucket_object_lock(name, final_config)
+            .put_bucket_object_lock(req.bucket.name, final_config)
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
                     name: name.to_string(),
@@ -5471,27 +5236,27 @@ impl Coordinator {
                 other => ServerError::Metadata(other),
             })?;
         self.storage_node
-            .update_bucket_fast_path_if_present(name, |info| info.object_lock = final_config);
+            .update_bucket_fast_path_if_present(req.bucket.name, |info| {
+                info.object_lock = final_config
+            });
         Ok(())
     }
 
-    pub fn get_bucket_object_lock_configuration(
+    pub fn get_bucket_object_lock_configuration_for_request(
         &self,
-        name: &str,
-        requester: Requester,
-        expected_bucket_owner: Option<&str>,
+        req: &BucketRequest<'_>,
     ) -> Result<BucketObjectLockConfig, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_bucket_object_lock_configuration",
             "bucket={}",
-            name
+            req.name
         );
-        let info = self.active_bucket_summary(name, None)?;
-        Self::ensure_expected_bucket_owner(&info, expected_bucket_owner)?;
+        let info = self.active_bucket_summary(req.name, None)?;
+        Self::ensure_expected_bucket_owner(&info, req.expected_bucket_owner())?;
         let bucket_policy = self.cached_bucket_policy(&info)?;
         if !Self::requester_can_get_bucket_object_lock_configuration_with_bucket_policy(
-            &requester,
+            &req.requester,
             &info,
             bucket_policy.as_deref(),
         ) {
@@ -5499,31 +5264,31 @@ impl Coordinator {
         }
         if !info.object_lock.enabled {
             return Err(ServerError::ObjectLockConfigurationNotFound {
-                bucket: name.to_string(),
+                bucket: req.name.to_string(),
             });
         }
         Ok(info.object_lock)
     }
 
-    pub fn put_bucket_encryption(
+    pub fn put_bucket_encryption_for_request(
         &self,
-        name: &str,
-        config: BucketEncryptionConfig,
-        requester: Requester,
-        expected_bucket_owner: Option<&str>,
+        req: &PutBucketEncryptionRequest<'_>,
     ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_bucket_encryption",
             "bucket={} sse_c_blocked={}",
-            name,
-            config.sse_c_blocked
+            req.bucket.name,
+            req.config.sse_c_blocked
         );
-        let _bucket_info =
-            self.authorize_bucket_admin_requester(&requester, name, expected_bucket_owner)?;
-        let bucket_pg = self.get_bucket_pg(name)?;
+        let _bucket_info = self.authorize_bucket_admin_requester(
+            &req.bucket.requester,
+            req.bucket.name,
+            req.bucket.expected_bucket_owner(),
+        )?;
+        let bucket_pg = self.get_bucket_pg(req.bucket.name)?;
         bucket_pg
-            .put_bucket_encryption(name, config)
+            .put_bucket_encryption(req.bucket.name, req.config)
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
                     name: name.to_string(),
@@ -5531,52 +5296,598 @@ impl Coordinator {
                 other => ServerError::Metadata(other),
             })?;
         self.storage_node
-            .update_bucket_fast_path_if_present(name, |info| info.encryption = config);
+            .update_bucket_fast_path_if_present(req.bucket.name, |info| {
+                info.encryption = req.config
+            });
         Ok(())
     }
 
-    pub fn get_bucket_encryption(
+    pub fn get_bucket_encryption_for_request(
         &self,
-        name: &str,
-        requester: Requester,
-        expected_bucket_owner: Option<&str>,
+        req: &BucketRequest<'_>,
     ) -> Result<BucketEncryptionConfig, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_bucket_encryption",
             "bucket={}",
-            name
+            req.name
         );
-        let info =
-            self.authorize_bucket_admin_requester(&requester, name, expected_bucket_owner)?;
+        let info = self.authorize_bucket_admin_requester(
+            &req.requester,
+            req.name,
+            req.expected_bucket_owner(),
+        )?;
         Ok(info.encryption)
     }
 
-    pub fn put_bucket_cors(
+    pub fn put_bucket_cors_for_request(
         &self,
-        name: &str,
-        config: &str,
-        requester: Requester,
-        expected_bucket_owner: Option<&str>,
+        req: &PutBucketConfigRequest<'_>,
     ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_bucket_cors",
             "bucket={} bytes={}",
-            name,
-            config.len()
+            req.bucket.name,
+            req.config.len()
         );
-        let _bucket_info =
-            self.authorize_bucket_admin_requester(&requester, name, expected_bucket_owner)?;
-        let bucket_pg = self.get_bucket_pg(name)?;
+        let _bucket_info = self.authorize_bucket_admin_requester(
+            &req.bucket.requester,
+            req.bucket.name,
+            req.bucket.expected_bucket_owner(),
+        )?;
+        let bucket_pg = self.get_bucket_pg(req.bucket.name)?;
         bucket_pg
-            .put_bucket_cors(name, config)
+            .put_bucket_cors(req.bucket.name, req.config)
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
                     name: name.to_string(),
                 },
                 other => ServerError::Metadata(other),
             })
+    }
+
+    pub fn get_bucket_cors_for_request(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<Option<String>, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::get_bucket_cors",
+            "bucket={}",
+            req.name
+        );
+        let _bucket_info = self.authorize_bucket_read_requester(
+            &req.requester,
+            req.name,
+            req.expected_bucket_owner(),
+        )?;
+        self.get_bucket_cors_unchecked(req.name)
+    }
+
+    pub fn delete_bucket_cors_for_request(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<(), ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::delete_bucket_cors",
+            "bucket={}",
+            req.name
+        );
+        let _bucket_info = self.authorize_bucket_admin_requester(
+            &req.requester,
+            req.name,
+            req.expected_bucket_owner(),
+        )?;
+        let bucket_pg = self.get_bucket_pg(req.name)?;
+        bucket_pg.delete_bucket_cors(req.name).map_err(|e| match e {
+            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                name: name.to_string(),
+            },
+            other => ServerError::Metadata(other),
+        })
+    }
+
+    pub fn put_bucket_tags_for_request(
+        &self,
+        req: &PutBucketConfigRequest<'_>,
+    ) -> Result<(), ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::put_bucket_tags",
+            "bucket={} bytes={}",
+            req.bucket.name,
+            req.config.len()
+        );
+        let _bucket_info = self.authorize_bucket_admin_requester(
+            &req.bucket.requester,
+            req.bucket.name,
+            req.bucket.expected_bucket_owner(),
+        )?;
+        let bucket_pg = self.get_bucket_pg(req.bucket.name)?;
+        bucket_pg
+            .put_bucket_tags(req.bucket.name, req.config)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })
+    }
+
+    pub fn get_bucket_tags_for_request(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<Option<String>, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::get_bucket_tags",
+            "bucket={}",
+            req.name
+        );
+        let _bucket_info = self.authorize_bucket_read_requester(
+            &req.requester,
+            req.name,
+            req.expected_bucket_owner(),
+        )?;
+        let bucket_pg = self.get_bucket_pg(req.name)?;
+        bucket_pg.get_bucket_tags(req.name).map_err(|e| match e {
+            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                name: name.to_string(),
+            },
+            other => ServerError::Metadata(other),
+        })
+    }
+
+    pub fn delete_bucket_tags_for_request(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<(), ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::delete_bucket_tags",
+            "bucket={}",
+            req.name
+        );
+        let _bucket_info = self.authorize_bucket_admin_requester(
+            &req.requester,
+            req.name,
+            req.expected_bucket_owner(),
+        )?;
+        let bucket_pg = self.get_bucket_pg(req.name)?;
+        bucket_pg.delete_bucket_tags(req.name).map_err(|e| match e {
+            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                name: name.to_string(),
+            },
+            other => ServerError::Metadata(other),
+        })
+    }
+
+    pub fn put_bucket_policy_for_request(
+        &self,
+        req: &PutBucketConfigRequest<'_>,
+    ) -> Result<(), ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::put_bucket_policy",
+            "bucket={} bytes={}",
+            req.bucket.name,
+            req.config.len()
+        );
+        let bucket_info = self.authorize_bucket_admin_requester(
+            &req.bucket.requester,
+            req.bucket.name,
+            req.bucket.expected_bucket_owner(),
+        )?;
+        let parsed_policy =
+            auth::parse_bucket_policy(req.config).map_err(|e| ServerError::MalformedPolicy {
+                reason: e.reason().to_string(),
+            })?;
+        parsed_policy
+            .validate_evaluable_object_conditions()
+            .map_err(|e| ServerError::MalformedPolicy {
+                reason: e.reason().to_string(),
+            })?;
+        let policy_is_public = parsed_policy.is_public();
+        if Self::blocks_public_policy(bucket_info.public_access_block.as_deref())
+            && policy_is_public
+        {
+            return Err(ServerError::AccessDenied);
+        }
+        let bucket_pg = self.get_bucket_pg(req.bucket.name)?;
+        bucket_pg
+            .put_bucket_policy(req.bucket.name, req.config, policy_is_public)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })?;
+        let info = bucket_pg
+            .head_bucket_raw(req.bucket.name)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })?;
+        self.storage_node.upsert_bucket_fast_path((&info).into());
+        self.cache_bucket_policy(
+            req.bucket.name,
+            info.bucket_policy_generation,
+            Arc::new(parsed_policy),
+        );
+        Ok(())
+    }
+
+    pub fn get_bucket_policy_for_request(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<Option<String>, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::get_bucket_policy",
+            "bucket={}",
+            req.name
+        );
+        let _bucket_info = self.authorize_bucket_admin_requester(
+            &req.requester,
+            req.name,
+            req.expected_bucket_owner(),
+        )?;
+        let bucket_pg = self.get_bucket_pg(req.name)?;
+        bucket_pg.get_bucket_policy(req.name).map_err(|e| match e {
+            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                name: name.to_string(),
+            },
+            other => ServerError::Metadata(other),
+        })
+    }
+
+    pub fn get_bucket_policy_status_for_request(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<bool, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::get_bucket_policy_status",
+            "bucket={}",
+            req.name
+        );
+        let bucket_info = self.active_bucket_summary(req.name, None)?;
+        Self::ensure_expected_bucket_owner(&bucket_info, req.expected_bucket_owner())?;
+        if !bucket_info.bucket_policy_present {
+            if !Self::requester_can_bucket_admin(&req.requester, &bucket_info.owner_principal) {
+                return Err(ServerError::AccessDenied);
+            }
+            return Err(ServerError::NoSuchBucketPolicy {
+                bucket: req.name.to_string(),
+            });
+        }
+        let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
+        if !Self::requester_can_get_bucket_policy_status_with_bucket_policy(
+            &req.requester,
+            &bucket_info,
+            bucket_policy.as_deref(),
+        ) {
+            return Err(ServerError::AccessDenied);
+        }
+        Ok(bucket_info.bucket_policy_public)
+    }
+
+    pub fn delete_bucket_policy_for_request(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<(), ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::delete_bucket_policy",
+            "bucket={}",
+            req.name
+        );
+        let _bucket_info = self.authorize_bucket_admin_requester(
+            &req.requester,
+            req.name,
+            req.expected_bucket_owner(),
+        )?;
+        let bucket_pg = self.get_bucket_pg(req.name)?;
+        bucket_pg
+            .delete_bucket_policy(req.name)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })?;
+        let info = bucket_pg.head_bucket_raw(req.name).map_err(|e| match e {
+            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                name: name.to_string(),
+            },
+            other => ServerError::Metadata(other),
+        })?;
+        self.storage_node.upsert_bucket_fast_path((&info).into());
+        self.clear_bucket_policy_cache(req.name);
+        Ok(())
+    }
+
+    pub fn put_bucket_public_access_block_for_request(
+        &self,
+        req: &PutBucketConfigRequest<'_>,
+    ) -> Result<(), ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::put_bucket_public_access_block",
+            "bucket={} bytes={}",
+            req.bucket.name,
+            req.config.len()
+        );
+        let _bucket_info = self.authorize_bucket_admin_requester(
+            &req.bucket.requester,
+            req.bucket.name,
+            req.bucket.expected_bucket_owner(),
+        )?;
+        let bucket_pg = self.get_bucket_pg(req.bucket.name)?;
+        bucket_pg
+            .put_bucket_public_access_block(req.bucket.name, req.config)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })?;
+        let config = req.config.to_string();
+        self.storage_node
+            .update_bucket_fast_path_if_present(req.bucket.name, |info| {
+                info.public_access_block = Some(config.clone());
+            });
+        Ok(())
+    }
+
+    pub fn get_bucket_public_access_block_for_request(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<Option<String>, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::get_bucket_public_access_block",
+            "bucket={}",
+            req.name
+        );
+        let bucket_info = self.active_bucket_summary(req.name, None)?;
+        Self::ensure_expected_bucket_owner(&bucket_info, req.expected_bucket_owner())?;
+        let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
+        if !Self::requester_can_get_bucket_public_access_block_with_bucket_policy(
+            &req.requester,
+            &bucket_info,
+            bucket_policy.as_deref(),
+        ) {
+            return Err(ServerError::AccessDenied);
+        }
+        let bucket_pg = self.get_bucket_pg(req.name)?;
+        bucket_pg
+            .get_bucket_public_access_block(req.name)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })
+    }
+
+    pub fn delete_bucket_public_access_block_for_request(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<(), ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::delete_bucket_public_access_block",
+            "bucket={}",
+            req.name
+        );
+        let _bucket_info = self.authorize_bucket_admin_requester(
+            &req.requester,
+            req.name,
+            req.expected_bucket_owner(),
+        )?;
+        let bucket_pg = self.get_bucket_pg(req.name)?;
+        bucket_pg
+            .delete_bucket_public_access_block(req.name)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })?;
+        self.storage_node
+            .update_bucket_fast_path_if_present(req.name, |info| info.public_access_block = None);
+        Ok(())
+    }
+
+    pub fn put_bucket_ownership_controls_for_request(
+        &self,
+        req: &PutBucketConfigRequest<'_>,
+    ) -> Result<(), ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::put_bucket_ownership_controls",
+            "bucket={} bytes={}",
+            req.bucket.name,
+            req.config.len()
+        );
+        let bucket_info = self.authorize_bucket_admin_requester(
+            &req.bucket.requester,
+            req.bucket.name,
+            req.bucket.expected_bucket_owner(),
+        )?;
+        if Self::is_bucket_owner_enforced(Some(req.config))
+            && !Self::acl_grants_owner_full_control_only(
+                &bucket_info.owner_canonical_id,
+                &bucket_info.acl_grants,
+            )
+        {
+            return Err(ServerError::InvalidBucketAclWithObjectOwnership);
+        }
+        let bucket_pg = self.get_bucket_pg(req.bucket.name)?;
+        bucket_pg
+            .put_bucket_ownership_controls(req.bucket.name, req.config)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })?;
+        let config = req.config.to_string();
+        self.storage_node
+            .update_bucket_fast_path_if_present(req.bucket.name, |info| {
+                info.ownership_controls = Some(config.clone());
+            });
+        Ok(())
+    }
+
+    pub fn get_bucket_ownership_controls_for_request(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<Option<String>, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::get_bucket_ownership_controls",
+            "bucket={}",
+            req.name
+        );
+        let _bucket_info = self.authorize_bucket_admin_requester(
+            &req.requester,
+            req.name,
+            req.expected_bucket_owner(),
+        )?;
+        let bucket_pg = self.get_bucket_pg(req.name)?;
+        bucket_pg
+            .get_bucket_ownership_controls(req.name)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })
+    }
+
+    pub fn delete_bucket_ownership_controls_for_request(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<(), ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::delete_bucket_ownership_controls",
+            "bucket={}",
+            req.name
+        );
+        let _bucket_info = self.authorize_bucket_admin_requester(
+            &req.requester,
+            req.name,
+            req.expected_bucket_owner(),
+        )?;
+        let bucket_pg = self.get_bucket_pg(req.name)?;
+        bucket_pg
+            .delete_bucket_ownership_controls(req.name)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })?;
+        self.storage_node
+            .update_bucket_fast_path_if_present(req.name, |info| info.ownership_controls = None);
+        Ok(())
+    }
+
+    pub fn get_bucket_acl_for_request(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<GetBucketAclResult, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::get_bucket_acl",
+            "bucket={}",
+            req.name
+        );
+        let bucket = self.active_bucket_summary(req.name, req.expected_bucket_owner())?;
+        if !Self::requester_can_read_bucket_acl(&req.requester, &bucket) {
+            return Err(ServerError::AccessDenied);
+        }
+        Ok(GetBucketAclResult {
+            owner_principal: bucket.owner_principal,
+            owner_canonical_id: bucket.owner_canonical_id,
+            acl_grants: bucket.acl_grants,
+        })
+    }
+
+    pub fn put_bucket_acl_for_request(
+        &self,
+        req: &PutBucketAclRequest<'_>,
+    ) -> Result<(), ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::put_bucket_acl",
+            "bucket={} grants={}",
+            req.bucket.name,
+            req.acl_grants.iter().count()
+        );
+        let bucket_info =
+            self.active_bucket_summary(req.bucket.name, req.bucket.expected_bucket_owner())?;
+        if !Self::requester_can_write_bucket_acl(&req.bucket.requester, &bucket_info) {
+            return Err(ServerError::AccessDenied);
+        }
+        if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_deref()) {
+            return Err(ServerError::AccessControlListNotSupported);
+        }
+        Self::ensure_supported_bucket_acl_grants(&req.acl_grants)?;
+        let acl_grants = Self::normalize_bucket_acl_grants(&bucket_info, req.acl_grants.clone());
+        let public_read = Self::acl_grants_public_read(&acl_grants);
+        let public_write = Self::acl_grants_public_write(&acl_grants);
+        if Self::blocks_public_acls(bucket_info.public_access_block.as_deref())
+            && (public_read || public_write)
+        {
+            return Err(ServerError::AccessDenied);
+        }
+        let bucket_pg = self.get_bucket_pg(req.bucket.name)?;
+        bucket_pg
+            .put_bucket_acl(req.bucket.name, &acl_grants, public_read, public_write)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })?;
+        self.storage_node
+            .update_bucket_fast_path_if_present(req.bucket.name, |info| {
+                info.acl_grants = acl_grants.clone();
+                info.public_read = public_read;
+                info.public_write = public_write;
+            });
+        Ok(())
+    }
+
+    pub fn put_bucket_canned_acl_for_request(
+        &self,
+        req: &PutBucketCannedAclRequest<'_>,
+    ) -> Result<(), ServerError> {
+        let bucket =
+            self.active_bucket_summary(req.bucket.name, req.bucket.expected_bucket_owner())?;
+        if !Self::requester_can_write_bucket_acl(&req.bucket.requester, &bucket) {
+            return Err(ServerError::AccessDenied);
+        }
+        Self::ensure_put_bucket_acl_supported(&bucket, req.acl)?;
+        let grants =
+            Self::bucket_acl_grants_from_canned(&Self::bucket_owner_identity(&bucket), req.acl)?;
+        self.put_bucket_acl_for_request(&PutBucketAclRequest {
+            bucket: BucketRequest {
+                name: req.bucket.name,
+                requester: req.bucket.requester.clone(),
+                #[cfg(not(test))]
+                expected_bucket_owner: req.bucket.expected_bucket_owner(),
+            },
+            acl_grants: grants,
+        })
     }
 
     pub fn get_bucket_cors_unchecked(&self, name: &str) -> Result<Option<String>, ServerError> {
@@ -5595,444 +5906,7 @@ impl Coordinator {
         })
     }
 
-    pub fn get_bucket_cors(
-        &self,
-        name: &str,
-        requester: Requester,
-        expected_bucket_owner: Option<&str>,
-    ) -> Result<Option<String>, ServerError> {
-        observability::trace_scope!(
-            TRACE_TARGET,
-            "Coordinator::get_bucket_cors",
-            "bucket={}",
-            name
-        );
-        let _bucket_info =
-            self.authorize_bucket_read_requester(&requester, name, expected_bucket_owner)?;
-        self.get_bucket_cors_unchecked(name)
-    }
-
-    pub fn delete_bucket_cors(
-        &self,
-        name: &str,
-        requester: Requester,
-        expected_bucket_owner: Option<&str>,
-    ) -> Result<(), ServerError> {
-        observability::trace_scope!(
-            TRACE_TARGET,
-            "Coordinator::delete_bucket_cors",
-            "bucket={}",
-            name
-        );
-        let _bucket_info =
-            self.authorize_bucket_admin_requester(&requester, name, expected_bucket_owner)?;
-        let bucket_pg = self.get_bucket_pg(name)?;
-        bucket_pg.delete_bucket_cors(name).map_err(|e| match e {
-            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                name: name.to_string(),
-            },
-            other => ServerError::Metadata(other),
-        })
-    }
-
     // ── Bucket tagging ────────────────────────────────────────────────
-
-    pub fn put_bucket_tags(
-        &self,
-        name: &str,
-        tags: &str,
-        requester: Requester,
-        expected_bucket_owner: Option<&str>,
-    ) -> Result<(), ServerError> {
-        observability::trace_scope!(
-            TRACE_TARGET,
-            "Coordinator::put_bucket_tags",
-            "bucket={} bytes={}",
-            name,
-            tags.len()
-        );
-        let _bucket_info =
-            self.authorize_bucket_admin_requester(&requester, name, expected_bucket_owner)?;
-        let bucket_pg = self.get_bucket_pg(name)?;
-        bucket_pg.put_bucket_tags(name, tags).map_err(|e| match e {
-            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                name: name.to_string(),
-            },
-            other => ServerError::Metadata(other),
-        })
-    }
-
-    pub fn get_bucket_tags(
-        &self,
-        name: &str,
-        requester: Requester,
-        expected_bucket_owner: Option<&str>,
-    ) -> Result<Option<String>, ServerError> {
-        observability::trace_scope!(
-            TRACE_TARGET,
-            "Coordinator::get_bucket_tags",
-            "bucket={}",
-            name
-        );
-        let _bucket_info =
-            self.authorize_bucket_read_requester(&requester, name, expected_bucket_owner)?;
-        let bucket_pg = self.get_bucket_pg(name)?;
-        bucket_pg.get_bucket_tags(name).map_err(|e| match e {
-            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                name: name.to_string(),
-            },
-            other => ServerError::Metadata(other),
-        })
-    }
-
-    pub fn delete_bucket_tags(
-        &self,
-        name: &str,
-        requester: Requester,
-        expected_bucket_owner: Option<&str>,
-    ) -> Result<(), ServerError> {
-        observability::trace_scope!(
-            TRACE_TARGET,
-            "Coordinator::delete_bucket_tags",
-            "bucket={}",
-            name
-        );
-        let _bucket_info =
-            self.authorize_bucket_admin_requester(&requester, name, expected_bucket_owner)?;
-        let bucket_pg = self.get_bucket_pg(name)?;
-        bucket_pg.delete_bucket_tags(name).map_err(|e| match e {
-            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                name: name.to_string(),
-            },
-            other => ServerError::Metadata(other),
-        })
-    }
-
-    pub fn put_bucket_policy(
-        &self,
-        name: &str,
-        policy: &str,
-        requester: Requester,
-        expected_bucket_owner: Option<&str>,
-    ) -> Result<(), ServerError> {
-        observability::trace_scope!(
-            TRACE_TARGET,
-            "Coordinator::put_bucket_policy",
-            "bucket={} bytes={}",
-            name,
-            policy.len()
-        );
-        let bucket_info =
-            self.authorize_bucket_admin_requester(&requester, name, expected_bucket_owner)?;
-        let parsed_policy =
-            auth::parse_bucket_policy(policy).map_err(|e| ServerError::MalformedPolicy {
-                reason: e.reason().to_string(),
-            })?;
-        parsed_policy
-            .validate_evaluable_object_conditions()
-            .map_err(|e| ServerError::MalformedPolicy {
-                reason: e.reason().to_string(),
-            })?;
-        let policy_is_public = parsed_policy.is_public();
-        if Self::blocks_public_policy(bucket_info.public_access_block.as_deref())
-            && policy_is_public
-        {
-            return Err(ServerError::AccessDenied);
-        }
-        let bucket_pg = self.get_bucket_pg(name)?;
-        bucket_pg
-            .put_bucket_policy(name, policy, policy_is_public)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })?;
-        let info = bucket_pg.head_bucket_raw(name).map_err(|e| match e {
-            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                name: name.to_string(),
-            },
-            other => ServerError::Metadata(other),
-        })?;
-        self.storage_node.upsert_bucket_fast_path((&info).into());
-        self.cache_bucket_policy(name, info.bucket_policy_generation, Arc::new(parsed_policy));
-        Ok(())
-    }
-
-    pub fn get_bucket_policy(
-        &self,
-        name: &str,
-        requester: Requester,
-        expected_bucket_owner: Option<&str>,
-    ) -> Result<Option<String>, ServerError> {
-        observability::trace_scope!(
-            TRACE_TARGET,
-            "Coordinator::get_bucket_policy",
-            "bucket={}",
-            name
-        );
-        let _bucket_info =
-            self.authorize_bucket_admin_requester(&requester, name, expected_bucket_owner)?;
-        let bucket_pg = self.get_bucket_pg(name)?;
-        bucket_pg.get_bucket_policy(name).map_err(|e| match e {
-            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                name: name.to_string(),
-            },
-            other => ServerError::Metadata(other),
-        })
-    }
-
-    pub fn delete_bucket_policy(
-        &self,
-        name: &str,
-        requester: Requester,
-        expected_bucket_owner: Option<&str>,
-    ) -> Result<(), ServerError> {
-        observability::trace_scope!(
-            TRACE_TARGET,
-            "Coordinator::delete_bucket_policy",
-            "bucket={}",
-            name
-        );
-        let _bucket_info =
-            self.authorize_bucket_admin_requester(&requester, name, expected_bucket_owner)?;
-        let bucket_pg = self.get_bucket_pg(name)?;
-        bucket_pg.delete_bucket_policy(name).map_err(|e| match e {
-            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                name: name.to_string(),
-            },
-            other => ServerError::Metadata(other),
-        })?;
-        let info = bucket_pg.head_bucket_raw(name).map_err(|e| match e {
-            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                name: name.to_string(),
-            },
-            other => ServerError::Metadata(other),
-        })?;
-        self.storage_node.upsert_bucket_fast_path((&info).into());
-        self.clear_bucket_policy_cache(name);
-        Ok(())
-    }
-
-    pub fn get_bucket_policy_status(
-        &self,
-        name: &str,
-        requester: Requester,
-        expected_bucket_owner: Option<&str>,
-    ) -> Result<bool, ServerError> {
-        observability::trace_scope!(
-            TRACE_TARGET,
-            "Coordinator::get_bucket_policy_status",
-            "bucket={}",
-            name
-        );
-        let bucket_info = self.active_bucket_summary(name, None)?;
-        Self::ensure_expected_bucket_owner(&bucket_info, expected_bucket_owner)?;
-        if !bucket_info.bucket_policy_present {
-            if !Self::requester_can_bucket_admin(&requester, &bucket_info.owner_principal) {
-                return Err(ServerError::AccessDenied);
-            }
-            return Err(ServerError::NoSuchBucketPolicy {
-                bucket: name.to_string(),
-            });
-        }
-        let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
-        if !Self::requester_can_get_bucket_policy_status_with_bucket_policy(
-            &requester,
-            &bucket_info,
-            bucket_policy.as_deref(),
-        ) {
-            return Err(ServerError::AccessDenied);
-        }
-        Ok(bucket_info.bucket_policy_public)
-    }
-
-    // ── Public access block ───────────────────────────────────────────
-
-    pub fn put_bucket_public_access_block(
-        &self,
-        name: &str,
-        config: &str,
-        requester: Requester,
-        expected_bucket_owner: Option<&str>,
-    ) -> Result<(), ServerError> {
-        observability::trace_scope!(
-            TRACE_TARGET,
-            "Coordinator::put_bucket_public_access_block",
-            "bucket={} bytes={}",
-            name,
-            config.len()
-        );
-        let _bucket_info =
-            self.authorize_bucket_admin_requester(&requester, name, expected_bucket_owner)?;
-        let bucket_pg = self.get_bucket_pg(name)?;
-        bucket_pg
-            .put_bucket_public_access_block(name, config)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })?;
-        let config = config.to_string();
-        self.storage_node
-            .update_bucket_fast_path_if_present(name, |info| {
-                info.public_access_block = Some(config);
-            });
-        Ok(())
-    }
-
-    pub fn get_bucket_public_access_block(
-        &self,
-        name: &str,
-        requester: Requester,
-        expected_bucket_owner: Option<&str>,
-    ) -> Result<Option<String>, ServerError> {
-        observability::trace_scope!(
-            TRACE_TARGET,
-            "Coordinator::get_bucket_public_access_block",
-            "bucket={}",
-            name
-        );
-        let bucket_info = self.active_bucket_summary(name, None)?;
-        Self::ensure_expected_bucket_owner(&bucket_info, expected_bucket_owner)?;
-        let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
-        if !Self::requester_can_get_bucket_public_access_block_with_bucket_policy(
-            &requester,
-            &bucket_info,
-            bucket_policy.as_deref(),
-        ) {
-            return Err(ServerError::AccessDenied);
-        }
-        let bucket_pg = self.get_bucket_pg(name)?;
-        bucket_pg
-            .get_bucket_public_access_block(name)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })
-    }
-
-    pub fn delete_bucket_public_access_block(
-        &self,
-        name: &str,
-        requester: Requester,
-        expected_bucket_owner: Option<&str>,
-    ) -> Result<(), ServerError> {
-        observability::trace_scope!(
-            TRACE_TARGET,
-            "Coordinator::delete_bucket_public_access_block",
-            "bucket={}",
-            name
-        );
-        let _bucket_info =
-            self.authorize_bucket_admin_requester(&requester, name, expected_bucket_owner)?;
-        let bucket_pg = self.get_bucket_pg(name)?;
-        bucket_pg
-            .delete_bucket_public_access_block(name)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })?;
-        self.storage_node
-            .update_bucket_fast_path_if_present(name, |info| info.public_access_block = None);
-        Ok(())
-    }
-
-    // ── Bucket ACL ───────────────────────────────────────────────────
-
-    pub fn put_bucket_acl(
-        &self,
-        name: &str,
-        acl_grants: AclGrants,
-        requester: Requester,
-        expected_bucket_owner: Option<&str>,
-    ) -> Result<(), ServerError> {
-        observability::trace_scope!(
-            TRACE_TARGET,
-            "Coordinator::put_bucket_acl",
-            "bucket={} grants={}",
-            name,
-            acl_grants.iter().count()
-        );
-        let bucket_info = self.active_bucket_summary(name, expected_bucket_owner)?;
-        if !Self::requester_can_write_bucket_acl(&requester, &bucket_info) {
-            return Err(ServerError::AccessDenied);
-        }
-        if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_deref()) {
-            return Err(ServerError::AccessControlListNotSupported);
-        }
-        Self::ensure_supported_bucket_acl_grants(&acl_grants)?;
-        let acl_grants = Self::normalize_bucket_acl_grants(&bucket_info, acl_grants);
-        let public_read = Self::acl_grants_public_read(&acl_grants);
-        let public_write = Self::acl_grants_public_write(&acl_grants);
-        if Self::blocks_public_acls(bucket_info.public_access_block.as_deref())
-            && (public_read || public_write)
-        {
-            return Err(ServerError::AccessDenied);
-        }
-        let bucket_pg = self.get_bucket_pg(name)?;
-        bucket_pg
-            .put_bucket_acl(name, &acl_grants, public_read, public_write)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })?;
-        self.storage_node
-            .update_bucket_fast_path_if_present(name, |info| {
-                info.acl_grants = acl_grants.clone();
-                info.public_read = public_read;
-                info.public_write = public_write;
-            });
-        Ok(())
-    }
-
-    pub fn put_bucket_canned_acl(
-        &self,
-        name: &str,
-        acl: BucketAcl,
-        requester: Requester,
-        expected_bucket_owner: Option<&str>,
-    ) -> Result<(), ServerError> {
-        let bucket = self.active_bucket_summary(name, expected_bucket_owner)?;
-        if !Self::requester_can_write_bucket_acl(&requester, &bucket) {
-            return Err(ServerError::AccessDenied);
-        }
-        Self::ensure_put_bucket_acl_supported(&bucket, acl)?;
-        let grants =
-            Self::bucket_acl_grants_from_canned(&Self::bucket_owner_identity(&bucket), acl)?;
-        self.put_bucket_acl(name, grants, requester, expected_bucket_owner)
-    }
-
-    pub fn get_bucket_acl(
-        &self,
-        name: &str,
-        requester: Requester,
-        expected_bucket_owner: Option<&str>,
-    ) -> Result<GetBucketAclResult, ServerError> {
-        observability::trace_scope!(
-            TRACE_TARGET,
-            "Coordinator::get_bucket_acl",
-            "bucket={}",
-            name
-        );
-        let bucket = self.active_bucket_summary(name, expected_bucket_owner)?;
-        if !Self::requester_can_read_bucket_acl(&requester, &bucket) {
-            return Err(ServerError::AccessDenied);
-        }
-        Ok(GetBucketAclResult {
-            owner_principal: bucket.owner_principal,
-            owner_canonical_id: bucket.owner_canonical_id,
-            acl_grants: bucket.acl_grants,
-        })
-    }
-
     fn persist_locked_object_acl(
         bucket: &str,
         key: &str,
@@ -6063,211 +5937,6 @@ impl Coordinator {
                 other => ServerError::Metadata(other),
             })?;
         Ok(live.version_id)
-    }
-
-    pub fn put_object_acl(
-        &self,
-        bucket: &str,
-        key: &str,
-        version_id: Option<VersionId>,
-        acl_grants: AclGrants,
-        requester: Requester,
-        expected_bucket_owner: Option<&str>,
-    ) -> Result<VersionId, ServerError> {
-        observability::trace_scope!(
-            TRACE_TARGET,
-            "Coordinator::put_object_acl",
-            "bucket={} key={} version_id={:?} grants={}",
-            bucket,
-            key,
-            version_id,
-            acl_grants.iter().count()
-        );
-        let (bucket_info, locked) = self.lock_object_for_authorized_acl(
-            &requester,
-            bucket,
-            key,
-            version_id,
-            ObjectAclAuthorization::Write,
-            expected_bucket_owner,
-        )?;
-        if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_deref()) {
-            return Err(ServerError::AccessControlListNotSupported);
-        }
-        let LockedReadObject {
-            record: stored,
-            pgs,
-        } = locked;
-        Self::ensure_supported_object_acl_grants(&acl_grants)?;
-        Self::persist_locked_object_acl(bucket, key, &bucket_info, &stored, pgs.meta(), acl_grants)
-    }
-
-    pub fn put_object_canned_acl(
-        &self,
-        bucket: &str,
-        key: &str,
-        version_id: Option<VersionId>,
-        acl: PutObjectAcl<'_>,
-        requester: Requester,
-        expected_bucket_owner: Option<&str>,
-    ) -> Result<VersionId, ServerError> {
-        let (bucket_info, locked) = self.lock_object_for_authorized_acl(
-            &requester,
-            bucket,
-            key,
-            version_id,
-            ObjectAclAuthorization::Write,
-            expected_bucket_owner,
-        )?;
-        if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_deref()) {
-            return Err(ServerError::AccessControlListNotSupported);
-        }
-        Self::ensure_put_object_acl_supported(&bucket_info, acl)?;
-        let acl_grants = {
-            let live = locked
-                .record
-                .as_live()
-                .ok_or(ServerError::MethodNotAllowed)?;
-            Self::object_acl_grants_for_write(&bucket_info, &live.owner, acl)
-        };
-        Self::persist_locked_object_acl(
-            bucket,
-            key,
-            &bucket_info,
-            &locked.record,
-            locked.pgs.meta(),
-            acl_grants,
-        )
-    }
-
-    pub fn get_object_acl(
-        &self,
-        bucket: &str,
-        key: &str,
-        version_id: Option<VersionId>,
-        requester: Requester,
-        expected_bucket_owner: Option<&str>,
-    ) -> Result<GetObjectAclResult, ServerError> {
-        observability::trace_scope!(
-            TRACE_TARGET,
-            "Coordinator::get_object_acl",
-            "bucket={} key={} version_id={:?}",
-            bucket,
-            key,
-            version_id
-        );
-        let (_bucket_info, locked) = self.lock_object_for_authorized_acl(
-            &requester,
-            bucket,
-            key,
-            version_id,
-            ObjectAclAuthorization::ReadWithPolicy(Self::get_object_acl_policy_action(version_id)),
-            expected_bucket_owner,
-        )?;
-        let LockedReadObject { record: stored, .. } = locked;
-        let live = stored.as_live().ok_or(ServerError::MethodNotAllowed)?;
-        Ok(GetObjectAclResult {
-            owner_principal: live.owner.principal.clone(),
-            owner_canonical_id: live.owner.canonical_id.clone(),
-            acl_grants: live.acl_grants.clone(),
-            version_id: live.version_id,
-        })
-    }
-
-    // ── Ownership controls ────────────────────────────────────────────
-
-    pub fn put_bucket_ownership_controls(
-        &self,
-        name: &str,
-        config: &str,
-        requester: Requester,
-        expected_bucket_owner: Option<&str>,
-    ) -> Result<(), ServerError> {
-        observability::trace_scope!(
-            TRACE_TARGET,
-            "Coordinator::put_bucket_ownership_controls",
-            "bucket={} bytes={}",
-            name,
-            config.len()
-        );
-        let bucket_info =
-            self.authorize_bucket_admin_requester(&requester, name, expected_bucket_owner)?;
-        if Self::is_bucket_owner_enforced(Some(config))
-            && !Self::acl_grants_owner_full_control_only(
-                &bucket_info.owner_canonical_id,
-                &bucket_info.acl_grants,
-            )
-        {
-            return Err(ServerError::InvalidBucketAclWithObjectOwnership);
-        }
-        let bucket_pg = self.get_bucket_pg(name)?;
-        bucket_pg
-            .put_bucket_ownership_controls(name, config)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })?;
-        let config = config.to_string();
-        self.storage_node
-            .update_bucket_fast_path_if_present(name, |info| {
-                info.ownership_controls = Some(config);
-            });
-        Ok(())
-    }
-
-    pub fn get_bucket_ownership_controls(
-        &self,
-        name: &str,
-        requester: Requester,
-        expected_bucket_owner: Option<&str>,
-    ) -> Result<Option<String>, ServerError> {
-        observability::trace_scope!(
-            TRACE_TARGET,
-            "Coordinator::get_bucket_ownership_controls",
-            "bucket={}",
-            name
-        );
-        let _bucket_info =
-            self.authorize_bucket_admin_requester(&requester, name, expected_bucket_owner)?;
-        let bucket_pg = self.get_bucket_pg(name)?;
-        bucket_pg
-            .get_bucket_ownership_controls(name)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })
-    }
-
-    pub fn delete_bucket_ownership_controls(
-        &self,
-        name: &str,
-        requester: Requester,
-        expected_bucket_owner: Option<&str>,
-    ) -> Result<(), ServerError> {
-        observability::trace_scope!(
-            TRACE_TARGET,
-            "Coordinator::delete_bucket_ownership_controls",
-            "bucket={}",
-            name
-        );
-        let _bucket_info =
-            self.authorize_bucket_admin_requester(&requester, name, expected_bucket_owner)?;
-        let bucket_pg = self.get_bucket_pg(name)?;
-        bucket_pg
-            .delete_bucket_ownership_controls(name)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })?;
-        self.storage_node
-            .update_bucket_fast_path_if_present(name, |info| info.ownership_controls = None);
-        Ok(())
     }
 
     // ── Object Lock metadata ───────────────────────────────────────
@@ -6583,14 +6252,36 @@ impl Coordinator {
         &self,
         req: &PutObjectTagsRequest<'_>,
     ) -> Result<(), ServerError> {
-        self.put_object_tags(
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::put_object_tags",
+            "bucket={} key={} bytes={}",
+            req.object.bucket,
+            req.object.key,
+            req.tags.len()
+        );
+        let LockedReadObject {
+            record: stored,
+            pgs,
+        } = self.lock_object_for_authorized_tagging(
+            &req.object.requester,
             req.object.bucket,
             req.object.key,
             req.object.version_id,
-            req.tags,
-            req.object.requester.clone(),
+            Self::put_object_tagging_policy_action(req.object.version_id),
             req.object.expected_bucket_owner(),
-        )
+        )?;
+        if stored.is_delete_marker() {
+            return Err(ServerError::MethodNotAllowed);
+        }
+        pgs.meta()
+            .put_object_tags(
+                req.object.bucket,
+                req.object.key,
+                stored.version_id(),
+                req.tags,
+            )
+            .map_err(ServerError::Metadata)
     }
 
     pub fn put_object_retention_for_request(
@@ -6749,52 +6440,130 @@ impl Coordinator {
         &self,
         req: &ObjectVersionRequest<'_>,
     ) -> Result<Option<String>, ServerError> {
-        self.get_object_tags(
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::get_object_tags",
+            "bucket={} key={}",
+            req.bucket,
+            req.key
+        );
+        let LockedReadObject {
+            record: stored,
+            pgs,
+        } = self.lock_object_for_authorized_tagging(
+            &req.requester,
             req.bucket,
             req.key,
             req.version_id,
-            req.requester.clone(),
+            Self::get_object_tagging_policy_action(req.version_id),
             req.expected_bucket_owner(),
-        )
+        )?;
+        if stored.is_delete_marker() {
+            return Err(ServerError::MethodNotAllowed);
+        }
+        pgs.meta()
+            .get_object_tags(req.bucket, req.key, stored.version_id())
+            .map_err(ServerError::Metadata)
     }
 
     pub fn delete_object_tags_for_request(
         &self,
         req: &ObjectVersionRequest<'_>,
     ) -> Result<(), ServerError> {
-        self.delete_object_tags(
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::delete_object_tags",
+            "bucket={} key={}",
+            req.bucket,
+            req.key
+        );
+        let LockedReadObject {
+            record: stored,
+            pgs,
+        } = self.lock_object_for_authorized_tagging(
+            &req.requester,
             req.bucket,
             req.key,
             req.version_id,
-            req.requester.clone(),
+            Self::delete_object_tagging_policy_action(req.version_id),
             req.expected_bucket_owner(),
-        )
+        )?;
+        if stored.is_delete_marker() {
+            return Err(ServerError::MethodNotAllowed);
+        }
+        pgs.meta()
+            .delete_object_tags(req.bucket, req.key, stored.version_id())
+            .map_err(ServerError::Metadata)
     }
 
     pub fn get_object_acl_for_request(
         &self,
         req: &ObjectVersionRequest<'_>,
     ) -> Result<GetObjectAclResult, ServerError> {
-        self.get_object_acl(
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::get_object_acl",
+            "bucket={} key={} version_id={:?}",
+            req.bucket,
+            req.key,
+            req.version_id
+        );
+        let (_bucket_info, locked) = self.lock_object_for_authorized_acl(
+            &req.requester,
             req.bucket,
             req.key,
             req.version_id,
-            req.requester.clone(),
+            ObjectAclAuthorization::ReadWithPolicy(Self::get_object_acl_policy_action(
+                req.version_id,
+            )),
             req.expected_bucket_owner(),
-        )
+        )?;
+        let LockedReadObject { record: stored, .. } = locked;
+        let live = stored.as_live().ok_or(ServerError::MethodNotAllowed)?;
+        Ok(GetObjectAclResult {
+            owner_principal: live.owner.principal.clone(),
+            owner_canonical_id: live.owner.canonical_id.clone(),
+            acl_grants: live.acl_grants.clone(),
+            version_id: live.version_id,
+        })
     }
 
     pub fn put_object_acl_for_request(
         &self,
         req: &PutObjectAclRequest<'_>,
     ) -> Result<VersionId, ServerError> {
-        self.put_object_acl(
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::put_object_acl",
+            "bucket={} key={} version_id={:?} grants={}",
             req.object.bucket,
             req.object.key,
             req.object.version_id,
-            req.acl_grants.clone(),
-            req.object.requester.clone(),
+            req.acl_grants.iter().count()
+        );
+        let (bucket_info, locked) = self.lock_object_for_authorized_acl(
+            &req.object.requester,
+            req.object.bucket,
+            req.object.key,
+            req.object.version_id,
+            ObjectAclAuthorization::Write,
             req.object.expected_bucket_owner(),
+        )?;
+        if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_deref()) {
+            return Err(ServerError::AccessControlListNotSupported);
+        }
+        let LockedReadObject {
+            record: stored,
+            pgs,
+        } = locked;
+        Self::ensure_supported_object_acl_grants(&req.acl_grants)?;
+        Self::persist_locked_object_acl(
+            req.object.bucket,
+            req.object.key,
+            &bucket_info,
+            &stored,
+            pgs.meta(),
+            req.acl_grants.clone(),
         )
     }
 
@@ -6802,118 +6571,33 @@ impl Coordinator {
         &self,
         req: &PutObjectCannedAclRequest<'_>,
     ) -> Result<VersionId, ServerError> {
-        self.put_object_canned_acl(
+        let (bucket_info, locked) = self.lock_object_for_authorized_acl(
+            &req.object.requester,
             req.object.bucket,
             req.object.key,
             req.object.version_id,
-            req.acl,
-            req.object.requester.clone(),
+            ObjectAclAuthorization::Write,
             req.object.expected_bucket_owner(),
+        )?;
+        if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_deref()) {
+            return Err(ServerError::AccessControlListNotSupported);
+        }
+        Self::ensure_put_object_acl_supported(&bucket_info, req.acl)?;
+        let acl_grants = {
+            let live = locked
+                .record
+                .as_live()
+                .ok_or(ServerError::MethodNotAllowed)?;
+            Self::object_acl_grants_for_write(&bucket_info, &live.owner, req.acl)
+        };
+        Self::persist_locked_object_acl(
+            req.object.bucket,
+            req.object.key,
+            &bucket_info,
+            &locked.record,
+            locked.pgs.meta(),
+            acl_grants,
         )
-    }
-
-    pub fn put_object_tags(
-        &self,
-        bucket: &str,
-        key: &str,
-        version_id: Option<VersionId>,
-        tags: &str,
-        requester: Requester,
-        expected_bucket_owner: Option<&str>,
-    ) -> Result<(), ServerError> {
-        observability::trace_scope!(
-            TRACE_TARGET,
-            "Coordinator::put_object_tags",
-            "bucket={} key={} bytes={}",
-            bucket,
-            key,
-            tags.len()
-        );
-        let LockedReadObject {
-            record: stored,
-            pgs,
-        } = self.lock_object_for_authorized_tagging(
-            &requester,
-            bucket,
-            key,
-            version_id,
-            Self::put_object_tagging_policy_action(version_id),
-            expected_bucket_owner,
-        )?;
-        if stored.is_delete_marker() {
-            return Err(ServerError::MethodNotAllowed);
-        }
-        pgs.meta()
-            .put_object_tags(bucket, key, stored.version_id(), tags)
-            .map_err(ServerError::Metadata)
-    }
-
-    pub fn get_object_tags(
-        &self,
-        bucket: &str,
-        key: &str,
-        version_id: Option<VersionId>,
-        requester: Requester,
-        expected_bucket_owner: Option<&str>,
-    ) -> Result<Option<String>, ServerError> {
-        observability::trace_scope!(
-            TRACE_TARGET,
-            "Coordinator::get_object_tags",
-            "bucket={} key={}",
-            bucket,
-            key
-        );
-        let LockedReadObject {
-            record: stored,
-            pgs,
-        } = self.lock_object_for_authorized_tagging(
-            &requester,
-            bucket,
-            key,
-            version_id,
-            Self::get_object_tagging_policy_action(version_id),
-            expected_bucket_owner,
-        )?;
-        if stored.is_delete_marker() {
-            return Err(ServerError::MethodNotAllowed);
-        }
-        pgs.meta()
-            .get_object_tags(bucket, key, stored.version_id())
-            .map_err(ServerError::Metadata)
-    }
-
-    pub fn delete_object_tags(
-        &self,
-        bucket: &str,
-        key: &str,
-        version_id: Option<VersionId>,
-        requester: Requester,
-        expected_bucket_owner: Option<&str>,
-    ) -> Result<(), ServerError> {
-        observability::trace_scope!(
-            TRACE_TARGET,
-            "Coordinator::delete_object_tags",
-            "bucket={} key={}",
-            bucket,
-            key
-        );
-        let LockedReadObject {
-            record: stored,
-            pgs,
-        } = self.lock_object_for_authorized_tagging(
-            &requester,
-            bucket,
-            key,
-            version_id,
-            Self::delete_object_tagging_policy_action(version_id),
-            expected_bucket_owner,
-        )?;
-        if stored.is_delete_marker() {
-            return Err(ServerError::MethodNotAllowed);
-        }
-        pgs.meta()
-            .delete_object_tags(bucket, key, stored.version_id())
-            .map_err(ServerError::Metadata)
     }
 
     // ── Object operations ─────────────────────────────────────────────
@@ -12028,6 +11712,309 @@ mod tests {
         })
     }
 
+    fn bucket_request<'a>(name: &'a str, requester: Requester) -> BucketRequest<'a> {
+        BucketRequest { name, requester }
+    }
+
+    fn put_bucket_config_request<'a>(
+        name: &'a str,
+        config: &'a str,
+        requester: Requester,
+    ) -> PutBucketConfigRequest<'a> {
+        PutBucketConfigRequest {
+            bucket: bucket_request(name, requester),
+            config,
+        }
+    }
+
+    fn object_version_request<'a>(
+        bucket: &'a str,
+        key: &'a str,
+        version_id: Option<VersionId>,
+        requester: Requester,
+    ) -> ObjectVersionRequest<'a> {
+        ObjectVersionRequest {
+            bucket,
+            key,
+            version_id,
+            requester,
+        }
+    }
+
+    fn put_bucket_versioning_test(
+        coord: &Coordinator,
+        name: &str,
+        state: BucketVersioningState,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<(), ServerError> {
+        assert!(expected_bucket_owner.is_none());
+        coord.put_bucket_versioning_for_request(&PutBucketVersioningRequest {
+            bucket: bucket_request(name, requester),
+            state,
+        })
+    }
+
+    fn get_bucket_versioning_test(
+        coord: &Coordinator,
+        name: &str,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<BucketVersioningState, ServerError> {
+        assert!(expected_bucket_owner.is_none());
+        coord.get_bucket_versioning_for_request(&bucket_request(name, requester))
+    }
+
+    fn put_bucket_object_lock_configuration_test(
+        coord: &Coordinator,
+        name: &str,
+        config: BucketObjectLockConfigurationUpdate,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<(), ServerError> {
+        assert!(expected_bucket_owner.is_none());
+        coord.put_bucket_object_lock_configuration_for_request(
+            &PutBucketObjectLockConfigurationRequest {
+                bucket: bucket_request(name, requester),
+                config,
+            },
+        )
+    }
+
+    fn get_bucket_object_lock_configuration_test(
+        coord: &Coordinator,
+        name: &str,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<BucketObjectLockConfig, ServerError> {
+        assert!(expected_bucket_owner.is_none());
+        coord.get_bucket_object_lock_configuration_for_request(&bucket_request(name, requester))
+    }
+
+    fn put_bucket_encryption_test(
+        coord: &Coordinator,
+        name: &str,
+        config: BucketEncryptionConfig,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<(), ServerError> {
+        assert!(expected_bucket_owner.is_none());
+        coord.put_bucket_encryption_for_request(&PutBucketEncryptionRequest {
+            bucket: bucket_request(name, requester),
+            config,
+        })
+    }
+
+    fn get_bucket_encryption_test(
+        coord: &Coordinator,
+        name: &str,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<BucketEncryptionConfig, ServerError> {
+        assert!(expected_bucket_owner.is_none());
+        coord.get_bucket_encryption_for_request(&bucket_request(name, requester))
+    }
+
+    fn put_bucket_policy_test(
+        coord: &Coordinator,
+        name: &str,
+        policy: &str,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<(), ServerError> {
+        assert!(expected_bucket_owner.is_none());
+        coord.put_bucket_policy_for_request(&put_bucket_config_request(name, policy, requester))
+    }
+
+    fn get_bucket_policy_test(
+        coord: &Coordinator,
+        name: &str,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<Option<String>, ServerError> {
+        assert!(expected_bucket_owner.is_none());
+        coord.get_bucket_policy_for_request(&bucket_request(name, requester))
+    }
+
+    fn delete_bucket_policy_test(
+        coord: &Coordinator,
+        name: &str,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<(), ServerError> {
+        assert!(expected_bucket_owner.is_none());
+        coord.delete_bucket_policy_for_request(&bucket_request(name, requester))
+    }
+
+    fn get_bucket_policy_status_test(
+        coord: &Coordinator,
+        name: &str,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<bool, ServerError> {
+        assert!(expected_bucket_owner.is_none());
+        coord.get_bucket_policy_status_for_request(&bucket_request(name, requester))
+    }
+
+    fn put_bucket_public_access_block_test(
+        coord: &Coordinator,
+        name: &str,
+        config: &str,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<(), ServerError> {
+        assert!(expected_bucket_owner.is_none());
+        coord.put_bucket_public_access_block_for_request(&put_bucket_config_request(
+            name, config, requester,
+        ))
+    }
+
+    fn get_bucket_public_access_block_test(
+        coord: &Coordinator,
+        name: &str,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<Option<String>, ServerError> {
+        assert!(expected_bucket_owner.is_none());
+        coord.get_bucket_public_access_block_for_request(&bucket_request(name, requester))
+    }
+
+    fn put_bucket_ownership_controls_test(
+        coord: &Coordinator,
+        name: &str,
+        config: &str,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<(), ServerError> {
+        assert!(expected_bucket_owner.is_none());
+        coord.put_bucket_ownership_controls_for_request(&put_bucket_config_request(
+            name, config, requester,
+        ))
+    }
+
+    fn get_bucket_ownership_controls_test(
+        coord: &Coordinator,
+        name: &str,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<Option<String>, ServerError> {
+        assert!(expected_bucket_owner.is_none());
+        coord.get_bucket_ownership_controls_for_request(&bucket_request(name, requester))
+    }
+
+    fn put_bucket_acl_test(
+        coord: &Coordinator,
+        name: &str,
+        acl_grants: AclGrants,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<(), ServerError> {
+        assert!(expected_bucket_owner.is_none());
+        coord.put_bucket_acl_for_request(&PutBucketAclRequest {
+            bucket: bucket_request(name, requester),
+            acl_grants,
+        })
+    }
+
+    fn put_bucket_canned_acl_test(
+        coord: &Coordinator,
+        name: &str,
+        acl: BucketAcl,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<(), ServerError> {
+        assert!(expected_bucket_owner.is_none());
+        coord.put_bucket_canned_acl_for_request(&PutBucketCannedAclRequest {
+            bucket: bucket_request(name, requester),
+            acl,
+        })
+    }
+
+    fn get_bucket_acl_test(
+        coord: &Coordinator,
+        name: &str,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<GetBucketAclResult, ServerError> {
+        assert!(expected_bucket_owner.is_none());
+        coord.get_bucket_acl_for_request(&bucket_request(name, requester))
+    }
+
+    fn put_object_tags_test(
+        coord: &Coordinator,
+        bucket: &str,
+        key: &str,
+        version_id: Option<VersionId>,
+        tags: &str,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<(), ServerError> {
+        assert!(expected_bucket_owner.is_none());
+        coord.put_object_tags_for_request(&PutObjectTagsRequest {
+            object: object_version_request(bucket, key, version_id, requester),
+            tags,
+        })
+    }
+
+    fn get_object_tags_test(
+        coord: &Coordinator,
+        bucket: &str,
+        key: &str,
+        version_id: Option<VersionId>,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<Option<String>, ServerError> {
+        assert!(expected_bucket_owner.is_none());
+        coord.get_object_tags_for_request(&object_version_request(
+            bucket, key, version_id, requester,
+        ))
+    }
+
+    fn put_object_acl_test(
+        coord: &Coordinator,
+        bucket: &str,
+        key: &str,
+        version_id: Option<VersionId>,
+        acl_grants: AclGrants,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<VersionId, ServerError> {
+        assert!(expected_bucket_owner.is_none());
+        coord.put_object_acl_for_request(&PutObjectAclRequest {
+            object: object_version_request(bucket, key, version_id, requester),
+            acl_grants,
+        })
+    }
+
+    fn put_object_canned_acl_test(
+        coord: &Coordinator,
+        bucket: &str,
+        key: &str,
+        version_id: Option<VersionId>,
+        acl: PutObjectAcl<'_>,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<VersionId, ServerError> {
+        assert!(expected_bucket_owner.is_none());
+        coord.put_object_canned_acl_for_request(&PutObjectCannedAclRequest {
+            object: object_version_request(bucket, key, version_id, requester),
+            acl,
+        })
+    }
+
+    fn get_object_acl_test(
+        coord: &Coordinator,
+        bucket: &str,
+        key: &str,
+        version_id: Option<VersionId>,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<GetObjectAclResult, ServerError> {
+        assert!(expected_bucket_owner.is_none());
+        coord
+            .get_object_acl_for_request(&object_version_request(bucket, key, version_id, requester))
+    }
+
     fn wait_until_bucket_gone(coord: &Coordinator, name: &str) {
         for _ in 0..200 {
             if matches!(
@@ -12391,10 +12378,14 @@ mod tests {
             })
             .unwrap();
 
-        let controls = coord
-            .get_bucket_ownership_controls("bucket", Requester::principal("owner-a"), None)
-            .unwrap()
-            .unwrap();
+        let controls = get_bucket_ownership_controls_test(
+            &coord,
+            "bucket",
+            Requester::principal("owner-a"),
+            None,
+        )
+        .unwrap()
+        .unwrap();
         assert!(controls.contains("<ObjectOwnership>ObjectWriter</ObjectOwnership>"));
     }
 
@@ -12414,27 +12405,26 @@ mod tests {
             .unwrap();
 
         let policy = "{\"Version\":\"2012-10-17\",\"Statement\":[]}";
-        coord
-            .put_bucket_policy("bucket", policy, Requester::principal("owner-a"), None)
-            .unwrap();
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            policy,
+            Requester::principal("owner-a"),
+            None,
+        )
+        .unwrap();
 
         assert_eq!(
-            coord
-                .get_bucket_policy("bucket", Requester::principal("owner-a"), None)
+            get_bucket_policy_test(&coord, "bucket", Requester::principal("owner-a"), None)
                 .unwrap(),
             Some(policy.to_string())
         );
 
-        coord
-            .delete_bucket_policy("bucket", Requester::principal("owner-a"), None)
-            .unwrap();
-        coord
-            .delete_bucket_policy("bucket", Requester::principal("owner-a"), None)
-            .unwrap();
+        delete_bucket_policy_test(&coord, "bucket", Requester::principal("owner-a"), None).unwrap();
+        delete_bucket_policy_test(&coord, "bucket", Requester::principal("owner-a"), None).unwrap();
 
         assert_eq!(
-            coord
-                .get_bucket_policy("bucket", Requester::principal("owner-a"), None)
+            get_bucket_policy_test(&coord, "bucket", Requester::principal("owner-a"), None)
                 .unwrap(),
             None
         );
@@ -12455,9 +12445,9 @@ mod tests {
             })
             .unwrap();
 
-        let err = coord
-            .put_bucket_policy("bucket", "{", Requester::principal("owner-a"), None)
-            .unwrap_err();
+        let err =
+            put_bucket_policy_test(&coord, "bucket", "{", Requester::principal("owner-a"), None)
+                .unwrap_err();
         assert!(matches!(err, ServerError::MalformedPolicy { .. }));
     }
 
@@ -12475,23 +12465,20 @@ mod tests {
                 object_lock_enabled: false,
             })
             .unwrap();
-        coord
-            .put_bucket_public_access_block(
+        put_bucket_public_access_block_test(&coord,
                 "bucket",
                 "<PublicAccessBlockConfiguration><BlockPublicAcls>false</BlockPublicAcls><IgnorePublicAcls>false</IgnorePublicAcls><BlockPublicPolicy>true</BlockPublicPolicy><RestrictPublicBuckets>false</RestrictPublicBuckets></PublicAccessBlockConfiguration>",
                 Requester::principal("owner-a"), None)
             .unwrap();
 
-        let err = coord
-            .put_bucket_policy(
+        let err = put_bucket_policy_test(&coord,
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"}]}"#,
                 Requester::principal("owner-a"), None)
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
         assert_eq!(
-            coord
-                .get_bucket_policy("bucket", Requester::principal("owner-a"), None)
+            get_bucket_policy_test(&coord, "bucket", Requester::principal("owner-a"), None)
                 .unwrap(),
             None
         );
@@ -12511,23 +12498,20 @@ mod tests {
                 object_lock_enabled: false,
             })
             .unwrap();
-        coord
-            .put_bucket_public_access_block(
+        put_bucket_public_access_block_test(&coord,
                 "bucket",
                 "<PublicAccessBlockConfiguration><BlockPublicAcls>false</BlockPublicAcls><IgnorePublicAcls>false</IgnorePublicAcls><BlockPublicPolicy>true</BlockPublicPolicy><RestrictPublicBuckets>false</RestrictPublicBuckets></PublicAccessBlockConfiguration>",
                 Requester::principal("owner-a"), None)
             .unwrap();
 
-        let err = coord
-            .put_bucket_policy(
+        let err = put_bucket_policy_test(&coord,
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringNotEquals":{"aws:SourceVpc":"vpc-12345678"}}}]}"#,
                 Requester::principal("owner-a"), None)
             .unwrap_err();
         assert!(matches!(err, ServerError::MalformedPolicy { .. }));
         assert_eq!(
-            coord
-                .get_bucket_policy("bucket", Requester::principal("owner-a"), None)
+            get_bucket_policy_test(&coord, "bucket", Requester::principal("owner-a"), None)
                 .unwrap(),
             None
         );
@@ -12548,16 +12532,14 @@ mod tests {
             })
             .unwrap();
 
-        let err = coord
-            .put_bucket_policy(
+        let err = put_bucket_policy_test(&coord,
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringNotEquals":{"aws:PrincipalArn":"arn:aws:iam::444455556666:user/other"}}}]}"#,
                 Requester::principal("owner-a"), None)
             .unwrap_err();
         assert!(matches!(err, ServerError::MalformedPolicy { .. }));
         assert_eq!(
-            coord
-                .get_bucket_policy("bucket", Requester::principal("owner-a"), None)
+            get_bucket_policy_test(&coord, "bucket", Requester::principal("owner-a"), None)
                 .unwrap(),
             None
         );
@@ -12578,16 +12560,14 @@ mod tests {
             })
             .unwrap();
 
-        let err = coord
-            .put_bucket_policy(
+        let err = put_bucket_policy_test(&coord,
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket/*"}]}"#,
                 Requester::principal("owner-a"), None)
             .unwrap_err();
         assert!(matches!(err, ServerError::MalformedPolicy { .. }));
         assert_eq!(
-            coord
-                .get_bucket_policy("bucket", Requester::principal("owner-a"), None)
+            get_bucket_policy_test(&coord, "bucket", Requester::principal("owner-a"), None)
                 .unwrap(),
             None
         );
@@ -12607,21 +12587,24 @@ mod tests {
                 object_lock_enabled: false,
             })
             .unwrap();
-        coord
-            .put_bucket_public_access_block(
+        put_bucket_public_access_block_test(&coord,
                 "bucket",
                 "<PublicAccessBlockConfiguration><BlockPublicAcls>false</BlockPublicAcls><IgnorePublicAcls>false</IgnorePublicAcls><BlockPublicPolicy>true</BlockPublicPolicy><RestrictPublicBuckets>false</RestrictPublicBuckets></PublicAccessBlockConfiguration>",
                 Requester::principal("owner-a"), None)
             .unwrap();
 
         let policy = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::123456789012:root"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"}]}"#;
-        coord
-            .put_bucket_policy("bucket", policy, Requester::principal("owner-a"), None)
-            .unwrap();
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            policy,
+            Requester::principal("owner-a"),
+            None,
+        )
+        .unwrap();
 
         assert_eq!(
-            coord
-                .get_bucket_policy("bucket", Requester::principal("owner-a"), None)
+            get_bucket_policy_test(&coord, "bucket", Requester::principal("owner-a"), None)
                 .unwrap(),
             Some(policy.to_string())
         );
@@ -12652,14 +12635,12 @@ mod tests {
             },
         )
         .unwrap();
-        coord
-            .put_bucket_policy(
+        put_bucket_policy_test(&coord,
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"}]}"#,
                 Requester::principal("111122223333"), None)
             .unwrap();
-        coord
-            .put_bucket_public_access_block(
+        put_bucket_public_access_block_test(&coord,
                 "bucket",
                 "<PublicAccessBlockConfiguration><BlockPublicAcls>false</BlockPublicAcls><IgnorePublicAcls>false</IgnorePublicAcls><BlockPublicPolicy>false</BlockPublicPolicy><RestrictPublicBuckets>true</RestrictPublicBuckets></PublicAccessBlockConfiguration>",
                 Requester::principal("111122223333"), None)
@@ -12715,14 +12696,12 @@ mod tests {
             },
         )
         .unwrap();
-        coord
-            .put_bucket_policy(
+        put_bucket_policy_test(&coord,
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"}]}"#,
                 Requester::principal("111122223333"), None)
             .unwrap();
-        coord
-            .put_bucket_public_access_block(
+        put_bucket_public_access_block_test(&coord,
                 "bucket",
                 "<PublicAccessBlockConfiguration><BlockPublicAcls>false</BlockPublicAcls><IgnorePublicAcls>false</IgnorePublicAcls><BlockPublicPolicy>false</BlockPublicPolicy><RestrictPublicBuckets>true</RestrictPublicBuckets></PublicAccessBlockConfiguration>",
                 Requester::principal("111122223333"), None)
@@ -12766,14 +12745,12 @@ mod tests {
             },
         )
         .unwrap();
-        coord
-            .put_bucket_policy(
+        put_bucket_policy_test(&coord,
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::444455556666:root"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"},{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"}]}"#,
                 Requester::principal("111122223333"), None)
             .unwrap();
-        coord
-            .put_bucket_public_access_block(
+        put_bucket_public_access_block_test(&coord,
                 "bucket",
                 "<PublicAccessBlockConfiguration><BlockPublicAcls>false</BlockPublicAcls><IgnorePublicAcls>false</IgnorePublicAcls><BlockPublicPolicy>false</BlockPublicPolicy><RestrictPublicBuckets>true</RestrictPublicBuckets></PublicAccessBlockConfiguration>",
                 Requester::principal("111122223333"), None)
@@ -12817,14 +12794,12 @@ mod tests {
             },
         )
         .unwrap();
-        coord
-            .put_bucket_policy(
+        put_bucket_policy_test(&coord,
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"}]}"#,
                 Requester::principal("111122223333"), None)
             .unwrap();
-        coord
-            .put_bucket_public_access_block(
+        put_bucket_public_access_block_test(&coord,
                 "bucket",
                 "<PublicAccessBlockConfiguration><BlockPublicAcls>false</BlockPublicAcls><IgnorePublicAcls>false</IgnorePublicAcls><BlockPublicPolicy>false</BlockPublicPolicy><RestrictPublicBuckets>true</RestrictPublicBuckets></PublicAccessBlockConfiguration>",
                 Requester::principal("111122223333"), None)
@@ -12850,22 +12825,24 @@ mod tests {
         coord
             .create_bucket_for_owner("111122223333", "bucket", false)
             .unwrap();
-        coord
-            .put_bucket_public_access_block(
+        put_bucket_public_access_block_test(&coord,
                 "bucket",
                 "<PublicAccessBlockConfiguration><BlockPublicAcls>true</BlockPublicAcls><IgnorePublicAcls>true</IgnorePublicAcls><BlockPublicPolicy>true</BlockPublicPolicy><RestrictPublicBuckets>false</RestrictPublicBuckets></PublicAccessBlockConfiguration>",
                 Requester::principal("111122223333"), None)
             .unwrap();
-        coord
-            .put_bucket_policy(
+        put_bucket_policy_test(&coord,
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetBucketPublicAccessBlock","Resource":"arn:aws:s3:::bucket"}]}"#,
                 Requester::principal("111122223333"), None)
             .unwrap();
 
-        let err = coord
-            .get_bucket_public_access_block("bucket", Requester::principal("111122223333"), None)
-            .unwrap_err();
+        let err = get_bucket_public_access_block_test(
+            &coord,
+            "bucket",
+            Requester::principal("111122223333"),
+            None,
+        )
+        .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
     }
 
@@ -12877,9 +12854,13 @@ mod tests {
             .create_bucket_for_owner("111122223333", "bucket", false)
             .unwrap();
 
-        let err = coord
-            .get_bucket_policy_status("bucket", Requester::principal("111122223333"), None)
-            .unwrap_err();
+        let err = get_bucket_policy_status_test(
+            &coord,
+            "bucket",
+            Requester::principal("111122223333"),
+            None,
+        )
+        .unwrap_err();
         assert!(matches!(err, ServerError::NoSuchBucketPolicy { .. }));
     }
 
@@ -12891,13 +12872,10 @@ mod tests {
         coord
             .create_bucket_for_owner("111122223333", "bucket", false)
             .unwrap();
-        coord
-            .put_bucket_canned_acl("bucket", BucketAcl::PublicRead, owner.clone(), None)
+        put_bucket_canned_acl_test(&coord, "bucket", BucketAcl::PublicRead, owner.clone(), None)
             .unwrap();
 
-        let err = coord
-            .get_bucket_policy_status("bucket", owner, None)
-            .unwrap_err();
+        let err = get_bucket_policy_status_test(&coord, "bucket", owner, None).unwrap_err();
         assert!(matches!(err, ServerError::NoSuchBucketPolicy { .. }));
     }
 
@@ -12908,16 +12886,19 @@ mod tests {
         coord
             .create_bucket_for_owner("111122223333", "bucket", false)
             .unwrap();
-        coord
-            .put_bucket_policy(
+        put_bucket_policy_test(&coord,
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket"}]}"#,
                 Requester::principal("111122223333"), None)
             .unwrap();
 
-        let is_public = coord
-            .get_bucket_policy_status("bucket", Requester::principal("111122223333"), None)
-            .unwrap();
+        let is_public = get_bucket_policy_status_test(
+            &coord,
+            "bucket",
+            Requester::principal("111122223333"),
+            None,
+        )
+        .unwrap();
         assert!(is_public);
     }
 
@@ -12928,16 +12909,19 @@ mod tests {
         coord
             .create_bucket_for_owner("111122223333", "bucket", false)
             .unwrap();
-        coord
-            .put_bucket_policy(
+        put_bucket_policy_test(&coord,
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"444455556666"},"Action":"s3:GetBucketPolicyStatus","Resource":"arn:aws:s3:::bucket"}]}"#,
                 Requester::principal("111122223333"), None)
             .unwrap();
 
-        let is_public = coord
-            .get_bucket_policy_status("bucket", Requester::principal("444455556666"), None)
-            .unwrap();
+        let is_public = get_bucket_policy_status_test(
+            &coord,
+            "bucket",
+            Requester::principal("444455556666"),
+            None,
+        )
+        .unwrap();
         assert!(!is_public);
     }
 
@@ -12948,16 +12932,19 @@ mod tests {
         coord
             .create_bucket_for_owner("111122223333", "bucket", false)
             .unwrap();
-        coord
-            .put_bucket_policy(
+        put_bucket_policy_test(&coord,
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetBucketPolicyStatus","Resource":"arn:aws:s3:::bucket"}]}"#,
                 Requester::principal("111122223333"), None)
             .unwrap();
 
-        let err = coord
-            .get_bucket_policy_status("bucket", Requester::principal("111122223333"), None)
-            .unwrap_err();
+        let err = get_bucket_policy_status_test(
+            &coord,
+            "bucket",
+            Requester::principal("111122223333"),
+            None,
+        )
+        .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
     }
 
@@ -13048,14 +13035,14 @@ mod tests {
                 object_lock_enabled: false,
             })
             .unwrap();
-        coord
-            .put_bucket_versioning(
-                "bucket",
-                BucketVersioningState::Enabled,
-                requester.clone(),
-                None,
-            )
-            .unwrap();
+        put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Enabled,
+            requester.clone(),
+            None,
+        )
+        .unwrap();
         coord
             .put_object(&PutObjectRequest {
                 bucket: "bucket",
@@ -13209,16 +13196,15 @@ mod tests {
                 object_lock_enabled: false,
             })
             .unwrap();
-        coord
-            .put_bucket_canned_acl(
-                "bucket",
-                BucketAcl::PublicReadWrite,
-                Requester::authenticated(bucket_owner.clone()),
-                None,
-            )
-            .unwrap();
-        coord
-            .put_bucket_ownership_controls(
+        put_bucket_canned_acl_test(
+            &coord,
+            "bucket",
+            BucketAcl::PublicReadWrite,
+            Requester::authenticated(bucket_owner.clone()),
+            None,
+        )
+        .unwrap();
+        put_bucket_ownership_controls_test(&coord,
                 "bucket",
                 "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerPreferred</ObjectOwnership></Rule></OwnershipControls>",
                 Requester::authenticated(bucket_owner.clone()), None)
@@ -13285,10 +13271,14 @@ mod tests {
             })
             .unwrap();
 
-        let controls = coord
-            .get_bucket_ownership_controls("bucket", Requester::principal("owner-a"), None)
-            .unwrap()
-            .unwrap();
+        let controls = get_bucket_ownership_controls_test(
+            &coord,
+            "bucket",
+            Requester::principal("owner-a"),
+            None,
+        )
+        .unwrap()
+        .unwrap();
         assert!(controls.contains("<ObjectOwnership>ObjectWriter</ObjectOwnership>"));
         assert!(!controls.contains("<ObjectOwnership>BucketOwnerEnforced</ObjectOwnership>"));
     }
@@ -13328,10 +13318,14 @@ mod tests {
             })
             .unwrap();
 
-        let controls = coord
-            .get_bucket_ownership_controls("bucket", Requester::principal("owner-a"), None)
-            .unwrap()
-            .unwrap();
+        let controls = get_bucket_ownership_controls_test(
+            &coord,
+            "bucket",
+            Requester::principal("owner-a"),
+            None,
+        )
+        .unwrap()
+        .unwrap();
         assert!(controls.contains("<ObjectOwnership>BucketOwnerEnforced</ObjectOwnership>"));
     }
 
@@ -13403,9 +13397,7 @@ mod tests {
             })
             .unwrap();
 
-        let acl = coord
-            .get_bucket_acl("bucket", owner_requester.clone(), None)
-            .unwrap();
+        let acl = get_bucket_acl_test(&coord, "bucket", owner_requester.clone(), None).unwrap();
         assert!(grants_contain(
             &acl.acl_grants,
             &AclGrantee::CanonicalUser(writer.canonical_user_id().clone()),
@@ -16772,8 +16764,7 @@ mod tests {
         coord
             .create_bucket_for_owner("default-owner", "bucket", false)
             .unwrap();
-        coord
-            .put_bucket_ownership_controls(
+        put_bucket_ownership_controls_test(&coord,
                 "bucket",
                 "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
                 TEST_REQUESTER, None)
@@ -16808,8 +16799,7 @@ mod tests {
             .create_bucket_for_owner("owner-a", "bucket", true)
             .unwrap();
 
-        let err = coord
-            .put_bucket_ownership_controls(
+        let err = put_bucket_ownership_controls_test(&coord,
                 "bucket",
                 "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
                 Requester::principal("owner-a"), None)
@@ -16827,31 +16817,30 @@ mod tests {
         coord
             .create_bucket_for_owner("owner-a", "bucket", false)
             .unwrap();
-        coord
-            .put_bucket_public_access_block(
+        put_bucket_public_access_block_test(&coord,
                 "bucket",
                 "<PublicAccessBlockConfiguration><BlockPublicAcls>true</BlockPublicAcls><IgnorePublicAcls>false</IgnorePublicAcls><BlockPublicPolicy>false</BlockPublicPolicy><RestrictPublicBuckets>false</RestrictPublicBuckets></PublicAccessBlockConfiguration>",
                 Requester::principal("owner-a"), None)
             .unwrap();
 
-        let err = coord
-            .put_bucket_canned_acl(
-                "bucket",
-                BucketAcl::PublicRead,
-                Requester::principal("owner-a"),
-                None,
-            )
-            .unwrap_err();
+        let err = put_bucket_canned_acl_test(
+            &coord,
+            "bucket",
+            BucketAcl::PublicRead,
+            Requester::principal("owner-a"),
+            None,
+        )
+        .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
 
-        let err = coord
-            .put_bucket_canned_acl(
-                "bucket",
-                BucketAcl::AuthenticatedRead,
-                Requester::principal("owner-a"),
-                None,
-            )
-            .unwrap_err();
+        let err = put_bucket_canned_acl_test(
+            &coord,
+            "bucket",
+            BucketAcl::AuthenticatedRead,
+            Requester::principal("owner-a"),
+            None,
+        )
+        .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
     }
 
@@ -16862,8 +16851,7 @@ mod tests {
         coord
             .create_bucket_for_owner("owner-a", "bucket", false)
             .unwrap();
-        coord
-            .put_bucket_public_access_block(
+        put_bucket_public_access_block_test(&coord,
                 "bucket",
                 "<PublicAccessBlockConfiguration><BlockPublicAcls>true</BlockPublicAcls><IgnorePublicAcls>false</IgnorePublicAcls><BlockPublicPolicy>false</BlockPublicPolicy><RestrictPublicBuckets>false</RestrictPublicBuckets></PublicAccessBlockConfiguration>",
                 Requester::principal("owner-a"), None)
@@ -17019,9 +17007,8 @@ mod tests {
             .unwrap();
         assert_eq!(object.body.read_all().unwrap(), b"granted-read");
 
-        let acl = coord
-            .get_object_acl("bucket", "key", None, grantee_requester, None)
-            .unwrap();
+        let acl =
+            get_object_acl_test(&coord, "bucket", "key", None, grantee_requester, None).unwrap();
         assert!(grants_contain(
             &acl.acl_grants,
             &AclGrantee::CanonicalUser(grantee.canonical_user_id().clone()),
@@ -17088,26 +17075,23 @@ mod tests {
         )
         .unwrap();
 
-        let err = coord
-            .get_object_acl("bucket", "key", None, owner_requester.clone(), None)
+        let err = get_object_acl_test(&coord, "bucket", "key", None, owner_requester.clone(), None)
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
 
-        let err = coord
-            .put_object_acl(
-                "bucket",
-                "key",
-                None,
-                AclGrants::new(vec![]),
-                owner_requester,
-                None,
-            )
-            .unwrap_err();
+        let err = put_object_acl_test(
+            &coord,
+            "bucket",
+            "key",
+            None,
+            AclGrants::new(vec![]),
+            owner_requester,
+            None,
+        )
+        .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
 
-        coord
-            .get_object_acl("bucket", "key", None, writer_requester, None)
-            .unwrap();
+        get_object_acl_test(&coord, "bucket", "key", None, writer_requester, None).unwrap();
     }
 
     #[test]
@@ -17238,15 +17222,15 @@ mod tests {
         )
         .unwrap();
 
-        let err = coord
-            .get_object_tags(
-                "bucket",
-                "key",
-                None,
-                Requester::principal("other-user"),
-                None,
-            )
-            .unwrap_err();
+        let err = get_object_tags_test(
+            &coord,
+            "bucket",
+            "key",
+            None,
+            Requester::principal("other-user"),
+            None,
+        )
+        .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
     }
 
@@ -17257,8 +17241,7 @@ mod tests {
         coord
             .create_bucket_for_owner("owner-a", "bucket", false)
             .unwrap();
-        coord
-            .put_bucket_policy(
+        put_bucket_policy_test(&coord,
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}}]}"#,
                 Requester::principal("owner-a"), None)
@@ -17329,8 +17312,7 @@ mod tests {
         coord
             .create_bucket_for_owner("owner-a", "bucket", false)
             .unwrap();
-        coord
-            .put_bucket_policy(
+        put_bucket_policy_test(&coord,
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:PutObjectTagging","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}}]}"#,
                 Requester::principal("owner-a"), None)
@@ -17360,33 +17342,39 @@ mod tests {
         )
         .unwrap();
 
-        coord
-            .put_object_tags(
-                "bucket",
-                "key",
-                None,
-                private_tags,
-                Requester::principal("other-user"),
-                None,
-            )
-            .unwrap();
+        put_object_tags_test(
+            &coord,
+            "bucket",
+            "key",
+            None,
+            private_tags,
+            Requester::principal("other-user"),
+            None,
+        )
+        .unwrap();
 
-        let err = coord
-            .put_object_tags(
-                "bucket",
-                "key",
-                None,
-                public_tags,
-                Requester::principal("other-user"),
-                None,
-            )
-            .unwrap_err();
+        let err = put_object_tags_test(
+            &coord,
+            "bucket",
+            "key",
+            None,
+            public_tags,
+            Requester::principal("other-user"),
+            None,
+        )
+        .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
 
-        let tags = coord
-            .get_object_tags("bucket", "key", None, Requester::principal("owner-a"), None)
-            .unwrap()
-            .expect("expected tags after update");
+        let tags = get_object_tags_test(
+            &coord,
+            "bucket",
+            "key",
+            None,
+            Requester::principal("owner-a"),
+            None,
+        )
+        .unwrap()
+        .expect("expected tags after update");
         assert!(tags.contains("<Key>security</Key>"));
         assert!(tags.contains("<Value>private</Value>"));
     }
@@ -17401,14 +17389,12 @@ mod tests {
         coord
             .create_bucket_for_owner("owner-a", "dst", false)
             .unwrap();
-        coord
-            .put_bucket_policy(
+        put_bucket_policy_test(&coord,
                 "src",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::src/*"}]}"#,
                 Requester::principal("owner-a"), None)
             .unwrap();
-        coord
-            .put_bucket_policy(
+        put_bucket_policy_test(&coord,
                 "dst",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::dst/*","Condition":{"StringLike":{"s3:x-amz-copy-source":"src/public/*"}}}]}"#,
                 Requester::principal("owner-a"), None)
@@ -17526,14 +17512,12 @@ mod tests {
         coord
             .create_bucket_for_owner("owner-a", "dst", false)
             .unwrap();
-        coord
-            .put_bucket_policy(
+        put_bucket_policy_test(&coord,
                 "src",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::src/*"}]}"#,
                 Requester::principal("owner-a"), None)
             .unwrap();
-        coord
-            .put_bucket_policy(
+        put_bucket_policy_test(&coord,
                 "dst",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::dst/*","Condition":{"StringEquals":{"s3:x-amz-metadata-directive":"COPY"}}}]}"#,
                 Requester::principal("owner-a"), None)
@@ -17628,8 +17612,7 @@ mod tests {
         coord
             .create_bucket_for_owner("owner-a", "bucket", false)
             .unwrap();
-        coord
-            .put_bucket_policy(
+        put_bucket_policy_test(&coord,
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*"},{"Effect":"Deny","Principal":{"AWS":"other-user"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringLike":{"s3:x-amz-acl":"public*"}}}]}"#,
                 Requester::principal("owner-a"), None)
@@ -17682,8 +17665,7 @@ mod tests {
         coord
             .create_bucket_for_owner("owner-a", "bucket", false)
             .unwrap();
-        coord
-            .put_bucket_policy(
+        put_bucket_policy_test(&coord,
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":["s3:PutObject","s3:PutObjectTagging"],"Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:RequestObjectTag/security":"public"}}}]}"#,
                 Requester::principal("owner-a"), None)
@@ -17738,8 +17720,7 @@ mod tests {
         coord
             .create_bucket_for_owner("owner-a", "bucket", false)
             .unwrap();
-        coord
-            .put_bucket_policy(
+        put_bucket_policy_test(&coord,
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:RequestObjectTag/security":"public"}}}]}"#,
                 Requester::principal("owner-a"), None)
@@ -17769,8 +17750,7 @@ mod tests {
         coord
             .create_bucket_for_owner("owner-a", "bucket", false)
             .unwrap();
-        coord
-            .put_bucket_policy(
+        put_bucket_policy_test(&coord,
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":["s3:PutObject","s3:PutObjectTagging"],"Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:RequestObjectTag/security":"public"}}}]}"#,
                 Requester::principal("owner-a"), None)
@@ -17800,8 +17780,7 @@ mod tests {
         coord
             .create_bucket_for_owner("owner-a", "bucket", false)
             .unwrap();
-        coord
-            .put_bucket_policy(
+        put_bucket_policy_test(&coord,
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:RequestObjectTag/security":"public"}}}]}"#,
                 Requester::principal("owner-a"), None)
@@ -17837,8 +17816,7 @@ mod tests {
         coord
             .create_bucket_for_owner("owner-a", "bucket", false)
             .unwrap();
-        coord
-            .put_bucket_policy(
+        put_bucket_policy_test(&coord,
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":["s3:PutObject","s3:PutObjectTagging"],"Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:RequestObjectTag/security":"public"}}}]}"#,
                 Requester::principal("owner-a"), None)
@@ -17887,8 +17865,7 @@ mod tests {
         coord
             .create_bucket_for_owner("owner-a", "bucket", false)
             .unwrap();
-        coord
-            .put_bucket_policy(
+        put_bucket_policy_test(&coord,
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:RequestObjectTag/security":"public"}}}]}"#,
                 Requester::principal("owner-a"), None)
@@ -17923,8 +17900,7 @@ mod tests {
         coord
             .create_bucket_for_owner("other-user", "dst", false)
             .unwrap();
-        coord
-            .put_bucket_policy(
+        put_bucket_policy_test(&coord,
                 "src",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::src/public/*"}]}"#,
                 Requester::principal("owner-a"), None)
@@ -18017,8 +17993,7 @@ mod tests {
         coord
             .create_bucket_for_owner("owner-a", "bucket", false)
             .unwrap();
-        coord
-            .put_bucket_policy(
+        put_bucket_policy_test(&coord,
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*"},{"Effect":"Deny","Principal":{"AWS":"other-user"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringLike":{"s3:x-amz-acl":"public*"}}}]}"#,
                 Requester::principal("owner-a"), None)
@@ -18060,8 +18035,7 @@ mod tests {
         coord
             .create_bucket_for_owner("owner-a", "bucket", false)
             .unwrap();
-        coord
-            .put_bucket_policy(
+        put_bucket_policy_test(&coord,
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:GetObjectAcl","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}}]}"#,
                 Requester::principal("owner-a"), None)
@@ -18104,15 +18078,15 @@ mod tests {
             .unwrap();
         }
 
-        let acl = coord
-            .get_object_acl(
-                "bucket",
-                "publictag",
-                None,
-                Requester::principal("other-user"),
-                None,
-            )
-            .unwrap();
+        let acl = get_object_acl_test(
+            &coord,
+            "bucket",
+            "publictag",
+            None,
+            Requester::principal("other-user"),
+            None,
+        )
+        .unwrap();
         assert_eq!(acl.version_id, VersionId::Null);
 
         let denied_object = coord
@@ -18128,15 +18102,15 @@ mod tests {
         assert!(matches!(denied_object, ServerError::AccessDenied));
 
         for key in ["privatetag", "invalidtag"] {
-            let err = coord
-                .get_object_acl(
-                    "bucket",
-                    key,
-                    None,
-                    Requester::principal("other-user"),
-                    None,
-                )
-                .unwrap_err();
+            let err = get_object_acl_test(
+                &coord,
+                "bucket",
+                key,
+                None,
+                Requester::principal("other-user"),
+                None,
+            )
+            .unwrap_err();
             assert!(matches!(err, ServerError::AccessDenied));
         }
     }
@@ -18169,8 +18143,7 @@ mod tests {
         )
         .unwrap();
 
-        admin
-            .put_bucket_policy(
+        put_bucket_policy_test(&admin,
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}}]}"#,
                 Requester::principal("owner-a"), None)
@@ -18188,8 +18161,7 @@ mod tests {
             .unwrap();
         assert_eq!(first.body.read_all().unwrap(), b"data");
 
-        admin
-            .put_bucket_policy(
+        put_bucket_policy_test(&admin,
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":{"AWS":"other-user"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}}]}"#,
                 Requester::principal("owner-a"), None)
@@ -18215,8 +18187,7 @@ mod tests {
         admin
             .create_bucket_for_owner("owner-a", "bucket", false)
             .unwrap();
-        admin
-            .put_bucket_policy(
+        put_bucket_policy_test(&admin,
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}}]}"#,
                 Requester::principal("owner-a"), None)
@@ -18271,8 +18242,7 @@ mod tests {
         admin
             .create_bucket_for_owner("owner-a", "bucket", false)
             .unwrap();
-        admin
-            .put_bucket_policy(
+        put_bucket_policy_test(&admin,
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:GetObjectTagging","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}}]}"#,
                 Requester::principal("owner-a"), None)
@@ -18300,7 +18270,8 @@ mod tests {
 
         let (tx, rx) = mpsc::channel();
         let handle = thread::spawn(move || {
-            let res = reader.get_object_tags(
+            let res = get_object_tags_test(
+                &reader,
                 "bucket",
                 "key",
                 None,
@@ -18367,8 +18338,7 @@ mod tests {
                 owner_requester.clone(),
             )
             .unwrap();
-        admin
-            .put_bucket_policy(
+        put_bucket_policy_test(&admin,
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":{"AWS":"owner-a"},"Action":"s3:BypassGovernanceRetention","Resource":"arn:aws:s3:::bucket/*"}]}"#,
                 owner_requester.clone(), None)
@@ -18403,15 +18373,15 @@ mod tests {
             .create_bucket_for_owner("owner-a", "bucket", false)
             .unwrap();
 
-        let err = coord
-            .get_object_acl(
-                "bucket",
-                "missing",
-                None,
-                Requester::principal("other-user"),
-                None,
-            )
-            .unwrap_err();
+        let err = get_object_acl_test(
+            &coord,
+            "bucket",
+            "missing",
+            None,
+            Requester::principal("other-user"),
+            None,
+        )
+        .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
     }
 
@@ -18423,16 +18393,16 @@ mod tests {
             .create_bucket_for_owner("owner-a", "bucket", false)
             .unwrap();
 
-        let err = coord
-            .put_object_acl(
-                "bucket",
-                "missing",
-                None,
-                AclGrants::new(vec![]),
-                Requester::principal("other-user"),
-                None,
-            )
-            .unwrap_err();
+        let err = put_object_acl_test(
+            &coord,
+            "bucket",
+            "missing",
+            None,
+            AclGrants::new(vec![]),
+            Requester::principal("other-user"),
+            None,
+        )
+        .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
     }
 
@@ -18443,14 +18413,14 @@ mod tests {
         coord
             .create_bucket_for_owner("owner-a", "bucket", false)
             .unwrap();
-        coord
-            .put_bucket_versioning(
-                "bucket",
-                BucketVersioningState::Enabled,
-                TEST_REQUESTER,
-                None,
-            )
-            .unwrap();
+        put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Enabled,
+            TEST_REQUESTER,
+            None,
+        )
+        .unwrap();
         let current = test_helpers::put_object(
             &coord,
             &PutObjectRequest {
@@ -18470,15 +18440,15 @@ mod tests {
         )
         .unwrap();
 
-        let err = coord
-            .get_object_acl(
-                "bucket",
-                "key",
-                Some(VersionId::from_u64(current.version_id.to_u64() + 1000)),
-                Requester::principal("other-user"),
-                None,
-            )
-            .unwrap_err();
+        let err = get_object_acl_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(VersionId::from_u64(current.version_id.to_u64() + 1000)),
+            Requester::principal("other-user"),
+            None,
+        )
+        .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
     }
 
@@ -18489,14 +18459,14 @@ mod tests {
         coord
             .create_bucket_for_owner("owner-a", "bucket", false)
             .unwrap();
-        coord
-            .put_bucket_versioning(
-                "bucket",
-                BucketVersioningState::Enabled,
-                TEST_REQUESTER,
-                None,
-            )
-            .unwrap();
+        put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Enabled,
+            TEST_REQUESTER,
+            None,
+        )
+        .unwrap();
         let current = test_helpers::put_object(
             &coord,
             &PutObjectRequest {
@@ -18516,16 +18486,16 @@ mod tests {
         )
         .unwrap();
 
-        let err = coord
-            .put_object_acl(
-                "bucket",
-                "key",
-                Some(VersionId::from_u64(current.version_id.to_u64() + 1000)),
-                AclGrants::new(vec![]),
-                Requester::principal("other-user"),
-                None,
-            )
-            .unwrap_err();
+        let err = put_object_acl_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(VersionId::from_u64(current.version_id.to_u64() + 1000)),
+            AclGrants::new(vec![]),
+            Requester::principal("other-user"),
+            None,
+        )
+        .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
     }
 
@@ -18557,8 +18527,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = coord
-            .get_object_tags("bucket", "key", None, Requester::anonymous(), None)
+        let err = get_object_tags_test(&coord, "bucket", "key", None, Requester::anonymous(), None)
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
     }
@@ -18598,21 +18567,27 @@ mod tests {
             },
         )
         .unwrap();
-        coord
-            .put_object_tags(
-                "bucket",
-                "key",
-                None,
-                tags_xml,
-                Requester::principal("writer-a"),
-                None,
-            )
-            .unwrap();
+        put_object_tags_test(
+            &coord,
+            "bucket",
+            "key",
+            None,
+            tags_xml,
+            Requester::principal("writer-a"),
+            None,
+        )
+        .unwrap();
 
-        let tags = coord
-            .get_object_tags("bucket", "key", None, Requester::principal("owner-a"), None)
-            .unwrap()
-            .expect("expected tag set");
+        let tags = get_object_tags_test(
+            &coord,
+            "bucket",
+            "key",
+            None,
+            Requester::principal("owner-a"),
+            None,
+        )
+        .unwrap()
+        .expect("expected tag set");
         assert!(tags.contains("<Key>env</Key>"));
         assert!(tags.contains("<Value>writer</Value>"));
     }
@@ -18880,8 +18855,7 @@ mod tests {
             },
         )
         .unwrap();
-        coord
-            .put_bucket_public_access_block(
+        put_bucket_public_access_block_test(&coord,
                 "bucket",
                 "<PublicAccessBlockConfiguration><BlockPublicAcls>false</BlockPublicAcls><IgnorePublicAcls>true</IgnorePublicAcls><BlockPublicPolicy>false</BlockPublicPolicy><RestrictPublicBuckets>false</RestrictPublicBuckets></PublicAccessBlockConfiguration>",
                 Requester::principal("owner-a"), None)
@@ -19035,8 +19009,7 @@ mod tests {
             },
         )
         .unwrap();
-        coord
-            .put_bucket_policy(
+        put_bucket_policy_test(&coord,
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket"}]}"#,
                 Requester::principal("owner-a"), None)
@@ -19081,8 +19054,7 @@ mod tests {
             },
         )
         .unwrap();
-        coord
-            .put_bucket_policy(
+        put_bucket_policy_test(&coord,
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket"}]}"#,
                 Requester::principal("owner-a"), None)
@@ -19190,8 +19162,7 @@ mod tests {
         coord
             .create_bucket_for_owner("owner-a", "bucket", false)
             .unwrap();
-        coord
-            .put_bucket_ownership_controls(
+        put_bucket_ownership_controls_test(&coord,
                 "bucket",
                 "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
                 Requester::principal("owner-a"), None)
@@ -19350,8 +19321,7 @@ mod tests {
         coord
             .create_bucket_for_owner("owner-a", "bucket", false)
             .unwrap();
-        coord
-            .put_bucket_ownership_controls(
+        put_bucket_ownership_controls_test(&coord,
                 "bucket",
                 "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
                 Requester::principal("owner-a"), None)
@@ -19664,14 +19634,14 @@ mod tests {
         coord
             .create_bucket_for_owner("default-owner", "bucket", false)
             .unwrap();
-        coord
-            .put_bucket_versioning(
-                "bucket",
-                BucketVersioningState::Enabled,
-                TEST_REQUESTER,
-                None,
-            )
-            .unwrap();
+        put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Enabled,
+            TEST_REQUESTER,
+            None,
+        )
+        .unwrap();
 
         let v1 = test_helpers::put_object(
             &coord,
@@ -20079,30 +20049,30 @@ mod tests {
             },
         )
         .unwrap();
-        coord
-            .put_bucket_acl(
-                "bucket",
-                AclGrants::new(vec![AclGrant::new(
-                    AclGrantee::CanonicalUser(writer.canonical_user_id().clone()),
-                    AclPermission::FullControl,
-                )]),
-                owner_requester.clone(),
-                None,
-            )
-            .unwrap();
-        coord
-            .put_object_acl(
-                "bucket",
-                "src",
-                None,
-                AclGrants::new(vec![AclGrant::new(
-                    AclGrantee::CanonicalUser(writer.canonical_user_id().clone()),
-                    AclPermission::FullControl,
-                )]),
-                owner_requester,
-                None,
-            )
-            .unwrap();
+        put_bucket_acl_test(
+            &coord,
+            "bucket",
+            AclGrants::new(vec![AclGrant::new(
+                AclGrantee::CanonicalUser(writer.canonical_user_id().clone()),
+                AclPermission::FullControl,
+            )]),
+            owner_requester.clone(),
+            None,
+        )
+        .unwrap();
+        put_object_acl_test(
+            &coord,
+            "bucket",
+            "src",
+            None,
+            AclGrants::new(vec![AclGrant::new(
+                AclGrantee::CanonicalUser(writer.canonical_user_id().clone()),
+                AclPermission::FullControl,
+            )]),
+            owner_requester,
+            None,
+        )
+        .unwrap();
 
         coord
             .copy_object(&CopyObjectRequest {
@@ -20137,9 +20107,8 @@ mod tests {
             .unwrap();
         assert_eq!(copied.body.read_all().unwrap(), b"granted-copy");
 
-        let dst_acl = coord
-            .get_object_acl("bucket", "dst", None, writer_requester, None)
-            .unwrap();
+        let dst_acl =
+            get_object_acl_test(&coord, "bucket", "dst", None, writer_requester, None).unwrap();
         assert_eq!(dst_acl.owner_principal, writer.principal());
         assert_eq!(
             dst_acl.owner_canonical_id,
@@ -20159,8 +20128,7 @@ mod tests {
         coord
             .create_bucket_for_owner("default-owner", "bucket", false)
             .unwrap();
-        coord
-            .put_bucket_ownership_controls(
+        put_bucket_ownership_controls_test(&coord,
                 "bucket",
                 "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
                 TEST_REQUESTER, None)
@@ -20232,8 +20200,7 @@ mod tests {
             },
         )
         .unwrap();
-        coord
-            .put_bucket_public_access_block(
+        put_bucket_public_access_block_test(&coord,
                 "bucket",
                 "<PublicAccessBlockConfiguration><BlockPublicAcls>true</BlockPublicAcls><IgnorePublicAcls>false</IgnorePublicAcls><BlockPublicPolicy>false</BlockPublicPolicy><RestrictPublicBuckets>false</RestrictPublicBuckets></PublicAccessBlockConfiguration>",
                 Requester::principal("owner-a"), None)
@@ -21148,9 +21115,7 @@ mod tests {
             .create_bucket_for_owner("default-owner", "bucket", false)
             .unwrap();
 
-        let state = coord
-            .get_bucket_versioning("bucket", TEST_REQUESTER, None)
-            .unwrap();
+        let state = get_bucket_versioning_test(&coord, "bucket", TEST_REQUESTER, None).unwrap();
         assert_eq!(state, BucketVersioningState::Disabled);
     }
 
@@ -21162,18 +21127,16 @@ mod tests {
             .create_bucket_for_owner("default-owner", "bucket", false)
             .unwrap();
 
-        coord
-            .put_bucket_versioning(
-                "bucket",
-                BucketVersioningState::Enabled,
-                TEST_REQUESTER,
-                None,
-            )
-            .unwrap();
+        put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Enabled,
+            TEST_REQUESTER,
+            None,
+        )
+        .unwrap();
         assert_eq!(
-            coord
-                .get_bucket_versioning("bucket", TEST_REQUESTER, None)
-                .unwrap(),
+            get_bucket_versioning_test(&coord, "bucket", TEST_REQUESTER, None).unwrap(),
             BucketVersioningState::Enabled
         );
     }
@@ -21198,14 +21161,14 @@ mod tests {
                 object_lock_enabled: false,
             })
             .unwrap();
-        coord
-            .put_bucket_versioning(
-                "bucket",
-                BucketVersioningState::Enabled,
-                requester.clone(),
-                None,
-            )
-            .unwrap();
+        put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Enabled,
+            requester.clone(),
+            None,
+        )
+        .unwrap();
 
         let v1 = test_helpers::put_object(
             &coord,
@@ -21244,29 +21207,35 @@ mod tests {
         )
         .unwrap();
 
-        coord
-            .put_object_canned_acl(
-                "bucket",
-                "key",
-                Some(v1.version_id),
-                PutObjectAcl::PublicRead,
-                requester.clone(),
-                None,
-            )
-            .unwrap();
+        put_object_canned_acl_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(v1.version_id),
+            PutObjectAcl::PublicRead,
+            requester.clone(),
+            None,
+        )
+        .unwrap();
 
-        let v1_acl = coord
-            .get_object_acl(
-                "bucket",
-                "key",
-                Some(v1.version_id),
-                requester.clone(),
-                None,
-            )
-            .unwrap();
-        let v2_acl = coord
-            .get_object_acl("bucket", "key", Some(v2.version_id), requester, None)
-            .unwrap();
+        let v1_acl = get_object_acl_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(v1.version_id),
+            requester.clone(),
+            None,
+        )
+        .unwrap();
+        let v2_acl = get_object_acl_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(v2.version_id),
+            requester,
+            None,
+        )
+        .unwrap();
         assert!(grants_contain(
             &v1_acl.acl_grants,
             &AclGrantee::AllUsers,
@@ -21299,14 +21268,14 @@ mod tests {
                 object_lock_enabled: false,
             })
             .unwrap();
-        coord
-            .put_bucket_versioning(
-                "bucket",
-                BucketVersioningState::Enabled,
-                requester.clone(),
-                None,
-            )
-            .unwrap();
+        put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Enabled,
+            requester.clone(),
+            None,
+        )
+        .unwrap();
 
         let old = test_helpers::put_object(
             &coord,
@@ -21345,29 +21314,35 @@ mod tests {
         )
         .unwrap();
 
-        coord
-            .put_object_canned_acl(
-                "bucket",
-                "key",
-                None,
-                PutObjectAcl::PublicRead,
-                requester.clone(),
-                None,
-            )
-            .unwrap();
+        put_object_canned_acl_test(
+            &coord,
+            "bucket",
+            "key",
+            None,
+            PutObjectAcl::PublicRead,
+            requester.clone(),
+            None,
+        )
+        .unwrap();
 
-        let current_acl = coord
-            .get_object_acl(
-                "bucket",
-                "key",
-                Some(current.version_id),
-                requester.clone(),
-                None,
-            )
-            .unwrap();
-        let old_acl = coord
-            .get_object_acl("bucket", "key", Some(old.version_id), requester, None)
-            .unwrap();
+        let current_acl = get_object_acl_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(current.version_id),
+            requester.clone(),
+            None,
+        )
+        .unwrap();
+        let old_acl = get_object_acl_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(old.version_id),
+            requester,
+            None,
+        )
+        .unwrap();
         assert!(grants_contain(
             &current_acl.acl_grants,
             &AclGrantee::AllUsers,
@@ -21388,26 +21363,24 @@ mod tests {
             .create_bucket_for_owner("default-owner", "bucket", false)
             .unwrap();
 
-        coord
-            .put_bucket_versioning(
-                "bucket",
-                BucketVersioningState::Enabled,
-                TEST_REQUESTER,
-                None,
-            )
-            .unwrap();
-        coord
-            .put_bucket_versioning(
-                "bucket",
-                BucketVersioningState::Suspended,
-                TEST_REQUESTER,
-                None,
-            )
-            .unwrap();
+        put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Enabled,
+            TEST_REQUESTER,
+            None,
+        )
+        .unwrap();
+        put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Suspended,
+            TEST_REQUESTER,
+            None,
+        )
+        .unwrap();
         assert_eq!(
-            coord
-                .get_bucket_versioning("bucket", TEST_REQUESTER, None)
-                .unwrap(),
+            get_bucket_versioning_test(&coord, "bucket", TEST_REQUESTER, None).unwrap(),
             BucketVersioningState::Suspended
         );
     }
@@ -21429,19 +21402,18 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            coord
-                .get_bucket_versioning("bucket", Requester::principal("owner-a"), None)
+            get_bucket_versioning_test(&coord, "bucket", Requester::principal("owner-a"), None)
                 .unwrap(),
             BucketVersioningState::Enabled
         );
         assert_eq!(
-            coord
-                .get_bucket_object_lock_configuration(
-                    "bucket",
-                    Requester::principal("owner-a"),
-                    None
-                )
-                .unwrap(),
+            get_bucket_object_lock_configuration_test(
+                &coord,
+                "bucket",
+                Requester::principal("owner-a"),
+                None
+            )
+            .unwrap(),
             BucketObjectLockConfig {
                 enabled: true,
                 default_retention: None,
@@ -21457,34 +21429,32 @@ mod tests {
             .create_bucket_for_owner("default-owner", "bucket", false)
             .unwrap();
 
-        coord
-            .put_bucket_versioning(
-                "bucket",
-                BucketVersioningState::Enabled,
-                TEST_REQUESTER,
-                None,
-            )
-            .unwrap();
-        coord
-            .put_bucket_versioning(
-                "bucket",
-                BucketVersioningState::Suspended,
-                TEST_REQUESTER,
-                None,
-            )
-            .unwrap();
-        coord
-            .put_bucket_versioning(
-                "bucket",
-                BucketVersioningState::Enabled,
-                TEST_REQUESTER,
-                None,
-            )
-            .unwrap();
+        put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Enabled,
+            TEST_REQUESTER,
+            None,
+        )
+        .unwrap();
+        put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Suspended,
+            TEST_REQUESTER,
+            None,
+        )
+        .unwrap();
+        put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Enabled,
+            TEST_REQUESTER,
+            None,
+        )
+        .unwrap();
         assert_eq!(
-            coord
-                .get_bucket_versioning("bucket", TEST_REQUESTER, None)
-                .unwrap(),
+            get_bucket_versioning_test(&coord, "bucket", TEST_REQUESTER, None).unwrap(),
             BucketVersioningState::Enabled
         );
     }
@@ -21497,22 +21467,22 @@ mod tests {
             .create_bucket_for_owner("default-owner", "bucket", false)
             .unwrap();
 
-        coord
-            .put_bucket_versioning(
-                "bucket",
-                BucketVersioningState::Enabled,
-                TEST_REQUESTER,
-                None,
-            )
-            .unwrap();
-        let err = coord
-            .put_bucket_versioning(
-                "bucket",
-                BucketVersioningState::Disabled,
-                TEST_REQUESTER,
-                None,
-            )
-            .unwrap_err();
+        put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Enabled,
+            TEST_REQUESTER,
+            None,
+        )
+        .unwrap();
+        let err = put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Disabled,
+            TEST_REQUESTER,
+            None,
+        )
+        .unwrap_err();
         assert!(matches!(err, ServerError::InvalidRequest { .. }));
     }
 
@@ -21532,14 +21502,14 @@ mod tests {
             })
             .unwrap();
 
-        let err = coord
-            .put_bucket_versioning(
-                "bucket",
-                BucketVersioningState::Suspended,
-                Requester::principal("owner-a"),
-                None,
-            )
-            .unwrap_err();
+        let err = put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Suspended,
+            Requester::principal("owner-a"),
+            None,
+        )
+        .unwrap_err();
         assert!(matches!(err, ServerError::InvalidBucketState));
     }
 
@@ -21548,14 +21518,14 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        let err = coord
-            .put_bucket_versioning(
-                "no-bucket",
-                BucketVersioningState::Enabled,
-                TEST_REQUESTER,
-                None,
-            )
-            .unwrap_err();
+        let err = put_bucket_versioning_test(
+            &coord,
+            "no-bucket",
+            BucketVersioningState::Enabled,
+            TEST_REQUESTER,
+            None,
+        )
+        .unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
     }
 
@@ -21567,14 +21537,14 @@ mod tests {
             .create_bucket_for_owner("owner-a", "bucket", false)
             .unwrap();
 
-        let err = coord
-            .put_bucket_versioning(
-                "bucket",
-                BucketVersioningState::Enabled,
-                Requester::principal("other-user"),
-                None,
-            )
-            .unwrap_err();
+        let err = put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Enabled,
+            Requester::principal("other-user"),
+            None,
+        )
+        .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
     }
 
@@ -21593,58 +21563,58 @@ mod tests {
             }),
         };
 
-        let err = coord
-            .put_bucket_object_lock_configuration(
-                "bucket",
-                update,
-                Requester::principal("owner-a"),
-                None,
-            )
-            .unwrap_err();
+        let err = put_bucket_object_lock_configuration_test(
+            &coord,
+            "bucket",
+            update,
+            Requester::principal("owner-a"),
+            None,
+        )
+        .unwrap_err();
         assert!(matches!(err, ServerError::InvalidBucketState));
 
-        coord
-            .put_bucket_versioning(
-                "bucket",
-                BucketVersioningState::Suspended,
-                Requester::principal("owner-a"),
-                None,
-            )
-            .unwrap();
-        let err = coord
-            .put_bucket_object_lock_configuration(
-                "bucket",
-                update,
-                Requester::principal("owner-a"),
-                None,
-            )
-            .unwrap_err();
+        put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Suspended,
+            Requester::principal("owner-a"),
+            None,
+        )
+        .unwrap();
+        let err = put_bucket_object_lock_configuration_test(
+            &coord,
+            "bucket",
+            update,
+            Requester::principal("owner-a"),
+            None,
+        )
+        .unwrap_err();
         assert!(matches!(err, ServerError::InvalidBucketState));
 
-        coord
-            .put_bucket_versioning(
-                "bucket",
-                BucketVersioningState::Enabled,
-                Requester::principal("owner-a"),
-                None,
-            )
-            .unwrap();
-        coord
-            .put_bucket_object_lock_configuration(
-                "bucket",
-                update,
-                Requester::principal("owner-a"),
-                None,
-            )
-            .unwrap();
+        put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Enabled,
+            Requester::principal("owner-a"),
+            None,
+        )
+        .unwrap();
+        put_bucket_object_lock_configuration_test(
+            &coord,
+            "bucket",
+            update,
+            Requester::principal("owner-a"),
+            None,
+        )
+        .unwrap();
         assert_eq!(
-            coord
-                .get_bucket_object_lock_configuration(
-                    "bucket",
-                    Requester::principal("owner-a"),
-                    None
-                )
-                .unwrap(),
+            get_bucket_object_lock_configuration_test(
+                &coord,
+                "bucket",
+                Requester::principal("owner-a"),
+                None
+            )
+            .unwrap(),
             BucketObjectLockConfig {
                 enabled: true,
                 default_retention: update.default_retention,
@@ -21660,9 +21630,13 @@ mod tests {
             .create_bucket_for_owner("owner-a", "bucket", false)
             .unwrap();
 
-        let err = coord
-            .get_bucket_object_lock_configuration("bucket", Requester::principal("owner-a"), None)
-            .unwrap_err();
+        let err = get_bucket_object_lock_configuration_test(
+            &coord,
+            "bucket",
+            Requester::principal("owner-a"),
+            None,
+        )
+        .unwrap_err();
         assert!(matches!(
             err,
             ServerError::ObjectLockConfigurationNotFound { .. }
@@ -21684,20 +21658,19 @@ mod tests {
                 object_lock_enabled: true,
             })
             .unwrap();
-        coord
-            .put_bucket_policy(
+        put_bucket_policy_test(&coord,
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:GetBucketObjectLockConfiguration","Resource":"arn:aws:s3:::bucket"}]}"#,
                 Requester::principal("owner-a"), None)
             .unwrap();
 
-        let config = coord
-            .get_bucket_object_lock_configuration(
-                "bucket",
-                Requester::principal("other-user"),
-                None,
-            )
-            .unwrap();
+        let config = get_bucket_object_lock_configuration_test(
+            &coord,
+            "bucket",
+            Requester::principal("other-user"),
+            None,
+        )
+        .unwrap();
         assert!(config.enabled);
     }
 
@@ -21749,8 +21722,7 @@ mod tests {
                 owner_requester.clone(),
             )
             .unwrap();
-        coord
-            .put_bucket_policy(
+        put_bucket_policy_test(&coord,
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:GetObjectRetention","Resource":"arn:aws:s3:::bucket/*"}]}"#,
                 owner_requester, None)
@@ -21816,8 +21788,7 @@ mod tests {
                 owner_requester.clone(),
             )
             .unwrap();
-        coord
-            .put_bucket_policy(
+        put_bucket_policy_test(&coord,
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:PutObjectRetention","Resource":"arn:aws:s3:::bucket/*"}]}"#,
                 owner_requester.clone(), None)
@@ -21838,8 +21809,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
 
-        coord
-            .put_bucket_policy(
+        put_bucket_policy_test(&coord,
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":["s3:PutObjectRetention","s3:BypassGovernanceRetention"],"Resource":"arn:aws:s3:::bucket/*"}]}"#,
                 owner_requester, None)
@@ -21908,8 +21878,7 @@ mod tests {
                 owner_requester.clone(),
             )
             .unwrap();
-        coord
-            .put_bucket_policy(
+        put_bucket_policy_test(&coord,
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":{"AWS":"owner-a"},"Action":"s3:BypassGovernanceRetention","Resource":"arn:aws:s3:::bucket/*"}]}"#,
                 owner_requester.clone(), None)
@@ -21965,8 +21934,7 @@ mod tests {
             },
         )
         .unwrap();
-        coord
-            .put_bucket_policy(
+        put_bucket_policy_test(&coord,
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":["s3:PutObjectLegalHold","s3:GetObjectLegalHold"],"Resource":"arn:aws:s3:::bucket/*"}]}"#,
                 owner_requester, None)
@@ -21999,28 +21967,28 @@ mod tests {
         coord
             .create_bucket_for_owner("owner-a", "bucket", false)
             .unwrap();
-        coord
-            .put_bucket_versioning(
-                "bucket",
-                BucketVersioningState::Enabled,
-                Requester::principal("owner-a"),
-                None,
-            )
-            .unwrap();
-        coord
-            .put_bucket_object_lock_configuration(
-                "bucket",
-                BucketObjectLockConfigurationUpdate {
-                    object_lock_enabled: Some(true),
-                    default_retention: Some(ObjectLockDefaultRetention {
-                        mode: ObjectLockMode::Governance,
-                        period: RetentionPeriod::days(1).unwrap(),
-                    }),
-                },
-                Requester::principal("owner-a"),
-                None,
-            )
-            .unwrap();
+        put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Enabled,
+            Requester::principal("owner-a"),
+            None,
+        )
+        .unwrap();
+        put_bucket_object_lock_configuration_test(
+            &coord,
+            "bucket",
+            BucketObjectLockConfigurationUpdate {
+                object_lock_enabled: Some(true),
+                default_retention: Some(ObjectLockDefaultRetention {
+                    mode: ObjectLockMode::Governance,
+                    period: RetentionPeriod::days(1).unwrap(),
+                }),
+            },
+            Requester::principal("owner-a"),
+            None,
+        )
+        .unwrap();
         let bucket = coord.active_bucket_summary("bucket", None).unwrap();
         let before = Coordinator::current_unix_seconds().unwrap();
         let resolved = Coordinator::resolve_new_object_lock_state(
@@ -22047,28 +22015,28 @@ mod tests {
         coord
             .create_bucket_for_owner("owner-a", "bucket", false)
             .unwrap();
-        coord
-            .put_bucket_versioning(
-                "bucket",
-                BucketVersioningState::Enabled,
-                Requester::principal("owner-a"),
-                None,
-            )
-            .unwrap();
-        coord
-            .put_bucket_object_lock_configuration(
-                "bucket",
-                BucketObjectLockConfigurationUpdate {
-                    object_lock_enabled: Some(true),
-                    default_retention: Some(ObjectLockDefaultRetention {
-                        mode: ObjectLockMode::Governance,
-                        period: RetentionPeriod::days(1).unwrap(),
-                    }),
-                },
-                Requester::principal("owner-a"),
-                None,
-            )
-            .unwrap();
+        put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Enabled,
+            Requester::principal("owner-a"),
+            None,
+        )
+        .unwrap();
+        put_bucket_object_lock_configuration_test(
+            &coord,
+            "bucket",
+            BucketObjectLockConfigurationUpdate {
+                object_lock_enabled: Some(true),
+                default_retention: Some(ObjectLockDefaultRetention {
+                    mode: ObjectLockMode::Governance,
+                    period: RetentionPeriod::days(1).unwrap(),
+                }),
+            },
+            Requester::principal("owner-a"),
+            None,
+        )
+        .unwrap();
         let bucket = coord.active_bucket_summary("bucket", None).unwrap();
         let explicit = ObjectLockState {
             retention: Some(ObjectRetention {
@@ -22305,8 +22273,7 @@ mod tests {
                 owner_requester.clone(),
             )
             .unwrap();
-        coord
-            .put_bucket_policy(
+        put_bucket_policy_test(&coord,
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":{"AWS":"owner-a"},"Action":"s3:BypassGovernanceRetention","Resource":"arn:aws:s3:::bucket/*"}]}"#,
                 owner_requester.clone(), None)
@@ -22373,8 +22340,7 @@ mod tests {
                 owner_requester.clone(),
             )
             .unwrap();
-        coord
-            .put_bucket_policy(
+        put_bucket_policy_test(&coord,
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":["s3:DeleteObjectVersion","s3:BypassGovernanceRetention"],"Resource":"arn:aws:s3:::bucket/*"}]}"#,
                 owner_requester, None)
@@ -22697,9 +22663,7 @@ mod tests {
             .create_bucket_for_owner("default-owner", "bucket", false)
             .unwrap();
 
-        let config = coord
-            .get_bucket_encryption("bucket", TEST_REQUESTER, None)
-            .unwrap();
+        let config = get_bucket_encryption_test(&coord, "bucket", TEST_REQUESTER, None).unwrap();
         assert!(!config.sse_c_blocked);
     }
 
@@ -22711,36 +22675,34 @@ mod tests {
             .create_bucket_for_owner("default-owner", "bucket", false)
             .unwrap();
 
-        coord
-            .put_bucket_encryption(
-                "bucket",
-                BucketEncryptionConfig {
-                    sse_c_blocked: true,
-                },
-                TEST_REQUESTER,
-                None,
-            )
-            .unwrap();
+        put_bucket_encryption_test(
+            &coord,
+            "bucket",
+            BucketEncryptionConfig {
+                sse_c_blocked: true,
+            },
+            TEST_REQUESTER,
+            None,
+        )
+        .unwrap();
         assert!(
-            coord
-                .get_bucket_encryption("bucket", TEST_REQUESTER, None)
+            get_bucket_encryption_test(&coord, "bucket", TEST_REQUESTER, None)
                 .unwrap()
                 .sse_c_blocked
         );
 
-        coord
-            .put_bucket_encryption(
-                "bucket",
-                BucketEncryptionConfig {
-                    sse_c_blocked: false,
-                },
-                TEST_REQUESTER,
-                None,
-            )
-            .unwrap();
+        put_bucket_encryption_test(
+            &coord,
+            "bucket",
+            BucketEncryptionConfig {
+                sse_c_blocked: false,
+            },
+            TEST_REQUESTER,
+            None,
+        )
+        .unwrap();
         assert!(
-            !coord
-                .get_bucket_encryption("bucket", TEST_REQUESTER, None)
+            !get_bucket_encryption_test(&coord, "bucket", TEST_REQUESTER, None)
                 .unwrap()
                 .sse_c_blocked
         );
@@ -22754,16 +22716,16 @@ mod tests {
             .create_bucket_for_owner("owner-a", "bucket", false)
             .unwrap();
 
-        let err = coord
-            .put_bucket_encryption(
-                "bucket",
-                BucketEncryptionConfig {
-                    sse_c_blocked: true,
-                },
-                Requester::principal("other-user"),
-                None,
-            )
-            .unwrap_err();
+        let err = put_bucket_encryption_test(
+            &coord,
+            "bucket",
+            BucketEncryptionConfig {
+                sse_c_blocked: true,
+            },
+            Requester::principal("other-user"),
+            None,
+        )
+        .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
     }
 
@@ -22774,16 +22736,16 @@ mod tests {
         coord
             .create_bucket_for_owner("default-owner", "bucket", false)
             .unwrap();
-        coord
-            .put_bucket_encryption(
-                "bucket",
-                BucketEncryptionConfig {
-                    sse_c_blocked: true,
-                },
-                TEST_REQUESTER,
-                None,
-            )
-            .unwrap();
+        put_bucket_encryption_test(
+            &coord,
+            "bucket",
+            BucketEncryptionConfig {
+                sse_c_blocked: true,
+            },
+            TEST_REQUESTER,
+            None,
+        )
+        .unwrap();
 
         let sse_customer = test_sse_customer_request();
         let err = test_helpers::put_object(
@@ -22814,16 +22776,16 @@ mod tests {
         coord
             .create_bucket_for_owner("default-owner", "bucket", false)
             .unwrap();
-        coord
-            .put_bucket_encryption(
-                "bucket",
-                BucketEncryptionConfig {
-                    sse_c_blocked: true,
-                },
-                TEST_REQUESTER,
-                None,
-            )
-            .unwrap();
+        put_bucket_encryption_test(
+            &coord,
+            "bucket",
+            BucketEncryptionConfig {
+                sse_c_blocked: true,
+            },
+            TEST_REQUESTER,
+            None,
+        )
+        .unwrap();
 
         test_helpers::put_object(
             &coord,
@@ -22852,16 +22814,16 @@ mod tests {
         coord
             .create_bucket_for_owner("default-owner", "bucket", false)
             .unwrap();
-        coord
-            .put_bucket_encryption(
-                "bucket",
-                BucketEncryptionConfig {
-                    sse_c_blocked: true,
-                },
-                TEST_REQUESTER,
-                None,
-            )
-            .unwrap();
+        put_bucket_encryption_test(
+            &coord,
+            "bucket",
+            BucketEncryptionConfig {
+                sse_c_blocked: true,
+            },
+            TEST_REQUESTER,
+            None,
+        )
+        .unwrap();
 
         let sse_customer = test_sse_customer_request();
         let encryption = coord
@@ -22909,16 +22871,16 @@ mod tests {
             })
             .unwrap();
 
-        coord
-            .put_bucket_encryption(
-                "bucket",
-                BucketEncryptionConfig {
-                    sse_c_blocked: true,
-                },
-                TEST_REQUESTER,
-                None,
-            )
-            .unwrap();
+        put_bucket_encryption_test(
+            &coord,
+            "bucket",
+            BucketEncryptionConfig {
+                sse_c_blocked: true,
+            },
+            TEST_REQUESTER,
+            None,
+        )
+        .unwrap();
 
         let err = coord
             .begin_stream_part(&BeginStreamPartRequest {
@@ -23061,14 +23023,14 @@ mod tests {
         admin
             .create_bucket_for_owner("default-owner", "bucket", false)
             .unwrap();
-        admin
-            .put_bucket_versioning(
-                "bucket",
-                BucketVersioningState::Enabled,
-                TEST_REQUESTER,
-                None,
-            )
-            .unwrap();
+        put_bucket_versioning_test(
+            &admin,
+            "bucket",
+            BucketVersioningState::Enabled,
+            TEST_REQUESTER,
+            None,
+        )
+        .unwrap();
 
         // Repeat to increase the chance of exposing races.
         for i in 0..20 {
@@ -24322,16 +24284,15 @@ mod tests {
                 object_lock_enabled: false,
             })
             .unwrap();
-        coord
-            .put_bucket_canned_acl(
-                "bucket",
-                BucketAcl::PublicReadWrite,
-                Requester::authenticated(bucket_owner.clone()),
-                None,
-            )
-            .unwrap();
-        coord
-            .put_bucket_ownership_controls(
+        put_bucket_canned_acl_test(
+            &coord,
+            "bucket",
+            BucketAcl::PublicReadWrite,
+            Requester::authenticated(bucket_owner.clone()),
+            None,
+        )
+        .unwrap();
+        put_bucket_ownership_controls_test(&coord,
                 "bucket",
                 "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerPreferred</ObjectOwnership></Rule></OwnershipControls>",
                 Requester::authenticated(bucket_owner.clone()), None)
@@ -24412,9 +24373,14 @@ mod tests {
                 object_lock_enabled: false,
             })
             .unwrap();
-        coord
-            .put_bucket_canned_acl("bucket", BucketAcl::PublicReadWrite, owner_requester, None)
-            .unwrap();
+        put_bucket_canned_acl_test(
+            &coord,
+            "bucket",
+            BucketAcl::PublicReadWrite,
+            owner_requester,
+            None,
+        )
+        .unwrap();
 
         let upload = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
@@ -24557,16 +24523,15 @@ mod tests {
                 object_lock_enabled: false,
             })
             .unwrap();
-        coord
-            .put_bucket_canned_acl(
-                "bucket",
-                BucketAcl::PublicReadWrite,
-                owner_requester.clone(),
-                None,
-            )
-            .unwrap();
-        coord
-            .put_bucket_ownership_controls(
+        put_bucket_canned_acl_test(
+            &coord,
+            "bucket",
+            BucketAcl::PublicReadWrite,
+            owner_requester.clone(),
+            None,
+        )
+        .unwrap();
+        put_bucket_ownership_controls_test(&coord,
                 "bucket",
                 "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerPreferred</ObjectOwnership></Rule></OwnershipControls>",
                 owner_requester.clone(), None)
@@ -24587,9 +24552,14 @@ mod tests {
             })
             .unwrap();
 
-        coord
-            .put_bucket_canned_acl("bucket", BucketAcl::Private, owner_requester.clone(), None)
-            .unwrap();
+        put_bucket_canned_acl_test(
+            &coord,
+            "bucket",
+            BucketAcl::Private,
+            owner_requester.clone(),
+            None,
+        )
+        .unwrap();
 
         let completed = coord
             .complete_multipart_upload(&CompleteMultipartUploadRequest {
@@ -26411,14 +26381,14 @@ mod tests {
         coord
             .create_bucket_for_owner("default-owner", "bucket", false)
             .unwrap();
-        coord
-            .put_bucket_versioning(
-                "bucket",
-                BucketVersioningState::Enabled,
-                TEST_REQUESTER,
-                None,
-            )
-            .unwrap();
+        put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Enabled,
+            TEST_REQUESTER,
+            None,
+        )
+        .unwrap();
 
         let (upload_id, parts) =
             create_upload_with_parts(&coord, "bucket", "key", &[(1, b"data1")]);

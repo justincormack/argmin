@@ -4613,6 +4613,14 @@ mod tests {
             .unwrap();
     }
 
+    fn test_bucket_request(name: &str) -> crate::coordinator::BucketRequest<'_> {
+        crate::coordinator::BucketRequest {
+            name,
+            requester: crate::coordinator::Requester::principal("testuser"),
+            expected_bucket_owner: None,
+        }
+    }
+
     #[test]
     fn list_buckets_uses_account_display_name_and_explicit_canonical_id() {
         let tmp = test_util::tempdir();
@@ -5014,12 +5022,10 @@ mod tests {
         let fe = setup_frontend(tmp.path());
         create_test_bucket(&fe.coordinator, "mybucket");
         fe.coordinator
-            .put_bucket_policy(
-                "mybucket",
-                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::mybucket"}]}"#,
-                crate::coordinator::Requester::principal("testuser"),
-                None,
-            )
+            .put_bucket_policy_for_request(&crate::coordinator::PutBucketConfigRequest {
+                bucket: test_bucket_request("mybucket"),
+                config: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::mybucket"}]}"#,
+            })
             .unwrap();
 
         let get_req = new_req(http::Method::GET, "/", "policyStatus", vec![], vec![]);
@@ -5149,21 +5155,13 @@ mod tests {
         assert_eq!(resp.status_code, 200);
         assert_eq!(
             fe.coordinator
-                .get_bucket_versioning(
-                    "mybucket",
-                    crate::coordinator::Requester::principal("testuser"),
-                    None,
-                )
+                .get_bucket_versioning_for_request(&test_bucket_request("mybucket"))
                 .unwrap(),
             s3_types::BucketVersioningState::Enabled
         );
         assert_eq!(
             fe.coordinator
-                .get_bucket_object_lock_configuration(
-                    "mybucket",
-                    crate::coordinator::Requester::principal("testuser"),
-                    None,
-                )
+                .get_bucket_object_lock_configuration_for_request(&test_bucket_request("mybucket",))
                 .unwrap(),
             s3_types::BucketObjectLockConfig {
                 enabled: true,
@@ -5187,12 +5185,10 @@ mod tests {
         )
         .unwrap();
         fe.coordinator
-            .put_bucket_versioning(
-                "mybucket",
-                s3_types::BucketVersioningState::Enabled,
-                crate::coordinator::Requester::principal("testuser"),
-                None,
-            )
+            .put_bucket_versioning_for_request(&crate::coordinator::PutBucketVersioningRequest {
+                bucket: test_bucket_request("mybucket"),
+                state: s3_types::BucketVersioningState::Enabled,
+            })
             .unwrap();
 
         let put_req = new_req(
@@ -5922,11 +5918,11 @@ mod tests {
         let fe = setup_frontend(tmp.path());
         create_test_bucket(&fe.coordinator, "mybucket");
         fe.coordinator
-            .put_bucket_ownership_controls(
-                "mybucket",
-                "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
-                crate::coordinator::Requester::principal("testuser"),
-                None,
+            .put_bucket_ownership_controls_for_request(
+                &crate::coordinator::PutBucketConfigRequest {
+                    bucket: test_bucket_request("mybucket"),
+                    config: "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
+                },
             )
             .unwrap();
 
