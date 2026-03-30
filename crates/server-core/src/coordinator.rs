@@ -5113,22 +5113,12 @@ impl Coordinator {
         )
     }
 
-    pub fn list_buckets(&self) -> Result<Vec<BucketSummary>, ServerError> {
-        self.list_buckets_for_owner("default-owner")
-    }
-
     pub fn list_buckets_for_requester(
         &self,
         req: &ListBucketsRequest,
     ) -> Result<Vec<BucketSummary>, ServerError> {
         observability::trace_scope!(TRACE_TARGET, "Coordinator::list_buckets_for_requester");
-        self.list_buckets_for_owner(Self::requester_principal_required(&req.requester)?)
-    }
-
-    pub fn list_buckets_for_owner(
-        &self,
-        owner_principal: &str,
-    ) -> Result<Vec<BucketSummary>, ServerError> {
+        let owner_principal = Self::requester_principal_required(&req.requester)?;
         let mut out = Vec::new();
         self.pg_topology.for_each_pg(|pg_id| {
             let pg = self.storage_node.get_pg(pg_id)?;
@@ -12266,7 +12256,11 @@ mod tests {
         assert_eq!(info.name, "test-bucket");
 
         // List
-        let buckets = coord.list_buckets().unwrap();
+        let buckets = coord
+            .list_buckets_for_requester(&ListBucketsRequest {
+                requester: Requester::principal("default-owner"),
+            })
+            .unwrap();
         assert_eq!(buckets.len(), 1);
 
         // Delete
@@ -12288,7 +12282,11 @@ mod tests {
             .unwrap();
 
         // Only one bucket should exist
-        let buckets = coord.list_buckets().unwrap();
+        let buckets = coord
+            .list_buckets_for_requester(&ListBucketsRequest {
+                requester: Requester::principal("default-owner"),
+            })
+            .unwrap();
         assert_eq!(buckets.len(), 1);
     }
 
@@ -12318,12 +12316,20 @@ mod tests {
             .create_bucket_for_owner("owner-b", "bucket-b", false)
             .unwrap();
 
-        let a = coord.list_buckets_for_owner("owner-a").unwrap();
+        let a = coord
+            .list_buckets_for_requester(&ListBucketsRequest {
+                requester: Requester::principal("owner-a"),
+            })
+            .unwrap();
         assert_eq!(a.len(), 1);
         assert_eq!(a[0].name, "bucket-a");
         assert_eq!(a[0].owner_principal, "owner-a");
 
-        let b = coord.list_buckets_for_owner("owner-b").unwrap();
+        let b = coord
+            .list_buckets_for_requester(&ListBucketsRequest {
+                requester: Requester::principal("owner-b"),
+            })
+            .unwrap();
         assert_eq!(b.len(), 1);
         assert_eq!(b[0].name, "bucket-b");
         assert_eq!(b[0].owner_principal, "owner-b");
@@ -12347,7 +12353,9 @@ mod tests {
             .unwrap();
 
         let names: Vec<String> = coord
-            .list_buckets()
+            .list_buckets_for_requester(&ListBucketsRequest {
+                requester: Requester::principal("default-owner"),
+            })
             .unwrap()
             .into_iter()
             .map(|b| b.name.clone())
@@ -13462,7 +13470,9 @@ mod tests {
             .unwrap();
 
         let names: Vec<String> = coord
-            .list_buckets()
+            .list_buckets_for_requester(&ListBucketsRequest {
+                requester: Requester::principal("default-owner"),
+            })
             .unwrap()
             .into_iter()
             .map(|b| b.name.clone())
