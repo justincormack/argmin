@@ -1522,17 +1522,17 @@ pub struct PutBucketEncryptionRequest<'a> {
 }
 
 /// Request for a PutBucketAcl operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PutBucketAclInput {
+    Canned(BucketAcl),
+    Grants(AclGrants),
+}
+
+/// Request for a PutBucketAcl operation.
 #[derive(Debug)]
 pub struct PutBucketAclRequest<'a> {
     pub bucket: BucketRequest<'a>,
-    pub acl_grants: AclGrants,
-}
-
-/// Request for a PutBucket canned ACL operation.
-#[derive(Debug)]
-pub struct PutBucketCannedAclRequest<'a> {
-    pub bucket: BucketRequest<'a>,
-    pub acl: BucketAcl,
+    pub acl: PutBucketAclInput,
 }
 
 /// Request for an object or object-version-scoped operation.
@@ -1569,17 +1569,17 @@ pub struct PutObjectLegalHoldRequest<'a> {
 }
 
 /// Request for a PutObjectAcl operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PutObjectAclInput<'a> {
+    Canned(PutObjectAcl<'a>),
+    Grants(AclGrants),
+}
+
+/// Request for a PutObjectAcl operation.
 #[derive(Debug)]
 pub struct PutObjectAclRequest<'a> {
     pub object: ObjectVersionRequest<'a>,
-    pub acl_grants: AclGrants,
-}
-
-/// Request for a PutObject canned ACL operation.
-#[derive(Debug)]
-pub struct PutObjectCannedAclRequest<'a> {
-    pub object: ObjectVersionRequest<'a>,
-    pub acl: PutObjectAcl<'a>,
+    pub acl: PutObjectAclInput<'a>,
 }
 
 /// Request for a GetObject or HeadObject operation.
@@ -5828,20 +5828,34 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_bucket_acl",
-            "bucket={} grants={}",
+            "bucket={} acl_kind={}",
             req.bucket.name,
-            req.acl_grants.iter().count()
+            match &req.acl {
+                PutBucketAclInput::Canned(_) => "canned",
+                PutBucketAclInput::Grants(_) => "grants",
+            }
         );
         let bucket_info =
             self.active_bucket_summary(req.bucket.name, req.bucket.expected_bucket_owner())?;
         if !Self::requester_can_write_bucket_acl(&req.bucket.requester, &bucket_info) {
             return Err(ServerError::AccessDenied);
         }
-        if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_deref()) {
-            return Err(ServerError::AccessControlListNotSupported);
-        }
-        Self::ensure_supported_bucket_acl_grants(&req.acl_grants)?;
-        let acl_grants = Self::normalize_bucket_acl_grants(&bucket_info, req.acl_grants.clone());
+        let acl_grants = match &req.acl {
+            PutBucketAclInput::Canned(acl) => {
+                Self::ensure_put_bucket_acl_supported(&bucket_info, *acl)?;
+                Self::bucket_acl_grants_from_canned(
+                    &Self::bucket_owner_identity(&bucket_info),
+                    *acl,
+                )?
+            }
+            PutBucketAclInput::Grants(acl_grants) => {
+                if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_deref()) {
+                    return Err(ServerError::AccessControlListNotSupported);
+                }
+                Self::ensure_supported_bucket_acl_grants(acl_grants)?;
+                Self::normalize_bucket_acl_grants(&bucket_info, acl_grants.clone())
+            }
+        };
         let public_read = Self::acl_grants_public_read(&acl_grants);
         let public_write = Self::acl_grants_public_write(&acl_grants);
         if Self::blocks_public_acls(bucket_info.public_access_block.as_deref())
@@ -5865,29 +5879,6 @@ impl Coordinator {
                 info.public_write = public_write;
             });
         Ok(())
-    }
-
-    pub fn put_bucket_canned_acl_for_request(
-        &self,
-        req: &PutBucketCannedAclRequest<'_>,
-    ) -> Result<(), ServerError> {
-        let bucket =
-            self.active_bucket_summary(req.bucket.name, req.bucket.expected_bucket_owner())?;
-        if !Self::requester_can_write_bucket_acl(&req.bucket.requester, &bucket) {
-            return Err(ServerError::AccessDenied);
-        }
-        Self::ensure_put_bucket_acl_supported(&bucket, req.acl)?;
-        let grants =
-            Self::bucket_acl_grants_from_canned(&Self::bucket_owner_identity(&bucket), req.acl)?;
-        self.put_bucket_acl_for_request(&PutBucketAclRequest {
-            bucket: BucketRequest {
-                name: req.bucket.name,
-                requester: req.bucket.requester.clone(),
-                #[cfg(not(test))]
-                expected_bucket_owner: req.bucket.expected_bucket_owner(),
-            },
-            acl_grants: grants,
-        })
     }
 
     pub fn get_bucket_cors_unchecked(&self, name: &str) -> Result<Option<String>, ServerError> {
@@ -6535,11 +6526,14 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_object_acl",
-            "bucket={} key={} version_id={:?} grants={}",
+            "bucket={} key={} version_id={:?} acl_kind={}",
             req.object.bucket,
             req.object.key,
             req.object.version_id,
-            req.acl_grants.iter().count()
+            match &req.acl {
+                PutObjectAclInput::Canned(_) => "canned",
+                PutObjectAclInput::Grants(_) => "grants",
+            }
         );
         let (bucket_info, locked) = self.lock_object_for_authorized_acl(
             &req.object.requester,
@@ -6556,46 +6550,23 @@ impl Coordinator {
             record: stored,
             pgs,
         } = locked;
-        Self::ensure_supported_object_acl_grants(&req.acl_grants)?;
+        let acl_grants = match &req.acl {
+            PutObjectAclInput::Canned(acl) => {
+                Self::ensure_put_object_acl_supported(&bucket_info, *acl)?;
+                let live = stored.as_live().ok_or(ServerError::MethodNotAllowed)?;
+                Self::object_acl_grants_for_write(&bucket_info, &live.owner, *acl)
+            }
+            PutObjectAclInput::Grants(acl_grants) => {
+                Self::ensure_supported_object_acl_grants(acl_grants)?;
+                acl_grants.clone()
+            }
+        };
         Self::persist_locked_object_acl(
             req.object.bucket,
             req.object.key,
             &bucket_info,
             &stored,
             pgs.meta(),
-            req.acl_grants.clone(),
-        )
-    }
-
-    pub fn put_object_canned_acl_for_request(
-        &self,
-        req: &PutObjectCannedAclRequest<'_>,
-    ) -> Result<VersionId, ServerError> {
-        let (bucket_info, locked) = self.lock_object_for_authorized_acl(
-            &req.object.requester,
-            req.object.bucket,
-            req.object.key,
-            req.object.version_id,
-            ObjectAclAuthorization::Write,
-            req.object.expected_bucket_owner(),
-        )?;
-        if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_deref()) {
-            return Err(ServerError::AccessControlListNotSupported);
-        }
-        Self::ensure_put_object_acl_supported(&bucket_info, req.acl)?;
-        let acl_grants = {
-            let live = locked
-                .record
-                .as_live()
-                .ok_or(ServerError::MethodNotAllowed)?;
-            Self::object_acl_grants_for_write(&bucket_info, &live.owner, req.acl)
-        };
-        Self::persist_locked_object_acl(
-            req.object.bucket,
-            req.object.key,
-            &bucket_info,
-            &locked.record,
-            locked.pgs.meta(),
             acl_grants,
         )
     }
@@ -11912,7 +11883,7 @@ mod tests {
         assert!(expected_bucket_owner.is_none());
         coord.put_bucket_acl_for_request(&PutBucketAclRequest {
             bucket: bucket_request(name, requester),
-            acl_grants,
+            acl: PutBucketAclInput::Grants(acl_grants),
         })
     }
 
@@ -11924,9 +11895,9 @@ mod tests {
         expected_bucket_owner: Option<&str>,
     ) -> Result<(), ServerError> {
         assert!(expected_bucket_owner.is_none());
-        coord.put_bucket_canned_acl_for_request(&PutBucketCannedAclRequest {
+        coord.put_bucket_acl_for_request(&PutBucketAclRequest {
             bucket: bucket_request(name, requester),
-            acl,
+            acl: PutBucketAclInput::Canned(acl),
         })
     }
 
@@ -11982,7 +11953,7 @@ mod tests {
         assert!(expected_bucket_owner.is_none());
         coord.put_object_acl_for_request(&PutObjectAclRequest {
             object: object_version_request(bucket, key, version_id, requester),
-            acl_grants,
+            acl: PutObjectAclInput::Grants(acl_grants),
         })
     }
 
@@ -11996,9 +11967,9 @@ mod tests {
         expected_bucket_owner: Option<&str>,
     ) -> Result<VersionId, ServerError> {
         assert!(expected_bucket_owner.is_none());
-        coord.put_object_canned_acl_for_request(&PutObjectCannedAclRequest {
+        coord.put_object_acl_for_request(&PutObjectAclRequest {
             object: object_version_request(bucket, key, version_id, requester),
-            acl,
+            acl: PutObjectAclInput::Canned(acl),
         })
     }
 

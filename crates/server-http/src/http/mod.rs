@@ -1726,8 +1726,8 @@ impl HttpFrontend {
                         });
                     }
                     let acl = parse_put_object_acl(req.header("x-amz-acl"));
-                    self.coordinator.put_object_canned_acl_for_request(
-                        &crate::coordinator::PutObjectCannedAclRequest {
+                    self.coordinator.put_object_acl_for_request(
+                        &crate::coordinator::PutObjectAclRequest {
                             object: crate::coordinator::ObjectVersionRequest {
                                 bucket: &bucket,
                                 key: &key,
@@ -1735,7 +1735,7 @@ impl HttpFrontend {
                                 requester,
                                 expected_bucket_owner,
                             },
-                            acl,
+                            acl: crate::coordinator::PutObjectAclInput::Canned(acl),
                         },
                     )?
                 } else {
@@ -1749,7 +1749,7 @@ impl HttpFrontend {
                                 requester,
                                 expected_bucket_owner,
                             },
-                            acl_grants,
+                            acl: crate::coordinator::PutObjectAclInput::Grants(acl_grants),
                         },
                     )?
                 };
@@ -1940,14 +1940,14 @@ impl HttpFrontend {
                             unreachable!("x-amz-acl header must parse to a canned ACL")
                         }
                     };
-                    self.coordinator.put_bucket_canned_acl_for_request(
-                        &crate::coordinator::PutBucketCannedAclRequest {
+                    self.coordinator.put_bucket_acl_for_request(
+                        &crate::coordinator::PutBucketAclRequest {
                             bucket: crate::coordinator::BucketRequest {
                                 name: &bucket,
                                 requester,
                                 expected_bucket_owner,
                             },
-                            acl,
+                            acl: crate::coordinator::PutBucketAclInput::Canned(acl),
                         },
                     )?;
                 } else {
@@ -1959,7 +1959,7 @@ impl HttpFrontend {
                                 requester,
                                 expected_bucket_owner,
                             },
-                            acl_grants,
+                            acl: crate::coordinator::PutBucketAclInput::Grants(acl_grants),
                         },
                     )?;
                 }
