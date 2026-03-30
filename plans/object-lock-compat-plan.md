@@ -27,8 +27,8 @@ core Object Lock surface is correct.
 Implemented already:
 - Phase 1 test port: `crates/s3-tests/tests/object_lock.rs` exists, was
   validated against real AWS with all 39 cases enabled, and currently keeps the
-  11 completed bucket-level cases active while the remaining 28 object-level
-  cases stay `ignore`d until their features land
+  30 completed bucket/object API cases active while the remaining 10
+  later-phase cases stay `ignore`d until their features land
 - explicit Object Lock domain types exist across `s3-types`, storage, and
   coordinator code
 - durable Object Lock persistence exists for bucket metadata, live object
@@ -47,6 +47,13 @@ Implemented already:
 - AWS-specific bucket error mapping exists for:
   - `InvalidBucketState`
   - `ObjectLockConfigurationNotFoundError`
+- object-level Object Lock API support for existing versions:
+  - `PUT /<bucket>/<key>?retention`
+  - `GET /<bucket>/<key>?retention`
+  - `PUT /<bucket>/<key>?legal-hold`
+  - `GET /<bucket>/<key>?legal-hold`
+- retention/legal-hold XML parsing/rendering and governance/compliance
+  transition enforcement for API-driven updates
 - bucket versioning
 - version-specific reads/deletes and delete markers
 - `HeadObject` / `GetObject` metadata plumbing
@@ -57,13 +64,14 @@ Missing today:
 - `PutObject`, `CopyObject`, and multipart initiation do not accept Object Lock
   headers
 - `HeadObject` / `GetObject` do not project Object Lock headers
-- no object-level `PutObjectRetention` / `GetObjectRetention`
-- no object-level `PutObjectLegalHold` / `GetObjectLegalHold`
 - `DeleteObject` / `DeleteObjects` do not enforce WORM semantics or governance
   bypass
 - bucket-policy action coverage does not include Object Lock actions
-- the 28 object-level tests in `crates/s3-tests/tests/object_lock.rs` remain
-  `ignore`d until the later phases land
+- the remaining 10 `ignore`d cases in `crates/s3-tests/tests/object_lock.rs`
+  are now concentrated in later phases:
+  - write-path inline Object Lock headers
+  - `HeadObject` Object Lock headers
+  - WORM delete / multi-delete enforcement
 
 ## AWS Contract To Match
 
@@ -260,6 +268,16 @@ special cases.
 
 ### Phase 6: Object Retention And Legal-Hold APIs
 
+Status update:
+- implemented for the direct object APIs
+- local verification currently has `30 passed / 10 ignored` in
+  `crates/s3-tests/tests/object_lock.rs`
+- validated against real AWS with the direct API tests active, including:
+  - governance-to-compliance with bypass
+  - governance-to-compliance without bypass
+  - compliance-to-governance rejection
+  - version-aware legal-hold `versionId` reads and writes
+
 Implement:
 - `PUT /<bucket>/<key>?retention`
 - `GET /<bucket>/<key>?retention`
@@ -279,8 +297,8 @@ Retention update rules:
 - allow shortening governance retention with explicit bypass intent
 - reject compliance-to-governance change
 - reject compliance shortening
-- allow governance-to-compliance only when AWS does; verify exact behavior
-  against AWS while implementing
+- allow governance-to-compliance only when AWS does; this was verified against
+  AWS during Phase 6
 
 Likely files:
 - `crates/server-http/src/http/router.rs`

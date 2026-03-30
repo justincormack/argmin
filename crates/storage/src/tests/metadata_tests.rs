@@ -5611,6 +5611,88 @@ fn live_object_object_lock_round_trip() {
 }
 
 #[test]
+fn put_object_retention_and_legal_hold_round_trip() {
+    let (_dir, store) = make_pg_store();
+    let version_id = VersionId::Versioned(NonZeroU64::new(1).unwrap());
+    store
+        .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
+            bucket: "bucket".into(),
+            key: "key".into(),
+            version_id,
+            owner: test_owner(),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            generation_id: GenerationId::MIN,
+            size: 16,
+            etag: ObjectEtag::SinglePart([7; 8]),
+            ec: EcShape { k: 4, m: 2 },
+            layout: ObjectLayout::Standard,
+            tags: None,
+            metadata_blob: None,
+            system_metadata_blob: None,
+            object_lock: ObjectLockState::default(),
+            encryption: ObjectEncryption::None,
+        }))
+        .unwrap();
+
+    let retention = ObjectRetention {
+        mode: ObjectLockMode::Governance,
+        retain_until_unix_seconds: 5_364_662_400,
+    };
+    store
+        .put_object_retention("bucket", "key", version_id, retention)
+        .unwrap();
+    store
+        .put_object_legal_hold("bucket", "key", version_id, StoredLegalHoldStatus::On)
+        .unwrap();
+
+    let record = store
+        .get_object_version("bucket", "key", version_id)
+        .unwrap();
+    let live = record.as_live().unwrap();
+    assert_eq!(live.object_lock.retention, Some(retention));
+    assert_eq!(live.object_lock.legal_hold, StoredLegalHoldStatus::On);
+}
+
+#[test]
+fn put_object_retention_and_legal_hold_reject_delete_marker() {
+    let (_dir, store) = make_pg_store();
+    let version_id = VersionId::Versioned(NonZeroU64::new(1).unwrap());
+    store
+        .put_object_meta(&PutObjectReq::DeleteMarker(PutDeleteMarkerReq {
+            bucket: "bucket".into(),
+            key: "key".into(),
+            version_id,
+            owner: test_owner(),
+        }))
+        .unwrap();
+
+    let err = store
+        .put_object_retention(
+            "bucket",
+            "key",
+            version_id,
+            ObjectRetention {
+                mode: ObjectLockMode::Governance,
+                retain_until_unix_seconds: 5_364_662_400,
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        crate::error::MetadataError::MethodNotAllowedOnDeleteMarker
+    ));
+
+    let err = store
+        .put_object_legal_hold("bucket", "key", version_id, StoredLegalHoldStatus::Off)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        crate::error::MetadataError::MethodNotAllowedOnDeleteMarker
+    ));
+}
+
+#[test]
 fn multipart_upload_object_lock_round_trip_and_commit_copies_state() {
     let (_dir, store) = make_pg_store();
     let object_lock = sample_object_lock_state();

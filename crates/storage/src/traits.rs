@@ -198,6 +198,24 @@ pub trait PgMetadataStore {
         public_read: bool,
     ) -> Result<(), MetadataError>;
 
+    /// Update retention metadata for a specific live object version.
+    fn put_object_retention(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: VersionId,
+        retention: ObjectRetention,
+    ) -> Result<(), MetadataError>;
+
+    /// Update legal hold metadata for a specific live object version.
+    fn put_object_legal_hold(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: VersionId,
+        legal_hold: StoredLegalHoldStatus,
+    ) -> Result<(), MetadataError>;
+
     /// Delete all versions of an object's metadata.
     fn delete_object_meta(&self, bucket: &str, key: &str) -> Result<(), MetadataError>;
 

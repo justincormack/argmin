@@ -9,7 +9,10 @@ use crate::coordinator::{
 use crate::error::ServerError;
 use auth::canonical::uri_encode;
 use checksum::{ChecksumAlgorithm, ChecksumType, RawChecksum};
-use s3_types::{BucketObjectLockConfig, BucketVersioningState, CanonicalUserId, VersionId};
+use s3_types::{
+    BucketObjectLockConfig, BucketVersioningState, CanonicalUserId, LegalHoldStatus,
+    ObjectRetention, VersionId,
+};
 use server_core::sse::{SseCustomerResponseHeaders, SSE_CUSTOMER_ALGORITHM};
 use server_core::system_metadata::SystemMetadata;
 use storage::BucketEncryptionConfig;
@@ -509,6 +512,32 @@ impl S3Response {
     #[must_use]
     pub fn get_bucket_object_lock_configuration(config: BucketObjectLockConfig) -> Self {
         let body = xml::get_bucket_object_lock_configuration_xml(config);
+        Self::new(200).xml_body(body)
+    }
+
+    /// Build a response for `PutObjectRetention`.
+    #[must_use]
+    pub fn put_object_retention() -> Self {
+        Self::new(200)
+    }
+
+    /// Build a response for `GetObjectRetention`.
+    #[must_use]
+    pub fn get_object_retention(retention: Option<ObjectRetention>) -> Self {
+        let body = xml::get_object_retention_xml(retention);
+        Self::new(200).xml_body(body)
+    }
+
+    /// Build a response for `PutObjectLegalHold`.
+    #[must_use]
+    pub fn put_object_legal_hold() -> Self {
+        Self::new(200)
+    }
+
+    /// Build a response for `GetObjectLegalHold`.
+    #[must_use]
+    pub fn get_object_legal_hold(status: Option<LegalHoldStatus>) -> Self {
+        let body = xml::get_object_legal_hold_xml(status);
         Self::new(200).xml_body(body)
     }
 
@@ -1597,6 +1626,29 @@ mod tests {
         let body = String::from_utf8(resp.body).unwrap();
         assert!(body.contains("<ObjectLockEnabled>Enabled</ObjectLockEnabled>"));
         assert!(body.contains("<Days>1</Days>"));
+    }
+
+    #[test]
+    fn get_object_retention_response() {
+        let resp = S3Response::get_object_retention(Some(ObjectRetention {
+            mode: s3_types::ObjectLockMode::Governance,
+            retain_until_unix_seconds: 5_364_662_400,
+        }));
+        assert_eq!(resp.status_code, 200);
+        assert_eq!(find_header(&resp, "Content-Type"), Some("application/xml"));
+        let body = String::from_utf8(resp.body).unwrap();
+        assert!(body.contains("<Retention"));
+        assert!(body.contains("<Mode>GOVERNANCE</Mode>"));
+    }
+
+    #[test]
+    fn get_object_legal_hold_response() {
+        let resp = S3Response::get_object_legal_hold(Some(LegalHoldStatus::On));
+        assert_eq!(resp.status_code, 200);
+        assert_eq!(find_header(&resp, "Content-Type"), Some("application/xml"));
+        let body = String::from_utf8(resp.body).unwrap();
+        assert!(body.contains("<LegalHold"));
+        assert!(body.contains("<Status>ON</Status>"));
     }
 
     // ── head_bucket ───────────────────────────────────────────────────

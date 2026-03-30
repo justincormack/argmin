@@ -12,7 +12,8 @@ use quick_xml::{escape::unescape, events::Event, Reader};
 use s3_types::VersionId;
 use s3_types::{
     AclGrant, AclGrantee, AclGrants, AclPermission, BucketObjectLockConfig, BucketVersioningState,
-    CanonicalUserId, ObjectLockDefaultRetention, ObjectLockMode, RetentionPeriod,
+    CanonicalUserId, LegalHoldStatus, ObjectLockDefaultRetention, ObjectLockMode, ObjectRetention,
+    RetentionPeriod,
 };
 use storage::BucketEncryptionConfig;
 
@@ -1286,6 +1287,280 @@ pub fn get_bucket_object_lock_configuration_xml(config: BucketObjectLockConfig) 
     xml
 }
 
+/// Parse a `PutObjectRetention` XML request body.
+pub fn parse_object_retention_xml(data: &[u8]) -> Result<ObjectRetention, ServerError> {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum State {
+        Start,
+        InRoot,
+        InMode,
+        InRetainUntilDate,
+        Done,
+    }
+
+    fn decode_retention_text(bytes: &[u8]) -> Result<String, ServerError> {
+        decode_xml_text(
+            bytes,
+            "invalid UTF-8 in object retention XML body",
+            "invalid XML entity in object retention XML body",
+        )
+    }
+
+    fn malformed_retention_xml(reason: &str) -> ServerError {
+        ServerError::MalformedXML {
+            reason: reason.to_string(),
+        }
+    }
+
+    let mut reader = Reader::from_reader(data);
+    reader.config_mut().trim_text(true);
+
+    let mut buf = Vec::new();
+    let mut state = State::Start;
+    let mut current_text = String::new();
+    let mut mode_text: Option<String> = None;
+    let mut retain_until_text: Option<String> = None;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => match (state, e.local_name().as_ref()) {
+                (State::Start, b"Retention" | b"ObjectLockRetention") => state = State::InRoot,
+                (State::InRoot, b"Mode") => {
+                    current_text.clear();
+                    state = State::InMode;
+                }
+                (State::InRoot, b"RetainUntilDate") => {
+                    current_text.clear();
+                    state = State::InRetainUntilDate;
+                }
+                _ => {
+                    return Err(malformed_retention_xml(
+                        "unexpected element in object retention XML",
+                    ))
+                }
+            },
+            Ok(Event::Empty(_)) => {
+                return Err(malformed_retention_xml(
+                    "unexpected empty element in object retention XML",
+                ));
+            }
+            Ok(Event::End(e)) => match (state, e.local_name().as_ref()) {
+                (State::InRoot, b"Retention" | b"ObjectLockRetention") => state = State::Done,
+                (State::InMode, b"Mode") => {
+                    mode_text = Some(std::mem::take(&mut current_text));
+                    state = State::InRoot;
+                }
+                (State::InRetainUntilDate, b"RetainUntilDate") => {
+                    retain_until_text = Some(std::mem::take(&mut current_text));
+                    state = State::InRoot;
+                }
+                _ => {
+                    return Err(malformed_retention_xml(
+                        "unexpected closing element in object retention XML",
+                    ))
+                }
+            },
+            Ok(Event::Text(t)) => {
+                let text = decode_retention_text(t.as_ref())?;
+                match state {
+                    State::InMode | State::InRetainUntilDate => current_text.push_str(&text),
+                    _ if text.trim().is_empty() => {}
+                    _ => {
+                        return Err(malformed_retention_xml(
+                            "unexpected text in object retention XML",
+                        ))
+                    }
+                }
+            }
+            Ok(Event::CData(t)) => {
+                let text = std::str::from_utf8(t.as_ref()).map_err(|_| {
+                    malformed_retention_xml("invalid UTF-8 in object retention XML body")
+                })?;
+                match state {
+                    State::InMode | State::InRetainUntilDate => current_text.push_str(text),
+                    _ if text.trim().is_empty() => {}
+                    _ => {
+                        return Err(malformed_retention_xml(
+                            "unexpected CDATA in object retention XML",
+                        ))
+                    }
+                }
+            }
+            Ok(Event::Comment(_) | Event::Decl(_) | Event::PI(_) | Event::DocType(_)) => {}
+            Ok(Event::Eof) => {
+                if state == State::Start {
+                    return Err(malformed_retention_xml("missing <Retention> element"));
+                }
+                if state != State::Done {
+                    return Err(malformed_retention_xml(
+                        "unexpected end of object retention XML",
+                    ));
+                }
+                let mode = match mode_text.as_deref() {
+                    Some("GOVERNANCE") => ObjectLockMode::Governance,
+                    Some("COMPLIANCE") => ObjectLockMode::Compliance,
+                    _ => return Err(malformed_retention_xml("malformed object retention XML")),
+                };
+                let retain_until = retain_until_text
+                    .as_deref()
+                    .ok_or_else(|| malformed_retention_xml("malformed object retention XML"))
+                    .and_then(parse_object_lock_timestamp_secs)?;
+                return Ok(ObjectRetention {
+                    mode,
+                    retain_until_unix_seconds: retain_until,
+                });
+            }
+            Err(_) => return Err(malformed_retention_xml("malformed object retention XML")),
+        }
+        buf.clear();
+    }
+}
+
+/// Format a `GetObjectRetention` XML response.
+#[must_use]
+pub fn get_object_retention_xml(retention: Option<ObjectRetention>) -> String {
+    let mut xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <Retention xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
+    );
+    if let Some(retention) = retention {
+        xml.push_str("<Mode>");
+        xml.push_str(retention.mode.as_str());
+        xml.push_str("</Mode><RetainUntilDate>");
+        xml.push_str(&format_object_lock_timestamp(
+            retention.retain_until_unix_seconds,
+        ));
+        xml.push_str("</RetainUntilDate>");
+    }
+    xml.push_str("</Retention>");
+    xml
+}
+
+/// Parse a `PutObjectLegalHold` XML request body.
+pub fn parse_object_legal_hold_xml(data: &[u8]) -> Result<LegalHoldStatus, ServerError> {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum State {
+        Start,
+        InRoot,
+        InStatus,
+        Done,
+    }
+
+    fn decode_legal_hold_text(bytes: &[u8]) -> Result<String, ServerError> {
+        decode_xml_text(
+            bytes,
+            "invalid UTF-8 in legal hold XML body",
+            "invalid XML entity in legal hold XML body",
+        )
+    }
+
+    fn malformed_legal_hold_xml(reason: &str) -> ServerError {
+        ServerError::MalformedXML {
+            reason: reason.to_string(),
+        }
+    }
+
+    let mut reader = Reader::from_reader(data);
+    reader.config_mut().trim_text(true);
+
+    let mut buf = Vec::new();
+    let mut state = State::Start;
+    let mut current_text = String::new();
+    let mut status_text: Option<String> = None;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => match (state, e.local_name().as_ref()) {
+                (State::Start, b"LegalHold") => state = State::InRoot,
+                (State::InRoot, b"Status") => {
+                    current_text.clear();
+                    state = State::InStatus;
+                }
+                _ => {
+                    return Err(malformed_legal_hold_xml(
+                        "unexpected element in legal hold XML",
+                    ))
+                }
+            },
+            Ok(Event::Empty(_)) => {
+                return Err(malformed_legal_hold_xml(
+                    "unexpected empty element in legal hold XML",
+                ));
+            }
+            Ok(Event::End(e)) => match (state, e.local_name().as_ref()) {
+                (State::InRoot, b"LegalHold") => state = State::Done,
+                (State::InStatus, b"Status") => {
+                    status_text = Some(std::mem::take(&mut current_text));
+                    state = State::InRoot;
+                }
+                _ => {
+                    return Err(malformed_legal_hold_xml(
+                        "unexpected closing element in legal hold XML",
+                    ))
+                }
+            },
+            Ok(Event::Text(t)) => {
+                let text = decode_legal_hold_text(t.as_ref())?;
+                match state {
+                    State::InStatus => current_text.push_str(&text),
+                    _ if text.trim().is_empty() => {}
+                    _ => {
+                        return Err(malformed_legal_hold_xml(
+                            "unexpected text in legal hold XML",
+                        ))
+                    }
+                }
+            }
+            Ok(Event::CData(t)) => {
+                let text = std::str::from_utf8(t.as_ref()).map_err(|_| {
+                    malformed_legal_hold_xml("invalid UTF-8 in legal hold XML body")
+                })?;
+                match state {
+                    State::InStatus => current_text.push_str(text),
+                    _ if text.trim().is_empty() => {}
+                    _ => {
+                        return Err(malformed_legal_hold_xml(
+                            "unexpected CDATA in legal hold XML",
+                        ))
+                    }
+                }
+            }
+            Ok(Event::Comment(_) | Event::Decl(_) | Event::PI(_) | Event::DocType(_)) => {}
+            Ok(Event::Eof) => {
+                if state == State::Start {
+                    return Err(malformed_legal_hold_xml("missing <LegalHold> element"));
+                }
+                if state != State::Done {
+                    return Err(malformed_legal_hold_xml("unexpected end of legal hold XML"));
+                }
+                return match status_text.as_deref() {
+                    Some("OFF") => Ok(LegalHoldStatus::Off),
+                    Some("ON") => Ok(LegalHoldStatus::On),
+                    _ => Err(malformed_legal_hold_xml("malformed legal hold XML")),
+                };
+            }
+            Err(_) => return Err(malformed_legal_hold_xml("malformed legal hold XML")),
+        }
+        buf.clear();
+    }
+}
+
+/// Format a `GetObjectLegalHold` XML response.
+#[must_use]
+pub fn get_object_legal_hold_xml(status: Option<LegalHoldStatus>) -> String {
+    let mut xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <LegalHold xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
+    );
+    if let Some(status) = status {
+        xml.push_str("<Status>");
+        xml.push_str(status.as_str());
+        xml.push_str("</Status>");
+    }
+    xml.push_str("</LegalHold>");
+    xml
+}
+
 /// Parse a `PutBucketEncryption` XML request body.
 ///
 /// This currently supports the SSE-C bucket blocking subset:
@@ -2055,6 +2330,109 @@ fn days_to_date(days: i64) -> (i64, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y, m, d)
+}
+
+fn date_to_days(year: i64, month: u32, day: u32) -> i64 {
+    let year = year - i64::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let month = i64::from(month);
+    let day = i64::from(day);
+    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+fn is_leap_year(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn days_in_month(year: i64, month: u32) -> Option<u32> {
+    Some(match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => return None,
+    })
+}
+
+fn format_object_lock_timestamp(unix_seconds: u64) -> String {
+    format_timestamp(unix_seconds.saturating_mul(1000))
+}
+
+fn parse_object_lock_timestamp_secs(raw: &str) -> Result<u64, ServerError> {
+    fn malformed() -> ServerError {
+        ServerError::MalformedXML {
+            reason: "malformed object retention XML".to_string(),
+        }
+    }
+
+    let raw = raw.trim();
+    let datetime = raw.strip_suffix('Z').ok_or_else(malformed)?;
+    let (date, time) = datetime.split_once('T').ok_or_else(malformed)?;
+    let mut date_parts = date.split('-');
+    let year: i64 = date_parts
+        .next()
+        .ok_or_else(malformed)?
+        .parse()
+        .map_err(|_| malformed())?;
+    let month: u32 = date_parts
+        .next()
+        .ok_or_else(malformed)?
+        .parse()
+        .map_err(|_| malformed())?;
+    let day: u32 = date_parts
+        .next()
+        .ok_or_else(malformed)?
+        .parse()
+        .map_err(|_| malformed())?;
+    if date_parts.next().is_some() {
+        return Err(malformed());
+    }
+
+    let (hms, fractional) = time
+        .split_once('.')
+        .map_or((time, None), |(h, f)| (h, Some(f)));
+    if fractional.is_some_and(|part| !part.chars().all(|c| c.is_ascii_digit())) {
+        return Err(malformed());
+    }
+    let mut time_parts = hms.split(':');
+    let hour: u32 = time_parts
+        .next()
+        .ok_or_else(malformed)?
+        .parse()
+        .map_err(|_| malformed())?;
+    let minute: u32 = time_parts
+        .next()
+        .ok_or_else(malformed)?
+        .parse()
+        .map_err(|_| malformed())?;
+    let second: u32 = time_parts
+        .next()
+        .ok_or_else(malformed)?
+        .parse()
+        .map_err(|_| malformed())?;
+    if time_parts.next().is_some() {
+        return Err(malformed());
+    }
+
+    let max_day = days_in_month(year, month).ok_or_else(malformed)?;
+    if day == 0 || day > max_day || hour > 23 || minute > 59 || second > 59 {
+        return Err(malformed());
+    }
+
+    let days = date_to_days(year, month, day);
+    if days < 0 {
+        return Err(malformed());
+    }
+    let secs = days
+        .checked_mul(86_400)
+        .and_then(|v| v.checked_add(i64::from(hour) * 3_600))
+        .and_then(|v| v.checked_add(i64::from(minute) * 60))
+        .and_then(|v| v.checked_add(i64::from(second)))
+        .ok_or_else(malformed)?;
+    u64::try_from(secs).map_err(|_| malformed())
 }
 
 /// Parse a `<Tagging>` XML request body into a list of (key, value) pairs.
@@ -4077,6 +4455,98 @@ mod tests {
         assert!(xml.contains("<ObjectLockEnabled>Enabled</ObjectLockEnabled>"));
         assert!(xml.contains("<Mode>COMPLIANCE</Mode>"));
         assert!(xml.contains("<Years>3</Years>"));
+    }
+
+    #[test]
+    fn parse_object_retention_xml_accepts_retention_root() {
+        let xml = br#"
+            <Retention>
+              <Mode>GOVERNANCE</Mode>
+              <RetainUntilDate>2140-01-01T00:00:00Z</RetainUntilDate>
+            </Retention>
+        "#;
+        assert_eq!(
+            parse_object_retention_xml(xml).unwrap(),
+            ObjectRetention {
+                mode: ObjectLockMode::Governance,
+                retain_until_unix_seconds: 5_364_662_400,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_object_retention_xml_accepts_object_lock_retention_root() {
+        let xml = br#"
+            <ObjectLockRetention>
+              <Mode>COMPLIANCE</Mode>
+              <RetainUntilDate>2140-01-01T00:00:00.000Z</RetainUntilDate>
+            </ObjectLockRetention>
+        "#;
+        assert_eq!(
+            parse_object_retention_xml(xml).unwrap(),
+            ObjectRetention {
+                mode: ObjectLockMode::Compliance,
+                retain_until_unix_seconds: 5_364_662_400,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_object_retention_xml_rejects_invalid_mode() {
+        let xml = br#"
+            <Retention>
+              <Mode>governance</Mode>
+              <RetainUntilDate>2140-01-01T00:00:00Z</RetainUntilDate>
+            </Retention>
+        "#;
+        assert!(matches!(
+            parse_object_retention_xml(xml),
+            Err(ServerError::MalformedXML { .. })
+        ));
+    }
+
+    #[test]
+    fn object_retention_xml_round_trip() {
+        let xml = get_object_retention_xml(Some(ObjectRetention {
+            mode: ObjectLockMode::Governance,
+            retain_until_unix_seconds: 5_364_662_400,
+        }));
+        assert!(xml.contains("<Retention"));
+        assert!(xml.contains("<Mode>GOVERNANCE</Mode>"));
+        assert!(xml.contains("<RetainUntilDate>2140-01-01T00:00:00.000Z</RetainUntilDate>"));
+    }
+
+    #[test]
+    fn parse_object_legal_hold_xml_basic() {
+        let xml = br#"
+            <LegalHold>
+              <Status>ON</Status>
+            </LegalHold>
+        "#;
+        assert_eq!(
+            parse_object_legal_hold_xml(xml).unwrap(),
+            LegalHoldStatus::On
+        );
+    }
+
+    #[test]
+    fn parse_object_legal_hold_xml_rejects_invalid_status() {
+        let xml = br#"
+            <LegalHold>
+              <Status>enabled</Status>
+            </LegalHold>
+        "#;
+        assert!(matches!(
+            parse_object_legal_hold_xml(xml),
+            Err(ServerError::MalformedXML { .. })
+        ));
+    }
+
+    #[test]
+    fn object_legal_hold_xml_round_trip() {
+        let xml = get_object_legal_hold_xml(Some(LegalHoldStatus::Off));
+        assert!(xml.contains("<LegalHold"));
+        assert!(xml.contains("<Status>OFF</Status>"));
     }
 
     #[test]

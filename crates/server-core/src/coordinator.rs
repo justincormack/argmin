@@ -12,7 +12,8 @@ use checksum::{
 use ec::{EcConfig, ErasureCodec};
 use s3_types::{
     AccountIdentity, AclGrant, AclGrantee, AclGrants, AclPermission, BucketVersioningState,
-    CanonicalUserId, ObjectLockDefaultRetention, VersionId,
+    CanonicalUserId, LegalHoldStatus, ObjectLockDefaultRetention, ObjectLockMode, ObjectRetention,
+    StoredLegalHoldStatus, VersionId,
 };
 use storage::traits::{PgMetadataStore, ShardStore};
 #[cfg(test)]
@@ -1548,6 +1549,21 @@ pub struct PutObjectTagsRequest<'a> {
     pub tags: &'a str,
 }
 
+/// Request for a PutObjectRetention operation.
+#[derive(Debug)]
+pub struct PutObjectRetentionRequest<'a> {
+    pub object: ObjectVersionRequest<'a>,
+    pub retention: ObjectRetention,
+    pub bypass_governance: bool,
+}
+
+/// Request for a PutObjectLegalHold operation.
+#[derive(Debug)]
+pub struct PutObjectLegalHoldRequest<'a> {
+    pub object: ObjectVersionRequest<'a>,
+    pub legal_hold: LegalHoldStatus,
+}
+
 /// Request for a PutObjectAcl operation.
 #[derive(Debug)]
 pub struct PutObjectAclRequest<'a> {
@@ -1863,6 +1879,25 @@ impl_expected_bucket_owner_accessor!(
 
 #[cfg(any(test, feature = "test-utils"))]
 impl_expected_bucket_owner_accessor!(UploadPartRequest);
+
+impl<'a> ObjectVersionRequest<'a> {
+    fn new(
+        bucket: &'a str,
+        key: &'a str,
+        version_id: Option<VersionId>,
+        requester: Requester,
+        _expected_bucket_owner: Option<&'a str>,
+    ) -> Self {
+        Self {
+            bucket,
+            key,
+            version_id,
+            requester,
+            #[cfg(not(test))]
+            expected_bucket_owner: _expected_bucket_owner,
+        }
+    }
+}
 
 impl<'a> BeginStreamPutRequest<'a> {
     fn new(
@@ -6435,6 +6470,117 @@ impl Coordinator {
         Ok(())
     }
 
+    // ── Object Lock metadata ───────────────────────────────────────
+
+    fn ensure_object_lock_bucket(bucket: &BucketSummary) -> Result<(), ServerError> {
+        if bucket.object_lock.enabled {
+            Ok(())
+        } else {
+            Err(ServerError::InvalidRequest {
+                reason: "Bucket is missing Object Lock Configuration".to_string(),
+            })
+        }
+    }
+
+    fn lock_object_for_authorized_object_lock<'a>(
+        &'a self,
+        requester: &Requester,
+        bucket: &str,
+        key: &str,
+        version_id: Option<VersionId>,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<LockedReadObject<'a>, ServerError> {
+        let bucket_info =
+            self.authorize_bucket_admin_requester(requester, bucket, expected_bucket_owner)?;
+        Self::ensure_object_lock_bucket(&bucket_info)?;
+        self.lock_object_pgs_for_read(bucket, key, version_id)
+    }
+
+    fn validate_retention_update(
+        current: Option<ObjectRetention>,
+        requested: ObjectRetention,
+        bypass_governance: bool,
+    ) -> Result<(), ServerError> {
+        let Some(current) = current else {
+            return Ok(());
+        };
+
+        match current.mode {
+            ObjectLockMode::Governance => {
+                let shortens =
+                    requested.retain_until_unix_seconds < current.retain_until_unix_seconds;
+                let changes_mode = requested.mode != current.mode;
+                if (shortens || changes_mode) && !bypass_governance {
+                    return Err(ServerError::AccessDenied);
+                }
+                Ok(())
+            }
+            ObjectLockMode::Compliance => {
+                if requested.mode != ObjectLockMode::Compliance {
+                    return Err(ServerError::AccessDenied);
+                }
+                if requested.retain_until_unix_seconds < current.retain_until_unix_seconds {
+                    return Err(ServerError::AccessDenied);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    pub fn put_object_retention(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<VersionId>,
+        retention: ObjectRetention,
+        bypass_governance: bool,
+        requester: Requester,
+    ) -> Result<(), ServerError> {
+        self.put_object_retention_for_request(&PutObjectRetentionRequest {
+            object: ObjectVersionRequest::new(bucket, key, version_id, requester, None),
+            retention,
+            bypass_governance,
+        })
+    }
+
+    pub fn get_object_retention(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<VersionId>,
+        requester: Requester,
+    ) -> Result<Option<ObjectRetention>, ServerError> {
+        self.get_object_retention_for_request(&ObjectVersionRequest::new(
+            bucket, key, version_id, requester, None,
+        ))
+    }
+
+    pub fn put_object_legal_hold(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<VersionId>,
+        legal_hold: LegalHoldStatus,
+        requester: Requester,
+    ) -> Result<(), ServerError> {
+        self.put_object_legal_hold_for_request(&PutObjectLegalHoldRequest {
+            object: ObjectVersionRequest::new(bucket, key, version_id, requester, None),
+            legal_hold,
+        })
+    }
+
+    pub fn get_object_legal_hold(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<VersionId>,
+        requester: Requester,
+    ) -> Result<Option<LegalHoldStatus>, ServerError> {
+        self.get_object_legal_hold_for_request(&ObjectVersionRequest::new(
+            bucket, key, version_id, requester, None,
+        ))
+    }
+
     // ── Object tagging ──────────────────────────────────────────────
 
     pub fn put_object_tags_for_request(
@@ -6449,6 +6595,136 @@ impl Coordinator {
             req.object.requester.clone(),
             req.object.expected_bucket_owner(),
         )
+    }
+
+    pub fn put_object_retention_for_request(
+        &self,
+        req: &PutObjectRetentionRequest<'_>,
+    ) -> Result<(), ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::put_object_retention",
+            "bucket={} key={} version_id={:?} mode={:?} bypass={}",
+            req.object.bucket,
+            req.object.key,
+            req.object.version_id,
+            req.retention.mode,
+            req.bypass_governance
+        );
+        let LockedReadObject {
+            record: stored,
+            pgs,
+        } = self.lock_object_for_authorized_object_lock(
+            &req.object.requester,
+            req.object.bucket,
+            req.object.key,
+            req.object.version_id,
+            req.object.expected_bucket_owner(),
+        )?;
+        let live = stored.as_live().ok_or(ServerError::MethodNotAllowed)?;
+        Self::validate_retention_update(
+            live.object_lock.retention,
+            req.retention,
+            req.bypass_governance,
+        )?;
+        pgs.meta()
+            .put_object_retention(
+                req.object.bucket,
+                req.object.key,
+                live.version_id,
+                req.retention,
+            )
+            .map_err(|e| match e {
+                storage::MetadataError::MethodNotAllowedOnDeleteMarker => {
+                    ServerError::MethodNotAllowed
+                }
+                other => ServerError::Metadata(other),
+            })
+    }
+
+    pub fn get_object_retention_for_request(
+        &self,
+        req: &ObjectVersionRequest<'_>,
+    ) -> Result<Option<ObjectRetention>, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::get_object_retention",
+            "bucket={} key={} version_id={:?}",
+            req.bucket,
+            req.key,
+            req.version_id
+        );
+        let LockedReadObject { record: stored, .. } = self.lock_object_for_authorized_object_lock(
+            &req.requester,
+            req.bucket,
+            req.key,
+            req.version_id,
+            req.expected_bucket_owner(),
+        )?;
+        let live = stored.as_live().ok_or(ServerError::MethodNotAllowed)?;
+        Ok(live.object_lock.retention)
+    }
+
+    pub fn put_object_legal_hold_for_request(
+        &self,
+        req: &PutObjectLegalHoldRequest<'_>,
+    ) -> Result<(), ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::put_object_legal_hold",
+            "bucket={} key={} version_id={:?} status={:?}",
+            req.object.bucket,
+            req.object.key,
+            req.object.version_id,
+            req.legal_hold
+        );
+        let LockedReadObject {
+            record: stored,
+            pgs,
+        } = self.lock_object_for_authorized_object_lock(
+            &req.object.requester,
+            req.object.bucket,
+            req.object.key,
+            req.object.version_id,
+            req.object.expected_bucket_owner(),
+        )?;
+        let live = stored.as_live().ok_or(ServerError::MethodNotAllowed)?;
+        pgs.meta()
+            .put_object_legal_hold(
+                req.object.bucket,
+                req.object.key,
+                live.version_id,
+                StoredLegalHoldStatus::from_legal_hold_status(Some(req.legal_hold)),
+            )
+            .map_err(|e| match e {
+                storage::MetadataError::MethodNotAllowedOnDeleteMarker => {
+                    ServerError::MethodNotAllowed
+                }
+                other => ServerError::Metadata(other),
+            })
+    }
+
+    pub fn get_object_legal_hold_for_request(
+        &self,
+        req: &ObjectVersionRequest<'_>,
+    ) -> Result<Option<LegalHoldStatus>, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::get_object_legal_hold",
+            "bucket={} key={} version_id={:?}",
+            req.bucket,
+            req.key,
+            req.version_id
+        );
+        let LockedReadObject { record: stored, .. } = self.lock_object_for_authorized_object_lock(
+            &req.requester,
+            req.bucket,
+            req.key,
+            req.version_id,
+            req.expected_bucket_owner(),
+        )?;
+        let live = stored.as_live().ok_or(ServerError::MethodNotAllowed)?;
+        Ok(live.object_lock.legal_hold.as_legal_hold_status())
     }
 
     pub fn get_object_tags_for_request(
@@ -20723,6 +20999,59 @@ mod tests {
         assert!(matches!(
             err,
             ServerError::ObjectLockConfigurationNotFound { .. }
+        ));
+    }
+
+    #[test]
+    fn validate_retention_update_allows_governance_increase_without_bypass() {
+        let current = ObjectRetention {
+            mode: ObjectLockMode::Governance,
+            retain_until_unix_seconds: 100,
+        };
+        let requested = ObjectRetention {
+            mode: ObjectLockMode::Governance,
+            retain_until_unix_seconds: 200,
+        };
+        assert!(Coordinator::validate_retention_update(Some(current), requested, false).is_ok());
+    }
+
+    #[test]
+    fn validate_retention_update_requires_bypass_for_governance_mode_change() {
+        let current = ObjectRetention {
+            mode: ObjectLockMode::Governance,
+            retain_until_unix_seconds: 100,
+        };
+        let requested = ObjectRetention {
+            mode: ObjectLockMode::Compliance,
+            retain_until_unix_seconds: 100,
+        };
+        let err =
+            Coordinator::validate_retention_update(Some(current), requested, false).unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+        assert!(Coordinator::validate_retention_update(Some(current), requested, true).is_ok());
+    }
+
+    #[test]
+    fn validate_retention_update_rejects_compliance_downgrade_or_shorten() {
+        let current = ObjectRetention {
+            mode: ObjectLockMode::Compliance,
+            retain_until_unix_seconds: 200,
+        };
+        let downgrade = ObjectRetention {
+            mode: ObjectLockMode::Governance,
+            retain_until_unix_seconds: 200,
+        };
+        let shorten = ObjectRetention {
+            mode: ObjectLockMode::Compliance,
+            retain_until_unix_seconds: 100,
+        };
+        assert!(matches!(
+            Coordinator::validate_retention_update(Some(current), downgrade, true),
+            Err(ServerError::AccessDenied)
+        ));
+        assert!(matches!(
+            Coordinator::validate_retention_update(Some(current), shorten, true),
+            Err(ServerError::AccessDenied)
         ));
     }
 

@@ -96,12 +96,6 @@ fn expected_source_bucket_owner(req: &S3Request) -> Option<&str> {
     req.header("x-amz-source-expected-bucket-owner")
 }
 
-fn unsupported_s3_operation(feature: &str) -> Result<S3Response, ServerError> {
-    Err(ServerError::NotImplemented {
-        feature: format!("{feature} is not implemented"),
-    })
-}
-
 /// The HTTP frontend that handles incoming requests.
 pub struct HttpFrontend {
     pub coordinator: Coordinator,
@@ -1561,17 +1555,75 @@ impl HttpFrontend {
                 )?;
                 Ok(S3Response::delete_bucket_tagging())
             }
-            S3Operation::PutObjectRetention { .. } => {
-                unsupported_s3_operation("PutObjectRetention")
+            S3Operation::PutObjectRetention { bucket, key } => {
+                validate_content_md5(req)?;
+                let vid = parse_version_id(req)?;
+                let retention = xml::parse_object_retention_xml(&req.body)?;
+                let bypass_governance = req
+                    .header("x-amz-bypass-governance-retention")
+                    .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+                let requester = Self::requester_from_auth(auth);
+                self.coordinator.put_object_retention_for_request(
+                    &crate::coordinator::PutObjectRetentionRequest {
+                        object: crate::coordinator::ObjectVersionRequest {
+                            bucket: &bucket,
+                            key: &key,
+                            version_id: vid,
+                            requester,
+                            expected_bucket_owner,
+                        },
+                        retention,
+                        bypass_governance,
+                    },
+                )?;
+                Ok(S3Response::put_object_retention())
             }
-            S3Operation::GetObjectRetention { .. } => {
-                unsupported_s3_operation("GetObjectRetention")
+            S3Operation::GetObjectRetention { bucket, key } => {
+                let vid = parse_version_id(req)?;
+                let requester = Self::requester_from_auth(auth);
+                let retention = self.coordinator.get_object_retention_for_request(
+                    &crate::coordinator::ObjectVersionRequest {
+                        bucket: &bucket,
+                        key: &key,
+                        version_id: vid,
+                        requester,
+                        expected_bucket_owner,
+                    },
+                )?;
+                Ok(S3Response::get_object_retention(retention))
             }
-            S3Operation::PutObjectLegalHold { .. } => {
-                unsupported_s3_operation("PutObjectLegalHold")
+            S3Operation::PutObjectLegalHold { bucket, key } => {
+                validate_content_md5(req)?;
+                let vid = parse_version_id(req)?;
+                let legal_hold = xml::parse_object_legal_hold_xml(&req.body)?;
+                let requester = Self::requester_from_auth(auth);
+                self.coordinator.put_object_legal_hold_for_request(
+                    &crate::coordinator::PutObjectLegalHoldRequest {
+                        object: crate::coordinator::ObjectVersionRequest {
+                            bucket: &bucket,
+                            key: &key,
+                            version_id: vid,
+                            requester,
+                            expected_bucket_owner,
+                        },
+                        legal_hold,
+                    },
+                )?;
+                Ok(S3Response::put_object_legal_hold())
             }
-            S3Operation::GetObjectLegalHold { .. } => {
-                unsupported_s3_operation("GetObjectLegalHold")
+            S3Operation::GetObjectLegalHold { bucket, key } => {
+                let vid = parse_version_id(req)?;
+                let requester = Self::requester_from_auth(auth);
+                let legal_hold = self.coordinator.get_object_legal_hold_for_request(
+                    &crate::coordinator::ObjectVersionRequest {
+                        bucket: &bucket,
+                        key: &key,
+                        version_id: vid,
+                        requester,
+                        expected_bucket_owner,
+                    },
+                )?;
+                Ok(S3Response::get_object_legal_hold(legal_hold))
             }
             S3Operation::PutObjectTagging { bucket, key } => {
                 let vid = parse_version_id(req)?;
@@ -5101,81 +5153,6 @@ mod tests {
         let body = String::from_utf8(get_resp.body).unwrap();
         assert!(body.contains("<ObjectLockEnabled>Enabled</ObjectLockEnabled>"));
         assert!(body.contains("<Days>1</Days>"));
-    }
-
-    #[test]
-    fn object_level_object_lock_operations_are_not_implemented() {
-        let tmp = test_util::tempdir();
-        let fe = setup_frontend(tmp.path());
-
-        let cases = [
-            (
-                new_req(
-                    http::Method::PUT,
-                    "/mybucket/mykey",
-                    "retention",
-                    vec![],
-                    vec![],
-                ),
-                S3Operation::PutObjectRetention {
-                    bucket: "mybucket".to_string(),
-                    key: "mykey".to_string(),
-                },
-                "PutObjectRetention",
-            ),
-            (
-                new_req(
-                    http::Method::GET,
-                    "/mybucket/mykey",
-                    "retention",
-                    vec![],
-                    vec![],
-                ),
-                S3Operation::GetObjectRetention {
-                    bucket: "mybucket".to_string(),
-                    key: "mykey".to_string(),
-                },
-                "GetObjectRetention",
-            ),
-            (
-                new_req(
-                    http::Method::PUT,
-                    "/mybucket/mykey",
-                    "legal-hold",
-                    vec![],
-                    vec![],
-                ),
-                S3Operation::PutObjectLegalHold {
-                    bucket: "mybucket".to_string(),
-                    key: "mykey".to_string(),
-                },
-                "PutObjectLegalHold",
-            ),
-            (
-                new_req(
-                    http::Method::GET,
-                    "/mybucket/mykey",
-                    "legal-hold",
-                    vec![],
-                    vec![],
-                ),
-                S3Operation::GetObjectLegalHold {
-                    bucket: "mybucket".to_string(),
-                    key: "mykey".to_string(),
-                },
-                "GetObjectLegalHold",
-            ),
-        ];
-
-        for (req, op, feature_name) in cases {
-            match fe.dispatch_routed(&req, &test_auth(), op) {
-                Err(ServerError::NotImplemented { feature }) => {
-                    assert_eq!(feature, format!("{feature_name} is not implemented"));
-                }
-                Err(e) => panic!("expected NotImplemented, got {e:?}"),
-                Ok(_) => panic!("expected NotImplemented, got Ok"),
-            }
-        }
     }
 
     #[test]

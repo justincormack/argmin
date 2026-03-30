@@ -784,7 +784,6 @@ fn test_object_lock_get_obj_lock_invalid_bucket() {
 }
 
 #[test]
-#[ignore = "Object Lock / WORM not implemented yet"]
 fn test_object_lock_put_obj_retention() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -817,7 +816,6 @@ fn test_object_lock_put_obj_retention() {
 }
 
 #[test]
-#[ignore = "Object Lock / WORM not implemented yet"]
 fn test_object_lock_put_obj_retention_invalid_bucket() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -850,7 +848,6 @@ fn test_object_lock_put_obj_retention_invalid_bucket() {
 }
 
 #[test]
-#[ignore = "Object Lock / WORM not implemented yet"]
 fn test_object_lock_put_obj_retention_invalid_mode() {
     s3_tests::run(async {
         let bucket = setup_object_lock_bucket().await;
@@ -874,7 +871,6 @@ fn test_object_lock_put_obj_retention_invalid_mode() {
 }
 
 #[test]
-#[ignore = "Object Lock / WORM not implemented yet"]
 fn test_object_lock_get_obj_retention() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -942,7 +938,6 @@ fn test_object_lock_get_obj_retention_iso8601() {
 }
 
 #[test]
-#[ignore = "Object Lock / WORM not implemented yet"]
 fn test_object_lock_get_obj_retention_invalid_bucket() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -971,7 +966,6 @@ fn test_object_lock_get_obj_retention_invalid_bucket() {
 }
 
 #[test]
-#[ignore = "Object Lock / WORM not implemented yet"]
 fn test_object_lock_put_obj_retention_versionid() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -1008,7 +1002,6 @@ fn test_object_lock_put_obj_retention_versionid() {
 }
 
 #[test]
-#[ignore = "Object Lock / WORM not implemented yet"]
 fn test_object_lock_put_obj_retention_override_default_retention() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -1048,7 +1041,6 @@ fn test_object_lock_put_obj_retention_override_default_retention() {
 }
 
 #[test]
-#[ignore = "Object Lock / WORM not implemented yet"]
 fn test_object_lock_put_obj_retention_increase_period() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -1096,7 +1088,6 @@ fn test_object_lock_put_obj_retention_increase_period() {
 }
 
 #[test]
-#[ignore = "Object Lock / WORM not implemented yet"]
 fn test_object_lock_put_obj_retention_shorten_period() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -1134,7 +1125,6 @@ fn test_object_lock_put_obj_retention_shorten_period() {
 }
 
 #[test]
-#[ignore = "Object Lock / WORM not implemented yet"]
 fn test_object_lock_put_obj_retention_shorten_period_bypass() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -1432,7 +1422,6 @@ fn test_object_lock_multi_delete_object_with_retention() {
 }
 
 #[test]
-#[ignore = "Object Lock / WORM not implemented yet"]
 fn test_object_lock_put_legal_hold() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -1462,7 +1451,6 @@ fn test_object_lock_put_legal_hold() {
 }
 
 #[test]
-#[ignore = "Object Lock / WORM not implemented yet"]
 fn test_object_lock_put_legal_hold_invalid_bucket() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -1492,7 +1480,6 @@ fn test_object_lock_put_legal_hold_invalid_bucket() {
 }
 
 #[test]
-#[ignore = "Object Lock / WORM not implemented yet"]
 fn test_object_lock_put_legal_hold_invalid_status() {
     s3_tests::run(async {
         let bucket = setup_object_lock_bucket().await;
@@ -1510,7 +1497,6 @@ fn test_object_lock_put_legal_hold_invalid_status() {
 }
 
 #[test]
-#[ignore = "Object Lock / WORM not implemented yet"]
 fn test_object_lock_get_legal_hold() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -1563,7 +1549,64 @@ fn test_object_lock_get_legal_hold() {
 }
 
 #[test]
-#[ignore = "Object Lock / WORM not implemented yet"]
+fn test_object_lock_put_legal_hold_versionid() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_object_lock_bucket().await;
+        let key = "file1";
+        let version_id1 = put_object_bytes(&bucket, key, b"abc").await;
+        let version_id2 = put_object_bytes(&bucket, key, b"def").await;
+
+        client
+            .put_object_legal_hold()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&version_id1)
+            .legal_hold(legal_hold(ObjectLockLegalHoldStatus::On))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_object_legal_hold()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&version_id2)
+            .legal_hold(legal_hold(ObjectLockLegalHoldStatus::Off))
+            .send()
+            .await
+            .unwrap();
+
+        let response = client
+            .get_object_legal_hold()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&version_id1)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.legal_hold(),
+            Some(&legal_hold(ObjectLockLegalHoldStatus::On))
+        );
+
+        let response = client
+            .get_object_legal_hold()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&version_id2)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.legal_hold(),
+            Some(&legal_hold(ObjectLockLegalHoldStatus::Off))
+        );
+
+        cleanup_object_lock_bucket(&bucket).await;
+    });
+}
+
+#[test]
 fn test_object_lock_get_legal_hold_invalid_bucket() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -1842,21 +1885,20 @@ fn test_object_lock_uploading_obj() {
 }
 
 #[test]
-#[ignore = "Object Lock / WORM not implemented yet"]
 fn test_object_lock_changing_mode_from_governance_with_bypass() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = setup_object_lock_bucket().await;
         let key = "file1";
         let retain_until = future_date(10);
+        let version_id = put_object_bytes(&bucket, key, b"abc").await;
 
         client
-            .put_object()
+            .put_object_retention()
             .bucket(&bucket)
             .key(key)
-            .body(ByteStream::from_static(b"abc"))
-            .object_lock_mode(ObjectLockMode::Governance)
-            .object_lock_retain_until_date(retain_until)
+            .version_id(&version_id)
+            .retention(retention(ObjectLockRetentionMode::Governance, retain_until))
             .send()
             .await
             .unwrap();
@@ -1865,6 +1907,7 @@ fn test_object_lock_changing_mode_from_governance_with_bypass() {
             .put_object_retention()
             .bucket(&bucket)
             .key(key)
+            .version_id(&version_id)
             .retention(retention(ObjectLockRetentionMode::Compliance, retain_until))
             .bypass_governance_retention(true)
             .send()
@@ -1875,6 +1918,7 @@ fn test_object_lock_changing_mode_from_governance_with_bypass() {
             .get_object_retention()
             .bucket(&bucket)
             .key(key)
+            .version_id(&version_id)
             .send()
             .await
             .unwrap();
@@ -1891,58 +1935,20 @@ fn test_object_lock_changing_mode_from_governance_with_bypass() {
 }
 
 #[test]
-#[ignore = "Object Lock / WORM not implemented yet"]
 fn test_object_lock_changing_mode_from_governance_without_bypass() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = setup_object_lock_bucket().await;
         let key = "file1";
         let retain_until = future_date(10);
-        let version_id = client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"abc"))
-            .object_lock_mode(ObjectLockMode::Governance)
-            .object_lock_retain_until_date(retain_until)
-            .send()
-            .await
-            .unwrap()
-            .version_id()
-            .unwrap()
-            .to_string();
+        let version_id = put_object_bytes(&bucket, key, b"abc").await;
 
-        let result = client
+        client
             .put_object_retention()
             .bucket(&bucket)
             .key(key)
-            .retention(retention(ObjectLockRetentionMode::Compliance, retain_until))
-            .send()
-            .await;
-        assert_eq!(err_status(&result), 403);
-        assert_s3_err_code(&result, "AccessDenied");
-
-        delete_version_with_bypass(&bucket, key, &version_id).await;
-        cleanup_object_lock_bucket(&bucket).await;
-    });
-}
-
-#[test]
-#[ignore = "Object Lock / WORM not implemented yet"]
-fn test_object_lock_changing_mode_from_compliance() {
-    s3_tests::run(async {
-        let client = CTX.client();
-        let bucket = setup_object_lock_bucket().await;
-        let key = "file1";
-        let retain_until = future_date(10);
-
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"abc"))
-            .object_lock_mode(ObjectLockMode::Compliance)
-            .object_lock_retain_until_date(retain_until)
+            .version_id(&version_id)
+            .retention(retention(ObjectLockRetentionMode::Governance, retain_until))
             .send()
             .await
             .unwrap();
@@ -1951,6 +1957,58 @@ fn test_object_lock_changing_mode_from_compliance() {
             .put_object_retention()
             .bucket(&bucket)
             .key(key)
+            .version_id(&version_id)
+            .retention(retention(ObjectLockRetentionMode::Compliance, retain_until))
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 403);
+        assert_s3_err_code(&result, "AccessDenied");
+
+        let response = client
+            .get_object_retention()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&version_id)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.retention(),
+            Some(&retention(
+                ObjectLockRetentionMode::Governance,
+                retain_until,
+            ))
+        );
+
+        delete_version_with_bypass(&bucket, key, &version_id).await;
+        cleanup_object_lock_bucket(&bucket).await;
+    });
+}
+
+#[test]
+fn test_object_lock_changing_mode_from_compliance() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_object_lock_bucket().await;
+        let key = "file1";
+        let retain_until = future_date(10);
+        let version_id = put_object_bytes(&bucket, key, b"abc").await;
+
+        client
+            .put_object_retention()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&version_id)
+            .retention(retention(ObjectLockRetentionMode::Compliance, retain_until))
+            .send()
+            .await
+            .unwrap();
+
+        let result = client
+            .put_object_retention()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&version_id)
             .retention(retention(ObjectLockRetentionMode::Governance, retain_until))
             .send()
             .await;

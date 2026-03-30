@@ -2351,6 +2351,110 @@ impl PgMetadataStore for PgStore {
         Ok(())
     }
 
+    fn put_object_retention(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: VersionId,
+        retention: ObjectRetention,
+    ) -> Result<(), MetadataError> {
+        let retain_until =
+            i64::try_from(retention.retain_until_unix_seconds).map_err(|_| MetadataError::Db {
+                context: "put object retention (encode retain-until)",
+                source: rusqlite::Error::ToSqlConversionFailure(Box::from(format!(
+                    "object lock retain-until exceeds SQLite INTEGER: {}",
+                    retention.retain_until_unix_seconds
+                ))),
+            })?;
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE objects \
+                 SET object_lock_retention_mode = ?1, object_lock_retain_until = ?2 \
+                 WHERE bucket = ?3 AND key = ?4 AND version_id = ?5 AND status = ?6",
+                params![
+                    retention.mode as u8,
+                    retain_until,
+                    bucket,
+                    key,
+                    version_id.to_u64() as i64,
+                    ObjectState::Live as u8
+                ],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "put object retention",
+                source: e,
+            })?;
+        if updated == 0 {
+            let status = self
+                .conn
+                .query_row(
+                    "SELECT status FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
+                    params![bucket, key, version_id.to_u64() as i64],
+                    |row| row.get::<_, u8>(0),
+                )
+                .optional()
+                .map_err(|e| MetadataError::Db {
+                    context: "put object retention (check status)",
+                    source: e,
+                })?;
+            return match status {
+                Some(v) if v == ObjectState::DeleteMarker as u8 => {
+                    Err(MetadataError::MethodNotAllowedOnDeleteMarker)
+                }
+                _ => Err(MetadataError::ObjectNotFound),
+            };
+        }
+        Ok(())
+    }
+
+    fn put_object_legal_hold(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: VersionId,
+        legal_hold: StoredLegalHoldStatus,
+    ) -> Result<(), MetadataError> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE objects SET object_lock_legal_hold = ?1 \
+                 WHERE bucket = ?2 AND key = ?3 AND version_id = ?4 AND status = ?5",
+                params![
+                    legal_hold as u8,
+                    bucket,
+                    key,
+                    version_id.to_u64() as i64,
+                    ObjectState::Live as u8
+                ],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "put object legal hold",
+                source: e,
+            })?;
+        if updated == 0 {
+            let status = self
+                .conn
+                .query_row(
+                    "SELECT status FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
+                    params![bucket, key, version_id.to_u64() as i64],
+                    |row| row.get::<_, u8>(0),
+                )
+                .optional()
+                .map_err(|e| MetadataError::Db {
+                    context: "put object legal hold (check status)",
+                    source: e,
+                })?;
+            return match status {
+                Some(v) if v == ObjectState::DeleteMarker as u8 => {
+                    Err(MetadataError::MethodNotAllowedOnDeleteMarker)
+                }
+                _ => Err(MetadataError::ObjectNotFound),
+            };
+        }
+        Ok(())
+    }
+
     fn delete_object_meta(&self, bucket: &str, key: &str) -> Result<(), MetadataError> {
         observability::trace_scope!(
             TRACE_TARGET,
