@@ -3733,7 +3733,7 @@ mod tests {
 
     fn create_test_bucket(coord: &Coordinator, name: &str) {
         coord
-            .create_bucket_for_requester(&crate::coordinator::CreateBucketRequest {
+            .create_bucket(&crate::coordinator::CreateBucketRequest {
                 name,
                 requester: test_requester(),
                 acl: crate::coordinator::CreateBucketAcl::DefaultPrivate,

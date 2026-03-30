@@ -4881,13 +4881,10 @@ impl Coordinator {
 
     // ── Bucket operations ─────────────────────────────────────────────
 
-    pub fn create_bucket_for_requester(
-        &self,
-        req: &CreateBucketRequest<'_>,
-    ) -> Result<(), ServerError> {
+    pub fn create_bucket(&self, req: &CreateBucketRequest<'_>) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
-            "Coordinator::create_bucket_for_requester",
+            "Coordinator::create_bucket",
             "bucket={} object_lock_enabled={}",
             req.name,
             req.object_lock_enabled
@@ -4917,7 +4914,7 @@ impl Coordinator {
         )?;
         match create_outcome {
             BucketCreateOutcome::Created => {
-                self.put_bucket_ownership_controls_for_request(&PutBucketConfigRequest {
+                self.put_bucket_ownership_controls(&PutBucketConfigRequest {
                     bucket: BucketRequest {
                         name: req.name,
                         requester: req.requester.clone(),
@@ -5082,13 +5079,10 @@ impl Coordinator {
         result
     }
 
-    pub fn head_bucket_for_requester(
-        &self,
-        req: &HeadBucketRequest<'_>,
-    ) -> Result<BucketSummary, ServerError> {
+    pub fn head_bucket(&self, req: &HeadBucketRequest<'_>) -> Result<BucketSummary, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
-            "Coordinator::head_bucket_for_requester",
+            "Coordinator::head_bucket",
             "bucket={}",
             req.bucket
         );
@@ -5099,11 +5093,11 @@ impl Coordinator {
         )
     }
 
-    pub fn list_buckets_for_requester(
+    pub fn list_buckets(
         &self,
         req: &ListBucketsRequest,
     ) -> Result<Vec<BucketSummary>, ServerError> {
-        observability::trace_scope!(TRACE_TARGET, "Coordinator::list_buckets_for_requester");
+        observability::trace_scope!(TRACE_TARGET, "Coordinator::list_buckets");
         let owner_principal = Self::requester_principal_required(&req.requester)?;
         let mut out = Vec::new();
         self.pg_topology.for_each_pg(|pg_id| {
@@ -5116,7 +5110,7 @@ impl Coordinator {
         Ok(out)
     }
 
-    pub fn put_bucket_versioning_for_request(
+    pub fn put_bucket_versioning(
         &self,
         req: &PutBucketVersioningRequest<'_>,
     ) -> Result<(), ServerError> {
@@ -5156,7 +5150,7 @@ impl Coordinator {
         Ok(())
     }
 
-    pub fn get_bucket_versioning_for_request(
+    pub fn get_bucket_versioning(
         &self,
         req: &BucketRequest<'_>,
     ) -> Result<BucketVersioningState, ServerError> {
@@ -5174,7 +5168,7 @@ impl Coordinator {
         Ok(info.versioning)
     }
 
-    pub fn put_bucket_object_lock_configuration_for_request(
+    pub fn put_bucket_object_lock_configuration(
         &self,
         req: &PutBucketObjectLockConfigurationRequest<'_>,
     ) -> Result<(), ServerError> {
@@ -5223,7 +5217,7 @@ impl Coordinator {
         Ok(())
     }
 
-    pub fn get_bucket_object_lock_configuration_for_request(
+    pub fn get_bucket_object_lock_configuration(
         &self,
         req: &BucketRequest<'_>,
     ) -> Result<BucketObjectLockConfig, ServerError> {
@@ -5251,7 +5245,7 @@ impl Coordinator {
         Ok(info.object_lock)
     }
 
-    pub fn put_bucket_encryption_for_request(
+    pub fn put_bucket_encryption(
         &self,
         req: &PutBucketEncryptionRequest<'_>,
     ) -> Result<(), ServerError> {
@@ -5283,7 +5277,7 @@ impl Coordinator {
         Ok(())
     }
 
-    pub fn get_bucket_encryption_for_request(
+    pub fn get_bucket_encryption(
         &self,
         req: &BucketRequest<'_>,
     ) -> Result<BucketEncryptionConfig, ServerError> {
@@ -5301,10 +5295,7 @@ impl Coordinator {
         Ok(info.encryption)
     }
 
-    pub fn put_bucket_cors_for_request(
-        &self,
-        req: &PutBucketConfigRequest<'_>,
-    ) -> Result<(), ServerError> {
+    pub fn put_bucket_cors(&self, req: &PutBucketConfigRequest<'_>) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_bucket_cors",
@@ -5328,10 +5319,7 @@ impl Coordinator {
             })
     }
 
-    pub fn get_bucket_cors_for_request(
-        &self,
-        req: &BucketRequest<'_>,
-    ) -> Result<Option<String>, ServerError> {
+    pub fn get_bucket_cors(&self, req: &BucketRequest<'_>) -> Result<Option<String>, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_bucket_cors",
@@ -5346,10 +5334,7 @@ impl Coordinator {
         self.get_bucket_cors_unchecked(req.name)
     }
 
-    pub fn delete_bucket_cors_for_request(
-        &self,
-        req: &BucketRequest<'_>,
-    ) -> Result<(), ServerError> {
+    pub fn delete_bucket_cors(&self, req: &BucketRequest<'_>) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::delete_bucket_cors",
@@ -5370,10 +5355,7 @@ impl Coordinator {
         })
     }
 
-    pub fn put_bucket_tags_for_request(
-        &self,
-        req: &PutBucketConfigRequest<'_>,
-    ) -> Result<(), ServerError> {
+    pub fn put_bucket_tags(&self, req: &PutBucketConfigRequest<'_>) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_bucket_tags",
@@ -5397,10 +5379,7 @@ impl Coordinator {
             })
     }
 
-    pub fn get_bucket_tags_for_request(
-        &self,
-        req: &BucketRequest<'_>,
-    ) -> Result<Option<String>, ServerError> {
+    pub fn get_bucket_tags(&self, req: &BucketRequest<'_>) -> Result<Option<String>, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_bucket_tags",
@@ -5421,10 +5400,7 @@ impl Coordinator {
         })
     }
 
-    pub fn delete_bucket_tags_for_request(
-        &self,
-        req: &BucketRequest<'_>,
-    ) -> Result<(), ServerError> {
+    pub fn delete_bucket_tags(&self, req: &BucketRequest<'_>) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::delete_bucket_tags",
@@ -5445,10 +5421,7 @@ impl Coordinator {
         })
     }
 
-    pub fn put_bucket_policy_for_request(
-        &self,
-        req: &PutBucketConfigRequest<'_>,
-    ) -> Result<(), ServerError> {
+    pub fn put_bucket_policy(&self, req: &PutBucketConfigRequest<'_>) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_bucket_policy",
@@ -5502,7 +5475,7 @@ impl Coordinator {
         Ok(())
     }
 
-    pub fn get_bucket_policy_for_request(
+    pub fn get_bucket_policy(
         &self,
         req: &BucketRequest<'_>,
     ) -> Result<Option<String>, ServerError> {
@@ -5526,10 +5499,7 @@ impl Coordinator {
         })
     }
 
-    pub fn get_bucket_policy_status_for_request(
-        &self,
-        req: &BucketRequest<'_>,
-    ) -> Result<bool, ServerError> {
+    pub fn get_bucket_policy_status(&self, req: &BucketRequest<'_>) -> Result<bool, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_bucket_policy_status",
@@ -5557,10 +5527,7 @@ impl Coordinator {
         Ok(bucket_info.bucket_policy_public)
     }
 
-    pub fn delete_bucket_policy_for_request(
-        &self,
-        req: &BucketRequest<'_>,
-    ) -> Result<(), ServerError> {
+    pub fn delete_bucket_policy(&self, req: &BucketRequest<'_>) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::delete_bucket_policy",
@@ -5592,7 +5559,7 @@ impl Coordinator {
         Ok(())
     }
 
-    pub fn put_bucket_public_access_block_for_request(
+    pub fn put_bucket_public_access_block(
         &self,
         req: &PutBucketConfigRequest<'_>,
     ) -> Result<(), ServerError> {
@@ -5625,7 +5592,7 @@ impl Coordinator {
         Ok(())
     }
 
-    pub fn get_bucket_public_access_block_for_request(
+    pub fn get_bucket_public_access_block(
         &self,
         req: &BucketRequest<'_>,
     ) -> Result<Option<String>, ServerError> {
@@ -5656,7 +5623,7 @@ impl Coordinator {
             })
     }
 
-    pub fn delete_bucket_public_access_block_for_request(
+    pub fn delete_bucket_public_access_block(
         &self,
         req: &BucketRequest<'_>,
     ) -> Result<(), ServerError> {
@@ -5685,7 +5652,7 @@ impl Coordinator {
         Ok(())
     }
 
-    pub fn put_bucket_ownership_controls_for_request(
+    pub fn put_bucket_ownership_controls(
         &self,
         req: &PutBucketConfigRequest<'_>,
     ) -> Result<(), ServerError> {
@@ -5726,7 +5693,7 @@ impl Coordinator {
         Ok(())
     }
 
-    pub fn get_bucket_ownership_controls_for_request(
+    pub fn get_bucket_ownership_controls(
         &self,
         req: &BucketRequest<'_>,
     ) -> Result<Option<String>, ServerError> {
@@ -5752,7 +5719,7 @@ impl Coordinator {
             })
     }
 
-    pub fn delete_bucket_ownership_controls_for_request(
+    pub fn delete_bucket_ownership_controls(
         &self,
         req: &BucketRequest<'_>,
     ) -> Result<(), ServerError> {
@@ -5781,7 +5748,7 @@ impl Coordinator {
         Ok(())
     }
 
-    pub fn get_bucket_acl_for_request(
+    pub fn get_bucket_acl(
         &self,
         req: &BucketRequest<'_>,
     ) -> Result<GetBucketAclResult, ServerError> {
@@ -5802,10 +5769,7 @@ impl Coordinator {
         })
     }
 
-    pub fn put_bucket_acl_for_request(
-        &self,
-        req: &PutBucketAclRequest<'_>,
-    ) -> Result<(), ServerError> {
+    pub fn put_bucket_acl(&self, req: &PutBucketAclRequest<'_>) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_bucket_acl",
@@ -6166,10 +6130,7 @@ impl Coordinator {
 
     // ── Object tagging ──────────────────────────────────────────────
 
-    pub fn put_object_tags_for_request(
-        &self,
-        req: &PutObjectTagsRequest<'_>,
-    ) -> Result<(), ServerError> {
+    pub fn put_object_tags(&self, req: &PutObjectTagsRequest<'_>) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_object_tags",
@@ -6202,7 +6163,7 @@ impl Coordinator {
             .map_err(ServerError::Metadata)
     }
 
-    pub fn put_object_retention_for_request(
+    pub fn put_object_retention(
         &self,
         req: &PutObjectRetentionRequest<'_>,
     ) -> Result<(), ServerError> {
@@ -6260,7 +6221,7 @@ impl Coordinator {
             })
     }
 
-    pub fn get_object_retention_for_request(
+    pub fn get_object_retention(
         &self,
         req: &ObjectVersionRequest<'_>,
     ) -> Result<Option<ObjectRetention>, ServerError> {
@@ -6285,7 +6246,7 @@ impl Coordinator {
         Ok(live.object_lock.retention)
     }
 
-    pub fn put_object_legal_hold_for_request(
+    pub fn put_object_legal_hold(
         &self,
         req: &PutObjectLegalHoldRequest<'_>,
     ) -> Result<(), ServerError> {
@@ -6329,7 +6290,7 @@ impl Coordinator {
             })
     }
 
-    pub fn get_object_legal_hold_for_request(
+    pub fn get_object_legal_hold(
         &self,
         req: &ObjectVersionRequest<'_>,
     ) -> Result<Option<LegalHoldStatus>, ServerError> {
@@ -6354,7 +6315,7 @@ impl Coordinator {
         Ok(live.object_lock.legal_hold.as_legal_hold_status())
     }
 
-    pub fn get_object_tags_for_request(
+    pub fn get_object_tags(
         &self,
         req: &ObjectVersionRequest<'_>,
     ) -> Result<Option<String>, ServerError> {
@@ -6384,10 +6345,7 @@ impl Coordinator {
             .map_err(ServerError::Metadata)
     }
 
-    pub fn delete_object_tags_for_request(
-        &self,
-        req: &ObjectVersionRequest<'_>,
-    ) -> Result<(), ServerError> {
+    pub fn delete_object_tags(&self, req: &ObjectVersionRequest<'_>) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::delete_object_tags",
@@ -6414,7 +6372,7 @@ impl Coordinator {
             .map_err(ServerError::Metadata)
     }
 
-    pub fn get_object_acl_for_request(
+    pub fn get_object_acl(
         &self,
         req: &ObjectVersionRequest<'_>,
     ) -> Result<GetObjectAclResult, ServerError> {
@@ -6446,10 +6404,7 @@ impl Coordinator {
         })
     }
 
-    pub fn put_object_acl_for_request(
-        &self,
-        req: &PutObjectAclRequest<'_>,
-    ) -> Result<VersionId, ServerError> {
+    pub fn put_object_acl(&self, req: &PutObjectAclRequest<'_>) -> Result<VersionId, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_object_acl",
@@ -11647,7 +11602,7 @@ mod tests {
         expected_bucket_owner: Option<&str>,
     ) -> Result<(), ServerError> {
         assert!(expected_bucket_owner.is_none());
-        coord.put_bucket_versioning_for_request(&PutBucketVersioningRequest {
+        coord.put_bucket_versioning(&PutBucketVersioningRequest {
             bucket: bucket_request(name, requester),
             state,
         })
@@ -11660,7 +11615,7 @@ mod tests {
         expected_bucket_owner: Option<&str>,
     ) -> Result<BucketVersioningState, ServerError> {
         assert!(expected_bucket_owner.is_none());
-        coord.get_bucket_versioning_for_request(&bucket_request(name, requester))
+        coord.get_bucket_versioning(&bucket_request(name, requester))
     }
 
     fn put_bucket_object_lock_configuration_test(
@@ -11671,12 +11626,10 @@ mod tests {
         expected_bucket_owner: Option<&str>,
     ) -> Result<(), ServerError> {
         assert!(expected_bucket_owner.is_none());
-        coord.put_bucket_object_lock_configuration_for_request(
-            &PutBucketObjectLockConfigurationRequest {
-                bucket: bucket_request(name, requester),
-                config,
-            },
-        )
+        coord.put_bucket_object_lock_configuration(&PutBucketObjectLockConfigurationRequest {
+            bucket: bucket_request(name, requester),
+            config,
+        })
     }
 
     fn get_bucket_object_lock_configuration_test(
@@ -11686,7 +11639,7 @@ mod tests {
         expected_bucket_owner: Option<&str>,
     ) -> Result<BucketObjectLockConfig, ServerError> {
         assert!(expected_bucket_owner.is_none());
-        coord.get_bucket_object_lock_configuration_for_request(&bucket_request(name, requester))
+        coord.get_bucket_object_lock_configuration(&bucket_request(name, requester))
     }
 
     fn put_bucket_encryption_test(
@@ -11697,7 +11650,7 @@ mod tests {
         expected_bucket_owner: Option<&str>,
     ) -> Result<(), ServerError> {
         assert!(expected_bucket_owner.is_none());
-        coord.put_bucket_encryption_for_request(&PutBucketEncryptionRequest {
+        coord.put_bucket_encryption(&PutBucketEncryptionRequest {
             bucket: bucket_request(name, requester),
             config,
         })
@@ -11710,7 +11663,7 @@ mod tests {
         expected_bucket_owner: Option<&str>,
     ) -> Result<BucketEncryptionConfig, ServerError> {
         assert!(expected_bucket_owner.is_none());
-        coord.get_bucket_encryption_for_request(&bucket_request(name, requester))
+        coord.get_bucket_encryption(&bucket_request(name, requester))
     }
 
     fn put_bucket_policy_test(
@@ -11721,7 +11674,7 @@ mod tests {
         expected_bucket_owner: Option<&str>,
     ) -> Result<(), ServerError> {
         assert!(expected_bucket_owner.is_none());
-        coord.put_bucket_policy_for_request(&put_bucket_config_request(name, policy, requester))
+        coord.put_bucket_policy(&put_bucket_config_request(name, policy, requester))
     }
 
     fn get_bucket_policy_test(
@@ -11731,7 +11684,7 @@ mod tests {
         expected_bucket_owner: Option<&str>,
     ) -> Result<Option<String>, ServerError> {
         assert!(expected_bucket_owner.is_none());
-        coord.get_bucket_policy_for_request(&bucket_request(name, requester))
+        coord.get_bucket_policy(&bucket_request(name, requester))
     }
 
     fn delete_bucket_policy_test(
@@ -11741,7 +11694,7 @@ mod tests {
         expected_bucket_owner: Option<&str>,
     ) -> Result<(), ServerError> {
         assert!(expected_bucket_owner.is_none());
-        coord.delete_bucket_policy_for_request(&bucket_request(name, requester))
+        coord.delete_bucket_policy(&bucket_request(name, requester))
     }
 
     fn get_bucket_policy_status_test(
@@ -11751,7 +11704,7 @@ mod tests {
         expected_bucket_owner: Option<&str>,
     ) -> Result<bool, ServerError> {
         assert!(expected_bucket_owner.is_none());
-        coord.get_bucket_policy_status_for_request(&bucket_request(name, requester))
+        coord.get_bucket_policy_status(&bucket_request(name, requester))
     }
 
     fn put_bucket_public_access_block_test(
@@ -11762,9 +11715,7 @@ mod tests {
         expected_bucket_owner: Option<&str>,
     ) -> Result<(), ServerError> {
         assert!(expected_bucket_owner.is_none());
-        coord.put_bucket_public_access_block_for_request(&put_bucket_config_request(
-            name, config, requester,
-        ))
+        coord.put_bucket_public_access_block(&put_bucket_config_request(name, config, requester))
     }
 
     fn get_bucket_public_access_block_test(
@@ -11774,7 +11725,7 @@ mod tests {
         expected_bucket_owner: Option<&str>,
     ) -> Result<Option<String>, ServerError> {
         assert!(expected_bucket_owner.is_none());
-        coord.get_bucket_public_access_block_for_request(&bucket_request(name, requester))
+        coord.get_bucket_public_access_block(&bucket_request(name, requester))
     }
 
     fn put_bucket_ownership_controls_test(
@@ -11785,9 +11736,7 @@ mod tests {
         expected_bucket_owner: Option<&str>,
     ) -> Result<(), ServerError> {
         assert!(expected_bucket_owner.is_none());
-        coord.put_bucket_ownership_controls_for_request(&put_bucket_config_request(
-            name, config, requester,
-        ))
+        coord.put_bucket_ownership_controls(&put_bucket_config_request(name, config, requester))
     }
 
     fn get_bucket_ownership_controls_test(
@@ -11797,7 +11746,7 @@ mod tests {
         expected_bucket_owner: Option<&str>,
     ) -> Result<Option<String>, ServerError> {
         assert!(expected_bucket_owner.is_none());
-        coord.get_bucket_ownership_controls_for_request(&bucket_request(name, requester))
+        coord.get_bucket_ownership_controls(&bucket_request(name, requester))
     }
 
     fn put_bucket_acl_test(
@@ -11808,7 +11757,7 @@ mod tests {
         expected_bucket_owner: Option<&str>,
     ) -> Result<(), ServerError> {
         assert!(expected_bucket_owner.is_none());
-        coord.put_bucket_acl_for_request(&PutBucketAclRequest {
+        coord.put_bucket_acl(&PutBucketAclRequest {
             bucket: bucket_request(name, requester),
             acl: PutBucketAclInput::Grants(acl_grants),
         })
@@ -11822,7 +11771,7 @@ mod tests {
         expected_bucket_owner: Option<&str>,
     ) -> Result<(), ServerError> {
         assert!(expected_bucket_owner.is_none());
-        coord.put_bucket_acl_for_request(&PutBucketAclRequest {
+        coord.put_bucket_acl(&PutBucketAclRequest {
             bucket: bucket_request(name, requester),
             acl: PutBucketAclInput::Canned(acl),
         })
@@ -11835,7 +11784,7 @@ mod tests {
         expected_bucket_owner: Option<&str>,
     ) -> Result<GetBucketAclResult, ServerError> {
         assert!(expected_bucket_owner.is_none());
-        coord.get_bucket_acl_for_request(&bucket_request(name, requester))
+        coord.get_bucket_acl(&bucket_request(name, requester))
     }
 
     fn put_object_tags_test(
@@ -11848,7 +11797,7 @@ mod tests {
         expected_bucket_owner: Option<&str>,
     ) -> Result<(), ServerError> {
         assert!(expected_bucket_owner.is_none());
-        coord.put_object_tags_for_request(&PutObjectTagsRequest {
+        coord.put_object_tags(&PutObjectTagsRequest {
             object: object_version_request(bucket, key, version_id, requester),
             tags,
         })
@@ -11863,9 +11812,7 @@ mod tests {
         expected_bucket_owner: Option<&str>,
     ) -> Result<Option<String>, ServerError> {
         assert!(expected_bucket_owner.is_none());
-        coord.get_object_tags_for_request(&object_version_request(
-            bucket, key, version_id, requester,
-        ))
+        coord.get_object_tags(&object_version_request(bucket, key, version_id, requester))
     }
 
     fn put_object_retention_test(
@@ -11877,7 +11824,7 @@ mod tests {
         bypass_governance: bool,
         requester: Requester,
     ) -> Result<(), ServerError> {
-        coord.put_object_retention_for_request(&PutObjectRetentionRequest {
+        coord.put_object_retention(&PutObjectRetentionRequest {
             object: object_version_request(bucket, key, version_id, requester),
             retention,
             bypass_governance,
@@ -11891,9 +11838,7 @@ mod tests {
         version_id: Option<VersionId>,
         requester: Requester,
     ) -> Result<Option<ObjectRetention>, ServerError> {
-        coord.get_object_retention_for_request(&object_version_request(
-            bucket, key, version_id, requester,
-        ))
+        coord.get_object_retention(&object_version_request(bucket, key, version_id, requester))
     }
 
     fn put_object_legal_hold_test(
@@ -11904,7 +11849,7 @@ mod tests {
         legal_hold: LegalHoldStatus,
         requester: Requester,
     ) -> Result<(), ServerError> {
-        coord.put_object_legal_hold_for_request(&PutObjectLegalHoldRequest {
+        coord.put_object_legal_hold(&PutObjectLegalHoldRequest {
             object: object_version_request(bucket, key, version_id, requester),
             legal_hold,
         })
@@ -11917,9 +11862,7 @@ mod tests {
         version_id: Option<VersionId>,
         requester: Requester,
     ) -> Result<Option<LegalHoldStatus>, ServerError> {
-        coord.get_object_legal_hold_for_request(&object_version_request(
-            bucket, key, version_id, requester,
-        ))
+        coord.get_object_legal_hold(&object_version_request(bucket, key, version_id, requester))
     }
 
     fn put_object_acl_test(
@@ -11932,7 +11875,7 @@ mod tests {
         expected_bucket_owner: Option<&str>,
     ) -> Result<VersionId, ServerError> {
         assert!(expected_bucket_owner.is_none());
-        coord.put_object_acl_for_request(&PutObjectAclRequest {
+        coord.put_object_acl(&PutObjectAclRequest {
             object: object_version_request(bucket, key, version_id, requester),
             acl: PutObjectAclInput::Grants(acl_grants),
         })
@@ -11948,7 +11891,7 @@ mod tests {
         expected_bucket_owner: Option<&str>,
     ) -> Result<VersionId, ServerError> {
         assert!(expected_bucket_owner.is_none());
-        coord.put_object_acl_for_request(&PutObjectAclRequest {
+        coord.put_object_acl(&PutObjectAclRequest {
             object: object_version_request(bucket, key, version_id, requester),
             acl: PutObjectAclInput::Canned(acl),
         })
@@ -11963,8 +11906,7 @@ mod tests {
         expected_bucket_owner: Option<&str>,
     ) -> Result<GetObjectAclResult, ServerError> {
         assert!(expected_bucket_owner.is_none());
-        coord
-            .get_object_acl_for_request(&object_version_request(bucket, key, version_id, requester))
+        coord.get_object_acl(&object_version_request(bucket, key, version_id, requester))
     }
 
     fn wait_until_bucket_gone(coord: &Coordinator, name: &str) {
@@ -12196,7 +12138,7 @@ mod tests {
 
         // List
         let buckets = coord
-            .list_buckets_for_requester(&ListBucketsRequest {
+            .list_buckets(&ListBucketsRequest {
                 requester: Requester::principal("default-owner"),
             })
             .unwrap();
@@ -12222,7 +12164,7 @@ mod tests {
 
         // Only one bucket should exist
         let buckets = coord
-            .list_buckets_for_requester(&ListBucketsRequest {
+            .list_buckets(&ListBucketsRequest {
                 requester: Requester::principal("default-owner"),
             })
             .unwrap();
@@ -12256,7 +12198,7 @@ mod tests {
             .unwrap();
 
         let a = coord
-            .list_buckets_for_requester(&ListBucketsRequest {
+            .list_buckets(&ListBucketsRequest {
                 requester: Requester::principal("owner-a"),
             })
             .unwrap();
@@ -12265,7 +12207,7 @@ mod tests {
         assert_eq!(a[0].owner_principal, "owner-a");
 
         let b = coord
-            .list_buckets_for_requester(&ListBucketsRequest {
+            .list_buckets(&ListBucketsRequest {
                 requester: Requester::principal("owner-b"),
             })
             .unwrap();
@@ -12292,7 +12234,7 @@ mod tests {
             .unwrap();
 
         let names: Vec<String> = coord
-            .list_buckets_for_requester(&ListBucketsRequest {
+            .list_buckets(&ListBucketsRequest {
                 requester: Requester::principal("default-owner"),
             })
             .unwrap()
@@ -12303,12 +12245,12 @@ mod tests {
     }
 
     #[test]
-    fn list_buckets_for_requester_rejects_anonymous() {
+    fn list_buckets_rejects_anonymous() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         let err = coord
-            .list_buckets_for_requester(&ListBucketsRequest {
+            .list_buckets(&ListBucketsRequest {
                 requester: Requester::anonymous(),
             })
             .unwrap_err();
@@ -12316,12 +12258,12 @@ mod tests {
     }
 
     #[test]
-    fn create_bucket_for_requester_sets_ownership_controls() {
+    fn create_bucket_sets_ownership_controls() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         coord
-            .create_bucket_for_requester(&CreateBucketRequest {
+            .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::principal("owner-a"),
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -12347,7 +12289,7 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord
-            .create_bucket_for_requester(&CreateBucketRequest {
+            .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::principal("owner-a"),
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -12388,7 +12330,7 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord
-            .create_bucket_for_requester(&CreateBucketRequest {
+            .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::principal("owner-a"),
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -12409,7 +12351,7 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord
-            .create_bucket_for_requester(&CreateBucketRequest {
+            .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::principal("owner-a"),
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -12442,7 +12384,7 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord
-            .create_bucket_for_requester(&CreateBucketRequest {
+            .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::principal("owner-a"),
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -12475,7 +12417,7 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord
-            .create_bucket_for_requester(&CreateBucketRequest {
+            .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::principal("owner-a"),
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -12503,7 +12445,7 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord
-            .create_bucket_for_requester(&CreateBucketRequest {
+            .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::principal("owner-a"),
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -12531,7 +12473,7 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         coord
-            .create_bucket_for_requester(&CreateBucketRequest {
+            .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::principal("owner-a"),
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -12901,14 +12843,14 @@ mod tests {
     }
 
     #[test]
-    fn create_bucket_for_requester_persists_explicit_owner_canonical_id() {
+    fn create_bucket_persists_explicit_owner_canonical_id() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         let owner_canonical_id = CanonicalUserId::from_principal("custom-account-id");
         let owner = AccountIdentity::new("owner-a", owner_canonical_id.clone(), "Owner A");
 
         coord
-            .create_bucket_for_requester(&CreateBucketRequest {
+            .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::authenticated(owner),
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -12931,7 +12873,7 @@ mod tests {
         let requester = Requester::authenticated(owner.clone());
 
         coord
-            .create_bucket_for_requester(&CreateBucketRequest {
+            .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: requester.clone(),
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -12979,7 +12921,7 @@ mod tests {
         let requester = Requester::authenticated(owner.clone());
 
         coord
-            .create_bucket_for_requester(&CreateBucketRequest {
+            .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: requester.clone(),
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -13046,7 +12988,7 @@ mod tests {
             OwnerIdentity::new(owner.principal().to_string(), owner_canonical_id.clone());
 
         coord
-            .create_bucket_for_requester(&CreateBucketRequest {
+            .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: requester.clone(),
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -13140,7 +13082,7 @@ mod tests {
         );
 
         coord
-            .create_bucket_for_requester(&CreateBucketRequest {
+            .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::authenticated(bucket_owner.clone()),
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -13199,12 +13141,12 @@ mod tests {
     }
 
     #[test]
-    fn create_bucket_for_requester_idempotent_create_does_not_overwrite_ownership_controls() {
+    fn create_bucket_idempotent_create_does_not_overwrite_ownership_controls() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         coord
-            .create_bucket_for_requester(&CreateBucketRequest {
+            .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::principal("owner-a"),
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -13214,7 +13156,7 @@ mod tests {
             .unwrap();
 
         coord
-            .create_bucket_for_requester(&CreateBucketRequest {
+            .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::principal("owner-a"),
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -13236,12 +13178,12 @@ mod tests {
     }
 
     #[test]
-    fn create_bucket_for_requester_rejects_public_read_with_owner_enforced() {
+    fn create_bucket_rejects_public_read_with_owner_enforced() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         let err = coord
-            .create_bucket_for_requester(&CreateBucketRequest {
+            .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::principal("owner-a"),
                 acl: CreateBucketAcl::Canned(BucketAcl::PublicRead),
@@ -13256,12 +13198,12 @@ mod tests {
     }
 
     #[test]
-    fn create_bucket_for_requester_allows_default_private_with_owner_enforced() {
+    fn create_bucket_allows_default_private_with_owner_enforced() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         coord
-            .create_bucket_for_requester(&CreateBucketRequest {
+            .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::principal("owner-a"),
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -13282,12 +13224,12 @@ mod tests {
     }
 
     #[test]
-    fn create_bucket_for_requester_rejects_explicit_private_with_owner_enforced() {
+    fn create_bucket_rejects_explicit_private_with_owner_enforced() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
         let err = coord
-            .create_bucket_for_requester(&CreateBucketRequest {
+            .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::principal("owner-a"),
                 acl: CreateBucketAcl::Canned(BucketAcl::Private),
@@ -13302,7 +13244,7 @@ mod tests {
     }
 
     #[test]
-    fn create_bucket_for_requester_persists_explicit_grants() {
+    fn create_bucket_persists_explicit_grants() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         let owner = AccountIdentity::new(
@@ -13319,7 +13261,7 @@ mod tests {
         let writer_requester = Requester::authenticated(writer.clone());
 
         coord
-            .create_bucket_for_requester(&CreateBucketRequest {
+            .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: owner_requester.clone(),
                 acl: CreateBucketAcl::Grants(AclGrants::new(vec![
@@ -13414,7 +13356,7 @@ mod tests {
             .unwrap();
 
         let names: Vec<String> = coord
-            .list_buckets_for_requester(&ListBucketsRequest {
+            .list_buckets(&ListBucketsRequest {
                 requester: Requester::principal("default-owner"),
             })
             .unwrap()
@@ -16910,7 +16852,7 @@ mod tests {
         let grantee_requester = Requester::authenticated(grantee.clone());
 
         coord
-            .create_bucket_for_requester(&CreateBucketRequest {
+            .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: owner_requester.clone(),
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -16996,7 +16938,7 @@ mod tests {
         let writer_requester = Requester::authenticated(writer.clone());
 
         coord
-            .create_bucket_for_requester(&CreateBucketRequest {
+            .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: owner_requester.clone(),
                 acl: CreateBucketAcl::Grants(AclGrants::new(vec![AclGrant::new(
@@ -17063,7 +17005,7 @@ mod tests {
         let owner_requester = Requester::authenticated(owner);
 
         coord
-            .create_bucket_for_requester(&CreateBucketRequest {
+            .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: owner_requester.clone(),
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -17115,7 +17057,7 @@ mod tests {
         let owner_requester = Requester::authenticated(owner);
 
         coord
-            .create_bucket_for_requester(&CreateBucketRequest {
+            .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: owner_requester.clone(),
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -18251,7 +18193,7 @@ mod tests {
         let owner_requester = Requester::principal("owner-a");
 
         admin
-            .create_bucket_for_requester(&CreateBucketRequest {
+            .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::authenticated(owner),
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -18835,7 +18777,7 @@ mod tests {
             .unwrap();
 
         let err = coord
-            .head_bucket_for_requester(&HeadBucketRequest {
+            .head_bucket(&HeadBucketRequest {
                 bucket: "bucket",
                 requester: Requester::principal("other-user"),
             })
@@ -18852,7 +18794,7 @@ mod tests {
             .unwrap();
 
         let info = coord
-            .head_bucket_for_requester(&HeadBucketRequest {
+            .head_bucket(&HeadBucketRequest {
                 bucket: "bucket",
                 requester: Requester::principal("111122223333"),
             })
@@ -18870,7 +18812,7 @@ mod tests {
             .unwrap();
 
         let info = coord
-            .head_bucket_for_requester(&HeadBucketRequest {
+            .head_bucket(&HeadBucketRequest {
                 bucket: "bucket",
                 requester: Requester::principal("111122223333"),
             })
@@ -18889,7 +18831,7 @@ mod tests {
             .unwrap();
 
         let info = coord
-            .head_bucket_for_requester(&HeadBucketRequest {
+            .head_bucket(&HeadBucketRequest {
                 bucket: "bucket",
                 requester: Requester::anonymous(),
             })
@@ -19975,7 +19917,7 @@ mod tests {
         let writer_requester = Requester::authenticated(writer.clone());
 
         coord
-            .create_bucket_for_requester(&CreateBucketRequest {
+            .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: owner_requester.clone(),
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -21105,7 +21047,7 @@ mod tests {
         let requester = Requester::authenticated(owner);
 
         coord
-            .create_bucket_for_requester(&CreateBucketRequest {
+            .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: requester.clone(),
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -21212,7 +21154,7 @@ mod tests {
         let requester = Requester::authenticated(owner);
 
         coord
-            .create_bucket_for_requester(&CreateBucketRequest {
+            .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: requester.clone(),
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -21344,7 +21286,7 @@ mod tests {
         let owner = AccountIdentity::from_principal("owner-a");
 
         coord
-            .create_bucket_for_requester(&CreateBucketRequest {
+            .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::authenticated(owner),
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -21445,7 +21387,7 @@ mod tests {
         let owner = AccountIdentity::from_principal("owner-a");
 
         coord
-            .create_bucket_for_requester(&CreateBucketRequest {
+            .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::authenticated(owner),
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -21602,7 +21544,7 @@ mod tests {
         let owner = AccountIdentity::from_principal("owner-a");
 
         coord
-            .create_bucket_for_requester(&CreateBucketRequest {
+            .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::authenticated(owner),
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -21634,7 +21576,7 @@ mod tests {
         let owner_requester = Requester::principal("owner-a");
 
         coord
-            .create_bucket_for_requester(&CreateBucketRequest {
+            .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::authenticated(owner),
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -21701,7 +21643,7 @@ mod tests {
         let now = Coordinator::current_unix_seconds().unwrap();
 
         coord
-            .create_bucket_for_requester(&CreateBucketRequest {
+            .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::authenticated(owner),
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -21791,7 +21733,7 @@ mod tests {
         let now = Coordinator::current_unix_seconds().unwrap();
 
         coord
-            .create_bucket_for_requester(&CreateBucketRequest {
+            .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::authenticated(owner),
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -21860,7 +21802,7 @@ mod tests {
         let owner_requester = Requester::principal("owner-a");
 
         coord
-            .create_bucket_for_requester(&CreateBucketRequest {
+            .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::authenticated(owner),
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -22186,7 +22128,7 @@ mod tests {
         let now = Coordinator::current_unix_seconds().unwrap();
 
         coord
-            .create_bucket_for_requester(&CreateBucketRequest {
+            .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::authenticated(owner),
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -22253,7 +22195,7 @@ mod tests {
         let now = Coordinator::current_unix_seconds().unwrap();
 
         coord
-            .create_bucket_for_requester(&CreateBucketRequest {
+            .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::authenticated(AccountIdentity::from_principal("owner-a")),
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -22346,7 +22288,7 @@ mod tests {
         let requester = Requester::principal("owner-a");
 
         coord
-            .create_bucket_for_requester(&CreateBucketRequest {
+            .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::authenticated(owner),
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -22442,7 +22384,7 @@ mod tests {
         let requester = Requester::principal("owner-a");
 
         coord
-            .create_bucket_for_requester(&CreateBucketRequest {
+            .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::authenticated(owner),
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -24228,7 +24170,7 @@ mod tests {
         );
 
         coord
-            .create_bucket_for_requester(&CreateBucketRequest {
+            .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::authenticated(bucket_owner.clone()),
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -24317,7 +24259,7 @@ mod tests {
         let other_requester = Requester::authenticated(other);
 
         coord
-            .create_bucket_for_requester(&CreateBucketRequest {
+            .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: owner_requester.clone(),
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -24467,7 +24409,7 @@ mod tests {
         let writer_requester = Requester::authenticated(writer.clone());
 
         coord
-            .create_bucket_for_requester(&CreateBucketRequest {
+            .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: owner_requester.clone(),
                 acl: CreateBucketAcl::DefaultPrivate,
