@@ -4630,7 +4630,14 @@ mod tests {
             })
             .unwrap();
 
-        let bucket = fe.coordinator.head_bucket("mybucket").unwrap();
+        let bucket = fe
+            .coordinator
+            .head_bucket_for_requester(&crate::coordinator::HeadBucketRequest {
+                bucket: "mybucket",
+                requester: crate::coordinator::Requester::authenticated(account.clone()),
+                expected_bucket_owner: None,
+            })
+            .unwrap();
         assert_eq!(bucket.owner_canonical_id, owner_canonical_id);
 
         let auth = auth::AuthContext {
