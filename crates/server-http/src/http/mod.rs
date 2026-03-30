@@ -4601,6 +4601,18 @@ mod tests {
         }
     }
 
+    fn create_test_bucket(coord: &Coordinator, name: &str) {
+        coord
+            .create_bucket_for_requester(&crate::coordinator::CreateBucketRequest {
+                name,
+                requester: crate::coordinator::Requester::principal("testuser"),
+                acl: crate::coordinator::CreateBucketAcl::DefaultPrivate,
+                ownership: crate::coordinator::BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
+            })
+            .unwrap();
+    }
+
     #[test]
     fn list_buckets_uses_account_display_name_and_explicit_canonical_id() {
         let tmp = test_util::tempdir();
@@ -4836,9 +4848,7 @@ mod tests {
     fn put_bucket_acl_accepts_header_grants_and_renders_them() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
         let canonical_id = s3_types::CanonicalUserId::from_principal("grantee-a");
 
         let put_req = new_req(
@@ -4878,9 +4888,7 @@ mod tests {
     fn bucket_policy_put_get_delete_round_trip() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         let policy = "{\"Version\":\"2012-10-17\",\"Statement\":[]}";
         let put_req = new_req(
@@ -4947,9 +4955,7 @@ mod tests {
     fn put_bucket_policy_rejects_invalid_utf8() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         let put_req = new_req(
             http::Method::PUT,
@@ -4977,9 +4983,7 @@ mod tests {
     fn put_bucket_policy_rejects_invalid_json() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         let put_req = new_req(http::Method::PUT, "/", "policy", vec![], b"{".to_vec());
         match fe.dispatch_routed(
@@ -5001,9 +5005,7 @@ mod tests {
     fn get_bucket_policy_status_renders_xml() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
         fe.coordinator
             .put_bucket_policy(
                 "mybucket",
@@ -5083,9 +5085,7 @@ mod tests {
     fn put_bucket_acl_rejects_authenticated_users_header_grant() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         let put_req = new_req(
             http::Method::PUT,
@@ -5243,9 +5243,7 @@ mod tests {
     fn put_object_acl_rejects_write_header_grant() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
         let metadata = crate::metadata_blob::MetadataBlob::default();
         let system_metadata = server_core::system_metadata::SystemMetadata::default();
         fe.coordinator
@@ -5306,9 +5304,7 @@ mod tests {
     fn upload_part_missing_upload_id() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         let req = make_req("partNumber=1");
         let op = S3Operation::UploadPart {
@@ -5326,9 +5322,7 @@ mod tests {
     fn upload_part_invalid_part_number() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         let req = make_req("partNumber=abc&uploadId=xyz");
         let op = S3Operation::UploadPart {
@@ -5346,9 +5340,7 @@ mod tests {
     fn put_object_invalid_content_md5_rejected() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         let req = new_req(
             http::Method::PUT,
@@ -5372,9 +5364,7 @@ mod tests {
     fn put_object_bad_content_md5_rejected() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         let req = new_req(
             http::Method::PUT,
@@ -5401,9 +5391,7 @@ mod tests {
     fn put_object_invalid_acl_rejected() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         let req = new_req(
             http::Method::PUT,
@@ -5430,9 +5418,7 @@ mod tests {
     fn upload_part_invalid_content_md5_rejected() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
         let upload_id = create_upload_with_checksum(&fe, "mybucket", "mykey", None);
 
         let req = new_req(
@@ -5457,9 +5443,7 @@ mod tests {
     fn upload_part_bad_content_md5_rejected() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
         let upload_id = create_upload_with_checksum(&fe, "mybucket", "mykey", None);
 
         let req = new_req(
@@ -5489,9 +5473,7 @@ mod tests {
     fn complete_multipart_missing_upload_id() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         let req = make_req("");
         let op = S3Operation::CompleteMultipartUpload {
@@ -5509,9 +5491,7 @@ mod tests {
     fn complete_multipart_multiple_checksum_headers_rejected() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         let upload_id = create_upload_with_checksum(&fe, "mybucket", "k", Some("CRC32"));
         let xml = "<CompleteMultipartUpload>\
@@ -5543,9 +5523,7 @@ mod tests {
     fn complete_multipart_algorithm_header_contradicts_value_header() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         let upload_id = create_upload_with_checksum(&fe, "mybucket", "k", Some("CRC32"));
         let xml = "<CompleteMultipartUpload>\
@@ -5578,9 +5556,7 @@ mod tests {
     fn complete_multipart_duplicate_same_checksum_header_rejected() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         let upload_id = create_upload_with_checksum(&fe, "mybucket", "k", Some("CRC32"));
         let xml = "<CompleteMultipartUpload>\
@@ -5612,9 +5588,7 @@ mod tests {
     fn complete_multipart_duplicate_checksum_algorithm_header_rejected() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         let upload_id = create_upload_with_checksum(&fe, "mybucket", "k", Some("CRC32"));
         let xml = "<CompleteMultipartUpload>\
@@ -5648,9 +5622,7 @@ mod tests {
         // Upload created with CRC32 but complete sends SHA256 checksum header.
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         let upload_id = create_upload_with_checksum(&fe, "mybucket", "k", Some("CRC32"));
         // Upload a part so complete has something to work with.
@@ -5706,9 +5678,7 @@ mod tests {
     fn abort_multipart_missing_upload_id() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         let req = make_req("");
         let op = S3Operation::AbortMultipartUpload {
@@ -5728,9 +5698,7 @@ mod tests {
     fn list_parts_missing_upload_id() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         let req = make_req("");
         let op = S3Operation::ListParts {
@@ -5748,9 +5716,7 @@ mod tests {
     fn list_parts_invalid_part_number_marker() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         let req = make_req("uploadId=abc&part-number-marker=xyz");
         let op = S3Operation::ListParts {
@@ -5768,9 +5734,7 @@ mod tests {
     fn list_parts_invalid_max_parts() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         let req = make_req("uploadId=abc&max-parts=notanumber");
         let op = S3Operation::ListParts {
@@ -5790,9 +5754,7 @@ mod tests {
     fn get_object_attributes_invalid_max_parts() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         let req = new_req(
             http::Method::GET,
@@ -5822,9 +5784,7 @@ mod tests {
     fn get_object_attributes_invalid_part_number_marker() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         let req = new_req(
             http::Method::GET,
@@ -5856,9 +5816,7 @@ mod tests {
     fn multipart_upload_e2e_quoted_etags() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         // 1. CreateMultipartUpload
         let req = make_req("uploads");
@@ -5936,9 +5894,7 @@ mod tests {
     fn list_multipart_uploads_invalid_max_uploads() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         let req = make_req("uploads&max-uploads=abc");
         let op = S3Operation::ListMultipartUploads {
@@ -5957,9 +5913,7 @@ mod tests {
     fn create_multipart_rejects_acl_on_bucket_owner_enforced_bucket() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
         fe.coordinator
             .put_bucket_ownership_controls(
                 "mybucket",
@@ -5991,9 +5945,7 @@ mod tests {
     fn create_multipart_invalid_checksum_algorithm() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         let req = new_req(
             http::Method::GET,
@@ -6017,9 +5969,7 @@ mod tests {
     fn create_multipart_invalid_checksum_type() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         let req = new_req(
             http::Method::GET,
@@ -6046,9 +5996,7 @@ mod tests {
     fn create_multipart_checksum_type_without_algorithm() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         let req = new_req(
             http::Method::GET,
@@ -6072,9 +6020,7 @@ mod tests {
     fn create_multipart_sha_full_object_rejected() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         let req = new_req(
             http::Method::GET,
@@ -6101,9 +6047,7 @@ mod tests {
     fn create_multipart_with_checksum_returns_fields_in_xml() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         let req = new_req(
             http::Method::GET,
@@ -6136,9 +6080,7 @@ mod tests {
     fn create_multipart_crc32_composite_accepted() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         let req = new_req(
             http::Method::GET,
@@ -6171,9 +6113,7 @@ mod tests {
     fn create_multipart_algorithm_only_defaults_type() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         let req = new_req(
             http::Method::GET,
@@ -6229,9 +6169,7 @@ mod tests {
     fn upload_part_bad_digest() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         let upload_id = create_upload_with_checksum(&fe, "mybucket", "k", Some("CRC32"));
         let req = new_req(
@@ -6259,9 +6197,7 @@ mod tests {
     fn upload_part_multiple_checksum_headers_rejected() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         let upload_id = create_upload_with_checksum(&fe, "mybucket", "k", Some("CRC32"));
         let req = new_req(
@@ -6289,9 +6225,7 @@ mod tests {
     fn upload_part_algorithm_mismatch_rejected() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         // Upload configured with CRC32 but part sends SHA256 checksum.
         let upload_id = create_upload_with_checksum(&fe, "mybucket", "k", Some("CRC32"));
@@ -6319,9 +6253,7 @@ mod tests {
 
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         let upload_id = create_upload_with_checksum(&fe, "mybucket", "k", Some("CRC32"));
         let data = b"hello world";
@@ -6357,9 +6289,7 @@ mod tests {
         // AWS rejects this with "Checksum Type mismatch".
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         let upload_id = create_upload_with_checksum(&fe, "mybucket", "k", Some("CRC32"));
         let data = b"test data";
@@ -6393,9 +6323,7 @@ mod tests {
 
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         let upload_id = create_upload_with_checksum(&fe, "mybucket", "k", Some("CRC32"));
 
@@ -6449,9 +6377,7 @@ mod tests {
         use base64::Engine;
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         // Upload created without checksum algorithm.
         // AWS SDK v2+ sends CRC32 by default — it should be accepted and verified.
@@ -6478,9 +6404,7 @@ mod tests {
     fn upload_part_algorithm_header_contradicts_value_header() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         let upload_id = create_upload_with_checksum(&fe, "mybucket", "k", Some("CRC32"));
         let req = new_req(
@@ -6511,9 +6435,7 @@ mod tests {
         // claimed checksum. AWS rejects this when the upload requires a checksum.
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         let upload_id = create_upload_with_checksum(&fe, "mybucket", "k", Some("CRC32"));
         let req = new_req(
@@ -6543,9 +6465,7 @@ mod tests {
     fn upload_part_duplicate_checksum_algorithm_header_rejected() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         let upload_id = create_upload_with_checksum(&fe, "mybucket", "k", Some("CRC32"));
         let req = new_req(
@@ -6655,9 +6575,7 @@ mod tests {
     fn get_object_part_multipart() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         // 5 MiB minimum for non-final parts
         let part1 = vec![0xAA; 5 * 1024 * 1024];
@@ -6709,9 +6627,7 @@ mod tests {
     fn get_object_part_invalid_zero() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         // PUT a simple object
         let req = new_req(http::Method::GET, "", "", vec![], b"hello".to_vec());
@@ -6738,9 +6654,7 @@ mod tests {
     fn get_object_part_out_of_range() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         let part1 = vec![0xAA; 5 * 1024 * 1024];
         let part2 = vec![0xBB; 5 * 1024 * 1024];
@@ -6770,9 +6684,7 @@ mod tests {
     fn get_object_part_non_multipart() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         let data = b"hello world";
         let req = new_req(http::Method::GET, "", "", vec![], data.to_vec());
@@ -6817,9 +6729,7 @@ mod tests {
     fn get_object_part_non_multipart_out_of_range() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         let req = new_req(http::Method::GET, "", "", vec![], b"hello".to_vec());
         let op = S3Operation::PutObject {
@@ -6845,9 +6755,7 @@ mod tests {
     fn get_object_part_with_checksum() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         let part1 = vec![0xAA; 5 * 1024 * 1024];
         let part2 = vec![0xBB; 100];
@@ -6986,9 +6894,7 @@ mod tests {
     fn delete_objects_invalid_version_id_rejected() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         let xml = br#"<?xml version="1.0"?>
 <Delete>
@@ -7015,9 +6921,7 @@ mod tests {
     fn delete_objects_null_version_id_accepted() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         let xml = br#"<?xml version="1.0"?>
 <Delete>
@@ -7044,9 +6948,7 @@ mod tests {
     fn delete_objects_missing_content_md5_rejected() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         let xml = br#"<?xml version="1.0"?>
 <Delete>
@@ -7073,9 +6975,7 @@ mod tests {
     fn delete_objects_invalid_content_md5_rejected() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         let xml = br#"<?xml version="1.0"?>
 <Delete>
@@ -7102,9 +7002,7 @@ mod tests {
     fn delete_objects_bad_content_md5_rejected() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         let xml = br#"<?xml version="1.0"?>
 <Delete>
@@ -7139,9 +7037,7 @@ mod tests {
         // clean up the streaming session so no session is left behind.
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         // First put succeeds.
         let req = new_req(http::Method::GET, "", "", vec![], b"hello".to_vec());
@@ -7183,9 +7079,7 @@ mod tests {
         // fails with BadDigest.  The handler's abort path must clean up.
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
-        fe.coordinator
-            .create_bucket_for_owner("testuser", "mybucket", false)
-            .unwrap();
+        create_test_bucket(&fe.coordinator, "mybucket");
 
         // Create a multipart upload.
         let create_req = new_req(

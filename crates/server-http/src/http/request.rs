@@ -208,7 +208,7 @@ impl S3Request {
     /// Get headers as borrowed pairs for auth verification.
     #[cfg(test)]
     #[must_use]
-    pub fn header_pairs(&self) -> Vec<(&str, &str)> {
+    fn header_pairs(&self) -> Vec<(&str, &str)> {
         self.header_iter().collect()
     }
 

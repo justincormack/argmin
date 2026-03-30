@@ -4111,6 +4111,7 @@ impl Coordinator {
         Ok(AclGrants::new(grants))
     }
 
+    #[cfg(test)]
     fn bucket_acl_grants_from_flags(
         bucket_owner: &OwnerIdentity,
         public_read: bool,
@@ -4908,10 +4909,6 @@ impl Coordinator {
 
     // ── Bucket operations ─────────────────────────────────────────────
 
-    pub fn create_bucket(&self, name: &str) -> Result<(), ServerError> {
-        self.create_bucket_for_owner("default-owner", name, false)
-    }
-
     pub fn create_bucket_for_requester(
         &self,
         req: &CreateBucketRequest<'_>,
@@ -4940,9 +4937,8 @@ impl Coordinator {
             }
         };
 
-        let create_outcome = self.create_bucket_for_owner_with_acl_grants(
-            owner_account.principal(),
-            owner_account.canonical_user_id(),
+        let create_outcome = self.create_bucket_with_acl_grants(
+            &owner,
             req.name,
             acl_grants,
             req.object_lock_enabled,
@@ -4958,48 +4954,22 @@ impl Coordinator {
         }
     }
 
-    pub fn create_bucket_for_owner(
+    #[cfg(test)]
+    fn create_bucket_for_owner(
         &self,
         owner_principal: &str,
         name: &str,
         public_read: bool,
     ) -> Result<(), ServerError> {
-        let owner_canonical_id = CanonicalUserId::from_principal(owner_principal);
-        self.create_bucket_for_owner_with_acl(
-            owner_principal,
-            &owner_canonical_id,
-            name,
-            public_read,
-            false,
-            false,
-        )?;
+        let owner = OwnerIdentity::from_principal(owner_principal);
+        let acl_grants = Self::bucket_acl_grants_from_flags(&owner, public_read, false);
+        self.create_bucket_with_acl_grants(&owner, name, acl_grants, false)?;
         Ok(())
     }
 
-    fn create_bucket_for_owner_with_acl(
+    fn create_bucket_with_acl_grants(
         &self,
-        owner_principal: &str,
-        owner_canonical_id: &CanonicalUserId,
-        name: &str,
-        public_read: bool,
-        public_write: bool,
-        object_lock_enabled: bool,
-    ) -> Result<BucketCreateOutcome, ServerError> {
-        let owner = OwnerIdentity::new(owner_principal.to_string(), owner_canonical_id.clone());
-        let acl_grants = Self::bucket_acl_grants_from_flags(&owner, public_read, public_write);
-        self.create_bucket_for_owner_with_acl_grants(
-            owner_principal,
-            owner_canonical_id,
-            name,
-            acl_grants,
-            object_lock_enabled,
-        )
-    }
-
-    fn create_bucket_for_owner_with_acl_grants(
-        &self,
-        owner_principal: &str,
-        owner_canonical_id: &CanonicalUserId,
+        owner: &OwnerIdentity,
         name: &str,
         acl_grants: AclGrants,
         object_lock_enabled: bool,
@@ -5019,8 +4989,8 @@ impl Coordinator {
         };
         match bucket_pg.create_bucket_with_config(&storage::CreateBucketConfig {
             name,
-            owner_principal,
-            owner_canonical_id,
+            owner_principal: owner.principal.as_str(),
+            owner_canonical_id: &owner.canonical_id,
             acl_grants: &acl_grants,
             public_read,
             public_write,
@@ -5049,8 +5019,8 @@ impl Coordinator {
                     other => ServerError::Metadata(other),
                 })?;
                 if existing.state == BucketState::Active
-                    && existing.owner_principal == owner_principal
-                    && existing.owner_canonical_id == *owner_canonical_id
+                    && existing.owner_principal == owner.principal
+                    && existing.owner_canonical_id == owner.canonical_id
                 {
                     Ok(BucketCreateOutcome::AlreadyOwned)
                 } else {
@@ -12105,6 +12075,22 @@ mod tests {
         panic!("bucket {name} was not fully removed");
     }
 
+    fn create_bucket_for_owner_with_flags(
+        coord: &Coordinator,
+        owner_principal: &str,
+        owner_canonical_id: &CanonicalUserId,
+        name: &str,
+        public_read: bool,
+        public_write: bool,
+        object_lock_enabled: bool,
+    ) -> Result<(), ServerError> {
+        let owner = OwnerIdentity::new(owner_principal, owner_canonical_id.clone());
+        let acl_grants =
+            Coordinator::bucket_acl_grants_from_flags(&owner, public_read, public_write);
+        coord.create_bucket_with_acl_grants(&owner, name, acl_grants, object_lock_enabled)?;
+        Ok(())
+    }
+
     fn begin_stream_put_test(
         coord: &Coordinator,
         bucket: &str,
@@ -12292,7 +12278,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         // Create
-        coord.create_bucket("test-bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "test-bucket", false)
+            .unwrap();
 
         // Head
         let info = coord.head_bucket("test-bucket").unwrap();
@@ -12312,9 +12300,13 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         // Second create should succeed (idempotent for same owner)
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         // Only one bucket should exist
         let buckets = coord.list_buckets().unwrap();
@@ -12362,10 +12354,18 @@ mod tests {
     fn list_buckets_globally_sorted() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("zz-top").unwrap();
-        coord.create_bucket("alpha").unwrap();
-        coord.create_bucket("mango").unwrap();
-        coord.create_bucket("beta").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "zz-top", false)
+            .unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "alpha", false)
+            .unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "mango", false)
+            .unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "beta", false)
+            .unwrap();
 
         let names: Vec<String> = coord
             .list_buckets()
@@ -13478,7 +13478,9 @@ mod tests {
         let coord =
             Coordinator::new(storage_node, ec_config, "us-east-1".to_string(), None).unwrap();
         let bucket = "bucket-sparse";
-        coord.create_bucket(bucket).unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", bucket, false)
+            .unwrap();
 
         let names: Vec<String> = coord
             .list_buckets()
@@ -13497,7 +13499,9 @@ mod tests {
         let coord =
             Coordinator::new(storage_node, ec_config, "us-east-1".to_string(), None).unwrap();
         let bucket = "bucket-sparse";
-        coord.create_bucket(bucket).unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", bucket, false)
+            .unwrap();
 
         let resp = coord
             .list_objects_v2(&ListObjectsV2Request {
@@ -13520,7 +13524,9 @@ mod tests {
         let coord =
             Coordinator::new(storage_node, ec_config, "us-east-1".to_string(), None).unwrap();
         let bucket = "bucket-sparse";
-        coord.create_bucket(bucket).unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", bucket, false)
+            .unwrap();
 
         let resp = coord
             .list_object_versions(&ListObjectVersionsRequest {
@@ -13544,7 +13550,9 @@ mod tests {
             Coordinator::new(storage_node, ec_config, "us-east-1".to_string(), None).unwrap();
         let bucket = "bucket-sparse";
         let key = "key-sparse";
-        coord.create_bucket(bucket).unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", bucket, false)
+            .unwrap();
         coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
                 bucket,
@@ -13579,7 +13587,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
@@ -13607,7 +13617,9 @@ mod tests {
     fn put_object_persists_tags_in_initial_write() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let tags_xml =
             "<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag></TagSet></Tagging>";
@@ -13664,7 +13676,9 @@ mod tests {
             None,
         )
         .unwrap();
-        admin.create_bucket("bucket").unwrap();
+        admin
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let guard = storage_node.lock_bucket("bucket");
         let (tx, rx) = mpsc::channel();
@@ -13719,7 +13733,9 @@ mod tests {
             None,
         )
         .unwrap();
-        admin.create_bucket("bucket").unwrap();
+        admin
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let guard = storage_node.lock_bucket("bucket");
         let (tx, rx) = mpsc::channel();
@@ -13770,7 +13786,9 @@ mod tests {
             None,
         )
         .unwrap();
-        admin.create_bucket("bucket").unwrap();
+        admin
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let guard = storage_node.lock_bucket("bucket");
         let (tx, rx) = mpsc::channel();
@@ -13792,7 +13810,9 @@ mod tests {
     fn head_object_lazily_populates_bucket_fast_path() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         let key = find_key_with_object_pg_ne_bucket_pg(&coord, "bucket", "head-fast");
         test_helpers::put_object(
             &coord,
@@ -13858,7 +13878,9 @@ mod tests {
         )
         .unwrap();
 
-        admin.create_bucket("bucket").unwrap();
+        admin
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         let key = find_key_with_object_pg_ne_bucket_pg(&admin, "bucket", "head-fast");
         test_helpers::put_object(
             &admin,
@@ -13936,7 +13958,9 @@ mod tests {
         )
         .unwrap();
 
-        admin.create_bucket("bucket").unwrap();
+        admin
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         let key = find_key_with_object_pg_ne_bucket_pg(&admin, "bucket", "delete-fast");
         test_helpers::put_object(
             &admin,
@@ -14025,7 +14049,9 @@ mod tests {
             None,
         )
         .unwrap();
-        admin.create_bucket("bucket").unwrap();
+        admin
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let (upload_id, parts) = create_upload_with_parts(&admin, "bucket", "key", &[(1, b"part")]);
 
@@ -14062,7 +14088,9 @@ mod tests {
 
         let coord =
             Coordinator::new(storage_node, ec_config, "us-east-1".to_string(), None).unwrap();
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         let err = delete_bucket_test(&coord, "bucket").unwrap_err();
@@ -14080,7 +14108,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let headers = [("Content-Type", "text/plain")];
         let metadata = MetadataBlob::from_headers(&headers).unwrap();
@@ -14125,7 +14155,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let headers = [
             ("Content-Type", "application/json"),
@@ -14174,7 +14206,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         let metadata = MetadataBlob::from_headers(&[("Content-Type", "text/plain")]).unwrap();
         let system_metadata =
             SystemMetadata::from_headers(&[("Content-Type", "text/plain")]).unwrap();
@@ -14216,7 +14250,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
@@ -14272,7 +14308,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
@@ -14311,7 +14349,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
@@ -14359,7 +14399,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
@@ -14411,7 +14453,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         // Should not error
         coord
             .delete_object(&DeleteObjectRequest {
@@ -14430,7 +14474,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
@@ -14508,7 +14554,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
@@ -14582,7 +14630,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
@@ -14677,7 +14727,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
@@ -14829,7 +14881,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         let data = b"This data should survive shard loss!";
         test_helpers::put_object(
             &coord,
@@ -14872,7 +14926,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         let data = b"EC single shard loss test data";
         test_helpers::put_object(
             &coord,
@@ -14913,7 +14969,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         let data = vec![5u8; INTERNAL_SEGMENT_SIZE];
         test_helpers::put_object(
             &coord,
@@ -14971,7 +15029,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         let data = b"EC m-shard loss limit test data";
         test_helpers::put_object(
             &coord,
@@ -15015,7 +15075,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         let data = b"EC m+1 shard loss test data";
         test_helpers::put_object(
             &coord,
@@ -15061,7 +15123,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         let data = b"EC corruption recovery test data";
         test_helpers::put_object(
             &coord,
@@ -15102,7 +15166,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         let data = b"Hello, World! Range test with EC recovery";
         test_helpers::put_object(
             &coord,
@@ -15147,7 +15213,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         let data = b"EC parity shard drop test";
         test_helpers::put_object(
             &coord,
@@ -15189,7 +15257,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         let data = b"EC healthy read should skip parity shards";
         let put = test_helpers::put_object(
             &coord,
@@ -15247,7 +15317,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         let data = b"EC reconstruction should stop after first needed parity";
         let put = test_helpers::put_object(
             &coord,
@@ -15332,7 +15404,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         let err = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
@@ -15351,7 +15425,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         let result = test_helpers::put_object(
             &coord,
             &PutObjectRequest {
@@ -15401,7 +15477,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
@@ -15535,7 +15613,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         // Create many prefixed objects to ensure common_prefixes count toward max_keys
         for i in 0..10 {
             let key = format!("dir{i}/file.txt");
@@ -15615,7 +15695,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         for i in 0..5 {
             let key = format!("key-{i:02}");
             test_helpers::put_object(
@@ -15659,7 +15741,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         for i in 0..5 {
             let key = format!("key-{i:02}");
             test_helpers::put_object(
@@ -15733,7 +15817,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
@@ -15832,7 +15918,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
@@ -15872,7 +15960,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
@@ -15913,7 +16003,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
@@ -15989,7 +16081,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
@@ -16117,7 +16211,9 @@ mod tests {
     fn complete_multipart_too_many_parts() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let create = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
@@ -16228,7 +16324,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
@@ -16271,7 +16369,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
@@ -16313,7 +16413,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
@@ -16353,7 +16455,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
@@ -16393,7 +16497,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
@@ -16439,7 +16545,9 @@ mod tests {
     fn put_if_none_match_star_creates() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let cond = WriteCondition::IfNoneMatchStar;
         let result = test_helpers::put_object(
@@ -16467,7 +16575,9 @@ mod tests {
     fn put_if_none_match_star_rejects_overwrite() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
@@ -16513,7 +16623,9 @@ mod tests {
     fn put_if_match_updates() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let r1 = test_helpers::put_object(
             &coord,
@@ -16571,7 +16683,9 @@ mod tests {
     fn put_if_match_stale_etag_rejected() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let r1 = test_helpers::put_object(
             &coord,
@@ -16637,7 +16751,9 @@ mod tests {
     fn put_object_rejects_non_owner_requester() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let err = test_helpers::put_object(
             &coord,
@@ -16664,7 +16780,9 @@ mod tests {
     fn put_object_rejects_acl_on_bucket_owner_enforced_bucket() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         coord
             .put_bucket_ownership_controls(
                 "bucket",
@@ -18461,16 +18579,16 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         let owner_canonical_id = CanonicalUserId::from_principal("owner-a");
-        coord
-            .create_bucket_for_owner_with_acl(
-                "owner-a",
-                &owner_canonical_id,
-                "bucket",
-                false,
-                true,
-                false,
-            )
-            .unwrap();
+        create_bucket_for_owner_with_flags(
+            &coord,
+            "owner-a",
+            &owner_canonical_id,
+            "bucket",
+            false,
+            true,
+            false,
+        )
+        .unwrap();
         let tags_xml =
             "<Tagging><TagSet><Tag><Key>env</Key><Value>writer</Value></Tag></TagSet></Tagging>";
         test_helpers::put_object(
@@ -18620,16 +18738,16 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         let owner_canonical_id = CanonicalUserId::from_principal("owner-a");
-        coord
-            .create_bucket_for_owner_with_acl(
-                "owner-a",
-                &owner_canonical_id,
-                "bucket",
-                false,
-                true,
-                false,
-            )
-            .unwrap();
+        create_bucket_for_owner_with_flags(
+            &coord,
+            "owner-a",
+            &owner_canonical_id,
+            "bucket",
+            false,
+            true,
+            false,
+        )
+        .unwrap();
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
@@ -18667,16 +18785,16 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         let owner_canonical_id = CanonicalUserId::from_principal("owner-a");
-        coord
-            .create_bucket_for_owner_with_acl(
-                "owner-a",
-                &owner_canonical_id,
-                "bucket",
-                false,
-                true,
-                false,
-            )
-            .unwrap();
+        create_bucket_for_owner_with_flags(
+            &coord,
+            "owner-a",
+            &owner_canonical_id,
+            "bucket",
+            false,
+            true,
+            false,
+        )
+        .unwrap();
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
@@ -19268,7 +19386,9 @@ mod tests {
     fn begin_stream_put_rejects_object_lock_headers_on_plain_bucket() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let err = coord
             .begin_stream_put(&BeginStreamPutRequest {
@@ -19291,7 +19411,9 @@ mod tests {
     fn get_if_match_returns_object() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let put = test_helpers::put_object(
             &coord,
@@ -19332,7 +19454,9 @@ mod tests {
     fn get_if_match_wrong_etag_returns_412() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
@@ -19373,7 +19497,9 @@ mod tests {
     fn get_if_none_match_returns_304() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let put = test_helpers::put_object(
             &coord,
@@ -19414,7 +19540,9 @@ mod tests {
     fn head_if_none_match_returns_304() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let put = test_helpers::put_object(
             &coord,
@@ -19455,7 +19583,9 @@ mod tests {
     fn delete_if_match_succeeds() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let put = test_helpers::put_object(
             &coord,
@@ -19502,7 +19632,9 @@ mod tests {
     fn delete_if_match_wrong_etag_returns_412() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
@@ -19540,7 +19672,9 @@ mod tests {
     fn delete_version_if_match_is_not_implemented() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         coord
             .put_bucket_versioning(
                 "bucket",
@@ -19622,7 +19756,9 @@ mod tests {
     fn delete_objects_if_match_per_entry() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let p1 = test_helpers::put_object(
             &coord,
@@ -19692,7 +19828,9 @@ mod tests {
     fn range_get_if_match_returns_data() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let put = test_helpers::put_object(
             &coord,
@@ -19736,7 +19874,9 @@ mod tests {
     fn copy_object_basic() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let headers = [("Content-Type", "text/plain")];
         let metadata = MetadataBlob::from_headers(&headers).unwrap();
@@ -19853,16 +19993,16 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         let owner_canonical_id = CanonicalUserId::from_principal("owner-a");
-        coord
-            .create_bucket_for_owner_with_acl(
-                "owner-a",
-                &owner_canonical_id,
-                "bucket",
-                false,
-                true,
-                false,
-            )
-            .unwrap();
+        create_bucket_for_owner_with_flags(
+            &coord,
+            "owner-a",
+            &owner_canonical_id,
+            "bucket",
+            false,
+            true,
+            false,
+        )
+        .unwrap();
 
         test_helpers::put_object(
             &coord,
@@ -20027,7 +20167,9 @@ mod tests {
     fn copy_object_rejects_acl_on_bucket_owner_enforced_bucket() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         coord
             .put_bucket_ownership_controls(
                 "bucket",
@@ -20135,7 +20277,9 @@ mod tests {
     fn copy_object_metadata_copy_directive() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let headers = [
             ("Content-Type", "image/png"),
@@ -20201,7 +20345,9 @@ mod tests {
     fn copy_object_metadata_replace_directive() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let headers = [
             ("Content-Type", "image/png"),
@@ -20277,7 +20423,9 @@ mod tests {
     fn copy_object_same_key_replace_metadata() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let headers = [("Content-Type", "text/plain")];
         let metadata = MetadataBlob::from_headers(&headers).unwrap();
@@ -20347,7 +20495,9 @@ mod tests {
     fn copy_object_tagging_copy_preserves_source_tags() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let tags_xml =
             "<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag></TagSet></Tagging>";
@@ -20408,7 +20558,9 @@ mod tests {
     fn copy_object_tagging_replace_overwrites_source_tags() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let src_tags =
             "<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag></TagSet></Tagging>";
@@ -20473,7 +20625,9 @@ mod tests {
         // checksum value headers, since there is no body to verify them against.
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         test_helpers::put_object(
             &coord,
@@ -20546,7 +20700,9 @@ mod tests {
         use base64::Engine;
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let data = b"hello";
         test_helpers::put_object(
@@ -20633,7 +20789,9 @@ mod tests {
     fn copy_object_source_not_found() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let err = coord
             .copy_object(&CopyObjectRequest {
@@ -20662,7 +20820,9 @@ mod tests {
     fn copy_object_dest_bucket_not_found() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
@@ -20709,7 +20869,9 @@ mod tests {
     fn copy_object_source_if_match_fails() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
@@ -20760,7 +20922,9 @@ mod tests {
     fn copy_object_dest_if_none_match_prevents_overwrite() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         test_helpers::put_object(
             &coord,
@@ -20827,7 +20991,9 @@ mod tests {
     fn copy_object_dest_if_match_allows_update() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         test_helpers::put_object(
             &coord,
@@ -20906,8 +21072,12 @@ mod tests {
     fn copy_object_cross_bucket() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("src-bucket").unwrap();
-        coord.create_bucket("dst-bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "src-bucket", false)
+            .unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "dst-bucket", false)
+            .unwrap();
 
         let headers = [("Content-Type", "text/plain")];
         let metadata = MetadataBlob::from_headers(&headers).unwrap();
@@ -20985,7 +21155,9 @@ mod tests {
     fn bucket_versioning_default_disabled() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let state = coord
             .get_bucket_versioning("bucket", TEST_REQUESTER, None)
@@ -20997,7 +21169,9 @@ mod tests {
     fn bucket_versioning_enable() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         coord
             .put_bucket_versioning(
@@ -21221,7 +21395,9 @@ mod tests {
     fn bucket_versioning_enable_then_suspend() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         coord
             .put_bucket_versioning(
@@ -21288,7 +21464,9 @@ mod tests {
     fn bucket_versioning_suspend_then_enable() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         coord
             .put_bucket_versioning(
@@ -21326,7 +21504,9 @@ mod tests {
     fn bucket_versioning_cannot_disable_from_enabled() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         coord
             .put_bucket_versioning(
@@ -21939,8 +22119,12 @@ mod tests {
     fn copy_object_with_object_lock_to_plain_bucket_rejects_before_reading_source() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("src").unwrap();
-        coord.create_bucket("dst").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "src", false)
+            .unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "dst", false)
+            .unwrap();
 
         let source_body = vec![b'x'; INTERNAL_SEGMENT_SIZE + 1];
         test_helpers::put_object(
@@ -22429,16 +22613,16 @@ mod tests {
         let owner_requester = Requester::principal("owner-a");
         let writer_requester = Requester::principal("writer-a");
 
-        coord
-            .create_bucket_for_owner_with_acl(
-                "owner-a",
-                &owner_canonical_id,
-                "bucket",
-                false,
-                true,
-                true,
-            )
-            .unwrap();
+        create_bucket_for_owner_with_flags(
+            &coord,
+            "owner-a",
+            &owner_canonical_id,
+            "bucket",
+            false,
+            true,
+            true,
+        )
+        .unwrap();
 
         let plain = test_helpers::put_object(
             &coord,
@@ -22520,7 +22704,9 @@ mod tests {
     fn bucket_encryption_default_unblocked() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let config = coord
             .get_bucket_encryption("bucket", TEST_REQUESTER, None)
@@ -22532,7 +22718,9 @@ mod tests {
     fn bucket_encryption_block_and_unblock() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         coord
             .put_bucket_encryption(
@@ -22594,7 +22782,9 @@ mod tests {
     fn sse_c_put_object_rejected_when_bucket_blocks_sse_c() {
         let dir = test_util::tempdir();
         let coord = setup_coordinator_with_sse_c(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         coord
             .put_bucket_encryption(
                 "bucket",
@@ -22632,7 +22822,9 @@ mod tests {
     fn unencrypted_put_object_allowed_when_bucket_blocks_sse_c() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         coord
             .put_bucket_encryption(
                 "bucket",
@@ -22668,7 +22860,9 @@ mod tests {
     fn sse_c_stream_put_rejected_when_bucket_blocks_sse_c() {
         let dir = test_util::tempdir();
         let coord = setup_coordinator_with_sse_c(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         coord
             .put_bucket_encryption(
                 "bucket",
@@ -22706,7 +22900,9 @@ mod tests {
     fn sse_c_upload_part_rejected_when_bucket_blocks_sse_c() {
         let dir = test_util::tempdir();
         let coord = setup_coordinator_with_sse_c(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let sse_customer = test_sse_customer_request();
         let upload = coord
@@ -22752,7 +22948,9 @@ mod tests {
     fn put_object_returns_version_id_zero() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let result = test_helpers::put_object(
             &coord,
@@ -22779,7 +22977,9 @@ mod tests {
     fn get_object_returns_version_id() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         test_helpers::put_object(
             &coord,
@@ -22816,7 +23016,9 @@ mod tests {
     fn head_object_returns_version_id() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         test_helpers::put_object(
             &coord,
@@ -22867,7 +23069,9 @@ mod tests {
         };
 
         let admin = make_coord();
-        admin.create_bucket("bucket").unwrap();
+        admin
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         admin
             .put_bucket_versioning(
                 "bucket",
@@ -22962,7 +23166,9 @@ mod tests {
         };
 
         let admin = make_coord();
-        admin.create_bucket("bucket").unwrap();
+        admin
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let object_size = (2 * 1024 * 1024) + 137;
         test_helpers::put_object(
@@ -23067,8 +23273,12 @@ mod tests {
         };
 
         let admin = make_coord();
-        admin.create_bucket("src-bucket").unwrap();
-        admin.create_bucket("dst-bucket").unwrap();
+        admin
+            .create_bucket_for_owner("default-owner", "src-bucket", false)
+            .unwrap();
+        admin
+            .create_bucket_for_owner("default-owner", "dst-bucket", false)
+            .unwrap();
 
         let object_size = (2 * 1024 * 1024) + 137;
         test_helpers::put_object(
@@ -23199,7 +23409,9 @@ mod tests {
         };
 
         let admin = make_coord();
-        admin.create_bucket("bucket").unwrap();
+        admin
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let object_size = (2 * 1024 * 1024) + 137;
         test_helpers::put_object(
@@ -23356,7 +23568,9 @@ mod tests {
         };
 
         let admin = make_coord();
-        admin.create_bucket("bucket").unwrap();
+        admin
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let object_size = 256 * 1024;
         test_helpers::put_object(
@@ -23475,7 +23689,9 @@ mod tests {
         };
 
         let admin = make_coord();
-        admin.create_bucket("race-bucket").unwrap();
+        admin
+            .create_bucket_for_owner("default-owner", "race-bucket", false)
+            .unwrap();
         let key = find_fresh_key_with_meta_pg_gt_shard_pg(&admin, "race-bucket", "race-key-get");
         let (_, expected) =
             create_completed_multipart_with_streamed_tail(&admin, "race-bucket", &key);
@@ -23541,7 +23757,9 @@ mod tests {
         };
 
         let admin = make_coord();
-        admin.create_bucket("race-bucket").unwrap();
+        admin
+            .create_bucket_for_owner("default-owner", "race-bucket", false)
+            .unwrap();
         let key = find_fresh_key_with_meta_pg_gt_shard_pg(&admin, "race-bucket", "race-key-part");
         let (_, expected) =
             create_completed_multipart_with_streamed_tail(&admin, "race-bucket", &key);
@@ -23619,7 +23837,9 @@ mod tests {
         };
 
         let admin = make_coord();
-        admin.create_bucket("race-bucket").unwrap();
+        admin
+            .create_bucket_for_owner("default-owner", "race-bucket", false)
+            .unwrap();
         let key =
             find_fresh_key_with_meta_pg_gt_shard_pg(&admin, "race-bucket", "race-key-segments");
 
@@ -23710,7 +23930,9 @@ mod tests {
         };
 
         let admin = make_coord();
-        admin.create_bucket("race-bucket").unwrap();
+        admin
+            .create_bucket_for_owner("default-owner", "race-bucket", false)
+            .unwrap();
         let source_key =
             find_fresh_key_with_meta_pg_gt_shard_pg(&admin, "race-bucket", "race-key-copy");
         create_completed_multipart_with_streamed_tail(&admin, "race-bucket", &source_key);
@@ -23797,8 +24019,12 @@ mod tests {
         };
 
         let admin = make_coord();
-        admin.create_bucket("src-bucket").unwrap();
-        admin.create_bucket("dst-bucket").unwrap();
+        admin
+            .create_bucket_for_owner("default-owner", "src-bucket", false)
+            .unwrap();
+        admin
+            .create_bucket_for_owner("default-owner", "dst-bucket", false)
+            .unwrap();
         let (_, expected) =
             create_completed_multipart_with_streamed_tail(&admin, "src-bucket", "race-key-copy");
 
@@ -23867,7 +24093,9 @@ mod tests {
     fn delete_object_returns_result() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         test_helpers::put_object(
             &coord,
@@ -23907,7 +24135,9 @@ mod tests {
     fn create_multipart_upload_returns_upload_id() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let metadata = MetadataBlob::new();
         let result = coord
@@ -23935,7 +24165,9 @@ mod tests {
     fn create_multipart_upload_unique_ids() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let metadata = MetadataBlob::new();
         let r1 = coord
@@ -23999,7 +24231,9 @@ mod tests {
     fn list_multipart_uploads_empty() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let result = coord
             .list_multipart_uploads(&ListMultipartUploadsRequest {
@@ -24019,7 +24253,9 @@ mod tests {
     fn list_multipart_uploads_returns_created() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let metadata = MetadataBlob::new();
         let r1 = coord
@@ -24278,16 +24514,16 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         let owner_canonical_id = CanonicalUserId::from_principal("owner-a");
-        coord
-            .create_bucket_for_owner_with_acl(
-                "owner-a",
-                &owner_canonical_id,
-                "bucket",
-                false,
-                true,
-                false,
-            )
-            .unwrap();
+        create_bucket_for_owner_with_flags(
+            &coord,
+            "owner-a",
+            &owner_canonical_id,
+            "bucket",
+            false,
+            true,
+            false,
+        )
+        .unwrap();
 
         let err = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
@@ -24425,7 +24661,9 @@ mod tests {
     fn list_multipart_uploads_sorted_by_key_then_initiated() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let metadata = MetadataBlob::new();
         // Create two uploads for the same key.
@@ -24488,7 +24726,9 @@ mod tests {
     fn list_multipart_uploads_pagination() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let metadata = MetadataBlob::new();
         // Create 3 uploads for distinct keys so ordering is deterministic.
@@ -24576,7 +24816,9 @@ mod tests {
     fn list_multipart_uploads_prefix_filter() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let metadata = MetadataBlob::new();
         coord
@@ -24643,7 +24885,9 @@ mod tests {
     fn list_multipart_uploads_max_zero() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let metadata = MetadataBlob::new();
         coord
@@ -24698,7 +24942,9 @@ mod tests {
     fn create_multipart_upload_preserves_metadata() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let headers = [("Content-Type", "image/png"), ("X-Amz-Meta-Author", "test")];
         let metadata = MetadataBlob::from_headers(&headers).unwrap();
@@ -24742,7 +24988,9 @@ mod tests {
     fn delete_bucket_blocked_by_multipart_uploads() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let metadata = MetadataBlob::new();
         coord
@@ -24770,7 +25018,9 @@ mod tests {
     fn delete_bucket_drains_unqueued_payload_reclaim() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let generation_id = GenerationId::new(1).unwrap();
         let meta_pg_id = coord.object_pg_id("bucket", "ghost");
@@ -24822,7 +25072,9 @@ mod tests {
             None,
         )
         .unwrap();
-        admin.create_bucket("bucket").unwrap();
+        admin
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let metadata = MetadataBlob::new();
         test_helpers::put_object(
@@ -24892,7 +25144,7 @@ mod tests {
             Err(ServerError::BucketNotFound { .. })
         ));
         assert!(matches!(
-            deleter.create_bucket("bucket"),
+            deleter.create_bucket_for_owner("default-owner", "bucket", false),
             Err(ServerError::BucketAlreadyExists)
         ));
 
@@ -24912,7 +25164,9 @@ mod tests {
     fn no_such_upload_from_storage() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         // Directly call get_multipart_upload on a PG with a bogus upload ID.
         let meta_pg_id = coord.object_pg_id("bucket", "key");
@@ -24927,7 +25181,9 @@ mod tests {
     fn list_multipart_uploads_same_key_pagination() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let metadata = MetadataBlob::new();
         // Create 3 uploads for the same key.
@@ -25003,7 +25259,9 @@ mod tests {
     fn upload_part_first_upload() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let metadata = MetadataBlob::new();
         let create = coord
@@ -25065,7 +25323,9 @@ mod tests {
     fn upload_part_reupload_increments_generation() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let metadata = MetadataBlob::new();
         let create = coord
@@ -25133,7 +25393,9 @@ mod tests {
     fn upload_part_invalid_part_number_zero() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let metadata = MetadataBlob::new();
         let create = coord
@@ -25174,7 +25436,9 @@ mod tests {
     fn upload_part_invalid_part_number_exceeds_max() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let metadata = MetadataBlob::new();
         let create = coord
@@ -25215,7 +25479,9 @@ mod tests {
     fn upload_part_nonexistent_upload() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let err = test_helpers::upload_part(
             &coord,
@@ -25239,7 +25505,9 @@ mod tests {
     fn upload_part_multiple_parts() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let metadata = MetadataBlob::new();
         let create = coord
@@ -25325,7 +25593,9 @@ mod tests {
     fn upload_part_repeated_reupload_generations() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let metadata = MetadataBlob::new();
         let create = coord
@@ -25374,7 +25644,9 @@ mod tests {
     fn upload_part_boundary_part_numbers() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let metadata = MetadataBlob::new();
         let create = coord
@@ -25436,7 +25708,9 @@ mod tests {
     fn upload_part_wrong_bucket_key_rejected() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let metadata = MetadataBlob::new();
         let create = coord
@@ -25474,7 +25748,9 @@ mod tests {
         assert!(matches!(err, ServerError::NoSuchUpload { .. }));
 
         // Try uploading with wrong bucket.
-        coord.create_bucket("other-bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "other-bucket", false)
+            .unwrap();
         let err = test_helpers::upload_part(
             &coord,
             &UploadPartRequest {
@@ -25497,7 +25773,9 @@ mod tests {
     fn upload_part_same_part_last_writer_wins() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let metadata = MetadataBlob::new();
         let create = coord
@@ -25634,7 +25912,9 @@ mod tests {
     fn complete_multipart_upload_happy_path() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         // Use 5MiB+ parts for non-final parts.
         let big_part = vec![0xABu8; 5 * 1024 * 1024];
@@ -25691,7 +25971,9 @@ mod tests {
     fn delete_multipart_object_eventually_reclaims_part_shards() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let (upload_id, parts) = create_upload_with_parts(&coord, "bucket", "key", &[(1, b"part")]);
         let result = coord
@@ -25743,7 +26025,9 @@ mod tests {
     fn complete_multipart_upload_missing_part() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let (upload_id, mut parts) =
             create_upload_with_parts(&coord, "bucket", "key", &[(1, b"data1"), (3, b"data3")]);
@@ -25777,7 +26061,9 @@ mod tests {
     fn complete_multipart_upload_wrong_etag() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let (upload_id, mut parts) =
             create_upload_with_parts(&coord, "bucket", "key", &[(1, b"data1")]);
@@ -25804,7 +26090,9 @@ mod tests {
     fn complete_multipart_upload_invalid_order() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let (upload_id, parts) =
             create_upload_with_parts(&coord, "bucket", "key", &[(1, b"data1"), (2, b"data2")]);
@@ -25830,7 +26118,9 @@ mod tests {
     fn complete_multipart_upload_too_small_non_final_part() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         // Part 1 is only 10 bytes (below 5 MiB minimum for non-final).
         let (upload_id, parts) = create_upload_with_parts(
@@ -25862,7 +26152,9 @@ mod tests {
     fn complete_multipart_upload_single_part_any_size() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         // A single part can be any size (it's the "final" part).
         let (upload_id, parts) = create_upload_with_parts(&coord, "bucket", "key", &[(1, b"tiny")]);
@@ -25886,7 +26178,9 @@ mod tests {
     fn complete_multipart_upload_empty_part_list() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let metadata = MetadataBlob::new();
         let create = coord
@@ -25924,7 +26218,9 @@ mod tests {
     fn complete_multipart_upload_retry_after_validation_failure() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         // Upload two small parts.
         let (upload_id, parts) =
@@ -25990,7 +26286,9 @@ mod tests {
     fn complete_multipart_upload_duplicate_part_numbers() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let (upload_id, parts) =
             create_upload_with_parts(&coord, "bucket", "key", &[(1, b"data1")]);
@@ -26016,7 +26314,9 @@ mod tests {
     fn complete_multipart_upload_overwrite_unversioned() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         // First multipart upload to key.
         let (upload_id1, parts1) =
@@ -26076,7 +26376,9 @@ mod tests {
     fn complete_multipart_upload_list_shows_composite_etag() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let (upload_id, parts) =
             create_upload_with_parts(&coord, "bucket", "key", &[(1, b"data1")]);
@@ -26117,7 +26419,9 @@ mod tests {
     fn complete_multipart_upload_list_versions_shows_composite_etag() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
         coord
             .put_bucket_versioning(
                 "bucket",
@@ -26167,7 +26471,9 @@ mod tests {
     fn abort_multipart_upload_success() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let (upload_id, _parts) =
             create_upload_with_parts(&coord, "bucket", "key", &[(1, b"part1"), (2, b"part2")]);
@@ -26221,7 +26527,9 @@ mod tests {
     fn abort_multipart_upload_nonexistent() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let err = coord
             .abort_multipart_upload(&AbortMultipartUploadRequest {
@@ -26242,7 +26550,9 @@ mod tests {
     fn abort_multipart_upload_idempotent() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let metadata = MetadataBlob::new();
         let create = coord
@@ -26292,8 +26602,12 @@ mod tests {
     fn abort_multipart_upload_wrong_bucket_key() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
-        coord.create_bucket("other").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "other", false)
+            .unwrap();
 
         let metadata = MetadataBlob::new();
         let create = coord
@@ -26331,7 +26645,9 @@ mod tests {
     fn abort_does_not_affect_completed_object() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         // Create and complete an upload.
         let (upload_id, parts) =
@@ -26383,7 +26699,9 @@ mod tests {
     fn upload_part_after_abort_rejected() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let metadata = MetadataBlob::new();
         let create = coord
@@ -26454,7 +26772,9 @@ mod tests {
     fn list_parts_basic() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let (upload_id, _parts) = create_upload_with_parts(
             &coord,
@@ -26486,7 +26806,9 @@ mod tests {
     fn list_parts_pagination() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let (upload_id, _parts) = create_upload_with_parts(
             &coord,
@@ -26533,7 +26855,9 @@ mod tests {
     fn list_parts_etag_format() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let (upload_id, complete_parts) =
             create_upload_with_parts(&coord, "bucket", "key", &[(1, b"hello")]);
@@ -26557,8 +26881,12 @@ mod tests {
     fn list_parts_wrong_bucket_key() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
-        coord.create_bucket("other").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "other", false)
+            .unwrap();
 
         let metadata = MetadataBlob::new();
         let create = coord
@@ -26597,7 +26925,9 @@ mod tests {
     fn list_parts_nonexistent_upload() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let err = coord
             .list_parts(&ListPartsRequest {
@@ -26619,7 +26949,9 @@ mod tests {
     fn list_parts_after_reupload_shows_latest() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let metadata = MetadataBlob::new();
         let create = coord
@@ -26689,7 +27021,9 @@ mod tests {
     fn list_parts_rejected_when_aborting() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let metadata = MetadataBlob::new();
         let create = coord
@@ -26750,7 +27084,9 @@ mod tests {
     fn abort_completing_upload_returns_no_such_upload() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let metadata = MetadataBlob::new();
         let create = coord
@@ -26952,7 +27288,9 @@ mod tests {
     fn get_multipart_object_full() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let part1 = make_part(0xAA, MIN_PART);
         let part2 = make_part(0xBB, 100);
@@ -26981,7 +27319,9 @@ mod tests {
     fn get_multipart_object_single_part() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         create_completed_multipart_vec(&coord, "bucket", "key", &[(1, b"only-part".to_vec())]);
 
@@ -27002,7 +27342,9 @@ mod tests {
     fn head_multipart_object() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let part1 = make_part(0xAA, MIN_PART);
         let part2 = make_part(0xBB, 200);
@@ -27030,7 +27372,9 @@ mod tests {
     fn get_multipart_object_range_within_part() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let part1 = make_part(0xAA, MIN_PART);
         let part2 = make_part(0xBB, 100);
@@ -27058,7 +27402,9 @@ mod tests {
     fn get_multipart_object_range_spanning_parts() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let part1 = make_part(0xAA, MIN_PART);
         let part2 = make_part(0xBB, MIN_PART);
@@ -27096,7 +27442,9 @@ mod tests {
     fn get_multipart_object_range_suffix() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let part1 = make_part(0xAA, MIN_PART);
         let part2 = make_part(0xBB, 100);
@@ -27122,8 +27470,12 @@ mod tests {
     fn copy_multipart_source() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("src-bucket").unwrap();
-        coord.create_bucket("dst-bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "src-bucket", false)
+            .unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "dst-bucket", false)
+            .unwrap();
 
         let part1 = make_part(0xAA, MIN_PART);
         let part2 = make_part(0xBB, 200);
@@ -27171,7 +27523,9 @@ mod tests {
     fn get_multipart_object_zero_byte_single_part() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         create_completed_multipart_vec(&coord, "bucket", "key", &[(1, vec![])]);
 
@@ -27193,7 +27547,9 @@ mod tests {
     fn get_multipart_object_zero_byte_final_part() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let part1 = make_part(0xAA, MIN_PART);
         let expected = part1.clone();
@@ -27218,7 +27574,9 @@ mod tests {
     fn get_object_part_zero_byte_single_part() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         create_completed_multipart_vec(&coord, "bucket", "key", &[(1, vec![])]);
 
@@ -27245,7 +27603,9 @@ mod tests {
     fn get_object_part_zero_byte_final_part() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let part1 = make_part(0xAA, MIN_PART);
         create_completed_multipart_vec(&coord, "bucket", "key", &[(1, part1.clone()), (2, vec![])]);
@@ -27290,7 +27650,9 @@ mod tests {
     fn head_object_part_non_multipart() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         test_helpers::put_object(
             &coord,
@@ -27347,7 +27709,9 @@ mod tests {
     fn head_object_part_non_multipart_zero_byte() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         test_helpers::put_object(
             &coord,
@@ -27388,7 +27752,9 @@ mod tests {
     fn head_multipart_object_zero_byte() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         create_completed_multipart_vec(&coord, "bucket", "key", &[(1, vec![])]);
 
@@ -27409,8 +27775,12 @@ mod tests {
     fn copy_multipart_source_zero_byte() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("src").unwrap();
-        coord.create_bucket("dst").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "src", false)
+            .unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "dst", false)
+            .unwrap();
 
         create_completed_multipart_vec(&coord, "src", "key", &[(1, vec![])]);
 
@@ -27452,7 +27822,9 @@ mod tests {
     fn read_multipart_range_detects_incomplete_manifest() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         // Create a multipart object, then corrupt manifest by deleting a part row.
         let part1 = make_part(0xAA, MIN_PART);
@@ -27557,7 +27929,9 @@ mod tests {
         let b64 = base64::engine::general_purpose::STANDARD;
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let big = vec![0xABu8; 5 * 1024 * 1024];
         let small = b"final-part";
@@ -27606,7 +27980,9 @@ mod tests {
         let b64 = base64::engine::general_purpose::STANDARD;
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let big = vec![0xABu8; 5 * 1024 * 1024];
         let small = b"final-part";
@@ -27649,7 +28025,9 @@ mod tests {
         let b64 = base64::engine::general_purpose::STANDARD;
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let big = vec![0xCDu8; 5 * 1024 * 1024];
         let small = b"last";
@@ -27691,7 +28069,9 @@ mod tests {
         let b64 = base64::engine::general_purpose::STANDARD;
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let big = vec![0xEFu8; 5 * 1024 * 1024];
         let small = b"end";
@@ -27736,7 +28116,9 @@ mod tests {
         let b64 = base64::engine::general_purpose::STANDARD;
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         // CRC32 + COMPOSITE is intentionally allowed (produces hash-of-hashes-N).
         let big = vec![0x11u8; 5 * 1024 * 1024];
@@ -27783,7 +28165,9 @@ mod tests {
     fn complete_multipart_bad_part_checksum_rejected() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let big = vec![0xAAu8; 5 * 1024 * 1024];
         let small = b"end";
@@ -27822,7 +28206,9 @@ mod tests {
     fn complete_multipart_no_checksum_returns_none() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let big = vec![0u8; 5 * 1024 * 1024];
         let small = b"last";
@@ -27853,7 +28239,9 @@ mod tests {
 
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let big = vec![0xAAu8; 5 * 1024 * 1024];
         let small = b"end";
@@ -27897,7 +28285,9 @@ mod tests {
     fn stream_put_happy_path() {
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         // Begin session.
         let session_id = begin_stream_put_test(&coord, "bucket", "mykey").unwrap();
@@ -27961,7 +28351,9 @@ mod tests {
     fn sse_c_checksum_metadata_is_not_stored_in_cleartext() {
         let dir = test_util::tempdir();
         let coord = setup_coordinator_with_sse_c(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let sse_customer = test_sse_customer_request();
         let metadata = MetadataBlob::from_headers(&[("x-amz-meta-owner", "alice")]).unwrap();
@@ -28047,7 +28439,9 @@ mod tests {
     fn sse_c_multipart_parts_with_same_plaintext_use_distinct_nonce_scopes() {
         let dir = test_util::tempdir();
         let coord = setup_coordinator_with_sse_c(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let sse_customer = test_sse_customer_request();
         let upload = coord
@@ -28109,7 +28503,9 @@ mod tests {
     fn stream_put_zero_byte_object() {
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let session_id = begin_stream_put_test(&coord, "bucket", "mykey").unwrap();
 
@@ -28154,7 +28550,9 @@ mod tests {
     fn finalize_stream_put_persists_tags_in_initial_commit() {
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let session_id = begin_stream_put_test(&coord, "bucket", "mykey").unwrap();
         coord
@@ -28200,7 +28598,9 @@ mod tests {
     fn stream_put_abort() {
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let session_id = begin_stream_put_test(&coord, "bucket", "mykey").unwrap();
         coord
@@ -28230,7 +28630,9 @@ mod tests {
     fn stream_put_append_after_finalize_fails() {
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let session_id = begin_stream_put_test(&coord, "bucket", "mykey").unwrap();
         let crc = checksum::crc64::checksum(&[]);
@@ -28271,7 +28673,9 @@ mod tests {
     fn stream_put_finalize_after_abort_fails() {
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let session_id = begin_stream_put_test(&coord, "bucket", "mykey").unwrap();
         coord
@@ -28311,7 +28715,9 @@ mod tests {
     fn stream_put_bucket_key_mismatch_append() {
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let session_id = begin_stream_put_test(&coord, "bucket", "key1").unwrap();
 
@@ -28335,7 +28741,9 @@ mod tests {
     fn stream_put_bucket_key_mismatch_finalize() {
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let session_id = begin_stream_put_test(&coord, "bucket", "key1").unwrap();
 
@@ -28382,7 +28790,9 @@ mod tests {
     fn stream_put_overwrite_existing_object() {
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         // Write an existing object via normal put.
         test_helpers::put_object(
@@ -28451,7 +28861,9 @@ mod tests {
     fn stream_put_with_write_condition() {
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         // Write initial object.
         let initial = test_helpers::put_object(
@@ -28535,7 +28947,9 @@ mod tests {
     fn stream_put_multiple_segments_correct_manifest() {
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
 
@@ -28590,7 +29004,9 @@ mod tests {
     fn stream_put_abort_cleans_up_shards() {
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         coord
@@ -28622,7 +29038,9 @@ mod tests {
         // GET reads from object_segments to reconstruct the object.
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         coord
@@ -28682,7 +29100,9 @@ mod tests {
         // Stream-put with multiple segments: GET reconstructs all segments.
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         coord
@@ -28767,7 +29187,9 @@ mod tests {
     fn get_object_reuses_payload_buffer_for_repeated_segment_reads() {
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         let data = vec![7u8; INTERNAL_SEGMENT_SIZE];
@@ -28827,7 +29249,9 @@ mod tests {
         // Range reads on stream-put objects work correctly.
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         coord
@@ -28920,7 +29344,9 @@ mod tests {
         // CopyObject from a stream-put source works correctly.
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let session_id = begin_stream_put_test(&coord, "bucket", "src").unwrap();
         coord
@@ -28997,7 +29423,9 @@ mod tests {
     fn buffered_put_single_segment_skips_stream_session_rows() {
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let result = test_helpers::put_object(
             &coord,
@@ -29044,7 +29472,9 @@ mod tests {
     fn buffered_put_exact_segment_skips_stream_session_rows() {
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let data = vec![0xAB; INTERNAL_SEGMENT_SIZE];
         let result = test_helpers::put_object(
@@ -29080,7 +29510,9 @@ mod tests {
     fn buffered_put_writes_object_segments() {
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let data = vec![0x5A; (INTERNAL_SEGMENT_SIZE * 2) + 123];
         let result = test_helpers::put_object(
@@ -29134,7 +29566,9 @@ mod tests {
     fn buffered_put_overwrite_eventually_reclaims_old_segments() {
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let old_data = vec![0x41; INTERNAL_SEGMENT_SIZE + 17];
         let first = test_helpers::put_object(
@@ -29202,7 +29636,9 @@ mod tests {
         // Zero-byte stream-put objects are readable.
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let session_id = begin_stream_put_test(&coord, "bucket", "empty").unwrap();
         let crc = checksum::crc64::checksum(b"");
@@ -29244,7 +29680,9 @@ mod tests {
         // partNumber=1 on stream-put objects returns the full body.
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         coord
@@ -29290,7 +29728,9 @@ mod tests {
         // P0 fix: normal PUT after stream-write must clear stale segment rows.
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         // Stream-write an object.
         let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
@@ -29369,7 +29809,9 @@ mod tests {
         // P1 fix: delete must clean up object_segments and their shards.
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         coord
@@ -29425,7 +29867,9 @@ mod tests {
     fn stream_put_delete_eventually_reclaims_segment_shards() {
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         coord
@@ -29488,7 +29932,9 @@ mod tests {
         // P2 fix: UploadPartCopy must be able to read stream-written source objects.
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         // Stream-write a source object.
         let session_id = begin_stream_put_test(&coord, "bucket", "src").unwrap();
@@ -29560,7 +30006,9 @@ mod tests {
 
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let data: Vec<u8> = (0..((2 * INTERNAL_SEGMENT_SIZE) + 12_345))
             .map(|i| (i % 251) as u8)
@@ -29687,7 +30135,9 @@ mod tests {
     fn upload_part_copy_rejects_non_owner_requester() {
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         test_helpers::put_object(
             &coord,
@@ -29748,7 +30198,9 @@ mod tests {
     fn stream_put_duplicate_segment_index_rejected() {
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         coord
@@ -29791,7 +30243,9 @@ mod tests {
     fn stream_put_total_size_mismatch_rejected() {
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         coord
@@ -29830,7 +30284,9 @@ mod tests {
         // append_stream_segment accepts both PutObject and UploadPart sessions.
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let meta_pg_id = coord.object_pg_id("bucket", "key");
         let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
@@ -29856,7 +30312,9 @@ mod tests {
     fn stream_append_reuses_encode_scratch_for_aligned_segments() {
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         assert_eq!(coord.encode_scratch_pool.allocation_count(), 0);
@@ -29878,7 +30336,9 @@ mod tests {
     fn stream_part_happy_path() {
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         // Create a multipart upload first.
         let mpu = coord
@@ -29929,7 +30389,9 @@ mod tests {
     fn stream_part_no_upload_rejected() {
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let err = begin_stream_part_test(&coord, "bucket", "key", "nonexistent", 1).unwrap_err();
         assert!(matches!(err, ServerError::NoSuchUpload { .. }));
@@ -29939,7 +30401,9 @@ mod tests {
     fn stream_part_invalid_part_number_rejected() {
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let mpu = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
@@ -29996,7 +30460,9 @@ mod tests {
         // A PutObject session cannot be finalized as UploadPart.
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         coord
@@ -30042,7 +30508,9 @@ mod tests {
         // completes second (overwriting A). Each must read back its own data.
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let metadata = MetadataBlob::new();
 
@@ -30189,7 +30657,9 @@ mod tests {
         // multipart_part_segments rows and their shard data.
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let metadata = MetadataBlob::new();
         let mpu = coord
@@ -30300,7 +30770,9 @@ mod tests {
     fn scavenge_stale_sessions_cleans_old() {
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         // Begin a session (creates with current timestamp).
         let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
@@ -30335,7 +30807,9 @@ mod tests {
         // scavenge should not affect the object or its object segments.
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
         coord
@@ -30384,7 +30858,9 @@ mod tests {
         // Atomic visibility: object is not readable before finalize.
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let session_id = begin_stream_put_test(&coord, "bucket", "new-key").unwrap();
         coord
@@ -30424,7 +30900,9 @@ mod tests {
         // what was written, and shard data is intact.
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let session_id = begin_stream_put_test(&coord, "bucket", "verify").unwrap();
         coord
@@ -30500,7 +30978,9 @@ mod tests {
     fn get_object_rejects_bad_segment_crc64() {
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         let put = test_helpers::put_object(
             &coord,
@@ -30581,7 +31061,9 @@ mod tests {
         // Overwrite cycle: stream-put → delete → normal put → GET succeeds.
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         // 1. Stream-write.
         let session_id = begin_stream_put_test(&coord, "bucket", "cycle").unwrap();
@@ -30659,7 +31141,9 @@ mod tests {
         // Stream-write → stream-write overwrite: second write's segments replace first.
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
-        coord.create_bucket("bucket").unwrap();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
 
         // First stream-write.
         let s1 = begin_stream_put_test(&coord, "bucket", "key").unwrap();

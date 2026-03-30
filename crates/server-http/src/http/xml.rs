@@ -3731,6 +3731,18 @@ mod tests {
         Requester::principal("default-owner")
     }
 
+    fn create_test_bucket(coord: &Coordinator, name: &str) {
+        coord
+            .create_bucket_for_requester(&crate::coordinator::CreateBucketRequest {
+                name,
+                requester: test_requester(),
+                acl: crate::coordinator::CreateBucketAcl::DefaultPrivate,
+                ownership: crate::coordinator::BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
+            })
+            .unwrap();
+    }
+
     #[test]
     fn error_xml_format() {
         let xml = error_xml(
@@ -5946,7 +5958,7 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        coord.create_bucket("test-bucket").unwrap();
+        create_test_bucket(&coord, "test-bucket");
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
@@ -6096,7 +6108,7 @@ mod tests {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
-        coord.create_bucket("bucket").unwrap();
+        create_test_bucket(&coord, "bucket");
         for i in 0..5 {
             let key = format!("key-{i:02}");
             test_helpers::put_object(
