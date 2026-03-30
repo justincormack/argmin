@@ -1888,25 +1888,6 @@ impl_expected_bucket_owner_accessor!(
 #[cfg(any(test, feature = "test-utils"))]
 impl_expected_bucket_owner_accessor!(UploadPartRequest);
 
-impl<'a> ObjectVersionRequest<'a> {
-    fn new(
-        bucket: &'a str,
-        key: &'a str,
-        version_id: Option<VersionId>,
-        requester: Requester,
-        _expected_bucket_owner: Option<&'a str>,
-    ) -> Self {
-        Self {
-            bucket,
-            key,
-            version_id,
-            requester,
-            #[cfg(not(test))]
-            expected_bucket_owner: _expected_bucket_owner,
-        }
-    }
-}
-
 impl<'a> BeginStreamPutRequest<'a> {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -6181,60 +6162,6 @@ impl Coordinator {
                 Err(ServerError::AccessDenied)
             }
         }
-    }
-
-    pub fn put_object_retention(
-        &self,
-        bucket: &str,
-        key: &str,
-        version_id: Option<VersionId>,
-        retention: ObjectRetention,
-        bypass_governance: bool,
-        requester: Requester,
-    ) -> Result<(), ServerError> {
-        self.put_object_retention_for_request(&PutObjectRetentionRequest {
-            object: ObjectVersionRequest::new(bucket, key, version_id, requester, None),
-            retention,
-            bypass_governance,
-        })
-    }
-
-    pub fn get_object_retention(
-        &self,
-        bucket: &str,
-        key: &str,
-        version_id: Option<VersionId>,
-        requester: Requester,
-    ) -> Result<Option<ObjectRetention>, ServerError> {
-        self.get_object_retention_for_request(&ObjectVersionRequest::new(
-            bucket, key, version_id, requester, None,
-        ))
-    }
-
-    pub fn put_object_legal_hold(
-        &self,
-        bucket: &str,
-        key: &str,
-        version_id: Option<VersionId>,
-        legal_hold: LegalHoldStatus,
-        requester: Requester,
-    ) -> Result<(), ServerError> {
-        self.put_object_legal_hold_for_request(&PutObjectLegalHoldRequest {
-            object: ObjectVersionRequest::new(bucket, key, version_id, requester, None),
-            legal_hold,
-        })
-    }
-
-    pub fn get_object_legal_hold(
-        &self,
-        bucket: &str,
-        key: &str,
-        version_id: Option<VersionId>,
-        requester: Requester,
-    ) -> Result<Option<LegalHoldStatus>, ServerError> {
-        self.get_object_legal_hold_for_request(&ObjectVersionRequest::new(
-            bucket, key, version_id, requester, None,
-        ))
     }
 
     // ── Object tagging ──────────────────────────────────────────────
@@ -11937,6 +11864,60 @@ mod tests {
     ) -> Result<Option<String>, ServerError> {
         assert!(expected_bucket_owner.is_none());
         coord.get_object_tags_for_request(&object_version_request(
+            bucket, key, version_id, requester,
+        ))
+    }
+
+    fn put_object_retention_test(
+        coord: &Coordinator,
+        bucket: &str,
+        key: &str,
+        version_id: Option<VersionId>,
+        retention: ObjectRetention,
+        bypass_governance: bool,
+        requester: Requester,
+    ) -> Result<(), ServerError> {
+        coord.put_object_retention_for_request(&PutObjectRetentionRequest {
+            object: object_version_request(bucket, key, version_id, requester),
+            retention,
+            bypass_governance,
+        })
+    }
+
+    fn get_object_retention_test(
+        coord: &Coordinator,
+        bucket: &str,
+        key: &str,
+        version_id: Option<VersionId>,
+        requester: Requester,
+    ) -> Result<Option<ObjectRetention>, ServerError> {
+        coord.get_object_retention_for_request(&object_version_request(
+            bucket, key, version_id, requester,
+        ))
+    }
+
+    fn put_object_legal_hold_test(
+        coord: &Coordinator,
+        bucket: &str,
+        key: &str,
+        version_id: Option<VersionId>,
+        legal_hold: LegalHoldStatus,
+        requester: Requester,
+    ) -> Result<(), ServerError> {
+        coord.put_object_legal_hold_for_request(&PutObjectLegalHoldRequest {
+            object: object_version_request(bucket, key, version_id, requester),
+            legal_hold,
+        })
+    }
+
+    fn get_object_legal_hold_test(
+        coord: &Coordinator,
+        bucket: &str,
+        key: &str,
+        version_id: Option<VersionId>,
+        requester: Requester,
+    ) -> Result<Option<LegalHoldStatus>, ServerError> {
+        coord.get_object_legal_hold_for_request(&object_version_request(
             bucket, key, version_id, requester,
         ))
     }
@@ -18296,19 +18277,19 @@ mod tests {
             },
         )
         .unwrap();
-        admin
-            .put_object_retention(
-                "bucket",
-                "key",
-                Some(put.version_id),
-                ObjectRetention {
-                    mode: ObjectLockMode::Governance,
-                    retain_until_unix_seconds: Coordinator::current_unix_seconds().unwrap() + 3600,
-                },
-                false,
-                owner_requester.clone(),
-            )
-            .unwrap();
+        put_object_retention_test(
+            &admin,
+            "bucket",
+            "key",
+            Some(put.version_id),
+            ObjectRetention {
+                mode: ObjectLockMode::Governance,
+                retain_until_unix_seconds: Coordinator::current_unix_seconds().unwrap() + 3600,
+            },
+            false,
+            owner_requester.clone(),
+        )
+        .unwrap();
         put_bucket_policy_test(&admin,
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":{"AWS":"owner-a"},"Action":"s3:BypassGovernanceRetention","Resource":"arn:aws:s3:::bucket/*"}]}"#,
@@ -21683,30 +21664,30 @@ mod tests {
             mode: ObjectLockMode::Governance,
             retain_until_unix_seconds: Coordinator::current_unix_seconds().unwrap() + 3600,
         };
-        coord
-            .put_object_retention(
-                "bucket",
-                "key",
-                Some(put.version_id),
-                retention,
-                false,
-                owner_requester.clone(),
-            )
-            .unwrap();
+        put_object_retention_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(put.version_id),
+            retention,
+            false,
+            owner_requester.clone(),
+        )
+        .unwrap();
         put_bucket_policy_test(&coord,
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:GetObjectRetention","Resource":"arn:aws:s3:::bucket/*"}]}"#,
                 owner_requester, None)
             .unwrap();
 
-        let fetched = coord
-            .get_object_retention(
-                "bucket",
-                "key",
-                Some(put.version_id),
-                Requester::principal("other-user"),
-            )
-            .unwrap();
+        let fetched = get_object_retention_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(put.version_id),
+            Requester::principal("other-user"),
+        )
+        .unwrap();
         assert_eq!(fetched, Some(retention));
     }
 
@@ -21746,38 +21727,38 @@ mod tests {
             },
         )
         .unwrap();
-        coord
-            .put_object_retention(
-                "bucket",
-                "key",
-                Some(put.version_id),
-                ObjectRetention {
-                    mode: ObjectLockMode::Governance,
-                    retain_until_unix_seconds: now + 200,
-                },
-                false,
-                owner_requester.clone(),
-            )
-            .unwrap();
+        put_object_retention_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(put.version_id),
+            ObjectRetention {
+                mode: ObjectLockMode::Governance,
+                retain_until_unix_seconds: now + 200,
+            },
+            false,
+            owner_requester.clone(),
+        )
+        .unwrap();
         put_bucket_policy_test(&coord,
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:PutObjectRetention","Resource":"arn:aws:s3:::bucket/*"}]}"#,
                 owner_requester.clone(), None)
             .unwrap();
 
-        let err = coord
-            .put_object_retention(
-                "bucket",
-                "key",
-                Some(put.version_id),
-                ObjectRetention {
-                    mode: ObjectLockMode::Governance,
-                    retain_until_unix_seconds: now + 150,
-                },
-                true,
-                other_requester.clone(),
-            )
-            .unwrap_err();
+        let err = put_object_retention_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(put.version_id),
+            ObjectRetention {
+                mode: ObjectLockMode::Governance,
+                retain_until_unix_seconds: now + 150,
+            },
+            true,
+            other_requester.clone(),
+        )
+        .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
 
         put_bucket_policy_test(&coord,
@@ -21786,19 +21767,19 @@ mod tests {
                 owner_requester, None)
             .unwrap();
 
-        coord
-            .put_object_retention(
-                "bucket",
-                "key",
-                Some(put.version_id),
-                ObjectRetention {
-                    mode: ObjectLockMode::Governance,
-                    retain_until_unix_seconds: now + 150,
-                },
-                true,
-                other_requester,
-            )
-            .unwrap();
+        put_object_retention_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(put.version_id),
+            ObjectRetention {
+                mode: ObjectLockMode::Governance,
+                retain_until_unix_seconds: now + 150,
+            },
+            true,
+            other_requester,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -21836,38 +21817,38 @@ mod tests {
             },
         )
         .unwrap();
-        coord
-            .put_object_retention(
-                "bucket",
-                "key",
-                Some(put.version_id),
-                ObjectRetention {
-                    mode: ObjectLockMode::Governance,
-                    retain_until_unix_seconds: now + 200,
-                },
-                false,
-                owner_requester.clone(),
-            )
-            .unwrap();
+        put_object_retention_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(put.version_id),
+            ObjectRetention {
+                mode: ObjectLockMode::Governance,
+                retain_until_unix_seconds: now + 200,
+            },
+            false,
+            owner_requester.clone(),
+        )
+        .unwrap();
         put_bucket_policy_test(&coord,
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":{"AWS":"owner-a"},"Action":"s3:BypassGovernanceRetention","Resource":"arn:aws:s3:::bucket/*"}]}"#,
                 owner_requester.clone(), None)
             .unwrap();
 
-        let err = coord
-            .put_object_retention(
-                "bucket",
-                "key",
-                Some(put.version_id),
-                ObjectRetention {
-                    mode: ObjectLockMode::Governance,
-                    retain_until_unix_seconds: now + 150,
-                },
-                true,
-                owner_requester,
-            )
-            .unwrap_err();
+        let err = put_object_retention_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(put.version_id),
+            ObjectRetention {
+                mode: ObjectLockMode::Governance,
+                retain_until_unix_seconds: now + 150,
+            },
+            true,
+            owner_requester,
+        )
+        .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
     }
 
@@ -21911,23 +21892,23 @@ mod tests {
                 owner_requester, None)
             .unwrap();
 
-        coord
-            .put_object_legal_hold(
-                "bucket",
-                "key",
-                Some(put.version_id),
-                LegalHoldStatus::On,
-                Requester::principal("other-user"),
-            )
-            .unwrap();
-        let fetched = coord
-            .get_object_legal_hold(
-                "bucket",
-                "key",
-                Some(put.version_id),
-                Requester::principal("other-user"),
-            )
-            .unwrap();
+        put_object_legal_hold_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(put.version_id),
+            LegalHoldStatus::On,
+            Requester::principal("other-user"),
+        )
+        .unwrap();
+        let fetched = get_object_legal_hold_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(put.version_id),
+            Requester::principal("other-user"),
+        )
+        .unwrap();
         assert_eq!(fetched, Some(LegalHoldStatus::On));
     }
 
@@ -22231,19 +22212,19 @@ mod tests {
             },
         )
         .unwrap();
-        coord
-            .put_object_retention(
-                "bucket",
-                "key",
-                Some(put.version_id),
-                ObjectRetention {
-                    mode: ObjectLockMode::Governance,
-                    retain_until_unix_seconds: now + 200,
-                },
-                false,
-                owner_requester.clone(),
-            )
-            .unwrap();
+        put_object_retention_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(put.version_id),
+            ObjectRetention {
+                mode: ObjectLockMode::Governance,
+                retain_until_unix_seconds: now + 200,
+            },
+            false,
+            owner_requester.clone(),
+        )
+        .unwrap();
         put_bucket_policy_test(&coord,
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":{"AWS":"owner-a"},"Action":"s3:BypassGovernanceRetention","Resource":"arn:aws:s3:::bucket/*"}]}"#,
@@ -22298,19 +22279,19 @@ mod tests {
             },
         )
         .unwrap();
-        coord
-            .put_object_retention(
-                "bucket",
-                "key",
-                Some(put.version_id),
-                ObjectRetention {
-                    mode: ObjectLockMode::Governance,
-                    retain_until_unix_seconds: now + 200,
-                },
-                false,
-                owner_requester.clone(),
-            )
-            .unwrap();
+        put_object_retention_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(put.version_id),
+            ObjectRetention {
+                mode: ObjectLockMode::Governance,
+                retain_until_unix_seconds: now + 200,
+            },
+            false,
+            owner_requester.clone(),
+        )
+        .unwrap();
         put_bucket_policy_test(&coord,
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":["s3:DeleteObjectVersion","s3:BypassGovernanceRetention"],"Resource":"arn:aws:s3:::bucket/*"}]}"#,
@@ -22392,19 +22373,19 @@ mod tests {
             },
         )
         .unwrap();
-        coord
-            .put_object_retention(
-                "bucket",
-                "key",
-                Some(put.version_id),
-                ObjectRetention {
-                    mode: ObjectLockMode::Governance,
-                    retain_until_unix_seconds: Coordinator::current_unix_seconds().unwrap() + 3600,
-                },
-                false,
-                requester.clone(),
-            )
-            .unwrap();
+        put_object_retention_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(put.version_id),
+            ObjectRetention {
+                mode: ObjectLockMode::Governance,
+                retain_until_unix_seconds: Coordinator::current_unix_seconds().unwrap() + 3600,
+            },
+            false,
+            requester.clone(),
+        )
+        .unwrap();
 
         let delete_marker = coord
             .delete_object(&DeleteObjectRequest {
@@ -22488,15 +22469,15 @@ mod tests {
             },
         )
         .unwrap();
-        coord
-            .put_object_legal_hold(
-                "bucket",
-                "key",
-                Some(put.version_id),
-                LegalHoldStatus::On,
-                requester.clone(),
-            )
-            .unwrap();
+        put_object_legal_hold_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(put.version_id),
+            LegalHoldStatus::On,
+            requester.clone(),
+        )
+        .unwrap();
 
         let err = coord
             .delete_object(&DeleteObjectRequest {
@@ -22510,15 +22491,15 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
 
-        coord
-            .put_object_legal_hold(
-                "bucket",
-                "key",
-                Some(put.version_id),
-                LegalHoldStatus::Off,
-                requester.clone(),
-            )
-            .unwrap();
+        put_object_legal_hold_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(put.version_id),
+            LegalHoldStatus::Off,
+            requester.clone(),
+        )
+        .unwrap();
         coord
             .delete_object(&DeleteObjectRequest {
                 bucket: "bucket",
@@ -22599,19 +22580,19 @@ mod tests {
         )
         .unwrap();
 
-        coord
-            .put_object_retention(
-                "bucket",
-                "locked",
-                Some(locked.version_id),
-                ObjectRetention {
-                    mode: ObjectLockMode::Governance,
-                    retain_until_unix_seconds: Coordinator::current_unix_seconds().unwrap() + 3600,
-                },
-                false,
-                owner_requester,
-            )
-            .unwrap();
+        put_object_retention_test(
+            &coord,
+            "bucket",
+            "locked",
+            Some(locked.version_id),
+            ObjectRetention {
+                mode: ObjectLockMode::Governance,
+                retain_until_unix_seconds: Coordinator::current_unix_seconds().unwrap() + 3600,
+            },
+            false,
+            owner_requester,
+        )
+        .unwrap();
 
         let err = coord
             .delete_object(&DeleteObjectRequest {
